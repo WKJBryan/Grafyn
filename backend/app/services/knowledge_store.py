@@ -1,13 +1,15 @@
 """Knowledge store service for Markdown note CRUD operations"""
+import logging
 import re
 import frontmatter
 from pathlib import Path
 from typing import List, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 
-from app.models.note import Note, NoteCreate, NoteUpdate, NoteListItem
+from app.models.note import Note, NoteCreate, NoteUpdate, NoteListItem, NoteFrontmatter
 from app.config import get_settings
 
+logger = logging.getLogger(__name__)
 settings = get_settings()
 
 # Wikilink pattern: [[Note Title]] or [[Note Title|Display Text]]
@@ -23,8 +25,21 @@ class KnowledgeStore:
         self.vault_path.mkdir(parents=True, exist_ok=True)
     
     def _get_note_path(self, note_id: str) -> Path:
-        """Get the file path for a note ID"""
-        return self.vault_path / f"{note_id}.md"
+        """Get the file path for a note ID with path traversal protection"""
+        # Sanitize note_id to prevent path traversal
+        sanitized_id = re.sub(r'[^\w\s-]', '', note_id).strip().replace(' ', '_')
+        
+        # Construct path and resolve to absolute path
+        note_path = (self.vault_path / f"{sanitized_id}.md").resolve()
+        
+        # Ensure the resolved path is within vault_path
+        try:
+            note_path.relative_to(self.vault_path.resolve())
+        except ValueError:
+            logger.warning(f"Path traversal attempt detected: {note_id}")
+            raise ValueError(f"Invalid note ID: {note_id}")
+        
+        return note_path
     
     def _generate_note_id(self, title: str) -> str:
         """Generate a note ID from title"""
@@ -57,7 +72,7 @@ class KnowledgeStore:
                     link_count=len(wikilinks)
                 ))
             except Exception as e:
-                print(f"Error loading note {md_file}: {e}")
+                logger.error(f"Error loading note {md_file}: {e}")
                 continue
         
         return notes
@@ -101,7 +116,7 @@ class KnowledgeStore:
             raise FileExistsError(f"Note {note_id} already exists")
         
         # Create frontmatter
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         frontmatter_data = {
             'title': note_data.title,
             'created': now,
@@ -137,7 +152,7 @@ class KnowledgeStore:
             post['status'] = note_data.status
         
         # Update modified timestamp
-        post['modified'] = datetime.utcnow()
+        post['modified'] = datetime.now(timezone.utc)
         
         # Write updated note
         with open(note_path, 'w', encoding='utf-8') as f:
@@ -168,7 +183,7 @@ class KnowledgeStore:
                     'tags': post.get('tags', [])
                 })
             except Exception as e:
-                print(f"Error loading note {md_file}: {e}")
+                logger.error(f"Error loading note {md_file}: {e}")
                 continue
         
         return notes
