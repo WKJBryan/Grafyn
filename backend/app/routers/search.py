@@ -12,7 +12,7 @@ vector_search = None
 
 @router.get("", response_model=List[SearchResult])
 async def search_notes(
-    q: str = Query(..., description="Search query"),
+    q: str = Query(..., min_length=1, max_length=500, description="Search query"),
     limit: int = Query(10, ge=1, le=50, description="Maximum number of results"),
     semantic: bool = Query(True, description="Use semantic vector search")
 ):

@@ -138,9 +138,9 @@ class GraphIndexService:
     def update_note(self, note_id: str, old_content: str, new_content: str):
         """Incrementally update graph index for a modified note"""
         # Extract old and new wikilinks
-        from app.services.knowledge_store import KnowledgeStore
-        old_links = KnowledgeStore._extract_wikilinks(None, old_content)
-        new_links = KnowledgeStore._extract_wikilinks(None, new_content)
+        ks = KnowledgeStore()
+        old_links = ks._extract_wikilinks(old_content)
+        new_links = ks._extract_wikilinks(new_content)
         
         # Remove old links
         for linked_id in old_links:

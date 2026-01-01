@@ -29,7 +29,7 @@
 </template>
 
 <script setup>
-import { ref, watch } from 'vue'
+import { ref, watch, onBeforeUnmount } from 'vue'
 import { search as searchApi } from '../api/client'
 
 const emit = defineEmits(['select'])
@@ -84,11 +84,20 @@ function handleClear() {
   showResults.value = false
 }
 
-// Close results when clicking outside
-document.addEventListener('click', (e) => {
+// Store event handler reference
+const handleClickOutside = (e) => {
   if (!e.target.closest('.search-bar')) {
     showResults.value = false
   }
+}
+
+// Add event listener on mount
+document.addEventListener('click', handleClickOutside)
+
+// Clean up on unmount
+onBeforeUnmount(() => {
+  document.removeEventListener('click', handleClickOutside)
+  clearTimeout(debounceTimer)
 })
 </script>
 

@@ -21,8 +21,14 @@ fastapi-mcp>=0.1.0
 httpx>=0.25.0
 python-multipart>=0.0.6
 
+# Security & Encryption
+cryptography>=41.0.0
+
 # Environment & Configuration
 python-dotenv>=1.0.0
+
+# Rate Limiting
+slowapi>=0.1.9
 
 # Utilities
 aiofiles>=23.2.1

@@ -1,6 +1,8 @@
 """Configuration management for Seedream backend"""
+from pathlib import Path
 from pydantic_settings import BaseSettings
-from typing import List
+from pydantic import field_validator
+from typing import List, Optional
 
 
 class Settings(BaseSettings):
@@ -23,7 +25,28 @@ class Settings(BaseSettings):
     github_redirect_uri: str = ""
     
     # CORS Configuration
-    cors_origins: List[str] = ["http://localhost:5173", "http://localhost:3000"]
+    cors_origins: Optional[str] = None
+    
+    @field_validator('cors_origins')
+    @classmethod
+    def parse_cors_origins(cls, v: Optional[str]) -> List[str]:
+        if v is None:
+            return ["http://localhost:5173", "http://localhost:3000"]
+        return [origin.strip() for origin in v.split(',')]
+    
+    @field_validator('vault_path', 'data_path')
+    @classmethod
+    def validate_paths(cls, v: str) -> str:
+        path = Path(v).expanduser().resolve()
+        if not path.exists():
+            path.mkdir(parents=True, exist_ok=True)
+        return str(path)
+    
+    # Rate Limiting
+    rate_limit_enabled: bool = True
+    rate_limit_per_day: int = 200
+    rate_limit_per_hour: int = 50
+    rate_limit_per_minute: int = 10
     
     # Environment
     environment: str = "development"
