@@ -1,0 +1,19 @@
+version: '3.8'
+
+services:
+  backend:
+    build: .
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./vault:/app/vault
+      - ./data:/app/data
+      - ./app:/app/app
+    environment:
+      - SERVER_HOST=0.0.0.0
+      - SERVER_PORT=8080
+      - VAULT_PATH=/app/vault
+      - DATA_PATH=/app/data
+      - EMBEDDING_MODEL=all-MiniLM-L6-v2
+      - ENVIRONMENT=development
+    restart: unless-stopped

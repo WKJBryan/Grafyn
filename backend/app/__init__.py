@@ -1,0 +1,1 @@
+"""Seedream Backend Application"""
