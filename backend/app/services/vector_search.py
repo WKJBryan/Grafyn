@@ -2,9 +2,10 @@
 import lancedb
 from typing import List, Optional
 from pydantic import BaseModel
+import pyarrow as pa
 
-from app.services.embedding import EmbeddingService
-from app.config import get_settings
+from backend.app.services.embedding import EmbeddingService
+from backend.app.config import get_settings
 
 settings = get_settings()
 
@@ -38,7 +39,13 @@ class VectorSearchService:
         
         # Create table if it doesn't exist
         if "notes" not in self._db.table_names():
-            schema = NoteEmbedding.to_arrow_schema()
+            # Define PyArrow schema for LanceDB
+            schema = pa.schema([
+                pa.field("note_id", pa.string()),
+                pa.field("title", pa.string()),
+                pa.field("text", pa.string()),
+                pa.field("vector", pa.list_(pa.float32(), 384)),  # 384 for all-MiniLM-L6-v2
+            ])
             self._table = self._db.create_table("notes", schema=schema)
         else:
             self._table = self._db.open_table("notes")
@@ -107,5 +114,11 @@ class VectorSearchService:
         """Clear all indexed notes"""
         # Drop and recreate table
         self._db.drop_table("notes")
-        schema = NoteEmbedding.to_arrow_schema()
+        # Define PyArrow schema for LanceDB
+        schema = pa.schema([
+            pa.field("note_id", pa.string()),
+            pa.field("title", pa.string()),
+            pa.field("text", pa.string()),
+            pa.field("vector", pa.list_(pa.float32(), 384)),  # 384 for all-MiniLM-L6-v2
+        ])
         self._table = self._db.create_table("notes", schema=schema)

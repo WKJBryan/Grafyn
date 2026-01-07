@@ -63,7 +63,7 @@ htmlcov/
 .lancedb/
 
 # Models
-models/
+/models/
 *.pkl
 *.pt
 *.pth

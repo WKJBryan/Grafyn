@@ -1,4 +1,4 @@
-# OrgAI Data Models - Backend
+# Seedream Data Models - Backend
 
 > **Part:** Backend | **Models:** 8 | **Scan Level:** Exhaustive
 
@@ -28,7 +28,7 @@ class Note(BaseModel):
 {
   "id": "Welcome",
   "title": "Welcome",
-  "content": "# Welcome to OrgAI\n\nThis is your knowledge base...",
+  "content": "# Welcome to Seedream\n\nThis is your knowledge base...",
   "frontmatter": {
     "title": "Welcome",
     "created": "2024-12-17T00:00:00",

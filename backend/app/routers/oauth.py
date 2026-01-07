@@ -1,8 +1,8 @@
 """OAuth API router for frontend authentication"""
 from fastapi import APIRouter, HTTPException
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from app.mcp.oauth import token_store
-from app.config import get_settings
+from backend.app.mcp.oauth import token_store
+from backend.app.config import get_settings
 import httpx
 import secrets
 from datetime import datetime, timezone, timedelta

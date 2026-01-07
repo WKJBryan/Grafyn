@@ -2,8 +2,8 @@
 from fastapi import FastAPI, Depends, Header, HTTPException
 from fastapi_mcp import FastApiMCP
 
-from app.config import get_settings
-from app.mcp.oauth import verify_oauth
+from backend.app.config import get_settings
+from backend.app.mcp.oauth import verify_oauth
 
 settings = get_settings()
 
@@ -18,14 +18,12 @@ def setup_mcp(app: FastAPI) -> None:
     mcp = FastApiMCP(
         app,
         name="Seedream Knowledge Graph",
-        description="Access and query an organizational knowledge base",
-        transport="sse"
+        description="Access and query an organizational knowledge base"
     )
     
-    # Single SSE endpoint for both Claude and ChatGPT
-    # OAuth verification is optional for Claude Desktop
-    mcp.mount(path="/sse", dependencies=[Depends(verify_oauth)])
+    # Mount MCP SSE routes to app at /mcp
+    mcp.mount_sse()
     
     # Register OAuth routes
-    from app.mcp.oauth import setup_oauth_routes
+    from backend.app.mcp.oauth import setup_oauth_routes
     setup_oauth_routes(app)

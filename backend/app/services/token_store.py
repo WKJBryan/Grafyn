@@ -109,7 +109,7 @@ class TokenStore:
                 try:
                     os.chmod(self.storage_path, 0o600)
                 except (OSError, AttributeError):
-                    pass
+                    logger.warning("Could not set restrictive permissions on token storage file")
                     
             except Exception as e:
                 logger.error(f"Failed to load tokens: {e}")
@@ -125,7 +125,7 @@ class TokenStore:
             try:
                 os.chmod(self.storage_path, 0o600)
             except (OSError, AttributeError):
-                pass
+                logger.warning("Could not set restrictive permissions on token storage file")
                 
         except Exception as e:
             logger.error(f"Failed to save tokens: {e}")

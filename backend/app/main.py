@@ -1,18 +1,18 @@
 """Main FastAPI application for Seedream"""
 from contextlib import asynccontextmanager
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pathlib import Path
 
-from app.config import get_settings
-from app.routers import notes, search, graph, oauth
-from app.mcp.server import setup_mcp
-from app.services.knowledge_store import KnowledgeStore
-from app.services.vector_search import VectorSearchService
-from app.services.graph_index import GraphIndexService
-from app.middleware.logging import LoggingMiddleware
-from app.middleware.security import SecurityHeadersMiddleware, RequestSanitizationMiddleware
-from app.middleware.rate_limit import limiter, init_limiter, rate_limit_handler
+from backend.app.config import get_settings
+from backend.app.routers import notes, search, graph, oauth
+from backend.app.mcp.server import setup_mcp
+from backend.app.services.knowledge_store import KnowledgeStore
+from backend.app.services.vector_search import VectorSearchService
+from backend.app.services.graph_index import GraphIndexService
+from backend.app.middleware.logging import LoggingMiddleware
+from backend.app.middleware.security import SecurityHeadersMiddleware, RequestSanitizationMiddleware
+from backend.app.middleware.rate_limit import limiter, init_limiter, rate_limit_handler
 from slowapi.errors import RateLimitExceeded
 
 # Get settings
@@ -98,7 +98,7 @@ async def root():
 # Health check endpoint
 @app.get("/health")
 @limiter.limit("30 per minute")
-async def health_check():
+async def health_check(request: Request):
     """Health check endpoint"""
     return {
         "status": "healthy",
@@ -120,7 +120,7 @@ setup_mcp(app)
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(
-        "app.main:app",
+        "backend.app.main:app",
         host=settings.server_host,
         port=settings.server_port,
         reload=settings.environment == "development"

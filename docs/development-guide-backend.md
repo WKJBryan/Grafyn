@@ -1,51 +1,47 @@
-# OrgAI Backend Development Guide
+# Seedream Backend Development Guide
 
-> **Part:** Backend | **Language:** Python 3.10+ | **Framework:** FastAPI
+> **Part:** Backend | **Language:** Python 3.11+ | **Framework:** FastAPI
 
 ## Prerequisites
 
 | Requirement | Version | Check Command |
 |-------------|---------|---------------|
-| Python | 3.10+ | `python --version` |
-| pip | Latest | `pip --version` |
+| Python | 3.11+ | `python --version` |
+| uv | Latest | `uv --version` |
 
 ---
 
 ## Quick Start
 
-### 1. Setup Virtual Environment
+### 1. Install Dependencies
+
+```bash
+# From project root
+uv sync
+```
+
+This installs all dependencies from `pyproject.toml`.
+
+### 2. Configure Environment
 
 ```bash
 cd backend
-python -m venv venv
-
-# Windows
-venv\Scripts\activate
-
-# Linux/Mac
-source venv/bin/activate
-```
-
-### 2. Install Dependencies
-
-```bash
-pip install -r requirements.txt
-```
-
-### 3. Configure Environment
-
-```bash
 cp .env.example .env
 # Edit .env if needed
 ```
 
-### 4. Run Development Server
+### 3. Run Development Server
 
 ```bash
-uvicorn app.main:app --reload --host 0.0.0.0 --port 8080
+# From project root
+uv run uvicorn backend.app.main:app --reload --host 0.0.0.0 --port 8080
+
+# Or from backend directory
+cd backend
+uv run uvicorn app.main:app --reload --host 0.0.0.0 --port 8080
 ```
 
-### 5. Verify
+### 4. Verify
 
 - **API Docs:** http://localhost:8080/docs
 - **Health Check:** http://localhost:8080/health
@@ -61,22 +57,38 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8080
 | `DATA_PATH` | `../data` | LanceDB storage |
 | `SERVER_HOST` | `0.0.0.0` | Bind address |
 | `SERVER_PORT` | `8080` | HTTP port |
+| `ENVIRONMENT` | `development` | Environment mode |
 | `EMBEDDING_MODEL` | `all-MiniLM-L6-v2` | Sentence transformer model |
+| `GITHUB_CLIENT_ID` | - | GitHub OAuth client ID |
+| `GITHUB_CLIENT_SECRET` | - | GitHub OAuth client secret |
+| `GITHUB_REDIRECT_URI` | - | OAuth redirect URI |
+| `RATE_LIMIT_ENABLED` | `true` | Enable rate limiting |
+| `RATE_LIMIT_PER_MINUTE` | `10` | Requests per minute |
+| `RATE_LIMIT_PER_HOUR` | `50` | Requests per hour |
+| `CORS_ORIGINS` | - | Comma-separated allowed origins |
 
 ---
 
 ## Dependencies
 
-```text
-fastapi>=0.104.0          # Web framework
-uvicorn[standard]>=0.24.0 # ASGI server
-python-dotenv>=1.0.0      # Environment loading
-pydantic>=2.5.0           # Data validation
-pydantic-settings>=2.1.0  # Settings management
-lancedb>=0.3.0            # Vector database
-sentence-transformers>=2.2.0  # Embeddings
-python-frontmatter>=1.0.0 # YAML frontmatter
-fastapi-mcp>=0.1.0        # MCP integration
+From `pyproject.toml`:
+
+```toml
+[project]
+requires-python = ">=3.11"
+dependencies = [
+    "aiofiles>=25.1.0",
+    "fastapi>=0.128.0",
+    "httpx>=0.28.1",
+    "lancedb>=0.26.0",
+    "pydantic>=2.12.5",
+    "pydantic-settings>=2.12.0",
+    "python-dotenv>=1.2.1",
+    "python-frontmatter>=1.1.0",
+    "python-multipart>=0.0.21",
+    "sentence-transformers>=5.2.0",
+    "uvicorn[standard]>=0.40.0",
+]
 ```
 
 ---
@@ -92,20 +104,27 @@ backend/
 │   ├── routers/          # API endpoints
 │   │   ├── notes.py
 │   │   ├── search.py
-│   │   └── graph.py
+│   │   ├── graph.py
+│   │   └── oauth.py
 │   ├── services/         # Business logic
 │   │   ├── knowledge_store.py
 │   │   ├── vector_search.py
 │   │   ├── graph_index.py
-│   │   └── embedding.py
+│   │   ├── embedding.py
+│   │   └── token_store.py
+│   ├── middleware/       # Request processing
+│   │   ├── security.py
+│   │   ├── logging.py
+│   │   └── rate_limit.py
 │   ├── models/           # Pydantic schemas
 │   │   └── note.py
 │   └── mcp/              # MCP integration
 │       ├── server.py
 │       └── tools.py
+├── Dockerfile
+├── docker-compose.yml
 ├── requirements.txt
-├── .env.example
-└── venv/
+└── .env.example
 ```
 
 ---
@@ -114,7 +133,7 @@ backend/
 
 ### Run with Auto-Reload
 ```bash
-uvicorn app.main:app --reload --host 0.0.0.0 --port 8080
+uv run uvicorn backend.app.main:app --reload --host 0.0.0.0 --port 8080
 ```
 
 ### Reindex All Notes
@@ -143,17 +162,18 @@ curl http://localhost:8080/api/notes/Welcome
 
 ## Service Architecture
 
-### Singleton Pattern
-All services use a lazy singleton pattern:
+### Lifespan Pattern
+Services are initialized during application startup:
 
 ```python
-_service: Optional[ServiceClass] = None
-
-def get_service() -> ServiceClass:
-    global _service
-    if _service is None:
-        _service = ServiceClass()
-    return _service
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Initialize services
+    app.state.knowledge_store = KnowledgeStore()
+    app.state.vector_search = VectorSearchService()
+    app.state.graph_index = GraphIndexService()
+    yield
+    # Cleanup on shutdown
 ```
 
 ### Service Dependencies
@@ -167,7 +187,9 @@ Config
    │       │
    │       └── VectorSearchService (LanceDB)
    │
-   └── GraphIndexService (in-memory, uses KnowledgeStore)
+   ├── GraphIndexService (in-memory, uses KnowledgeStore)
+   │
+   └── TokenStore (OAuth tokens)
 ```
 
 ---
@@ -214,14 +236,21 @@ def get_new_service() -> NewService:
 from app.services.new_service import get_new_service
 ```
 
-### Add a New Pydantic Model
+### Add New Middleware
 
+1. **Create Middleware** (`app/middleware/`)
 ```python
-# app/models/note.py
-class NewModel(BaseModel):
-    field1: str
-    field2: int = 0
-    optional_field: Optional[str] = None
+class NewMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        # Pre-processing
+        response = await call_next(request)
+        # Post-processing
+        return response
+```
+
+2. **Register in main.py**
+```python
+app.add_middleware(NewMiddleware)
 ```
 
 ---
@@ -252,10 +281,30 @@ print(f"Dimension: {len(vector)}")  # Should be 384
 
 ---
 
+## Docker
+
+### Build and Run
+```bash
+cd backend
+docker-compose up --build
+```
+
+### Dockerfile
+```dockerfile
+FROM python:3.11-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install -r requirements.txt
+COPY . .
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080"]
+```
+
+---
+
 ## Common Issues
 
 ### "Module not found: app"
-**Solution:** Ensure you're running from `backend/` directory with venv activated.
+**Solution:** Ensure you're running from correct directory with uv.
 
 ### "LanceDB table doesn't exist"
 **Solution:** Run reindex: `POST /api/notes/reindex`
@@ -271,5 +320,11 @@ model = SentenceTransformer("all-MiniLM-L6-v2")
 ### "Port already in use"
 **Solution:** Kill existing process or use different port:
 ```bash
-uvicorn app.main:app --port 8081
+uv run uvicorn app.main:app --port 8081
+```
+
+### "Rate limit exceeded"
+**Solution:** Wait or disable rate limiting:
+```env
+RATE_LIMIT_ENABLED=false
 ```

@@ -2,7 +2,7 @@
 from sentence_transformers import SentenceTransformer
 from typing import List
 
-from app.config import get_settings
+from backend.app.config import get_settings
 
 settings = get_settings()
 

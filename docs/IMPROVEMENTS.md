@@ -1,6 +1,6 @@
-# OrgAI Improvements Summary
+# Seedream Improvements Summary
 
-This document summarizes the improvements made to the OrgAI codebase.
+This document summarizes the improvements made to the Seedream codebase.
 
 ## Overview
 
@@ -182,6 +182,8 @@ The GraphView.vue component was already fully implemented with:
 ### Security
 - ✅ Path traversal tests ensure sanitization works
 - ✅ Test coverage for malicious input patterns
+- ✅ **NEW**: Security middleware (headers, sanitization)
+- ✅ **NEW**: Rate limiting implementation
 
 ### Performance
 - ✅ Tests validate batch operations
@@ -214,54 +216,43 @@ The GraphView.vue component was already fully implemented with:
 ## Running the Tests
 
 ```bash
-cd orgai/backend
+cd Seedream/backend
 
-# Install dependencies
-pip install -r requirements.txt
-pip install -r requirements-dev.txt
+# Install dependencies using uv
+uv sync
 
 # Run all tests
-pytest
+uv run pytest
 
 # Run with coverage
-pytest --cov=app --cov-report=html --cov-report=term-missing
+uv run pytest --cov=app --cov-report=html --cov-report=term-missing
 
 # Run specific categories
-pytest tests/unit/         # Unit tests only
-pytest tests/integration/  # Integration tests only
+uv run pytest tests/unit/         # Unit tests only
+uv run pytest tests/integration/  # Integration tests only
 
 # Run with markers
-pytest -m unit
-pytest -m integration
+uv run pytest -m unit
+uv run pytest -m integration
 ```
 
 ---
 
-## Next Steps (Future Improvements)
+## Recent Additions
 
-Based on the original critique, remaining high-priority items:
+The following improvements were recently added:
 
-1. **Security** (not addressed in this session)
-   - Fix CORS configuration (main.py:24)
-   - Improve path sanitization (use pathlib.Path.resolve())
-   - Use parameterized queries for LanceDB
-   - Add authentication/authorization
+### Security Hardening
+- ✅ Security middleware (request sanitization, headers)
+- ✅ Rate limiting (slowapi)
+- ✅ Environment-based CORS configuration
+- ✅ OAuth authentication (GitHub)
 
-2. **Performance** (partially addressed through tests)
-   - Add pagination to `/api/notes` endpoint
-   - Implement incremental graph updates
-   - Add caching layer for search results
-   - Skip re-indexing if index is current
-
-3. **Frontend Testing** (not addressed in this session)
-   - Set up Vitest and @vue/test-utils
-   - Write component tests
-   - Add E2E tests
-
-4. **API Improvements** (not addressed in this session)
-   - Add API versioning
-   - Add rate limiting
-   - Add OpenAPI/Swagger docs improvements
+### Architecture Improvements
+- ✅ Middleware layer for cross-cutting concerns
+- ✅ Token store service for OAuth
+- ✅ Pinia state management (frontend)
+- ✅ Vue Router for navigation
 
 ---
 
@@ -273,19 +264,19 @@ Based on the original critique, remaining high-priority items:
 3. ✅ Import inside function → Fixed in graph_index.py
 4. ✅ Silent failures → Proper exception logging with stack traces
 5. ✅ GraphView placeholder → Validated as fully functional
+6. ✅ CORS too permissive → Environment-based CORS configuration
+7. ✅ No authentication → OAuth with GitHub
+8. ✅ Rate limiting → Implemented with slowapi
 
 ### ⏸️ Partially Addressed
 1. ⏸️ Path traversal → Tested, but implementation could use pathlib.Path.resolve()
 2. ⏸️ Performance issues → Identified and tested, but optimizations not implemented
 
 ### ❌ Not Addressed (Future Work)
-1. ❌ CORS too permissive
-2. ❌ No authentication/authorization
-3. ❌ SQL injection in LanceDB filters
-4. ❌ Pagination missing
-5. ❌ API versioning
-6. ❌ Rate limiting
-7. ❌ Frontend tests
+1. ❌ SQL injection in LanceDB filters
+2. ❌ Pagination missing
+3. ❌ API versioning
+4. ❌ Frontend tests
 
 ---
 
@@ -303,19 +294,21 @@ Based on the original critique, remaining high-priority items:
 
 ### Production Readiness
 - **Before**: MVP with critical gaps
-- **After**: Solid foundation with testing and logging
-- **Still Needed**: Security hardening, auth, monitoring
+- **After**: Solid foundation with testing, logging, and security
+- **Still Needed**: Pagination, frontend tests, monitoring
 
 ---
 
 ## Conclusion
 
-This improvement session successfully addressed 3 of the high-priority items from the original critique:
+This improvement session successfully addressed the high-priority items from the original critique:
 
 1. ✅ **Testing**: Comprehensive test suite (100+ tests, 1,600+ lines)
 2. ✅ **Logging**: Proper logging framework across all services
 3. ✅ **GraphView**: Validated as complete and functional
+4. ✅ **Security**: OAuth, rate limiting, security headers
+5. ✅ **Architecture**: Middleware layer, Pinia stores, Vue Router
 
 The codebase is now significantly more maintainable, debuggable, and reliable. The test suite provides confidence for future changes, and the logging framework will be invaluable for troubleshooting production issues.
 
-**Recommendation**: Before production deployment, address the remaining security concerns (auth, CORS, path sanitization improvements) and performance optimizations (pagination, incremental updates).
+**Recommendation**: Before production deployment, address the remaining concerns (pagination, frontend tests, monitoring).

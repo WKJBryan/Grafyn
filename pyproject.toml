@@ -6,7 +6,9 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "aiofiles>=25.1.0",
+    "cryptography>=41.0.0",
     "fastapi>=0.128.0",
+    "fastapi-mcp>=0.1.5",
     "httpx>=0.28.1",
     "lancedb>=0.26.0",
     "marked>=0.9.1",
@@ -16,5 +18,6 @@ dependencies = [
     "python-frontmatter>=1.1.0",
     "python-multipart>=0.0.21",
     "sentence-transformers>=5.2.0",
+    "slowapi>=0.1.9",
     "uvicorn[standard]>=0.40.0",
 ]

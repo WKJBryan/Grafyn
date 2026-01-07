@@ -61,6 +61,7 @@ export const graph = {
     api.get(`/graph/neighbors/${encodeURIComponent(id)}`, { params: { depth } }),
   unlinkedMentions: (id) => api.get(`/graph/unlinked-mentions/${encodeURIComponent(id)}`),
   rebuild: () => api.post('/graph/rebuild'),
+  full: () => api.get('/graph/full'),
 }
 
 // OAuth API

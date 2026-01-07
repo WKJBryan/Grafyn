@@ -6,8 +6,8 @@ from pathlib import Path
 from typing import List, Optional
 from datetime import datetime, timezone
 
-from app.models.note import Note, NoteCreate, NoteUpdate, NoteListItem, NoteFrontmatter
-from app.config import get_settings
+from backend.app.models.note import Note, NoteCreate, NoteUpdate, NoteListItem, NoteFrontmatter
+from backend.app.config import get_settings
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
