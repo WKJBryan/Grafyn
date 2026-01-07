@@ -1,40 +1,46 @@
 """Search API router for semantic and lexical search"""
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Query, Request, HTTPException
 from typing import List
-from app.models.note import SearchResult
-from app.services.vector_search import VectorSearchService
+from backend.app.models.note import SearchResult
+from backend.app.services.vector_search import VectorSearchService
+from backend.app.services.knowledge_store import KnowledgeStore
 
 router = APIRouter()
 
-# Initialize vector search service (will be properly initialized in app startup)
-vector_search = None
+
+def get_vector_search(request: Request) -> VectorSearchService:
+    """Get vector search service from app state"""
+    return request.app.state.vector_search
+
+
+def get_knowledge_store(request: Request) -> KnowledgeStore:
+    """Get knowledge store from app state"""
+    return request.app.state.knowledge_store
 
 
 @router.get("", response_model=List[SearchResult])
 async def search_notes(
+    request: Request,
     q: str = Query(..., min_length=1, max_length=500, description="Search query"),
     limit: int = Query(10, ge=1, le=50, description="Maximum number of results"),
     semantic: bool = Query(True, description="Use semantic vector search")
 ):
     """
     Search notes by query
-    
+
     - **q**: Search query string (required)
     - **limit**: Maximum number of results (1-50, default: 10)
     - **semantic**: Use semantic vector search (default: true)
     """
-    global vector_search
-    if vector_search is None:
-        vector_search = VectorSearchService()
-    
+    vector_search = get_vector_search(request)
+
     if semantic:
         return vector_search.search(q, limit)
     else:
         # Lexical search fallback
-        from app.services.knowledge_store import KnowledgeStore
-        knowledge_store = KnowledgeStore()
+        knowledge_store = get_knowledge_store(request)
         notes = knowledge_store.list_notes()
-        
+
         # Simple text matching
         results = []
         query_lower = q.lower()
@@ -53,26 +59,22 @@ async def search_notes(
 @router.get("/similar/{note_id}", response_model=List[SearchResult])
 async def find_similar_notes(
     note_id: str,
+    request: Request,
     limit: int = Query(5, ge=1, le=20, description="Maximum number of results")
 ):
     """
     Find notes similar to a given note
-    
+
     - **note_id**: ID of the reference note
     - **limit**: Maximum number of results (1-20, default: 5)
     """
-    global vector_search
-    if vector_search is None:
-        vector_search = VectorSearchService()
-    
-    from app.services.knowledge_store import KnowledgeStore
-    knowledge_store = KnowledgeStore()
+    vector_search = get_vector_search(request)
+    knowledge_store = get_knowledge_store(request)
+
     note = knowledge_store.get_note(note_id)
-    
     if note is None:
-        from fastapi import HTTPException
         raise HTTPException(status_code=404, detail="Note not found")
-    
+
     # Search using note title and content
     query = f"{note.title}\n\n{note.content[:500]}"
     return vector_search.search(query, limit)

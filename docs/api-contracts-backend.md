@@ -1,13 +1,13 @@
-# OrgAI API Contracts - Backend
+# Seedream API Contracts - Backend
 
-> **Part:** Backend | **Endpoints:** 14 | **Scan Level:** Exhaustive
+> **Part:** Backend | **Endpoints:** 15+ | **Scan Level:** Exhaustive
 
 ## Base URL
 
 - **Development:** `http://localhost:8080`
 - **API Prefix:** `/api/`
 - **OpenAPI Docs:** `/docs`
-- **MCP Endpoint:** `/mcp`
+- **MCP Endpoint:** `/sse`
 
 ---
 
@@ -46,7 +46,7 @@ Get a specific note by ID.
 {
   "id": "Welcome",
   "title": "Welcome",
-  "content": "# Welcome to OrgAI\n\nThis is your knowledge base...",
+  "content": "# Welcome to Seedream\n\nThis is your knowledge base...",
   "frontmatter": {
     "title": "Welcome",
     "created": "2024-12-17T00:00:00",
@@ -254,16 +254,39 @@ Rebuild the entire link graph index.
 
 ---
 
+## OAuth API (`/api/oauth`)
+
+### GET /api/oauth/github
+Initiate GitHub OAuth flow.
+
+**Response:** Redirect to GitHub authorization page
+
+---
+
+### GET /api/oauth/callback
+Handle OAuth callback from GitHub.
+
+**Query Parameters:**
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `code` | string | Authorization code from GitHub |
+| `state` | string | CSRF protection state |
+
+**Response:** Redirect with access token
+
+---
+
 ## System Endpoints
 
 ### GET /health
-Health check endpoint.
+Health check endpoint. Rate limited to 30/minute.
 
 **Response:** `200 OK`
 ```json
 {
   "status": "healthy",
-  "service": "orgai"
+  "service": "seedream",
+  "environment": "development"
 }
 ```
 
@@ -275,11 +298,12 @@ Root endpoint with API info.
 **Response:** `200 OK`
 ```json
 {
-  "name": "OrgAI Knowledge Graph",
+  "name": "Seedream Knowledge Graph",
   "version": "0.1.0",
   "vault_path": "/path/to/vault",
   "docs": "/docs",
-  "mcp": "/mcp"
+  "mcp": "/sse",
+  "oauth": "/auth"
 }
 ```
 
@@ -299,22 +323,60 @@ All endpoints may return these error formats:
 | Status Code | Meaning |
 |-------------|---------|
 | 400 | Bad Request - Invalid parameters |
+| 401 | Unauthorized - Authentication required |
 | 404 | Not Found - Resource doesn't exist |
 | 409 | Conflict - Resource already exists |
+| 429 | Too Many Requests - Rate limit exceeded |
 | 500 | Internal Server Error |
+
+---
+
+## Rate Limiting
+
+Rate limiting is enforced via `slowapi`:
+
+**Default Limits:**
+- 10 requests per minute
+- 50 requests per hour
+- 200 requests per day
+
+**Rate Limit Headers:**
+```
+X-RateLimit-Limit: 10
+X-RateLimit-Remaining: 9
+X-RateLimit-Reset: 1704067200
+```
+
+**Rate Limit Exceeded Response:**
+```json
+{
+  "detail": "Rate limit exceeded. Please try again later."
+}
+```
 
 ---
 
 ## CORS Configuration
 
 ```python
+# Development
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # All origins in development
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Production
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_origins,  # Specific origins only
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "PUT", "DELETE"],
+    allow_headers=["Content-Type", "Authorization"],
+    max_age=3600
+)
 ```
 
-**Note:** In production, restrict `allow_origins` to specific domains.
+**Note:** CORS configuration differs between development and production environments.

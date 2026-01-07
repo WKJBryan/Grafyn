@@ -1,4 +1,4 @@
-# OrgAI Frontend Architecture
+# Seedream Frontend Architecture
 
 > **Part:** Frontend | **Type:** Vue 3 SPA | **Scan Level:** Exhaustive
 
@@ -9,6 +9,7 @@ The frontend is a Vue 3 Single Page Application providing:
 - Markdown editing with preview
 - Semantic search with typeahead
 - Backlink visualization
+- Authentication (GitHub OAuth)
 - Clean dark theme design system
 
 ## Entry Point
@@ -17,48 +18,53 @@ The frontend is a Vue 3 Single Page Application providing:
 
 ```javascript
 import { createApp } from 'vue'
+import { createPinia } from 'pinia'
 import App from './App.vue'
+import router from './router'
 import './style.css'
 
-createApp(App).mount('#app')
+const app = createApp(App)
+
+app.use(createPinia())
+app.use(router)
+
+app.mount('#app')
 ```
 
 ## Architecture
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
-│                            App.vue (Root)                             │
-│  ┌────────────┐  ┌─────────────────────┐  ┌────────────────────────┐ │
-│  │  Header    │  │    Main Content     │  │     Right Panel        │ │
-│  │            │  │                     │  │                        │ │
-│  │ SearchBar  │  │ ┌─────────────────┐ │  │ ┌────────────────────┐ │ │
-│  │            │  │ │    Sidebar      │ │  │ │  BacklinksPanel    │ │ │
-│  │            │  │ │   (NoteList)    │ │  │ │                    │ │ │
-│  │            │  │ └─────────────────┘ │  │ └────────────────────┘ │ │
-│  │            │  │                     │  │                        │ │
-│  │            │  │ ┌─────────────────┐ │  │                        │ │
-│  │            │  │ │   NoteEditor    │ │  │                        │ │
-│  │            │  │ │   or Empty      │ │  │                        │ │
-│  │            │  │ │   State         │ │  │                        │ │
-│  │            │  │ └─────────────────┘ │  │                        │ │
-│  └────────────┘  └─────────────────────┘  └────────────────────────┘ │
+│                         App.vue (Root)                                │
+│                    ┌────────────────────┐                             │
+│                    │   <router-view />  │                             │
+│                    └────────────────────┘                             │
 └──────────────────────────────────────────────────────────────────────┘
+                              │
+         ┌────────────────────┼────────────────────┐
+         ▼                    ▼                    ▼
+┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐
+│   HomeView      │  │   LoginView     │  │ OAuthCallback   │
+│                 │  │                 │  │     View        │
+│  ┌───────────┐  │  │  Login form     │  │  OAuth handler  │
+│  │ SearchBar │  │  │  GitHub OAuth   │  │                 │
+│  ├───────────┤  │  │                 │  │                 │
+│  │ NoteList  │  │  └─────────────────┘  └─────────────────┘
+│  ├───────────┤  │
+│  │NoteEditor │  │          ┌─────────────────────────────┐
+│  ├───────────┤  │          │         Pinia Stores        │
+│  │Backlinks  │  │          │  ┌─────────┐ ┌───────────┐  │
+│  │  Panel    │  │◄─────────│  │ auth.js │ │ notes.js  │  │
+│  └───────────┘  │          │  └─────────┘ └───────────┘  │
+└─────────────────┘          └─────────────────────────────┘
 ```
 
-## Components (6 Total)
+## Views (4 Total)
 
-### 1. App.vue (Root Component)
-**File:** `src/App.vue`
+### 1. HomeView.vue
+**File:** `src/views/HomeView.vue`
 
-**Purpose:** Root layout with header, sidebar, editor, and backlinks panel.
-
-**State:**
-```javascript
-const notes = ref([])           // All notes list
-const selectedNoteId = ref(null) // Currently selected
-const selectedNote = ref(null)   // Full note object
-const indexing = ref(false)      // Reindex in progress
-```
+**Purpose:** Main application view with note management.
 
 **Layout:**
 - **Header:** Logo, SearchBar, action buttons
@@ -68,7 +74,74 @@ const indexing = ref(false)      // Reindex in progress
 
 ---
 
-### 2. SearchBar.vue
+### 2. LoginView.vue
+**File:** `src/views/LoginView.vue`
+
+**Purpose:** Authentication page with GitHub OAuth.
+
+---
+
+### 3. OAuthCallbackView.vue
+**File:** `src/views/OAuthCallbackView.vue`
+
+**Purpose:** Handles OAuth callback from GitHub, exchanges code for token.
+
+---
+
+### 4. NotFoundView.vue
+**File:** `src/views/NotFoundView.vue`
+
+**Purpose:** 404 page for unmatched routes.
+
+---
+
+## Pinia Stores (2 Stores)
+
+### auth.js
+**File:** `src/stores/auth.js`
+
+**State:**
+```javascript
+{
+  user: null,              // Current user data
+  token: null,             // OAuth access token
+  isAuthenticated: false,  // Auth status
+}
+```
+
+**Actions:**
+- `login()` - Initiate OAuth flow
+- `handleCallback(code)` - Exchange code for token
+- `logout()` - Clear auth state
+- `checkAuth()` - Verify token validity
+
+---
+
+### notes.js
+**File:** `src/stores/notes.js`
+
+**State:**
+```javascript
+{
+  notes: [],               // All notes list
+  selectedNoteId: null,    // Currently selected
+  selectedNote: null,      // Full note object
+  loading: false,          // Loading state
+}
+```
+
+**Actions:**
+- `loadNotes()` - Fetch all notes
+- `selectNote(id)` - Load and display a note
+- `createNote(data)` - Create new note
+- `updateNote(id, data)` - Update existing note
+- `deleteNote(id)` - Delete note
+
+---
+
+## Components (5 Total)
+
+### 1. SearchBar.vue
 **File:** `src/components/SearchBar.vue`
 
 **Purpose:** Semantic search with debounced typeahead dropdown.
@@ -87,7 +160,7 @@ const indexing = ref(false)      // Reindex in progress
 
 ---
 
-### 3. NoteList.vue
+### 2. NoteList.vue
 **File:** `src/components/NoteList.vue`
 
 **Purpose:** Sidebar listing of all notes with status and tags.
@@ -98,15 +171,9 @@ const indexing = ref(false)      // Reindex in progress
 | `notes` | Array | List of NoteListItem objects |
 | `selected` | String | Currently selected note ID |
 
-**Features:**
-- Shows note title, status badge, link count
-- Up to 3 tags displayed
-- Selected note highlighted with accent border
-- Hover states
-
 ---
 
-### 4. NoteEditor.vue
+### 3. NoteEditor.vue
 **File:** `src/components/NoteEditor.vue`
 
 **Purpose:** Markdown editor with preview mode.
@@ -115,53 +182,43 @@ const indexing = ref(false)      // Reindex in progress
 - Edit/Preview toggle
 - Title editing
 - Markdown content textarea
-- Wikilink rendering in preview (styled `<span>` elements)
+- Wikilink rendering in preview
 - Save button (enabled when dirty)
 - Delete button
 
-**Wikilink Rendering:**
-```javascript
-html = html.replace(
-  /\[\[([^\]|]+)(?:\|([^\]]+))?\]\]/g,
-  (match, target, display) => {
-    const text = display || target
-    return `<span class="wikilink" data-target="${target}">${text}</span>`
-  }
-)
-```
-
-**Events:**
-| Event | Payload | Description |
-|-------|---------|-------------|
-| `save` | `(id, data)` | Save note changes |
-| `delete` | `id` | Delete note |
-
 ---
 
-### 5. BacklinksPanel.vue
+### 4. BacklinksPanel.vue
 **File:** `src/components/BacklinksPanel.vue`
 
 **Purpose:** Right panel showing notes that link to current note.
 
 **Props:**
-| Prop | Type | Description |
-|------|------|-------------|
-| `noteId` | String | Current note ID |
-
-**Features:**
-- Loads backlinks via `/api/graph/backlinks/{id}`
-- Shows source title and context snippet
-- Click to navigate to linking note
-- Loading state
+| Prop | Type | Required | Description |
+|------|------|----------|-------------|
+| `noteId` | String | ✅ | Current note to find backlinks for |
 
 ---
 
-### 6. GraphView.vue (Placeholder)
+### 5. GraphView.vue
 **File:** `src/components/GraphView.vue`
 
-**Purpose:** Placeholder for Phase 2 graph visualization.
+**Purpose:** Graph visualization of note connections.
 
-**Status:** Not yet implemented - shows "Coming in Phase 2" message.
+---
+
+## Vue Router
+
+**File:** `src/router/index.js`
+
+```javascript
+const routes = [
+  { path: '/', component: HomeView },
+  { path: '/login', component: LoginView },
+  { path: '/oauth/callback', component: OAuthCallbackView },
+  { path: '/:pathMatch(.*)*', component: NotFoundView },
+]
+```
 
 ---
 
@@ -195,6 +252,12 @@ export const graph = {
     neighbors: (id, depth = 1) => ...,
     unlinkedMentions: (id) => ...,
     rebuild: () => ...,
+}
+
+// Auth API
+export const auth = {
+    getGithubUrl: () => ...,
+    callback: (code) => ...,
 }
 ```
 
@@ -239,14 +302,6 @@ export const graph = {
 | `.card` | Card containers |
 | `.card-hover` | Hoverable cards |
 
-### Status Colors
-
-| Status | Background | Text |
-|--------|------------|------|
-| `canonical` | `rgba(52, 211, 153, 0.15)` | Green |
-| `draft` | `rgba(251, 191, 36, 0.15)` | Yellow |
-| `evidence` | `rgba(124, 92, 255, 0.15)` | Purple |
-
 ---
 
 ## Build Configuration
@@ -263,7 +318,11 @@ export default defineConfig({
                 target: 'http://localhost:8080',
                 changeOrigin: true,
             },
-            '/mcp': {
+            '/sse': {
+                target: 'http://localhost:8080',
+                changeOrigin: true,
+            },
+            '/auth': {
                 target: 'http://localhost:8080',
                 changeOrigin: true,
             },
@@ -279,8 +338,8 @@ export default defineConfig({
 | Package | Version | Purpose |
 |---------|---------|---------|
 | vue | ^3.4.0 | UI framework |
-| vue-router | ^4.2.0 | SPA routing (ready for use) |
-| axios | ^1.6.0 | HTTP client |
+| pinia | Latest | State management |
+| vue-router | ^4.2.0 | SPA routing |
 | marked | ^11.0.0 | Markdown rendering |
 | @vitejs/plugin-vue | ^4.5.0 | Vue SFC support |
 | vite | ^5.0.0 | Build tool |
@@ -298,12 +357,22 @@ frontend/
     ├── main.js             # Vue app bootstrap
     ├── App.vue             # Root component
     ├── style.css           # Design system
+    ├── router/
+    │   └── index.js        # Route definitions
+    ├── stores/
+    │   ├── auth.js         # Auth state
+    │   └── notes.js        # Notes state
+    ├── views/
+    │   ├── HomeView.vue    # Main app
+    │   ├── LoginView.vue   # Login page
+    │   ├── OAuthCallbackView.vue  # OAuth handler
+    │   └── NotFoundView.vue  # 404 page
     ├── api/
     │   └── client.js       # Backend API client
     └── components/
-        ├── SearchBar.vue   # Semantic search
-        ├── NoteList.vue    # Sidebar listing
-        ├── NoteEditor.vue  # Markdown editor
-        ├── BacklinksPanel.vue  # Backlinks panel
-        └── GraphView.vue   # Graph (placeholder)
+        ├── SearchBar.vue
+        ├── NoteList.vue
+        ├── NoteEditor.vue
+        ├── BacklinksPanel.vue
+        └── GraphView.vue
 ```

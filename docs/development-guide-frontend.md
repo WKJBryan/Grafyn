@@ -1,4 +1,4 @@
-# OrgAI Frontend Development Guide
+# Seedream Frontend Development Guide
 
 > **Part:** Frontend | **Framework:** Vue 3 | **Build Tool:** Vite
 
@@ -41,9 +41,19 @@ frontend/
 ├── package.json          # Dependencies
 ├── vite.config.js        # Vite config (proxy)
 └── src/
-    ├── main.js           # Vue app bootstrap
-    ├── App.vue           # Root component
+    ├── main.js           # Vue app bootstrap with Pinia & Router
+    ├── App.vue           # Root component (router-view)
     ├── style.css         # Design system
+    ├── router/
+    │   └── index.js      # Route definitions
+    ├── stores/
+    │   ├── auth.js       # Authentication state
+    │   └── notes.js      # Notes state
+    ├── views/
+    │   ├── HomeView.vue
+    │   ├── LoginView.vue
+    │   ├── OAuthCallbackView.vue
+    │   └── NotFoundView.vue
     ├── api/
     │   └── client.js     # Backend API client
     └── components/
@@ -63,6 +73,8 @@ frontend/
 | `npm run dev` | Start Vite dev server with HMR |
 | `npm run build` | Build for production |
 | `npm run preview` | Preview production build |
+| `npm run lint` | Run ESLint |
+| `npm run format` | Format with Prettier |
 
 ---
 
@@ -72,13 +84,15 @@ frontend/
 {
     "dependencies": {
         "vue": "^3.4.0",
+        "pinia": "^2.1.0",
         "vue-router": "^4.2.0",
-        "axios": "^1.6.0",
         "marked": "^11.0.0"
     },
     "devDependencies": {
         "@vitejs/plugin-vue": "^4.5.0",
-        "vite": "^5.0.0"
+        "vite": "^5.0.0",
+        "eslint": "^8.0.0",
+        "prettier": "^3.0.0"
     }
 }
 ```
@@ -100,12 +114,106 @@ export default defineConfig({
                 target: 'http://localhost:8080',
                 changeOrigin: true,
             },
-            '/mcp': {
+            '/sse': {
+                target: 'http://localhost:8080',
+                changeOrigin: true,
+            },
+            '/auth': {
                 target: 'http://localhost:8080',
                 changeOrigin: true,
             },
         },
     },
+})
+```
+
+---
+
+## State Management with Pinia
+
+### Using Stores
+
+```javascript
+import { useNotesStore } from '@/stores/notes'
+import { useAuthStore } from '@/stores/auth'
+
+// In setup()
+const notesStore = useNotesStore()
+const authStore = useAuthStore()
+
+// Access state
+console.log(notesStore.notes)
+console.log(authStore.isAuthenticated)
+
+// Call actions
+await notesStore.loadNotes()
+await authStore.login()
+```
+
+### Creating a New Store
+
+```javascript
+// stores/newStore.js
+import { defineStore } from 'pinia'
+
+export const useNewStore = defineStore('new', {
+  state: () => ({
+    items: [],
+    loading: false,
+  }),
+  
+  getters: {
+    itemCount: (state) => state.items.length,
+  },
+  
+  actions: {
+    async loadItems() {
+      this.loading = true
+      try {
+        this.items = await api.getItems()
+      } finally {
+        this.loading = false
+      }
+    },
+  },
+})
+```
+
+---
+
+## Vue Router
+
+### Route Configuration
+
+```javascript
+// router/index.js
+import { createRouter, createWebHistory } from 'vue-router'
+import HomeView from '@/views/HomeView.vue'
+import LoginView from '@/views/LoginView.vue'
+
+const routes = [
+  { path: '/', name: 'home', component: HomeView },
+  { path: '/login', name: 'login', component: LoginView },
+  { path: '/oauth/callback', component: OAuthCallbackView },
+  { path: '/:pathMatch(.*)*', component: NotFoundView },
+]
+
+export default createRouter({
+  history: createWebHistory(),
+  routes,
+})
+```
+
+### Navigation Guards
+
+```javascript
+router.beforeEach((to, from, next) => {
+  const auth = useAuthStore()
+  if (to.meta.requiresAuth && !auth.isAuthenticated) {
+    next('/login')
+  } else {
+    next()
+  }
 })
 ```
 
@@ -124,16 +232,13 @@ export default defineConfig({
   </div>
 </template>
 
-<script>
-export default {
-  name: 'NewComponent',
-  props: {
-    title: {
-      type: String,
-      required: true,
-    },
+<script setup>
+defineProps({
+  title: {
+    type: String,
+    required: true,
   },
-}
+})
 </script>
 
 <style scoped>
@@ -147,12 +252,8 @@ export default {
 
 2. **Import and use**
 ```vue
-<script>
-import NewComponent from './components/NewComponent.vue'
-
-export default {
-  components: { NewComponent },
-}
+<script setup>
+import NewComponent from '@/components/NewComponent.vue'
 </script>
 
 <template>
@@ -166,7 +267,7 @@ export default {
 
 ### Import Functions
 ```javascript
-import { notes, search, graph } from './api/client.js'
+import { notes, search, graph, auth } from '@/api/client'
 ```
 
 ### Examples
@@ -198,6 +299,9 @@ await notes.update('New_Note', {
 
 // Delete note
 await notes.delete('New_Note')
+
+// Auth
+const authUrl = await auth.getGithubUrl()
 ```
 
 ---
@@ -241,48 +345,51 @@ All styling uses CSS custom properties from `src/style.css`:
 ```javascript
 import { ref, computed, onMounted, watch } from 'vue'
 
-setup() {
-    // Reactive references
-    const items = ref([])
-    const loading = ref(false)
-    
-    // Computed properties
-    const itemCount = computed(() => items.value.length)
-    
-    // Lifecycle
-    onMounted(async () => {
-        await loadItems()
-    })
-    
-    // Watchers
-    watch(() => props.id, async (newId) => {
-        await loadItem(newId)
-    })
-    
-    return { items, loading, itemCount }
-}
+const items = ref([])
+const loading = ref(false)
+
+// Computed properties
+const itemCount = computed(() => items.value.length)
+
+// Lifecycle
+onMounted(async () => {
+    await loadItems()
+})
+
+// Watchers
+watch(() => props.id, async (newId) => {
+    await loadItem(newId)
+})
 ```
 
-### Emitting Events
+### Using Stores in Components
 ```javascript
-setup(props, { emit }) {
-    function handleClick(id) {
-        emit('select', id)
-    }
-    return { handleClick }
-}
+import { storeToRefs } from 'pinia'
+import { useNotesStore } from '@/stores/notes'
+
+const store = useNotesStore()
+
+// Destructure reactive state
+const { notes, selectedNote, loading } = storeToRefs(store)
+
+// Call actions directly
+await store.loadNotes()
 ```
 
 ---
 
 ## Common Tasks
 
-### Add a New Route (when routing is enabled)
+### Add a New View
+
+1. Create view in `src/views/NewView.vue`
+2. Add route in `src/router/index.js`:
 ```javascript
-// router.js
+import NewView from '@/views/NewView.vue'
+
 const routes = [
-    { path: '/', component: Home },
-    { path: '/note/:id', component: NoteView },
+  // ...
+  { path: '/new', name: 'new', component: NewView },
 ]
 ```
 
@@ -302,7 +409,8 @@ export const newApi = {
 ### Vue DevTools
 Install the [Vue DevTools](https://devtools.vuejs.org/) browser extension for:
 - Component tree inspection
-- Reactive state tracking
+- Pinia store state tracking
+- Router debugging
 - Event monitoring
 
 ### Console Logging
@@ -344,9 +452,13 @@ Configure the server to redirect all routes to `index.html` for SPA routing.
 **Cause:** Missing CSS variable  
 **Solution:** Check `style.css` for variable definition
 
-### Component not reactive
-**Cause:** Missing `.value` on refs  
-**Solution:** Access refs with `.value` in script, not in template
+### Store state not updating
+**Cause:** Missing `storeToRefs` for reactive access  
+**Solution:** Use `storeToRefs(store)` for reactive destructuring
+
+### Route not found
+**Cause:** Missing route definition  
+**Solution:** Add route to `router/index.js`
 
 ### Hot reload not working
 **Solution:** Restart Vite dev server

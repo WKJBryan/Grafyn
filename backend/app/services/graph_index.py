@@ -2,7 +2,7 @@
 from typing import List, Dict, Set, Optional
 from collections import deque
 
-from app.services.knowledge_store import KnowledgeStore
+from backend.app.services.knowledge_store import KnowledgeStore
 
 
 class GraphIndexService:
@@ -158,3 +158,36 @@ class GraphIndexService:
             if linked_id not in self._incoming:
                 self._incoming[linked_id] = set()
             self._incoming[linked_id].add(note_id)
+
+    def get_full_graph(self) -> Dict:
+        """Get the complete graph structure (nodes and edges)"""
+        nodes = []
+        edges = []
+        
+        # Get all involved notes (both source and target)
+        all_ids = set(self._outgoing.keys())
+        for targets in self._outgoing.values():
+            all_ids.update(targets)
+            
+        # Create node list
+        for note_id in all_ids:
+            note = self._knowledge_store.get_note(note_id)
+            title = note.title if note else note_id
+            nodes.append({
+                "id": note_id,
+                "label": title,
+                "val": len(self._incoming.get(note_id, set())) + 1  # Size based on backlinks
+            })
+            
+        # Create edge list
+        for source, targets in self._outgoing.items():
+            for target in targets:
+                edges.append({
+                    "source": source,
+                    "target": target
+                })
+                
+        return {
+            "nodes": nodes,
+            "links": edges
+        }

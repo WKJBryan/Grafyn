@@ -8,20 +8,32 @@
     "build": "vite build",
     "preview": "vite preview",
     "lint": "eslint . --ext .vue,.js,.jsx,.cjs,.mjs --fix --ignore-path .gitignore",
-    "format": "prettier --write src/"
+    "format": "prettier --write src/",
+    "test": "vitest",
+    "test:ui": "vitest --ui",
+    "test:run": "vitest run",
+    "test:coverage": "vitest run --coverage"
   },
   "dependencies": {
-    "vue": "^3.4.0",
-    "vue-router": "^4.2.0",
     "axios": "^1.6.0",
+    "d3": "^7.9.0",
     "marked": "^11.0.0",
-    "pinia": "^2.1.0"
+    "pinia": "^2.1.0",
+    "vue": "^3.4.0",
+    "vue-router": "^4.2.0"
   },
   "devDependencies": {
-    "@vitejs/plugin-vue": "^4.5.0",
-    "vite": "^5.0.0",
+    "@pinia/testing": "^0.1.0",
+    "@vitejs/plugin-vue": "^6.0.3",
+    "@vitest/coverage-v8": "^4.0.16",
+    "@vitest/ui": "^4.0.16",
+    "@vue/test-utils": "^2.4.0",
     "eslint": "^8.55.0",
     "eslint-plugin-vue": "^9.19.0",
-    "prettier": "^3.1.0"
+    "jsdom": "^23.0.0",
+    "msw": "^2.0.0",
+    "prettier": "^3.1.0",
+    "vite": "^7.3.1",
+    "vitest": "^4.0.16"
   }
 }

@@ -1,41 +1,43 @@
 """Graph API router for knowledge graph operations"""
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
 from typing import List, Dict
-from app.models.note import BacklinkInfo
-from app.services.graph_index import GraphIndexService
+from backend.app.models.note import BacklinkInfo
+from backend.app.services.graph_index import GraphIndexService
+from backend.app.services.knowledge_store import KnowledgeStore
 
 router = APIRouter()
 
-# Initialize graph index service (will be properly initialized in app startup)
-graph_index = None
+
+def get_graph_index(request: Request) -> GraphIndexService:
+    """Get graph index service from app state"""
+    return request.app.state.graph_index
+
+
+def get_knowledge_store(request: Request) -> KnowledgeStore:
+    """Get knowledge store from app state"""
+    return request.app.state.knowledge_store
 
 
 @router.get("/backlinks/{note_id}", response_model=List[BacklinkInfo])
-async def get_backlinks(note_id: str):
+async def get_backlinks(note_id: str, request: Request):
     """
     Get all notes that link to the specified note
-    
+
     - **note_id**: ID of the note to get backlinks for
     """
-    global graph_index
-    if graph_index is None:
-        graph_index = GraphIndexService()
-    
+    graph_index = get_graph_index(request)
     backlinks = graph_index.get_backlinks_with_context(note_id)
     return backlinks
 
 
 @router.get("/outgoing/{note_id}", response_model=List[str])
-async def get_outgoing_links(note_id: str):
+async def get_outgoing_links(note_id: str, request: Request):
     """
     Get all notes that the specified note links to
-    
+
     - **note_id**: ID of the note to get outgoing links for
     """
-    global graph_index
-    if graph_index is None:
-        graph_index = GraphIndexService()
-    
+    graph_index = get_graph_index(request)
     outgoing = graph_index.get_outgoing_links(note_id)
     return outgoing
 
@@ -43,54 +45,53 @@ async def get_outgoing_links(note_id: str):
 @router.get("/neighbors/{note_id}", response_model=Dict[str, List[str]])
 async def get_neighbors(
     note_id: str,
+    request: Request,
     depth: int = Query(1, ge=1, le=3, description="Traversal depth (1-3)")
 ):
     """
     Get neighboring notes within a specified depth
-    
+
     - **note_id**: ID of the starting note
     - **depth**: Traversal depth (1-3, default: 1)
     """
-    global graph_index
-    if graph_index is None:
-        graph_index = GraphIndexService()
-    
+    graph_index = get_graph_index(request)
     neighbors = graph_index.get_neighbors(note_id, depth)
     return neighbors
 
 
 @router.get("/unlinked-mentions/{note_id}", response_model=List[dict])
-async def find_unlinked_mentions(note_id: str):
+async def find_unlinked_mentions(note_id: str, request: Request):
     """
     Find notes that mention the note title but don't link to it
-    
+
     - **note_id**: ID of the note to find unlinked mentions for
     """
-    global graph_index
-    if graph_index is None:
-        graph_index = GraphIndexService()
-    
+    graph_index = get_graph_index(request)
     mentions = graph_index.find_unlinked_mentions(note_id)
     return mentions
 
 
 @router.post("/rebuild", response_model=dict)
-async def rebuild_graph():
+async def rebuild_graph(request: Request):
     """
     Rebuild the entire knowledge graph from all notes
     """
-    global graph_index
-    if graph_index is None:
-        graph_index = GraphIndexService()
-    
+    graph_index = get_graph_index(request)
+    knowledge_store = get_knowledge_store(request)
+
     graph_index.build_index()
-    
-    # Get total number of notes
-    from app.services.knowledge_store import KnowledgeStore
-    knowledge_store = KnowledgeStore()
     notes = knowledge_store.list_notes()
-    
+
     return {
         "processed": len(notes),
         "message": f"Rebuilt graph with {len(notes)} notes"
     }
+
+
+@router.get("/full", response_model=dict)
+async def get_full_graph(request: Request):
+    """
+    Get the complete knowledge graph structure
+    """
+    graph_index = get_graph_index(request)
+    return graph_index.get_full_graph()

@@ -1,10 +1,10 @@
-# OrgAI Chat Ingestion Guide
+# Seedream Chat Ingestion Guide
 
-> **Purpose:** How to save conversations from ChatGPT, Claude, and other AI assistants into your OrgAI knowledge base
+> **Purpose:** How to save conversations from ChatGPT, Claude, and other AI assistants into your Seedream knowledge base
 
 ## Overview
 
-OrgAI provides multiple pathways to ingest AI conversations:
+Seedream provides multiple pathways to ingest AI conversations:
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -18,8 +18,8 @@ OrgAI provides multiple pathways to ingest AI conversations:
 │         │                 │                 │                        │
 │         ▼                 ▼                 ▼                        │
 │  ┌─────────────────────────────────────────────────────────────┐    │
-│  │                    OrgAI Backend                             │    │
-│  │                   (/api/notes + /mcp)                        │    │
+│  │                   Seedream Backend                           │    │
+│  │                   (/api/notes + /sse)                        │    │
 │  └─────────────────────────────────────────────────────────────┘    │
 │                              │                                       │
 │                              ▼                                       │
@@ -36,7 +36,7 @@ OrgAI provides multiple pathways to ingest AI conversations:
 
 ### What is MCP?
 
-The **Model Context Protocol (MCP)** allows AI assistants to interact with external tools. OrgAI exposes 6 MCP tools including `ingest_chat` for saving conversations.
+The **Model Context Protocol (MCP)** allows AI assistants to interact with external tools. Seedream exposes 6 MCP tools including `ingest_chat` for saving conversations.
 
 ### Setup Claude Desktop
 
@@ -44,13 +44,13 @@ The **Model Context Protocol (MCP)** allows AI assistants to interact with exter
    - **Windows:** `%APPDATA%\Claude\claude_desktop_config.json`
    - **Mac:** `~/Library/Application Support/Claude/claude_desktop_config.json`
 
-2. **Add OrgAI as an MCP server:**
+2. **Add Seedream as an MCP server:**
 
 ```json
 {
   "mcpServers": {
-    "orgai": {
-      "url": "http://localhost:8080/mcp",
+    "seedream": {
+      "url": "http://localhost:8080/sse",
       "transport": "sse"
     }
   }
@@ -61,8 +61,8 @@ The **Model Context Protocol (MCP)** allows AI assistants to interact with exter
 
 4. **Verify connection:**
    - Open Claude Desktop
-   - You should see OrgAI tools available (hammer icon)
-   - Ask Claude: "What tools do you have from OrgAI?"
+   - You should see Seedream tools available (hammer icon)
+   - Ask Claude: "What tools do you have from Seedream?"
 
 ### Using ingest_chat in Claude
 
@@ -117,7 +117,7 @@ curl -X POST http://localhost:8080/api/notes \
 
 ### Using the Web UI
 
-1. Open OrgAI at http://localhost:5173
+1. Open Seedream at http://localhost:5173
 2. Click **+ New Note**
 3. Title: "Chat with [AI] - [Topic]"
 4. Paste the conversation
@@ -125,7 +125,7 @@ curl -X POST http://localhost:8080/api/notes \
 
 ### Browser Bookmarklet
 
-Create a bookmarklet to quickly open OrgAI with clipboard content:
+Create a bookmarklet to quickly open Seedream with clipboard content:
 
 ```javascript
 javascript:(function(){
@@ -155,14 +155,14 @@ javascript:(function(){
 ```python
 #!/usr/bin/env python3
 """
-ingest_clipboard.py - Save clipboard content to OrgAI
+ingest_clipboard.py - Save clipboard content to Seedream
 """
 
 import requests
 import pyperclip
 from datetime import datetime
 
-ORGAI_URL = "http://localhost:8080"
+SEEDREAM_URL = "http://localhost:8080"
 
 def ingest_chat(title: str = None, source: str = "clipboard", tags: list = None):
     """Ingest clipboard content as a chat note."""
@@ -182,7 +182,7 @@ def ingest_chat(title: str = None, source: str = "clipboard", tags: list = None)
         "status": "evidence",
     }
     
-    response = requests.post(f"{ORGAI_URL}/api/notes", json=payload)
+    response = requests.post(f"{SEEDREAM_URL}/api/notes", json=payload)
     
     if response.ok:
         note = response.json()
@@ -219,7 +219,7 @@ import requests
 from pathlib import Path
 from datetime import datetime
 
-ORGAI_URL = "http://localhost:8080"
+SEEDREAM_URL = "http://localhost:8080"
 IMPORT_DIR = "./chat_exports"  # Directory with .txt or .md files
 
 def import_file(filepath: Path):
@@ -241,7 +241,7 @@ def import_file(filepath: Path):
         "status": "evidence",
     }
     
-    response = requests.post(f"{ORGAI_URL}/api/notes", json=payload)
+    response = requests.post(f"{SEEDREAM_URL}/api/notes", json=payload)
     return response.ok, title
 
 def bulk_import():
@@ -272,7 +272,7 @@ def bulk_import():
     print(f"\n✓ Imported {success}/{len(files)} files")
     
     # Reindex for search
-    requests.post(f"{ORGAI_URL}/api/notes/reindex")
+    requests.post(f"{SEEDREAM_URL}/api/notes/reindex")
     print("✓ Reindexed for search")
 
 if __name__ == "__main__":
@@ -293,7 +293,7 @@ For ChatGPT, you can run this in the browser console to export the current conve
 
 ```javascript
 // Run in ChatGPT browser console
-(async function exportToOrgAI() {
+(async function exportToSeedream() {
     // Extract messages
     const messages = document.querySelectorAll('[data-message-author-role]');
     let content = '# ChatGPT Export\n\n';
@@ -327,7 +327,7 @@ For ChatGPT, you can run this in the browser console to export the current conve
 })();
 ```
 
-**Note:** This requires CORS to be configured (already enabled in OrgAI).
+**Note:** This requires CORS to be configured (already enabled in Seedream).
 
 ---
 
@@ -412,7 +412,7 @@ curl "http://localhost:8080/api/search?q=REST%20API%20design"
 | Feature | Current Status | Notes |
 |---------|----------------|-------|
 | Claude MCP | ✅ Works | Requires Claude Desktop config |
-| ChatGPT MCP | ❌ Not supported | ChatGPT doesn't support custom MCP |
+| ChatGPT MCP | ✅ Works | Requires OAuth setup (see integration-architecture.md) |
 | Gemini MCP | ⏳ Possible | Similar config to Claude |
 | Auto-export | ❌ Not built | Would need browser extensions |
 | Conversation threading | ❌ Flat | No follow-up linking |
@@ -423,13 +423,13 @@ curl "http://localhost:8080/api/search?q=REST%20API%20design"
 ## Troubleshooting
 
 ### "Connection refused" from scripts
-**Solution:** Ensure OrgAI backend is running on port 8080
+**Solution:** Ensure Seedream backend is running on port 8080
 
 ### MCP tools not appearing in Claude
 **Solution:** Check config path, restart Claude Desktop
 
 ### CORS errors in browser console
-**Solution:** OrgAI allows all origins by default; check backend logs
+**Solution:** Seedream allows all origins in development; check backend logs
 
 ### Note not searchable
 **Solution:** Run reindex: `POST /api/notes/reindex`

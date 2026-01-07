@@ -7,8 +7,13 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-# Limiter will be initialized with config from settings
-limiter = None
+# Initialize limiter with a default configuration that will be updated by init_limiter
+limiter = Limiter(
+    key_func=get_remote_address,
+    default_limits=["10000 per day"],
+    storage_uri="memory://",
+    strategy="fixed-window"
+)
 
 def init_limiter(settings):
     """Initialize limiter with settings from config"""

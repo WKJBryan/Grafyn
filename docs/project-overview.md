@@ -1,8 +1,8 @@
-# OrgAI Knowledge Graph Platform - Project Overview
+# Seedream Knowledge Graph Platform - Project Overview
 
 ## Executive Summary
 
-OrgAI is a **local knowledge graph platform** that enables semantic search, Obsidian-style linking, and MCP (Model Context Protocol) integration. It provides a self-hosted knowledge base with AI-ready capabilities for personal or organizational use.
+Seedream is a **local knowledge graph platform** that enables semantic search, Obsidian-style linking, and MCP (Model Context Protocol) integration. It provides a self-hosted knowledge base with AI-ready capabilities for personal or organizational use.
 
 ## Key Features
 
@@ -12,42 +12,48 @@ OrgAI is a **local knowledge graph platform** that enables semantic search, Obsi
 | **Semantic search** | Vector-based search using sentence-transformers (all-MiniLM-L6-v2) |
 | **Backlinks** | Automatic bidirectional link tracking and discovery |
 | **MCP Server** | Connects external AI models (Claude, ChatGPT, Gemini) to knowledge base |
-| **Web UI** | Vue 3 SPA accessible from any device |
+| **OAuth Authentication** | GitHub OAuth for secure ChatGPT integration |
+| **Web UI** | Vue 3 SPA with Pinia state management |
 
 ## Technology Stack Summary
 
 | Layer | Technology | Version | Purpose |
 |-------|------------|---------|---------|
-| **Backend Framework** | FastAPI | 0.104+ | REST API server |
-| **Vector Database** | LanceDB | 0.3+ | Embedding storage and similarity search |
-| **Embeddings** | sentence-transformers | 2.2+ | Text to vector encoding (384 dimensions) |
-| **MCP Integration** | fastapi-mcp | 0.1+ | AI model protocol bridge |
-| **Data Validation** | Pydantic | 2.5+ | Request/response schemas |
+| **Backend Framework** | FastAPI | 0.128+ | REST API server |
+| **Vector Database** | LanceDB | 0.26+ | Embedding storage and similarity search |
+| **Embeddings** | sentence-transformers | 5.2+ | Text to vector encoding (384 dimensions) |
+| **MCP Integration** | fastapi-mcp | Latest | AI model protocol bridge |
+| **Data Validation** | Pydantic | 2.12+ | Request/response schemas |
+| **Rate Limiting** | slowapi | Latest | API protection |
 | **Frontend Framework** | Vue 3 | 3.4+ | Reactive UI components |
+| **State Management** | Pinia | Latest | Centralized state |
+| **Routing** | Vue Router | 4.2+ | SPA navigation |
 | **Build Tool** | Vite | 5.0+ | Fast development server |
-| **HTTP Client** | Axios | 1.6+ | API communication |
 | **Markdown** | marked | 11.0+ | Content rendering |
-| **Routing** | vue-router | 4.2+ | SPA navigation |
 
 ## Architecture Type
 
 **Multi-Part Monorepo** with clear separation:
 
 ```
-orgai/
+seedream/
 ├── backend/     → FastAPI Python service (data, search, MCP)
 │   └── app/
 │       ├── main.py           # Application entry point
 │       ├── config.py         # Settings from .env
-│       ├── routers/          # API endpoints (notes, search, graph)
-│       ├── services/         # Business logic (4 services)
+│       ├── routers/          # API endpoints (notes, search, graph, oauth)
+│       ├── services/         # Business logic (5 services)
 │       ├── models/           # Pydantic schemas
+│       ├── middleware/       # Security, logging, rate limiting
 │       └── mcp/              # MCP server integration
 ├── frontend/    → Vue 3 SPA (user interface)
 │   └── src/
 │       ├── main.js           # Vue app bootstrap
 │       ├── App.vue           # Root component
-│       ├── components/       # UI components (6 total)
+│       ├── router/           # Vue Router configuration
+│       ├── stores/           # Pinia stores (auth, notes)
+│       ├── views/            # Page components
+│       ├── components/       # UI components (5 total)
 │       ├── api/              # Backend client
 │       └── style.css         # Design system
 ├── vault/       → Markdown notes storage (Obsidian-compatible)
@@ -70,7 +76,7 @@ User → Vue 3 Frontend → REST API → FastAPI Backend
 ## External AI Integration
 
 ```
-External AI (Claude/ChatGPT) → MCP Protocol → /mcp endpoint
+External AI (Claude/ChatGPT) → MCP Protocol → /sse endpoint
                                                     ↓
                                             FastAPI routes
                                             exposed as tools
@@ -95,13 +101,20 @@ External AI (Claude/ChatGPT) → MCP Protocol → /mcp endpoint
 - Neighbor traversal up to 3 hops for visualization
 - Unlinked mention detection for link suggestions
 
-## Statistics (from Exhaustive Scan)
+### Authentication
+- OAuth 2.0 with GitHub for ChatGPT integration
+- Token-based session management
+- Environment-based CORS configuration (stricter in production)
+
+## Statistics
 
 | Metric | Count |
 |--------|-------|
-| API Endpoints | 14 |
-| Backend Services | 4 |
+| API Endpoints | 15+ |
+| Backend Services | 5 |
+| Middleware | 4 |
 | MCP Tools | 6 |
-| Vue Components | 6 |
+| Vue Components | 5 |
+| Vue Views | 4 |
+| Pinia Stores | 2 |
 | Pydantic Models | 8 |
-| Source Files Scanned | 25+ |

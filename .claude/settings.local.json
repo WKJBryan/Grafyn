@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(mkdir:*)",
+      "Bash(dir \"C:\\\\Users\\\\bryan\\\\Seedream\\\\backend\\\\tests\\\\unit\")",
+      "Bash(dir \"C:\\\\Users\\\\bryan\\\\Seedream\\\\backend\\\\tests\")",
+      "Bash(git checkout:*)",
+      "WebSearch"
+    ]
+  }
+}
