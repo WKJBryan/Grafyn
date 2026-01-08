@@ -23,6 +23,11 @@ class Settings(BaseSettings):
     github_client_id: str = ""
     github_client_secret: str = ""
     github_redirect_uri: str = ""
+
+    # OpenRouter Configuration
+    openrouter_api_key: str = ""
+    app_url: str = "http://localhost:8080"
+    canvas_data_path: str = "../data/canvas"
     
     # CORS Configuration
     cors_origins: Optional[str] = None

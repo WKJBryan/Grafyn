@@ -1,0 +1,456 @@
+import { defineStore } from 'pinia'
+import { ref, computed } from 'vue'
+import { canvas as canvasApi } from '@/api/client'
+
+export const useCanvasStore = defineStore('canvas', () => {
+  // State
+  const sessions = ref([])
+  const currentSession = ref(null)
+  const availableModels = ref([])
+  const loading = ref(false)
+  const error = ref(null)
+  const streamingModels = ref(new Set())
+
+  // Getters
+  const promptTiles = computed(() => currentSession.value?.prompt_tiles || [])
+  const debates = computed(() => currentSession.value?.debates || [])
+  const hasSession = computed(() => currentSession.value !== null)
+  const isStreaming = computed(() => streamingModels.value.size > 0)
+
+  const modelsByProvider = computed(() => {
+    const groups = {}
+    for (const model of availableModels.value) {
+      const provider = model.provider || 'Other'
+      if (!groups[provider]) groups[provider] = []
+      groups[provider].push(model)
+    }
+    return groups
+  })
+
+  // Actions
+  async function loadSessions() {
+    loading.value = true
+    error.value = null
+    try {
+      sessions.value = await canvasApi.list()
+    } catch (err) {
+      error.value = err.message || 'Failed to load sessions'
+      console.error('Failed to load canvas sessions:', err)
+    } finally {
+      loading.value = false
+    }
+  }
+
+  async function loadSession(sessionId) {
+    loading.value = true
+    error.value = null
+    try {
+      currentSession.value = await canvasApi.get(sessionId)
+    } catch (err) {
+      error.value = err.message || 'Failed to load session'
+      console.error('Failed to load canvas session:', err)
+    } finally {
+      loading.value = false
+    }
+  }
+
+  async function createSession(data = {}) {
+    loading.value = true
+    error.value = null
+    try {
+      const session = await canvasApi.create(data)
+      sessions.value.unshift(session)
+      currentSession.value = session
+      return session
+    } catch (err) {
+      error.value = err.message || 'Failed to create session'
+      console.error('Failed to create canvas session:', err)
+      throw err
+    } finally {
+      loading.value = false
+    }
+  }
+
+  async function updateSession(sessionId, data) {
+    try {
+      const updated = await canvasApi.update(sessionId, data)
+
+      // Update in sessions list
+      const idx = sessions.value.findIndex(s => s.id === sessionId)
+      if (idx !== -1) {
+        sessions.value[idx] = { ...sessions.value[idx], ...updated }
+      }
+
+      // Update current session if it's the same
+      if (currentSession.value?.id === sessionId) {
+        currentSession.value = updated
+      }
+
+      return updated
+    } catch (err) {
+      error.value = err.message || 'Failed to update session'
+      console.error('Failed to update canvas session:', err)
+      throw err
+    }
+  }
+
+  async function deleteSession(sessionId) {
+    try {
+      await canvasApi.delete(sessionId)
+      sessions.value = sessions.value.filter(s => s.id !== sessionId)
+
+      if (currentSession.value?.id === sessionId) {
+        currentSession.value = null
+      }
+    } catch (err) {
+      error.value = err.message || 'Failed to delete session'
+      console.error('Failed to delete canvas session:', err)
+      throw err
+    }
+  }
+
+  async function loadModels() {
+    try {
+      availableModels.value = await canvasApi.getModels()
+    } catch (err) {
+      console.error('Failed to load models:', err)
+      // Don't set error for models load - it's not critical
+    }
+  }
+
+  async function sendPrompt(prompt, models, systemPrompt = null, temperature = 0.7, maxTokens = 2048) {
+    if (!currentSession.value) {
+      throw new Error('No active session')
+    }
+
+    const sessionId = currentSession.value.id
+    error.value = null
+
+    // Mark models as streaming
+    models.forEach(m => streamingModels.value.add(m))
+
+    try {
+      const response = await fetch(`/api/canvas/${sessionId}/prompt`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          prompt,
+          models,
+          system_prompt: systemPrompt,
+          temperature,
+          max_tokens: maxTokens
+        })
+      })
+
+      if (!response.ok) {
+        throw new Error(`HTTP error: ${response.status}`)
+      }
+
+      const reader = response.body.getReader()
+      const decoder = new TextDecoder()
+
+      let tileId = null
+      const modelContent = {}
+      models.forEach(m => modelContent[m] = '')
+
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+
+        const text = decoder.decode(value)
+        const lines = text.split('\n')
+
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue
+          const data = line.slice(6)
+          if (data === '[DONE]') break
+
+          try {
+            const event = JSON.parse(data)
+
+            switch (event.type) {
+              case 'tile_created':
+                tileId = event.tile_id
+                break
+
+              case 'chunk':
+                modelContent[event.model_id] += event.chunk
+                updateTileResponseLocal(tileId, event.model_id, modelContent[event.model_id], 'streaming')
+                break
+
+              case 'complete':
+                updateTileResponseLocal(tileId, event.model_id, modelContent[event.model_id], 'completed')
+                streamingModels.value.delete(event.model_id)
+                break
+
+              case 'error':
+                updateTileResponseLocal(tileId, event.model_id, event.error, 'error')
+                streamingModels.value.delete(event.model_id)
+                break
+
+              case 'session_saved':
+                // Refresh session data
+                await loadSession(sessionId)
+                break
+            }
+          } catch (e) {
+            console.error('Failed to parse SSE event:', e)
+          }
+        }
+      }
+
+      return tileId
+    } catch (err) {
+      error.value = err.message || 'Failed to send prompt'
+      console.error('Failed to send prompt:', err)
+      throw err
+    } finally {
+      // Clear streaming state
+      models.forEach(m => streamingModels.value.delete(m))
+    }
+  }
+
+  function updateTileResponseLocal(tileId, modelId, content, status) {
+    if (!currentSession.value) return
+
+    const tile = currentSession.value.prompt_tiles.find(t => t.id === tileId)
+    if (tile && tile.responses[modelId]) {
+      tile.responses[modelId].content = content
+      tile.responses[modelId].status = status
+    }
+  }
+
+  async function updateTilePosition(tileId, position) {
+    if (!currentSession.value) return
+
+    // Optimistic update
+    const tile = currentSession.value.prompt_tiles.find(t => t.id === tileId)
+    if (tile) {
+      tile.position = { ...tile.position, ...position }
+    }
+
+    // Also check debates
+    const debate = currentSession.value.debates.find(d => d.id === tileId)
+    if (debate) {
+      debate.position = { ...debate.position, ...position }
+    }
+
+    // Persist to backend (debounced in component)
+    try {
+      await canvasApi.updateTilePosition(currentSession.value.id, tileId, position)
+    } catch (err) {
+      console.error('Failed to update tile position:', err)
+    }
+  }
+
+  async function updateViewport(viewport) {
+    if (!currentSession.value) return
+
+    currentSession.value.viewport = viewport
+
+    try {
+      await canvasApi.updateViewport(currentSession.value.id, viewport)
+    } catch (err) {
+      console.error('Failed to update viewport:', err)
+    }
+  }
+
+  async function startDebate(tileIds, participatingModels, mode = 'auto', maxRounds = 3) {
+    if (!currentSession.value) {
+      throw new Error('No active session')
+    }
+
+    const sessionId = currentSession.value.id
+    error.value = null
+
+    // Mark models as streaming
+    participatingModels.forEach(m => streamingModels.value.add(m))
+
+    try {
+      const response = await fetch(`/api/canvas/${sessionId}/debate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          source_tile_ids: tileIds,
+          participating_models: participatingModels,
+          debate_mode: mode,
+          max_rounds: maxRounds
+        })
+      })
+
+      if (!response.ok) {
+        throw new Error(`HTTP error: ${response.status}`)
+      }
+
+      const reader = response.body.getReader()
+      const decoder = new TextDecoder()
+
+      let debateId = null
+      const roundContent = {}
+
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+
+        const text = decoder.decode(value)
+        const lines = text.split('\n')
+
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue
+          const data = line.slice(6)
+          if (data === '[DONE]') break
+
+          try {
+            const event = JSON.parse(data)
+
+            switch (event.type) {
+              case 'debate_created':
+                debateId = event.debate_id
+                break
+
+              case 'round_start':
+                participatingModels.forEach(m => roundContent[m] = '')
+                break
+
+              case 'debate_chunk':
+                if (!roundContent[event.model_id]) roundContent[event.model_id] = ''
+                roundContent[event.model_id] += event.chunk
+                // Could update UI here for streaming debate content
+                break
+
+              case 'model_complete':
+                streamingModels.value.delete(event.model_id)
+                break
+
+              case 'debate_error':
+                console.error(`Debate error for ${event.model_id}:`, event.error)
+                streamingModels.value.delete(event.model_id)
+                break
+
+              case 'debate_complete':
+                await loadSession(sessionId)
+                break
+            }
+          } catch (e) {
+            console.error('Failed to parse debate SSE event:', e)
+          }
+        }
+      }
+
+      return debateId
+    } catch (err) {
+      error.value = err.message || 'Failed to start debate'
+      console.error('Failed to start debate:', err)
+      throw err
+    } finally {
+      participatingModels.forEach(m => streamingModels.value.delete(m))
+    }
+  }
+
+  async function continueDebate(debateId, prompt) {
+    if (!currentSession.value) {
+      throw new Error('No active session')
+    }
+
+    const sessionId = currentSession.value.id
+    const debate = currentSession.value.debates.find(d => d.id === debateId)
+    if (!debate) {
+      throw new Error('Debate not found')
+    }
+
+    const participatingModels = debate.participating_models
+    participatingModels.forEach(m => streamingModels.value.add(m))
+
+    try {
+      const response = await fetch(`/api/canvas/${sessionId}/debate/${debateId}/continue`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ prompt })
+      })
+
+      if (!response.ok) {
+        throw new Error(`HTTP error: ${response.status}`)
+      }
+
+      const reader = response.body.getReader()
+      const decoder = new TextDecoder()
+
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+
+        const text = decoder.decode(value)
+        const lines = text.split('\n')
+
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue
+          const data = line.slice(6)
+          if (data === '[DONE]') break
+
+          try {
+            const event = JSON.parse(data)
+
+            if (event.type === 'round_complete') {
+              await loadSession(sessionId)
+            }
+          } catch (e) {
+            console.error('Failed to parse continue debate SSE event:', e)
+          }
+        }
+      }
+    } catch (err) {
+      error.value = err.message || 'Failed to continue debate'
+      throw err
+    } finally {
+      participatingModels.forEach(m => streamingModels.value.delete(m))
+    }
+  }
+
+  function clearError() {
+    error.value = null
+  }
+
+  function clearSession() {
+    currentSession.value = null
+  }
+
+  function reset() {
+    sessions.value = []
+    currentSession.value = null
+    availableModels.value = []
+    loading.value = false
+    error.value = null
+    streamingModels.value.clear()
+  }
+
+  return {
+    // State
+    sessions,
+    currentSession,
+    availableModels,
+    loading,
+    error,
+    streamingModels,
+    // Getters
+    promptTiles,
+    debates,
+    hasSession,
+    isStreaming,
+    modelsByProvider,
+    // Actions
+    loadSessions,
+    loadSession,
+    createSession,
+    updateSession,
+    deleteSession,
+    loadModels,
+    sendPrompt,
+    updateTilePosition,
+    updateViewport,
+    startDebate,
+    continueDebate,
+    clearError,
+    clearSession,
+    reset
+  }
+})
