@@ -244,6 +244,10 @@ function handleDelete() {
   line-height: 1.6;
 }
 
+.editor-preview :deep(*) {
+  color: inherit;
+}
+
 .editor-preview :deep(h1),
 .editor-preview :deep(h2),
 .editor-preview :deep(h3),
@@ -253,6 +257,7 @@ function handleDelete() {
   margin-top: var(--spacing-lg);
   margin-bottom: var(--spacing-md);
   font-weight: 600;
+  color: var(--text-primary);
 }
 
 .editor-preview :deep(h1) { font-size: 2rem; }
@@ -262,16 +267,19 @@ function handleDelete() {
 
 .editor-preview :deep(p) {
   margin-bottom: var(--spacing-md);
+  color: var(--text-primary);
 }
 
 .editor-preview :deep(ul),
 .editor-preview :deep(ol) {
   margin-bottom: var(--spacing-md);
   padding-left: var(--spacing-lg);
+  color: var(--text-primary);
 }
 
 .editor-preview :deep(li) {
   margin-bottom: var(--spacing-xs);
+  color: var(--text-primary);
 }
 
 .editor-preview :deep(code) {
@@ -279,6 +287,7 @@ function handleDelete() {
   padding: 2px 6px;
   border-radius: var(--radius-sm);
   font-size: 0.9em;
+  color: var(--text-primary);
 }
 
 .editor-preview :deep(pre) {
@@ -287,11 +296,13 @@ function handleDelete() {
   border-radius: var(--radius-md);
   overflow-x: auto;
   margin-bottom: var(--spacing-md);
+  color: var(--text-primary);
 }
 
 .editor-preview :deep(pre code) {
   background: none;
   padding: 0;
+  color: var(--text-primary);
 }
 
 .editor-preview :deep(blockquote) {

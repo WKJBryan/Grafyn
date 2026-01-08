@@ -84,10 +84,14 @@ export const canvas = {
   getModels: () => api.get('/canvas/models/available'),
   updateTilePosition: (sessionId, tileId, position) =>
     api.put(`/canvas/${encodeURIComponent(sessionId)}/tiles/${encodeURIComponent(tileId)}/position`, position),
+  deleteTile: (sessionId, tileId) =>
+    api.delete(`/canvas/${encodeURIComponent(sessionId)}/tiles/${encodeURIComponent(tileId)}`),
   updateViewport: (sessionId, viewport) =>
     api.put(`/canvas/${encodeURIComponent(sessionId)}/viewport`, viewport),
   updateDebateStatus: (sessionId, debateId, status) =>
     api.put(`/canvas/${encodeURIComponent(sessionId)}/debate/${encodeURIComponent(debateId)}/status`, null, { params: { status } }),
+  exportToNote: (sessionId) =>
+    api.post(`/canvas/${encodeURIComponent(sessionId)}/export-note`),
 }
 
 export default api

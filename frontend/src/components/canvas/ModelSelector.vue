@@ -5,6 +5,18 @@
       <span class="selected-count">{{ selectedModels.length }} selected</span>
     </div>
 
+    <!-- Selected Models Tags -->
+    <div v-if="selectedModels.length > 0" class="selected-tags">
+      <span
+        v-for="modelId in selectedModels"
+        :key="modelId"
+        class="model-tag"
+      >
+        <span class="tag-name">{{ getModelDisplayName(modelId) }}</span>
+        <button class="tag-remove" @click.stop="removeModel(modelId)" title="Remove">&times;</button>
+      </span>
+    </div>
+
     <div class="search-box">
       <input
         v-model="searchQuery"
@@ -47,9 +59,12 @@
             />
             <div class="model-info">
               <span class="model-name">{{ model.name }}</span>
-              <span class="model-meta">
-                {{ formatContextLength(model.context_length) }} ctx
-              </span>
+              <div class="model-pricing">
+                <span class="pricing-item" title="Input cost per 1M tokens">${{ formatPrice(model.pricing?.prompt) }}</span>
+                <span class="pricing-divider">/</span>
+                <span class="pricing-item" title="Output cost per 1M tokens">${{ formatPrice(model.pricing?.completion) }}</span>
+              </div>
+              <span class="model-ctx">{{ formatContextLength(model.context_length) }}</span>
             </div>
           </label>
         </div>
@@ -144,6 +159,31 @@ function formatContextLength(length) {
   if (length >= 1000) return `${(length / 1000).toFixed(0)}k`
   return length.toString()
 }
+
+function formatPrice(price) {
+  if (price === undefined || price === null) return '?'
+  // Price is typically per token, convert to per 1M tokens
+  const perMillion = price * 1000000
+  if (perMillion < 0.01) return perMillion.toFixed(4)
+  if (perMillion < 1) return perMillion.toFixed(2)
+  return perMillion.toFixed(1)
+}
+
+function getModelDisplayName(modelId) {
+  const model = props.models.find(m => m.id === modelId)
+  if (model) {
+    // Return short name - extract model name without provider prefix
+    const parts = model.name.split(':')
+    return parts.length > 1 ? parts[1].trim() : model.name
+  }
+  // Fallback: extract from model ID
+  const parts = modelId.split('/')
+  return parts.length > 1 ? parts[1] : modelId
+}
+
+function removeModel(modelId) {
+  selectedModels.value = selectedModels.value.filter(id => id !== modelId)
+}
 </script>
 
 <style scoped>
@@ -172,6 +212,57 @@ function formatContextLength(length) {
   background: rgba(124, 92, 255, 0.15);
   padding: 2px 8px;
   border-radius: var(--radius-sm);
+}
+
+.selected-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: var(--spacing-xs);
+  background: var(--bg-tertiary);
+  border-radius: var(--radius-sm);
+  max-height: 80px;
+  overflow-y: auto;
+}
+
+.model-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 8px;
+  background: var(--bg-primary);
+  border: 1px solid var(--bg-tertiary);
+  border-radius: var(--radius-sm);
+  font-size: 0.75rem;
+  color: var(--text-primary);
+}
+
+.tag-name {
+  max-width: 150px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tag-remove {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 1rem;
+  line-height: 1;
+  border-radius: 50%;
+}
+
+.tag-remove:hover {
+  background: rgba(255, 255, 255, 0.1);
+  color: var(--text-primary);
 }
 
 .search-box {
@@ -272,27 +363,52 @@ function formatContextLength(length) {
 
 .model-checkbox {
   accent-color: var(--accent-primary);
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+  flex-grow: 0;
 }
 
 .model-info {
   flex: 1;
   min-width: 0;
   display: flex;
-  justify-content: space-between;
   align-items: center;
+  gap: var(--spacing-sm);
 }
 
 .model-name {
+  flex: 1;
   font-size: 0.8125rem;
   color: var(--text-primary);
-  white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
-.model-meta {
+.model-pricing {
+  display: flex;
+  align-items: center;
+  gap: 2px;
   font-size: 0.6875rem;
   color: var(--text-muted);
+  flex-shrink: 0;
+}
+
+.pricing-item {
+  min-width: 32px;
+  text-align: right;
+}
+
+.pricing-divider {
+  color: var(--bg-tertiary);
+}
+
+.model-ctx {
+  font-size: 0.6875rem;
+  color: var(--text-muted);
+  min-width: 35px;
+  text-align: right;
   flex-shrink: 0;
 }
 

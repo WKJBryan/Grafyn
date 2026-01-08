@@ -15,9 +15,9 @@
     <div v-if="showResults && results.length > 0" class="search-results">
       <div
         v-for="result in results"
-        :key="result.id"
+        :key="result.note_id"
         class="search-result-item"
-        @click="handleSelect(result.id)"
+        @click="handleSelect(result.note_id)"
       >
         <div class="result-title">{{ result.title }}</div>
         <div class="result-score">
@@ -68,7 +68,7 @@ function handleSelect(noteId) {
 
 function handleEnter() {
   if (results.value.length > 0) {
-    handleSelect(results.value[0].id)
+    handleSelect(results.value[0].note_id)
   }
 }
 

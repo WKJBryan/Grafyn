@@ -103,8 +103,35 @@ watch(() => props.response.content, () => {
   align-items: center;
   justify-content: space-between;
   padding: var(--spacing-xs) var(--spacing-sm);
-  background: rgba(0, 0, 0, 0.2);
-  border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+  background: var(--bg-hover);
+  border-bottom: 1px solid var(--bg-tertiary);
+}
+
+.header-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-xs);
+}
+
+.branch-btn {
+  background: transparent;
+  border: 1px solid var(--text-muted);
+  color: var(--text-muted);
+  width: 22px;
+  height: 22px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  font-size: 0.75rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.15s ease;
+}
+
+.branch-btn:hover {
+  background: var(--accent-primary);
+  border-color: var(--accent-primary);
+  color: white;
 }
 
 .model-name {
@@ -221,8 +248,13 @@ watch(() => props.response.content, () => {
   color: var(--text-primary);
 }
 
+.content-text :deep(*) {
+  color: inherit;
+}
+
 .content-text :deep(p) {
   margin: 0 0 var(--spacing-sm) 0;
+  color: var(--text-primary);
 }
 
 .content-text :deep(p:last-child) {
@@ -230,39 +262,66 @@ watch(() => props.response.content, () => {
 }
 
 .content-text :deep(code) {
-  background: rgba(0, 0, 0, 0.3);
+  background: var(--bg-tertiary);
   padding: 2px 4px;
   border-radius: 3px;
   font-size: 0.75rem;
   font-family: 'Fira Code', monospace;
+  color: var(--text-primary);
 }
 
 .content-text :deep(pre) {
-  background: rgba(0, 0, 0, 0.3);
+  background: var(--bg-tertiary);
   padding: var(--spacing-sm);
   border-radius: var(--radius-sm);
   overflow-x: auto;
   margin: var(--spacing-sm) 0;
+  color: var(--text-primary);
 }
 
 .content-text :deep(pre code) {
   background: none;
   padding: 0;
+  color: var(--text-primary);
 }
 
 .content-text :deep(ul), .content-text :deep(ol) {
   margin: var(--spacing-sm) 0;
   padding-left: var(--spacing-md);
+  color: var(--text-primary);
 }
 
 .content-text :deep(li) {
   margin-bottom: 4px;
+  color: var(--text-primary);
+}
+
+.content-text :deep(h1),
+.content-text :deep(h2),
+.content-text :deep(h3),
+.content-text :deep(h4),
+.content-text :deep(h5),
+.content-text :deep(h6) {
+  color: var(--text-primary);
+  font-weight: 600;
+  margin: var(--spacing-sm) 0;
+}
+
+.content-text :deep(a) {
+  color: var(--accent-primary);
+}
+
+.content-text :deep(blockquote) {
+  color: var(--text-secondary);
+  border-left: 3px solid var(--accent-primary);
+  padding-left: var(--spacing-sm);
+  margin-left: 0;
 }
 
 .response-footer {
   padding: var(--spacing-xs) var(--spacing-sm);
-  background: rgba(0, 0, 0, 0.2);
-  border-top: 1px solid rgba(255, 255, 255, 0.05);
+  background: var(--bg-hover);
+  border-top: 1px solid var(--bg-tertiary);
 }
 
 .tokens {

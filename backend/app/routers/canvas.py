@@ -19,9 +19,12 @@ from backend.app.models.canvas import (
     TilePositionUpdate,
     CanvasViewport,
     DebateMode,
+    TileEdge,
+    ContextMode,
 )
 from backend.app.services.canvas_store import CanvasSessionStore
 from backend.app.services.openrouter import OpenRouterService
+from backend.app.services.vector_search import VectorSearchService
 from backend.app.middleware.rate_limit import limiter
 
 logger = logging.getLogger(__name__)
@@ -36,6 +39,11 @@ def get_canvas_store(request: Request) -> CanvasSessionStore:
 def get_openrouter(request: Request) -> OpenRouterService:
     """Get OpenRouter service from app state"""
     return request.app.state.openrouter
+
+
+def get_vector_search(request: Request) -> VectorSearchService:
+    """Get vector search service from app state"""
+    return request.app.state.vector_search
 
 
 # --- Session Management ---
@@ -136,6 +144,24 @@ async def update_tile_position(
     return {"status": "updated"}
 
 
+@router.delete("/{session_id}/tiles/{tile_id}", status_code=204)
+async def delete_tile(session_id: str, tile_id: str, request: Request):
+    """Delete a tile (prompt or debate) from the canvas"""
+    store = get_canvas_store(request)
+    if not store.delete_tile(session_id, tile_id):
+        raise HTTPException(status_code=404, detail="Tile not found")
+
+
+@router.get("/{session_id}/edges", response_model=List[TileEdge])
+async def get_tile_edges(session_id: str, request: Request):
+    """Get all parent-child tile edges for mind-map visualization"""
+    store = get_canvas_store(request)
+    session = store.get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return store.get_tile_edges(session_id)
+
+
 # --- Prompt & Streaming ---
 
 
@@ -147,6 +173,7 @@ async def send_prompt(
     """Send a prompt to multiple models with SSE streaming"""
     store = get_canvas_store(request)
     openrouter = get_openrouter(request)
+    vector_search = get_vector_search(request)
 
     if not openrouter.is_configured():
         raise HTTPException(
@@ -157,12 +184,15 @@ async def send_prompt(
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    # Create the prompt tile
+    # Create the prompt tile with branching support
     tile = store.add_prompt_tile(
         session_id,
         prompt_request.prompt,
         prompt_request.models,
         prompt_request.system_prompt,
+        None,  # position - auto-calculated
+        prompt_request.parent_tile_id,
+        prompt_request.parent_model_id,
     )
 
     if not tile:
@@ -170,10 +200,40 @@ async def send_prompt(
 
     async def event_generator():
         """Generate SSE events for all model streams"""
-        # Build messages
+        # Build messages based on context_mode
         messages = []
+
+        # Add system prompt if provided
         if prompt_request.system_prompt:
             messages.append({"role": "system", "content": prompt_request.system_prompt})
+
+        # Build conversation context based on mode
+        if prompt_request.parent_tile_id and prompt_request.parent_model_id:
+            if prompt_request.context_mode == ContextMode.FULL_HISTORY:
+                # Full history: walk parent chain, include all turns
+                history = store.build_full_history(
+                    session_id,
+                    prompt_request.parent_tile_id,
+                    prompt_request.parent_model_id,
+                )
+                messages.extend(history)
+            elif prompt_request.context_mode == ContextMode.COMPACT:
+                # Compact: recent turns verbatim + summary of older context
+                history = store.build_compact_history(
+                    session_id,
+                    prompt_request.parent_tile_id,
+                    prompt_request.parent_model_id,
+                )
+                messages.extend(history)
+            elif prompt_request.context_mode == ContextMode.SEMANTIC:
+                # Semantic: RAG-style search across notes and tiles
+                context = store.build_semantic_context(
+                    prompt_request.prompt,
+                    vector_search,
+                )
+                messages.extend(context)
+
+        # Add the new user prompt
         messages.append({"role": "user", "content": prompt_request.prompt})
 
         # Track state for each model
@@ -229,6 +289,18 @@ async def send_prompt(
                             model_content[model_id],
                             "completed",
                         )
+                        # Index tile in vector search for semantic retrieval
+                        try:
+                            vector_search.index_tile(
+                                tile_id=tile.id,
+                                session_id=session_id,
+                                prompt=prompt_request.prompt,
+                                response=model_content[model_id],
+                                model_id=model_id,
+                            )
+                        except Exception as e:
+                            logger.warning(f"Failed to index tile: {e}")
+
                         yield f"data: {json.dumps({'type': 'complete', 'model_id': model_id})}\n\n"
                         model_done.add(model_id)
 
@@ -591,3 +663,126 @@ async def update_debate_status(
         raise HTTPException(status_code=404, detail="Debate not found")
 
     return {"status": "updated"}
+
+
+# --- Export to Note ---
+
+
+@router.post("/{session_id}/export-note")
+async def export_to_note(session_id: str, request: Request):
+    """Export canvas session as a markdown note"""
+    store = get_canvas_store(request)
+    knowledge_store = request.app.state.knowledge_store
+
+    session = store.get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    # Generate markdown content
+    markdown_content = _canvas_to_markdown(session)
+
+    from backend.app.models.note import NoteCreate, NoteUpdate
+
+    note_title = f"Canvas: {session.title}"
+    tags = list(set(session.tags + ["canvas-export"]))
+
+    try:
+        # Check if note already exists (from previous export)
+        if session.linked_note_id:
+            existing_note = knowledge_store.get_note(session.linked_note_id)
+            if existing_note:
+                # Update existing note
+                update_data = NoteUpdate(
+                    content=markdown_content,
+                    tags=tags,
+                )
+                note = knowledge_store.update_note(session.linked_note_id, update_data)
+                return {
+                    "note_id": note.id,
+                    "title": note.title,
+                    "message": f"Canvas updated in note: {note.title}",
+                    "updated": True,
+                }
+
+        # Create new note
+        note_data = NoteCreate(
+            title=note_title,
+            content=markdown_content,
+            status="evidence",
+            tags=tags,
+        )
+
+        note = knowledge_store.create_note(note_data)
+
+        # Link the note to the canvas session
+        store.link_note(session_id, note.id)
+
+        return {
+            "note_id": note.id,
+            "title": note.title,
+            "message": f"Canvas exported to note: {note.title}",
+            "updated": False,
+        }
+    except Exception as e:
+        logger.error(f"Failed to export canvas to note: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to export: {str(e)}")
+
+
+def _canvas_to_markdown(session) -> str:
+    """Convert canvas session to markdown format"""
+    lines = []
+
+    # Title
+    lines.append(f"# {session.title}\n")
+
+    if session.description:
+        lines.append(f"{session.description}\n")
+
+    lines.append(f"*Canvas ID: `{session.id}`*\n")
+    lines.append(f"*Created: {session.created_at.strftime('%Y-%m-%d %H:%M')}*\n")
+
+    # Prompt Tiles
+    if session.prompt_tiles:
+        lines.append("\n---\n")
+
+        for i, tile in enumerate(session.prompt_tiles, 1):
+            lines.append(f"\n## Prompt {i}\n")
+            lines.append(f"> {tile.prompt}\n")
+
+            if tile.system_prompt:
+                lines.append(f"\n*System prompt:* {tile.system_prompt}\n")
+
+            # Model responses
+            for model_id, response in tile.responses.items():
+                model_name = response.model_name or model_id.split("/")[-1]
+                lines.append(f"\n### {model_name}\n")
+
+                if response.status == "completed":
+                    lines.append(f"{response.content}\n")
+                elif response.status == "error":
+                    lines.append(f"*Error: {response.error_message}*\n")
+                else:
+                    lines.append(f"*Status: {response.status}*\n")
+
+    # Debates
+    if session.debates:
+        lines.append("\n---\n")
+        lines.append("\n## Debates\n")
+
+        for i, debate in enumerate(session.debates, 1):
+            mode = debate.debate_mode.value if hasattr(debate.debate_mode, "value") else debate.debate_mode
+            lines.append(f"\n### Debate {i} ({mode} mode)\n")
+
+            participating = ", ".join(
+                m.split("/")[-1] for m in debate.participating_models
+            )
+            lines.append(f"*Participants: {participating}*\n")
+
+            for round_num, round_data in enumerate(debate.rounds, 1):
+                lines.append(f"\n#### Round {round_num}\n")
+
+                for model_id, content in round_data.items():
+                    model_name = model_id.split("/")[-1]
+                    lines.append(f"\n**{model_name}:**\n{content}\n")
+
+    return "\n".join(lines)
