@@ -18,6 +18,7 @@ from backend.app.models.canvas import (
     ModelResponse,
     CanvasViewport,
     DebateMode,
+    TileEdge,
 )
 from backend.app.config import get_settings
 
@@ -140,6 +141,8 @@ class CanvasSessionStore:
         models: List[str],
         system_prompt: Optional[str] = None,
         position: Optional[TilePosition] = None,
+        parent_tile_id: Optional[str] = None,
+        parent_model_id: Optional[str] = None,
     ) -> Optional[PromptTile]:
         """Add a new prompt tile to a session"""
         session = self._sessions.get(session_id)
@@ -148,11 +151,28 @@ class CanvasSessionStore:
 
         tile_id = str(uuid.uuid4())
 
-        # Calculate position if not provided (stagger tiles)
+        # Calculate position if not provided
         if position is None:
-            base_x = 50 + (len(session.prompt_tiles) % 3) * 450
-            base_y = 50 + (len(session.prompt_tiles) // 3) * 400
-            position = TilePosition(x=base_x, y=base_y)
+            if parent_tile_id:
+                # Position relative to parent tile for branching
+                parent_tile = next(
+                    (t for t in session.prompt_tiles if t.id == parent_tile_id), None
+                )
+                if parent_tile:
+                    # Count existing children of this parent to offset
+                    child_count = sum(
+                        1 for t in session.prompt_tiles if t.parent_tile_id == parent_tile_id
+                    )
+                    base_x = parent_tile.position.x + parent_tile.position.width + 100
+                    base_y = parent_tile.position.y + child_count * 350
+                    position = TilePosition(x=base_x, y=base_y)
+                else:
+                    position = TilePosition(x=50, y=50)
+            else:
+                # Default grid layout for root tiles
+                base_x = 50 + (len(session.prompt_tiles) % 3) * 450
+                base_y = 50 + (len(session.prompt_tiles) // 3) * 400
+                position = TilePosition(x=base_x, y=base_y)
 
         # Create response placeholders for each model
         responses = {}
@@ -173,14 +193,50 @@ class CanvasSessionStore:
             models=models,
             responses=responses,
             position=position,
+            parent_tile_id=parent_tile_id,
+            parent_model_id=parent_model_id,
         )
 
         session.prompt_tiles.append(tile)
         session.updated_at = datetime.now(timezone.utc)
         self._save(session)
 
-        logger.info(f"Added prompt tile {tile_id} to session {session_id}")
+        logger.info(f"Added prompt tile {tile_id} to session {session_id}" + 
+                    (f" (branching from {parent_tile_id})" if parent_tile_id else ""))
         return tile
+
+    def delete_tile(self, session_id: str, tile_id: str) -> bool:
+        """Delete a tile (prompt or debate) from a session"""
+        session = self._sessions.get(session_id)
+        if not session:
+            return False
+
+        # Try to delete from prompt tiles
+        original_count = len(session.prompt_tiles)
+        session.prompt_tiles = [t for t in session.prompt_tiles if t.id != tile_id]
+        
+        if len(session.prompt_tiles) < original_count:
+            # Also remove any child tiles that reference this as parent
+            session.prompt_tiles = [
+                t for t in session.prompt_tiles 
+                if t.parent_tile_id != tile_id
+            ]
+            session.updated_at = datetime.now(timezone.utc)
+            self._save(session)
+            logger.info(f"Deleted prompt tile {tile_id} from session {session_id}")
+            return True
+
+        # Try to delete from debates
+        original_debate_count = len(session.debates)
+        session.debates = [d for d in session.debates if d.id != tile_id]
+        
+        if len(session.debates) < original_debate_count:
+            session.updated_at = datetime.now(timezone.utc)
+            self._save(session)
+            logger.info(f"Deleted debate {tile_id} from session {session_id}")
+            return True
+
+        return False
 
     def update_tile_position(
         self, session_id: str, tile_id: str, position: TilePositionUpdate
@@ -369,3 +425,179 @@ class CanvasSessionStore:
         session.updated_at = datetime.now(timezone.utc)
         self._save(session)
         return True
+
+    def link_note(self, session_id: str, note_id: str) -> bool:
+        """Link an exported note to this canvas session"""
+        session = self._sessions.get(session_id)
+        if not session:
+            return False
+
+        session.linked_note_id = note_id
+        session.updated_at = datetime.now(timezone.utc)
+        self._save(session)
+        logger.info(f"Linked note {note_id} to canvas session {session_id}")
+        return True
+
+    def get_tile_edges(self, session_id: str) -> List[TileEdge]:
+        """Get all parent-child relationships for rendering mind-map edges"""
+        session = self._sessions.get(session_id)
+        if not session:
+            return []
+
+        edges = []
+        for tile in session.prompt_tiles:
+            if tile.parent_tile_id:
+                edges.append(
+                    TileEdge(
+                        source_tile_id=tile.parent_tile_id,
+                        target_tile_id=tile.id,
+                        source_model_id=tile.parent_model_id,
+                    )
+                )
+        return edges
+
+    # ============================================================
+    # Conversation Context Methods
+    # ============================================================
+
+    def build_full_history(
+        self,
+        session_id: str,
+        parent_tile_id: Optional[str],
+        parent_model_id: Optional[str],
+    ) -> List[Dict[str, str]]:
+        """
+        Build conversation history by walking up the parent chain.
+        Returns messages in chronological order (oldest first).
+
+        Each turn includes:
+        - user: the prompt from that tile
+        - assistant: the response from the model that was used to branch from it
+        """
+        session = self._sessions.get(session_id)
+        if not session or not parent_tile_id or not parent_model_id:
+            return []
+
+        # Collect turns walking backwards
+        turns = []
+        current_tile_id = parent_tile_id
+        current_model_id = parent_model_id
+
+        while current_tile_id:
+            tile = next(
+                (t for t in session.prompt_tiles if t.id == current_tile_id),
+                None
+            )
+            if not tile:
+                break
+
+            # Get the specific model's response
+            response = tile.responses.get(current_model_id)
+            if not response or response.status != "completed":
+                # Skip if response not available, but continue walking
+                break
+
+            turns.append({
+                "prompt": tile.prompt,
+                "response": response.content,
+            })
+
+            # Move to parent - use the tile's parent_model_id for next iteration
+            current_tile_id = tile.parent_tile_id
+            current_model_id = tile.parent_model_id
+            if not current_model_id and tile.parent_tile_id:
+                # Edge case: old tiles without parent_model_id
+                break
+
+        # Convert to messages format (oldest first)
+        messages = []
+        for turn in reversed(turns):
+            messages.append({"role": "user", "content": turn["prompt"]})
+            messages.append({"role": "assistant", "content": turn["response"]})
+
+        return messages
+
+    def build_compact_history(
+        self,
+        session_id: str,
+        parent_tile_id: Optional[str],
+        parent_model_id: Optional[str],
+        max_recent: int = 2,
+    ) -> List[Dict[str, str]]:
+        """
+        Build compact conversation history.
+        Recent turns are included verbatim, older turns are summarized.
+
+        Args:
+            session_id: The canvas session ID
+            parent_tile_id: The parent tile to start from
+            parent_model_id: The model whose response to follow
+            max_recent: Number of recent turns to include verbatim (default 2)
+
+        Returns:
+            List of messages with optional summary prefix
+        """
+        full_history = self.build_full_history(
+            session_id, parent_tile_id, parent_model_id
+        )
+
+        # If history is short, return as-is
+        if len(full_history) <= max_recent * 2:  # Each turn = 2 messages
+            return full_history
+
+        # Split into old and recent
+        recent_start = len(full_history) - (max_recent * 2)
+        old_turns = full_history[:recent_start]
+        recent_turns = full_history[recent_start:]
+
+        # Summarize old turns as context prefix
+        # Extract prompts (every other message starting at 0)
+        topics = []
+        for i in range(0, len(old_turns), 2):
+            prompt_content = old_turns[i]["content"]
+            # Truncate long prompts
+            if len(prompt_content) > 100:
+                prompt_content = prompt_content[:100] + "..."
+            topics.append(prompt_content)
+
+        summary = f"Previous discussion covered: {'; '.join(topics)}"
+
+        return [{"role": "system", "content": summary}] + recent_turns
+
+    def build_semantic_context(
+        self,
+        prompt: str,
+        vector_search,
+        top_k: int = 3,
+    ) -> List[Dict[str, str]]:
+        """
+        Build context by searching notes and tiles for relevant content.
+
+        Args:
+            prompt: The new prompt to find context for
+            vector_search: VectorSearchService instance
+            top_k: Number of results to include
+
+        Returns:
+            List with a single system message containing relevant context
+        """
+        if not vector_search:
+            return []
+
+        results = vector_search.search_all(prompt, limit=top_k)
+        if not results:
+            return []
+
+        context_parts = []
+        for r in results:
+            if r.get("tile_id"):  # Canvas tile result
+                context_parts.append(
+                    f"Previous conversation:\nQ: {r['prompt']}\nA: {r['response']}"
+                )
+            else:  # Note result
+                context_parts.append(
+                    f"From note '{r['title']}':\n{r['snippet']}"
+                )
+
+        context = "Relevant context:\n\n" + "\n\n---\n\n".join(context_parts)
+        return [{"role": "system", "content": context}]

@@ -21,7 +21,9 @@
             <router-link to="/canvas" class="btn btn-secondary" title="Multi-LLM Canvas">
               Canvas
             </router-link>
-            <button class="btn btn-ghost" title="Toggle Theme">🌙</button>
+            <button class="btn btn-ghost" @click="handleThemeToggle" title="Toggle Theme">
+              {{ themeIcon }}
+            </button>
             <button class="btn btn-primary" @click="handleNewNote">
               + New Note
             </button>
@@ -87,7 +89,7 @@
 </template>
 
 <script setup>
-import { ref, onMounted } from 'vue'
+import { ref, onMounted, computed } from 'vue'
 import { notes as notesApi } from '../api/client'
 import SearchBar from '../components/SearchBar.vue'
 import NoteEditor from '../components/NoteEditor.vue'
@@ -96,11 +98,23 @@ import TreeNav from '../components/TreeNav.vue'
 import MiniGraph from '../components/MiniGraph.vue'
 import OnThisPage from '../components/OnThisPage.vue'
 import GraphView from '../components/GraphView.vue'
+import { useThemeStore } from '../stores/theme'
 
 const notes = ref([])
 const selectedNoteId = ref(null)
 const selectedNote = ref(null)
 const showFullGraph = ref(false)
+const themeStore = useThemeStore()
+
+// Computed property to get the current theme icon
+const themeIcon = computed(() => {
+  return themeStore.theme === 'dark' ? '🌙' : '☀️'
+})
+
+// Function to toggle theme
+function handleThemeToggle() {
+  themeStore.toggleTheme()
+}
 
 // Load notes on mount
 onMounted(async () => {

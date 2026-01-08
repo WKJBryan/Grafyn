@@ -2,8 +2,16 @@
   <div class="dialog-overlay" @click.self="$emit('cancel')">
     <div class="dialog-content">
       <div class="dialog-header">
-        <h3>New Prompt</h3>
+        <h3>{{ branchContext ? 'Branch Prompt' : 'New Prompt' }}</h3>
         <button class="close-btn" @click="$emit('cancel')">&#10005;</button>
+      </div>
+
+      <!-- Branch Context Banner -->
+      <div v-if="branchContext" class="branch-context">
+        <span class="branch-icon">⑂</span>
+        <span class="branch-text">
+          Branching from <strong>{{ branchContext.parentContent?.model?.split('/').pop() || 'response' }}</strong>
+        </span>
       </div>
 
       <div class="dialog-body">
@@ -73,6 +81,19 @@
               />
             </div>
           </div>
+
+          <!-- Context Mode Selector (only for branching) -->
+          <div v-if="branchContext" class="form-group context-mode-group">
+            <label for="contextMode">Context Mode</label>
+            <select id="contextMode" v-model="contextMode" class="select-input">
+              <option value="full_history">Full History (all previous turns)</option>
+              <option value="compact">Compact (summary + recent)</option>
+              <option value="semantic">Semantic Search (relevant context)</option>
+            </select>
+            <span class="context-mode-hint">
+              {{ contextModeHints[contextMode] }}
+            </span>
+          </div>
         </div>
       </div>
 
@@ -98,6 +119,10 @@ const props = defineProps({
   models: {
     type: Array,
     default: () => []
+  },
+  branchContext: {
+    type: Object,
+    default: null
   }
 })
 
@@ -111,6 +136,14 @@ const selectedModels = ref([])
 const temperature = ref(0.7)
 const maxTokens = ref(2048)
 const showAdvanced = ref(false)
+const contextMode = ref('full_history')
+
+// Context mode descriptions
+const contextModeHints = {
+  full_history: 'Include all conversation turns from the parent chain',
+  compact: 'Include recent turns + summary of older context to save tokens',
+  semantic: 'Search notes and previous conversations for relevant context'
+}
 
 // Computed
 const canSubmit = computed(() => {
@@ -126,7 +159,8 @@ function handleSubmit() {
     models: selectedModels.value,
     systemPrompt: showSystemPrompt.value ? systemPrompt.value.trim() : null,
     temperature: temperature.value,
-    maxTokens: maxTokens.value
+    maxTokens: maxTokens.value,
+    contextMode: contextMode.value
   })
 }
 </script>
@@ -166,6 +200,25 @@ function handleSubmit() {
 .dialog-header h3 {
   margin: 0;
   font-size: 1.125rem;
+  color: var(--text-primary);
+}
+
+.branch-context {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-sm);
+  padding: var(--spacing-sm) var(--spacing-lg);
+  background: rgba(124, 92, 255, 0.1);
+  border-bottom: 1px solid rgba(124, 92, 255, 0.2);
+  color: var(--accent-primary);
+  font-size: 0.875rem;
+}
+
+.branch-icon {
+  font-size: 1rem;
+}
+
+.branch-text strong {
   color: var(--text-primary);
 }
 
@@ -215,12 +268,19 @@ function handleSubmit() {
 .checkbox-label {
   display: inline-flex;
   align-items: center;
-  gap: var(--spacing-xs);
+  gap: var(--spacing-sm);
   cursor: pointer;
+  white-space: nowrap;
+  font-size: 0.8125rem;
+  color: var(--text-secondary);
 }
 
 .checkbox-label input[type="checkbox"] {
   margin: 0;
+  flex-shrink: 0;
+  width: 16px;
+  height: 16px;
+  accent-color: var(--accent-primary);
 }
 
 .prompt-input,
@@ -304,5 +364,32 @@ function handleSubmit() {
   gap: var(--spacing-sm);
   padding: var(--spacing-md) var(--spacing-lg);
   border-top: 1px solid var(--bg-tertiary);
+}
+
+.context-mode-group {
+  margin-top: var(--spacing-md);
+}
+
+.select-input {
+  width: 100%;
+  padding: var(--spacing-sm);
+  background: var(--bg-secondary);
+  border: 1px solid var(--bg-tertiary);
+  border-radius: var(--radius-sm);
+  color: var(--text-primary);
+  font-size: 0.875rem;
+  cursor: pointer;
+}
+
+.select-input:focus {
+  border-color: var(--accent-primary);
+  outline: none;
+}
+
+.context-mode-hint {
+  display: block;
+  margin-top: var(--spacing-xs);
+  font-size: 0.75rem;
+  color: var(--text-muted);
 }
 </style>

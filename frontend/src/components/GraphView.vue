@@ -164,15 +164,16 @@ function initGraph() {
     .attr('stroke', '#fff')
     .attr('stroke-width', 1.5)
     
-  // Node labels
+  // Node labels - use CSS variable so it adapts to light/dark theme
+  const textColor = getComputedStyle(document.documentElement).getPropertyValue('--text-primary').trim() || '#e8e8ed'
   node.append('text')
     .text(d => d.label)
     .attr('x', 12)
     .attr('y', 4)
     .attr('font-size', '12px')
-    .attr('fill', '#e8e8ed')
+    .attr('fill', textColor)
+    .attr('class', 'graph-node-label')
     .style('pointer-events', 'none')
-    .style('text-shadow', '0 1px 3px rgba(0,0,0,0.8)')
     
   // Animation loop
   simulation.on('tick', () => {
@@ -342,5 +343,21 @@ function resetZoom() {
 .btn-sm {
   padding: 4px 8px;
   font-size: 0.75rem;
+}
+
+/* Graph node label styling - adapts to light/dark theme */
+.graph-canvas :deep(.graph-node-label) {
+  fill: var(--text-primary);
+  text-shadow: 0 1px 3px var(--bg-primary);
+}
+
+/* In dark mode, use light shadow for contrast */
+:root[data-theme="dark"] .graph-canvas :deep(.graph-node-label) {
+  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.8);
+}
+
+/* In light mode, use subtle shadow for readability */
+:root[data-theme="light"] .graph-canvas :deep(.graph-node-label) {
+  text-shadow: 0 1px 2px rgba(255, 255, 255, 0.8);
 }
 </style>

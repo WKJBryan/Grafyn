@@ -6,8 +6,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 | Component | Stack | Entry Point | Port |
 |-----------|-------|-------------|------|
-| **Backend** | FastAPI, LanceDB, sentence-transformers | `backend/app/main.py` | 8080 |
-| **Frontend** | Vue 3, Vite, Pinia | `frontend/src/main.js` | 5173 |
+| **Backend** | FastAPI, LanceDB, sentence-transformers, OpenRouter | `backend/app/main.py` | 8080 |
+| **Frontend** | Vue 3, Vite, Pinia, D3.js | `frontend/src/main.js` | 5173 |
 
 ## Development Commands
 
@@ -98,6 +98,8 @@ The backend uses a **singleton service pattern** initialized at startup via `lif
 app.state.knowledge_store    # Markdown CRUD + wikilink parsing
 app.state.vector_search       # LanceDB semantic search
 app.state.graph_index         # Backlinks + graph traversal
+app.state.openrouter          # OpenRouter API client (Multi-LLM)
+app.state.canvas_store        # Canvas session storage
 ```
 
 **Access pattern in routers:**
@@ -117,6 +119,8 @@ async def list_notes(request: Request):
 | `GraphIndexService` | `services/graph_index.py` | Yes | In-memory adjacency lists for backlinks/outgoing links |
 | `EmbeddingService` | `services/embedding.py` | Yes | sentence-transformers wrapper (all-MiniLM-L6-v2) |
 | `TokenStore` | `services/token_store.py` | No | OAuth token management (stateful per-instance) |
+| `OpenRouterService` | `services/openrouter.py` | Yes | OpenRouter API client with streaming support |
+| `CanvasSessionStore` | `services/canvas_store.py` | Yes | Canvas session persistence (JSON file storage) |
 
 ### Middleware Order (Applied Bottom-Up)
 
@@ -134,14 +138,16 @@ RequestSanitizationMiddleware  # Input validation/sanitization
 **Pinia Stores:**
 - `stores/auth.js` - OAuth state, user session, token management
 - `stores/notes.js` - Note list, selected note, CRUD operations
+- `stores/canvas.js` - Canvas sessions, tiles, SSE streaming, debates
 
 **API Client Pattern:**
 ```javascript
 // src/api/client.js provides typed API calls
-import { notes, search, graph, auth } from '@/api/client'
+import { notes, search, graph, auth, canvas } from '@/api/client'
 
-// All API calls use fetch with JSON body
+// All API calls use Axios with JSON body
 const result = await notes.get('note-id')
+const models = await canvas.getModels()
 ```
 
 ## Key Concepts
@@ -182,19 +188,56 @@ Stored in YAML frontmatter `status` field. Frontend filters/displays based on st
 - **Setup:** `setup_mcp(app)` in `main.py` auto-exposes tagged endpoints
 - **OAuth:** GitHub OAuth required for ChatGPT integration (tokens in `TokenStore`)
 
+### Multi-LLM Canvas
+
+The Canvas feature allows comparing responses from multiple LLM models simultaneously.
+
+**Features:**
+- Send one prompt to multiple models via OpenRouter
+- Real-time SSE streaming of responses
+- Infinite canvas with drag-and-drop tiles (D3.js zoom/pan)
+- Model debate mode (auto or user-mediated)
+- Session persistence (JSON files in `data/canvas/`)
+
+**Architecture:**
+```
+User Prompt → CanvasStore (create tile) → OpenRouterService (parallel streams)
+                                                    ↓
+                                        SSE multiplexing via asyncio.Queue
+                                                    ↓
+                                        Frontend updates per-model content
+```
+
+**API Endpoints (`/api/canvas`):**
+| Method | Endpoint | Purpose |
+|--------|----------|---------|
+| GET | `/` | List all sessions |
+| POST | `/` | Create new session |
+| GET | `/{id}` | Get session with tiles |
+| PUT | `/{id}` | Update session metadata |
+| DELETE | `/{id}` | Delete session |
+| GET | `/models/available` | List OpenRouter models |
+| POST | `/{id}/prompt` | Send prompt to models (SSE) |
+| PUT | `/{id}/tiles/{tid}/position` | Update tile position |
+| POST | `/{id}/debate` | Start model debate (SSE) |
+
+**Frontend Route:** `/canvas` and `/canvas/:id`
+
 ## Configuration
 
 ### Environment Setup
 
 ```bash
-# Backend (required)
-cd backend
-cp .env.example .env
+# Backend (required) - run from project root
+cp backend/.env.example .env
 # Edit .env with:
 # - VAULT_PATH (default: ../vault)
 # - DATA_PATH (default: ../data)
 # - GITHUB_CLIENT_ID/SECRET (for MCP OAuth)
 # - TOKEN_ENCRYPTION_KEY (generate with: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())")
+# - OPENROUTER_API_KEY (for Multi-LLM Canvas feature)
+
+# Note: .env must be in project root when running from root
 ```
 
 ### Critical Settings
@@ -205,6 +248,9 @@ cp .env.example .env
 | `CORS_ORIGINS` | `*` (dev) | Comma-separated in production |
 | `RATE_LIMIT_ENABLED` | `true` | Slowapi rate limiting (10/min, 50/hr, 200/day) |
 | `EMBEDDING_MODEL` | `all-MiniLM-L6-v2` | Must match LanceDB vector dimension (384) |
+| `OPENROUTER_API_KEY` | `""` | Required for Multi-LLM Canvas feature |
+| `APP_URL` | `http://localhost:8080` | Used in OpenRouter API headers |
+| `CANVAS_DATA_PATH` | `../data/canvas` | JSON storage for canvas sessions |
 
 ## Common Patterns
 
@@ -257,6 +303,7 @@ routers/
   search.py    - 2 endpoints (query, similar)
   graph.py     - 5 endpoints (backlinks, outgoing, neighbors, unlinked, rebuild)
   oauth.py     - 2 endpoints (GitHub OAuth flow)
+  canvas.py    - 9 endpoints (sessions, prompts, debates, SSE streaming)
 
 services/
   knowledge_store.py  - Markdown I/O, frontmatter parsing
@@ -264,6 +311,12 @@ services/
   graph_index.py      - Adjacency lists (Dict[str, Set[str]])
   embedding.py        - sentence-transformers SentenceTransformer wrapper
   token_store.py      - In-memory OAuth token storage with TTL
+  openrouter.py       - OpenRouter API client with streaming
+  canvas_store.py     - Canvas session CRUD (JSON file storage)
+
+models/
+  note.py      - Note, NoteCreate, NoteUpdate schemas
+  canvas.py    - CanvasSession, PromptTile, ModelResponse, DebateRound schemas
 
 middleware/
   security.py   - SecurityHeadersMiddleware, RequestSanitizationMiddleware
@@ -280,6 +333,7 @@ mcp/
 ```
 views/
   HomeView.vue          - Main app (header, sidebar, editor, backlinks panel)
+  CanvasView.vue        - Multi-LLM Canvas with session sidebar
   LoginView.vue         - GitHub OAuth login page
   OAuthCallbackView.vue - OAuth code→token exchange
   NotFoundView.vue      - 404 page
@@ -291,9 +345,19 @@ components/
   BacklinksPanel.vue - Right panel showing incoming links
   GraphView.vue      - Graph visualization (neighbors endpoint)
 
+components/canvas/
+  CanvasContainer.vue   - Infinite canvas with D3 zoom/pan
+  PromptTile.vue        - Draggable tile with prompt + model responses
+  ModelResponseCard.vue - Single model response with streaming
+  ModelSelector.vue     - Model picker grouped by provider
+  PromptDialog.vue      - New prompt modal with settings
+  DebateTile.vue        - Debate visualization with rounds
+  DebateControls.vue    - Auto/mediated debate toggle
+
 stores/
   auth.js   - { user, token, isAuthenticated } + login/logout/checkAuth
   notes.js  - { notes[], selectedNote } + loadNotes/createNote/updateNote/deleteNote
+  canvas.js - { sessions[], currentSession, availableModels } + SSE streaming
 ```
 
 ## Data Models
@@ -324,6 +388,37 @@ updated_at: 2025-01-07T12:00:00Z
 ---
 
 Markdown content here with [[wikilinks]].
+```
+
+### Canvas Session Object (Pydantic)
+
+```python
+class CanvasSession(BaseModel):
+    id: str
+    title: str
+    description: Optional[str]
+    prompt_tiles: List[PromptTile]      # Tiles with prompts + responses
+    debates: List[DebateRound]          # Model debate rounds
+    viewport: CanvasViewport            # { x, y, zoom }
+    created_at: datetime
+    updated_at: datetime
+    tags: List[str]
+    status: str                         # draft|evidence|canonical
+
+class PromptTile(BaseModel):
+    id: str
+    prompt: str
+    system_prompt: Optional[str]
+    models: List[str]                   # Model IDs sent to
+    responses: Dict[str, ModelResponse] # model_id -> response
+    position: TilePosition              # { x, y, width, height }
+
+class ModelResponse(BaseModel):
+    id: str
+    model_id: str                       # e.g., "openai/gpt-4o"
+    model_name: str                     # Display name
+    content: str                        # Streamed response
+    status: str                         # pending|streaming|completed|error
 ```
 
 ## Testing

@@ -11,6 +11,13 @@ class DebateMode(str, Enum):
     MEDIATED = "mediated"
 
 
+class ContextMode(str, Enum):
+    """Context mode for branched prompts"""
+    FULL_HISTORY = "full_history"  # Walk parent chain, include all turns
+    COMPACT = "compact"  # Recent turns verbatim + summary of older context
+    SEMANTIC = "semantic"  # RAG-style search across notes and tiles
+
+
 class TilePosition(BaseModel):
     """Position and size of a tile on the canvas"""
     x: float = 0.0
@@ -42,6 +49,9 @@ class PromptTile(BaseModel):
     responses: Dict[str, ModelResponse] = Field(default_factory=dict)
     position: TilePosition = Field(default_factory=TilePosition)
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    # Branching/mind-map support
+    parent_tile_id: Optional[str] = None  # ID of the parent tile this branches from
+    parent_model_id: Optional[str] = None  # Which model's response this branches from
 
 
 class DebateRound(BaseModel):
@@ -114,6 +124,11 @@ class PromptRequest(BaseModel):
     models: List[str] = Field(..., min_length=1)
     temperature: float = Field(default=0.7, ge=0.0, le=2.0)
     max_tokens: int = Field(default=2048, ge=1, le=32000)
+    # Branching support
+    parent_tile_id: Optional[str] = None
+    parent_model_id: Optional[str] = None
+    # Context mode for conversation history
+    context_mode: ContextMode = Field(default=ContextMode.FULL_HISTORY)
 
 
 class DebateStartRequest(BaseModel):
@@ -146,3 +161,10 @@ class TilePositionUpdate(BaseModel):
     y: float
     width: Optional[float] = None
     height: Optional[float] = None
+
+
+class TileEdge(BaseModel):
+    """Edge connecting parent tile to child tile (for mind-map visualization)"""
+    source_tile_id: str  # Parent tile ID
+    target_tile_id: str  # Child tile ID
+    source_model_id: Optional[str] = None  # Which model response the child branches from

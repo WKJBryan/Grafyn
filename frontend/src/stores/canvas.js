@@ -27,6 +27,36 @@ export const useCanvasStore = defineStore('canvas', () => {
     return groups
   })
 
+  // Computed edges for mind-map visualization
+  const tileEdges = computed(() => {
+    if (!currentSession.value) return []
+    return currentSession.value.prompt_tiles
+      .filter(t => t.parent_tile_id)
+      .map(t => ({
+        source_tile_id: t.parent_tile_id,
+        target_tile_id: t.id,
+        source_model_id: t.parent_model_id,
+        type: 'prompt'
+      }))
+  })
+
+  // Computed edges for debates (from source tiles to debate)
+  const debateEdges = computed(() => {
+    if (!currentSession.value) return []
+    const edges = []
+    for (const debate of currentSession.value.debates || []) {
+      for (const sourceTileId of debate.source_tile_ids || []) {
+        edges.push({
+          source_tile_id: sourceTileId,
+          target_id: debate.id,
+          target_type: 'debate',
+          type: 'debate'
+        })
+      }
+    }
+    return edges
+  })
+
   // Actions
   async function loadSessions() {
     loading.value = true
@@ -118,7 +148,7 @@ export const useCanvasStore = defineStore('canvas', () => {
     }
   }
 
-  async function sendPrompt(prompt, models, systemPrompt = null, temperature = 0.7, maxTokens = 2048) {
+  async function sendPrompt(prompt, models, systemPrompt = null, temperature = 0.7, maxTokens = 2048, parentTileId = null, parentModelId = null, contextMode = 'full_history') {
     if (!currentSession.value) {
       throw new Error('No active session')
     }
@@ -138,7 +168,10 @@ export const useCanvasStore = defineStore('canvas', () => {
           models,
           system_prompt: systemPrompt,
           temperature,
-          max_tokens: maxTokens
+          max_tokens: maxTokens,
+          parent_tile_id: parentTileId,
+          parent_model_id: parentModelId,
+          context_mode: contextMode
         })
       })
 
@@ -240,6 +273,45 @@ export const useCanvasStore = defineStore('canvas', () => {
       await canvasApi.updateTilePosition(currentSession.value.id, tileId, position)
     } catch (err) {
       console.error('Failed to update tile position:', err)
+    }
+  }
+
+  async function deleteTile(tileId) {
+    if (!currentSession.value) return
+
+    // Optimistic update - remove from prompt tiles
+    const tileIndex = currentSession.value.prompt_tiles.findIndex(t => t.id === tileId)
+    let removedTile = null
+    if (tileIndex !== -1) {
+      removedTile = currentSession.value.prompt_tiles[tileIndex]
+      currentSession.value.prompt_tiles.splice(tileIndex, 1)
+      // Also remove any child tiles
+      currentSession.value.prompt_tiles = currentSession.value.prompt_tiles.filter(
+        t => t.parent_tile_id !== tileId
+      )
+    }
+
+    // Also try to remove from debates
+    const debateIndex = currentSession.value.debates.findIndex(d => d.id === tileId)
+    let removedDebate = null
+    if (debateIndex !== -1) {
+      removedDebate = currentSession.value.debates[debateIndex]
+      currentSession.value.debates.splice(debateIndex, 1)
+    }
+
+    // Persist to backend
+    try {
+      await canvasApi.deleteTile(currentSession.value.id, tileId)
+    } catch (err) {
+      console.error('Failed to delete tile:', err)
+      // Revert optimistic update on error
+      if (removedTile) {
+        currentSession.value.prompt_tiles.push(removedTile)
+      }
+      if (removedDebate) {
+        currentSession.value.debates.push(removedDebate)
+      }
+      throw err
     }
   }
 
@@ -406,6 +478,30 @@ export const useCanvasStore = defineStore('canvas', () => {
     }
   }
 
+  async function saveAsNote() {
+    if (!currentSession.value) {
+      throw new Error('No active session')
+    }
+
+    const sessionId = currentSession.value.id
+    error.value = null
+
+    try {
+      const result = await canvasApi.exportToNote(sessionId)
+
+      // Update current session with linked note
+      if (currentSession.value) {
+        currentSession.value.linked_note_id = result.note_id
+      }
+
+      return result
+    } catch (err) {
+      error.value = err.message || 'Failed to export to note'
+      console.error('Failed to export canvas to note:', err)
+      throw err
+    }
+  }
+
   function clearError() {
     error.value = null
   }
@@ -423,6 +519,25 @@ export const useCanvasStore = defineStore('canvas', () => {
     streamingModels.value.clear()
   }
 
+  // Branching helper - get parent response content for context
+  function getParentResponseContent(parentTileId, parentModelId) {
+    if (!currentSession.value || !parentTileId) return null
+    const tile = currentSession.value.prompt_tiles.find(t => t.id === parentTileId)
+    if (!tile) return null
+
+    const response = tile.responses[parentModelId]
+    return {
+      prompt: tile.prompt,
+      model: parentModelId,
+      content: response?.content || ''
+    }
+  }
+
+  // Branch from a specific model response
+  async function branchFromResponse(parentTileId, parentModelId, newPrompt, models, systemPrompt = null, temperature = 0.7, maxTokens = 2048, contextMode = 'full_history') {
+    return sendPrompt(newPrompt, models, systemPrompt, temperature, maxTokens, parentTileId, parentModelId, contextMode)
+  }
+
   return {
     // State
     sessions,
@@ -437,6 +552,8 @@ export const useCanvasStore = defineStore('canvas', () => {
     hasSession,
     isStreaming,
     modelsByProvider,
+    tileEdges,
+    debateEdges,
     // Actions
     loadSessions,
     loadSession,
@@ -446,11 +563,15 @@ export const useCanvasStore = defineStore('canvas', () => {
     loadModels,
     sendPrompt,
     updateTilePosition,
+    deleteTile,
     updateViewport,
     startDebate,
     continueDebate,
+    saveAsNote,
     clearError,
     clearSession,
-    reset
+    reset,
+    getParentResponseContent,
+    branchFromResponse
   }
 })

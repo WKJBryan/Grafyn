@@ -4,9 +4,14 @@
     <aside class="canvas-sidebar">
       <div class="sidebar-header">
         <h2>Canvas Sessions</h2>
-        <button class="btn btn-primary btn-sm" @click="createNewSession">
-          + New
-        </button>
+        <div class="header-actions">
+          <button class="btn btn-ghost btn-sm" @click="handleThemeToggle" title="Toggle Theme">
+            {{ themeIcon }}
+          </button>
+          <button class="btn btn-primary btn-sm" @click="createNewSession">
+            + New
+          </button>
+        </div>
       </div>
 
       <div class="sessions-list">
@@ -113,16 +118,28 @@
 import { ref, computed, onMounted, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useCanvasStore } from '@/stores/canvas'
+import { useThemeStore } from '@/stores/theme'
 import CanvasContainer from '@/components/canvas/CanvasContainer.vue'
 
 const route = useRoute()
 const router = useRouter()
 const canvasStore = useCanvasStore()
+const themeStore = useThemeStore()
 
 // Local state
 const showCreateDialog = ref(false)
 const newSessionTitle = ref('')
 const newSessionDescription = ref('')
+
+// Computed property to get the current theme icon
+const themeIcon = computed(() => {
+  return themeStore.theme === 'dark' ? '🌙' : '☀️'
+})
+
+// Function to toggle theme
+function handleThemeToggle() {
+  themeStore.toggleTheme()
+}
 
 // Computed
 const sessions = computed(() => canvasStore.sessions)
@@ -219,6 +236,12 @@ function formatDate(dateStr) {
   margin: 0;
   font-size: 1rem;
   color: var(--text-primary);
+}
+
+.header-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-sm);
 }
 
 .sessions-list {
