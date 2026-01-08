@@ -5,7 +5,15 @@
       "Bash(dir \"C:\\\\Users\\\\bryan\\\\Seedream\\\\backend\\\\tests\\\\unit\")",
       "Bash(dir \"C:\\\\Users\\\\bryan\\\\Seedream\\\\backend\\\\tests\")",
       "Bash(git checkout:*)",
-      "WebSearch"
+      "WebSearch",
+      "Bash(python -m uvicorn:*)",
+      "Bash(curl:*)",
+      "Bash(python -m json.tool:*)",
+      "Bash(npm run dev:*)",
+      "Bash(python:*)",
+      "Bash(timeout /t 5 /nobreak)",
+      "Bash(pkill:*)",
+      "Bash(taskkill:*)"
     ]
   }
 }
