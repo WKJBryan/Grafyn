@@ -25,7 +25,11 @@
       "mcp__plugin_playwright_playwright__browser_select_option",
       "mcp__plugin_playwright_playwright__browser_close",
       "Bash(git add:*)",
-      "Bash(git reset:*)"
+      "Bash(git reset:*)",
+      "Bash(git commit:*)",
+      "Bash(git push:*)",
+      "Bash(gh pr create:*)",
+      "Bash(where:*)"
     ]
   }
 }
