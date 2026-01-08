@@ -74,4 +74,20 @@ export const oauth = {
   logout: () => api.post('/oauth/logout'),
 }
 
+// Canvas API
+export const canvas = {
+  list: () => api.get('/canvas'),
+  get: (id) => api.get(`/canvas/${encodeURIComponent(id)}`),
+  create: (data) => api.post('/canvas', data),
+  update: (id, data) => api.put(`/canvas/${encodeURIComponent(id)}`, data),
+  delete: (id) => api.delete(`/canvas/${encodeURIComponent(id)}`),
+  getModels: () => api.get('/canvas/models/available'),
+  updateTilePosition: (sessionId, tileId, position) =>
+    api.put(`/canvas/${encodeURIComponent(sessionId)}/tiles/${encodeURIComponent(tileId)}/position`, position),
+  updateViewport: (sessionId, viewport) =>
+    api.put(`/canvas/${encodeURIComponent(sessionId)}/viewport`, viewport),
+  updateDebateStatus: (sessionId, debateId, status) =>
+    api.put(`/canvas/${encodeURIComponent(sessionId)}/debate/${encodeURIComponent(debateId)}/status`, null, { params: { status } }),
+}
+
 export default api

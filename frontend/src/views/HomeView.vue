@@ -18,6 +18,9 @@
         </div>
         <div class="header-right">
           <div class="action-buttons">
+            <router-link to="/canvas" class="btn btn-secondary" title="Multi-LLM Canvas">
+              Canvas
+            </router-link>
             <button class="btn btn-ghost" title="Toggle Theme">🌙</button>
             <button class="btn btn-primary" @click="handleNewNote">
               + New Note

@@ -1,0 +1,308 @@
+<template>
+  <div class="dialog-overlay" @click.self="$emit('cancel')">
+    <div class="dialog-content">
+      <div class="dialog-header">
+        <h3>New Prompt</h3>
+        <button class="close-btn" @click="$emit('cancel')">&#10005;</button>
+      </div>
+
+      <div class="dialog-body">
+        <div class="form-group">
+          <label for="prompt">Prompt</label>
+          <textarea
+            id="prompt"
+            v-model="prompt"
+            placeholder="Enter your prompt..."
+            rows="4"
+            class="prompt-input"
+            @keydown.ctrl.enter="handleSubmit"
+          ></textarea>
+        </div>
+
+        <div class="form-group checkbox-group">
+          <label class="checkbox-label">
+            <input type="checkbox" v-model="showSystemPrompt" />
+            <span>Add system prompt</span>
+          </label>
+          <textarea
+            v-if="showSystemPrompt"
+            v-model="systemPrompt"
+            placeholder="Optional system prompt..."
+            rows="2"
+            class="system-input"
+          ></textarea>
+        </div>
+
+        <div class="form-group">
+          <label>Select Models</label>
+          <ModelSelector
+            :models="models"
+            v-model="selectedModels"
+          />
+        </div>
+
+        <div class="advanced-toggle" @click="showAdvanced = !showAdvanced">
+          <span>Advanced Options</span>
+          <span class="toggle-icon">{{ showAdvanced ? '-' : '+' }}</span>
+        </div>
+
+        <div v-if="showAdvanced" class="advanced-options">
+          <div class="form-row">
+            <div class="form-group">
+              <label for="temperature">Temperature: {{ temperature }}</label>
+              <input
+                id="temperature"
+                type="range"
+                v-model.number="temperature"
+                min="0"
+                max="2"
+                step="0.1"
+                class="slider"
+              />
+            </div>
+            <div class="form-group">
+              <label for="maxTokens">Max Tokens</label>
+              <input
+                id="maxTokens"
+                type="number"
+                v-model.number="maxTokens"
+                min="100"
+                max="32000"
+                step="100"
+                class="number-input"
+              />
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="dialog-footer">
+        <button class="btn btn-secondary" @click="$emit('cancel')">Cancel</button>
+        <button
+          class="btn btn-primary"
+          :disabled="!canSubmit"
+          @click="handleSubmit"
+        >
+          Send to {{ selectedModels.length }} Model{{ selectedModels.length !== 1 ? 's' : '' }}
+        </button>
+      </div>
+    </div>
+  </div>
+</template>
+
+<script setup>
+import { ref, computed } from 'vue'
+import ModelSelector from './ModelSelector.vue'
+
+const props = defineProps({
+  models: {
+    type: Array,
+    default: () => []
+  }
+})
+
+const emit = defineEmits(['submit', 'cancel'])
+
+// Form state
+const prompt = ref('')
+const systemPrompt = ref('')
+const showSystemPrompt = ref(false)
+const selectedModels = ref([])
+const temperature = ref(0.7)
+const maxTokens = ref(2048)
+const showAdvanced = ref(false)
+
+// Computed
+const canSubmit = computed(() => {
+  return prompt.value.trim().length > 0 && selectedModels.value.length > 0
+})
+
+// Methods
+function handleSubmit() {
+  if (!canSubmit.value) return
+
+  emit('submit', {
+    prompt: prompt.value.trim(),
+    models: selectedModels.value,
+    systemPrompt: showSystemPrompt.value ? systemPrompt.value.trim() : null,
+    temperature: temperature.value,
+    maxTokens: maxTokens.value
+  })
+}
+</script>
+
+<style scoped>
+.dialog-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.7);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+  padding: var(--spacing-lg);
+}
+
+.dialog-content {
+  background: var(--bg-secondary);
+  border: 1px solid var(--bg-tertiary);
+  border-radius: var(--radius-lg);
+  width: 100%;
+  max-width: 600px;
+  max-height: 90vh;
+  display: flex;
+  flex-direction: column;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+}
+
+.dialog-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--spacing-md) var(--spacing-lg);
+  border-bottom: 1px solid var(--bg-tertiary);
+}
+
+.dialog-header h3 {
+  margin: 0;
+  font-size: 1.125rem;
+  color: var(--text-primary);
+}
+
+.close-btn {
+  width: 32px;
+  height: 32px;
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  border-radius: var(--radius-sm);
+  font-size: 1rem;
+}
+
+.close-btn:hover {
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+}
+
+.dialog-body {
+  flex: 1;
+  padding: var(--spacing-lg);
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-md);
+}
+
+.form-group {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-xs);
+}
+
+.form-group label {
+  font-size: 0.875rem;
+  color: var(--text-secondary);
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-sm);
+}
+
+.checkbox-group {
+  align-items: flex-start;
+}
+
+.checkbox-label {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--spacing-xs);
+  cursor: pointer;
+}
+
+.checkbox-label input[type="checkbox"] {
+  margin: 0;
+}
+
+.prompt-input,
+.system-input {
+  width: 100%;
+  padding: var(--spacing-sm);
+  background: var(--bg-tertiary);
+  border: 1px solid var(--bg-tertiary);
+  border-radius: var(--radius-sm);
+  color: var(--text-primary);
+  font-size: 0.875rem;
+  font-family: inherit;
+  resize: vertical;
+}
+
+.prompt-input:focus,
+.system-input:focus {
+  border-color: var(--accent-primary);
+  outline: none;
+}
+
+.prompt-input {
+  min-height: 100px;
+}
+
+.advanced-toggle {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--spacing-sm);
+  background: var(--bg-tertiary);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  font-size: 0.875rem;
+  color: var(--text-secondary);
+}
+
+.advanced-toggle:hover {
+  background: var(--bg-hover);
+}
+
+.toggle-icon {
+  font-weight: 600;
+}
+
+.advanced-options {
+  padding: var(--spacing-md);
+  background: var(--bg-tertiary);
+  border-radius: var(--radius-sm);
+}
+
+.form-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--spacing-md);
+}
+
+.slider {
+  width: 100%;
+  accent-color: var(--accent-primary);
+}
+
+.number-input {
+  width: 100%;
+  padding: var(--spacing-sm);
+  background: var(--bg-secondary);
+  border: 1px solid var(--bg-tertiary);
+  border-radius: var(--radius-sm);
+  color: var(--text-primary);
+  font-size: 0.875rem;
+}
+
+.number-input:focus {
+  border-color: var(--accent-primary);
+  outline: none;
+}
+
+.dialog-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--spacing-sm);
+  padding: var(--spacing-md) var(--spacing-lg);
+  border-top: 1px solid var(--bg-tertiary);
+}
+</style>

@@ -21,6 +21,18 @@ const routes = [
     meta: { requiresAuth: false }
   },
   {
+    path: '/canvas',
+    name: 'canvas',
+    component: () => import('../views/CanvasView.vue'),
+    meta: { requiresAuth: false }
+  },
+  {
+    path: '/canvas/:id',
+    name: 'canvas-session',
+    component: () => import('../views/CanvasView.vue'),
+    meta: { requiresAuth: false }
+  },
+  {
     path: '/:pathMatch(.*)*',
     name: 'not-found',
     component: () => import('../views/NotFoundView.vue'),
