@@ -4,15 +4,25 @@
       <div class="toolbar-left">
         <span class="session-title" v-if="session">{{ session.title }}</span>
         <span class="toolbar-stats" v-if="session">
-          <span class="stat-item">{{ session.prompt_tiles?.length || 0 }} Tiles</span>
+          <span class="stat-item">{{ promptTiles.length }} Prompts</span>
           <span class="stat-divider">|</span>
-          <span class="stat-item">{{ session.debates?.length || 0 }} Debates</span>
+          <span class="stat-item">{{ llmNodes.length }} Responses</span>
+          <span class="stat-divider">|</span>
+          <span class="stat-item">{{ debates.length }} Debates</span>
         </span>
         <span v-if="session?.linked_note_id" class="linked-note-badge" title="Saved as note">
           Linked
         </span>
       </div>
       <div class="toolbar-actions">
+        <button
+          class="btn btn-secondary btn-sm"
+          @click="handleAutoArrange"
+          :disabled="!session || promptTiles.length === 0"
+          title="Auto-arrange nodes"
+        >
+          <span class="icon">⊞</span> Arrange
+        </button>
         <button
           class="btn btn-secondary btn-sm"
           @click="handleSaveAsNote"
@@ -37,51 +47,90 @@
 
     <div class="canvas-surface" ref="surface">
       <div class="canvas-content" :style="transformStyle">
-        <!-- SVG layer for edges (inside content for shared coordinates) -->
+        <!-- SVG layer for edges -->
         <svg class="edges-layer">
+          <!-- Prompt → LLM edges -->
           <path
-            v-for="edge in edgePaths"
-            :key="`${edge.source}-${edge.target}`"
+            v-for="edge in promptToLLMEdges"
+            :key="`p2l-${edge.source}-${edge.target}`"
             :d="edge.path"
-            class="tile-edge"
-            :class="{ 'debate-edge': edge.type === 'debate' }"
+            class="node-edge prompt-to-llm"
+            :style="{ stroke: edge.color }"
+          />
+          <!-- LLM → Prompt branch edges -->
+          <path
+            v-for="edge in branchEdges"
+            :key="`br-${edge.source}-${edge.target}`"
+            :d="edge.path"
+            class="node-edge branch-edge"
+          />
+          <!-- Debate edges -->
+          <path
+            v-for="edge in debateEdgePaths"
+            :key="`db-${edge.source}-${edge.target}`"
+            :d="edge.path"
+            class="node-edge debate-edge"
           />
         </svg>
-        
-        <!-- Prompt Tiles -->
-        <PromptTile
+
+        <!-- Prompt Nodes -->
+        <PromptNode
           v-for="tile in promptTiles"
-          :key="tile.id"
+          :key="`prompt-${tile.id}`"
           :tile="tile"
-          :selected="selectedTiles.includes(tile.id)"
-          :streaming-models="streamingModels"
-          @drag="handleTileDrag"
-          @select="handleTileSelect"
-          @branch="handleInlineBranch"
-          @delete="handleDeleteTile"
+          :selected="selectedNodes.includes(`prompt:${tile.id}`)"
+          @drag="handlePromptDrag"
+          @delete="handleDeletePrompt"
         />
 
-        <!-- Debate Tiles -->
-        <DebateTile
+        <!-- LLM Response Nodes -->
+        <LLMNode
+          v-for="node in llmNodes"
+          :key="`llm-${node.tileId}-${node.modelId}`"
+          :tile-id="node.tileId"
+          :model-id="node.modelId"
+          :response="node.response"
+          :is-streaming="streamingModels.has(node.modelId)"
+          :selected="selectedNodes.includes(`llm:${node.tileId}:${node.modelId}`)"
+          @drag="handleLLMDrag"
+          @branch="handleLLMBranch"
+          @select="handleNodeSelect"
+          @delete="handleDeleteLLMNode"
+        />
+
+        <!-- Debate Nodes -->
+        <DebateNode
           v-for="debate in debates"
-          :key="debate.id"
+          :key="`debate-${debate.id}`"
           :debate="debate"
+          :is-expanded="expandedDebates.includes(debate.id)"
           @drag="handleDebateDrag"
+          @delete="handleDeleteDebate"
+          @expand="expandDebate"
+          @collapse="collapseDebate"
           @continue="handleDebateContinue"
-          @delete="handleDeleteTile"
         />
       </div>
     </div>
 
     <!-- Minimap -->
-    <div class="minimap" v-if="session && promptTiles.length > 0">
+    <div class="minimap" v-if="session && (promptTiles.length > 0 || llmNodes.length > 0)">
       <div class="minimap-content">
+        <!-- Prompt nodes in minimap -->
         <div
           v-for="tile in promptTiles"
-          :key="'mini-' + tile.id"
-          class="minimap-tile"
-          :style="minimapTileStyle(tile)"
-          @click="panToTile(tile)"
+          :key="'mini-prompt-' + tile.id"
+          class="minimap-node minimap-prompt"
+          :style="minimapPromptStyle(tile)"
+          @click="panToNode(tile.position)"
+        ></div>
+        <!-- LLM nodes in minimap -->
+        <div
+          v-for="node in llmNodes"
+          :key="'mini-llm-' + node.tileId + '-' + node.modelId"
+          class="minimap-node minimap-llm"
+          :style="minimapLLMStyle(node)"
+          @click="panToNode(node.response.position)"
         ></div>
         <div class="minimap-viewport" :style="minimapViewportStyle"></div>
       </div>
@@ -98,13 +147,13 @@
       </button>
       <button
         class="btn btn-secondary"
-        :disabled="selectedTiles.length < 2"
+        :disabled="selectedLLMNodes.length < 2"
         @click="handleStartDebate"
       >
-        Debate ({{ selectedTiles.length }})
+        Debate ({{ selectedLLMNodes.length }})
       </button>
       <button
-        v-if="selectedTiles.length > 0"
+        v-if="selectedNodes.length > 0"
         class="btn btn-ghost"
         @click="clearSelection"
       >
@@ -142,8 +191,9 @@
 import { ref, computed, onMounted, onBeforeUnmount, watch } from 'vue'
 import * as d3 from 'd3'
 import { useCanvasStore } from '@/stores/canvas'
-import PromptTile from './PromptTile.vue'
-import DebateTile from './DebateTile.vue'
+import PromptNode from './PromptNode.vue'
+import LLMNode from './LLMNode.vue'
+import DebateNode from './DebateNode.vue'
 import PromptDialog from './PromptDialog.vue'
 
 const props = defineProps({
@@ -163,11 +213,13 @@ const surface = ref(null)
 
 // Local state
 const viewport = ref({ x: 0, y: 0, zoom: 1 })
-const selectedTiles = ref([])
+const selectedNodes = ref([])  // Format: "prompt:{id}", "llm:{tileId}:{modelId}", "debate:{id}"
 const showPromptDialog = ref(false)
 const saving = ref(false)
 const saveMessage = ref(null)
 const branchContext = ref(null)  // { parentTileId, parentModelId, parentContent }
+const expandedDebates = ref([])  // IDs of expanded debate nodes
+
 
 // D3 zoom
 let zoom = null
@@ -182,62 +234,136 @@ const streamingModels = computed(() => canvasStore.streamingModels)
 const tileEdges = computed(() => canvasStore.tileEdges)
 const debateEdges = computed(() => canvasStore.debateEdges)
 
-// Compute edge paths for SVG (prompt branches + debate connections)
-const edgePaths = computed(() => {
+// Flatten all LLM responses into individual node objects
+const llmNodes = computed(() => {
+  const nodes = []
+  for (const tile of promptTiles.value) {
+    for (const [modelId, response] of Object.entries(tile.responses)) {
+      nodes.push({
+        tileId: tile.id,
+        modelId,
+        response
+      })
+    }
+  }
+  return nodes
+})
+
+// Get selected LLM nodes for debate functionality
+const selectedLLMNodes = computed(() => {
+  return selectedNodes.value
+    .filter(id => id.startsWith('llm:'))
+    .map(id => {
+      const parts = id.split(':')
+      return { tileId: parts[1], modelId: parts.slice(2).join(':') }
+    })
+})
+
+// Compute Prompt → LLM edge paths
+const promptToLLMEdges = computed(() => {
   const edges = []
   
-  // Prompt tile edges (parent-child branches)
-  if (tileEdges.value.length && promptTiles.value.length) {
-    for (const edge of tileEdges.value) {
-      const sourceTile = promptTiles.value.find(t => t.id === edge.source_tile_id)
-      const targetTile = promptTiles.value.find(t => t.id === edge.target_tile_id)
+  for (const tile of promptTiles.value) {
+    const promptPos = tile.position
+    
+    for (const [modelId, response] of Object.entries(tile.responses)) {
+      const llmPos = response.position
       
-      if (!sourceTile || !targetTile) continue
+      // Source: right side of prompt node
+      const sourceX = promptPos.x + (promptPos.width || 200)
+      const sourceY = promptPos.y + (promptPos.height || 120) / 2
       
-      // Calculate connection points
-      const sourceX = sourceTile.position.x + sourceTile.position.width
-      const sourceY = sourceTile.position.y + sourceTile.position.height / 2
-      const targetX = targetTile.position.x
-      const targetY = targetTile.position.y + targetTile.position.height / 2
+      // Target: left side of LLM node
+      const targetX = llmPos.x
+      const targetY = llmPos.y + (llmPos.height || 200) / 2
       
       // Create bezier curve
       const midX = (sourceX + targetX) / 2
       const path = `M ${sourceX} ${sourceY} C ${midX} ${sourceY}, ${midX} ${targetY}, ${targetX} ${targetY}`
       
       edges.push({
-        source: edge.source_tile_id,
-        target: edge.target_tile_id,
-        modelId: edge.source_model_id,
-        type: 'prompt',
+        source: `prompt:${tile.id}`,
+        target: `llm:${tile.id}:${modelId}`,
+        color: response.color || '#7c5cff',
         path
       })
     }
   }
   
-  // Debate edges (from source tiles to debate tiles)
-  if (debateEdges.value.length && promptTiles.value.length && debates.value.length) {
-    for (const edge of debateEdges.value) {
-      const sourceTile = promptTiles.value.find(t => t.id === edge.source_tile_id)
-      const targetDebate = debates.value.find(d => d.id === edge.target_id)
+  return edges
+})
+
+// Compute LLM → Prompt branch edge paths
+const branchEdges = computed(() => {
+  const edges = []
+  
+  for (const tile of promptTiles.value) {
+    if (!tile.parent_tile_id || !tile.parent_model_id) continue
+    
+    // Find parent tile
+    const parentTile = promptTiles.value.find(t => t.id === tile.parent_tile_id)
+    if (!parentTile || !parentTile.responses[tile.parent_model_id]) continue
+    
+    const parentResponse = parentTile.responses[tile.parent_model_id]
+    const parentPos = parentResponse.position
+    const childPos = tile.position
+    
+    // Source: right side of parent LLM node
+    const sourceX = parentPos.x + (parentPos.width || 280)
+    const sourceY = parentPos.y + (parentPos.height || 200) / 2
+    
+    // Target: left side of child prompt node
+    const targetX = childPos.x
+    const targetY = childPos.y + (childPos.height || 120) / 2
+    
+    // Create bezier curve
+    const midX = (sourceX + targetX) / 2
+    const path = `M ${sourceX} ${sourceY} C ${midX} ${sourceY}, ${midX} ${targetY}, ${targetX} ${targetY}`
+    
+    edges.push({
+      source: `llm:${tile.parent_tile_id}:${tile.parent_model_id}`,
+      target: `prompt:${tile.id}`,
+      path
+    })
+  }
+  
+  return edges
+})
+
+// Compute Debate edge paths (LLM → Debate)
+const debateEdgePaths = computed(() => {
+  const edges = []
+  
+  for (const debate of debates.value) {
+    const debatePos = debate.position
+    
+    for (const sourceTileId of debate.source_tile_ids || []) {
+      const sourceTile = promptTiles.value.find(t => t.id === sourceTileId)
+      if (!sourceTile) continue
       
-      if (!sourceTile || !targetDebate) continue
-      
-      // Calculate connection points
-      const sourceX = sourceTile.position.x + sourceTile.position.width
-      const sourceY = sourceTile.position.y + sourceTile.position.height / 2
-      const targetX = targetDebate.position.x
-      const targetY = targetDebate.position.y + targetDebate.position.height / 2
-      
-      // Create bezier curve
-      const midX = (sourceX + targetX) / 2
-      const path = `M ${sourceX} ${sourceY} C ${midX} ${sourceY}, ${midX} ${targetY}, ${targetX} ${targetY}`
-      
-      edges.push({
-        source: edge.source_tile_id,
-        target: edge.target_id,
-        type: 'debate',
-        path
-      })
+      for (const modelId of debate.participating_models || []) {
+        if (!sourceTile.responses[modelId]) continue
+        
+        const llmPos = sourceTile.responses[modelId].position
+        
+        // Source: right side of LLM node
+        const sourceX = llmPos.x + (llmPos.width || 280)
+        const sourceY = llmPos.y + (llmPos.height || 200) / 2
+        
+        // Target: left side of debate node
+        const targetX = debatePos.x
+        const targetY = debatePos.y + (debatePos.height || 150) / 2
+        
+        // Create bezier curve
+        const midX = (sourceX + targetX) / 2
+        const path = `M ${sourceX} ${sourceY} C ${midX} ${sourceY}, ${midX} ${targetY}, ${targetX} ${targetY}`
+        
+        edges.push({
+          source: `llm:${sourceTileId}:${modelId}`,
+          target: `debate:${debate.id}`,
+          path
+        })
+      }
     }
   }
   
@@ -253,12 +379,23 @@ const MINIMAP_SCALE = 0.02
 const MINIMAP_WIDTH = 150
 const MINIMAP_HEIGHT = 100
 
-function minimapTileStyle(tile) {
+function minimapPromptStyle(tile) {
   return {
     left: `${tile.position.x * MINIMAP_SCALE}px`,
     top: `${tile.position.y * MINIMAP_SCALE}px`,
-    width: `${Math.max(4, tile.position.width * MINIMAP_SCALE)}px`,
-    height: `${Math.max(3, tile.position.height * MINIMAP_SCALE)}px`
+    width: `${Math.max(4, (tile.position.width || 200) * MINIMAP_SCALE)}px`,
+    height: `${Math.max(3, (tile.position.height || 120) * MINIMAP_SCALE)}px`,
+    background: 'var(--accent-primary)'
+  }
+}
+
+function minimapLLMStyle(node) {
+  return {
+    left: `${node.response.position.x * MINIMAP_SCALE}px`,
+    top: `${node.response.position.y * MINIMAP_SCALE}px`,
+    width: `${Math.max(4, (node.response.position.width || 280) * MINIMAP_SCALE)}px`,
+    height: `${Math.max(3, (node.response.position.height || 200) * MINIMAP_SCALE)}px`,
+    background: node.response.color || '#7c5cff'
   }
 }
 
@@ -276,9 +413,9 @@ const minimapViewportStyle = computed(() => {
   }
 })
 
-function panToTile(tile) {
-  const centerX = tile.position.x + tile.position.width / 2
-  const centerY = tile.position.y + tile.position.height / 2
+function panToNode(position) {
+  const centerX = position.x + (position.width || 200) / 2
+  const centerY = position.y + (position.height || 200) / 2
   const newX = -centerX * viewport.value.zoom + window.innerWidth / 2
   const newY = -centerY * viewport.value.zoom + window.innerHeight / 2
   
@@ -333,8 +470,12 @@ function initZoom() {
     .filter((event) => {
       // Allow all non-wheel events
       if (event.type !== 'wheel') return true
-      // Block wheel events from inside tiles (let them scroll)
-      if (event.target.closest('.prompt-tile') || event.target.closest('.debate-tile')) {
+      // Block wheel events from inside nodes (let them scroll)
+      if (event.target.closest('.prompt-node') || 
+          event.target.closest('.llm-node') || 
+          event.target.closest('.debate-node') ||
+          event.target.closest('.prompt-tile') || 
+          event.target.closest('.debate-tile')) {
         return false
       }
       return true
@@ -379,42 +520,79 @@ function zoomOut() {
   }
 }
 
-function handleTileDrag(tileId, position) {
+// Node drag handlers
+function handlePromptDrag(tileId, position) {
   canvasStore.updateTilePosition(tileId, position)
+}
+
+function handleLLMDrag(tileId, modelId, position) {
+  canvasStore.updateLLMNodePosition(tileId, modelId, position)
 }
 
 function handleDebateDrag(debateId, position) {
   canvasStore.updateTilePosition(debateId, position)
 }
 
-async function handleDeleteTile(tileId) {
-  if (!confirm('Are you sure you want to delete this tile? This action cannot be undone.')) {
+// Node delete handlers
+async function handleDeletePrompt(tileId) {
+  if (!confirm('Delete this prompt and all its responses? This action cannot be undone.')) {
     return
   }
   
   try {
     await canvasStore.deleteTile(tileId)
-    // Also remove from selection if selected
-    const index = selectedTiles.value.indexOf(tileId)
-    if (index !== -1) {
-      selectedTiles.value.splice(index, 1)
-    }
+    // Remove related nodes from selection
+    selectedNodes.value = selectedNodes.value.filter(id => !id.includes(tileId))
   } catch (err) {
-    console.error('Failed to delete tile:', err)
+    console.error('Failed to delete prompt:', err)
   }
 }
 
-function handleTileSelect(tileId) {
-  const index = selectedTiles.value.indexOf(tileId)
+async function handleDeleteLLMNode(info) {
+  // TODO: Implement individual LLM node deletion
+  // For now, we just deselect it
+  const nodeId = `llm:${info.tileId}:${info.modelId}`
+  selectedNodes.value = selectedNodes.value.filter(id => id !== nodeId)
+}
+
+async function handleDeleteDebate(debateId) {
+  if (!confirm('Delete this debate? This action cannot be undone.')) {
+    return
+  }
+  
+  try {
+    await canvasStore.deleteTile(debateId)
+    selectedNodes.value = selectedNodes.value.filter(id => id !== `debate:${debateId}`)
+    expandedDebates.value = expandedDebates.value.filter(id => id !== debateId)
+  } catch (err) {
+    console.error('Failed to delete debate:', err)
+  }
+}
+
+// Node selection handler
+function handleNodeSelect({ tileId, modelId }) {
+  const nodeId = `llm:${tileId}:${modelId}`
+  const index = selectedNodes.value.indexOf(nodeId)
   if (index === -1) {
-    selectedTiles.value.push(tileId)
+    selectedNodes.value.push(nodeId)
   } else {
-    selectedTiles.value.splice(index, 1)
+    selectedNodes.value.splice(index, 1)
   }
 }
 
 function clearSelection() {
-  selectedTiles.value = []
+  selectedNodes.value = []
+}
+
+// Debate expand/collapse
+function expandDebate(debateId) {
+  if (!expandedDebates.value.includes(debateId)) {
+    expandedDebates.value.push(debateId)
+  }
+}
+
+function collapseDebate(debateId) {
+  expandedDebates.value = expandedDebates.value.filter(id => id !== debateId)
 }
 
 async function handlePromptSubmit({ prompt, models, systemPrompt, temperature, maxTokens, contextMode }) {
@@ -443,7 +621,8 @@ async function handlePromptSubmit({ prompt, models, systemPrompt, temperature, m
   }
 }
 
-function handleBranch(tileId, modelId) {
+// Handle branch from LLM node
+function handleLLMBranch(tileId, modelId, prompt, contextMode = 'full_history') {
   // Get parent context
   const parentInfo = canvasStore.getParentResponseContent(tileId, modelId)
   branchContext.value = {
@@ -451,24 +630,19 @@ function handleBranch(tileId, modelId) {
     parentModelId: modelId,
     parentContent: parentInfo
   }
-  showPromptDialog.value = true
-}
-
-// Handle inline branch (from tile's built-in input)
-async function handleInlineBranch(tileId, modelId, prompt, models, contextMode = 'full_history') {
-  try {
-    await canvasStore.branchFromResponse(
-      tileId,
-      modelId,
+  
+  // If prompt is provided directly (inline branch), submit immediately
+  if (prompt) {
+    handlePromptSubmit({
       prompt,
-      models,
-      null,  // systemPrompt
-      0.7,   // temperature
-      2048,  // maxTokens
+      models: [modelId],  // Default to same model
+      systemPrompt: null,
+      temperature: 0.7,
+      maxTokens: 2048,
       contextMode
-    )
-  } catch (err) {
-    console.error('Failed to branch:', err)
+    })
+  } else {
+    showPromptDialog.value = true
   }
 }
 
@@ -478,19 +652,19 @@ function closeBranchDialog() {
 }
 
 async function handleStartDebate() {
-  if (selectedTiles.value.length < 2) return
+  if (selectedLLMNodes.value.length < 2) return
 
-  // Collect all models from selected tiles
+  // Extract unique models and tile IDs from selected LLM nodes
   const models = new Set()
-  for (const tileId of selectedTiles.value) {
-    const tile = promptTiles.value.find(t => t.id === tileId)
-    if (tile) {
-      Object.keys(tile.responses).forEach(m => models.add(m))
-    }
+  const tileIds = new Set()
+  
+  for (const node of selectedLLMNodes.value) {
+    models.add(node.modelId)
+    tileIds.add(node.tileId)
   }
 
   try {
-    await canvasStore.startDebate(selectedTiles.value, Array.from(models), 'auto', 3)
+    await canvasStore.startDebate(Array.from(tileIds), Array.from(models), 'auto', 3)
     clearSelection()
   } catch (err) {
     console.error('Failed to start debate:', err)
@@ -531,6 +705,125 @@ async function handleSaveAsNote() {
     }
   } finally {
     saving.value = false
+  }
+}
+
+// Auto-arrange nodes in a horizontal tree layout
+async function handleAutoArrange() {
+  if (!session.value || promptTiles.value.length === 0) return
+  
+  const positions = {}
+  const NODE_GAP_X = 80   // Horizontal gap between columns
+  const NODE_GAP_Y = 40   // Vertical gap between nodes
+  const PROMPT_WIDTH = 200
+  const PROMPT_HEIGHT = 120
+  const LLM_WIDTH = 280
+  const LLM_HEIGHT = 220
+  const DEBATE_WIDTH = 280
+  const DEBATE_HEIGHT = 200
+  
+  // Track global Y position to prevent overlaps
+  let globalY = 50
+  
+  // Find root prompts (no parent)
+  const rootTiles = promptTiles.value.filter(t => !t.parent_tile_id)
+  
+  // Recursive function to layout a prompt tree and return the total height used
+  function layoutPromptTree(tile, startX, startY) {
+    let treeHeight = 0
+    let currentY = startY
+    
+    // Position prompt node
+    positions[`prompt:${tile.id}`] = { 
+      x: startX, 
+      y: currentY,
+      width: PROMPT_WIDTH,
+      height: PROMPT_HEIGHT
+    }
+    
+    // Position LLM nodes to the right
+    const responses = Object.entries(tile.responses || {})
+    const llmX = startX + PROMPT_WIDTH + NODE_GAP_X
+    
+    if (responses.length === 0) {
+      treeHeight = PROMPT_HEIGHT
+    } else {
+      for (let i = 0; i < responses.length; i++) {
+        const [modelId, response] = responses[i]
+        
+        // Position this LLM node
+        positions[`llm:${tile.id}:${modelId}`] = { 
+          x: llmX, 
+          y: currentY,
+          width: LLM_WIDTH,
+          height: LLM_HEIGHT
+        }
+        
+        // Find branches from this LLM node
+        const branches = promptTiles.value.filter(
+          t => t.parent_tile_id === tile.id && t.parent_model_id === modelId
+        )
+        
+        let llmSubtreeHeight = LLM_HEIGHT
+        
+        if (branches.length > 0) {
+          // Layout branches recursively
+          const branchX = llmX + LLM_WIDTH + NODE_GAP_X
+          let branchY = currentY
+          
+          for (const branch of branches) {
+            const branchHeight = layoutPromptTree(branch, branchX, branchY)
+            branchY += branchHeight + NODE_GAP_Y
+            llmSubtreeHeight = Math.max(llmSubtreeHeight, branchY - currentY - NODE_GAP_Y)
+          }
+        }
+        
+        currentY += llmSubtreeHeight + NODE_GAP_Y
+      }
+      
+      treeHeight = currentY - startY - NODE_GAP_Y
+    }
+    
+    // Center the prompt node vertically relative to its LLM children
+    if (responses.length > 0) {
+      const promptCenterY = startY + (treeHeight - PROMPT_HEIGHT) / 2
+      positions[`prompt:${tile.id}`].y = promptCenterY
+    }
+    
+    return Math.max(treeHeight, PROMPT_HEIGHT)
+  }
+  
+  // Layout all root trees
+  for (const rootTile of rootTiles) {
+    const treeHeight = layoutPromptTree(rootTile, 50, globalY)
+    globalY += treeHeight + NODE_GAP_Y * 2
+  }
+  
+  // Position debate nodes in a separate column to the right
+  // Find the rightmost X position used
+  let maxX = 0
+  for (const pos of Object.values(positions)) {
+    maxX = Math.max(maxX, pos.x + (pos.width || LLM_WIDTH))
+  }
+  
+  const debateX = maxX + NODE_GAP_X * 2
+  let debateY = 50
+  
+  for (const debate of debates.value) {
+    positions[`debate:${debate.id}`] = { 
+      x: debateX, 
+      y: debateY, 
+      width: DEBATE_WIDTH, 
+      height: DEBATE_HEIGHT 
+    }
+    debateY += DEBATE_HEIGHT + NODE_GAP_Y
+  }
+  
+  // Send batch update to backend
+  try {
+    await canvasStore.autoArrange(positions)
+  } catch (err) {
+    console.error('Failed to auto-arrange:', err)
   }
 }
 </script>
@@ -654,17 +947,45 @@ async function handleSaveAsNote() {
   overflow: visible;
 }
 
+/* Node edge styles */
+.node-edge {
+  fill: none;
+  stroke-width: 2.5;
+  stroke-linecap: round;
+  transition: stroke 0.15s;
+}
+
+.node-edge.prompt-to-llm {
+  /* Stroke color set dynamically via style attribute, fallback to theme color */
+  stroke: var(--accent-primary);
+  filter: drop-shadow(0 0 2px color-mix(in srgb, var(--accent-primary) 40%, transparent));
+}
+
+.node-edge.branch-edge {
+  stroke: var(--accent-primary);
+  stroke-width: 2;
+  stroke-dasharray: 8 4;
+  filter: drop-shadow(0 0 2px color-mix(in srgb, var(--accent-primary) 40%, transparent));
+}
+
+.node-edge.debate-edge {
+  stroke: var(--accent-cyan);
+  stroke-width: 2;
+  filter: drop-shadow(0 0 3px color-mix(in srgb, var(--accent-cyan) 50%, transparent));
+}
+
+/* Legacy tile-edge for backwards compatibility */
 .tile-edge {
   fill: none;
-  stroke: #7c5cff;
+  stroke: var(--accent-primary);
   stroke-width: 3;
   stroke-linecap: round;
-  filter: drop-shadow(0 0 3px rgba(124, 92, 255, 0.5));
+  filter: drop-shadow(0 0 3px color-mix(in srgb, var(--accent-primary) 50%, transparent));
 }
 
 .tile-edge.debate-edge {
-  stroke: #22d3ee;
-  filter: drop-shadow(0 0 3px rgba(34, 211, 238, 0.5));
+  stroke: var(--accent-cyan);
+  filter: drop-shadow(0 0 3px color-mix(in srgb, var(--accent-cyan) 50%, transparent));
 }
 
 /* Minimap */
@@ -688,6 +1009,28 @@ async function handleSaveAsNote() {
   height: 100%;
 }
 
+/* New node-based minimap styles */
+.minimap-node {
+  position: absolute;
+  border-radius: 1px;
+  opacity: 0.7;
+  cursor: pointer;
+  transition: opacity 0.15s;
+}
+
+.minimap-node:hover {
+  opacity: 1;
+}
+
+.minimap-prompt {
+  background: var(--accent-primary);
+}
+
+.minimap-llm {
+  /* Background color set dynamically via style attribute */
+}
+
+/* Legacy minimap-tile for backwards compatibility */
 .minimap-tile {
   position: absolute;
   background: var(--accent-primary);

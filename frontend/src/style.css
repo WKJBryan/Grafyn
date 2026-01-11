@@ -1,29 +1,52 @@
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Fira+Code:wght@400;500&display=swap');
 
-/* Dark Theme (Default) */
+/* Dark Theme (Default) - Solarized Dark */
 :root,
 [data-theme='dark'] {
-  /* Color Palette */
-  --bg-primary: #0f0f10;
-  --bg-secondary: #1a1a1d;
-  --bg-tertiary: #242428;
-  --bg-hover: #2a2a2f;
-  --text-primary: #e8e8ed;
-  --text-secondary: #a0a0a8;
-  --text-muted: #6b6b73;
-  --accent-primary: #7c5cff;
-  --accent-secondary: #5c8fff;
-  --accent-success: #34d399;
-  --accent-warning: #fbbf24;
-  --accent-danger: #f87171;
+  /* Solarized Dark Color Palette */
+  --bg-primary: #002b36;
+  /* base03 - main background */
+  --bg-secondary: #073642;
+  /* base02 - secondary background */
+  --bg-tertiary: #0a4050;
+  /* slightly lighter for contrast */
+  --bg-hover: #0d4a5c;
+  /* hover state */
+  --text-primary: #839496;
+  /* base0 - body text */
+  --text-secondary: #93a1a1;
+  /* base1 - emphasized text */
+  --text-muted: #586e75;
+  /* base01 - comments/muted */
 
-  /* Status Colors */
-  --status-canonical-bg: rgba(52, 211, 153, 0.15);
-  --status-canonical-text: #34d399;
-  --status-draft-bg: rgba(251, 191, 36, 0.15);
-  --status-draft-text: #fbbf24;
-  --status-evidence-bg: rgba(124, 92, 255, 0.15);
-  --status-evidence-text: #7c5cff;
+  /* Solarized Accent Colors */
+  --accent-primary: #6c71c4;
+  /* violet */
+  --accent-secondary: #268bd2;
+  /* blue */
+  --accent-success: #859900;
+  /* green */
+  --accent-warning: #b58900;
+  /* yellow */
+  --accent-danger: #dc322f;
+  /* red */
+
+  /* Additional Solarized Colors for use */
+  --accent-cyan: #2aa198;
+  --accent-magenta: #d33682;
+  --accent-orange: #cb4b16;
+  --accent-blue: #268bd2;
+  --accent-green: #859900;
+  --accent-yellow: #b58900;
+  --accent-red: #dc322f;
+
+  /* Status Colors - Solarized variants */
+  --status-canonical-bg: rgba(133, 153, 0, 0.2);
+  --status-canonical-text: #859900;
+  --status-draft-bg: rgba(181, 137, 0, 0.2);
+  --status-draft-text: #b58900;
+  --status-evidence-bg: rgba(108, 113, 196, 0.2);
+  --status-evidence-text: #6c71c4;
 
   /* Spacing */
   --spacing-xs: 4px;
@@ -42,29 +65,52 @@
   --transition-normal: 250ms ease;
 }
 
-/* Light Theme */
+/* Light Theme - Solarized Light */
 [data-theme='light'] {
-  /* Color Palette */
-  --bg-primary: #ffffff;
-  --bg-secondary: #f8f9fa;
-  --bg-tertiary: #e9ecef;
-  --bg-hover: #dee2e6;
-  --text-primary: #212529;
-  --text-secondary: #495057;
-  --text-muted: #6c757d;
-  --accent-primary: #7c5cff;
-  --accent-secondary: #5c8fff;
-  --accent-success: #34d399;
-  --accent-warning: #fbbf24;
-  --accent-danger: #f87171;
+  /* Solarized Light Color Palette */
+  --bg-primary: #fdf6e3;
+  /* base3 - main background */
+  --bg-secondary: #eee8d5;
+  /* base2 - secondary background */
+  --bg-tertiary: #ddd6c3;
+  /* slightly darker for contrast */
+  --bg-hover: #d3cbb8;
+  /* hover state */
+  --text-primary: #657b83;
+  /* base00 - body text */
+  --text-secondary: #586e75;
+  /* base01 - emphasized text */
+  --text-muted: #93a1a1;
+  /* base1 - comments/muted */
 
-  /* Status Colors */
-  --status-canonical-bg: rgba(52, 211, 153, 0.15);
-  --status-canonical-text: #059669;
-  --status-draft-bg: rgba(251, 191, 36, 0.15);
-  --status-draft-text: #d97706;
-  --status-evidence-bg: rgba(124, 92, 255, 0.15);
-  --status-evidence-text: #6366f1;
+  /* Solarized Accent Colors */
+  --accent-primary: #6c71c4;
+  /* violet */
+  --accent-secondary: #268bd2;
+  /* blue */
+  --accent-success: #859900;
+  /* green */
+  --accent-warning: #b58900;
+  /* yellow */
+  --accent-danger: #dc322f;
+  /* red */
+
+  /* Additional Solarized Colors for use */
+  --accent-cyan: #2aa198;
+  --accent-magenta: #d33682;
+  --accent-orange: #cb4b16;
+  --accent-blue: #268bd2;
+  --accent-green: #859900;
+  --accent-yellow: #b58900;
+  --accent-red: #dc322f;
+
+  /* Status Colors - Solarized variants */
+  --status-canonical-bg: rgba(133, 153, 0, 0.15);
+  --status-canonical-text: #859900;
+  --status-draft-bg: rgba(181, 137, 0, 0.15);
+  --status-draft-text: #b58900;
+  --status-evidence-bg: rgba(108, 113, 196, 0.15);
+  --status-evidence-text: #6c71c4;
 
   /* Spacing */
   --spacing-xs: 4px;

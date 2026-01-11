@@ -276,6 +276,60 @@ export const useCanvasStore = defineStore('canvas', () => {
     }
   }
 
+  async function updateLLMNodePosition(tileId, modelId, position) {
+    if (!currentSession.value) return
+
+    // Optimistic update
+    const tile = currentSession.value.prompt_tiles.find(t => t.id === tileId)
+    if (tile && tile.responses[modelId]) {
+      tile.responses[modelId].position = { ...tile.responses[modelId].position, ...position }
+    }
+
+    // Persist to backend
+    try {
+      await canvasApi.updateLLMNodePosition(currentSession.value.id, tileId, modelId, position)
+    } catch (err) {
+      console.error('Failed to update LLM node position:', err)
+    }
+  }
+
+  async function autoArrange(positions) {
+    if (!currentSession.value) return
+
+    // Optimistic update: apply all positions locally
+    for (const [nodeId, position] of Object.entries(positions)) {
+      const parts = nodeId.split(':')
+
+      if (parts[0] === 'prompt' && parts.length >= 2) {
+        const tileId = parts[1]
+        const tile = currentSession.value.prompt_tiles.find(t => t.id === tileId)
+        if (tile) {
+          tile.position = { ...tile.position, ...position }
+        }
+      } else if (parts[0] === 'llm' && parts.length >= 3) {
+        const tileId = parts[1]
+        const modelId = parts.slice(2).join(':')
+        const tile = currentSession.value.prompt_tiles.find(t => t.id === tileId)
+        if (tile && tile.responses[modelId]) {
+          tile.responses[modelId].position = { ...tile.responses[modelId].position, ...position }
+        }
+      } else if (parts[0] === 'debate' && parts.length >= 2) {
+        const debateId = parts[1]
+        const debate = currentSession.value.debates.find(d => d.id === debateId)
+        if (debate) {
+          debate.position = { ...debate.position, ...position }
+        }
+      }
+    }
+
+    // Persist to backend
+    try {
+      await canvasApi.autoArrange(currentSession.value.id, positions)
+    } catch (err) {
+      console.error('Failed to auto-arrange nodes:', err)
+    }
+  }
+
   async function deleteTile(tileId) {
     if (!currentSession.value) return
 
@@ -563,6 +617,8 @@ export const useCanvasStore = defineStore('canvas', () => {
     loadModels,
     sendPrompt,
     updateTilePosition,
+    updateLLMNodePosition,
+    autoArrange,
     deleteTile,
     updateViewport,
     startDebate,

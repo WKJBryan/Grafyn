@@ -19,6 +19,8 @@ from backend.app.models.canvas import (
     CanvasViewport,
     DebateMode,
     TileEdge,
+    NodeEdge,
+    EdgeType,
 )
 from backend.app.config import get_settings
 
@@ -144,46 +146,69 @@ class CanvasSessionStore:
         parent_tile_id: Optional[str] = None,
         parent_model_id: Optional[str] = None,
     ) -> Optional[PromptTile]:
-        """Add a new prompt tile to a session"""
+        """Add a new prompt tile to a session with individual LLM node positioning"""
         session = self._sessions.get(session_id)
         if not session:
             return None
 
         tile_id = str(uuid.uuid4())
 
-        # Calculate position if not provided
+        # Per-model color palette (vibrant, distinct colors)
+        MODEL_COLORS = [
+            "#7c5cff",  # Violet
+            "#22d3ee",  # Cyan
+            "#f59e0b",  # Amber
+            "#10b981",  # Emerald
+            "#f43f5e",  # Rose
+            "#8b5cf6",  # Purple
+            "#06b6d4",  # Teal
+            "#ec4899",  # Pink
+            "#84cc16",  # Lime
+            "#3b82f6",  # Blue
+        ]
+
+        # Calculate prompt node position if not provided
         if position is None:
-            if parent_tile_id:
-                # Position relative to parent tile for branching
+            if parent_tile_id and parent_model_id:
+                # Position relative to parent LLM node for branching
                 parent_tile = next(
                     (t for t in session.prompt_tiles if t.id == parent_tile_id), None
                 )
-                if parent_tile:
-                    # Count existing children of this parent to offset
-                    child_count = sum(
-                        1 for t in session.prompt_tiles if t.parent_tile_id == parent_tile_id
-                    )
-                    base_x = parent_tile.position.x + parent_tile.position.width + 100
-                    base_y = parent_tile.position.y + child_count * 350
-                    position = TilePosition(x=base_x, y=base_y)
+                if parent_tile and parent_model_id in parent_tile.responses:
+                    parent_llm = parent_tile.responses[parent_model_id]
+                    # Position to the right of the parent LLM node
+                    base_x = parent_llm.position.x + parent_llm.position.width + 80
+                    base_y = parent_llm.position.y
+                    position = TilePosition(x=base_x, y=base_y, width=200, height=120)
                 else:
-                    position = TilePosition(x=50, y=50)
+                    position = TilePosition(x=50, y=50, width=200, height=120)
             else:
-                # Default grid layout for root tiles
-                base_x = 50 + (len(session.prompt_tiles) % 3) * 450
-                base_y = 50 + (len(session.prompt_tiles) // 3) * 400
-                position = TilePosition(x=base_x, y=base_y)
+                # Default layout for root tiles - horizontal arrangement
+                root_tiles = [t for t in session.prompt_tiles if not t.parent_tile_id]
+                base_x = 50
+                base_y = 50 + len(root_tiles) * 300  # Stack root prompts vertically
+                position = TilePosition(x=base_x, y=base_y, width=200, height=120)
 
-        # Create response placeholders for each model
+        # Create response placeholders with individual positions
         responses = {}
-        for model_id in models:
+        for idx, model_id in enumerate(models):
             response_id = str(uuid.uuid4())
             model_name = model_id.split("/")[-1] if "/" in model_id else model_id
+            
+            # Position LLM nodes to the right of prompt, stacked vertically
+            llm_x = position.x + position.width + 80  # Gap from prompt node
+            llm_y = position.y + (idx * 220)  # Vertical stacking
+            
+            # Assign color based on model index (cycles through palette)
+            color = MODEL_COLORS[idx % len(MODEL_COLORS)]
+            
             responses[model_id] = ModelResponse(
                 id=response_id,
                 model_id=model_id,
                 model_name=model_name,
                 status="pending",
+                position=TilePosition(x=llm_x, y=llm_y, width=280, height=200),
+                color=color,
             )
 
         tile = PromptTile(
@@ -268,6 +293,28 @@ class CanvasSessionStore:
                     debate.position.width = position.width
                 if position.height is not None:
                     debate.position.height = position.height
+                session.updated_at = datetime.now(timezone.utc)
+                self._save(session)
+                return True
+
+        return False
+
+    def update_llm_node_position(
+        self, session_id: str, tile_id: str, model_id: str, position: TilePositionUpdate
+    ) -> bool:
+        """Update an individual LLM response node's position on the canvas"""
+        session = self._sessions.get(session_id)
+        if not session:
+            return False
+
+        for tile in session.prompt_tiles:
+            if tile.id == tile_id and model_id in tile.responses:
+                tile.responses[model_id].position.x = position.x
+                tile.responses[model_id].position.y = position.y
+                if position.width is not None:
+                    tile.responses[model_id].position.width = position.width
+                if position.height is not None:
+                    tile.responses[model_id].position.height = position.height
                 session.updated_at = datetime.now(timezone.utc)
                 self._save(session)
                 return True
@@ -601,3 +648,191 @@ class CanvasSessionStore:
 
         context = "Relevant context:\n\n" + "\n\n---\n\n".join(context_parts)
         return [{"role": "system", "content": context}]
+
+    # ============================================================
+    # Node Graph Methods
+    # ============================================================
+
+    def find_node_groups(self, session_id: str) -> List[List[str]]:
+        """
+        Find connected components (isolated node groups) in the canvas.
+        Returns list of groups, where each group is a list of node IDs.
+        Node ID format: "prompt:{id}", "llm:{tile_id}:{model_id}", "debate:{id}"
+        """
+        session = self._sessions.get(session_id)
+        if not session:
+            return []
+
+        # Build adjacency list
+        adjacency: Dict[str, set] = {}
+
+        def add_edge(node1: str, node2: str):
+            if node1 not in adjacency:
+                adjacency[node1] = set()
+            if node2 not in adjacency:
+                adjacency[node2] = set()
+            adjacency[node1].add(node2)
+            adjacency[node2].add(node1)
+
+        # Process prompt tiles
+        for tile in session.prompt_tiles:
+            prompt_node = f"prompt:{tile.id}"
+            if prompt_node not in adjacency:
+                adjacency[prompt_node] = set()
+
+            # Connect prompt to its LLM responses
+            for model_id in tile.responses:
+                llm_node = f"llm:{tile.id}:{model_id}"
+                add_edge(prompt_node, llm_node)
+
+            # Connect to parent LLM if branched
+            if tile.parent_tile_id and tile.parent_model_id:
+                parent_llm = f"llm:{tile.parent_tile_id}:{tile.parent_model_id}"
+                add_edge(prompt_node, parent_llm)
+
+        # Process debates
+        for debate in session.debates:
+            debate_node = f"debate:{debate.id}"
+            if debate_node not in adjacency:
+                adjacency[debate_node] = set()
+
+            # Connect debate to source tile LLMs
+            for source_tile_id in debate.source_tile_ids:
+                source_tile = next(
+                    (t for t in session.prompt_tiles if t.id == source_tile_id), None
+                )
+                if source_tile:
+                    for model_id in debate.participating_models:
+                        if model_id in source_tile.responses:
+                            llm_node = f"llm:{source_tile_id}:{model_id}"
+                            add_edge(debate_node, llm_node)
+
+        # Find connected components using BFS
+        visited: set = set()
+        groups: List[List[str]] = []
+
+        for node in adjacency:
+            if node not in visited:
+                component = []
+                queue = [node]
+                while queue:
+                    current = queue.pop(0)
+                    if current not in visited:
+                        visited.add(current)
+                        component.append(current)
+                        queue.extend(adjacency[current] - visited)
+                if component:
+                    groups.append(component)
+
+        return groups
+
+    def batch_update_positions(
+        self, session_id: str, positions: Dict[str, TilePositionUpdate]
+    ) -> bool:
+        """
+        Batch update positions for multiple nodes (used by auto-arrange).
+        positions dict keys use format: "prompt:{id}", "llm:{tile_id}:{model_id}", "debate:{id}"
+        """
+        session = self._sessions.get(session_id)
+        if not session:
+            return False
+
+        updated = False
+
+        for node_id, pos in positions.items():
+            parts = node_id.split(":")
+
+            if parts[0] == "prompt" and len(parts) >= 2:
+                tile_id = parts[1]
+                for tile in session.prompt_tiles:
+                    if tile.id == tile_id:
+                        tile.position.x = pos.x
+                        tile.position.y = pos.y
+                        if pos.width:
+                            tile.position.width = pos.width
+                        if pos.height:
+                            tile.position.height = pos.height
+                        updated = True
+                        break
+
+            elif parts[0] == "llm" and len(parts) >= 3:
+                tile_id = parts[1]
+                model_id = ":".join(parts[2:])  # Handle model IDs with colons
+                for tile in session.prompt_tiles:
+                    if tile.id == tile_id and model_id in tile.responses:
+                        tile.responses[model_id].position.x = pos.x
+                        tile.responses[model_id].position.y = pos.y
+                        if pos.width:
+                            tile.responses[model_id].position.width = pos.width
+                        if pos.height:
+                            tile.responses[model_id].position.height = pos.height
+                        updated = True
+                        break
+
+            elif parts[0] == "debate" and len(parts) >= 2:
+                debate_id = parts[1]
+                for debate in session.debates:
+                    if debate.id == debate_id:
+                        debate.position.x = pos.x
+                        debate.position.y = pos.y
+                        if pos.width:
+                            debate.position.width = pos.width
+                        if pos.height:
+                            debate.position.height = pos.height
+                        updated = True
+                        break
+
+        if updated:
+            session.updated_at = datetime.now(timezone.utc)
+            self._save(session)
+
+        return updated
+
+    def get_node_edges(self, session_id: str) -> List[NodeEdge]:
+        """Get all edges in the canvas graph for visualization"""
+        session = self._sessions.get(session_id)
+        if not session:
+            return []
+
+        edges = []
+
+        # Prompt → LLM edges
+        for tile in session.prompt_tiles:
+            prompt_node = f"prompt:{tile.id}"
+            for model_id, response in tile.responses.items():
+                llm_node = f"llm:{tile.id}:{model_id}"
+                edges.append(NodeEdge(
+                    source_id=prompt_node,
+                    target_id=llm_node,
+                    edge_type=EdgeType.PROMPT_TO_LLM,
+                    color=response.color,
+                ))
+
+            # LLM → Prompt branch edges
+            if tile.parent_tile_id and tile.parent_model_id:
+                parent_llm = f"llm:{tile.parent_tile_id}:{tile.parent_model_id}"
+                edges.append(NodeEdge(
+                    source_id=parent_llm,
+                    target_id=prompt_node,
+                    edge_type=EdgeType.LLM_TO_PROMPT,
+                ))
+
+        # Debate → LLM edges (conceptual - debates connect to the LLMs they originated from)
+        for debate in session.debates:
+            debate_node = f"debate:{debate.id}"
+            for source_tile_id in debate.source_tile_ids:
+                source_tile = next(
+                    (t for t in session.prompt_tiles if t.id == source_tile_id), None
+                )
+                if source_tile:
+                    for model_id in debate.participating_models:
+                        if model_id in source_tile.responses:
+                            llm_node = f"llm:{source_tile_id}:{model_id}"
+                            edges.append(NodeEdge(
+                                source_id=llm_node,
+                                target_id=debate_node,
+                                edge_type=EdgeType.DEBATE_TO_LLM,
+                            ))
+
+        return edges
+
