@@ -3,6 +3,7 @@ import asyncio
 import json
 import logging
 from typing import List
+from urllib.parse import unquote
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
@@ -21,6 +22,8 @@ from backend.app.models.canvas import (
     DebateMode,
     TileEdge,
     ContextMode,
+    NodeEdge,
+    ArrangeRequest,
 )
 from backend.app.services.canvas_store import CanvasSessionStore
 from backend.app.services.openrouter import OpenRouterService
@@ -144,6 +147,21 @@ async def update_tile_position(
     return {"status": "updated"}
 
 
+@router.put("/{session_id}/tiles/{tile_id}/responses/{model_id}/position")
+async def update_llm_node_position(
+    session_id: str, tile_id: str, model_id: str,
+    position: TilePositionUpdate, request: Request
+):
+    """Update an individual LLM response node's position on the canvas"""
+    store = get_canvas_store(request)
+    # URL decode model_id (may contain slashes like "openai/gpt-4")
+    decoded_model_id = unquote(model_id)
+    
+    if not store.update_llm_node_position(session_id, tile_id, decoded_model_id, position):
+        raise HTTPException(status_code=404, detail="LLM node not found")
+    return {"status": "updated"}
+
+
 @router.delete("/{session_id}/tiles/{tile_id}", status_code=204)
 async def delete_tile(session_id: str, tile_id: str, request: Request):
     """Delete a tile (prompt or debate) from the canvas"""
@@ -154,12 +172,48 @@ async def delete_tile(session_id: str, tile_id: str, request: Request):
 
 @router.get("/{session_id}/edges", response_model=List[TileEdge])
 async def get_tile_edges(session_id: str, request: Request):
-    """Get all parent-child tile edges for mind-map visualization"""
+    """Get all parent-child tile edges for mind-map visualization (legacy)"""
     store = get_canvas_store(request)
     session = store.get_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
     return store.get_tile_edges(session_id)
+
+
+@router.get("/{session_id}/node-edges", response_model=List[NodeEdge])
+async def get_node_edges(session_id: str, request: Request):
+    """Get all edges in the canvas graph for node-graph visualization"""
+    store = get_canvas_store(request)
+    session = store.get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return store.get_node_edges(session_id)
+
+
+@router.post("/{session_id}/arrange")
+async def arrange_nodes(session_id: str, arrange_request: ArrangeRequest, request: Request):
+    """Batch update node positions after auto-arrange"""
+    store = get_canvas_store(request)
+    session = store.get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    if not store.batch_update_positions(session_id, arrange_request.positions):
+        raise HTTPException(status_code=400, detail="Failed to update positions")
+    
+    return {"status": "arranged", "node_count": len(arrange_request.positions)}
+
+
+@router.get("/{session_id}/node-groups")
+async def get_node_groups(session_id: str, request: Request):
+    """Get isolated node groups for multi-note export"""
+    store = get_canvas_store(request)
+    session = store.get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    groups = store.find_node_groups(session_id)
+    return {"groups": groups, "count": len(groups)}
 
 
 # --- Prompt & Streaming ---

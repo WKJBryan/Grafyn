@@ -84,6 +84,10 @@ export const canvas = {
   getModels: () => api.get('/canvas/models/available'),
   updateTilePosition: (sessionId, tileId, position) =>
     api.put(`/canvas/${encodeURIComponent(sessionId)}/tiles/${encodeURIComponent(tileId)}/position`, position),
+  updateLLMNodePosition: (sessionId, tileId, modelId, position) =>
+    api.put(`/canvas/${encodeURIComponent(sessionId)}/tiles/${encodeURIComponent(tileId)}/responses/${encodeURIComponent(modelId)}/position`, position),
+  autoArrange: (sessionId, positions) =>
+    api.post(`/canvas/${encodeURIComponent(sessionId)}/arrange`, { positions }),
   deleteTile: (sessionId, tileId) =>
     api.delete(`/canvas/${encodeURIComponent(sessionId)}/tiles/${encodeURIComponent(tileId)}`),
   updateViewport: (sessionId, viewport) =>
@@ -92,6 +96,10 @@ export const canvas = {
     api.put(`/canvas/${encodeURIComponent(sessionId)}/debate/${encodeURIComponent(debateId)}/status`, null, { params: { status } }),
   exportToNote: (sessionId) =>
     api.post(`/canvas/${encodeURIComponent(sessionId)}/export-note`),
+  getNodeEdges: (sessionId) =>
+    api.get(`/canvas/${encodeURIComponent(sessionId)}/node-edges`),
+  getNodeGroups: (sessionId) =>
+    api.get(`/canvas/${encodeURIComponent(sessionId)}/node-groups`),
 }
 
 export default api
