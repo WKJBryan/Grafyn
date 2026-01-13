@@ -1,7 +1,9 @@
 """Notes API router for CRUD operations"""
 from fastapi import APIRouter, HTTPException, Request
-from typing import List
-from backend.app.models.note import Note, NoteCreate, NoteUpdate, NoteListItem
+from typing import List, Optional
+from backend.app.models.note import (
+    Note, NoteCreate, NoteUpdate, NoteListItem, TypedProperty, PropertyType
+)
 from backend.app.services.knowledge_store import KnowledgeStore
 from backend.app.services.vector_search import VectorSearchService
 from backend.app.services.graph_index import GraphIndexService
@@ -35,8 +37,21 @@ async def get_note(note_id: str, request: Request):
 async def create_note(note_data: NoteCreate, request: Request):
     """Create a new note"""
     knowledge_store = get_knowledge_store(request)
+    vector_search: VectorSearchService = request.app.state.vector_search
+    
     try:
         note = knowledge_store.create_note(note_data)
+        
+        # Index the new note with content type for priority scoring
+        vector_search.index_note(
+            note_id=note.id,
+            title=note.title,
+            content=note.content,
+            content_type=note.frontmatter.content_type.value,
+            modified=note.frontmatter.modified.isoformat() if note.frontmatter.modified else None,
+            tags=note.frontmatter.tags,
+        )
+        
         return note
     except FileExistsError:
         raise HTTPException(status_code=409, detail="Note already exists")
@@ -46,9 +61,22 @@ async def create_note(note_data: NoteCreate, request: Request):
 async def update_note(note_id: str, note_data: NoteUpdate, request: Request):
     """Update an existing note"""
     knowledge_store = get_knowledge_store(request)
+    vector_search: VectorSearchService = request.app.state.vector_search
+    
     note = knowledge_store.update_note(note_id, note_data)
     if note is None:
         raise HTTPException(status_code=404, detail="Note not found")
+    
+    # Update vector index with new content type for priority scoring
+    vector_search.index_note(
+        note_id=note.id,
+        title=note.title,
+        content=note.content,
+        content_type=note.frontmatter.content_type.value,
+        modified=note.frontmatter.modified.isoformat() if note.frontmatter.modified else None,
+        tags=note.frontmatter.tags,
+    )
+    
     return note
 
 
@@ -70,7 +98,7 @@ async def reindex_notes(request: Request):
 
     notes = knowledge_store.get_all_content()
 
-    # Reindex vector search
+    # Reindex vector search with content type for priority scoring
     vector_search.index_all(notes)
 
     # Rebuild graph
@@ -80,3 +108,83 @@ async def reindex_notes(request: Request):
         "indexed": len(notes),
         "message": f"Reindexed {len(notes)} notes"
     }
+
+
+# Property endpoints
+@router.get("/{note_id}/properties", response_model=dict)
+async def get_properties(note_id: str, request: Request):
+    """Get all properties for a note"""
+    knowledge_store = get_knowledge_store(request)
+    note = knowledge_store.get_note(note_id)
+    if note is None:
+        raise HTTPException(status_code=404, detail="Note not found")
+    
+    return {
+        "note_id": note_id,
+        "properties": note.frontmatter.properties
+    }
+
+
+@router.get("/{note_id}/properties/{property_name}", response_model=TypedProperty)
+async def get_property(note_id: str, property_name: str, request: Request):
+    """Get a specific property from a note"""
+    knowledge_store = get_knowledge_store(request)
+    note = knowledge_store.get_note(note_id)
+    if note is None:
+        raise HTTPException(status_code=404, detail="Note not found")
+    
+    prop = note.frontmatter.get_property(property_name)
+    if prop is None:
+        raise HTTPException(status_code=404, detail="Property not found")
+    
+    return prop
+
+
+@router.put("/{note_id}/properties/{property_name}", response_model=TypedProperty)
+async def set_property(
+    note_id: str,
+    property_name: str,
+    property_data: TypedProperty,
+    request: Request
+):
+    """Set or update a property on a note"""
+    knowledge_store = get_knowledge_store(request)
+    note = knowledge_store.get_note(note_id)
+    if note is None:
+        raise HTTPException(status_code=404, detail="Note not found")
+    
+    # Update the property in the note's frontmatter
+    note.frontmatter.set_property(property_name, property_data)
+    
+    # Update the note in storage
+    from backend.app.models.note import NoteUpdate
+    update_data = NoteUpdate(properties=note.frontmatter.properties)
+    updated_note = knowledge_store.update_note(note_id, update_data)
+    
+    if updated_note is None:
+        raise HTTPException(status_code=500, detail="Failed to update note")
+    
+    return property_data
+
+
+@router.delete("/{note_id}/properties/{property_name}", status_code=204)
+async def delete_property(note_id: str, property_name: str, request: Request):
+    """Delete a property from a note"""
+    knowledge_store = get_knowledge_store(request)
+    note = knowledge_store.get_note(note_id)
+    if note is None:
+        raise HTTPException(status_code=404, detail="Note not found")
+    
+    deleted = note.frontmatter.delete_property(property_name)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Property not found")
+    
+    # Update the note in storage
+    from backend.app.models.note import NoteUpdate
+    update_data = NoteUpdate(properties=note.frontmatter.properties)
+    updated_note = knowledge_store.update_note(note_id, update_data)
+    
+    if updated_note is None:
+        raise HTTPException(status_code=500, detail="Failed to update note")
+    
+    return None

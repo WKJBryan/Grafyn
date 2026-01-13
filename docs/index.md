@@ -1,6 +1,6 @@
 # Seedream Knowledge Graph Platform - Project Documentation
 
-> **Generated:** 2026-01-06 | **Scan Level:** Exhaustive | **Mode:** Full Rescan
+> **Generated:** 2026-01-11 | **Scan Level:** Exhaustive | **Mode:** Full Rescan
 
 ## Project Overview
 
@@ -19,18 +19,19 @@
 - **Embeddings:** sentence-transformers (all-MiniLM-L6-v2, 384 dimensions)
 - **Entry Point:** `backend/app/main.py`
 - **API Prefix:** `/api/`
-- **Services:** 5 core services (KnowledgeStore, VectorSearch, GraphIndex, Embedding, TokenStore)
+- **Services:** 7 core services (KnowledgeStore, VectorSearch, GraphIndex, Embedding, TokenStore, CanvasSessionStore, OpenRouterService)
 - **Middleware:** Security, Logging, Rate Limiting
 
 ### Frontend (Vue 3)
 - **Framework:** Vue 3.4 with Composition API
-- **State Management:** Pinia
+- **State Management:** Pinia (3 stores: auth, notes, canvas)
 - **Routing:** Vue Router
 - **Build Tool:** Vite 5
-- **HTTP Client:** Fetch API
+- **HTTP Client:** Axios
 - **Markdown:** marked 11.0+
 - **Entry Point:** `frontend/src/main.js`
-- **Components:** 5 Vue components + 4 Views
+- **Components:** 14 Vue components + 5 Views
+- **Visualization:** D3.js for canvas graphs
 
 ---
 
@@ -55,12 +56,15 @@
 - [Component Inventory - Frontend](./component-inventory-frontend.md)
 - [Development Guide - Frontend](./development-guide-frontend.md)
 
+### Canvas/Multi-LLM Feature
+- **[Canvas Architecture](./canvas-architecture.md)** ⭐ - Multi-LLM comparison canvas system
+
 ### AI Integration
 - [Chat Ingestion Guide](./chat-ingestion-guide.md) - MCP setup, export scripts, ingestion workflows
 
 ---
 
-## API Summary (15+ Endpoints)
+## API Summary (30+ Endpoints)
 
 | Category | Endpoints | Description |
 |----------|-----------|-------------|
@@ -68,9 +72,10 @@
 | **Search** | 2 | Semantic/lexical search + similar notes |
 | **Graph** | 5 | Backlinks, neighbors, unlinked mentions, rebuild |
 | **OAuth** | 3+ | GitHub OAuth authentication |
+| **Canvas** | 15+ | Multi-LLM canvas sessions, prompts, debates |
 | **System** | 2 | Health check + API info |
 
-## Service Summary (5 Services)
+## Service Summary (7 Services)
 
 | Service | Purpose |
 |---------|---------|
@@ -79,6 +84,8 @@
 | **GraphIndexService** | Wikilink parsing and backlink tracking |
 | **EmbeddingService** | Text→vector via sentence-transformers |
 | **TokenStore** | OAuth token management |
+| **CanvasSessionStore** | Multi-LLM canvas session persistence |
+| **OpenRouterService** | Multi-LLM API integration with streaming |
 
 ## Middleware
 
@@ -105,6 +112,7 @@
 ## Existing Documentation
 
 - [README.md](../README.md) - Project overview and quick start guide
+- [IMPROVEMENTS.md](./IMPROVEMENTS.md) - Summary of codebase improvements
 
 ---
 
@@ -135,6 +143,7 @@ npm run dev
 - **API Docs:** http://localhost:8080/docs
 - **MCP Endpoint:** http://localhost:8080/sse
 - **OAuth:** http://localhost:8080/api/oauth
+- **Canvas View:** http://localhost:5173/canvas
 
 ---
 

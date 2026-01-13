@@ -15,6 +15,8 @@ from app.models.note import (
     NoteListItem,
     SearchResult,
     BacklinkInfo,
+    TypedProperty,
+    PropertyType,
 )
 
 
@@ -645,3 +647,334 @@ class TestModelSerialization:
 
         assert '"note_id"' in json_str
         assert '"score"' in json_str
+
+
+# ============================================================================
+# TypedProperty Tests
+# ============================================================================
+
+class TestTypedProperty:
+    """Tests for TypedProperty model"""
+
+    def test_requires_type(self):
+        """Type is required"""
+        with pytest.raises(ValidationError):
+            TypedProperty(value="test")
+
+    def test_requires_value(self):
+        """Value is required"""
+        with pytest.raises(ValidationError):
+            TypedProperty(type=PropertyType.STRING)
+
+    def test_label_optional(self):
+        """Label should be optional"""
+        prop = TypedProperty(type=PropertyType.STRING, value="test")
+
+        assert prop.label is None
+
+    def test_valid_string_property(self):
+        """Should create valid string property"""
+        prop = TypedProperty(type=PropertyType.STRING, value="Hello World")
+
+        assert prop.type == PropertyType.STRING
+        assert prop.value == "Hello World"
+
+    def test_valid_number_property_int(self):
+        """Should create valid number property with int"""
+        prop = TypedProperty(type=PropertyType.NUMBER, value=42)
+
+        assert prop.type == PropertyType.NUMBER
+        assert prop.value == 42
+
+    def test_valid_number_property_float(self):
+        """Should create valid number property with float"""
+        prop = TypedProperty(type=PropertyType.NUMBER, value=3.14)
+
+        assert prop.type == PropertyType.NUMBER
+        assert prop.value == 3.14
+
+    def test_valid_date_property(self):
+        """Should create valid date property"""
+        now = datetime.now()
+        prop = TypedProperty(type=PropertyType.DATE, value=now)
+
+        assert prop.type == PropertyType.DATE
+        assert prop.value == now
+
+    def test_valid_boolean_property(self):
+        """Should create valid boolean property"""
+        prop = TypedProperty(type=PropertyType.BOOLEAN, value=True)
+
+        assert prop.type == PropertyType.BOOLEAN
+        assert prop.value is True
+
+    def test_valid_link_property(self):
+        """Should create valid link property"""
+        prop = TypedProperty(type=PropertyType.LINK, value="[[Some Note]]")
+
+        assert prop.type == PropertyType.LINK
+        assert prop.value == "[[Some Note]]"
+
+    def test_string_with_label(self):
+        """Should accept label for string property"""
+        prop = TypedProperty(
+            type=PropertyType.STRING,
+            value="test",
+            label="Test Label"
+        )
+
+        assert prop.label == "Test Label"
+
+    def test_string_rejects_non_string(self):
+        """String property should reject non-string values"""
+        with pytest.raises(ValidationError):
+            TypedProperty(type=PropertyType.STRING, value=42)
+
+    def test_number_rejects_non_number(self):
+        """Number property should reject non-number values"""
+        with pytest.raises(ValidationError):
+            TypedProperty(type=PropertyType.NUMBER, value="not a number")
+
+    def test_date_rejects_non_date(self):
+        """Date property should reject non-datetime values"""
+        with pytest.raises(ValidationError):
+            TypedProperty(type=PropertyType.DATE, value="2024-01-01")
+
+    def test_boolean_rejects_non_boolean(self):
+        """Boolean property should reject non-boolean values"""
+        with pytest.raises(ValidationError):
+            TypedProperty(type=PropertyType.BOOLEAN, value="true")
+
+    def test_link_rejects_non_string(self):
+        """Link property should reject non-string values"""
+        with pytest.raises(ValidationError):
+            TypedProperty(type=PropertyType.LINK, value=123)
+
+    def test_get_value(self):
+        """get_value should return the property value"""
+        prop = TypedProperty(type=PropertyType.STRING, value="test")
+
+        assert prop.get_value() == "test"
+
+    def test_set_value_valid(self):
+        """set_value should update value with valid type"""
+        prop = TypedProperty(type=PropertyType.STRING, value="old")
+        prop.set_value("new")
+
+        assert prop.value == "new"
+
+    def test_set_value_invalid_type(self):
+        """set_value should reject invalid type"""
+        prop = TypedProperty(type=PropertyType.STRING, value="old")
+
+        with pytest.raises(ValidationError):
+            prop.set_value(42)
+
+    def test_serialization(self):
+        """TypedProperty should serialize correctly"""
+        prop = TypedProperty(
+            type=PropertyType.STRING,
+            value="test",
+            label="Label"
+        )
+
+        data = prop.model_dump()
+
+        assert data["type"] == "string"
+        assert data["value"] == "test"
+        assert data["label"] == "Label"
+
+    def test_deserialization(self):
+        """TypedProperty should deserialize from dict"""
+        data = {
+            "type": "string",
+            "value": "test",
+            "label": "Label"
+        }
+
+        prop = TypedProperty(**data)
+
+        assert prop.type == PropertyType.STRING
+        assert prop.value == "test"
+        assert prop.label == "Label"
+
+
+# ============================================================================
+# NoteFrontmatter with Properties Tests
+# ============================================================================
+
+class TestNoteFrontmatterProperties:
+    """Tests for NoteFrontmatter with typed properties"""
+
+    def test_defaults_properties_to_empty(self):
+        """Properties should default to empty dict"""
+        fm = NoteFrontmatter(title="Test")
+
+        assert fm.properties == {}
+
+    def test_accepts_properties(self):
+        """Should accept properties dict"""
+        prop = TypedProperty(type=PropertyType.STRING, value="test")
+        fm = NoteFrontmatter(title="Test", properties={"priority": prop})
+
+        assert "priority" in fm.properties
+        assert fm.properties["priority"].value == "test"
+
+    def test_accepts_multiple_properties(self):
+        """Should accept multiple properties"""
+        props = {
+            "priority": TypedProperty(type=PropertyType.STRING, value="high"),
+            "count": TypedProperty(type=PropertyType.NUMBER, value=5),
+            "done": TypedProperty(type=PropertyType.BOOLEAN, value=False)
+        }
+        fm = NoteFrontmatter(title="Test", properties=props)
+
+        assert len(fm.properties) == 3
+        assert fm.properties["priority"].value == "high"
+        assert fm.properties["count"].value == 5
+        assert fm.properties["done"].value is False
+
+    def test_get_property(self):
+        """get_property should return property by name"""
+        prop = TypedProperty(type=PropertyType.STRING, value="test")
+        fm = NoteFrontmatter(title="Test", properties={"name": prop})
+
+        result = fm.get_property("name")
+
+        assert result is not None
+        assert result.value == "test"
+
+    def test_get_property_not_found(self):
+        """get_property should return None for missing property"""
+        fm = NoteFrontmatter(title="Test")
+
+        result = fm.get_property("nonexistent")
+
+        assert result is None
+
+    def test_set_property(self):
+        """set_property should add or update property"""
+        fm = NoteFrontmatter(title="Test")
+        prop = TypedProperty(type=PropertyType.STRING, value="test")
+
+        fm.set_property("name", prop)
+
+        assert "name" in fm.properties
+        assert fm.properties["name"].value == "test"
+
+    def test_set_property_update(self):
+        """set_property should update existing property"""
+        prop1 = TypedProperty(type=PropertyType.STRING, value="old")
+        fm = NoteFrontmatter(title="Test", properties={"name": prop1})
+
+        prop2 = TypedProperty(type=PropertyType.STRING, value="new")
+        fm.set_property("name", prop2)
+
+        assert fm.properties["name"].value == "new"
+
+    def test_delete_property(self):
+        """delete_property should remove property"""
+        prop = TypedProperty(type=PropertyType.STRING, value="test")
+        fm = NoteFrontmatter(title="Test", properties={"name": prop})
+
+        result = fm.delete_property("name")
+
+        assert result is True
+        assert "name" not in fm.properties
+
+    def test_delete_property_not_found(self):
+        """delete_property should return False for missing property"""
+        fm = NoteFrontmatter(title="Test")
+
+        result = fm.delete_property("nonexistent")
+
+        assert result is False
+
+    def test_get_property_value(self):
+        """get_property_value should return property value"""
+        prop = TypedProperty(type=PropertyType.NUMBER, value=42)
+        fm = NoteFrontmatter(title="Test", properties={"count": prop})
+
+        result = fm.get_property_value("count")
+
+        assert result == 42
+
+    def test_get_property_value_not_found(self):
+        """get_property_value should return None for missing property"""
+        fm = NoteFrontmatter(title="Test")
+
+        result = fm.get_property_value("nonexistent")
+
+        assert result is None
+
+    def test_serialization_with_properties(self):
+        """NoteFrontmatter should serialize with properties"""
+        prop = TypedProperty(type=PropertyType.STRING, value="test")
+        fm = NoteFrontmatter(title="Test", properties={"name": prop})
+
+        data = fm.model_dump()
+
+        assert "properties" in data
+        assert "name" in data["properties"]
+        assert data["properties"]["name"]["value"] == "test"
+
+
+# ============================================================================
+# NoteCreate with Properties Tests
+# ============================================================================
+
+class TestNoteCreateProperties:
+    """Tests for NoteCreate with typed properties"""
+
+    def test_defaults_properties_to_empty(self):
+        """Properties should default to empty dict"""
+        create = NoteCreate(title="Test")
+
+        assert create.properties == {}
+
+    def test_accepts_properties(self):
+        """Should accept properties"""
+        prop = TypedProperty(type=PropertyType.STRING, value="test")
+        create = NoteCreate(title="Test", properties={"name": prop})
+
+        assert "name" in create.properties
+
+    def test_serialization_with_properties(self):
+        """NoteCreate should serialize with properties"""
+        prop = TypedProperty(type=PropertyType.STRING, value="test")
+        create = NoteCreate(title="Test", properties={"name": prop})
+
+        data = create.model_dump()
+
+        assert "properties" in data
+        assert "name" in data["properties"]
+
+
+# ============================================================================
+# NoteUpdate with Properties Tests
+# ============================================================================
+
+class TestNoteUpdateProperties:
+    """Tests for NoteUpdate with typed properties"""
+
+    def test_properties_optional(self):
+        """Properties should be optional"""
+        update = NoteUpdate()
+
+        assert update.properties is None
+
+    def test_accepts_properties(self):
+        """Should accept properties"""
+        prop = TypedProperty(type=PropertyType.STRING, value="test")
+        update = NoteUpdate(properties={"name": prop})
+
+        assert "name" in update.properties
+
+    def test_partial_update_with_properties(self):
+        """Should allow partial updates with properties"""
+        prop = TypedProperty(type=PropertyType.STRING, value="test")
+        update = NoteUpdate(properties={"name": prop})
+
+        assert update.properties is not None
+        assert update.title is None
+        assert update.content is None

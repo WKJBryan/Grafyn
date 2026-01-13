@@ -1,9 +1,10 @@
 """Search API router for semantic and lexical search"""
 from fastapi import APIRouter, Query, Request, HTTPException
-from typing import List
+from typing import List, Optional
 from backend.app.models.note import SearchResult
 from backend.app.services.vector_search import VectorSearchService
 from backend.app.services.knowledge_store import KnowledgeStore
+from backend.app.services.priority_scoring import PriorityScoringService
 
 router = APIRouter()
 
@@ -18,24 +19,44 @@ def get_knowledge_store(request: Request) -> KnowledgeStore:
     return request.app.state.knowledge_store
 
 
+def get_priority_scoring(request: Request) -> Optional[PriorityScoringService]:
+    """Get priority scoring service from app state (optional)"""
+    return getattr(request.app.state, 'priority_scoring', None)
+
+
 @router.get("", response_model=List[SearchResult])
 async def search_notes(
     request: Request,
     q: str = Query(..., min_length=1, max_length=500, description="Search query"),
     limit: int = Query(10, ge=1, le=50, description="Maximum number of results"),
-    semantic: bool = Query(True, description="Use semantic vector search")
+    semantic: bool = Query(True, description="Use semantic vector search"),
+    use_priority: bool = Query(True, description="Apply priority scoring")
 ):
     """
-    Search notes by query
+    Search notes by query with optional priority scoring
 
     - **q**: Search query string (required)
     - **limit**: Maximum number of results (1-50, default: 10)
     - **semantic**: Use semantic vector search (default: true)
+    - **use_priority**: Apply priority scoring for better relevance (default: true)
     """
     vector_search = get_vector_search(request)
 
     if semantic:
-        return vector_search.search(q, limit)
+        results = vector_search.search(q, limit)
+        
+        # Apply priority scoring if enabled
+        if use_priority:
+            priority_scoring = get_priority_scoring(request)
+            knowledge_store = get_knowledge_store(request)
+            if priority_scoring:
+                # Parse query for tags
+                parsed = vector_search.parse_search_query(q)
+                results = priority_scoring.score_search_results(
+                    results, parsed.tags, knowledge_store
+                )
+        
+        return results[:limit]
     else:
         # Lexical search fallback
         knowledge_store = get_knowledge_store(request)

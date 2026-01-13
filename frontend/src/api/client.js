@@ -43,6 +43,9 @@ export const notes = {
   update: (id, data) => api.put(`/notes/${encodeURIComponent(id)}`, data),
   delete: (id) => api.delete(`/notes/${encodeURIComponent(id)}`),
   reindex: () => api.post('/notes/reindex'),
+  // Distillation API
+  distill: (id, request) => api.post(`/notes/${encodeURIComponent(id)}/distill`, request),
+  normalizeTags: (id) => api.post(`/notes/${encodeURIComponent(id)}/normalize-tags`),
 }
 
 // Search API

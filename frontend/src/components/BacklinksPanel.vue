@@ -18,9 +18,9 @@
     <div v-else class="backlinks-list">
       <div
         v-for="backlink in backlinks"
-        :key="backlink.id"
+        :key="backlink.note_id"
         class="backlink-item card card-hover"
-        @click="$emit('navigate', backlink.id)"
+        @click="$emit('navigate', backlink.note_id)"
       >
         <div class="backlink-title">{{ backlink.title }}</div>
         <div v-if="backlink.context" class="backlink-context">

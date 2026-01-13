@@ -1,14 +1,16 @@
 <template>
   <div class="note-editor">
     <div class="editor-header">
-      <input
-        v-model="localNote.title"
-        type="text"
-        class="title-input"
-        placeholder="Note title..."
-        @input="handleDirty"
-      />
       <div class="editor-actions">
+        <button
+          v-if="canDistill"
+          class="btn btn-accent"
+          :disabled="isDistilling"
+          @click="handleDistill"
+          title="Extract atomic notes from this container"
+        >
+          {{ isDistilling ? '⏳ Distilling...' : '⚗️ Distill' }}
+        </button>
         <button
           class="btn btn-secondary"
           :disabled="!isDirty"
@@ -66,12 +68,18 @@
         @input="handleTagsInput"
       />
     </div>
+
+    <!-- Distill Status Message -->
+    <div v-if="distillMessage" class="distill-message" :class="{ error: distillMessage.includes('failed') }">
+      {{ distillMessage }}
+    </div>
   </div>
 </template>
 
 <script setup>
 import { ref, computed, watch } from 'vue'
 import { marked } from 'marked'
+import { notes } from '@/api/client'
 
 const props = defineProps({
   note: {
@@ -80,12 +88,22 @@ const props = defineProps({
   }
 })
 
-const emit = defineEmits(['save', 'delete'])
+const emit = defineEmits(['save', 'delete', 'distill-success', 'close'])
 
 const localNote = ref({ ...props.note })
 const mode = ref('edit')
 const isDirty = ref(false)
 const tagsInput = ref(props.note.tags ? props.note.tags.join(', ') : '')
+const isDistilling = ref(false)
+const distillMessage = ref('')
+
+// Computed: can distill if status is evidence, has canvas-export tag, or source is mcp
+const canDistill = computed(() => {
+  const status = localNote.value.frontmatter?.status || localNote.value.status
+  const tags = localNote.value.frontmatter?.tags || localNote.value.tags || []
+  const source = localNote.value.frontmatter?.source
+  return status === 'evidence' || tags.includes('canvas-export') || source === 'mcp'
+})
 
 // Watch for prop changes
 watch(() => props.note, (newNote) => {
@@ -97,14 +115,39 @@ watch(() => props.note, (newNote) => {
 const renderedContent = computed(() => {
   if (!localNote.value.content) return ''
   
+  // Configure marked to add IDs to headings for On This Page navigation
+  marked.use({
+    renderer: {
+      heading(text, level) {
+        const id = text.toLowerCase().replace(/[^\w]+/g, '-')
+        return `<h${level} id="${id}">${text}</h${level}>`
+      }
+    }
+  })
+  
   let html = marked(localNote.value.content)
   
-  // Render wikilinks
+  // Render embed syntax ![[Note]] - these become embedded content placeholders
   html = html.replace(
-    /\[\[([^\]|]+)(?:\|([^\]]+))?\]\]/g,
-    (match, target, display) => {
-      const text = display || target
-      return `<span class="wikilink" data-target="${target}">${text}</span>`
+    /!\[\[([^\]|#]+)(?:#([^\]|]+))?(?:\|([^\]]+))?\]\]/g,
+    (match, target, anchor, display) => {
+      const anchorAttr = anchor ? ` data-anchor="${anchor}"` : ''
+      return `<div class="embed-placeholder" data-target="${target}"${anchorAttr}>
+        <span class="embed-icon">📄</span>
+        <span class="embed-title">${display || target}${anchor ? '#' + anchor : ''}</span>
+        <span class="embed-hint">Click to view embedded content</span>
+      </div>`
+    }
+  )
+  
+  // Render wikilinks with optional heading anchors
+  // [[Note#Heading]] or [[Note#^block-id]] or [[Note|Display]]
+  html = html.replace(
+    /\[\[([^\]|#]+)(?:#([^\]|]+))?(?:\|([^\]]+))?\]\]/g,
+    (match, target, anchor, display) => {
+      const text = display || (anchor ? `${target}#${anchor}` : target)
+      const anchorAttr = anchor ? ` data-anchor="${anchor}"` : ''
+      return `<span class="wikilink" data-target="${target}"${anchorAttr}>${text}</span>`
     }
   )
   
@@ -144,7 +187,36 @@ function handleDelete() {
     emit('delete', props.note.id)
   }
 }
+
+async function handleDistill() {
+  if (isDistilling.value) return
+  
+  isDistilling.value = true
+  distillMessage.value = ''
+  
+  try {
+    const result = await notes.distill(props.note.id, { mode: 'auto' })
+    
+    if (result.created_note_ids?.length > 0) {
+      distillMessage.value = `✓ Created ${result.created_note_ids.length} draft notes`
+      emit('distill-success', result)
+    } else {
+      distillMessage.value = result.message || 'No atomic notes found to extract'
+    }
+    
+    // Show success briefly
+    setTimeout(() => {
+      distillMessage.value = ''
+    }, 3000)
+  } catch (error) {
+    console.error('Distill failed:', error)
+    distillMessage.value = error.response?.data?.detail || 'Distillation failed'
+  } finally {
+    isDistilling.value = false
+  }
+}
 </script>
+
 
 <style scoped>
 .note-editor {
@@ -159,28 +231,10 @@ function handleDelete() {
 .editor-header {
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  justify-content: flex-end;
   padding: var(--spacing-md);
   border-bottom: 1px solid var(--bg-tertiary);
-  gap: var(--spacing-md);
-}
-
-.title-input {
-  flex: 1;
-  font-size: 1.25rem;
-  font-weight: 600;
-  background: transparent;
-  border: none;
-  color: var(--text-primary);
-  padding: 0;
-}
-
-.title-input:focus {
-  outline: none;
-}
-
-.title-input::placeholder {
-  color: var(--text-muted);
+  gap: var(--spacing-sm);
 }
 
 .editor-actions {
@@ -336,5 +390,89 @@ function handleDelete() {
 
 .tags-input {
   flex: 1;
+}
+
+.distill-message {
+  padding: var(--spacing-sm) var(--spacing-md);
+  background: var(--accent-primary);
+  color: white;
+  font-size: 0.875rem;
+  text-align: center;
+  animation: fadeIn 0.3s ease;
+}
+
+.distill-message.error {
+  background: var(--error-bg, #dc2626);
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(-10px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+/* Wikilink styles */
+.editor-preview :deep(.wikilink) {
+  color: var(--accent-primary);
+  cursor: pointer;
+  text-decoration: none;
+  border-bottom: 1px dashed var(--accent-primary);
+  transition: all var(--transition-fast);
+}
+
+.editor-preview :deep(.wikilink:hover) {
+  background: var(--accent-primary);
+  color: var(--bg-primary);
+  border-radius: 2px;
+  border-bottom-color: transparent;
+}
+
+/* Wikilink with anchor indicator */
+.editor-preview :deep(.wikilink[data-anchor]) {
+  position: relative;
+}
+
+.editor-preview :deep(.wikilink[data-anchor])::after {
+  content: '§';
+  font-size: 0.75em;
+  margin-left: 2px;
+  opacity: 0.6;
+}
+
+/* Embed placeholder styles */
+.editor-preview :deep(.embed-placeholder) {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--spacing-xs);
+  padding: var(--spacing-md);
+  margin: var(--spacing-md) 0;
+  background: var(--bg-tertiary);
+  border: 1px dashed var(--accent-primary);
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  transition: all var(--transition-fast);
+}
+
+.editor-preview :deep(.embed-placeholder:hover) {
+  background: var(--accent-primary);
+  border-style: solid;
+}
+
+.editor-preview :deep(.embed-placeholder:hover) * {
+  color: white;
+}
+
+.editor-preview :deep(.embed-icon) {
+  font-size: 1.5rem;
+}
+
+.editor-preview :deep(.embed-title) {
+  font-weight: 600;
+  color: var(--accent-primary);
+}
+
+.editor-preview :deep(.embed-hint) {
+  font-size: 0.75rem;
+  color: var(--text-muted);
 }
 </style>

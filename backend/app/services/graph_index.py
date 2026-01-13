@@ -1,4 +1,5 @@
 """Graph index service for wikilink parsing and backlink tracking"""
+import re
 from typing import List, Dict, Set, Optional
 from collections import deque
 
@@ -12,6 +13,8 @@ class GraphIndexService:
         """Initialize graph index"""
         self._outgoing: Dict[str, Set[str]] = {}  # note_id -> linked note IDs
         self._incoming: Dict[str, Set[str]] = {}  # note_id -> notes linking to it
+        self._title_to_id: Dict[str, str] = {}    # title -> note_id (for resolving wikilinks)
+        self._id_to_title: Dict[str, str] = {}    # note_id -> title (reverse lookup)
         self._knowledge_store = KnowledgeStore()
         self._build_index()
     
@@ -20,24 +23,54 @@ class GraphIndexService:
         # Clear existing index
         self._outgoing.clear()
         self._incoming.clear()
+        self._title_to_id.clear()
+        self._id_to_title.clear()
         
         # Get all notes
         notes = self._knowledge_store.list_notes()
         
-        # Build adjacency lists
+        # First pass: build title<->ID maps
+        for note in notes:
+            full_note = self._knowledge_store.get_note(note.id)
+            if full_note:
+                self._title_to_id[full_note.title] = note.id
+                self._id_to_title[note.id] = full_note.title
+                # Also map aliases if available
+                for alias in full_note.frontmatter.aliases:
+                    self._title_to_id[alias] = note.id
+        
+        # Second pass: build adjacency lists with resolved IDs
         for note in notes:
             note_id = note.id
             full_note = self._knowledge_store.get_note(note_id)
             
             if full_note:
-                # Initialize outgoing links
-                self._outgoing[note_id] = set(full_note.outgoing_links)
+                # Resolve wikilink titles to note IDs
+                resolved_links = set()
+                for linked_title in full_note.outgoing_links:
+                    # Try to resolve title to ID
+                    resolved_id = self._title_to_id.get(linked_title)
+                    if resolved_id:
+                        resolved_links.add(resolved_id)
+                    else:
+                        # Keep unresolved for forward links (note might not exist yet)
+                        resolved_links.add(linked_title)
+                
+                self._outgoing[note_id] = resolved_links
                 
                 # Update incoming links for each target
-                for linked_id in full_note.outgoing_links:
+                for linked_id in resolved_links:
                     if linked_id not in self._incoming:
                         self._incoming[linked_id] = set()
                     self._incoming[linked_id].add(note_id)
+    
+    def resolve_title_to_id(self, title: str) -> Optional[str]:
+        """Resolve a wikilink title to a note ID"""
+        return self._title_to_id.get(title)
+    
+    def resolve_id_to_title(self, note_id: str) -> Optional[str]:
+        """Get the title for a note ID"""
+        return self._id_to_title.get(note_id)
     
     def build_index(self):
         """Rebuild the entire graph index"""
@@ -56,24 +89,26 @@ class GraphIndexService:
         backlinks = self.get_backlinks(note_id)
         results = []
         
+        # Get the target note's title for context extraction
+        target_title = self._id_to_title.get(note_id, note_id)
+        
         for source_id in backlinks:
             source_note = self._knowledge_store.get_note(source_id)
             if source_note:
-                # Find context around the wikilink
-                context = self._extract_context(source_note.content, note_id)
+                # Find context around the wikilink (by title, not ID)
+                context = self._extract_context(source_note.content, target_title)
                 results.append({
-                    'source_id': source_id,
-                    'source_title': source_note.title,
+                    'note_id': source_id,  # Match BacklinkInfo model
+                    'title': source_note.title,  # Match BacklinkInfo model
                     'context': context
                 })
         
         return results
     
-    def _extract_context(self, content: str, target_id: str) -> str:
+    def _extract_context(self, content: str, target_title: str) -> str:
         """Extract context around a wikilink"""
-        # Find the wikilink in content
-        import re
-        pattern = re.compile(r'\[\[' + re.escape(target_id) + r'(?:\|[^\]]+)?\]\]')
+        # Find the wikilink in content (search by title)
+        pattern = re.compile(r'\[\[' + re.escape(target_title) + r'(?:\|[^\]]+)?\]\]')
         match = pattern.search(content)
         
         if match:
@@ -118,7 +153,10 @@ class GraphIndexService:
         if not target_note:
             return []
         
-        # Search for mentions of the title in other notes
+        # Get notes that already link to this note
+        already_linked = set(self.get_backlinks(note_id))
+        
+        # Search for mentions of the title in other notes' CONTENT
         mentions = []
         all_notes = self._knowledge_store.list_notes()
         
@@ -126,11 +164,30 @@ class GraphIndexService:
             if note.id == note_id:
                 continue
             
-            # Check if title is mentioned in content
-            if target_note.title.lower() in note.title.lower():
+            # Skip if already linked
+            if note.id in already_linked:
+                continue
+            
+            # Get full note to check content
+            full_note = self._knowledge_store.get_note(note.id)
+            if not full_note:
+                continue
+            
+            # Check if title is mentioned in content (case-insensitive)
+            if target_note.title.lower() in full_note.content.lower():
+                # Find the context of the mention
+                pattern = re.compile(re.escape(target_note.title), re.IGNORECASE)
+                match = pattern.search(full_note.content)
+                context = ""
+                if match:
+                    start = max(0, match.start() - 50)
+                    end = min(len(full_note.content), match.end() + 50)
+                    context = full_note.content[start:end]
+                
                 mentions.append({
                     'note_id': note.id,
-                    'title': note.title
+                    'title': note.title,
+                    'context': context
                 })
         
         return mentions
@@ -139,8 +196,12 @@ class GraphIndexService:
         """Incrementally update graph index for a modified note"""
         # Extract old and new wikilinks
         ks = KnowledgeStore()
-        old_links = ks._extract_wikilinks(old_content)
-        new_links = ks._extract_wikilinks(new_content)
+        old_links_raw = ks._extract_wikilinks(old_content)
+        new_links_raw = ks._extract_wikilinks(new_content)
+        
+        # Resolve to IDs
+        old_links = set(self._title_to_id.get(t, t) for t in old_links_raw)
+        new_links = set(self._title_to_id.get(t, t) for t in new_links_raw)
         
         # Remove old links
         for linked_id in old_links:

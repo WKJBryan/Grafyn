@@ -94,6 +94,14 @@
               {{ contextModeHints[contextMode] }}
             </span>
           </div>
+          
+          <!-- Context Budget Display -->
+          <div v-if="selectedModels.length > 0" class="form-group">
+            <ContextBudgetDisplay
+              :current-tokens="currentTokens"
+              :max-tokens="maxContextTokens"
+            />
+          </div>
         </div>
       </div>
 
@@ -114,6 +122,7 @@
 <script setup>
 import { ref, computed } from 'vue'
 import ModelSelector from './ModelSelector.vue'
+import ContextBudgetDisplay from './ContextBudgetDisplay.vue'
 
 const props = defineProps({
   models: {
@@ -149,6 +158,44 @@ const contextModeHints = {
 const canSubmit = computed(() => {
   return prompt.value.trim().length > 0 && selectedModels.value.length > 0
 })
+
+// Token counting for context budget
+const estimatedTokens = computed(() => {
+  // Estimate tokens: ~4 characters per token for English text
+  const charsPerToken = 4
+  
+  // Count tokens from prompt
+  let totalChars = prompt.value?.length || 0
+  
+  // Count tokens from system prompt if present
+  if (showSystemPrompt.value) {
+    totalChars += systemPrompt.value?.length || 0
+  }
+  
+  // Estimate context tokens based on mode (only for branching)
+  if (branchContext.value) {
+    const contextMultiplier = {
+      full_history: 1.5,  // Include conversation history
+      compact: 1.2,       // Compact summary
+      semantic: 1.3       // Semantic search results
+    }
+    const multiplier = contextMultiplier[contextMode.value] || 1.2
+    totalChars *= multiplier
+  }
+  
+  return Math.ceil(totalChars / charsPerToken)
+})
+
+const maxContextTokens = computed(() => {
+  // Get the first selected model's context limit
+  const firstModelId = selectedModels.value[0]
+  if (!firstModelId) return 4096
+  
+  const model = props.models.find(m => m.id === firstModelId)
+  return model?.context_length || 4096
+})
+
+const currentTokens = computed(() => estimatedTokens.value)
 
 // Methods
 function handleSubmit() {
