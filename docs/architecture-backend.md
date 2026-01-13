@@ -8,8 +8,11 @@ The backend is a FastAPI-based REST API providing:
 - Note CRUD operations with Markdown/YAML frontmatter support
 - Semantic vector search using LanceDB + sentence-transformers
 - Knowledge graph with wikilink parsing and backlinks
+- **Distillation service** for Container → Atomic → Hub knowledge workflow
 - MCP server for external AI model integration
+- Multi-LLM Canvas for comparing AI model responses
 - OAuth authentication for ChatGPT
+- OpenRouter integration for 100+ AI models
 - Security middleware (rate limiting, input sanitization, security headers)
 
 ## Entry Point
@@ -60,6 +63,7 @@ app.include_router(notes.router, prefix="/api/notes", tags=["notes"])
 app.include_router(search.router, prefix="/api/search", tags=["search"])
 app.include_router(graph.router, prefix="/api/graph", tags=["graph"])
 app.include_router(oauth.router, prefix="/api/oauth", tags=["oauth"])
+app.include_router(canvas.router, prefix="/api/canvas", tags=["canvas"])
 
 # MCP server
 setup_mcp(app)
@@ -77,8 +81,8 @@ setup_mcp(app)
 ├──────────────────────────────────────────────────────────────┤
 │                      API Layer (Routers)                      │
 │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌──────┐ │
-│  │ notes.py    │  │ search.py   │  │ graph.py    │  │oauth │ │
-│  │ 6 endpoints │  │ 2 endpoints │  │ 5 endpoints │  │.py   │ │
+│  │ notes.py    │  │ search.py   │  │ graph.py    │  │oauth │ │canvas│ │
+│  │ 6 endpoints │  │ 2 endpoints │  │ 5 endpoints │  │.py   │ │.py  │ │
 │  └─────────────┘  └─────────────┘  └─────────────┘  └──────┘ │
 ├──────────────────────────────────────────────────────────────┤
 │                     Service Layer                             │
@@ -94,8 +98,13 @@ setup_mcp(app)
 ├──────────────────────────────────────────────────────────────┤
 │                     Data Layer                                │
 │  ┌────────────────┐ ┌─────────────────┐ ┌─────────────────┐  │
-│  │ vault/*.md     │ │ data/lancedb/   │ │ In-memory graph │  │
-│  │ (Markdown)     │ │ (Vectors)       │ │ (Adjacency)     │  │
+│  │ vault/*.md     │ │ data/lancedb/   │ │ In-memory graph │ │
+│  │ (Markdown)     │ │ (Vectors)       │ │ (Adjacency)     │ │
+│  └────────────────┘ └─────────────────┘ └─────────────────┘ │
+│            │                 │                               │
+│  ┌────────────────┐ ┌─────────────────┐ ┌─────────────────┐  │
+│  │data/canvas/    │ │ OpenRouter API  │ │                 │  │
+│  │(Sessions JSON) │ │ (External)      │ │                 │  │
 │  └────────────────┘ └─────────────────┘ └─────────────────┘  │
 └──────────────────────────────────────────────────────────────┘
 ```
@@ -132,6 +141,11 @@ class Settings(BaseSettings):
     rate_limit_per_hour: int = 50
     rate_limit_per_minute: int = 10
     
+    # OpenRouter
+    openrouter_api_key: str = ""
+    app_url: str = "http://localhost:8080"
+    canvas_data_path: str = "../data/canvas"
+    
     class Config:
         env_file = ".env"
 ```
@@ -140,12 +154,15 @@ class Settings(BaseSettings):
 |---------|---------|---------|
 | `VAULT_PATH` | `../vault` | Markdown notes directory |
 | `DATA_PATH` | `../data` | LanceDB storage |
+| `CANVAS_DATA_PATH` | `../data/canvas` | Canvas session storage |
 | `SERVER_HOST` | `0.0.0.0` | Bind address |
 | `SERVER_PORT` | `8080` | HTTP port |
 | `ENVIRONMENT` | `development` | Environment mode |
 | `EMBEDDING_MODEL` | `all-MiniLM-L6-v2` | Sentence transformer model |
 | `GITHUB_CLIENT_ID` | - | OAuth client ID |
 | `GITHUB_CLIENT_SECRET` | - | OAuth client secret |
+| `OPENROUTER_API_KEY` | - | OpenRouter API key |
+| `APP_URL` | `http://localhost:8080` | App URL for OpenRouter |
 | `RATE_LIMIT_ENABLED` | `true` | Enable rate limiting |
 
 ## Service Details
@@ -228,6 +245,83 @@ self._incoming: Dict[str, Set[str]]  # note_id → notes linking to it
 | `validate_token(token)` | Validate and return user data |
 | `revoke_token(token)` | Revoke a token |
 
+### 6. CanvasSessionStore (`services/canvas_store.py`)
+
+**Purpose:** Multi-LLM canvas session persistence and management
+
+**Key Methods:**
+| Method | Description |
+|--------|-------------|
+| `list_sessions()` | List all canvas sessions |
+| `get_session(id)` | Get specific session |
+| `create_session(data)` | Create new session |
+| `update_session(id, data)` | Update session metadata |
+| `delete_session(id)` | Delete session |
+| `add_prompt_tile()` | Add prompt with model responses |
+| `delete_tile(id)` | Delete prompt or debate tile |
+| `update_tile_position()` | Update tile canvas position |
+| `update_llm_node_position()` | Update individual LLM node position |
+| `update_response_content()` | Update streaming response |
+| `add_debate()` | Create debate between models |
+| `add_debate_round()` | Add round to debate |
+| `update_debate_status()` | Update debate state |
+| `get_tile_responses()` | Get responses for debate context |
+| `update_viewport()` | Save viewport state |
+| `link_note()` | Link canvas to note |
+| `get_tile_edges()` | Get parent-child edges |
+| `get_node_edges()` | Get all graph edges |
+| `find_node_groups()` | Find connected components |
+| `batch_update_positions()` | Auto-arrange positions |
+| `build_full_history()` | Build conversation context (full) |
+| `build_compact_history()` | Build conversation context (compact) |
+| `build_semantic_context()` | Build context from vector search |
+
+**Data Structures:**
+- Sessions stored as JSON files in `data/canvas/`
+- In-memory cache for active sessions
+- Node graph with adjacency lists for edges
+
+### 7. OpenRouterService (`services/openrouter.py`)
+
+**Purpose:** Multi-LLM API integration with streaming support
+
+**Key Methods:**
+| Method | Description |
+|--------|-------------|
+| `list_models()` | Get available models (cached 5min) |
+| `stream_completion()` | Stream chat completion |
+| `complete()` | Non-streaming completion |
+| `validate_api_key()` | Test API key |
+| `close()` | Close HTTP client |
+
+**Features:**
+- Unified API for 100+ AI models (OpenAI, Anthropic, Google, etc.)
+- Server-Sent Events (SSE) streaming
+- Model metadata (pricing, context length, provider)
+- Connection pooling with httpx
+- Automatic retry and timeout handling
+
+### 8. DistillationService (`services/distillation.py`)
+
+**Purpose:** Container → Atomic → Hub knowledge workflow
+
+**Key Methods:**
+| Method | Description |
+|--------|-------------|
+| `distill(note_id, request)` | Main entry point for distillation |
+| `normalize_tag(tag)` | Normalize tag (lowercase, strip #, space→hyphen) |
+| `parse_inline_tags(content)` | Extract #tags from markdown (ignores code/headings) |
+| `merge_tags(yaml_tags, inline_tags)` | Merge inline tags into YAML (additive only) |
+| `update_protected_section(content, snapshot)` | Safe canvas export update |
+| `find_duplicate(candidate, min_score)` | Semantic search for existing atomic notes |
+
+**Features:**
+- Tag normalization and inline `#tag` parsing (heading-safe)
+- Protected section markers for canvas export preservation
+- Dedup filtering (only matches draft/canonical notes)
+- Atomic file writes with filelock
+- Hub note creation and linking
+
 ## Middleware
 
 ### SecurityHeadersMiddleware
@@ -275,6 +369,8 @@ def setup_mcp(app: FastAPI) -> None:
 | `get_backlinks` | `note_id` | Backlinks with context |
 | `ingest_chat` | `content`, `title`, `source`, `tags` | Store transcripts |
 | `create_draft` | `title`, `content`, `based_on`, `tags` | Create drafts |
+| `distill_note` | `note_id`, `mode`, `hub_policy`, `min_score` | Container → Atomic distillation |
+| `normalize_tags` | `note_id` | Normalize and merge inline #tags |
 
 ## Dependencies
 
@@ -288,7 +384,7 @@ def setup_mcp(app: FastAPI) -> None:
 | sentence-transformers | ≥5.2.0 | Embeddings |
 | python-frontmatter | ≥1.1.0 | YAML frontmatter parsing |
 | slowapi | Latest | Rate limiting |
-| httpx | ≥0.28.0 | HTTP client (OAuth) |
+| httpx | ≥0.28.0 | HTTP client (OAuth, OpenRouter) |
 | python-dotenv | ≥1.2.0 | Environment loading |
 
 ## File Structure
@@ -304,14 +400,18 @@ backend/
 │   │   ├── notes.py         # Note CRUD endpoints
 │   │   ├── search.py        # Search endpoints
 │   │   ├── graph.py         # Graph endpoints
-│   │   └── oauth.py         # OAuth endpoints
+│   │   ├── oauth.py         # OAuth endpoints
+│   │   └── canvas.py        # Canvas API endpoints (15+)
 │   ├── services/
 │   │   ├── __init__.py
 │   │   ├── knowledge_store.py
 │   │   ├── vector_search.py
 │   │   ├── graph_index.py
 │   │   ├── embedding.py
-│   │   └── token_store.py
+│   │   ├── token_store.py
+│   │   ├── canvas_store.py   # Canvas session management
+│   │   ├── openrouter.py     # Multi-LLM API client
+│   │   └── distillation.py   # Container → Atomic → Hub workflow
 │   ├── middleware/
 │   │   ├── __init__.py
 │   │   ├── security.py
@@ -319,7 +419,9 @@ backend/
 │   │   └── rate_limit.py
 │   ├── models/
 │   │   ├── __init__.py
-│   │   └── note.py
+│   │   ├── note.py
+│   │   ├── canvas.py        # Canvas data models
+│   │   └── distillation.py  # Distillation workflow models
 │   └── mcp/
 │       ├── __init__.py
 │       ├── server.py

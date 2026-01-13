@@ -1,6 +1,6 @@
 # Seedream API Contracts - Backend
 
-> **Part:** Backend | **Endpoints:** 15+ | **Scan Level:** Exhaustive
+> **Part:** Backend | **Endpoints:** 30+ | **Scan Level:** Exhaustive
 
 ## Base URL
 
@@ -273,6 +273,514 @@ Handle OAuth callback from GitHub.
 | `state` | string | CSRF protection state |
 
 **Response:** Redirect with access token
+
+---
+
+## Canvas API (`/api/canvas`)
+
+### GET /api/canvas
+List all canvas sessions.
+
+**Response:** `200 OK`
+```json
+[
+  {
+    "id": "550e8400-e29b-41d4-a716-446655440000",
+    "title": "My Canvas Session",
+    "description": "Exploring AI model comparisons",
+    "tile_count": 3,
+    "debate_count": 1,
+    "created_at": "2026-01-11T14:00:00Z",
+    "updated_at": "2026-01-11T14:05:00Z",
+    "tags": ["ai-comparison"],
+    "status": "draft"
+  }
+]
+```
+
+---
+
+### POST /api/canvas
+Create a new canvas session.
+
+**Request Body:**
+```json
+{
+  "title": "My Canvas Session",
+  "description": "Exploring AI model comparisons",
+  "tags": ["ai-comparison"]
+}
+```
+
+**Response:** `201 Created`
+```json
+{
+  "id": "550e8400-e29b-41d4-a716-446655440000",
+  "title": "My Canvas Session",
+  "description": "Exploring AI model comparisons",
+  "prompt_tiles": [],
+  "debates": [],
+  "viewport": {"x": 0, "y": 0, "zoom": 1},
+  "created_at": "2026-01-11T14:00:00Z",
+  "updated_at": "2026-01-11T14:00:00Z",
+  "tags": ["ai-comparison"],
+  "status": "draft"
+}
+```
+
+---
+
+### GET /api/canvas/{session_id}
+Get a specific canvas session.
+
+**Path Parameters:**
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `session_id` | string | Canvas session UUID |
+
+**Response:** `200 OK` - Full CanvasSession object
+
+**Errors:**
+- `404 Not Found`: Session doesn't exist
+
+---
+
+### PUT /api/canvas/{session_id}
+Update canvas session metadata.
+
+**Path Parameters:**
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `session_id` | string | Canvas session UUID |
+
+**Request Body:**
+```json
+{
+  "title": "Updated Title",
+  "description": "Updated description",
+  "viewport": {"x": 100, "y": 50, "zoom": 1.2},
+  "tags": ["new-tag"],
+  "status": "evidence"
+}
+```
+
+**Response:** `200 OK` - Updated CanvasSession object
+
+**Errors:**
+- `404 Not Found`: Session doesn't exist
+
+---
+
+### DELETE /api/canvas/{session_id}
+Delete a canvas session.
+
+**Path Parameters:**
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `session_id` | string | Canvas session UUID |
+
+**Response:** `204 No Content`
+
+**Errors:**
+- `404 Not Found`: Session doesn't exist
+
+---
+
+### GET /api/canvas/models/available
+Get list of available models from OpenRouter. Rate limited to 30/minute.
+
+**Response:** `200 OK`
+```json
+[
+  {
+    "id": "openai/gpt-4",
+    "name": "GPT-4",
+    "provider": "openai",
+    "context_length": 8192,
+    "pricing": {"prompt": 0.03, "completion": 0.06},
+    "supports_streaming": true
+  },
+  {
+    "id": "anthropic/claude-3-opus",
+    "name": "Claude 3 Opus",
+    "provider": "anthropic",
+    "context_length": 200000,
+    "pricing": {"prompt": 0.015, "completion": 0.075},
+    "supports_streaming": true
+  }
+]
+```
+
+**Errors:**
+- `503 Service Unavailable`: OpenRouter API key not configured
+
+---
+
+### PUT /api/canvas/{session_id}/viewport
+Update canvas viewport state.
+
+**Path Parameters:**
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `session_id` | string | Canvas session UUID |
+
+**Request Body:**
+```json
+{
+  "x": 100,
+  "y": 50,
+  "zoom": 1.2
+}
+```
+
+**Response:** `200 OK`
+```json
+{
+  "status": "updated"
+}
+```
+
+**Errors:**
+- `404 Not Found`: Session doesn't exist
+
+---
+
+### PUT /api/canvas/{session_id}/tiles/{tile_id}/position
+Update a tile's position on the canvas.
+
+**Path Parameters:**
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `session_id` | string | Canvas session UUID |
+| `tile_id` | string | Tile UUID |
+
+**Request Body:**
+```json
+{
+  "x": 300,
+  "y": 100,
+  "width": 280,
+  "height": 200
+}
+```
+
+**Response:** `200 OK`
+```json
+{
+  "status": "updated"
+}
+```
+
+**Errors:**
+- `404 Not Found`: Tile doesn't exist
+
+---
+
+### PUT /api/canvas/{session_id}/tiles/{tile_id}/responses/{model_id}/position
+Update an individual LLM response node's position on the canvas.
+
+**Path Parameters:**
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `session_id` | string | Canvas session UUID |
+| `tile_id` | string | Tile UUID |
+| `model_id` | string | Model ID (URL encoded, may contain `/`) |
+
+**Request Body:**
+```json
+{
+  "x": 600,
+  "y": 150,
+  "width": 280,
+  "height": 200
+}
+```
+
+**Response:** `200 OK`
+```json
+{
+  "status": "updated"
+}
+```
+
+**Errors:**
+- `404 Not Found`: LLM node doesn't exist
+
+---
+
+### DELETE /api/canvas/{session_id}/tiles/{tile_id}
+Delete a tile (prompt or debate) from the canvas.
+
+**Path Parameters:**
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `session_id` | string | Canvas session UUID |
+| `tile_id` | string | Tile UUID |
+
+**Response:** `204 No Content`
+
+**Errors:**
+- `404 Not Found`: Tile doesn't exist
+
+---
+
+### GET /api/canvas/{session_id}/edges
+Get all parent-child tile edges for mind-map visualization (legacy).
+
+**Response:** `200 OK`
+```json
+[
+  {
+    "source_tile_id": "tile-1",
+    "target_tile_id": "tile-2",
+    "source_model_id": "openai/gpt-4"
+  }
+]
+```
+
+**Errors:**
+- `404 Not Found`: Session doesn't exist
+
+---
+
+### GET /api/canvas/{session_id}/node-edges
+Get all edges in the canvas graph for node-graph visualization.
+
+**Response:** `200 OK`
+```json
+[
+  {
+    "source_id": "prompt:tile-1",
+    "target_id": "llm:tile-1:openai/gpt-4",
+    "edge_type": "prompt_to_llm",
+    "color": "#7c5cff"
+  },
+  {
+    "source_id": "llm:tile-1:openai/gpt-4",
+    "target_id": "prompt:tile-2",
+    "edge_type": "llm_to_prompt"
+  }
+]
+```
+
+**Errors:**
+- `404 Not Found`: Session doesn't exist
+
+---
+
+### POST /api/canvas/{session_id}/arrange
+Batch update node positions after auto-arrange.
+
+**Path Parameters:**
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `session_id` | string | Canvas session UUID |
+
+**Request Body:**
+```json
+{
+  "positions": {
+    "prompt:tile-1": {"x": 50, "y": 50, "width": 200, "height": 120},
+    "llm:tile-1:openai/gpt-4": {"x": 300, "y": 50, "width": 280, "height": 200},
+    "debate:debate-1": {"x": 700, "y": 50, "width": 600, "height": 400}
+  }
+}
+```
+
+**Response:** `200 OK`
+```json
+{
+  "status": "arranged",
+  "node_count": 3
+}
+```
+
+**Errors:**
+- `400 Bad Request`: Failed to update positions
+- `404 Not Found`: Session doesn't exist
+
+---
+
+### GET /api/canvas/{session_id}/node-groups
+Get isolated node groups for multi-note export.
+
+**Response:** `200 OK`
+```json
+{
+  "groups": [
+    ["prompt:tile-1", "llm:tile-1:openai/gpt-4", "llm:tile-1:claude-3-opus"],
+    ["prompt:tile-2", "llm:tile-2:gpt-4"]
+  ],
+  "count": 2
+}
+```
+
+**Errors:**
+- `404 Not Found`: Session doesn't exist
+
+---
+
+### POST /api/canvas/{session_id}/prompt
+Send a prompt to multiple models with SSE streaming. Rate limited to 20/minute.
+
+**Path Parameters:**
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `session_id` | string | Canvas session UUID |
+
+**Request Body:**
+```json
+{
+  "prompt": "What is the meaning of life?",
+  "system_prompt": "You are a helpful assistant.",
+  "models": ["openai/gpt-4", "anthropic/claude-3-opus"],
+  "temperature": 0.7,
+  "max_tokens": 2048,
+  "parent_tile_id": null,
+  "parent_model_id": null,
+  "context_mode": "full_history"
+}
+```
+
+**Response:** `200 OK` - Server-Sent Events (SSE) stream
+
+**SSE Events:**
+| Event Type | Payload | Description |
+|-----------|----------|-------------|
+| `tile_created` | `{tile_id}` | New prompt tile created |
+| `chunk` | `{model_id, chunk}` | Streaming text chunk |
+| `complete` | `{model_id}` | Model finished streaming |
+| `error` | `{model_id, error}` | Model error occurred |
+| `session_saved` | - | Session persisted to disk |
+| `[DONE]` | - | Stream complete |
+
+**Errors:**
+- `404 Not Found`: Session doesn't exist
+- `503 Service Unavailable`: OpenRouter API key not configured
+
+---
+
+### POST /api/canvas/{session_id}/debate
+Start a debate between models with SSE streaming. Rate limited to 10/minute.
+
+**Path Parameters:**
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `session_id` | string | Canvas session UUID |
+
+**Request Body:**
+```json
+{
+  "source_tile_ids": ["tile-1", "tile-2"],
+  "participating_models": ["openai/gpt-4", "anthropic/claude-3-opus"],
+  "debate_mode": "auto",
+  "debate_prompt": null,
+  "max_rounds": 3
+}
+```
+
+**Response:** `200 OK` - Server-Sent Events (SSE) stream
+
+**SSE Events:**
+| Event Type | Payload | Description |
+|-----------|----------|-------------|
+| `debate_created` | `{debate_id}` | New debate started |
+| `round_start` | `{round}` | New round started |
+| `debate_chunk` | `{round, model_id, chunk}` | Streaming debate content |
+| `model_complete` | `{round, model_id}` | Model finished round |
+| `debate_error` | `{round, model_id, error}` | Model error |
+| `round_complete` | `{round}` | Round finished |
+| `debate_complete` | `{debate_id}` | Debate finished |
+| `[DONE]` | - | Stream complete |
+
+**Errors:**
+- `404 Not Found`: Session doesn't exist
+- `400 Bad Request`: No valid source tiles found
+- `503 Service Unavailable`: OpenRouter API key not configured
+
+---
+
+### POST /api/canvas/{session_id}/debate/{debate_id}/continue
+Continue a debate with a custom prompt (user-mediated mode). Rate limited to 10/minute.
+
+**Path Parameters:**
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `session_id` | string | Canvas session UUID |
+| `debate_id` | string | Debate UUID |
+
+**Request Body:**
+```json
+{
+  "prompt": "Please elaborate on your previous points."
+}
+```
+
+**Response:** `200 OK` - Server-Sent Events (SSE) stream
+
+**SSE Events:**
+| Event Type | Payload | Description |
+|-----------|----------|-------------|
+| `round_start` | `{round}` | New round started |
+| `debate_chunk` | `{round, model_id, chunk}` | Streaming debate content |
+| `model_complete` | `{round, model_id}` | Model finished round |
+| `debate_error` | `{round, model_id, error}` | Model error |
+| `round_complete` | `{round}` | Round finished |
+| `[DONE]` | - | Stream complete |
+
+**Errors:**
+- `404 Not Found`: Session or debate doesn't exist
+
+---
+
+### PUT /api/canvas/{session_id}/debate/{debate_id}/status
+Update debate status (pause/resume/complete).
+
+**Path Parameters:**
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `session_id` | string | Canvas session UUID |
+| `debate_id` | string | Debate UUID |
+
+**Query Parameters:**
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `status` | string | New status: `active`, `paused`, or `completed` |
+
+**Response:** `200 OK`
+```json
+{
+  "status": "updated"
+}
+```
+
+**Errors:**
+- `400 Bad Request`: Invalid status value
+- `404 Not Found`: Debate doesn't exist
+
+---
+
+### POST /api/canvas/{session_id}/export-note
+Export canvas session as a markdown note.
+
+**Path Parameters:**
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `session_id` | string | Canvas session UUID |
+
+**Response:** `200 OK`
+```json
+{
+  "note_id": "Canvas_My_Canvas_Session",
+  "title": "Canvas: My Canvas Session",
+  "message": "Canvas exported to note: Canvas: My Canvas Session",
+  "updated": false
+}
+```
+
+**Errors:**
+- `404 Not Found`: Session doesn't exist
+- `500 Internal Server Error`: Failed to export
 
 ---
 

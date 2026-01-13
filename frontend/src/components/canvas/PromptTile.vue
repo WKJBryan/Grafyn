@@ -63,6 +63,11 @@
             <option value="semantic">Semantic</option>
           </select>
         </div>
+        <ContextBudgetDisplay
+          :current-tokens="currentTokens"
+          :max-tokens="maxContextTokens"
+          :compact="true"
+        />
         <div class="branch-actions">
           <button class="branch-cancel" @click.stop="closeBranchInput">Cancel</button>
           <button class="branch-submit" @click.stop="submitBranch" :disabled="!branchPrompt.trim()">

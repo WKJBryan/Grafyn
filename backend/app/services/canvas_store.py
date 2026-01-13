@@ -616,14 +616,19 @@ class CanvasSessionStore:
         prompt: str,
         vector_search,
         top_k: int = 3,
+        priority_scoring=None,
+        knowledge_store=None,
     ) -> List[Dict[str, str]]:
         """
         Build context by searching notes and tiles for relevant content.
+        Applies priority scoring to rank results by relevance.
 
         Args:
             prompt: The new prompt to find context for
             vector_search: VectorSearchService instance
             top_k: Number of results to include
+            priority_scoring: Optional PriorityScoringService instance for prioritization
+            knowledge_store: Optional KnowledgeStore instance for metadata
 
         Returns:
             List with a single system message containing relevant context
@@ -631,9 +636,26 @@ class CanvasSessionStore:
         if not vector_search:
             return []
 
-        results = vector_search.search_all(prompt, limit=top_k)
+        # Get initial search results (fetch more for scoring)
+        initial_limit = top_k * 3 if priority_scoring else top_k
+        results = vector_search.search_all(prompt, limit=initial_limit)
         if not results:
             return []
+
+        # Apply priority scoring if available
+        if priority_scoring:
+            # Extract tags from prompt for relevance matching
+            from backend.app.services.vector_search import ParsedQuery
+            parsed = vector_search.parse_search_query(prompt)
+            query_tags = parsed.tags
+            
+            # Score and sort results
+            results = priority_scoring.score_search_results(
+                results, query_tags, knowledge_store
+            )
+        
+        # Take top_k results after scoring
+        results = results[:top_k]
 
         context_parts = []
         for r in results:

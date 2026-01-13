@@ -15,14 +15,53 @@
         </span>
       </div>
       <div class="toolbar-actions">
-        <button
-          class="btn btn-secondary btn-sm"
-          @click="handleAutoArrange"
-          :disabled="!session || promptTiles.length === 0"
-          title="Auto-arrange nodes"
-        >
-          <span class="icon">⊞</span> Arrange
-        </button>
+        <div class="arrange-dropdown" ref="arrangeDropdown">
+          <button
+            class="btn btn-secondary btn-sm"
+            @click="toggleArrangeMenu"
+            :disabled="!session || promptTiles.length === 0"
+            title="Auto-arrange nodes"
+          >
+            <span class="icon">⊞</span> Arrange
+            <span class="dropdown-arrow">▼</span>
+          </button>
+          <div class="dropdown-menu" v-if="showArrangeMenu">
+            <div class="dropdown-header">Layout Algorithm</div>
+            <button
+              class="dropdown-item"
+              :class="{ active: layoutAlgorithm === 'hierarchical' }"
+              @click="handleAutoArrange('hierarchical')"
+            >
+              <span class="layout-icon">🌳</span>
+              <div class="layout-info">
+                <span class="layout-name">Hierarchical</span>
+                <span class="layout-desc">Tree layout from left to right</span>
+              </div>
+            </button>
+            <button
+              class="dropdown-item"
+              :class="{ active: layoutAlgorithm === 'force-directed' }"
+              @click="handleAutoArrange('force-directed')"
+            >
+              <span class="layout-icon">🔮</span>
+              <div class="layout-info">
+                <span class="layout-name">Force-Directed</span>
+                <span class="layout-desc">Physics-based node positioning</span>
+              </div>
+            </button>
+            <button
+              class="dropdown-item"
+              :class="{ active: layoutAlgorithm === 'circular' }"
+              @click="handleAutoArrange('circular')"
+            >
+              <span class="layout-icon">⭕</span>
+              <div class="layout-info">
+                <span class="layout-name">Circular</span>
+                <span class="layout-desc">Nodes arranged in a circle</span>
+              </div>
+            </button>
+          </div>
+        </div>
         <button
           class="btn btn-secondary btn-sm"
           @click="handleSaveAsNote"
@@ -176,6 +215,12 @@
       <p>Loading...</p>
     </div>
 
+    <!-- Arranging Overlay -->
+    <div class="arranging-overlay" v-if="arranging">
+      <div class="spinner"></div>
+      <p>Arranging nodes...</p>
+    </div>
+
     <!-- Save Toast -->
     <div
       v-if="saveMessage"
@@ -219,6 +264,10 @@ const saving = ref(false)
 const saveMessage = ref(null)
 const branchContext = ref(null)  // { parentTileId, parentModelId, parentContent }
 const expandedDebates = ref([])  // IDs of expanded debate nodes
+const showArrangeMenu = ref(false)
+const layoutAlgorithm = ref('hierarchical')  // 'hierarchical', 'force-directed', 'circular'
+const arranging = ref(false)  // Loading state during arrangement
+const arrangeDropdown = ref(null)  // Ref for dropdown element
 
 
 // D3 zoom
@@ -454,6 +503,9 @@ watch(() => props.sessionId, async (newId) => {
 onMounted(() => {
   initZoom()
   canvasStore.loadModels()
+  
+  // Add click outside listener for dropdown
+  document.addEventListener('click', handleClickOutside)
 })
 
 onBeforeUnmount(() => {
@@ -461,6 +513,9 @@ onBeforeUnmount(() => {
   if (session.value) {
     canvasStore.updateViewport(viewport.value)
   }
+  
+  // Remove click outside listener
+  document.removeEventListener('click', handleClickOutside)
 })
 
 // Methods
@@ -708,13 +763,28 @@ async function handleSaveAsNote() {
   }
 }
 
-// Auto-arrange nodes in a horizontal tree layout
-async function handleAutoArrange() {
+// Toggle arrange menu dropdown
+function toggleArrangeMenu() {
+  showArrangeMenu.value = !showArrangeMenu.value
+}
+
+// Close arrange menu when clicking outside
+function handleClickOutside(event) {
+  if (arrangeDropdown.value && !arrangeDropdown.value.contains(event.target)) {
+    showArrangeMenu.value = false
+  }
+}
+
+// Auto-arrange nodes with different layout algorithms
+async function handleAutoArrange(algorithm = 'hierarchical') {
   if (!session.value || promptTiles.value.length === 0) return
   
+  arranging.value = true
+  showArrangeMenu.value = false
+  layoutAlgorithm.value = algorithm
+  
   const positions = {}
-  const NODE_GAP_X = 80   // Horizontal gap between columns
-  const NODE_GAP_Y = 40   // Vertical gap between nodes
+  const NODE_GAP = 80
   const PROMPT_WIDTH = 200
   const PROMPT_HEIGHT = 120
   const LLM_WIDTH = 280
@@ -722,108 +792,239 @@ async function handleAutoArrange() {
   const DEBATE_WIDTH = 280
   const DEBATE_HEIGHT = 200
   
-  // Track global Y position to prevent overlaps
-  let globalY = 50
-  
-  // Find root prompts (no parent)
-  const rootTiles = promptTiles.value.filter(t => !t.parent_tile_id)
-  
-  // Recursive function to layout a prompt tree and return the total height used
-  function layoutPromptTree(tile, startX, startY) {
-    let treeHeight = 0
-    let currentY = startY
-    
-    // Position prompt node
-    positions[`prompt:${tile.id}`] = { 
-      x: startX, 
-      y: currentY,
-      width: PROMPT_WIDTH,
-      height: PROMPT_HEIGHT
-    }
-    
-    // Position LLM nodes to the right
-    const responses = Object.entries(tile.responses || {})
-    const llmX = startX + PROMPT_WIDTH + NODE_GAP_X
-    
-    if (responses.length === 0) {
-      treeHeight = PROMPT_HEIGHT
-    } else {
-      for (let i = 0; i < responses.length; i++) {
-        const [modelId, response] = responses[i]
+  try {
+    if (algorithm === 'hierarchical') {
+      // Hierarchical tree layout
+      let globalY = 50
+      
+      const rootTiles = promptTiles.value.filter(t => !t.parent_tile_id)
+      
+      function layoutPromptTree(tile, startX, startY) {
+        let treeHeight = 0
+        let currentY = startY
         
-        // Position this LLM node
-        positions[`llm:${tile.id}:${modelId}`] = { 
-          x: llmX, 
+        positions[`prompt:${tile.id}`] = {
+          x: startX,
           y: currentY,
-          width: LLM_WIDTH,
-          height: LLM_HEIGHT
+          width: PROMPT_WIDTH,
+          height: PROMPT_HEIGHT
         }
         
-        // Find branches from this LLM node
-        const branches = promptTiles.value.filter(
-          t => t.parent_tile_id === tile.id && t.parent_model_id === modelId
-        )
+        const responses = Object.entries(tile.responses || {})
+        const llmX = startX + PROMPT_WIDTH + NODE_GAP
         
-        let llmSubtreeHeight = LLM_HEIGHT
-        
-        if (branches.length > 0) {
-          // Layout branches recursively
-          const branchX = llmX + LLM_WIDTH + NODE_GAP_X
-          let branchY = currentY
-          
-          for (const branch of branches) {
-            const branchHeight = layoutPromptTree(branch, branchX, branchY)
-            branchY += branchHeight + NODE_GAP_Y
-            llmSubtreeHeight = Math.max(llmSubtreeHeight, branchY - currentY - NODE_GAP_Y)
+        if (responses.length === 0) {
+          treeHeight = PROMPT_HEIGHT
+        } else {
+          for (const [modelId, response] of responses) {
+            positions[`llm:${tile.id}:${modelId}`] = {
+              x: llmX,
+              y: currentY,
+              width: LLM_WIDTH,
+              height: LLM_HEIGHT
+            }
+            
+            const branches = promptTiles.value.filter(
+              t => t.parent_tile_id === tile.id && t.parent_model_id === modelId
+            )
+            
+            let llmSubtreeHeight = LLM_HEIGHT
+            
+            if (branches.length > 0) {
+              const branchX = llmX + LLM_WIDTH + NODE_GAP
+              let branchY = currentY
+              
+              for (const branch of branches) {
+                const branchHeight = layoutPromptTree(branch, branchX, branchY)
+                branchY += branchHeight + NODE_GAP
+                llmSubtreeHeight = Math.max(llmSubtreeHeight, branchY - currentY - NODE_GAP)
+              }
+            }
+            
+            currentY += llmSubtreeHeight + NODE_GAP
           }
+          
+          treeHeight = currentY - startY - NODE_GAP
         }
         
-        currentY += llmSubtreeHeight + NODE_GAP_Y
+        if (responses.length > 0) {
+          const promptCenterY = startY + (treeHeight - PROMPT_HEIGHT) / 2
+          positions[`prompt:${tile.id}`].y = promptCenterY
+        }
+        
+        return Math.max(treeHeight, PROMPT_HEIGHT)
       }
       
-      treeHeight = currentY - startY - NODE_GAP_Y
+      for (const rootTile of rootTiles) {
+        const treeHeight = layoutPromptTree(rootTile, 50, globalY)
+        globalY += treeHeight + NODE_GAP * 2
+      }
+      
+      // Position debates
+      let maxX = 0
+      for (const pos of Object.values(positions)) {
+        maxX = Math.max(maxX, pos.x + (pos.width || LLM_WIDTH))
+      }
+      
+      const debateX = maxX + NODE_GAP * 2
+      let debateY = 50
+      
+      for (const debate of debates.value) {
+        positions[`debate:${debate.id}`] = {
+          x: debateX,
+          y: debateY,
+          width: DEBATE_WIDTH,
+          height: DEBATE_HEIGHT
+        }
+        debateY += DEBATE_HEIGHT + NODE_GAP
+      }
+      
+    } else if (algorithm === 'force-directed') {
+      // Force-directed layout using D3
+      const nodes = []
+      const links = []
+      
+      // Create nodes
+      for (const tile of promptTiles.value) {
+        nodes.push({
+          id: `prompt:${tile.id}`,
+          type: 'prompt',
+          width: PROMPT_WIDTH,
+          height: PROMPT_HEIGHT,
+          x: tile.position?.x || Math.random() * 800,
+          y: tile.position?.y || Math.random() * 600
+        })
+        
+        for (const [modelId, response] of Object.entries(tile.responses || {})) {
+          const llmId = `llm:${tile.id}:${modelId}`
+          nodes.push({
+            id: llmId,
+            type: 'llm',
+            width: LLM_WIDTH,
+            height: LLM_HEIGHT,
+            x: response.position?.x || Math.random() * 800,
+            y: response.position?.y || Math.random() * 600
+          })
+          
+          // Link prompt to LLM
+          links.push({
+            source: `prompt:${tile.id}`,
+            target: llmId
+          })
+          
+          // Link LLM to branches
+          for (const branch of promptTiles.value) {
+            if (branch.parent_tile_id === tile.id && branch.parent_model_id === modelId) {
+              links.push({
+                source: llmId,
+                target: `prompt:${branch.id}`
+              })
+            }
+          }
+        }
+      }
+      
+      for (const debate of debates.value) {
+        nodes.push({
+          id: `debate:${debate.id}`,
+          type: 'debate',
+          width: DEBATE_WIDTH,
+          height: DEBATE_HEIGHT,
+          x: debate.position?.x || Math.random() * 800,
+          y: debate.position?.y || Math.random() * 600
+        })
+        
+        // Link source LLMs to debate
+        for (const sourceTileId of debate.source_tile_ids || []) {
+          const sourceTile = promptTiles.value.find(t => t.id === sourceTileId)
+          if (sourceTile) {
+            for (const modelId of debate.participating_models || []) {
+              if (sourceTile.responses[modelId]) {
+                links.push({
+                  source: `llm:${sourceTileId}:${modelId}`,
+                  target: `debate:${debate.id}`
+                })
+              }
+            }
+          }
+        }
+      }
+      
+      // Run force simulation
+      const simulation = d3.forceSimulation(nodes)
+        .force('link', d3.forceLink(links).id(d => d.id).distance(150))
+        .force('charge', d3.forceManyBody().strength(-300))
+        .force('center', d3.forceCenter(400, 300))
+        .force('collision', d3.forceCollide().radius(d => (d.width + d.height) / 4))
+        .stop()
+      
+      // Run simulation for 300 iterations
+      for (let i = 0; i < 300; i++) {
+        simulation.tick()
+      }
+      
+      // Extract final positions
+      for (const node of nodes) {
+        positions[node.id] = {
+          x: Math.max(50, node.x - node.width / 2),
+          y: Math.max(50, node.y - node.height / 2),
+          width: node.width,
+          height: node.height
+        }
+      }
+      
+    } else if (algorithm === 'circular') {
+      // Circular layout
+      const nodes = []
+      
+      // Collect all nodes
+      for (const tile of promptTiles.value) {
+        nodes.push({
+          id: `prompt:${tile.id}`,
+          width: PROMPT_WIDTH,
+          height: PROMPT_HEIGHT
+        })
+        
+        for (const [modelId, response] of Object.entries(tile.responses || {})) {
+          nodes.push({
+            id: `llm:${tile.id}:${modelId}`,
+            width: LLM_WIDTH,
+            height: LLM_HEIGHT
+          })
+        }
+      }
+      
+      for (const debate of debates.value) {
+        nodes.push({
+          id: `debate:${debate.id}`,
+          width: DEBATE_WIDTH,
+          height: DEBATE_HEIGHT
+        })
+      }
+      
+      // Arrange in a circle
+      const centerX = 400
+      const centerY = 300
+      const radius = Math.min(centerX, centerY) - 100
+      const angleStep = (2 * Math.PI) / nodes.length
+      
+      nodes.forEach((node, i) => {
+        const angle = i * angleStep
+        positions[node.id] = {
+          x: centerX + radius * Math.cos(angle) - node.width / 2,
+          y: centerY + radius * Math.sin(angle) - node.height / 2,
+          width: node.width,
+          height: node.height
+        }
+      })
     }
     
-    // Center the prompt node vertically relative to its LLM children
-    if (responses.length > 0) {
-      const promptCenterY = startY + (treeHeight - PROMPT_HEIGHT) / 2
-      positions[`prompt:${tile.id}`].y = promptCenterY
-    }
-    
-    return Math.max(treeHeight, PROMPT_HEIGHT)
-  }
-  
-  // Layout all root trees
-  for (const rootTile of rootTiles) {
-    const treeHeight = layoutPromptTree(rootTile, 50, globalY)
-    globalY += treeHeight + NODE_GAP_Y * 2
-  }
-  
-  // Position debate nodes in a separate column to the right
-  // Find the rightmost X position used
-  let maxX = 0
-  for (const pos of Object.values(positions)) {
-    maxX = Math.max(maxX, pos.x + (pos.width || LLM_WIDTH))
-  }
-  
-  const debateX = maxX + NODE_GAP_X * 2
-  let debateY = 50
-  
-  for (const debate of debates.value) {
-    positions[`debate:${debate.id}`] = { 
-      x: debateX, 
-      y: debateY, 
-      width: DEBATE_WIDTH, 
-      height: DEBATE_HEIGHT 
-    }
-    debateY += DEBATE_HEIGHT + NODE_GAP_Y
-  }
-  
-  // Send batch update to backend
-  try {
+    // Send batch update to backend
     await canvasStore.autoArrange(positions)
   } catch (err) {
     console.error('Failed to auto-arrange:', err)
+  } finally {
+    arranging.value = false
   }
 }
 </script>
@@ -891,6 +1092,85 @@ async function handleAutoArrange() {
   display: flex;
   align-items: center;
   gap: var(--spacing-xs);
+}
+
+/* Arrange Dropdown */
+.arrange-dropdown {
+  position: relative;
+  display: inline-block;
+}
+
+.dropdown-arrow {
+  font-size: 0.7rem;
+  margin-left: 4px;
+  opacity: 0.7;
+}
+
+.dropdown-menu {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  min-width: 280px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--bg-tertiary);
+  border-radius: var(--radius-md);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+  z-index: 100;
+  overflow: hidden;
+}
+
+.dropdown-header {
+  padding: var(--spacing-sm) var(--spacing-md);
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  border-bottom: 1px solid var(--bg-tertiary);
+}
+
+.dropdown-item {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-sm);
+  padding: var(--spacing-sm) var(--spacing-md);
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.dropdown-item:hover {
+  background: var(--bg-tertiary);
+}
+
+.dropdown-item.active {
+  background: color-mix(in srgb, var(--accent-primary) 15%, transparent);
+  border-left: 3px solid var(--accent-primary);
+}
+
+.layout-icon {
+  font-size: 1.25rem;
+  flex-shrink: 0;
+}
+
+.layout-info {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+}
+
+.layout-name {
+  font-size: 0.875rem;
+  font-weight: 500;
+  color: var(--text-primary);
+}
+
+.layout-desc {
+  font-size: 0.75rem;
+  color: var(--text-muted);
 }
 
 .zoom-level {
@@ -1026,9 +1306,7 @@ async function handleAutoArrange() {
   background: var(--accent-primary);
 }
 
-.minimap-llm {
-  /* Background color set dynamically via style attribute */
-}
+
 
 /* Legacy minimap-tile for backwards compatibility */
 .minimap-tile {
@@ -1065,7 +1343,8 @@ async function handleAutoArrange() {
   z-index: 10;
 }
 
-.loading-overlay {
+.loading-overlay,
+.arranging-overlay {
   position: absolute;
   inset: 0;
   background: rgba(15, 15, 16, 0.8);
@@ -1075,6 +1354,10 @@ async function handleAutoArrange() {
   justify-content: center;
   color: var(--text-muted);
   z-index: 100;
+}
+
+.arranging-overlay {
+  z-index: 150;
 }
 
 .spinner {

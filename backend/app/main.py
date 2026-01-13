@@ -5,13 +5,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from pathlib import Path
 
 from backend.app.config import get_settings
-from backend.app.routers import notes, search, graph, oauth, canvas
+from backend.app.routers import notes, search, graph, oauth, canvas, distill, priority
 from backend.app.mcp.server import setup_mcp
 from backend.app.services.knowledge_store import KnowledgeStore
 from backend.app.services.vector_search import VectorSearchService
 from backend.app.services.graph_index import GraphIndexService
 from backend.app.services.openrouter import OpenRouterService
 from backend.app.services.canvas_store import CanvasSessionStore
+from backend.app.services.priority_scoring import PriorityScoringService
+from backend.app.services.priority_settings import PrioritySettingsService
 from backend.app.middleware.logging import LoggingMiddleware
 from backend.app.middleware.security import SecurityHeadersMiddleware, RequestSanitizationMiddleware
 from backend.app.middleware.rate_limit import limiter, init_limiter, rate_limit_handler
@@ -32,12 +34,16 @@ async def lifespan(app: FastAPI):
     graph_index = GraphIndexService()
     openrouter = OpenRouterService()
     canvas_store = CanvasSessionStore()
+    priority_settings = PrioritySettingsService()
+    priority_scoring = PriorityScoringService(priority_settings.get_weights())
 
     app.state.knowledge_store = knowledge_store
     app.state.vector_search = vector_search
     app.state.graph_index = graph_index
     app.state.openrouter = openrouter
     app.state.canvas_store = canvas_store
+    app.state.priority_settings = priority_settings
+    app.state.priority_scoring = priority_scoring
 
     yield
 
@@ -119,6 +125,8 @@ app.include_router(search.router, prefix="/api/search", tags=["search"])
 app.include_router(graph.router, prefix="/api/graph", tags=["graph"])
 app.include_router(oauth.router, prefix="/api/oauth", tags=["oauth"])
 app.include_router(canvas.router, prefix="/api/canvas", tags=["canvas"])
+app.include_router(distill.router, prefix="/api/notes", tags=["distillation"])
+app.include_router(priority.router, prefix="/api/priority", tags=["priority"])
 
 # Setup MCP server
 setup_mcp(app)

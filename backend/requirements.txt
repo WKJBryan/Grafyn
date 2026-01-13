@@ -32,3 +32,4 @@ slowapi>=0.1.9
 
 # Utilities
 aiofiles>=23.2.1
+filelock>=3.13.0

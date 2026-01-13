@@ -15,6 +15,8 @@ from app.services.vector_search import VectorSearchService
 from app.services.graph_index import GraphIndexService
 from app.services.embedding import EmbeddingService
 from app.services.token_store import TokenStore
+from app.services.priority_scoring import PriorityScoringService, PriorityWeights
+from app.services.priority_settings import PrioritySettingsService
 
 
 # ============================================================================
@@ -134,16 +136,33 @@ def token_store(temp_token_storage_path: Path) -> TokenStore:
 # ============================================================================
 
 @pytest.fixture
+def priority_scoring_service() -> PriorityScoringService:
+    """Create a PriorityScoringService instance"""
+    weights = PriorityWeights()
+    return PriorityScoringService(weights)
+
+
+@pytest.fixture
+def priority_settings_service(temp_data_path: Path) -> PrioritySettingsService:
+    """Create a PrioritySettingsService instance with temporary storage"""
+    return PrioritySettingsService(temp_data_path / "priority_settings.json")
+
+
+@pytest.fixture
 def test_client(
     knowledge_store: KnowledgeStore,
     vector_search: VectorSearchService,
     graph_index: GraphIndexService,
+    priority_scoring_service: PriorityScoringService,
+    priority_settings_service: PrioritySettingsService,
 ) -> TestClient:
     """Create a FastAPI TestClient with all services attached"""
     # Attach services to app.state
     app.state.knowledge_store = knowledge_store
     app.state.vector_search = vector_search
     app.state.graph_index = graph_index
+    app.state.priority_scoring = priority_scoring_service
+    app.state.priority_settings = priority_settings_service
 
     return TestClient(app)
 

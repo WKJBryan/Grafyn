@@ -121,6 +121,7 @@ async def list_notes(request: Request):
 | `TokenStore` | `services/token_store.py` | No | OAuth token management (stateful per-instance) |
 | `OpenRouterService` | `services/openrouter.py` | Yes | OpenRouter API client with streaming support |
 | `CanvasSessionStore` | `services/canvas_store.py` | Yes | Canvas session persistence (JSON file storage) |
+| `DistillationService` | `services/distillation.py` | No | Container → Atomic → Hub knowledge workflow |
 
 ### Middleware Order (Applied Bottom-Up)
 
@@ -173,6 +174,24 @@ draft → evidence → canonical
 ```
 
 Stored in YAML frontmatter `status` field. Frontend filters/displays based on status.
+
+### Container → Atomic → Hub Workflow
+
+Distillation splits large "container" notes into focused "atomic" notes:
+
+```
+Container (evidence)  →  Atomic Notes (draft)  →  Hub (topic index)
+     ↑                          ↓                         ↓
+   MCP ingestion/         Linked via [[backlinks]]    Links to atomics
+   Canvas export          to source container
+```
+
+**Key features:**
+- Tag normalization: `#Tag` → `tag` (lowercase, strip #, spaces→hyphens)
+- Inline `#tag` parsing (ignores headings and code blocks)
+- Canvas exports use protected section markers to preserve user edits
+- Dedup only matches against `draft`/`canonical` notes (not evidence/hubs)
+- Provenance fields: `source`, `source_id`, `container_of` in YAML
 
 ### Vector Embeddings
 
@@ -313,10 +332,12 @@ services/
   token_store.py      - In-memory OAuth token storage with TTL
   openrouter.py       - OpenRouter API client with streaming
   canvas_store.py     - Canvas session CRUD (JSON file storage)
+  distillation.py     - Container → Atomic → Hub workflow
 
 models/
   note.py      - Note, NoteCreate, NoteUpdate schemas
   canvas.py    - CanvasSession, PromptTile, ModelResponse, DebateRound schemas
+  distillation.py - DistillRequest, AtomicNoteCandidate, HubUpdate schemas
 
 middleware/
   security.py   - SecurityHeadersMiddleware, RequestSanitizationMiddleware

@@ -28,6 +28,7 @@ from backend.app.models.canvas import (
 from backend.app.services.canvas_store import CanvasSessionStore
 from backend.app.services.openrouter import OpenRouterService
 from backend.app.services.vector_search import VectorSearchService
+from backend.app.services.distillation import update_protected_section
 from backend.app.middleware.rate_limit import limiter
 
 logger = logging.getLogger(__name__)
@@ -745,9 +746,12 @@ async def export_to_note(session_id: str, request: Request):
         if session.linked_note_id:
             existing_note = knowledge_store.get_note(session.linked_note_id)
             if existing_note:
-                # Update existing note
+                # Safe migration: append if markers missing, else replace only snapshot
+                new_content = update_protected_section(
+                    existing_note.content, markdown_content
+                )
                 update_data = NoteUpdate(
-                    content=markdown_content,
+                    content=new_content,
                     tags=tags,
                 )
                 note = knowledge_store.update_note(session.linked_note_id, update_data)

@@ -253,6 +253,16 @@ pre code {
   color: var(--text-primary);
 }
 
+.btn-accent {
+  background: linear-gradient(135deg, var(--accent-cyan), var(--accent-magenta));
+  color: white;
+}
+
+.btn-accent:hover:not(:disabled) {
+  background: linear-gradient(135deg, var(--accent-magenta), var(--accent-cyan));
+  transform: scale(1.02);
+}
+
 /* Inputs */
 input,
 textarea,

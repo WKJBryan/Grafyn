@@ -6,7 +6,10 @@ from pathlib import Path
 from typing import List, Optional
 from datetime import datetime, timezone
 
-from backend.app.models.note import Note, NoteCreate, NoteUpdate, NoteListItem, NoteFrontmatter
+from backend.app.models.note import (
+    Note, NoteCreate, NoteUpdate, NoteListItem, NoteFrontmatter,
+    TypedProperty, PropertyType, ContentType, NoteType
+)
 from backend.app.config import get_settings
 
 logger = logging.getLogger(__name__)
@@ -14,6 +17,17 @@ settings = get_settings()
 
 # Wikilink pattern: [[Note Title]] or [[Note Title|Display Text]]
 WIKILINK_PATTERN = re.compile(r'\[\[([^\]|]+)(?:\|[^\]]+)?\]\]')
+
+# Wikilink pattern with heading/block anchors: [[Note#Heading]] or [[Note#^block-id]]
+WIKILINK_WITH_ANCHOR_PATTERN = re.compile(
+    r'\[\[([^\]|#]+)(?:#([^\]|]+))?(?:\|[^\]]+)?\]\]'
+)
+
+# Heading pattern for extracting headings from content
+HEADING_PATTERN = re.compile(r'^(#{1,6})\s+(.+)$', re.MULTILINE)
+
+# Block ID pattern for extracting block references
+BLOCK_ID_PATTERN = re.compile(r'\^([a-zA-Z0-9-]+)\s*$', re.MULTILINE)
 
 
 class KnowledgeStore:
@@ -51,6 +65,114 @@ class KnowledgeStore:
         matches = WIKILINK_PATTERN.findall(content)
         return matches
     
+    def _infer_note_type(self, title: str, stored_type: Optional[str] = None) -> NoteType:
+        """
+        Infer note type from title or stored frontmatter value.
+        
+        Priority:
+        1. Explicit stored type in frontmatter
+        2. Title prefix inference (Atomic:, Hub:)
+        3. Default to GENERAL
+        """
+        # If explicitly stored, use that
+        if stored_type:
+            try:
+                return NoteType(stored_type)
+            except ValueError:
+                pass
+        
+        # Infer from title prefix for backward compatibility
+        if title.startswith('Atomic:') or title.startswith('Atomic '):
+            return NoteType.ATOMIC
+        elif title.startswith('Hub:') or title.startswith('Hub '):
+            return NoteType.HUB
+        elif title.startswith('Canvas:') or title.startswith('Evidence:'):
+            return NoteType.CONTAINER
+        
+        return NoteType.GENERAL
+    
+    def extract_wikilinks_with_anchors(self, content: str) -> List[dict]:
+        """
+        Extract wikilinks with optional heading/block anchors.
+        
+        Returns list of dicts with 'target' (note title) and 'anchor' (heading/block-id)
+        """
+        results = []
+        for match in WIKILINK_WITH_ANCHOR_PATTERN.finditer(content):
+            target = match.group(1)
+            anchor = match.group(2) if match.group(2) else None
+            results.append({
+                'target': target,
+                'anchor': anchor,
+                'is_block': anchor and anchor.startswith('^') if anchor else False
+            })
+        return results
+    
+    def extract_headings(self, content: str) -> List[dict]:
+        """
+        Extract all headings from markdown content.
+        
+        Returns list of dicts with 'level', 'text', and 'slug' (URL-friendly ID)
+        """
+        headings = []
+        for match in HEADING_PATTERN.finditer(content):
+            level = len(match.group(1))  # Number of # characters
+            text = match.group(2).strip()
+            # Create URL-friendly slug
+            slug = re.sub(r'[^\w\s-]', '', text.lower()).strip().replace(' ', '-')
+            headings.append({
+                'level': level,
+                'text': text,
+                'slug': slug
+            })
+        return headings
+    
+    def extract_block_ids(self, content: str) -> List[str]:
+        """Extract all block IDs (^block-id) from content"""
+        return BLOCK_ID_PATTERN.findall(content)
+    
+    def update_links_on_rename(self, old_title: str, new_title: str) -> int:
+        """
+        Update all wikilinks when a note is renamed.
+        
+        Finds all notes that link to old_title and updates them to new_title.
+        Returns the number of notes updated.
+        """
+        updated_count = 0
+        
+        # Pattern to match [[Old Title]] or [[Old Title|Display]]
+        old_link_pattern = re.compile(
+            r'\[\[' + re.escape(old_title) + r'(\|[^\]]+)?\]\]'
+        )
+        
+        for md_file in self.vault_path.glob("*.md"):
+            try:
+                post = frontmatter.load(md_file)
+                original_content = post.content
+                
+                # Replace old links with new
+                def replace_link(match):
+                    display = match.group(1) if match.group(1) else ''
+                    return f'[[{new_title}{display}]]'
+                
+                new_content = old_link_pattern.sub(replace_link, original_content)
+                
+                if new_content != original_content:
+                    post.content = new_content
+                    post['modified'] = datetime.now(timezone.utc)
+                    
+                    with open(md_file, 'w', encoding='utf-8') as f:
+                        f.write(frontmatter.dumps(post))
+                    
+                    updated_count += 1
+                    logger.info(f"Updated links in {md_file.name}: '{old_title}' -> '{new_title}'")
+                    
+            except Exception as e:
+                logger.error(f"Error updating links in {md_file}: {e}")
+                continue
+        
+        return updated_count
+    
     def list_notes(self) -> List[NoteListItem]:
         """List all notes with metadata"""
         notes = []
@@ -62,6 +184,12 @@ class KnowledgeStore:
                 # Extract wikilinks for link count
                 wikilinks = self._extract_wikilinks(post.content)
                 
+                # Infer note_type from title or frontmatter
+                note_type = self._infer_note_type(
+                    post.get('title', note_id),
+                    post.get('note_type')
+                )
+                
                 notes.append(NoteListItem(
                     id=note_id,
                     title=post.get('title', note_id),
@@ -69,7 +197,8 @@ class KnowledgeStore:
                     tags=post.get('tags', []),
                     created=post.get('created'),
                     modified=post.get('modified'),
-                    link_count=len(wikilinks)
+                    link_count=len(wikilinks),
+                    note_type=note_type
                 ))
             except Exception as e:
                 logger.error(f"Error loading note {md_file}: {e}")
@@ -88,6 +217,23 @@ class KnowledgeStore:
         # Extract wikilinks
         outgoing_links = self._extract_wikilinks(post.content)
         
+        # Load properties from frontmatter
+        properties = {}
+        raw_properties = post.get('properties', {})
+        if isinstance(raw_properties, dict):
+            for prop_name, prop_data in raw_properties.items():
+                try:
+                    if isinstance(prop_data, dict):
+                        properties[prop_name] = TypedProperty(**prop_data)
+                except Exception as e:
+                    logger.warning(f"Failed to load property '{prop_name}' from note {note_id}: {e}")
+        
+        # Infer note_type from title or frontmatter
+        note_type = self._infer_note_type(
+            post.get('title', note_id),
+            post.get('note_type')
+        )
+        
         # Build frontmatter
         frontmatter_data = NoteFrontmatter(
             title=post.get('title', note_id),
@@ -95,7 +241,10 @@ class KnowledgeStore:
             modified=post.get('modified'),
             tags=post.get('tags', []),
             status=post.get('status', 'draft'),
-            aliases=post.get('aliases', [])
+            aliases=post.get('aliases', []),
+            content_type=ContentType(post.get('content_type', 'general')),
+            note_type=note_type,
+            properties=properties
         )
         
         return Note(
@@ -122,7 +271,10 @@ class KnowledgeStore:
             'created': now,
             'modified': now,
             'tags': note_data.tags,
-            'status': note_data.status
+            'status': note_data.status,
+            'content_type': note_data.content_type.value,
+            'note_type': note_data.note_type.value,
+            'properties': {name: prop.model_dump() for name, prop in note_data.properties.items()}
         }
         
         # Write note file
@@ -140,6 +292,7 @@ class KnowledgeStore:
         
         # Load existing note
         post = frontmatter.load(note_path)
+        old_title = post.get('title', note_id)
         
         # Update fields if provided
         if note_data.title is not None:
@@ -150,6 +303,10 @@ class KnowledgeStore:
             post['tags'] = note_data.tags
         if note_data.status is not None:
             post['status'] = note_data.status
+        if note_data.content_type is not None:
+            post['content_type'] = note_data.content_type.value
+        if note_data.properties is not None:
+            post['properties'] = {name: prop.model_dump() for name, prop in note_data.properties.items()}
         
         # Update modified timestamp
         post['modified'] = datetime.now(timezone.utc)
@@ -157,6 +314,11 @@ class KnowledgeStore:
         # Write updated note
         with open(note_path, 'w', encoding='utf-8') as f:
             f.write(frontmatter.dumps(post))
+        
+        # If title changed, update links in other notes
+        if note_data.title is not None and note_data.title != old_title:
+            updated_count = self.update_links_on_rename(old_title, note_data.title)
+            logger.info(f"Updated {updated_count} notes with new link: '{old_title}' -> '{note_data.title}'")
         
         return self.get_note(note_id)
     
