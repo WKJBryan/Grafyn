@@ -38,13 +38,13 @@
         :key="provider"
         class="model-group"
       >
-        <div class="group-header" @click="toggleGroup(provider)">
+        <div class="group-header" @click="toggleGroup(provider.toLowerCase())">
           <span class="provider-name">{{ provider }}</span>
           <span class="group-count">({{ models.length }})</span>
-          <span class="expand-icon">{{ expandedGroups.has(provider) ? '-' : '+' }}</span>
+          <span class="expand-icon">{{ expandedGroups.has(provider.toLowerCase()) ? '-' : '+' }}</span>
         </div>
 
-        <div v-show="expandedGroups.has(provider)" class="group-models">
+        <div v-show="expandedGroups.has(provider.toLowerCase())" class="group-models">
           <label
             v-for="model in models"
             :key="model.id"
@@ -191,7 +191,8 @@ function removeModel(modelId) {
   display: flex;
   flex-direction: column;
   gap: var(--spacing-sm);
-  max-height: 400px;
+  max-height: 350px;
+  min-height: 200px;
 }
 
 .selector-header {
@@ -217,10 +218,11 @@ function removeModel(modelId) {
 .selected-tags {
   display: flex;
   flex-wrap: wrap;
-  gap: 6px;
-  padding: var(--spacing-xs);
+  gap: 8px;
+  padding: var(--spacing-sm);
   background: var(--bg-tertiary);
   border-radius: var(--radius-sm);
+  min-height: 40px;
   max-height: 80px;
   overflow-y: auto;
 }
@@ -228,12 +230,12 @@ function removeModel(modelId) {
 .model-tag {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
+  gap: 6px;
   padding: 4px 8px;
-  background: var(--bg-primary);
-  border: 1px solid var(--bg-tertiary);
+  background: rgba(124, 92, 255, 0.15);
+  border: 1px solid rgba(124, 92, 255, 0.3);
   border-radius: var(--radius-sm);
-  font-size: 0.75rem;
+  font-size: 0.875rem;
   color: var(--text-primary);
 }
 
@@ -290,17 +292,17 @@ function removeModel(modelId) {
 }
 
 .model-groups {
-  flex: 1;
+  flex: 1 1 auto;
   overflow-y: auto;
-  display: flex;
-  flex-direction: column;
-  gap: var(--spacing-xs);
+  display: block;
+  min-height: 0;
 }
 
 .model-group {
   background: var(--bg-tertiary);
   border-radius: var(--radius-sm);
-  overflow: hidden;
+  overflow: visible;
+  margin-bottom: var(--spacing-xs);
 }
 
 .group-header {
@@ -308,11 +310,11 @@ function removeModel(modelId) {
   align-items: center;
   padding: var(--spacing-sm);
   cursor: pointer;
-  background: rgba(0, 0, 0, 0.2);
+  background: var(--bg-hover);
 }
 
 .group-header:hover {
-  background: rgba(0, 0, 0, 0.3);
+  background: var(--bg-tertiary);
 }
 
 .provider-name {
@@ -338,9 +340,6 @@ function removeModel(modelId) {
 
 .group-models {
   padding: var(--spacing-xs);
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
 }
 
 .model-option {
@@ -351,6 +350,7 @@ function removeModel(modelId) {
   border-radius: var(--radius-sm);
   cursor: pointer;
   transition: background 0.15s;
+  min-height: 32px;
 }
 
 .model-option:hover {

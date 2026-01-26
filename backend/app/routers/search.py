@@ -1,10 +1,10 @@
 """Search API router for semantic and lexical search"""
 from fastapi import APIRouter, Query, Request, HTTPException
 from typing import List, Optional
-from backend.app.models.note import SearchResult
-from backend.app.services.vector_search import VectorSearchService
-from backend.app.services.knowledge_store import KnowledgeStore
-from backend.app.services.priority_scoring import PriorityScoringService
+from app.models.note import SearchResult
+from app.services.vector_search import VectorSearchService
+from app.services.knowledge_store import KnowledgeStore
+from app.services.priority_scoring import PriorityScoringService
 
 router = APIRouter()
 

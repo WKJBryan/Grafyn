@@ -42,7 +42,6 @@
         </div>
 
         <div class="form-group">
-          <label>Select Models</label>
           <ModelSelector
             :models="models"
             v-model="selectedModels"
@@ -82,13 +81,14 @@
             </div>
           </div>
 
-          <!-- Context Mode Selector (only for branching) -->
-          <div v-if="branchContext" class="form-group context-mode-group">
+          <!-- Context Mode Selector -->
+          <div class="form-group context-mode-group">
             <label for="contextMode">Context Mode</label>
             <select id="contextMode" v-model="contextMode" class="select-input">
-              <option value="full_history">Full History (all previous turns)</option>
-              <option value="compact">Compact (summary + recent)</option>
-              <option value="semantic">Semantic Search (relevant context)</option>
+              <option value="none">None (no additional context)</option>
+              <option value="semantic">Semantic Search (relevant notes & tiles)</option>
+              <option v-if="branchContext" value="full_history">Full History (all previous turns)</option>
+              <option v-if="branchContext" value="compact">Compact (summary + recent)</option>
             </select>
             <span class="context-mode-hint">
               {{ contextModeHints[contextMode] }}
@@ -145,13 +145,14 @@ const selectedModels = ref([])
 const temperature = ref(0.7)
 const maxTokens = ref(2048)
 const showAdvanced = ref(false)
-const contextMode = ref('full_history')
+const contextMode = ref('semantic')  // Default to semantic for note lookup
 
 // Context mode descriptions
 const contextModeHints = {
+  none: 'No additional context - just your prompt',
+  semantic: 'Search your notes and previous conversations for relevant context',
   full_history: 'Include all conversation turns from the parent chain',
-  compact: 'Include recent turns + summary of older context to save tokens',
-  semantic: 'Search notes and previous conversations for relevant context'
+  compact: 'Include recent turns + summary of older context to save tokens'
 }
 
 // Computed
@@ -172,16 +173,15 @@ const estimatedTokens = computed(() => {
     totalChars += systemPrompt.value?.length || 0
   }
   
-  // Estimate context tokens based on mode (only for branching)
-  if (branchContext.value) {
-    const contextMultiplier = {
-      full_history: 1.5,  // Include conversation history
-      compact: 1.2,       // Compact summary
-      semantic: 1.3       // Semantic search results
-    }
-    const multiplier = contextMultiplier[contextMode.value] || 1.2
-    totalChars *= multiplier
+  // Estimate context tokens based on mode
+  const contextMultiplier = {
+    none: 1.0,          // No additional context
+    semantic: 1.3,      // Semantic search results
+    full_history: 1.5,  // Include conversation history
+    compact: 1.2        // Compact summary
   }
+  const multiplier = contextMultiplier[contextMode.value] || 1.0
+  totalChars *= multiplier
   
   return Math.ceil(totalChars / charsPerToken)
 })

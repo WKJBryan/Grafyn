@@ -33,7 +33,19 @@ const routes = [
     meta: { requiresAuth: false }
   },
   {
-    path: '/:pathMatch(.*)*',
+    path: '/import',
+    name: 'import-upload',
+    component: () => import('../views/ImportUpload.vue'),
+    meta: { requiresAuth: false }
+  },
+  {
+    path: '/import/review',
+    name: 'import-review',
+    component: () => import('../views/ImportReview.vue'),
+    meta: { requiresAuth: false }
+  },
+  {
+    path: '/pathMatch(.*)*',
     name: 'not-found',
     component: () => import('../views/NotFoundView.vue'),
     meta: { requiresAuth: false }

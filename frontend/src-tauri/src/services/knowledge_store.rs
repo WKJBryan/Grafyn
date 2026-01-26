@@ -1,0 +1,254 @@
+use crate::models::note::{Note, NoteCreate, NoteFrontmatter, NoteMeta, NoteStatus, NoteUpdate};
+use anyhow::{Context, Result};
+use chrono::Utc;
+use gray_matter::{engine::YAML, Matter};
+use lazy_static::lazy_static;
+use regex::Regex;
+use std::collections::HashMap;
+use std::path::PathBuf;
+use walkdir::WalkDir;
+
+lazy_static! {
+    /// Regex for extracting wikilinks: [[Target]] or [[Target|Display]]
+    static ref WIKILINK_REGEX: Regex = Regex::new(r"\[\[([^\]|]+)(?:\|[^\]]+)?\]\]").unwrap();
+}
+
+/// Service for managing markdown notes with YAML frontmatter
+#[derive(Debug, Clone)]
+pub struct KnowledgeStore {
+    vault_path: PathBuf,
+}
+
+impl KnowledgeStore {
+    pub fn new(vault_path: PathBuf) -> Self {
+        // Ensure vault directory exists
+        std::fs::create_dir_all(&vault_path).ok();
+        Self { vault_path }
+    }
+
+    /// List all notes in the vault (metadata only)
+    pub fn list_notes(&self) -> Result<Vec<NoteMeta>> {
+        let mut notes = Vec::new();
+
+        for entry in WalkDir::new(&self.vault_path)
+            .min_depth(1)
+            .max_depth(2)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
+            let path = entry.path();
+            if path.extension().map_or(false, |ext| ext == "md") {
+                if let Ok(note) = self.read_note_file(path) {
+                    notes.push(NoteMeta::from(&note));
+                }
+            }
+        }
+
+        // Sort by updated_at descending
+        notes.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        Ok(notes)
+    }
+
+    /// Get a full note by ID
+    pub fn get_note(&self, id: &str) -> Result<Note> {
+        let path = self.note_path(id);
+        self.read_note_file(&path)
+            .with_context(|| format!("Note not found: {}", id))
+    }
+
+    /// Create a new note
+    pub fn create_note(&mut self, create: NoteCreate) -> Result<Note> {
+        let id = self.generate_note_id(&create.title);
+        let now = Utc::now();
+
+        let note = Note {
+            id: id.clone(),
+            title: create.title,
+            content: create.content,
+            status: create.status,
+            tags: create.tags,
+            created_at: now,
+            updated_at: now,
+            wikilinks: Vec::new(),
+            properties: create.properties,
+        };
+
+        // Extract wikilinks from content
+        let mut note = note;
+        note.wikilinks = self.extract_wikilinks(&note.content);
+
+        self.write_note_file(&note)?;
+        Ok(note)
+    }
+
+    /// Update an existing note
+    pub fn update_note(&mut self, id: &str, update: NoteUpdate) -> Result<Note> {
+        let mut note = self.get_note(id)?;
+
+        if let Some(title) = update.title {
+            note.title = title;
+        }
+        if let Some(content) = update.content {
+            note.content = content;
+            note.wikilinks = self.extract_wikilinks(&note.content);
+        }
+        if let Some(status) = update.status {
+            note.status = status;
+        }
+        if let Some(tags) = update.tags {
+            note.tags = tags;
+        }
+        if let Some(properties) = update.properties {
+            note.properties = properties;
+        }
+
+        note.updated_at = Utc::now();
+        self.write_note_file(&note)?;
+        Ok(note)
+    }
+
+    /// Delete a note
+    pub fn delete_note(&mut self, id: &str) -> Result<()> {
+        let path = self.note_path(id);
+        std::fs::remove_file(&path).with_context(|| format!("Failed to delete note: {}", id))?;
+        Ok(())
+    }
+
+    /// Extract wikilinks from markdown content
+    pub fn extract_wikilinks(&self, content: &str) -> Vec<String> {
+        WIKILINK_REGEX
+            .captures_iter(content)
+            .filter_map(|cap| cap.get(1).map(|m| m.as_str().to_string()))
+            .collect()
+    }
+
+    /// Generate a note ID from title (slug format)
+    fn generate_note_id(&self, title: &str) -> String {
+        let slug: String = title
+            .to_lowercase()
+            .chars()
+            .map(|c| {
+                if c.is_alphanumeric() {
+                    c
+                } else if c.is_whitespace() || c == '-' || c == '_' {
+                    '-'
+                } else {
+                    ' '
+                }
+            })
+            .collect::<String>()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join("-");
+
+        // Handle duplicates by adding a suffix
+        let mut id = slug.clone();
+        let mut counter = 1;
+        while self.note_path(&id).exists() {
+            id = format!("{}-{}", slug, counter);
+            counter += 1;
+        }
+        id
+    }
+
+    /// Get the file path for a note ID
+    fn note_path(&self, id: &str) -> PathBuf {
+        self.vault_path.join(format!("{}.md", id))
+    }
+
+    /// Read and parse a note file
+    fn read_note_file(&self, path: &std::path::Path) -> Result<Note> {
+        let content = std::fs::read_to_string(path)
+            .with_context(|| format!("Failed to read file: {:?}", path))?;
+
+        let matter = Matter::<YAML>::new();
+        let parsed = matter.parse(&content);
+
+        // Extract frontmatter
+        let frontmatter: NoteFrontmatter = parsed
+            .data
+            .map(|d| d.deserialize())
+            .transpose()
+            .unwrap_or(None)
+            .unwrap_or_default();
+
+        // Get file metadata for timestamps
+        let metadata = std::fs::metadata(path)?;
+        let file_modified = metadata.modified().ok();
+
+        let id = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+
+        let now = Utc::now();
+        let created_at = frontmatter.created_at.unwrap_or(now);
+        let updated_at = frontmatter.updated_at.or_else(|| {
+            file_modified.map(|t| chrono::DateTime::<Utc>::from(t))
+        }).unwrap_or(now);
+
+        let body = parsed.content;
+        let wikilinks = self.extract_wikilinks(&body);
+
+        Ok(Note {
+            id,
+            title: frontmatter.title,
+            content: body,
+            status: frontmatter.status.parse().unwrap_or_default(),
+            tags: frontmatter.tags,
+            created_at,
+            updated_at,
+            wikilinks,
+            properties: frontmatter.extra,
+        })
+    }
+
+    /// Write a note to file with YAML frontmatter
+    fn write_note_file(&self, note: &Note) -> Result<()> {
+        let path = self.note_path(&note.id);
+
+        // Build frontmatter
+        let mut frontmatter = serde_yaml::Mapping::new();
+        frontmatter.insert(
+            serde_yaml::Value::String("title".to_string()),
+            serde_yaml::Value::String(note.title.clone()),
+        );
+        frontmatter.insert(
+            serde_yaml::Value::String("status".to_string()),
+            serde_yaml::Value::String(note.status.to_string()),
+        );
+        frontmatter.insert(
+            serde_yaml::Value::String("tags".to_string()),
+            serde_yaml::Value::Sequence(
+                note.tags
+                    .iter()
+                    .map(|t| serde_yaml::Value::String(t.clone()))
+                    .collect(),
+            ),
+        );
+        frontmatter.insert(
+            serde_yaml::Value::String("created_at".to_string()),
+            serde_yaml::Value::String(note.created_at.to_rfc3339()),
+        );
+        frontmatter.insert(
+            serde_yaml::Value::String("updated_at".to_string()),
+            serde_yaml::Value::String(note.updated_at.to_rfc3339()),
+        );
+
+        // Add extra properties
+        for (key, value) in &note.properties {
+            if let Ok(yaml_value) = serde_yaml::to_value(value) {
+                frontmatter.insert(serde_yaml::Value::String(key.clone()), yaml_value);
+            }
+        }
+
+        let yaml = serde_yaml::to_string(&frontmatter)?;
+        let file_content = format!("---\n{}---\n\n{}", yaml, note.content);
+
+        std::fs::write(&path, file_content)
+            .with_context(|| format!("Failed to write note: {:?}", path))?;
+
+        Ok(())
+    }
+}

@@ -8,7 +8,7 @@ from urllib.parse import unquote
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
-from backend.app.models.canvas import (
+from app.models.canvas import (
     CanvasSession,
     CanvasSessionListItem,
     CanvasCreate,
@@ -16,6 +16,7 @@ from backend.app.models.canvas import (
     PromptRequest,
     DebateStartRequest,
     DebateContinueRequest,
+    AddModelsRequest,
     ModelInfo,
     TilePositionUpdate,
     CanvasViewport,
@@ -25,11 +26,11 @@ from backend.app.models.canvas import (
     NodeEdge,
     ArrangeRequest,
 )
-from backend.app.services.canvas_store import CanvasSessionStore
-from backend.app.services.openrouter import OpenRouterService
-from backend.app.services.vector_search import VectorSearchService
-from backend.app.services.distillation import update_protected_section
-from backend.app.middleware.rate_limit import limiter
+from app.services.canvas_store import CanvasSessionStore
+from app.services.openrouter import OpenRouterService
+from app.services.vector_search import VectorSearchService
+from app.services.distillation import update_protected_section
+from app.middleware.rate_limit import limiter
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -263,7 +264,15 @@ async def send_prompt(
             messages.append({"role": "system", "content": prompt_request.system_prompt})
 
         # Build conversation context based on mode
-        if prompt_request.parent_tile_id and prompt_request.parent_model_id:
+        if prompt_request.context_mode == ContextMode.SEMANTIC:
+            # Semantic: RAG-style search across notes and tiles (works for all prompts)
+            context = store.build_semantic_context(
+                prompt_request.prompt,
+                vector_search,
+            )
+            messages.extend(context)
+        elif prompt_request.parent_tile_id and prompt_request.parent_model_id:
+            # History-based modes only work when branching
             if prompt_request.context_mode == ContextMode.FULL_HISTORY:
                 # Full history: walk parent chain, include all turns
                 history = store.build_full_history(
@@ -280,13 +289,7 @@ async def send_prompt(
                     prompt_request.parent_model_id,
                 )
                 messages.extend(history)
-            elif prompt_request.context_mode == ContextMode.SEMANTIC:
-                # Semantic: RAG-style search across notes and tiles
-                context = store.build_semantic_context(
-                    prompt_request.prompt,
-                    vector_search,
-                )
-                messages.extend(context)
+        # ContextMode.NONE: no additional context added
 
         # Add the new user prompt
         messages.append({"role": "user", "content": prompt_request.prompt})
@@ -383,6 +386,280 @@ async def send_prompt(
                     task.cancel()
 
             # Save session after all streams complete
+            store.save_session(session_id)
+
+        yield f"data: {json.dumps({'type': 'session_saved'})}\n\n"
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+# --- Add Models & Regenerate ---
+
+
+@router.post("/{session_id}/tile/{tile_id}/add-models")
+@limiter.limit("20 per minute")
+async def add_models_to_tile(
+    session_id: str, tile_id: str, add_request: AddModelsRequest, request: Request
+):
+    """Add new models to an existing tile (same prompt, new models) with SSE streaming"""
+    store = get_canvas_store(request)
+    openrouter = get_openrouter(request)
+    vector_search = get_vector_search(request)
+
+    if not openrouter.is_configured():
+        raise HTTPException(
+            status_code=503, detail="OpenRouter API key not configured"
+        )
+
+    session = store.get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    # Find the tile
+    tile = None
+    for t in session.prompt_tiles:
+        if t.id == tile_id:
+            tile = t
+            break
+
+    if not tile:
+        raise HTTPException(status_code=404, detail="Tile not found")
+
+    # Add new responses to the tile
+    store.add_models_to_tile(session_id, tile_id, add_request.model_ids)
+
+    async def event_generator():
+        """Generate SSE events for new model streams"""
+        # Build messages - same as original prompt
+        messages = []
+
+        # Add system prompt if it was used
+        if tile.system_prompt:
+            messages.append({"role": "system", "content": tile.system_prompt})
+
+        # Build conversation context if this is a branch
+        if tile.parent_tile_id and tile.parent_model_id:
+            history = store.build_full_history(
+                session_id,
+                tile.parent_tile_id,
+                tile.parent_model_id,
+            )
+            messages.extend(history)
+
+        # Add the prompt
+        messages.append({"role": "user", "content": tile.prompt})
+
+        # Track state for each model
+        model_content = {m: "" for m in add_request.model_ids}
+        model_done = set()
+
+        queue = asyncio.Queue()
+
+        async def stream_model(model_id: str):
+            """Process stream for a single model"""
+            try:
+                async for chunk in openrouter.stream_completion(
+                    model_id,
+                    messages,
+                    0.7,  # Default temperature
+                    2048,  # Default max tokens
+                ):
+                    await queue.put({"model_id": model_id, "type": "chunk", "chunk": chunk})
+                await queue.put({"model_id": model_id, "type": "done"})
+            except Exception as e:
+                logger.error(f"Error streaming from {model_id}: {e}")
+                await queue.put({"model_id": model_id, "type": "error", "error": str(e)})
+
+        # Start all model streams
+        tasks = [
+            asyncio.create_task(stream_model(m)) for m in add_request.model_ids
+        ]
+
+        # Process queue until all models done
+        try:
+            while len(model_done) < len(add_request.model_ids):
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=120.0)
+                    model_id = event["model_id"]
+
+                    if event["type"] == "error":
+                        store.set_response_error(
+                            session_id, tile_id, model_id, event["error"]
+                        )
+                        yield f"data: {json.dumps({'type': 'error', 'model_id': model_id, 'error': event['error']})}\n\n"
+                        model_done.add(model_id)
+
+                    elif event["type"] == "done":
+                        store.update_response_content(
+                            session_id,
+                            tile_id,
+                            model_id,
+                            model_content[model_id],
+                            "completed",
+                        )
+                        # Index in vector search
+                        try:
+                            vector_search.index_tile(
+                                tile_id=tile_id,
+                                session_id=session_id,
+                                prompt=tile.prompt,
+                                response=model_content[model_id],
+                                model_id=model_id,
+                            )
+                        except Exception as e:
+                            logger.warning(f"Failed to index tile: {e}")
+
+                        yield f"data: {json.dumps({'type': 'complete', 'model_id': model_id})}\n\n"
+                        model_done.add(model_id)
+
+                    elif event["type"] == "chunk":
+                        model_content[model_id] += event["chunk"]
+                        store.update_response_content(
+                            session_id,
+                            tile_id,
+                            model_id,
+                            model_content[model_id],
+                            "streaming",
+                        )
+                        yield f"data: {json.dumps({'type': 'chunk', 'model_id': model_id, 'chunk': event['chunk']})}\n\n"
+
+                except asyncio.TimeoutError:
+                    logger.warning("Stream timeout")
+                    yield f"data: {json.dumps({'type': 'timeout'})}\n\n"
+                    break
+
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+
+            store.save_session(session_id)
+
+        yield f"data: {json.dumps({'type': 'session_saved'})}\n\n"
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@router.post("/{session_id}/tile/{tile_id}/regenerate/{model_id}")
+@limiter.limit("20 per minute")
+async def regenerate_response(
+    session_id: str, tile_id: str, model_id: str, request: Request
+):
+    """Regenerate response for a specific model in a tile with SSE streaming"""
+    store = get_canvas_store(request)
+    openrouter = get_openrouter(request)
+    vector_search = get_vector_search(request)
+
+    if not openrouter.is_configured():
+        raise HTTPException(
+            status_code=503, detail="OpenRouter API key not configured"
+        )
+
+    session = store.get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    # URL decode model_id
+    decoded_model_id = unquote(model_id)
+
+    # Find the tile
+    tile = None
+    for t in session.prompt_tiles:
+        if t.id == tile_id:
+            tile = t
+            break
+
+    if not tile:
+        raise HTTPException(status_code=404, detail="Tile not found")
+
+    if decoded_model_id not in tile.responses:
+        raise HTTPException(status_code=404, detail="Model response not found in tile")
+
+    async def event_generator():
+        """Generate SSE events for regenerated response"""
+        # Build messages - same as original prompt
+        messages = []
+
+        if tile.system_prompt:
+            messages.append({"role": "system", "content": tile.system_prompt})
+
+        # Build conversation context if this is a branch
+        if tile.parent_tile_id and tile.parent_model_id:
+            history = store.build_full_history(
+                session_id,
+                tile.parent_tile_id,
+                tile.parent_model_id,
+            )
+            messages.extend(history)
+
+        messages.append({"role": "user", "content": tile.prompt})
+
+        content = ""
+
+        try:
+            async for chunk in openrouter.stream_completion(
+                decoded_model_id,
+                messages,
+                0.7,
+                2048,
+            ):
+                content += chunk
+                store.update_response_content(
+                    session_id,
+                    tile_id,
+                    decoded_model_id,
+                    content,
+                    "streaming",
+                )
+                yield f"data: {json.dumps({'type': 'chunk', 'model_id': decoded_model_id, 'chunk': chunk})}\n\n"
+
+            # Complete
+            store.update_response_content(
+                session_id,
+                tile_id,
+                decoded_model_id,
+                content,
+                "completed",
+            )
+
+            # Re-index in vector search
+            try:
+                vector_search.index_tile(
+                    tile_id=tile_id,
+                    session_id=session_id,
+                    prompt=tile.prompt,
+                    response=content,
+                    model_id=decoded_model_id,
+                )
+            except Exception as e:
+                logger.warning(f"Failed to re-index tile: {e}")
+
+            yield f"data: {json.dumps({'type': 'complete', 'model_id': decoded_model_id})}\n\n"
+
+        except Exception as e:
+            logger.error(f"Error regenerating from {decoded_model_id}: {e}")
+            store.set_response_error(session_id, tile_id, decoded_model_id, str(e))
+            yield f"data: {json.dumps({'type': 'error', 'model_id': decoded_model_id, 'error': str(e)})}\n\n"
+
+        finally:
             store.save_session(session_id)
 
         yield f"data: {json.dumps({'type': 'session_saved'})}\n\n"
@@ -736,7 +1013,7 @@ async def export_to_note(session_id: str, request: Request):
     # Generate markdown content
     markdown_content = _canvas_to_markdown(session)
 
-    from backend.app.models.note import NoteCreate, NoteUpdate
+    from app.models.note import NoteCreate, NoteUpdate
 
     note_title = f"Canvas: {session.title}"
     tags = list(set(session.tags + ["canvas-export"]))

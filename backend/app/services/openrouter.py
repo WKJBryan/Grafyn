@@ -5,7 +5,7 @@ import logging
 from typing import AsyncGenerator, List, Dict, Optional
 from datetime import datetime, timezone, timedelta
 
-from backend.app.config import get_settings
+from app.config import get_settings
 
 logger = logging.getLogger(__name__)
 settings = get_settings()

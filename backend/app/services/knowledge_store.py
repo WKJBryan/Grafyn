@@ -6,11 +6,11 @@ from pathlib import Path
 from typing import List, Optional
 from datetime import datetime, timezone
 
-from backend.app.models.note import (
+from app.models.note import (
     Note, NoteCreate, NoteUpdate, NoteListItem, NoteFrontmatter,
     TypedProperty, PropertyType, ContentType, NoteType
 )
-from backend.app.config import get_settings
+from app.config import get_settings
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -181,7 +181,7 @@ class KnowledgeStore:
                 post = frontmatter.load(md_file)
                 note_id = md_file.stem
                 
-                # Extract wikilinks for link count
+                # Extract wikilinks for link count and outgoing links
                 wikilinks = self._extract_wikilinks(post.content)
                 
                 # Infer note_type from title or frontmatter
@@ -198,7 +198,10 @@ class KnowledgeStore:
                     created=post.get('created'),
                     modified=post.get('modified'),
                     link_count=len(wikilinks),
-                    note_type=note_type
+                    note_type=note_type,
+                    outgoing_links=wikilinks,
+                    source=post.get('source'),
+                    container_of=post.get('container_of', [])
                 ))
             except Exception as e:
                 logger.error(f"Error loading note {md_file}: {e}")

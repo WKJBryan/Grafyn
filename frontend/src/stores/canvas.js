@@ -592,6 +592,175 @@ export const useCanvasStore = defineStore('canvas', () => {
     return sendPrompt(newPrompt, models, systemPrompt, temperature, maxTokens, parentTileId, parentModelId, contextMode)
   }
 
+  // Add new models to an existing tile (same prompt, different models)
+  async function addModelToTile(tileId, newModelIds) {
+    if (!currentSession.value) {
+      throw new Error('No active session')
+    }
+
+    const tile = currentSession.value.prompt_tiles.find(t => t.id === tileId)
+    if (!tile) {
+      throw new Error('Tile not found')
+    }
+
+    const sessionId = currentSession.value.id
+    error.value = null
+
+    // Mark new models as streaming
+    newModelIds.forEach(m => streamingModels.value.add(m))
+
+    try {
+      const response = await fetch(`/api/canvas/${sessionId}/tile/${tileId}/add-models`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model_ids: newModelIds
+        })
+      })
+
+      if (!response.ok) {
+        throw new Error(`HTTP error: ${response.status}`)
+      }
+
+      const reader = response.body.getReader()
+      const decoder = new TextDecoder()
+
+      const modelContent = {}
+      newModelIds.forEach(m => modelContent[m] = '')
+
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+
+        const text = decoder.decode(value)
+        const lines = text.split('\n')
+
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue
+          const data = line.slice(6)
+          if (data === '[DONE]') break
+
+          try {
+            const event = JSON.parse(data)
+
+            switch (event.type) {
+              case 'chunk':
+                modelContent[event.model_id] += event.chunk
+                updateTileResponseLocal(tileId, event.model_id, modelContent[event.model_id], 'streaming')
+                break
+
+              case 'complete':
+                updateTileResponseLocal(tileId, event.model_id, modelContent[event.model_id], 'completed')
+                streamingModels.value.delete(event.model_id)
+                break
+
+              case 'error':
+                updateTileResponseLocal(tileId, event.model_id, event.error, 'error')
+                streamingModels.value.delete(event.model_id)
+                break
+
+              case 'session_saved':
+                await loadSession(sessionId)
+                break
+            }
+          } catch (e) {
+            console.error('Failed to parse SSE event:', e)
+          }
+        }
+      }
+    } catch (err) {
+      error.value = err.message || 'Failed to add models'
+      console.error('Failed to add models to tile:', err)
+      throw err
+    } finally {
+      newModelIds.forEach(m => streamingModels.value.delete(m))
+    }
+  }
+
+  // Regenerate response for a specific model
+  async function regenerateResponse(tileId, modelId) {
+    if (!currentSession.value) {
+      throw new Error('No active session')
+    }
+
+    const tile = currentSession.value.prompt_tiles.find(t => t.id === tileId)
+    if (!tile || !tile.responses[modelId]) {
+      throw new Error('Response not found')
+    }
+
+    const sessionId = currentSession.value.id
+    error.value = null
+
+    // Mark model as streaming
+    streamingModels.value.add(modelId)
+
+    // Clear existing content
+    updateTileResponseLocal(tileId, modelId, '', 'streaming')
+
+    try {
+      const response = await fetch(`/api/canvas/${sessionId}/tile/${tileId}/regenerate/${encodeURIComponent(modelId)}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' }
+      })
+
+      if (!response.ok) {
+        throw new Error(`HTTP error: ${response.status}`)
+      }
+
+      const reader = response.body.getReader()
+      const decoder = new TextDecoder()
+
+      let content = ''
+
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+
+        const text = decoder.decode(value)
+        const lines = text.split('\n')
+
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue
+          const data = line.slice(6)
+          if (data === '[DONE]') break
+
+          try {
+            const event = JSON.parse(data)
+
+            switch (event.type) {
+              case 'chunk':
+                content += event.chunk
+                updateTileResponseLocal(tileId, modelId, content, 'streaming')
+                break
+
+              case 'complete':
+                updateTileResponseLocal(tileId, modelId, content, 'completed')
+                streamingModels.value.delete(modelId)
+                break
+
+              case 'error':
+                updateTileResponseLocal(tileId, modelId, event.error, 'error')
+                streamingModels.value.delete(modelId)
+                break
+
+              case 'session_saved':
+                await loadSession(sessionId)
+                break
+            }
+          } catch (e) {
+            console.error('Failed to parse SSE event:', e)
+          }
+        }
+      }
+    } catch (err) {
+      error.value = err.message || 'Failed to regenerate response'
+      console.error('Failed to regenerate response:', err)
+      throw err
+    } finally {
+      streamingModels.value.delete(modelId)
+    }
+  }
+
   return {
     // State
     sessions,
@@ -628,6 +797,8 @@ export const useCanvasStore = defineStore('canvas', () => {
     clearSession,
     reset,
     getParentResponseContent,
-    branchFromResponse
+    branchFromResponse,
+    addModelToTile,
+    regenerateResponse
   }
 })

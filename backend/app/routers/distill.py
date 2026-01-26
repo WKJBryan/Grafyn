@@ -1,13 +1,13 @@
 """Distillation API router for Container → Atomic → Hub workflow"""
 from fastapi import APIRouter, HTTPException, Request
-from backend.app.models.distillation import (
+from app.models.distillation import (
     DistillRequest,
     DistillResponse,
     DistillMode,
     ExtractionMethod,
 )
-from backend.app.models.note import Note
-from backend.app.services.distillation import (
+from app.models.note import Note
+from app.services.distillation import (
     DistillationService,
     normalize_tag,
     merge_tags,

@@ -18,6 +18,9 @@
         </div>
         <div class="header-right">
           <div class="action-buttons">
+            <router-link to="/import" class="btn btn-secondary" title="Import Conversations">
+              Import
+            </router-link>
             <router-link to="/canvas" class="btn btn-secondary" title="Multi-LLM Canvas">
               Canvas
             </router-link>
@@ -107,6 +110,14 @@
         </aside>
       </div>
     </div>
+
+    <!-- Topic Selector Modal -->
+    <TopicSelector
+      v-if="showTopicSelector"
+      :existing-topics="existingTopics"
+      @create="handleTopicSelected"
+      @close="showTopicSelector = false"
+    />
   </div>
 </template>
 
@@ -122,6 +133,7 @@ import UnlinkedMentions from '../components/UnlinkedMentions.vue'
 import MiniGraph from '../components/MiniGraph.vue'
 import OnThisPage from '../components/OnThisPage.vue'
 import GraphView from '../components/GraphView.vue'
+import TopicSelector from '../components/TopicSelector.vue'
 import { useThemeStore } from '../stores/theme'
 
 const notes = ref([])
@@ -130,6 +142,7 @@ const selectedNote = ref(null)
 const themeStore = useThemeStore()
 const selectedTags = ref([])
 const isDirty = ref(false)
+const showTopicSelector = ref(false)
 
 // Computed property to get the current theme icon
 const themeIcon = computed(() => {
@@ -145,6 +158,20 @@ const allTags = computed(() => {
     }
   })
   return Array.from(tags).sort()
+})
+
+// Extract unique root topics (first part of tags before /)
+const existingTopics = computed(() => {
+  const topics = new Set()
+  notes.value.forEach(note => {
+    if (note.tags && Array.isArray(note.tags)) {
+      note.tags.forEach(tag => {
+        const rootTopic = tag.split('/')[0]
+        topics.add(rootTopic)
+      })
+    }
+  })
+  return Array.from(topics).sort()
 })
 
 // Filter notes based on selected tags
@@ -249,13 +276,23 @@ async function loadSelectedNote() {
 }
 
 function handleNewNote() {
+  // Show topic selector for manual note creation
+  showTopicSelector.value = true
+}
+
+function handleTopicSelected({ note_type, topic }) {
+  // Close the selector
+  showTopicSelector.value = false
+  
+  // Create new note with selected type and topic
   selectedNoteId.value = null
   selectedNote.value = {
     id: '',
     title: '',
     content: '',
     status: 'draft',
-    tags: []
+    note_type: note_type,
+    tags: topic ? [topic] : []
   }
 }
 
@@ -368,6 +405,13 @@ function handleCloseNote() {
   flex: 0 0 280px; /* Match right sidebar width */
   display: flex;
   justify-content: flex-end;
+  align-items: center;
+}
+
+.action-buttons {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-sm);
 }
 
 /* Main Layout */

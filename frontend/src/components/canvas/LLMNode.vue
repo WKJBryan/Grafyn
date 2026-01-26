@@ -36,6 +36,14 @@
         ⑂ Branch
       </button>
       <button 
+        class="regenerate-btn" 
+        @click.stop="$emit('regenerate', { tileId, modelId })"
+        :disabled="!isCompleted"
+        title="Regenerate response"
+      >
+        ↻
+      </button>
+      <button 
         class="select-btn"
         :class="{ active: selected }"
         @click.stop="$emit('select', { tileId, modelId })"
@@ -57,6 +65,16 @@
     <!-- Connection point (right side - output for branching) -->
     <div class="connection-point out" v-if="isCompleted"></div>
     
+    <!-- Add Model button (+) on right edge -->
+    <button
+      v-if="isCompleted"
+      class="add-model-btn"
+      @click.stop="$emit('show-add-model-dialog', { tileId, modelId })"
+      title="Add more models to this conversation"
+    >
+      +
+    </button>
+    
     <!-- Branch input overlay -->
     <div v-if="showBranch" class="branch-overlay" @click.stop>
       <textarea
@@ -68,6 +86,67 @@
         @keydown.ctrl.enter="submitBranch"
         @keydown.escape="showBranch = false"
       ></textarea>
+      
+      <!-- Model selection for branch -->
+      <div class="branch-models">
+        <div class="branch-models-header">
+          <span class="models-label">Models:</span>
+          <button 
+            class="models-toggle" 
+            @click.stop="showModelPicker = !showModelPicker"
+            :title="branchModels.length + ' model(s) selected'"
+          >
+            {{ branchModels.length }} selected ▾
+          </button>
+        </div>
+        
+        <!-- Selected model tags -->
+        <div v-if="branchModels.length > 0" class="branch-model-tags">
+          <span 
+            v-for="mId in branchModels.slice(0, 3)" 
+            :key="mId" 
+            class="branch-model-tag"
+          >
+            {{ getShortModelName(mId) }}
+            <button class="tag-remove-btn" @click.stop="removeModel(mId)">×</button>
+          </span>
+          <span v-if="branchModels.length > 3" class="more-models">
+            +{{ branchModels.length - 3 }} more
+          </span>
+        </div>
+        
+        <!-- Model picker dropdown -->
+        <div v-if="showModelPicker" class="model-picker-dropdown">
+          <input 
+            v-model="modelSearchQuery" 
+            type="text" 
+            placeholder="Search models..." 
+            class="model-search-input"
+            @click.stop
+          />
+          <div class="model-picker-list">
+            <label 
+              v-for="model in filteredModels" 
+              :key="model.id" 
+              class="model-picker-item"
+              :class="{ selected: branchModels.includes(model.id) }"
+            >
+              <input 
+                type="checkbox" 
+                :value="model.id" 
+                v-model="branchModels"
+                @click.stop
+              />
+              <span class="model-picker-name">{{ model.name }}</span>
+            </label>
+          </div>
+          <div class="model-picker-actions">
+            <button class="picker-btn" @click.stop="branchModels = [modelId]">Reset</button>
+            <button class="picker-btn picker-btn-done" @click.stop="showModelPicker = false">Done</button>
+          </div>
+        </div>
+      </div>
+      
       <div class="branch-options">
         <select v-model="branchContextMode" class="context-select">
           <option value="full_history">Full History</option>
@@ -77,8 +156,8 @@
       </div>
       <div class="branch-actions">
         <button class="branch-cancel" @click.stop="showBranch = false">Cancel</button>
-        <button class="branch-submit" @click.stop="submitBranch" :disabled="!branchPrompt.trim()">
-          Send
+        <button class="branch-submit" @click.stop="submitBranch" :disabled="!branchPrompt.trim() || branchModels.length === 0">
+          Send ({{ branchModels.length }})
         </button>
       </div>
     </div>
@@ -109,10 +188,14 @@ const props = defineProps({
   selected: {
     type: Boolean,
     default: false
+  },
+  availableModels: {
+    type: Array,
+    default: () => []
   }
 })
 
-const emit = defineEmits(['drag', 'branch', 'select', 'delete'])
+const emit = defineEmits(['drag', 'branch', 'select', 'delete', 'regenerate', 'show-add-model-dialog'])
 
 // Refs
 const contentRef = ref(null)
@@ -126,6 +209,10 @@ const dragStart = ref({ x: 0, y: 0, nodeX: 0, nodeY: 0 })
 const showBranch = ref(false)
 const branchPrompt = ref('')
 const branchContextMode = ref('full_history')
+const branchModels = ref([])
+const showModelPicker = ref(false)
+const modelSearchQuery = ref('')
+
 
 // Computed
 const modelName = computed(() => {
@@ -161,10 +248,40 @@ const renderedContent = computed(() => {
 // Watch for branch input focus
 watch(showBranch, async (isShowing) => {
   if (isShowing) {
+    // Initialize with current model
+    branchModels.value = [props.modelId]
+    modelSearchQuery.value = ''
+    showModelPicker.value = false
     await nextTick()
     branchInputRef.value?.focus()
   }
 })
+
+// Computed for filtered models
+const filteredModels = computed(() => {
+  if (!modelSearchQuery.value) return props.availableModels
+  const query = modelSearchQuery.value.toLowerCase()
+  return props.availableModels.filter(m =>
+    m.name.toLowerCase().includes(query) ||
+    m.id.toLowerCase().includes(query)
+  )
+})
+
+
+function getShortModelName(modelId) {
+  const model = props.availableModels.find(m => m.id === modelId)
+  if (model) {
+    const parts = model.name.split(':')
+    return parts.length > 1 ? parts[1].trim() : model.name
+  }
+  const parts = modelId.split('/')
+  return parts.length > 1 ? parts[1] : modelId
+}
+
+function removeModel(modelId) {
+  branchModels.value = branchModels.value.filter(id => id !== modelId)
+}
+
 
 // Methods
 function handleMouseDown(e) {
@@ -226,11 +343,13 @@ function toggleBranch() {
 }
 
 function submitBranch() {
-  if (!branchPrompt.value.trim()) return
+  if (!branchPrompt.value.trim() || branchModels.value.length === 0) return
   
-  emit('branch', props.tileId, props.modelId, branchPrompt.value.trim(), branchContextMode.value)
+  emit('branch', props.tileId, props.modelId, branchPrompt.value.trim(), branchContextMode.value, branchModels.value)
   showBranch.value = false
   branchPrompt.value = ''
+  branchModels.value = []
+  showModelPicker.value = false
 }
 
 // Cleanup on unmount
@@ -250,7 +369,7 @@ onBeforeUnmount(() => {
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.2);
   display: flex;
   flex-direction: column;
-  overflow: hidden;
+  overflow: visible;
   transition: left 0.5s ease-out, top 0.5s ease-out, box-shadow 0.15s, border-color 0.15s, transform 0.1s;
   user-select: none;
 }
@@ -491,6 +610,67 @@ onBeforeUnmount(() => {
   background: var(--node-color, #7c5cff);
 }
 
+/* Regenerate button */
+.regenerate-btn {
+  padding: 4px 8px;
+  border: 1px solid var(--bg-tertiary);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 0.875rem;
+  cursor: pointer;
+  transition: all 0.15s;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+}
+
+.regenerate-btn:hover:not(:disabled) {
+  border-color: var(--accent-blue);
+  color: var(--accent-blue);
+  background: color-mix(in srgb, var(--accent-blue) 10%, transparent);
+}
+
+.regenerate-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* Add Model button (+) */
+.add-model-btn {
+  position: absolute;
+  right: -14px;
+  top: 35%;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  background: var(--bg-secondary);
+  border: 2px solid var(--accent-green);
+  color: var(--accent-green);
+  font-size: 1.25rem;
+  font-weight: bold;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: all 0.15s;
+  opacity: 0;
+  transform: scale(0.8);
+  z-index: 5;
+}
+
+.llm-node:hover .add-model-btn {
+  opacity: 1;
+  transform: scale(1);
+}
+
+.add-model-btn:hover {
+  background: var(--accent-green);
+  color: white;
+  transform: scale(1.1);
+}
+
 /* Branch overlay */
 .branch-overlay {
   position: absolute;
@@ -574,5 +754,183 @@ onBeforeUnmount(() => {
 .branch-submit:disabled {
   opacity: 0.5;
   cursor: not-allowed;
+}
+
+/* Branch Model Picker Styles */
+.branch-models {
+  margin: var(--spacing-xs) 0;
+  position: relative;
+}
+
+.branch-models-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 4px;
+}
+
+.models-label {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+}
+
+.models-toggle {
+  padding: 2px 8px;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--bg-tertiary);
+  border-radius: var(--radius-sm);
+  color: var(--text-secondary);
+  font-size: 0.75rem;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.models-toggle:hover {
+  border-color: var(--accent-primary);
+  color: var(--text-primary);
+}
+
+.branch-model-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-bottom: var(--spacing-xs);
+}
+
+.branch-model-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 6px;
+  background: rgba(124, 92, 255, 0.15);
+  border: 1px solid rgba(124, 92, 255, 0.3);
+  border-radius: var(--radius-sm);
+  font-size: 0.6875rem;
+  color: var(--text-primary);
+}
+
+.tag-remove-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 12px;
+  height: 12px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 0.875rem;
+  line-height: 1;
+}
+
+.tag-remove-btn:hover {
+  color: var(--accent-primary);
+}
+
+.more-models {
+  font-size: 0.6875rem;
+  color: var(--text-muted);
+  padding: 2px 6px;
+}
+
+.model-picker-dropdown {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  right: 0;
+  background: var(--bg-secondary);
+  border: 1px solid var(--accent-primary);
+  border-radius: var(--radius-sm);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+  z-index: 100;
+  max-height: 250px;
+  display: flex;
+  flex-direction: column;
+}
+
+.model-search-input {
+  width: 100%;
+  padding: 8px;
+  background: var(--bg-tertiary);
+  border: none;
+  border-bottom: 1px solid var(--bg-tertiary);
+  color: var(--text-primary);
+  font-size: 0.75rem;
+}
+
+.model-search-input:focus {
+  outline: none;
+  background: var(--bg-primary);
+}
+
+.model-picker-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 4px;
+}
+
+.model-picker-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: background 0.1s;
+}
+
+.model-picker-item:hover {
+  background: var(--bg-tertiary);
+}
+
+.model-picker-item.selected {
+  background: rgba(124, 92, 255, 0.15);
+}
+
+.model-picker-item input[type="checkbox"] {
+  accent-color: var(--accent-primary);
+  width: 14px;
+  height: 14px;
+}
+
+.model-picker-name {
+  font-size: 0.75rem;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.model-picker-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 4px;
+  padding: 6px 8px;
+  border-top: 1px solid var(--bg-tertiary);
+}
+
+.picker-btn {
+  padding: 4px 10px;
+  border-radius: var(--radius-sm);
+  font-size: 0.6875rem;
+  cursor: pointer;
+  background: transparent;
+  border: 1px solid var(--bg-tertiary);
+  color: var(--text-muted);
+}
+
+.picker-btn:hover {
+  border-color: var(--text-muted);
+}
+
+.picker-btn-done {
+  background: var(--accent-primary);
+  border-color: var(--accent-primary);
+  color: white;
+}
+
+.picker-btn-done:hover {
+  background: #6b4fd9;
 }
 </style>

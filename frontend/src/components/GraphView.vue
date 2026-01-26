@@ -7,9 +7,6 @@
         <span class="stat-item">{{ stats.edges }} Links</span>
       </div>
       <div class="toolbar-actions">
-        <div class="color-picker-wrapper" title="Change Node Color">
-          <input type="color" v-model="userColor" @input="updateNodeColors" class="color-input">
-        </div>
         <button class="btn btn-secondary btn-sm" @click="refreshGraph" title="Refresh Graph">
           <span class="icon">&#8634;</span>
         </button>
@@ -19,6 +16,15 @@
       </div>
     </div>
     <div class="graph-canvas" ref="canvas"></div>
+    
+    <!-- Settings Panel -->
+    <GraphSettings 
+      @update:filters="handleFiltersUpdate"
+      @update:display="handleDisplayUpdate"
+      @update:forces="handleForcesUpdate"
+      @animate="restartSimulation"
+    />
+    
     <div class="loading-overlay" v-if="loading">
       <div class="spinner"></div>
       <p>Loading graph...</p>
@@ -30,6 +36,7 @@
 import { ref, onMounted, onBeforeUnmount, watch } from 'vue'
 import * as d3 from 'd3'
 import { graph as graphApi } from '../api/client'
+import GraphSettings from './GraphSettings.vue'
 
 const props = defineProps({
   width: {
@@ -48,18 +55,44 @@ const container = ref(null)
 const canvas = ref(null)
 const loading = ref(false)
 const stats = ref(null)
-const userColor = ref('#34d399') // Default green
 
 // D3 variables
 let simulation = null
 let svg = null
 let zoom = null
+let zoomGroup = null
 let width = 800
 let height = 600
+let currentZoomLevel = 1
 
 // Graph data
 let nodes = []
 let links = []
+let allNodes = []  // Unfiltered data
+let allLinks = []
+
+// Settings state
+const currentFilters = ref({
+  showContainers: true,
+  showAtomics: true,
+  showHubs: true,
+  showGeneral: true,
+  search: ''
+})
+
+const currentDisplay = ref({
+  arrows: true,
+  textFade: 50,
+  nodeSize: 8,
+  linkThickness: 1
+})
+
+const currentForces = ref({
+  center: 0.5,
+  repel: -300,
+  link: 1,
+  distance: 100
+})
 
 onMounted(() => {
   // Initial load
@@ -90,20 +123,50 @@ async function loadGraph() {
   loading.value = true
   try {
     const data = await graphApi.full()
-    nodes = data.nodes.map(d => ({ ...d })) // Clone to avoid mutation issues
-    links = data.links.map(d => ({ ...d }))
+    allNodes = data.nodes.map(d => ({ ...d })) // Clone to avoid mutation issues
+    allLinks = data.links.map(d => ({ ...d }))
     
     stats.value = {
-      nodes: nodes.length,
-      edges: links.length
+      nodes: allNodes.length,
+      edges: allLinks.length
     }
     
+    applyFilters()
     initGraph()
   } catch (error) {
     console.error('Failed to load graph:', error)
   } finally {
     loading.value = false
   }
+}
+
+function applyFilters() {
+  const f = currentFilters.value
+  
+  // Filter nodes by type and search
+  nodes = allNodes.filter(node => {
+    // Type filter
+    const type = node.note_type || 'general'
+    if (type === 'container' && !f.showContainers) return false
+    if (type === 'atomic' && !f.showAtomics) return false
+    if (type === 'hub' && !f.showHubs) return false
+    if (type === 'general' && !f.showGeneral) return false
+    
+    // Search filter
+    if (f.search && !node.label.toLowerCase().includes(f.search.toLowerCase())) {
+      return false
+    }
+    
+    return true
+  }).map(d => ({ ...d }))
+  
+  // Filter links to only include visible nodes
+  const visibleIds = new Set(nodes.map(n => n.id))
+  links = allLinks.filter(link => {
+    const sourceId = typeof link.source === 'object' ? link.source.id : link.source
+    const targetId = typeof link.target === 'object' ? link.target.id : link.target
+    return visibleIds.has(sourceId) && visibleIds.has(targetId)
+  }).map(d => ({ ...d }))
 }
 
 function initGraph() {
@@ -116,37 +179,57 @@ function initGraph() {
     .attr('width', '100%')
     .attr('height', '100%')
     .attr('viewBox', [0, 0, width, height])
+  
+  // Add arrow marker definition
+  const defs = svg.append('defs')
+  defs.append('marker')
+    .attr('id', 'arrowhead')
+    .attr('viewBox', '0 -5 10 10')
+    .attr('refX', 20)
+    .attr('refY', 0)
+    .attr('markerWidth', 6)
+    .attr('markerHeight', 6)
+    .attr('orient', 'auto')
+    .append('path')
+    .attr('d', 'M0,-5L10,0L0,5')
+    .attr('fill', '#4a4a4f')
     
   // Add group for zoom
-  const g = svg.append('g')
+  zoomGroup = svg.append('g')
   
   // Zoom behavior
   zoom = d3.zoom()
     .scaleExtent([0.1, 4])
     .on('zoom', (event) => {
-      g.attr('transform', event.transform)
+      currentZoomLevel = event.transform.k
+      zoomGroup.attr('transform', event.transform)
+      updateTextOpacity()
     })
     
   svg.call(zoom)
   
-  // Simulation
+  // Simulation with configurable forces
   simulation = d3.forceSimulation(nodes)
-    .force('link', d3.forceLink(links).id(d => d.id).distance(100))
-    .force('charge', d3.forceManyBody().strength(-300))
-    .force('center', d3.forceCenter(width / 2, height / 2))
+    .force('link', d3.forceLink(links).id(d => d.id).distance(currentForces.value.distance).strength(currentForces.value.link))
+    .force('charge', d3.forceManyBody().strength(currentForces.value.repel))
+    .force('x', d3.forceX(width / 2).strength(currentForces.value.center))
+    .force('y', d3.forceY(height / 2).strength(currentForces.value.center))
     .force('collide', d3.forceCollide(30).strength(0.7))
     
   // Draw lines
-  const link = g.append('g')
+  const link = zoomGroup.append('g')
+    .attr('class', 'links-group')
     .attr('stroke', '#4a4a4f')
     .attr('stroke-opacity', 0.6)
     .selectAll('line')
     .data(links)
     .join('line')
-    .attr('stroke-width', 1)
+    .attr('stroke-width', currentDisplay.value.linkThickness)
+    .attr('marker-end', currentDisplay.value.arrows ? 'url(#arrowhead)' : null)
     
   // Draw nodes
-  const node = g.append('g')
+  const node = zoomGroup.append('g')
+    .attr('class', 'nodes-group')
     .selectAll('.node-group')
     .data(nodes)
     .join('g')
@@ -157,14 +240,15 @@ function initGraph() {
       emit('node-click', d.id)
     })
     
-  // Node circles
+  // Node circles with hub-based coloring
   node.append('circle')
-    .attr('r', d => Math.max(5, Math.min(20, 5 + (d.val || 1) * 2)))
-    .attr('fill', d => getNodeColor(d.val))
+    .attr('r', d => getNodeRadius(d))
+    .attr('fill', d => d.group || '#6b7280')
     .attr('stroke', '#fff')
     .attr('stroke-width', 1.5)
+    .attr('class', 'node-circle')
     
-  // Node labels - use CSS variable so it adapts to light/dark theme
+  // Node labels
   const textColor = getComputedStyle(document.documentElement).getPropertyValue('--text-primary').trim() || '#e8e8ed'
   node.append('text')
     .text(d => d.label)
@@ -186,19 +270,114 @@ function initGraph() {
     node
       .attr('transform', d => `translate(${d.x},${d.y})`)
   })
+  
+  // Initial text opacity
+  updateTextOpacity()
+}
+
+function getNodeRadius(node) {
+  const baseSize = currentDisplay.value.nodeSize
+  const valFactor = Math.max(1, Math.min(3, (node.val || 1) * 0.5))
+  return baseSize * valFactor
+}
+
+function updateTextOpacity() {
+  if (!zoomGroup) return
+  
+  const threshold = currentDisplay.value.textFade / 100
+  const fadeStart = 0.3 + threshold * 0.7  // Range: 0.3 to 1.0
+  
+  // Fade text based on zoom level
+  const opacity = currentZoomLevel < fadeStart 
+    ? Math.max(0, (currentZoomLevel - 0.1) / (fadeStart - 0.1))
+    : 1
+    
+  zoomGroup.selectAll('.graph-node-label')
+    .style('opacity', opacity)
 }
 
 function updateDimensions() {
   if (simulation) {
-    simulation.force('center', d3.forceCenter(width / 2, height / 2))
+    simulation.force('center', d3.forceCenter(width / 2, height / 2).strength(currentForces.value.center))
     simulation.alpha(0.3).restart()
   }
 }
 
-function updateNodeColors() {
-  if (svg) {
-    svg.selectAll('circle')
-       .attr('fill', userColor.value)
+function handleFiltersUpdate(filters) {
+  currentFilters.value = filters
+  applyFilters()
+  initGraph()
+}
+
+function handleDisplayUpdate(display) {
+  currentDisplay.value = display
+  
+  if (!zoomGroup) return
+  
+  // Update arrows
+  zoomGroup.selectAll('.links-group line')
+    .attr('marker-end', display.arrows ? 'url(#arrowhead)' : null)
+    .attr('stroke-width', display.linkThickness)
+  
+  // Update node sizes
+  zoomGroup.selectAll('.node-circle')
+    .attr('r', d => getNodeRadius(d))
+  
+  // Update text visibility
+  updateTextOpacity()
+}
+
+function handleForcesUpdate(forces) {
+  currentForces.value = forces
+  
+  if (!simulation) return
+  
+  // Update existing force parameters rather than replacing forces
+  const linkForce = simulation.force('link')
+  if (linkForce) {
+    linkForce.distance(forces.distance).strength(forces.link)
+  }
+  
+  const chargeForce = simulation.force('charge')
+  if (chargeForce) {
+    chargeForce.strength(forces.repel)
+  }
+  
+  // Update X and Y forces for center pulling
+  const xForce = simulation.force('x')
+  if (xForce) {
+    xForce.strength(forces.center)
+  }
+  
+  const yForce = simulation.force('y')
+  if (yForce) {
+    yForce.strength(forces.center)
+  }
+  
+  // Restart with new forces
+  simulation.alpha(0.5).restart()
+}
+
+function restartSimulation() {
+  if (simulation) {
+    // Reset all nodes to center of the graph
+    const centerX = width / 2
+    const centerY = height / 2
+    
+    nodes.forEach(node => {
+      // Reset position to center with some random spread
+      node.x = centerX + (Math.random() - 0.5) * 100
+      node.y = centerY + (Math.random() - 0.5) * 100
+      // Clear any fixed position from dragging
+      node.fx = null
+      node.fy = null
+    })
+    
+    // Restart with slower animation (lower alphaDecay = slower)
+    simulation
+      .alpha(1)
+      .alphaDecay(0.01)  // Default is 0.0228, lower = slower
+      .restart()
   }
 }
 
@@ -224,11 +403,6 @@ function drag(simulation) {
     .on('start', dragstarted)
     .on('drag', dragged)
     .on('end', dragended)
-}
-
-function getNodeColor(val) {
-  // Use user color if set, otherwise default logic (which we are overriding now with the implementation)
-  return userColor.value
 }
 
 function refreshGraph() {
@@ -299,7 +473,7 @@ function resetZoom() {
   align-items: center;
   justify-content: center;
   color: var(--text-muted);
-  z-index: 20;
+  z-index: 200;
 }
 
 .spinner {
@@ -316,30 +490,6 @@ function resetZoom() {
   to { transform: rotate(360deg); }
 }
 
-.color-picker-wrapper {
-  display: flex;
-  align-items: center;
-}
-
-.color-input {
-  width: 24px;
-  height: 24px;
-  padding: 0;
-  border: none;
-  border-radius: 4px;
-  cursor: pointer;
-  background: transparent;
-}
-
-.color-input::-webkit-color-swatch-wrapper {
-  padding: 0;
-}
-
-.color-input::-webkit-color-swatch {
-  border: 1px solid var(--bg-tertiary);
-  border-radius: 4px;
-}
-
 .btn-sm {
   padding: 4px 8px;
   font-size: 0.75rem;
@@ -349,6 +499,7 @@ function resetZoom() {
 .graph-canvas :deep(.graph-node-label) {
   fill: var(--text-primary);
   text-shadow: 0 1px 3px var(--bg-primary);
+  transition: opacity 0.15s ease;
 }
 
 /* In dark mode, use light shadow for contrast */

@@ -12,9 +12,13 @@
     "test": "vitest",
     "test:ui": "vitest --ui",
     "test:run": "vitest run",
-    "test:coverage": "vitest run --coverage"
+    "test:coverage": "vitest run --coverage",
+    "tauri": "tauri",
+    "tauri:dev": "tauri dev",
+    "tauri:build": "tauri build"
   },
   "dependencies": {
+    "@tauri-apps/api": "^1.6.0",
     "axios": "^1.6.0",
     "d3": "^7.9.0",
     "marked": "^11.0.0",
@@ -24,6 +28,7 @@
   },
   "devDependencies": {
     "@pinia/testing": "^0.1.0",
+    "@tauri-apps/cli": "^1.6.0",
     "@vitejs/plugin-vue": "^6.0.3",
     "@vitest/coverage-v8": "^4.0.16",
     "@vitest/ui": "^4.0.16",
@@ -33,6 +38,7 @@
     "jsdom": "^23.0.0",
     "msw": "^2.0.0",
     "prettier": "^3.1.0",
+    "sharp": "^0.34.5",
     "vite": "^7.3.1",
     "vitest": "^4.0.16"
   }
