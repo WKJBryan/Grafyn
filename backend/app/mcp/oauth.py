@@ -6,8 +6,8 @@ import httpx
 import secrets
 from datetime import datetime, timezone, timedelta
 
-from backend.app.config import get_settings
-from backend.app.services.token_store import TokenStore
+from app.config import get_settings
+from app.services.token_store import TokenStore
 
 settings = get_settings()
 

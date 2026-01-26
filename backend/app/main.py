@@ -1,22 +1,32 @@
 """Main FastAPI application for Seedream"""
+
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pathlib import Path
 
-from backend.app.config import get_settings
-from backend.app.routers import notes, search, graph, oauth, canvas, distill, priority
-from backend.app.mcp.server import setup_mcp
-from backend.app.services.knowledge_store import KnowledgeStore
-from backend.app.services.vector_search import VectorSearchService
-from backend.app.services.graph_index import GraphIndexService
-from backend.app.services.openrouter import OpenRouterService
-from backend.app.services.canvas_store import CanvasSessionStore
-from backend.app.services.priority_scoring import PriorityScoringService
-from backend.app.services.priority_settings import PrioritySettingsService
-from backend.app.middleware.logging import LoggingMiddleware
-from backend.app.middleware.security import SecurityHeadersMiddleware, RequestSanitizationMiddleware
-from backend.app.middleware.rate_limit import limiter, init_limiter, rate_limit_handler
+from app.config import get_settings
+from app.routers import notes, search, graph, oauth, canvas, distill, priority
+from app.routers.conversation_import import router as import_router
+from app.routers import mcp_write
+from app.routers import zettelkasten
+from app.mcp.server import setup_mcp
+from app.services.knowledge_store import KnowledgeStore
+from app.services.vector_search import VectorSearchService
+from app.services.graph_index import GraphIndexService
+from app.services.openrouter import OpenRouterService
+from app.services.canvas_store import CanvasSessionStore
+from app.services.priority_scoring import PriorityScoringService
+from app.services.priority_settings import PrioritySettingsService
+from app.services.distillation import DistillationService
+from app.services.link_discovery import LinkDiscoveryService
+from app.services.import_service import ImportService
+from app.middleware.logging import LoggingMiddleware
+from app.middleware.security import (
+    SecurityHeadersMiddleware,
+    RequestSanitizationMiddleware,
+)
+from app.middleware.rate_limit import limiter, init_limiter, rate_limit_handler
 from slowapi.errors import RateLimitExceeded
 
 # Get settings
@@ -37,6 +47,30 @@ async def lifespan(app: FastAPI):
     priority_settings = PrioritySettingsService()
     priority_scoring = PriorityScoringService(priority_settings.get_weights())
 
+    # Distillation service (initialized with other services)
+    distillation_service = DistillationService(
+        knowledge_store=knowledge_store,
+        vector_search=vector_search,
+        graph_index=graph_index,
+        openrouter_service=openrouter,
+    )
+
+    # Link discovery service for Zettelkasten
+    link_discovery = LinkDiscoveryService(
+        knowledge_store=knowledge_store,
+        vector_search=vector_search,
+        graph_index=graph_index,
+        openrouter_service=openrouter,
+    )
+
+    import_service = ImportService(
+        knowledge_store=knowledge_store,
+        vector_search=vector_search,
+        graph_index=graph_index,
+        distillation_service=distillation_service,
+        openrouter_service=openrouter,
+    )
+
     app.state.knowledge_store = knowledge_store
     app.state.vector_search = vector_search
     app.state.graph_index = graph_index
@@ -44,6 +78,9 @@ async def lifespan(app: FastAPI):
     app.state.canvas_store = canvas_store
     app.state.priority_settings = priority_settings
     app.state.priority_scoring = priority_scoring
+    app.state.distillation = distillation_service
+    app.state.link_discovery = link_discovery
+    app.state.import_service = import_service
 
     yield
 
@@ -58,7 +95,7 @@ app = FastAPI(
     version="0.1.0",
     docs_url="/docs",
     redoc_url="/redoc",
-    lifespan=lifespan
+    lifespan=lifespan,
 )
 
 # Security middleware (order matters - request sanitization first)
@@ -75,7 +112,7 @@ if settings.environment == "production":
         allow_credentials=False,  # Disable credentials in production
         allow_methods=["GET", "POST", "PUT", "DELETE"],
         allow_headers=["Content-Type", "Authorization"],
-        max_age=3600
+        max_age=3600,
     )
 else:
     # Development mode - more permissive
@@ -103,7 +140,7 @@ async def root():
         "vault_path": vault_path,
         "docs": "/docs",
         "mcp": "/sse",
-        "oauth": "/auth"
+        "oauth": "/auth",
     }
 
 
@@ -115,7 +152,7 @@ async def health_check(request: Request):
     return {
         "status": "healthy",
         "service": "seedream",
-        "environment": settings.environment
+        "environment": settings.environment,
     }
 
 
@@ -127,6 +164,9 @@ app.include_router(oauth.router, prefix="/api/oauth", tags=["oauth"])
 app.include_router(canvas.router, prefix="/api/canvas", tags=["canvas"])
 app.include_router(distill.router, prefix="/api/notes", tags=["distillation"])
 app.include_router(priority.router, prefix="/api/priority", tags=["priority"])
+app.include_router(import_router, prefix="/api/import", tags=["import"])
+app.include_router(mcp_write.router, prefix="/api", tags=["mcp-write"])
+app.include_router(zettelkasten.router, prefix="/api/zettel", tags=["zettelkasten"])
 
 # Setup MCP server
 setup_mcp(app)
@@ -134,9 +174,10 @@ setup_mcp(app)
 
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run(
-        "backend.app.main:app",
+        "app.main:app",
         host=settings.server_host,
         port=settings.server_port,
-        reload=settings.environment == "development"
+        reload=settings.environment == "development",
     )

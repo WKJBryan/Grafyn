@@ -5,8 +5,8 @@ from pathlib import Path
 from typing import Optional
 from pydantic import BaseModel, Field
 
-from backend.app.config import get_settings
-from backend.app.services.priority_scoring import PriorityWeights
+from app.config import get_settings
+from app.services.priority_scoring import PriorityWeights
 
 logger = logging.getLogger(__name__)
 settings = get_settings()

@@ -131,10 +131,13 @@
           :response="node.response"
           :is-streaming="streamingModels.has(node.modelId)"
           :selected="selectedNodes.includes(`llm:${node.tileId}:${node.modelId}`)"
+          :available-models="availableModels"
           @drag="handleLLMDrag"
           @branch="handleLLMBranch"
           @select="handleNodeSelect"
           @delete="handleDeleteLLMNode"
+          @regenerate="handleRegenerate"
+          @show-add-model-dialog="handleShowAddModelDialog"
         />
 
         <!-- Debate Nodes -->
@@ -209,6 +212,15 @@
       @cancel="closeBranchDialog"
     />
 
+    <!-- Add Model Dialog -->
+    <AddModelDialog
+      v-if="showAddModelDialog"
+      :models="availableModels"
+      :existing-model-ids="addModelContext?.existingModelIds || []"
+      @submit="handleAddModelDialogSubmit"
+      @cancel="handleAddModelDialogCancel"
+    />
+
     <!-- Loading Overlay -->
     <div class="loading-overlay" v-if="loading">
       <div class="spinner"></div>
@@ -240,6 +252,7 @@ import PromptNode from './PromptNode.vue'
 import LLMNode from './LLMNode.vue'
 import DebateNode from './DebateNode.vue'
 import PromptDialog from './PromptDialog.vue'
+import AddModelDialog from './AddModelDialog.vue'
 
 const props = defineProps({
   sessionId: {
@@ -264,6 +277,8 @@ const saving = ref(false)
 const saveMessage = ref(null)
 const branchContext = ref(null)  // { parentTileId, parentModelId, parentContent }
 const expandedDebates = ref([])  // IDs of expanded debate nodes
+const showAddModelDialog = ref(false)
+const addModelContext = ref(null)  // { tileId, existingModelIds }
 const showArrangeMenu = ref(false)
 const layoutAlgorithm = ref('hierarchical')  // 'hierarchical', 'force-directed', 'circular'
 const arranging = ref(false)  // Loading state during arrangement
@@ -610,6 +625,50 @@ async function handleDeleteLLMNode(info) {
   selectedNodes.value = selectedNodes.value.filter(id => id !== nodeId)
 }
 
+// Handle regenerate response
+async function handleRegenerate({ tileId, modelId }) {
+  try {
+    await canvasStore.regenerateResponse(tileId, modelId)
+  } catch (err) {
+    console.error('Failed to regenerate response:', err)
+  }
+}
+
+// Handle showing the add model dialog
+function handleShowAddModelDialog({ tileId, modelId }) {
+  // Find the tile and get all existing model IDs
+  const tile = promptTiles.value.find(t => t.id === tileId)
+  if (!tile) return
+
+  const existingModelIds = Object.keys(tile.responses || {})
+
+  addModelContext.value = {
+    tileId,
+    existingModelIds
+  }
+  showAddModelDialog.value = true
+}
+
+// Handle add model dialog submit
+async function handleAddModelDialogSubmit(newModelIds) {
+  if (!addModelContext.value || newModelIds.length === 0) return
+
+  try {
+    await canvasStore.addModelToTile(addModelContext.value.tileId, newModelIds)
+  } catch (err) {
+    console.error('Failed to add models to tile:', err)
+  } finally {
+    showAddModelDialog.value = false
+    addModelContext.value = null
+  }
+}
+
+// Handle add model dialog cancel
+function handleAddModelDialogCancel() {
+  showAddModelDialog.value = false
+  addModelContext.value = null
+}
+
 async function handleDeleteDebate(debateId) {
   if (!confirm('Delete this debate? This action cannot be undone.')) {
     return
@@ -677,7 +736,7 @@ async function handlePromptSubmit({ prompt, models, systemPrompt, temperature, m
 }
 
 // Handle branch from LLM node
-function handleLLMBranch(tileId, modelId, prompt, contextMode = 'full_history') {
+function handleLLMBranch(tileId, modelId, prompt, contextMode = 'full_history', selectedModels = null) {
   // Get parent context
   const parentInfo = canvasStore.getParentResponseContent(tileId, modelId)
   branchContext.value = {
@@ -688,9 +747,11 @@ function handleLLMBranch(tileId, modelId, prompt, contextMode = 'full_history') 
   
   // If prompt is provided directly (inline branch), submit immediately
   if (prompt) {
+    // Use selected models if provided, otherwise fall back to parent model
+    const models = selectedModels && selectedModels.length > 0 ? selectedModels : [modelId]
     handlePromptSubmit({
       prompt,
-      models: [modelId],  // Default to same model
+      models,
       systemPrompt: null,
       temperature: 0.7,
       maxTokens: 2048,

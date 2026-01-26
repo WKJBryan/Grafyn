@@ -3,7 +3,7 @@ import re
 from typing import List, Dict, Set, Optional
 from collections import deque
 
-from backend.app.services.knowledge_store import KnowledgeStore
+from app.services.knowledge_store import KnowledgeStore
 
 
 class GraphIndexService:
@@ -221,23 +221,61 @@ class GraphIndexService:
             self._incoming[linked_id].add(note_id)
 
     def get_full_graph(self) -> Dict:
-        """Get the complete graph structure (nodes and edges)"""
+        """Get the complete graph structure (nodes and edges) with hub-based coloring"""
         nodes = []
         edges = []
+        
+        # Color palette for hubs
+        hub_colors = ['#8b5cf6', '#06b6d4', '#10b981', '#f59e0b', '#ef4444', '#ec4899', '#6366f1', '#14b8a6']
         
         # Get all involved notes (both source and target)
         all_ids = set(self._outgoing.keys())
         for targets in self._outgoing.values():
             all_ids.update(targets)
+        
+        # First pass: identify all hub notes and assign colors
+        hub_to_color: Dict[str, str] = {}
+        hub_index = 0
+        for note_id in all_ids:
+            note = self._knowledge_store.get_note(note_id)
+            if note and note.frontmatter.note_type.value == "hub":
+                hub_to_color[note_id] = hub_colors[hub_index % len(hub_colors)]
+                hub_index += 1
+        
+        # Second pass: assign colors to non-hub notes based on hub linkage
+        note_to_group: Dict[str, str] = {}
+        for hub_id, color in hub_to_color.items():
+            # Notes that the hub links TO inherit the hub's color
+            for target_id in self._outgoing.get(hub_id, set()):
+                if target_id not in hub_to_color:  # Don't override other hubs
+                    note_to_group[target_id] = color
+            # Notes that link TO the hub also get the color
+            for source_id in self._incoming.get(hub_id, set()):
+                if source_id not in hub_to_color:
+                    note_to_group[source_id] = color
             
-        # Create node list
+        # Create node list with extended metadata
         for note_id in all_ids:
             note = self._knowledge_store.get_note(note_id)
             title = note.title if note else note_id
+            note_type = note.frontmatter.note_type.value if note else "general"
+            tags = note.frontmatter.tags if note else []
+            
+            # Determine group color
+            if note_id in hub_to_color:
+                group_color = hub_to_color[note_id]
+            elif note_id in note_to_group:
+                group_color = note_to_group[note_id]
+            else:
+                group_color = "#6b7280"  # Gray for orphans/unlinked
+            
             nodes.append({
                 "id": note_id,
                 "label": title,
-                "val": len(self._incoming.get(note_id, set())) + 1  # Size based on backlinks
+                "val": len(self._incoming.get(note_id, set())) + 1,  # Size based on backlinks
+                "note_type": note_type,
+                "tags": tags,
+                "group": group_color
             })
             
         # Create edge list

@@ -164,6 +164,10 @@ class NoteListItem(BaseModel):
     modified: Optional[datetime] = None
     link_count: int = 0
     note_type: NoteType = NoteType.GENERAL
+    # Additional fields for sidebar nesting
+    outgoing_links: List[str] = Field(default_factory=list)
+    source: Optional[str] = None
+    container_of: List[str] = Field(default_factory=list)
 
 
 class SearchResult(BaseModel):

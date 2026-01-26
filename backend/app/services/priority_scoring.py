@@ -5,7 +5,7 @@ from datetime import datetime, timezone, timedelta
 from enum import Enum
 from pydantic import BaseModel, Field
 
-from backend.app.config import get_settings
+from app.config import get_settings
 
 logger = logging.getLogger(__name__)
 settings = get_settings()

@@ -1,8 +1,72 @@
 """Pydantic models for distillation workflow"""
 from pydantic import BaseModel, Field
-from typing import List, Optional
+from typing import List, Optional, TYPE_CHECKING
 from enum import Enum
 
+if TYPE_CHECKING:
+    pass  # Avoid circular import
+
+
+# ============================================================================
+# ZETTELKASTEN MODELS
+# ============================================================================
+
+class ZettelType(str, Enum):
+    """Zettelkasten note types following atomic principles"""
+    CONCEPT = "concept"      # Definitions, explanations of ideas
+    CLAIM = "claim"          # Assertions, hypotheses needing evidence
+    EVIDENCE = "evidence"    # Data, research, examples supporting claims
+    QUESTION = "question"    # Inquiries driving exploration
+    FLECHE = "fleche"        # Structure/argument chain notes (connecting ideas)
+    FLEETING = "fleeting"    # Quick temporary captures
+
+
+class LinkMode(str, Enum):
+    """Link discovery modes for Zettelkasten"""
+    AUTOMATIC = "automatic"      # Create all links without review
+    SUGGESTED = "suggested"      # Suggest links for user approval
+    MANUAL = "manual"            # User triggers on-demand
+
+
+class LinkType(str, Enum):
+    """Types of relationships between Zettelkasten notes"""
+    RELATED = "related"          # General conceptual relationship
+    SUPPORTS = "supports"        # Evidence supports claim
+    CONTRADICTS = "contradicts"  # Notes contradict each other
+    EXPANDS = "expands"          # One note expands on another
+    QUESTIONS = "questions"      # Note questions another
+    ANSWERS = "answers"          # Note answers another
+    EXAMPLE = "example"          # Note is example of concept
+    PART_OF = "part_of"         # Part-whole relationship
+
+
+class ZettelLinkCandidate(BaseModel):
+    """A candidate link between notes for Zettelkasten"""
+    target_id: str = ""  # Will be resolved when creating links
+    target_title: str
+    link_type: LinkType = LinkType.RELATED
+    confidence: float = Field(default=0.5, ge=0.0, le=1.0)
+    reason: str = ""  # Why this link is suggested
+
+
+class ZettelNoteCandidate(BaseModel):
+    """Enhanced atomic note candidate with Zettelkasten metadata"""
+    id: str
+    title: str
+    zettel_type: ZettelType = ZettelType.CONCEPT
+    content: str = ""  # Full note content with proper structure
+    summary: List[str] = Field(default_factory=list)
+    key_claims: List[str] = Field(default_factory=list)
+    open_questions: List[str] = Field(default_factory=list)
+    recommended_tags: List[str] = Field(default_factory=list)
+    confidence: float = Field(default=0.5, ge=0.0, le=1.0)
+    suggested_links: List[ZettelLinkCandidate] = Field(default_factory=list)
+    source_section: Optional[str] = None
+
+
+# ============================================================================
+# ORIGINAL DISTILLATION MODELS
+# ============================================================================
 
 class DistillMode(str, Enum):
     """Mode for distillation operation"""

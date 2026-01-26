@@ -1,12 +1,12 @@
 """Notes API router for CRUD operations"""
 from fastapi import APIRouter, HTTPException, Request
 from typing import List, Optional
-from backend.app.models.note import (
+from app.models.note import (
     Note, NoteCreate, NoteUpdate, NoteListItem, TypedProperty, PropertyType
 )
-from backend.app.services.knowledge_store import KnowledgeStore
-from backend.app.services.vector_search import VectorSearchService
-from backend.app.services.graph_index import GraphIndexService
+from app.services.knowledge_store import KnowledgeStore
+from app.services.vector_search import VectorSearchService
+from app.services.graph_index import GraphIndexService
 
 router = APIRouter()
 
@@ -157,7 +157,7 @@ async def set_property(
     note.frontmatter.set_property(property_name, property_data)
     
     # Update the note in storage
-    from backend.app.models.note import NoteUpdate
+    from app.models.note import NoteUpdate
     update_data = NoteUpdate(properties=note.frontmatter.properties)
     updated_note = knowledge_store.update_note(note_id, update_data)
     
@@ -180,7 +180,7 @@ async def delete_property(note_id: str, property_name: str, request: Request):
         raise HTTPException(status_code=404, detail="Property not found")
     
     # Update the note in storage
-    from backend.app.models.note import NoteUpdate
+    from app.models.note import NoteUpdate
     update_data = NoteUpdate(properties=note.frontmatter.properties)
     updated_note = knowledge_store.update_note(note_id, update_data)
     

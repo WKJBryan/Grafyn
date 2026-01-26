@@ -1,9 +1,9 @@
 """Graph API router for knowledge graph operations"""
 from fastapi import APIRouter, HTTPException, Query, Request
 from typing import List, Dict
-from backend.app.models.note import BacklinkInfo
-from backend.app.services.graph_index import GraphIndexService
-from backend.app.services.knowledge_store import KnowledgeStore
+from app.models.note import BacklinkInfo
+from app.services.graph_index import GraphIndexService
+from app.services.knowledge_store import KnowledgeStore
 
 router = APIRouter()
 

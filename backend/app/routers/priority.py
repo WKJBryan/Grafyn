@@ -2,8 +2,8 @@
 from fastapi import APIRouter, Request, HTTPException
 from typing import Dict, Any
 
-from backend.app.services.priority_scoring import PriorityWeights, ContentType
-from backend.app.services.priority_settings import PrioritySettingsService
+from app.services.priority_scoring import PriorityWeights, ContentType
+from app.services.priority_settings import PrioritySettingsService
 
 router = APIRouter()
 

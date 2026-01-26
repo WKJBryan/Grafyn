@@ -1,5 +1,5 @@
 """Pydantic models for Seedream"""
-from backend.app.models.note import (
+from app.models.note import (
     Note,
     NoteCreate,
     NoteUpdate,

@@ -6,7 +6,7 @@ from typing import List, Optional, Dict
 from datetime import datetime, timezone
 import uuid
 
-from backend.app.models.canvas import (
+from app.models.canvas import (
     CanvasSession,
     CanvasSessionListItem,
     CanvasCreate,
@@ -22,7 +22,7 @@ from backend.app.models.canvas import (
     NodeEdge,
     EdgeType,
 )
-from backend.app.config import get_settings
+from app.config import get_settings
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -229,6 +229,78 @@ class CanvasSessionStore:
         logger.info(f"Added prompt tile {tile_id} to session {session_id}" + 
                     (f" (branching from {parent_tile_id})" if parent_tile_id else ""))
         return tile
+
+    def add_models_to_tile(
+        self,
+        session_id: str,
+        tile_id: str,
+        new_model_ids: List[str],
+    ) -> bool:
+        """Add new model responses to an existing tile (same prompt, new models)"""
+        session = self._sessions.get(session_id)
+        if not session:
+            return False
+
+        # Find the tile
+        tile = None
+        for t in session.prompt_tiles:
+            if t.id == tile_id:
+                tile = t
+                break
+
+        if not tile:
+            return False
+
+        # Per-model color palette
+        MODEL_COLORS = [
+            "#7c5cff",  # Violet
+            "#22d3ee",  # Cyan
+            "#f59e0b",  # Amber
+            "#10b981",  # Emerald
+            "#f43f5e",  # Rose
+            "#8b5cf6",  # Purple
+            "#06b6d4",  # Teal
+            "#ec4899",  # Pink
+            "#84cc16",  # Lime
+            "#3b82f6",  # Blue
+        ]
+
+        # Get existing response count for positioning
+        existing_count = len(tile.responses)
+
+        for idx, model_id in enumerate(new_model_ids):
+            if model_id in tile.responses:
+                # Skip if model already exists in this tile
+                continue
+
+            response_id = str(uuid.uuid4())
+            model_name = model_id.split("/")[-1] if "/" in model_id else model_id
+            
+            # Position new LLM nodes below existing ones
+            llm_x = tile.position.x + tile.position.width + 80
+            llm_y = tile.position.y + ((existing_count + idx) * 220)
+            
+            # Assign color (continue from where existing models left off)
+            color = MODEL_COLORS[(existing_count + idx) % len(MODEL_COLORS)]
+            
+            tile.responses[model_id] = ModelResponse(
+                id=response_id,
+                model_id=model_id,
+                model_name=model_name,
+                status="pending",
+                position=TilePosition(x=llm_x, y=llm_y, width=280, height=200),
+                color=color,
+            )
+
+            # Add to tile's model list
+            if model_id not in tile.models:
+                tile.models.append(model_id)
+
+        session.updated_at = datetime.now(timezone.utc)
+        # Don't save here - let the streaming complete and call save_session
+        
+        logger.info(f"Added {len(new_model_ids)} new models to tile {tile_id}")
+        return True
 
     def delete_tile(self, session_id: str, tile_id: str) -> bool:
         """Delete a tile (prompt or debate) from a session"""
@@ -645,7 +717,7 @@ class CanvasSessionStore:
         # Apply priority scoring if available
         if priority_scoring:
             # Extract tags from prompt for relevance matching
-            from backend.app.services.vector_search import ParsedQuery
+            from app.services.vector_search import ParsedQuery
             parsed = vector_search.parse_search_query(prompt)
             query_tags = parsed.tags
             

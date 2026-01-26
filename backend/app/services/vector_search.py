@@ -5,8 +5,8 @@ from typing import List, Optional, Dict, Any
 from pydantic import BaseModel
 import pyarrow as pa
 
-from backend.app.services.embedding import EmbeddingService
-from backend.app.config import get_settings
+from app.services.embedding import EmbeddingService
+from app.config import get_settings
 
 settings = get_settings()
 

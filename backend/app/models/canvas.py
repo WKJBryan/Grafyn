@@ -12,7 +12,8 @@ class DebateMode(str, Enum):
 
 
 class ContextMode(str, Enum):
-    """Context mode for branched prompts"""
+    """Context mode for prompts"""
+    NONE = "none"  # No additional context
     FULL_HISTORY = "full_history"  # Walk parent chain, include all turns
     COMPACT = "compact"  # Recent turns verbatim + summary of older context
     SEMANTIC = "semantic"  # RAG-style search across notes and tiles
@@ -139,8 +140,8 @@ class PromptRequest(BaseModel):
     # Branching support
     parent_tile_id: Optional[str] = None
     parent_model_id: Optional[str] = None
-    # Context mode for conversation history
-    context_mode: ContextMode = Field(default=ContextMode.FULL_HISTORY)
+    # Context mode for conversation history (default to semantic for note lookup)
+    context_mode: ContextMode = Field(default=ContextMode.SEMANTIC)
 
 
 class DebateStartRequest(BaseModel):
@@ -155,6 +156,11 @@ class DebateStartRequest(BaseModel):
 class DebateContinueRequest(BaseModel):
     """Request to continue a debate with custom prompt"""
     prompt: str = Field(..., min_length=1)
+
+
+class AddModelsRequest(BaseModel):
+    """Request to add new models to an existing tile"""
+    model_ids: List[str] = Field(..., min_length=1)
 
 
 class ModelInfo(BaseModel):

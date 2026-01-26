@@ -2,7 +2,7 @@
 from typing import Optional
 from pydantic import BaseModel, Field
 
-from backend.app.models.distillation import (
+from app.models.distillation import (
     DistillMode,
     HubPolicy,
     CandidateAction,

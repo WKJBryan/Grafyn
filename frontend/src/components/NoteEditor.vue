@@ -91,7 +91,7 @@ const props = defineProps({
 const emit = defineEmits(['save', 'delete', 'distill-success', 'close'])
 
 const localNote = ref({ ...props.note })
-const mode = ref('edit')
+const mode = ref('preview')
 const isDirty = ref(false)
 const tagsInput = ref(props.note.tags ? props.note.tags.join(', ') : '')
 const isDistilling = ref(false)
@@ -177,7 +177,8 @@ function handleSave() {
     title: localNote.value.title,
     content: localNote.value.content,
     status: localNote.value.status,
-    tags: localNote.value.tags
+    tags: localNote.value.tags,
+    note_type: localNote.value.note_type
   })
   isDirty.value = false
 }
@@ -374,6 +375,85 @@ async function handleDistill() {
 
 .editor-preview :deep(a:hover) {
   text-decoration: underline;
+}
+
+/* Table styles */
+.editor-preview :deep(table) {
+  width: 100%;
+  border-collapse: collapse;
+  margin-bottom: var(--spacing-md);
+  overflow-x: auto;
+  display: block;
+}
+
+.editor-preview :deep(table thead) {
+  border-bottom: 2px solid var(--bg-tertiary);
+}
+
+.editor-preview :deep(table th) {
+  padding: var(--spacing-sm) var(--spacing-md);
+  text-align: left;
+  font-weight: 600;
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+  border-bottom: 1px solid var(--bg-tertiary);
+}
+
+.editor-preview :deep(table th[align="center"]) {
+  text-align: center;
+}
+
+.editor-preview :deep(table th[align="right"]) {
+  text-align: right;
+}
+
+.editor-preview :deep(table tbody tr) {
+  border-bottom: 1px solid var(--bg-tertiary);
+  transition: background var(--transition-fast);
+}
+
+.editor-preview :deep(table tbody tr:last-child) {
+  border-bottom: none;
+}
+
+.editor-preview :deep(table tbody tr:hover) {
+  background: var(--bg-hover);
+}
+
+.editor-preview :deep(table td) {
+  padding: var(--spacing-sm) var(--spacing-md);
+  color: var(--text-primary);
+  border-bottom: 1px solid var(--bg-tertiary);
+}
+
+.editor-preview :deep(table td[align="center"]) {
+  text-align: center;
+}
+
+.editor-preview :deep(table td[align="right"]) {
+  text-align: right;
+}
+
+.editor-preview :deep(table code) {
+  background: var(--bg-tertiary);
+  padding: 2px 6px;
+  border-radius: var(--radius-sm);
+  font-size: 0.9em;
+  color: var(--text-primary);
+}
+
+.editor-preview :deep(table pre) {
+  background: var(--bg-tertiary);
+  padding: var(--spacing-sm);
+  border-radius: var(--radius-sm);
+  margin: 0;
+  overflow-x: auto;
+}
+
+/* Responsive table container for mobile */
+.editor-preview :deep(.table-wrapper) {
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
 }
 
 .editor-footer {
