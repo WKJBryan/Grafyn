@@ -220,6 +220,28 @@ class GraphIndexService:
                 self._incoming[linked_id] = set()
             self._incoming[linked_id].add(note_id)
 
+    def get_unlinked_notes(self) -> List[dict]:
+        """Get all notes that have no incoming or outgoing links (orphan notes)"""
+        all_notes = self._knowledge_store.list_notes()
+        unlinked = []
+
+        for note in all_notes:
+            note_id = note.id
+            has_outgoing = bool(self._outgoing.get(note_id))
+            has_incoming = bool(self._incoming.get(note_id))
+
+            if not has_outgoing and not has_incoming:
+                full_note = self._knowledge_store.get_note(note_id)
+                if full_note:
+                    unlinked.append({
+                        'note_id': note_id,
+                        'title': full_note.title,
+                        'status': full_note.frontmatter.status.value if full_note.frontmatter.status else 'draft',
+                        'tags': full_note.frontmatter.tags or [],
+                    })
+
+        return unlinked
+
     def get_full_graph(self) -> Dict:
         """Get the complete graph structure (nodes and edges) with hub-based coloring"""
         nodes = []

@@ -247,11 +247,16 @@ The backend uses a **singleton service pattern** initialized at startup via `lif
 
 ```python
 # Services are attached to app.state and shared across all requests
-app.state.knowledge_store    # Markdown CRUD + wikilink parsing
+app.state.knowledge_store     # Markdown CRUD + wikilink parsing
 app.state.vector_search       # LanceDB semantic search
 app.state.graph_index         # Backlinks + graph traversal
 app.state.openrouter          # OpenRouter API client (Multi-LLM)
 app.state.canvas_store        # Canvas session storage
+app.state.priority_settings   # Priority weight configuration
+app.state.priority_scoring    # Search result ranking
+app.state.distillation        # Container → Atomic → Hub workflow
+app.state.link_discovery      # Zettelkasten link suggestions
+app.state.import_service      # LLM conversation import
 ```
 
 **Access pattern in routers:**
@@ -273,7 +278,11 @@ async def list_notes(request: Request):
 | `TokenStore` | `services/token_store.py` | No | OAuth token management (stateful per-instance) |
 | `OpenRouterService` | `services/openrouter.py` | Yes | OpenRouter API client with streaming support |
 | `CanvasSessionStore` | `services/canvas_store.py` | Yes | Canvas session persistence (JSON file storage) |
-| `DistillationService` | `services/distillation.py` | No | Container → Atomic → Hub knowledge workflow |
+| `DistillationService` | `services/distillation.py` | Yes | Container → Atomic → Hub knowledge workflow |
+| `ImportService` | `services/import_service.py` | Yes | LLM conversation import + quality assessment |
+| `LinkDiscoveryService` | `services/link_discovery.py` | Yes | Semantic + LLM-based link discovery |
+| `PriorityScoringService` | `services/priority_scoring.py` | Yes | Search result ranking with configurable weights |
+| `PrioritySettingsService` | `services/priority_settings.py` | Yes | Priority weight persistence (JSON) |
 
 ### Middleware Order (Applied Bottom-Up)
 
@@ -352,6 +361,44 @@ Container (evidence)  →  Atomic Notes (draft)  →  Hub (topic index)
 - Dedup only matches against `draft`/`canonical` notes (not evidence/hubs)
 - Provenance fields: `source`, `source_id`, `container_of` in YAML
 
+### Zettelkasten Link Discovery
+
+Automatically discover potential links between notes using semantic similarity and LLM analysis.
+
+**API Endpoints (`/api/zettel/`):**
+| Method | Endpoint | Purpose |
+|--------|----------|---------|
+| GET | `/suggestions/{note_id}` | Get link suggestions for a note |
+| POST | `/suggestions/{note_id}/accept` | Accept a suggestion and create link |
+| POST | `/suggestions/{note_id}/reject` | Reject a suggestion |
+| GET | `/orphans` | Find notes with no links |
+| GET | `/clusters` | Detect topic clusters |
+| POST | `/analyze` | Deep analysis of link opportunities |
+| GET | `/stats` | Link graph statistics |
+
+**Discovery Methods:**
+- **Semantic:** Find notes with similar embeddings (cosine similarity > threshold)
+- **LLM:** Use OpenRouter to analyze content and suggest meaningful connections
+- **Hybrid:** Combine semantic candidates with LLM ranking
+
+### Priority Scoring
+
+Configurable search result ranking that considers recency, content type, and tags.
+
+**API Endpoints (`/api/priority/`):**
+| Method | Endpoint | Purpose |
+|--------|----------|---------|
+| GET | `/weights` | Get current priority weights |
+| PUT | `/weights` | Update priority weights |
+| POST | `/weights/reset` | Reset to defaults |
+| GET | `/score/{note_id}` | Get priority score for a note |
+| POST | `/preview` | Preview scores with custom weights |
+
+**Scoring Factors:**
+- `recency_weight` - Boost recently modified notes
+- `content_type_weights` - Different weights for canonical, evidence, draft
+- `tag_boosts` - Specific tags can boost priority
+
 ### Vector Embeddings
 
 - **Model:** `all-MiniLM-L6-v2` (384 dimensions)
@@ -405,6 +452,44 @@ Container (evidence)  →  Atomic Notes (draft)  →  Hub (topic index)
 5. Add MCP server in ChatGPT: `https://your-ngrok-url.ngrok-free.dev/sse`
 
 **See also:** `CHATGPT_MCP_SETUP_GUIDE.md` for detailed setup instructions.
+
+### Conversation Import Workflow
+
+Import LLM conversations (ChatGPT, Claude, Grok, Gemini) into the knowledge base.
+
+**Import Flow:**
+```
+Upload File → Parse Conversations → Quality Assessment → Review → Import as Notes
+```
+
+**API Endpoints (`/api/import/`):**
+| Method | Endpoint | Purpose |
+|--------|----------|---------|
+| POST | `/upload` | Upload conversation file for parsing |
+| GET | `/jobs` | List all import jobs |
+| GET | `/jobs/{id}` | Get job status and parsed conversations |
+| POST | `/jobs/{id}/import` | Execute import with selected conversations |
+| DELETE | `/jobs/{id}` | Cancel/delete import job |
+| GET | `/jobs/{id}/preview/{conv_id}` | Preview converted markdown |
+| PUT | `/jobs/{id}/conversations/{conv_id}` | Update conversation settings |
+
+**Supported Formats:**
+- ChatGPT: JSON export from conversations.json
+- Claude: JSON export from claude.ai
+- Grok: JSON export from x.com
+- Gemini: JSON export from gemini.google.com
+
+**Parser System** (`services/parsers/`):
+Each parser implements `BaseParser` with methods:
+- `can_parse(data)` - Check if parser handles this format
+- `parse(data)` - Extract conversations from raw data
+- `to_markdown(conversation)` - Convert to note format
+
+**Quality Assessment:**
+- Token count per conversation
+- Message count and average length
+- Code block detection
+- Topic extraction via LLM
 
 ### Multi-LLM Canvas
 
@@ -494,12 +579,33 @@ app.include_router(example.router, prefix="/api/example", tags=["example"])
 ### Accessing Services in Custom Code
 
 ```python
-# Services are singletons attached to app.state
+# Option 1: Use shared dependency helpers (recommended)
+from app.utils import get_knowledge_store, get_vector_search, get_graph_index
+
+@router.get("/example")
+async def example(request: Request):
+    knowledge_store = get_knowledge_store(request)
+    vector_search = get_vector_search(request)
+    return knowledge_store.list_notes()
+
+# Option 2: Direct access via app.state
 def my_function(app: FastAPI):
     knowledge_store = app.state.knowledge_store
     vector_search = app.state.vector_search
     graph_index = app.state.graph_index
 ```
+
+**Available dependency helpers** in `app/utils/dependencies.py`:
+- `get_knowledge_store(request)` - Markdown CRUD
+- `get_vector_search(request)` - LanceDB semantic search
+- `get_graph_index(request)` - Backlinks/graph traversal
+- `get_openrouter(request)` - OpenRouter API client
+- `get_canvas_store(request)` - Canvas session storage
+- `get_priority_scoring(request)` - Search result ranking
+- `get_priority_settings(request)` - Priority config persistence
+- `get_distillation(request)` - Distillation workflow
+- `get_link_discovery(request)` - Zettelkasten link discovery
+- `get_import_service(request)` - Conversation import
 
 ### Frontend Component Data Flow
 
@@ -545,32 +651,52 @@ src-tauri/
 
 ```
 routers/
-  notes.py     - 6 endpoints (CRUD, list, reindex)
-  search.py    - 2 endpoints (query, similar)
-  graph.py     - 5 endpoints (backlinks, outgoing, neighbors, unlinked, rebuild)
-  oauth.py     - 2 endpoints (GitHub OAuth flow)
-  canvas.py    - 9 endpoints (sessions, prompts, debates, SSE streaming)
-  mcp_write.py - NEW: MCP write endpoints (create, update, find-or-create, properties)
+  notes.py              - 12 endpoints (CRUD, list, reindex, property endpoints)
+  search.py             - 2 endpoints (query, similar)
+  graph.py              - 6 endpoints (backlinks, outgoing, neighbors, unlinked, unlinked-mentions, rebuild)
+  oauth.py              - 4 endpoints (GitHub OAuth flow)
+  canvas.py             - 9 endpoints (sessions, prompts, debates, SSE streaming)
+  mcp_write.py          - MCP write endpoints (create, update, find-or-create, properties)
+  distill.py            - 2 endpoints (distill note, normalize tags)
+  priority.py           - 7 endpoints (priority scoring configuration)
+  conversation_import.py - 7 endpoints (LLM conversation import workflow)
+  zettelkasten.py       - 7 endpoints (link discovery for Zettelkasten method)
 
 services/
-  knowledge_store.py  - Markdown I/O, frontmatter parsing
-  vector_search.py    - LanceDB wrapper with NoteEmbedding schema
-  graph_index.py      - Adjacency lists (Dict[str, Set[str]])
-  embedding.py        - sentence-transformers SentenceTransformer wrapper
-  token_store.py      - In-memory OAuth token storage with TTL
-  openrouter.py       - OpenRouter API client with streaming
-  canvas_store.py     - Canvas session CRUD (JSON file storage)
-  distillation.py     - Container → Atomic → Hub workflow
+  knowledge_store.py    - Markdown I/O, frontmatter parsing
+  vector_search.py      - LanceDB wrapper with NoteEmbedding schema
+  graph_index.py        - Adjacency lists (Dict[str, Set[str]])
+  embedding.py          - sentence-transformers SentenceTransformer wrapper
+  token_store.py        - In-memory OAuth token storage with TTL
+  openrouter.py         - OpenRouter API client with streaming
+  canvas_store.py       - Canvas session CRUD (JSON file storage)
+  distillation.py       - Container → Atomic → Hub workflow (1,610 LOC)
+  import_service.py     - LLM conversation import + quality assessment (1,036 LOC)
+  link_discovery.py     - Semantic + LLM-based link discovery (523 LOC)
+  priority_scoring.py   - Search result ranking with configurable weights
+  priority_settings.py  - Priority weight persistence (JSON storage)
+
+services/parsers/       - LLM conversation parsers
+  __init__.py           - Parser factory with PARSERS registry
+  base_parser.py        - Abstract base parser interface
+  chatgpt_parser.py     - ChatGPT conversation format parser
+  claude_parser.py      - Claude conversation format parser
+  grok_parser.py        - Grok conversation format parser
+  gemini_parser.py      - Gemini conversation format parser
 
 models/
-  note.py      - Note, NoteCreate, NoteUpdate schemas
-  canvas.py    - CanvasSession, PromptTile, ModelResponse, DebateRound schemas
-  distillation.py - DistillRequest, AtomicNoteCandidate, HubUpdate schemas
+  note.py               - Note, NoteCreate, NoteUpdate, TypedProperty, ContentType, NoteType
+  canvas.py             - CanvasSession, PromptTile, ModelResponse, DebateRound schemas
+  distillation.py       - DistillRequest, AtomicNoteCandidate, HubUpdate schemas
+  import_models.py      - ImportJob, ConversationQuality, SummarizationSettings
 
 middleware/
   security.py   - SecurityHeadersMiddleware, RequestSanitizationMiddleware
   logging.py    - Request/response logging
   rate_limit.py - Slowapi limiter configuration
+
+utils/
+  dependencies.py       - Shared service accessor helpers (get_knowledge_store, etc.)
 
 mcp/
   server.py  - setup_mcp() function to mount MCP endpoint
@@ -583,16 +709,26 @@ mcp/
 views/
   HomeView.vue          - Main app (header, sidebar, editor, backlinks panel)
   CanvasView.vue        - Multi-LLM Canvas with session sidebar
+  ImportUpload.vue      - Drag-drop file upload for LLM conversations
+  ImportReview.vue      - Review parsed conversations before import
   LoginView.vue         - GitHub OAuth login page
   OAuthCallbackView.vue - OAuth code→token exchange
   NotFoundView.vue      - 404 page
 
 components/
-  SearchBar.vue      - Debounced semantic search dropdown
-  NoteList.vue       - Sidebar list with status badges
-  NoteEditor.vue     - Markdown editor with edit/preview toggle
-  BacklinksPanel.vue - Right panel showing incoming links
-  GraphView.vue      - Graph visualization (neighbors endpoint)
+  SearchBar.vue         - Debounced semantic search dropdown
+  NoteList.vue          - Sidebar list with status badges
+  NoteEditor.vue        - Markdown editor with edit/preview toggle
+  BacklinksPanel.vue    - Right panel showing incoming links
+  GraphView.vue         - Graph visualization (neighbors endpoint)
+  TreeNav.vue           - Hierarchical navigation with topics/canvas exports
+  TagTree.vue           - Tag-based filtering tree
+  TagTreeNode.vue       - Individual tag tree node component
+  GraphSettings.vue     - Graph filter/display/force configuration
+  TopicSelector.vue     - Modal for topic management
+  UnlinkedMentions.vue  - Detects mentions not yet linked
+  MiniGraph.vue         - Small neighbor graph widget
+  OnThisPage.vue        - Heading outline from note content
 
 components/canvas/
   CanvasContainer.vue   - Infinite canvas with D3 zoom/pan
@@ -602,11 +738,29 @@ components/canvas/
   PromptDialog.vue      - New prompt modal with settings
   DebateTile.vue        - Debate visualization with rounds
   DebateControls.vue    - Auto/mediated debate toggle
+  AddModelDialog.vue    - Add models to existing tile
+  ContextBudgetDisplay.vue - Token budget visualization
+  PromptNode.vue        - Mind-map prompt node
+  LLMNode.vue           - Mind-map LLM response node
+  DebateNode.vue        - Mind-map debate node
 
 stores/
   auth.js   - { user, token, isAuthenticated } + login/logout/checkAuth
   notes.js  - { notes[], selectedNote } + loadNotes/createNote/updateNote/deleteNote
   canvas.js - { sessions[], currentSession, availableModels } + SSE streaming
+  import.js - File upload, parsing state, import workflow
+  theme.js  - Light/dark theme toggle + localStorage persistence
+```
+
+**Frontend Routes:**
+```javascript
+/               - HomeView (main notes interface)
+/canvas         - CanvasView (canvas list)
+/canvas/:id     - CanvasView (specific session)
+/import         - ImportUpload (file upload)
+/import/review  - ImportReview (review before import)
+/login          - LoginView
+/oauth/callback - OAuthCallbackView
 ```
 
 ## Data Models
@@ -672,9 +826,8 @@ class ModelResponse(BaseModel):
 
 ## Testing
 
-No test framework is currently configured. When adding tests:
+See the [Testing section](#testing) above for backend test commands and coverage details.
 
-**Backend:** Use `pytest` with `pytest-asyncio` for async tests
 **Frontend:** Use Vitest (already compatible with Vite) or Jest
 
 ## Deployment Notes
