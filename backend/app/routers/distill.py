@@ -18,13 +18,8 @@ router = APIRouter()
 
 
 def get_distillation_service(request: Request) -> DistillationService:
-    """Get distillation service with dependencies from app state."""
-    return DistillationService(
-        knowledge_store=request.app.state.knowledge_store,
-        vector_search=request.app.state.vector_search,
-        graph_index=getattr(request.app.state, 'graph_index', None),
-        openrouter_service=getattr(request.app.state, 'openrouter', None)
-    )
+    """Get distillation service singleton from app state."""
+    return request.app.state.distillation
 
 
 @router.post("/{note_id}/distill", response_model=DistillResponse)

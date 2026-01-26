@@ -127,7 +127,7 @@ def graph_index(knowledge_store: KnowledgeStore) -> GraphIndexService:
 @pytest.fixture
 def token_store(temp_token_storage_path: Path) -> TokenStore:
     """Create a TokenStore instance with temporary storage"""
-    store = TokenStore(storage_dir=str(temp_token_storage_path))
+    store = TokenStore(storage_path=str(temp_token_storage_path))
     return store
 
 

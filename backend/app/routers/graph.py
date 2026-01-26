@@ -59,6 +59,17 @@ async def get_neighbors(
     return neighbors
 
 
+@router.get("/unlinked", response_model=List[dict])
+async def get_unlinked_notes(request: Request):
+    """
+    Get all notes that have no incoming or outgoing links (orphan notes)
+
+    Returns notes that are completely disconnected from the knowledge graph.
+    """
+    graph_index = get_graph_index(request)
+    return graph_index.get_unlinked_notes()
+
+
 @router.get("/unlinked-mentions/{note_id}", response_model=List[dict])
 async def find_unlinked_mentions(note_id: str, request: Request):
     """
