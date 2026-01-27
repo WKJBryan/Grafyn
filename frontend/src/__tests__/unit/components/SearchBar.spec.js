@@ -205,8 +205,8 @@ describe('SearchBar', () => {
   describe('Results Display', () => {
     it('displays search results', async () => {
       const mockResults = [
-        { id: 'note-1', title: 'Test Note 1', score: 0.95 },
-        { id: 'note-2', title: 'Test Note 2', score: 0.85 },
+        { note_id: 'note-1', title: 'Test Note 1', score: 0.95 },
+        { note_id: 'note-2', title: 'Test Note 2', score: 0.85 },
       ]
 
       vi.spyOn(apiClient.search, 'query').mockResolvedValue(mockResults)
@@ -224,7 +224,7 @@ describe('SearchBar', () => {
     })
 
     it('shows score bars for results', async () => {
-      const mockResults = [{ id: 'note-1', title: 'Test Note', score: 0.75 }]
+      const mockResults = [{ note_id: 'note-1', title: 'Test Note', score: 0.75 }]
 
       vi.spyOn(apiClient.search, 'query').mockResolvedValue(mockResults)
 
@@ -239,7 +239,7 @@ describe('SearchBar', () => {
     })
 
     it('does not show results when query is cleared', async () => {
-      const mockResults = [{ id: 'note-1', title: 'Test Note', score: 0.95 }]
+      const mockResults = [{ note_id: 'note-1', title: 'Test Note', score: 0.95 }]
 
       vi.spyOn(apiClient.search, 'query').mockResolvedValue(mockResults)
 
@@ -277,8 +277,8 @@ describe('SearchBar', () => {
   describe('Result Selection', () => {
     it('emits select event when result is clicked', async () => {
       const mockResults = [
-        { id: 'note-1', title: 'Test Note 1', score: 0.95 },
-        { id: 'note-2', title: 'Test Note 2', score: 0.85 },
+        { note_id: 'note-1', title: 'Test Note 1', score: 0.95 },
+        { note_id: 'note-2', title: 'Test Note 2', score: 0.85 },
       ]
 
       vi.spyOn(apiClient.search, 'query').mockResolvedValue(mockResults)
@@ -297,7 +297,7 @@ describe('SearchBar', () => {
     })
 
     it('clears input and results after selection', async () => {
-      const mockResults = [{ id: 'note-1', title: 'Test Note', score: 0.95 }]
+      const mockResults = [{ note_id: 'note-1', title: 'Test Note', score: 0.95 }]
 
       vi.spyOn(apiClient.search, 'query').mockResolvedValue(mockResults)
 
@@ -321,8 +321,8 @@ describe('SearchBar', () => {
   describe('Keyboard Shortcuts', () => {
     it('selects first result on Enter key', async () => {
       const mockResults = [
-        { id: 'note-1', title: 'First Note', score: 0.95 },
-        { id: 'note-2', title: 'Second Note', score: 0.85 },
+        { note_id: 'note-1', title: 'First Note', score: 0.95 },
+        { note_id: 'note-2', title: 'Second Note', score: 0.85 },
       ]
 
       vi.spyOn(apiClient.search, 'query').mockResolvedValue(mockResults)
@@ -354,7 +354,7 @@ describe('SearchBar', () => {
     })
 
     it('clears query and results on Escape key', async () => {
-      const mockResults = [{ id: 'note-1', title: 'Test Note', score: 0.95 }]
+      const mockResults = [{ note_id: 'note-1', title: 'Test Note', score: 0.95 }]
 
       vi.spyOn(apiClient.search, 'query').mockResolvedValue(mockResults)
 
@@ -390,7 +390,7 @@ describe('SearchBar', () => {
     })
 
     it('clears results when clear button is clicked', async () => {
-      const mockResults = [{ id: 'note-1', title: 'Test Note', score: 0.95 }]
+      const mockResults = [{ note_id: 'note-1', title: 'Test Note', score: 0.95 }]
 
       vi.spyOn(apiClient.search, 'query').mockResolvedValue(mockResults)
 
@@ -425,7 +425,7 @@ describe('SearchBar', () => {
 
   describe('Click Outside Behavior', () => {
     it('hides results when clicking outside', async () => {
-      const mockResults = [{ id: 'note-1', title: 'Test Note', score: 0.95 }]
+      const mockResults = [{ note_id: 'note-1', title: 'Test Note', score: 0.95 }]
 
       vi.spyOn(apiClient.search, 'query').mockResolvedValue(mockResults)
 
@@ -447,7 +447,7 @@ describe('SearchBar', () => {
     })
 
     it('keeps results visible when clicking inside search bar', async () => {
-      const mockResults = [{ id: 'note-1', title: 'Test Note', score: 0.95 }]
+      const mockResults = [{ note_id: 'note-1', title: 'Test Note', score: 0.95 }]
 
       vi.spyOn(apiClient.search, 'query').mockResolvedValue(mockResults)
 

@@ -1,6 +1,13 @@
 <template>
   <div class="note-editor">
     <div class="editor-header">
+      <input
+        v-model="localNote.title"
+        type="text"
+        class="title-input"
+        placeholder="Note title..."
+        @input="handleDirty"
+      />
       <div class="editor-actions">
         <button
           v-if="canDistill"
@@ -91,7 +98,7 @@ const props = defineProps({
 const emit = defineEmits(['save', 'delete', 'distill-success', 'close'])
 
 const localNote = ref({ ...props.note })
-const mode = ref('preview')
+const mode = ref('edit')
 const isDirty = ref(false)
 const tagsInput = ref(props.note.tags ? props.note.tags.join(', ') : '')
 const isDistilling = ref(false)
@@ -232,10 +239,28 @@ async function handleDistill() {
 .editor-header {
   display: flex;
   align-items: center;
-  justify-content: flex-end;
+  justify-content: space-between;
   padding: var(--spacing-md);
   border-bottom: 1px solid var(--bg-tertiary);
   gap: var(--spacing-sm);
+}
+
+.title-input {
+  flex: 1;
+  background: transparent;
+  border: none;
+  color: var(--text-primary);
+  font-size: 1.25rem;
+  font-weight: 600;
+  padding: 0;
+}
+
+.title-input:focus {
+  outline: none;
+}
+
+.title-input::placeholder {
+  color: var(--text-muted);
 }
 
 .editor-actions {
