@@ -24,6 +24,9 @@
             <router-link to="/canvas" class="btn btn-secondary" title="Multi-LLM Canvas">
               Canvas
             </router-link>
+            <button class="btn btn-ghost" @click="showFeedbackModal = true" title="Send Feedback">
+              💬
+            </button>
             <button class="btn btn-ghost" @click="handleThemeToggle" title="Toggle Theme">
               {{ themeIcon }}
             </button>
@@ -118,6 +121,13 @@
       @create="handleTopicSelected"
       @close="showTopicSelector = false"
     />
+
+    <!-- Feedback Modal -->
+    <FeedbackModal
+      v-if="showFeedbackModal"
+      @close="showFeedbackModal = false"
+      @submitted="handleFeedbackSubmitted"
+    />
   </div>
 </template>
 
@@ -134,6 +144,7 @@ import MiniGraph from '../components/MiniGraph.vue'
 import OnThisPage from '../components/OnThisPage.vue'
 import GraphView from '../components/GraphView.vue'
 import TopicSelector from '../components/TopicSelector.vue'
+import FeedbackModal from '../components/FeedbackModal.vue'
 import { useThemeStore } from '../stores/theme'
 
 const notes = ref([])
@@ -143,6 +154,7 @@ const themeStore = useThemeStore()
 const selectedTags = ref([])
 const isDirty = ref(false)
 const showTopicSelector = ref(false)
+const showFeedbackModal = ref(false)
 
 // Computed property to get the current theme icon
 const themeIcon = computed(() => {
@@ -338,6 +350,11 @@ async function handleDeleteNote(id) {
 function handleCloseNote() {
   selectedNoteId.value = null
   selectedNote.value = null
+}
+
+function handleFeedbackSubmitted(response) {
+  console.log('Feedback submitted:', response)
+  // Modal will close itself after showing success message
 }
 </script>
 

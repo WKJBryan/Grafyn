@@ -39,6 +39,10 @@ class Settings(BaseSettings):
     import_dedup_threshold: float = 0.85
     import_check_dupes: bool = True
 
+    # Feedback Configuration (GitHub Issues)
+    github_feedback_repo: str = ""  # Format: owner/repo-name
+    github_feedback_token: str = ""  # PAT with issues:write scope
+
     # CORS Configuration
     cors_origins: Optional[str] = None
 

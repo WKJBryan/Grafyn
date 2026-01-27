@@ -199,6 +199,41 @@ export const canvas = {
   getNodeGroups: (sessionId) => api.get(`/canvas/${encodeURIComponent(sessionId)}/node-groups`),
 }
 
+// Feedback API
+export const feedback = {
+  submit: (data) =>
+    invokeOrHttp('submit_feedback', { feedback: data }, () => api.post('/feedback', data)),
+
+  status: () =>
+    invokeOrHttp('feedback_status', {}, () => api.get('/feedback/status')),
+
+  getSystemInfo: async (currentPage = null) => {
+    if (isTauri()) {
+      const invoke = await getTauriInvoke()
+      if (invoke) {
+        try {
+          return await invoke('get_system_info', { currentPage })
+        } catch (e) {
+          console.error('Failed to get system info from Tauri:', e)
+        }
+      }
+    }
+    // Fallback for web mode
+    return {
+      platform: navigator.platform || 'Unknown',
+      app_version: '1.0.0',
+      runtime: 'web-browser',
+      current_page: currentPage || window.location.pathname,
+    }
+  },
+
+  getPending: () =>
+    invokeOrHttp('get_pending_feedback', {}, () => api.get('/feedback/pending')),
+
+  retryPending: () =>
+    invokeOrHttp('retry_pending_feedback', {}, () => api.post('/feedback/retry')),
+}
+
 // Utility function to check if we're in Tauri environment
 export const isDesktopApp = isTauri
 
