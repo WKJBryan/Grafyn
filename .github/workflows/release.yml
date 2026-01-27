@@ -1,0 +1,310 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag (e.g., v1.0.0)'
+        required: false
+        default: 'dev'
+      create_release:
+        description: 'Create GitHub release'
+        required: false
+        default: 'false'
+        type: boolean
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ============================================================================
+  # Build Matrix - All Platforms & Architectures
+  # ============================================================================
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Windows
+          - platform: windows-latest
+            target: x86_64-pc-windows-msvc
+            arch: x64
+            os_name: windows
+          - platform: windows-latest
+            target: aarch64-pc-windows-msvc
+            arch: arm64
+            os_name: windows
+
+          # macOS
+          - platform: macos-latest
+            target: x86_64-apple-darwin
+            arch: x64
+            os_name: macos
+          - platform: macos-latest
+            target: aarch64-apple-darwin
+            arch: arm64
+            os_name: macos
+
+          # Linux
+          - platform: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            arch: x64
+            os_name: linux
+          # Note: Linux ARM64 requires cross-compilation or self-hosted runner
+          # Uncomment if you have ARM64 runners available:
+          # - platform: ubuntu-22.04
+          #   target: aarch64-unknown-linux-gnu
+          #   arch: arm64
+          #   os_name: linux
+
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ========================================
+      # Setup Node.js
+      # ========================================
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      # ========================================
+      # Setup Rust
+      # ========================================
+      - name: Setup Rust
+        uses: dtolnay/rust-action@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: 'frontend/src-tauri -> target'
+          key: ${{ matrix.target }}
+
+      # ========================================
+      # Install Linux Dependencies
+      # ========================================
+      - name: Install Linux dependencies
+        if: matrix.os_name == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-3-dev \
+            libwebkit2gtk-4.0-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf
+
+      # ========================================
+      # Install macOS Dependencies (for cross-compile)
+      # ========================================
+      - name: Install macOS cross-compile tools
+        if: matrix.os_name == 'macos' && matrix.arch == 'arm64'
+        run: |
+          # ARM64 builds on Intel Mac need no extra setup with recent Xcode
+          echo "Building for Apple Silicon on macOS"
+
+      # ========================================
+      # Install Frontend Dependencies
+      # ========================================
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      # ========================================
+      # Generate Icons (if missing)
+      # ========================================
+      - name: Generate app icons
+        working-directory: frontend
+        run: |
+          if [ ! -f "src-tauri/icons/icon.ico" ]; then
+            echo "Generating placeholder icons..."
+            node scripts/generate-icons.cjs
+          else
+            echo "Icons already exist"
+          fi
+        shell: bash
+
+      # ========================================
+      # Build Tauri App
+      # ========================================
+      - name: Build Tauri app
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
+          TAURI_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
+        with:
+          projectPath: frontend
+          args: --target ${{ matrix.target }}
+
+      # ========================================
+      # Upload Artifacts
+      # ========================================
+      - name: Upload Windows installers
+        if: matrix.os_name == 'windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-${{ matrix.arch }}
+          path: |
+            frontend/src-tauri/target/${{ matrix.target }}/release/bundle/msi/*.msi
+            frontend/src-tauri/target/${{ matrix.target }}/release/bundle/nsis/*.exe
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Upload macOS installers
+        if: matrix.os_name == 'macos'
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.arch }}
+          path: |
+            frontend/src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg
+            frontend/src-tauri/target/${{ matrix.target }}/release/bundle/macos/*.app
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Upload Linux installers
+        if: matrix.os_name == 'linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.arch }}
+          path: |
+            frontend/src-tauri/target/${{ matrix.target }}/release/bundle/deb/*.deb
+            frontend/src-tauri/target/${{ matrix.target }}/release/bundle/appimage/*.AppImage
+            frontend/src-tauri/target/${{ matrix.target }}/release/bundle/rpm/*.rpm
+          retention-days: 7
+          if-no-files-found: warn
+
+  # ============================================================================
+  # Create Release
+  # ============================================================================
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && github.event.inputs.create_release == 'true')
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Display artifact structure
+        run: find artifacts -type f | head -50
+
+      - name: Prepare release files
+        run: |
+          mkdir -p release-files
+
+          # Get version from tag or input
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            VERSION="${{ github.ref_name }}"
+          else
+            VERSION="${{ github.event.inputs.version }}"
+          fi
+
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+
+          # Copy and rename files with version
+          find artifacts -type f \( -name "*.msi" -o -name "*.exe" -o -name "*.dmg" -o -name "*.deb" -o -name "*.AppImage" -o -name "*.rpm" \) | while read file; do
+            # Get directory name for architecture info
+            dir=$(dirname "$file")
+            arch_dir=$(echo "$dir" | grep -oE "(windows|macos|linux)-(x64|arm64)" || echo "unknown")
+
+            # Get base filename
+            base=$(basename "$file")
+
+            # Copy with architecture prefix if identifiable
+            if [[ "$arch_dir" != "unknown" ]]; then
+              cp "$file" "release-files/${arch_dir}-${base}"
+            else
+              cp "$file" "release-files/${base}"
+            fi
+          done
+
+          ls -la release-files/
+
+      - name: Generate checksums
+        working-directory: release-files
+        run: |
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          name: Seedream ${{ env.VERSION }}
+          draft: true
+          prerelease: ${{ contains(env.VERSION, 'alpha') || contains(env.VERSION, 'beta') || contains(env.VERSION, 'rc') }}
+          generate_release_notes: true
+          files: |
+            release-files/*
+          body: |
+            ## Seedream ${{ env.VERSION }}
+
+            ### Downloads
+
+            | Platform | Architecture | Installer |
+            |----------|--------------|-----------|
+            | Windows | x64 | `windows-x64-*.msi` |
+            | Windows | ARM64 | `windows-arm64-*.msi` |
+            | macOS | Intel (x64) | `macos-x64-*.dmg` |
+            | macOS | Apple Silicon (ARM64) | `macos-arm64-*.dmg` |
+            | Linux | x64 | `linux-x64-*.deb` / `.AppImage` |
+
+            ### Verify Downloads
+
+            ```bash
+            # Verify checksum (replace filename)
+            sha256sum -c SHA256SUMS.txt
+            ```
+
+            ### What's Changed
+
+            See the auto-generated release notes below.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ============================================================================
+  # Summary
+  # ============================================================================
+  build-summary:
+    needs: build
+    runs-on: ubuntu-latest
+    if: always()
+
+    steps:
+      - name: Build Summary
+        run: |
+          echo "## Build Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Platform | Architecture | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|--------------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Windows | x64 | ${{ needs.build.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Windows | ARM64 | ${{ needs.build.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| macOS | x64 (Intel) | ${{ needs.build.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| macOS | ARM64 (Apple Silicon) | ${{ needs.build.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Linux | x64 | ${{ needs.build.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Artifacts" >> $GITHUB_STEP_SUMMARY
+          echo "Download artifacts from the Actions tab or the Release page." >> $GITHUB_STEP_SUMMARY
