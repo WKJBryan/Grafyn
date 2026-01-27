@@ -53,8 +53,8 @@ pub async fn delete_session(id: String, state: State<'_, AppState>) -> Result<()
 /// Get list of available LLM models
 #[tauri::command]
 pub async fn get_available_models(state: State<'_, AppState>) -> Result<Vec<AvailableModel>, String> {
-    state
-        .openrouter
+    let openrouter = state.openrouter.read().await;
+    openrouter
         .get_available_models()
         .await
         .map_err(|e| e.to_string())
@@ -121,10 +121,11 @@ pub async fn send_prompt(
         }
 
         // Send request
-        let result = state
-            .openrouter
+        let openrouter = state.openrouter.read().await;
+        let result = openrouter
             .chat(model_id, messages.clone(), request.system_prompt.as_deref())
             .await;
+        drop(openrouter); // Release lock before updating store
 
         // Update response
         if let Some(response) = tile.responses.get_mut(model_id) {
