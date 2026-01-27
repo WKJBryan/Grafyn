@@ -182,7 +182,7 @@
     <div class="canvas-floating-actions">
       <button
         class="btn btn-primary"
-        @click="showPromptDialog = true"
+        @click="handleNewPromptClick"
         :disabled="!session"
       >
         + New Prompt
@@ -221,6 +221,29 @@
       @cancel="handleAddModelDialogCancel"
     />
 
+    <!-- API Key Required Dialog -->
+    <div v-if="showApiKeyRequired" class="dialog-overlay" @click.self="showApiKeyRequired = false">
+      <div class="api-key-dialog">
+        <div class="dialog-header">
+          <h3>🔑 OpenRouter API Key Required</h3>
+          <button class="close-btn" @click="showApiKeyRequired = false">&#10005;</button>
+        </div>
+        <div class="dialog-body">
+          <p>To use the Multi-LLM Canvas, you need to configure your OpenRouter API key.</p>
+          <p class="hint">
+            OpenRouter provides access to 100+ AI models including GPT-4, Claude, Gemini, and more.
+            <a href="https://openrouter.ai/keys" target="_blank" rel="noopener">Get your API key →</a>
+          </p>
+        </div>
+        <div class="dialog-footer">
+          <button class="btn btn-secondary" @click="showApiKeyRequired = false">Cancel</button>
+          <button class="btn btn-primary" @click="openSettingsForApiKey">
+            Open Settings
+          </button>
+        </div>
+      </div>
+    </div>
+
     <!-- Loading Overlay -->
     <div class="loading-overlay" v-if="loading">
       <div class="spinner"></div>
@@ -248,6 +271,7 @@
 import { ref, computed, onMounted, onBeforeUnmount, watch } from 'vue'
 import * as d3 from 'd3'
 import { useCanvasStore } from '@/stores/canvas'
+import { settings as settingsApi, isDesktopApp } from '@/api/client'
 import PromptNode from './PromptNode.vue'
 import LLMNode from './LLMNode.vue'
 import DebateNode from './DebateNode.vue'
@@ -261,7 +285,7 @@ const props = defineProps({
   }
 })
 
-const emit = defineEmits(['session-loaded'])
+const emit = defineEmits(['session-loaded', 'open-settings'])
 
 const canvasStore = useCanvasStore()
 
@@ -283,7 +307,8 @@ const showArrangeMenu = ref(false)
 const layoutAlgorithm = ref('hierarchical')  // 'hierarchical', 'force-directed', 'circular'
 const arranging = ref(false)  // Loading state during arrangement
 const arrangeDropdown = ref(null)  // Ref for dropdown element
-
+const showApiKeyRequired = ref(false)  // Show API key required dialog
+const hasApiKey = ref(true)  // Assume true initially, check on mount
 
 // D3 zoom
 let zoom = null
@@ -515,12 +540,23 @@ watch(() => props.sessionId, async (newId) => {
 }, { immediate: true })
 
 // Lifecycle
-onMounted(() => {
+onMounted(async () => {
   initZoom()
   canvasStore.loadModels()
-  
+
   // Add click outside listener for dropdown
   document.addEventListener('click', handleClickOutside)
+
+  // Check if OpenRouter API key is configured (desktop only)
+  if (isDesktopApp()) {
+    try {
+      const status = await settingsApi.getOpenRouterStatus()
+      hasApiKey.value = status?.is_configured || false
+    } catch (e) {
+      console.error('Failed to check OpenRouter status:', e)
+      hasApiKey.value = false
+    }
+  }
 })
 
 onBeforeUnmount(() => {
@@ -707,6 +743,22 @@ function expandDebate(debateId) {
 
 function collapseDebate(debateId) {
   expandedDebates.value = expandedDebates.value.filter(id => id !== debateId)
+}
+
+// Handle "+ New Prompt" click - check API key first
+function handleNewPromptClick() {
+  if (!hasApiKey.value && isDesktopApp()) {
+    showApiKeyRequired.value = true
+    return
+  }
+  showPromptDialog.value = true
+}
+
+// Open settings to configure API key
+function openSettingsForApiKey() {
+  showApiKeyRequired.value = false
+  // Emit event to parent to open settings
+  emit('open-settings')
 }
 
 async function handlePromptSubmit({ prompt, models, systemPrompt, temperature, maxTokens, contextMode }) {
@@ -1486,5 +1538,65 @@ async function handleAutoArrange(algorithm = 'hierarchical') {
     opacity: 1;
     transform: translateX(0);
   }
+}
+
+/* API Key Required Dialog */
+.api-key-dialog {
+  background: var(--bg-secondary);
+  border: 1px solid var(--bg-tertiary);
+  border-radius: var(--radius-lg);
+  width: 90%;
+  max-width: 450px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+}
+
+.api-key-dialog .dialog-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--spacing-md) var(--spacing-lg);
+  border-bottom: 1px solid var(--bg-tertiary);
+}
+
+.api-key-dialog .dialog-header h3 {
+  margin: 0;
+  font-size: 1.125rem;
+  color: var(--text-primary);
+}
+
+.api-key-dialog .dialog-body {
+  padding: var(--spacing-lg);
+}
+
+.api-key-dialog .dialog-body p {
+  margin: 0 0 var(--spacing-md);
+  color: var(--text-secondary);
+  line-height: 1.5;
+}
+
+.api-key-dialog .dialog-body p:last-child {
+  margin-bottom: 0;
+}
+
+.api-key-dialog .hint {
+  font-size: 0.875rem;
+  color: var(--text-muted);
+}
+
+.api-key-dialog .hint a {
+  color: var(--accent-primary);
+  text-decoration: none;
+}
+
+.api-key-dialog .hint a:hover {
+  text-decoration: underline;
+}
+
+.api-key-dialog .dialog-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--spacing-sm);
+  padding: var(--spacing-md) var(--spacing-lg);
+  border-top: 1px solid var(--bg-tertiary);
 }
 </style>
