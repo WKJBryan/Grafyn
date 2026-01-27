@@ -78,8 +78,8 @@ describe('BacklinksPanel', () => {
 
     it('shows count badge when backlinks exist', async () => {
       const mockBacklinks = [
-        { id: 'note-1', title: 'Note 1', context: 'Context 1' },
-        { id: 'note-2', title: 'Note 2', context: 'Context 2' },
+        { note_id: 'note-1', title: 'Note 1', context: 'Context 1' },
+        { note_id: 'note-2', title: 'Note 2', context: 'Context 2' },
       ]
 
       vi.spyOn(apiClient.graph, 'backlinks').mockResolvedValue(mockBacklinks)
@@ -163,7 +163,7 @@ describe('BacklinksPanel', () => {
 
     it('does not show empty state when backlinks exist', async () => {
       const mockBacklinks = [
-        { id: 'note-1', title: 'Note 1', context: 'Context' },
+        { note_id: 'note-1', title: 'Note 1', context: 'Context' },
       ]
 
       vi.spyOn(apiClient.graph, 'backlinks').mockResolvedValue(mockBacklinks)
@@ -199,9 +199,9 @@ describe('BacklinksPanel', () => {
   describe('Backlinks Display', () => {
     it('renders all backlinks', async () => {
       const mockBacklinks = [
-        { id: 'note-1', title: 'First Note', context: 'Context 1' },
-        { id: 'note-2', title: 'Second Note', context: 'Context 2' },
-        { id: 'note-3', title: 'Third Note', context: 'Context 3' },
+        { note_id: 'note-1', title: 'First Note', context: 'Context 1' },
+        { note_id: 'note-2', title: 'Second Note', context: 'Context 2' },
+        { note_id: 'note-3', title: 'Third Note', context: 'Context 3' },
       ]
 
       vi.spyOn(apiClient.graph, 'backlinks').mockResolvedValue(mockBacklinks)
@@ -219,8 +219,8 @@ describe('BacklinksPanel', () => {
 
     it('displays backlink titles', async () => {
       const mockBacklinks = [
-        { id: 'note-1', title: 'First Note', context: 'Context 1' },
-        { id: 'note-2', title: 'Second Note', context: 'Context 2' },
+        { note_id: 'note-1', title: 'First Note', context: 'Context 1' },
+        { note_id: 'note-2', title: 'Second Note', context: 'Context 2' },
       ]
 
       vi.spyOn(apiClient.graph, 'backlinks').mockResolvedValue(mockBacklinks)
@@ -261,7 +261,7 @@ describe('BacklinksPanel', () => {
     })
 
     it('does not show context element when context is empty', async () => {
-      const mockBacklinks = [{ id: 'note-1', title: 'Note 1', context: '' }]
+      const mockBacklinks = [{ note_id: 'note-1', title: 'Note 1', context: '' }]
 
       vi.spyOn(apiClient.graph, 'backlinks').mockResolvedValue(mockBacklinks)
 
@@ -276,7 +276,7 @@ describe('BacklinksPanel', () => {
     })
 
     it('does not show context element when context is null', async () => {
-      const mockBacklinks = [{ id: 'note-1', title: 'Note 1', context: null }]
+      const mockBacklinks = [{ note_id: 'note-1', title: 'Note 1', context: null }]
 
       vi.spyOn(apiClient.graph, 'backlinks').mockResolvedValue(mockBacklinks)
 
@@ -298,8 +298,8 @@ describe('BacklinksPanel', () => {
   describe('Navigation', () => {
     it('emits navigate event when backlink is clicked', async () => {
       const mockBacklinks = [
-        { id: 'note-1', title: 'Note 1', context: 'Context 1' },
-        { id: 'note-2', title: 'Note 2', context: 'Context 2' },
+        { note_id: 'note-1', title: 'Note 1', context: 'Context 1' },
+        { note_id: 'note-2', title: 'Note 2', context: 'Context 2' },
       ]
 
       vi.spyOn(apiClient.graph, 'backlinks').mockResolvedValue(mockBacklinks)
@@ -320,9 +320,9 @@ describe('BacklinksPanel', () => {
 
     it('emits correct note ID for each backlink click', async () => {
       const mockBacklinks = [
-        { id: 'note-1', title: 'Note 1', context: 'Context 1' },
-        { id: 'note-2', title: 'Note 2', context: 'Context 2' },
-        { id: 'note-3', title: 'Note 3', context: 'Context 3' },
+        { note_id: 'note-1', title: 'Note 1', context: 'Context 1' },
+        { note_id: 'note-2', title: 'Note 2', context: 'Context 2' },
+        { note_id: 'note-3', title: 'Note 3', context: 'Context 3' },
       ]
 
       vi.spyOn(apiClient.graph, 'backlinks').mockResolvedValue(mockBacklinks)
@@ -445,7 +445,7 @@ describe('BacklinksPanel', () => {
       const mockBacklinks = vi.spyOn(apiClient.graph, 'backlinks')
 
       mockBacklinks.mockResolvedValueOnce([
-        { id: 'backlink-1', title: 'First Set', context: 'Context 1' },
+        { note_id: 'backlink-1', title: 'First Set', context: 'Context 1' },
       ])
 
       wrapper = mount(BacklinksPanel, {
@@ -459,8 +459,8 @@ describe('BacklinksPanel', () => {
       expect(wrapper.find('.backlink-title').text()).toBe('First Set')
 
       mockBacklinks.mockResolvedValueOnce([
-        { id: 'backlink-2', title: 'Second Set', context: 'Context 2' },
-        { id: 'backlink-3', title: 'Third Set', context: 'Context 3' },
+        { note_id: 'backlink-2', title: 'Second Set', context: 'Context 2' },
+        { note_id: 'backlink-3', title: 'Third Set', context: 'Context 3' },
       ])
 
       await wrapper.setProps({ noteId: 'note-2' })
@@ -510,7 +510,7 @@ describe('BacklinksPanel', () => {
     it('handles very long backlink titles', async () => {
       const longTitle = 'A'.repeat(200)
       const mockBacklinks = [
-        { id: 'note-1', title: longTitle, context: 'Context' },
+        { note_id: 'note-1', title: longTitle, context: 'Context' },
       ]
 
       vi.spyOn(apiClient.graph, 'backlinks').mockResolvedValue(mockBacklinks)
@@ -533,7 +533,7 @@ describe('BacklinksPanel', () => {
           10
         )
       const mockBacklinks = [
-        { id: 'note-1', title: 'Note', context: longContext },
+        { note_id: 'note-1', title: 'Note', context: longContext },
       ]
 
       vi.spyOn(apiClient.graph, 'backlinks').mockResolvedValue(mockBacklinks)
@@ -576,7 +576,7 @@ describe('BacklinksPanel', () => {
 
     it('handles large number of backlinks', async () => {
       const manyBacklinks = Array.from({ length: 100 }, (_, i) => ({
-        id: `note-${i}`,
+        note_id: `note-${i}`,
         title: `Note ${i}`,
         context: `Context ${i}`,
       }))
