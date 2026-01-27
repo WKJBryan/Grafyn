@@ -141,6 +141,8 @@ frontend/src-tauri/
 | `get_neighbors` | `noteId` | `Vec<GraphNeighbor>` | `GET /api/graph/neighbors/{id}` |
 | `list_sessions` | - | `Vec<SessionMeta>` | `GET /api/canvas` |
 | `send_prompt` | `sessionId, request` | `PromptTile` | `POST /api/canvas/{id}/prompt` |
+| `submit_feedback` | `feedback: FeedbackCreate` | `FeedbackResponse` | `POST /api/feedback` |
+| `feedback_status` | - | `FeedbackStatus` | `GET /api/feedback/status` |
 
 **Troubleshooting:**
 
@@ -257,6 +259,7 @@ app.state.priority_scoring    # Search result ranking
 app.state.distillation        # Container → Atomic → Hub workflow
 app.state.link_discovery      # Zettelkasten link suggestions
 app.state.import_service      # LLM conversation import
+app.state.feedback_service    # Bug reports & feature requests
 ```
 
 **Access pattern in routers:**
@@ -283,6 +286,7 @@ async def list_notes(request: Request):
 | `LinkDiscoveryService` | `services/link_discovery.py` | Yes | Semantic + LLM-based link discovery |
 | `PriorityScoringService` | `services/priority_scoring.py` | Yes | Search result ranking with configurable weights |
 | `PrioritySettingsService` | `services/priority_settings.py` | Yes | Priority weight persistence (JSON) |
+| `FeedbackService` | `services/feedback.py` | Yes | GitHub Issues integration for bug reports/feature requests |
 
 ### Middleware Order (Applied Bottom-Up)
 
@@ -526,6 +530,52 @@ User Prompt → CanvasStore (create tile) → OpenRouterService (parallel stream
 
 **Frontend Route:** `/canvas` and `/canvas/:id`
 
+### Feedback & Bug Reporting
+
+Users can submit bug reports, feature requests, and general feedback directly from the app. Submissions create GitHub Issues automatically.
+
+**Features:**
+- Unified feedback form with type selection (🐛 Bug / 💡 Feature / 💬 General)
+- Optional system info collection (platform, app version, runtime)
+- **Desktop:** Offline queue with automatic retry when back online
+- Rate limited (5 submissions/hour) to prevent abuse
+
+**API Endpoints (`/api/feedback/`):**
+| Method | Endpoint | Purpose |
+|--------|----------|---------|
+| POST | `/` | Submit feedback (creates GitHub issue) |
+| GET | `/status` | Check if service is configured |
+
+**Tauri IPC Commands:**
+| Command | Parameters | Returns |
+|---------|------------|---------|
+| `submit_feedback` | `feedback: FeedbackCreate` | `FeedbackResponse` |
+| `get_system_info` | `currentPage: Option<String>` | `SystemInfo` |
+| `feedback_status` | - | `FeedbackStatus` |
+| `get_pending_feedback` | - | `Vec<PendingFeedback>` |
+| `retry_pending_feedback` | - | `Vec<FeedbackResponse>` |
+
+**Configuration:**
+```bash
+# Environment variables (both Tauri and Python)
+GITHUB_FEEDBACK_REPO=owner/repo-name    # Target repository for issues
+GITHUB_FEEDBACK_TOKEN=ghp_xxxxx         # PAT with issues:write scope
+```
+
+**Frontend:** Click the 💬 button in the header to open the feedback modal.
+
+**Data Models:**
+```rust
+// Rust (Tauri)
+pub struct FeedbackCreate {
+    pub title: String,           // 5-200 chars
+    pub description: String,     // 10-10000 chars
+    pub feedback_type: FeedbackType,  // bug | feature | general
+    pub include_system_info: bool,
+    pub system_info: Option<SystemInfo>,
+}
+```
+
 ## Configuration
 
 ### Environment Setup
@@ -554,6 +604,8 @@ cp backend/.env.example .env
 | `OPENROUTER_API_KEY` | `""` | Required for Multi-LLM Canvas feature |
 | `APP_URL` | `http://localhost:8080` | Used in OpenRouter API headers |
 | `CANVAS_DATA_PATH` | `../data/canvas` | JSON storage for canvas sessions |
+| `GITHUB_FEEDBACK_REPO` | `""` | Target repo for feedback issues (format: `owner/repo`) |
+| `GITHUB_FEEDBACK_TOKEN` | `""` | GitHub PAT with `issues:write` scope |
 
 ## Common Patterns
 
@@ -606,6 +658,7 @@ def my_function(app: FastAPI):
 - `get_distillation(request)` - Distillation workflow
 - `get_link_discovery(request)` - Zettelkasten link discovery
 - `get_import_service(request)` - Conversation import
+- `get_feedback_service(request)` - Bug reports/feature requests
 
 ### Frontend Component Data Flow
 
@@ -633,18 +686,21 @@ src-tauri/
     │   ├── notes.rs     # list_notes, get_note, create_note, etc.
     │   ├── search.rs    # search_notes, find_similar, reindex
     │   ├── graph.rs     # get_backlinks, get_neighbors, rebuild_graph
-    │   └── canvas.rs    # list_sessions, send_prompt, etc.
+    │   ├── canvas.rs    # list_sessions, send_prompt, etc.
+    │   └── feedback.rs  # submit_feedback, feedback_status, etc.
     ├── services/        # Business logic (mirrors Python services)
     │   ├── mod.rs
     │   ├── knowledge_store.rs  # Markdown I/O, YAML frontmatter
     │   ├── search.rs           # Tantivy full-text search
     │   ├── graph_index.rs      # petgraph-based link graph
     │   ├── canvas_store.rs     # JSON session storage
-    │   └── openrouter.rs       # LLM API client
+    │   ├── openrouter.rs       # LLM API client
+    │   └── feedback.rs         # GitHub Issues integration + offline queue
     └── models/          # Data structures (serde)
         ├── mod.rs
         ├── note.rs      # Note, NoteCreate, NoteUpdate, SearchResult
-        └── canvas.rs    # CanvasSession, PromptTile, ModelResponse
+        ├── canvas.rs    # CanvasSession, PromptTile, ModelResponse
+        └── feedback.rs  # FeedbackCreate, FeedbackResponse, SystemInfo
 ```
 
 ### Python Backend (`backend/app/`)
@@ -661,6 +717,7 @@ routers/
   priority.py           - 7 endpoints (priority scoring configuration)
   conversation_import.py - 7 endpoints (LLM conversation import workflow)
   zettelkasten.py       - 7 endpoints (link discovery for Zettelkasten method)
+  feedback.py           - 2 endpoints (submit feedback, check status)
 
 services/
   knowledge_store.py    - Markdown I/O, frontmatter parsing
@@ -675,6 +732,7 @@ services/
   link_discovery.py     - Semantic + LLM-based link discovery (523 LOC)
   priority_scoring.py   - Search result ranking with configurable weights
   priority_settings.py  - Priority weight persistence (JSON storage)
+  feedback.py           - GitHub Issues integration for bug reports/feature requests
 
 services/parsers/       - LLM conversation parsers
   __init__.py           - Parser factory with PARSERS registry
@@ -689,6 +747,7 @@ models/
   canvas.py             - CanvasSession, PromptTile, ModelResponse, DebateRound schemas
   distillation.py       - DistillRequest, AtomicNoteCandidate, HubUpdate schemas
   import_models.py      - ImportJob, ConversationQuality, SummarizationSettings
+  feedback.py           - FeedbackCreate, FeedbackResponse, FeedbackStatus, SystemInfo
 
 middleware/
   security.py   - SecurityHeadersMiddleware, RequestSanitizationMiddleware
@@ -729,6 +788,7 @@ components/
   UnlinkedMentions.vue  - Detects mentions not yet linked
   MiniGraph.vue         - Small neighbor graph widget
   OnThisPage.vue        - Heading outline from note content
+  FeedbackModal.vue     - Bug report/feature request submission modal
 
 components/canvas/
   CanvasContainer.vue   - Infinite canvas with D3 zoom/pan
@@ -876,6 +936,8 @@ npm run tauri:build
 
 **Environment Variables:**
 - `OPENROUTER_API_KEY` - Required for Canvas LLM features
+- `GITHUB_FEEDBACK_REPO` - Target repo for feedback issues (format: `owner/repo`)
+- `GITHUB_FEEDBACK_TOKEN` - GitHub PAT with `issues:write` scope
 - `RUST_LOG=info` - Enable logging (debug, info, warn, error)
 
 **Code Signing (Optional):**

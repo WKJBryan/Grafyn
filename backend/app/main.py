@@ -6,7 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pathlib import Path
 
 from app.config import get_settings
-from app.routers import notes, search, graph, oauth, canvas, distill, priority
+from app.routers import notes, search, graph, oauth, canvas, distill, priority, feedback
 from app.routers.conversation_import import router as import_router
 from app.routers import mcp_write
 from app.routers import zettelkasten
@@ -21,6 +21,7 @@ from app.services.priority_settings import PrioritySettingsService
 from app.services.distillation import DistillationService
 from app.services.link_discovery import LinkDiscoveryService
 from app.services.import_service import ImportService
+from app.services.feedback import FeedbackService
 from app.middleware.logging import LoggingMiddleware
 from app.middleware.security import (
     SecurityHeadersMiddleware,
@@ -71,6 +72,9 @@ async def lifespan(app: FastAPI):
         openrouter_service=openrouter,
     )
 
+    # Feedback service for bug reports and feature requests
+    feedback_service = FeedbackService()
+
     app.state.knowledge_store = knowledge_store
     app.state.vector_search = vector_search
     app.state.graph_index = graph_index
@@ -81,11 +85,13 @@ async def lifespan(app: FastAPI):
     app.state.distillation = distillation_service
     app.state.link_discovery = link_discovery
     app.state.import_service = import_service
+    app.state.feedback_service = feedback_service
 
     yield
 
     # Shutdown
     await openrouter.close()
+    await feedback_service.close()
 
 
 # Create FastAPI application
@@ -167,6 +173,7 @@ app.include_router(priority.router, prefix="/api/priority", tags=["priority"])
 app.include_router(import_router, prefix="/api/import", tags=["import"])
 app.include_router(mcp_write.router, prefix="/api", tags=["mcp-write"])
 app.include_router(zettelkasten.router, prefix="/api/zettel", tags=["zettelkasten"])
+app.include_router(feedback.router, prefix="/api/feedback", tags=["feedback"])
 
 # Setup MCP server
 setup_mcp(app)

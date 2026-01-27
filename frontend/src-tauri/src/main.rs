@@ -7,6 +7,7 @@ mod services;
 
 use services::{
     canvas_store::CanvasStore,
+    feedback::FeedbackService,
     graph_index::GraphIndex,
     knowledge_store::KnowledgeStore,
     openrouter::OpenRouterService,
@@ -24,6 +25,7 @@ pub struct AppState {
     pub search_service: Arc<RwLock<SearchService>>,
     pub canvas_store: Arc<RwLock<CanvasStore>>,
     pub openrouter: Arc<OpenRouterService>,
+    pub feedback_service: Arc<RwLock<FeedbackService>>,
 }
 
 fn get_data_paths() -> (PathBuf, PathBuf) {
@@ -63,6 +65,9 @@ fn main() {
             let api_key = std::env::var("OPENROUTER_API_KEY").unwrap_or_default();
             let openrouter = OpenRouterService::new(api_key);
 
+            // Initialize feedback service for bug reports and feature requests
+            let feedback_service = FeedbackService::new(data_path.join("feedback"));
+
             // Build initial indices
             let mut ks = knowledge_store.clone();
             let notes = ks.list_notes().unwrap_or_default();
@@ -77,6 +82,7 @@ fn main() {
                 search_service: Arc::new(RwLock::new(search_service)),
                 canvas_store: Arc::new(RwLock::new(canvas_store)),
                 openrouter: Arc::new(openrouter),
+                feedback_service: Arc::new(RwLock::new(feedback_service)),
             };
 
             app.manage(state);
@@ -109,6 +115,13 @@ fn main() {
             commands::canvas::get_available_models,
             commands::canvas::send_prompt,
             commands::canvas::update_tile_position,
+            // Feedback commands
+            commands::feedback::submit_feedback,
+            commands::feedback::get_system_info,
+            commands::feedback::feedback_status,
+            commands::feedback::get_pending_feedback,
+            commands::feedback::retry_pending_feedback,
+            commands::feedback::clear_pending_feedback,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -1,59 +1,120 @@
 # Seedream
 
-A local knowledge graph platform with semantic search, Obsidian-style linking, and MCP (Model Context Protocol) integration.
+A local knowledge graph platform with semantic search, Obsidian-style linking, Multi-LLM Canvas, and MCP (Model Context Protocol) integration. Available as both a web app and a native desktop application.
 
 ## Features
 
-- **Obsidian-compatible notes**: Markdown files with YAML frontmatter and `[[wikilinks]]`
-- **Semantic search**: Vector-based search using sentence-transformers
-- **Backlinks**: Automatic bidirectional link tracking and discovery
-- **MCP Server**: Connects external AI models (Claude, ChatGPT) to knowledge base
-- **Web UI**: Vue 3 SPA accessible from any device
+### Core Knowledge Management
+- **Obsidian-compatible notes** - Markdown files with YAML frontmatter and `[[wikilinks]]`
+- **Semantic search** - Vector-based search using sentence-transformers (384-dim embeddings)
+- **Backlinks & graph** - Automatic bidirectional link tracking with force-directed visualization
+- **Note workflows** - Draft → Evidence → Canonical status progression
+- **Typed properties** - Custom metadata fields with type validation
+
+### Multi-LLM Canvas
+- **Compare AI models** - Send one prompt to multiple models simultaneously
+- **Real-time streaming** - SSE-based response streaming from 100+ models via OpenRouter
+- **Infinite canvas** - D3.js-powered zoom/pan interface with draggable tiles
+- **Debate mode** - Models critique and respond to each other
+- **Branching conversations** - Create conversation trees with context inheritance
+- **Export to notes** - Convert canvas sessions to knowledge base notes
+
+### AI Integration
+- **MCP Server** - Connect Claude, ChatGPT, and other AI models to your knowledge base
+- **MCP Write Operations** - AI models can create and update notes directly
+- **Conversation Import** - Import chat history from ChatGPT, Claude, Grok, and Gemini
+- **Distillation Workflow** - Transform container notes into atomic notes and topic hubs
+- **Link Discovery** - AI-powered suggestions for connecting related notes
+
+### Feedback & Bug Reporting
+- **In-app feedback** - Submit bug reports, feature requests, and general feedback
+- **GitHub Issues integration** - Submissions automatically create GitHub issues
+- **Offline support (Desktop)** - Feedback queued when offline, auto-retries on reconnect
+
+### Deployment Options
+| Mode | Backend | Use Case |
+|------|---------|----------|
+| **Web** | Python/FastAPI | Development, MCP integration, multi-user |
+| **Desktop** | Rust/Tauri | Single-user, portable, offline-capable |
 
 ## Tech Stack
 
-### Backend
-- **Framework**: FastAPI 0.104+
-- **Vector Database**: LanceDB
-- **Embeddings**: sentence-transformers (all-MiniLM-L6-v2)
-- **Authentication**: OAuth (GitHub)
-- **Python**: 3.11+
+### Backend (Python)
+- **Framework**: FastAPI 0.128+
+- **Vector Database**: LanceDB 0.26+
+- **Embeddings**: sentence-transformers 5.2+ (all-MiniLM-L6-v2)
+- **Multi-LLM API**: OpenRouter
+- **Authentication**: OAuth 2.0 (GitHub)
+- **Testing**: pytest (210+ tests)
 
-### Frontend
-- **Framework**: Vue 3.4+
+### Frontend (Vue 3)
+- **Framework**: Vue 3.4+ with Composition API
+- **State Management**: Pinia
 - **Build Tool**: Vite 5.0+
-- **HTTP Client**: Axios 1.6+
+- **Visualization**: D3.js v7+
 - **Markdown**: marked 11.0+
+
+### Desktop (Tauri)
+- **Framework**: Tauri 1.8
+- **Search Engine**: Tantivy 0.22
+- **Graph**: petgraph 0.6
+- **Async Runtime**: tokio 1.0
 
 ## Quick Start
 
 ### Prerequisites
 
-- Python 3.11 or higher
-- Node.js 18 or higher
-- Git
+- Python 3.11+ (for web backend)
+- Node.js 18+
+- Rust (for desktop app only)
 
-### Backend Setup
+### Web App Setup
 
 ```bash
+# Backend
 cd backend
 pip install -r requirements.txt
 cp .env.example .env
 # Edit .env with your configuration
-uvicorn app.main:app --reload
-```
+uvicorn app.main:app --reload --port 8080
 
-Backend will be available at `http://localhost:8080`
-
-### Frontend Setup
-
-```bash
+# Frontend (new terminal)
 cd frontend
 npm install
 npm run dev
 ```
 
-Frontend will be available at `http://localhost:5173`
+- Backend: http://localhost:8080
+- Frontend: http://localhost:5173
+
+### Desktop App Setup
+
+**Prerequisites:**
+- Windows: Visual Studio Build Tools 2022 with C++ workload
+- macOS: Xcode Command Line Tools (`xcode-select --install`)
+- Linux: `sudo apt install build-essential libgtk-3-dev libwebkit2gtk-4.0-dev`
+- All platforms: Rust via [rustup](https://rustup.rs/)
+
+```bash
+cd frontend
+npm install
+
+# Generate app icons (required for first build)
+node scripts/generate-icons.cjs
+
+# Development mode
+npm run tauri:dev       # macOS/Linux
+./run-tauri-dev.bat     # Windows
+
+# Production build
+npm run tauri:build     # macOS/Linux
+./build-tauri.bat       # Windows
+```
+
+**Output locations:**
+- Windows: `src-tauri/target/release/bundle/msi/Seedream_1.0.0_x64.msi`
+- macOS: `src-tauri/target/release/bundle/dmg/Seedream_1.0.0_x64.dmg`
+- Linux: `src-tauri/target/release/bundle/deb/seedream_1.0.0_amd64.deb`
 
 ### Docker Setup
 
@@ -66,122 +127,236 @@ docker-compose up
 
 ### Environment Variables
 
-See `backend/.env.example` for all available options:
+Create `.env` in the project root (see `backend/.env.example`):
 
-- `SERVER_HOST`: Server bind address (default: 0.0.0.0)
-- `SERVER_PORT`: HTTP port (default: 8080)
-- `VAULT_PATH`: Path to markdown notes (default: ../vault)
-- `DATA_PATH`: Path to vector database (default: ../data)
-- `EMBEDDING_MODEL`: Sentence transformer model (default: all-MiniLM-L6-v2)
-- `GITHUB_CLIENT_ID`: GitHub OAuth client ID
-- `GITHUB_CLIENT_SECRET`: GitHub OAuth client secret
-- `GITHUB_REDIRECT_URI`: OAuth redirect URI
-- `CORS_ORIGINS`: Comma-separated list of allowed origins
-- `ENVIRONMENT`: development or production
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `VAULT_PATH` | `../vault` | Path to markdown notes |
+| `DATA_PATH` | `../data` | Path to vector database and indices |
+| `OPENROUTER_API_KEY` | - | Required for Multi-LLM Canvas |
+| `GITHUB_CLIENT_ID` | - | GitHub OAuth (for MCP integration) |
+| `GITHUB_CLIENT_SECRET` | - | GitHub OAuth secret |
+| `TOKEN_ENCRYPTION_KEY` | - | Fernet key for token encryption |
+| `ENVIRONMENT` | `development` | `development` or `production` |
+| `CORS_ORIGINS` | `*` | Comma-separated allowed origins |
+| `GITHUB_FEEDBACK_REPO` | - | Target repo for feedback issues (`owner/repo`) |
+| `GITHUB_FEEDBACK_TOKEN` | - | GitHub PAT with `public_repo` scope |
+
+Generate encryption key:
+```bash
+python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+```
 
 ## Usage
 
-### Creating Notes
+### Notes
 
-1. Click "+ New Note" in the header
-2. Enter a title and write content in Markdown
-3. Use `[[Note Title]]` to create wikilinks
-4. Add tags (comma-separated) and set status
-5. Click "Save"
+1. Click **"+ New Note"** in the header
+2. Write content in Markdown with `[[wikilinks]]` to other notes
+3. Set status (draft/evidence/canonical) and add tags
+4. Save - note is automatically indexed for semantic search
 
-### Searching
+### Search
 
-- Use the search bar for semantic search
-- Results are ranked by similarity score
-- Click a result to navigate to that note
+- **Semantic search**: Type naturally in the search bar
+- **Operators**: `tag:python`, `status:canonical`, `type:atomic`
+- **Filters**: Include/exclude tags with `+tag` or `-tag`
 
-### Backlinks
+### Multi-LLM Canvas
 
-- When viewing a note, backlinks appear in the right panel
-- Shows which notes link to the current note
-- Includes context around the wikilink
+1. Navigate to `/canvas` or click the Canvas tab
+2. Create a new session
+3. Click **"+ Prompt"** to open the prompt dialog
+4. Select models to compare (e.g., GPT-4, Claude, Gemini)
+5. Enter your prompt - responses stream in real-time
+6. Use **Debate Mode** to have models critique each other
+7. Export insights to your knowledge base
+
+### Conversation Import
+
+1. Export conversations from ChatGPT, Claude, Grok, or Gemini
+2. Navigate to `/import`
+3. Upload the JSON file
+4. Review parsed conversations with quality scores
+5. Select conversations to import as notes
+
+### MCP Integration
+
+Connect external AI models to your knowledge base:
+
+1. Create a GitHub OAuth app at https://github.com/settings/developers
+2. Configure `.env` with OAuth credentials
+3. Start ngrok tunnel: `ngrok http 8080`
+4. Add MCP server in your AI client: `https://your-url.ngrok-free.dev/sse`
+
+See [CHATGPT_MCP_SETUP_GUIDE.md](CHATGPT_MCP_SETUP_GUIDE.md) for detailed instructions.
+
+### Feedback & Bug Reporting
+
+Submit feedback directly from the app:
+
+1. Click the **💬** button in the header
+2. Select feedback type (Bug Report, Feature Request, or General)
+3. Enter a title and description
+4. Optionally include system information
+5. Submit - creates a GitHub issue automatically
+
+**Desktop offline support:** Feedback is queued when offline and automatically submitted when connectivity is restored.
 
 ## API Documentation
 
-Interactive API documentation is available at:
-- Swagger UI: `http://localhost:8080/docs`
-- ReDoc: `http://localhost:8080/redoc`
+Interactive docs available at:
+- **Swagger UI**: http://localhost:8080/docs
+- **ReDoc**: http://localhost:8080/redoc
 
 ### Main Endpoints
 
-- `GET /api/notes` - List all notes
-- `GET /api/notes/{id}` - Get a specific note
-- `POST /api/notes` - Create a new note
-- `PUT /api/notes/{id}` - Update a note
-- `DELETE /api/notes/{id}` - Delete a note
-- `GET /api/search?q={query}` - Search notes
-- `GET /api/graph/backlinks/{id}` - Get backlinks for a note
-- `GET /api/graph/outgoing/{id}` - Get outgoing links from a note
-
-## Development
-
-### Backend
-
-```bash
-cd backend
-pip install -r requirements.txt
-uvicorn app.main:app --reload
-```
-
-### Frontend
-
-```bash
-cd frontend
-npm install
-npm run dev
-```
-
-### Code Style
-
-- Backend: Follow PEP 8, use type hints
-- Frontend: Use ESLint and Prettier (configured)
+| Category | Endpoint | Description |
+|----------|----------|-------------|
+| **Notes** | `GET /api/notes` | List all notes |
+| | `POST /api/notes` | Create note |
+| | `GET /api/notes/{id}` | Get note |
+| | `PUT /api/notes/{id}` | Update note |
+| | `DELETE /api/notes/{id}` | Delete note |
+| **Search** | `GET /api/search?q={query}` | Semantic search |
+| | `GET /api/search/similar/{id}` | Find similar notes |
+| **Graph** | `GET /api/graph/backlinks/{id}` | Get backlinks |
+| | `GET /api/graph/neighbors/{id}` | Get graph neighbors |
+| **Canvas** | `GET /api/canvas` | List sessions |
+| | `POST /api/canvas/{id}/prompt` | Send prompt (SSE) |
+| | `POST /api/canvas/{id}/debate` | Start debate (SSE) |
+| **Import** | `POST /api/import/upload` | Upload conversations |
+| | `POST /api/import/jobs/{id}/import` | Execute import |
+| **Zettelkasten** | `GET /api/zettel/suggestions/{id}` | Get link suggestions |
+| | `GET /api/zettel/orphans` | Find unlinked notes |
+| **Feedback** | `POST /api/feedback` | Submit feedback |
+| | `GET /api/feedback/status` | Check service status |
 
 ## Architecture
 
-The project follows a clean architecture with clear separation:
+```
+seedream/
+├── backend/                    # Python FastAPI backend
+│   ├── app/
+│   │   ├── main.py            # Application entry point
+│   │   ├── routers/           # API endpoints (10 routers)
+│   │   ├── services/          # Business logic (12 services)
+│   │   ├── models/            # Pydantic schemas
+│   │   ├── middleware/        # Security, logging, rate limiting
+│   │   └── mcp/               # MCP protocol integration
+│   └── tests/                 # pytest test suite (210+ tests)
+│
+├── frontend/                   # Vue 3 SPA + Tauri desktop
+│   ├── src/
+│   │   ├── views/             # Page components (7 views)
+│   │   ├── components/        # UI components (33 total)
+│   │   │   └── canvas/        # Canvas-specific (9 components)
+│   │   ├── stores/            # Pinia state (5 stores)
+│   │   └── api/               # API client (auto-detects Tauri/web)
+│   └── src-tauri/             # Rust desktop backend
+│       ├── src/
+│       │   ├── commands/      # IPC handlers
+│       │   ├── services/      # Rust business logic
+│       │   └── models/        # Data structures
+│       └── Cargo.toml
+│
+├── vault/                      # Markdown notes (Obsidian-compatible)
+├── data/                       # LanceDB, search indices, canvas data
+└── docs/                       # Project documentation (14 guides)
+```
+
+### Service Architecture
 
 ```
-backend/
-├── app/
-│   ├── main.py          # FastAPI application
-│   ├── config.py        # Settings management
-│   ├── routers/         # API endpoints
-│   ├── services/        # Business logic
-│   ├── models/          # Pydantic schemas
-│   └── mcp/            # MCP integration
-└── requirements.txt
-
-frontend/
-├── src/
-│   ├── main.js          # Vue app bootstrap
-│   ├── App.vue          # Root component
-│   ├── components/       # UI components
-│   ├── stores/          # Pinia state management
-│   └── api/            # API client
-└── package.json
+┌─────────────────────────────────────────────────────────────┐
+│                    Vue 3 Frontend                            │
+│  Notes │ Canvas │ Graph │ Search │ Import                   │
+└────────────────────────┬────────────────────────────────────┘
+                         │
+        ┌────────────────┴────────────────┐
+        │                                 │
+        ▼                                 ▼
+┌───────────────────┐           ┌───────────────────┐
+│  Python Backend   │           │   Rust Backend    │
+│    (Web Mode)     │           │  (Desktop Mode)   │
+├───────────────────┤           ├───────────────────┤
+│ • KnowledgeStore  │           │ • KnowledgeStore  │
+│ • VectorSearch    │           │ • SearchService   │
+│ • GraphIndex      │           │ • GraphIndex      │
+│ • OpenRouter      │           │ • OpenRouter      │
+│ • CanvasStore     │           │ • CanvasStore     │
+│ • Distillation    │           └───────────────────┘
+│ • ImportService   │
+│ • LinkDiscovery   │
+└───────────────────┘
 ```
+
+## Testing
+
+```bash
+cd backend
+
+# Install dev dependencies
+pip install -r requirements-dev.txt
+
+# Run all tests
+pytest
+
+# Run with coverage
+pytest --cov=app --cov-report=html
+
+# Run by category
+pytest -m unit           # Unit tests only
+pytest -m integration    # Integration tests
+pytest -m security       # Security tests
+pytest -m "not slow"     # Skip slow tests
+```
+
+**Test coverage:**
+- `test_knowledge_store.py` - 50+ tests (CRUD, path traversal, wikilinks)
+- `test_vector_search.py` - 45+ tests (LanceDB, indexing, similarity)
+- `test_graph_index.py` - 35+ tests (backlinks, traversal, cycles)
+- `test_token_store.py` - 40+ tests (encryption, TTL, cleanup)
+- `test_embedding.py` - 40+ tests (vector encoding, dimensions)
+
+## Security
+
+- **Path traversal protection** - Sanitized note IDs, resolved paths
+- **OAuth 2.0** - GitHub authentication for MCP
+- **Token encryption** - Fernet encryption for stored tokens
+- **Rate limiting** - 10/min, 50/hr, 200/day per IP
+- **Security headers** - X-Content-Type-Options, X-Frame-Options
+- **Input sanitization** - Request validation middleware
+- **CORS** - Strict origin checking in production
 
 ## Documentation
 
-Comprehensive documentation is available in the `docs/` directory:
+Comprehensive documentation in the `docs/` directory:
+
 - [Project Overview](docs/project-overview.md)
 - [Backend Architecture](docs/architecture-backend.md)
 - [Frontend Architecture](docs/architecture-frontend.md)
+- [Canvas Architecture](docs/canvas-architecture.md)
 - [API Contracts](docs/api-contracts-backend.md)
-- [Development Guides](docs/development-guide-backend.md)
+- [Data Models](docs/data-models-backend.md)
+- [Backend Development Guide](docs/development-guide-backend.md)
+- [Frontend Development Guide](docs/development-guide-frontend.md)
+- [Chat Ingestion Guide](docs/chat-ingestion-guide.md)
 
 ## Contributing
 
 1. Fork the repository
-2. Create a feature branch
+2. Create a feature branch (`git checkout -b feature/amazing-feature`)
 3. Make your changes
-4. Write tests (when applicable)
-5. Submit a pull request
+4. Write tests for new functionality
+5. Run the test suite (`pytest`)
+6. Submit a pull request
+
+### Code Style
+
+- **Backend**: PEP 8, type hints required
+- **Frontend**: ESLint + Prettier (configured)
+- **Rust**: `cargo fmt` and `cargo clippy`
 
 ## License
 
