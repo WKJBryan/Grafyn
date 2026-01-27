@@ -68,6 +68,7 @@
         v-else
         :session-id="currentSessionId"
         @session-loaded="onSessionLoaded"
+        @open-settings="showSettingsModal = true"
       />
     </main>
 
@@ -111,6 +112,13 @@
         </div>
       </div>
     </div>
+
+    <!-- Settings Modal (Desktop) -->
+    <SettingsModal
+      v-model="showSettingsModal"
+      :is-setup="false"
+      @saved="handleSettingsSaved"
+    />
   </div>
 </template>
 
@@ -119,7 +127,9 @@ import { ref, computed, onMounted, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useCanvasStore } from '@/stores/canvas'
 import { useThemeStore } from '@/stores/theme'
+import { isDesktopApp } from '@/api/client'
 import CanvasContainer from '@/components/canvas/CanvasContainer.vue'
+import SettingsModal from '@/components/SettingsModal.vue'
 
 const route = useRoute()
 const router = useRouter()
@@ -130,6 +140,8 @@ const themeStore = useThemeStore()
 const showCreateDialog = ref(false)
 const newSessionTitle = ref('')
 const newSessionDescription = ref('')
+const showSettingsModal = ref(false)
+const isDesktop = isDesktopApp()
 
 // Computed property to get the current theme icon
 const themeIcon = computed(() => {
@@ -199,6 +211,13 @@ async function deleteSession(sessionId) {
 
 function onSessionLoaded(session) {
   // Could update page title, etc.
+}
+
+function handleSettingsSaved() {
+  // Reload the canvas to pick up the new API key
+  showSettingsModal.value = false
+  // Reload models with the new API key
+  canvasStore.loadModels()
 }
 
 function formatDate(dateStr) {
