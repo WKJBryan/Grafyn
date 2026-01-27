@@ -27,6 +27,9 @@
             <button class="btn btn-ghost" @click="showFeedbackModal = true" title="Send Feedback">
               💬
             </button>
+            <button v-if="isDesktop" class="btn btn-ghost" @click="showSettingsModal = true" title="Settings">
+              ⚙️
+            </button>
             <button class="btn btn-ghost" @click="handleThemeToggle" title="Toggle Theme">
               {{ themeIcon }}
             </button>
@@ -128,12 +131,20 @@
       @close="showFeedbackModal = false"
       @submitted="handleFeedbackSubmitted"
     />
+
+    <!-- Settings Modal (Desktop only) -->
+    <SettingsModal
+      v-model="showSettingsModal"
+      :is-setup="isSetupMode"
+      @saved="handleSettingsSaved"
+      @setup-complete="handleSetupComplete"
+    />
   </div>
 </template>
 
 <script setup>
 import { ref, onMounted, computed, watch } from 'vue'
-import { notes as notesApi } from '../api/client'
+import { notes as notesApi, settings as settingsApi, isDesktopApp } from '../api/client'
 import SearchBar from '../components/SearchBar.vue'
 import NoteEditor from '../components/NoteEditor.vue'
 import BacklinksPanel from '../components/BacklinksPanel.vue'
@@ -145,6 +156,7 @@ import OnThisPage from '../components/OnThisPage.vue'
 import GraphView from '../components/GraphView.vue'
 import TopicSelector from '../components/TopicSelector.vue'
 import FeedbackModal from '../components/FeedbackModal.vue'
+import SettingsModal from '../components/SettingsModal.vue'
 import { useThemeStore } from '../stores/theme'
 
 const notes = ref([])
@@ -155,6 +167,9 @@ const selectedTags = ref([])
 const isDirty = ref(false)
 const showTopicSelector = ref(false)
 const showFeedbackModal = ref(false)
+const showSettingsModal = ref(false)
+const isSetupMode = ref(false)
+const isDesktop = isDesktopApp()
 
 // Computed property to get the current theme icon
 const themeIcon = computed(() => {
@@ -244,8 +259,26 @@ function handleThemeToggle() {
   themeStore.toggleTheme()
 }
 
+// Check for first-run setup (desktop only)
+async function checkSetup() {
+  if (!isDesktop) return
+
+  try {
+    const status = await settingsApi.getStatus()
+    if (status && status.needs_setup) {
+      isSetupMode.value = true
+      showSettingsModal.value = true
+    }
+  } catch (e) {
+    console.error('Failed to check setup status:', e)
+  }
+}
+
 // Load notes on mount
 onMounted(async () => {
+  // Check if setup is needed (desktop only)
+  await checkSetup()
+
   await loadNotes()
 })
 
@@ -355,6 +388,20 @@ function handleCloseNote() {
 function handleFeedbackSubmitted(response) {
   console.log('Feedback submitted:', response)
   // Modal will close itself after showing success message
+}
+
+function handleSettingsSaved() {
+  console.log('Settings saved')
+  // Reload notes in case vault path changed
+  loadNotes()
+}
+
+function handleSetupComplete() {
+  console.log('Setup completed')
+  isSetupMode.value = false
+  showSettingsModal.value = false
+  // Reload notes from new vault location
+  loadNotes()
 }
 </script>
 

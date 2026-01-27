@@ -21,6 +21,22 @@ impl OpenRouterService {
         }
     }
 
+    /// Update the API key (called when user updates settings)
+    pub fn set_api_key(&mut self, api_key: String) {
+        self.api_key = api_key;
+    }
+
+    /// Get the current API key (masked for display)
+    pub fn get_api_key_masked(&self) -> Option<String> {
+        if self.api_key.is_empty() {
+            None
+        } else if self.api_key.len() <= 8 {
+            Some("****".to_string())
+        } else {
+            Some(format!("{}...{}", &self.api_key[..4], &self.api_key[self.api_key.len()-4..]))
+        }
+    }
+
     /// Check if the service is configured
     pub fn is_configured(&self) -> bool {
         !self.api_key.is_empty()

@@ -12,8 +12,8 @@ use services::{
     knowledge_store::KnowledgeStore,
     openrouter::OpenRouterService,
     search::SearchService,
+    settings::SettingsService,
 };
-use std::path::PathBuf;
 use std::sync::Arc;
 use tauri::Manager;
 use tokio::sync::RwLock;
@@ -24,24 +24,9 @@ pub struct AppState {
     pub graph_index: Arc<RwLock<GraphIndex>>,
     pub search_service: Arc<RwLock<SearchService>>,
     pub canvas_store: Arc<RwLock<CanvasStore>>,
-    pub openrouter: Arc<OpenRouterService>,
+    pub openrouter: Arc<RwLock<OpenRouterService>>,
     pub feedback_service: Arc<RwLock<FeedbackService>>,
-}
-
-fn get_data_paths() -> (PathBuf, PathBuf) {
-    // Get user's documents directory
-    let documents = dirs::document_dir()
-        .unwrap_or_else(|| PathBuf::from("."));
-
-    let base_path = documents.join("Seedream");
-    let vault_path = base_path.join("vault");
-    let data_path = base_path.join("data");
-
-    // Create directories if they don't exist
-    std::fs::create_dir_all(&vault_path).ok();
-    std::fs::create_dir_all(&data_path).ok();
-
-    (vault_path, data_path)
+    pub settings_service: Arc<RwLock<SettingsService>>,
 }
 
 fn main() {
@@ -49,10 +34,19 @@ fn main() {
 
     tauri::Builder::default()
         .setup(|app| {
-            let (vault_path, data_path) = get_data_paths();
+            // Load user settings first
+            let settings_service = SettingsService::load()
+                .expect("Failed to load settings");
+
+            let vault_path = settings_service.vault_path();
+            let data_path = settings_service.data_path();
 
             log::info!("Vault path: {:?}", vault_path);
             log::info!("Data path: {:?}", data_path);
+
+            // Create directories if they don't exist
+            std::fs::create_dir_all(&vault_path).ok();
+            std::fs::create_dir_all(&data_path).ok();
 
             // Initialize services
             let knowledge_store = KnowledgeStore::new(vault_path.clone());
@@ -61,12 +55,21 @@ fn main() {
                 .expect("Failed to initialize search service");
             let canvas_store = CanvasStore::new(data_path.join("canvas"));
 
-            // Get OpenRouter API key from environment
-            let api_key = std::env::var("OPENROUTER_API_KEY").unwrap_or_default();
+            // Get OpenRouter API key from settings, fall back to environment
+            let api_key = settings_service
+                .openrouter_api_key()
+                .map(|s| s.to_string())
+                .or_else(|| std::env::var("OPENROUTER_API_KEY").ok())
+                .unwrap_or_default();
             let openrouter = OpenRouterService::new(api_key);
 
-            // Initialize feedback service for bug reports and feature requests
-            let feedback_service = FeedbackService::new(data_path.join("feedback"));
+            // Initialize feedback service with compile-time credentials
+            // These are embedded during build so users don't need to configure anything
+            let feedback_service = FeedbackService::new_with_credentials(
+                data_path.join("feedback"),
+                get_feedback_repo(),
+                get_feedback_token(),
+            );
 
             // Build initial indices
             let mut ks = knowledge_store.clone();
@@ -81,8 +84,9 @@ fn main() {
                 graph_index: Arc::new(RwLock::new(graph_index)),
                 search_service: Arc::new(RwLock::new(search_service)),
                 canvas_store: Arc::new(RwLock::new(canvas_store)),
-                openrouter: Arc::new(openrouter),
+                openrouter: Arc::new(RwLock::new(openrouter)),
                 feedback_service: Arc::new(RwLock::new(feedback_service)),
+                settings_service: Arc::new(RwLock::new(settings_service)),
             };
 
             app.manage(state);
@@ -122,7 +126,37 @@ fn main() {
             commands::feedback::get_pending_feedback,
             commands::feedback::retry_pending_feedback,
             commands::feedback::clear_pending_feedback,
+            // Settings commands
+            commands::settings::get_settings,
+            commands::settings::get_settings_status,
+            commands::settings::update_settings,
+            commands::settings::complete_setup,
+            commands::settings::pick_vault_folder,
+            commands::settings::validate_openrouter_key,
+            commands::settings::get_openrouter_status,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+/// Get feedback repository from compile-time env or runtime env
+/// Priority: compile-time > runtime env
+fn get_feedback_repo() -> String {
+    // First try compile-time env (embedded in binary during build)
+    option_env!("GITHUB_FEEDBACK_REPO")
+        .map(|s| s.to_string())
+        // Fall back to runtime env (for development)
+        .or_else(|| std::env::var("GITHUB_FEEDBACK_REPO").ok())
+        .unwrap_or_default()
+}
+
+/// Get feedback token from compile-time env or runtime env
+/// Priority: compile-time > runtime env
+fn get_feedback_token() -> String {
+    // First try compile-time env (embedded in binary during build)
+    option_env!("GITHUB_FEEDBACK_TOKEN")
+        .map(|s| s.to_string())
+        // Fall back to runtime env (for development)
+        .or_else(|| std::env::var("GITHUB_FEEDBACK_TOKEN").ok())
+        .unwrap_or_default()
 }

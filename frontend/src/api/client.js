@@ -234,6 +234,56 @@ export const feedback = {
     invokeOrHttp('retry_pending_feedback', {}, () => api.post('/feedback/retry')),
 }
 
+// Settings API (Desktop only)
+export const settings = {
+  get: () => invokeOrHttp('get_settings', {}, () => Promise.resolve(null)),
+
+  getStatus: () =>
+    invokeOrHttp('get_settings_status', {}, () =>
+      // Web mode doesn't need setup
+      Promise.resolve({ needs_setup: false, has_vault_path: true, has_openrouter_key: false })
+    ),
+
+  update: (data) =>
+    invokeOrHttp('update_settings', { update: data }, () => Promise.resolve(data)),
+
+  completeSetup: () =>
+    invokeOrHttp('complete_setup', {}, () => Promise.resolve()),
+
+  pickVaultFolder: async () => {
+    if (isTauri()) {
+      const invoke = await getTauriInvoke()
+      if (invoke) {
+        try {
+          return await invoke('pick_vault_folder')
+        } catch (e) {
+          console.error('Failed to pick vault folder:', e)
+          throw e
+        }
+      }
+    }
+    return null
+  },
+
+  validateOpenRouterKey: (apiKey) =>
+    invokeOrHttp('validate_openrouter_key', { apiKey }, async () => {
+      // Web mode: validate via OpenRouter API directly
+      try {
+        const response = await fetch('https://openrouter.ai/api/v1/models', {
+          headers: { Authorization: `Bearer ${apiKey}` },
+        })
+        return response.ok
+      } catch {
+        return false
+      }
+    }),
+
+  getOpenRouterStatus: () =>
+    invokeOrHttp('get_openrouter_status', {}, () =>
+      Promise.resolve({ has_key: false, is_configured: false })
+    ),
+}
+
 // Utility function to check if we're in Tauri environment
 export const isDesktopApp = isTauri
 
