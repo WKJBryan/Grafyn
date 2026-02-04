@@ -3,7 +3,7 @@ import os
 import shutil
 from pathlib import Path
 from typing import Generator
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from fastapi.testclient import TestClient
@@ -118,16 +118,14 @@ def vector_search(temp_data_path: Path, embedding_service: EmbeddingService) -> 
 
 @pytest.fixture
 def graph_index(knowledge_store: KnowledgeStore) -> GraphIndexService:
-    """Create a GraphIndexService instance"""
-    service = GraphIndexService()
-    service.knowledge_store = knowledge_store
-    return service
+    """Create a GraphIndexService instance with injected knowledge store"""
+    return GraphIndexService(knowledge_store=knowledge_store)
 
 
 @pytest.fixture
 def token_store(temp_token_storage_path: Path) -> TokenStore:
     """Create a TokenStore instance with temporary storage"""
-    store = TokenStore(storage_path=str(temp_token_storage_path))
+    store = TokenStore(storage_path=str(temp_token_storage_path / "tokens.json"))
     return store
 
 
@@ -236,7 +234,7 @@ def create_sample_notes(knowledge_store: KnowledgeStore, sample_notes_list: list
     created_ids = []
     for note_data in sample_notes_list:
         note = knowledge_store.create_note(note_data)
-        created_ids.append(note["id"])
+        created_ids.append(note.id)
     return created_ids
 
 
@@ -365,20 +363,13 @@ def expired_token_data(token_store: TokenStore, valid_access_token: str) -> dict
     """Create an expired token for testing"""
     import secrets
     token_id = secrets.token_urlsafe(16)
-    expires_at = datetime.utcnow() - timedelta(hours=1)  # Expired 1 hour ago
+    expires_at = datetime.now(timezone.utc) - timedelta(hours=1)  # Expired 1 hour ago
 
-    user_data = {
-        "id": "test_user",
-        "login": "testuser",
-        "email": "test@example.com",
-    }
-
-    token_store.store_token(token_id, valid_access_token, user_data, expires_at)
+    token_store.store_token(token_id, valid_access_token, expires_at)
 
     return {
         "token_id": token_id,
         "access_token": valid_access_token,
-        "user_data": user_data,
         "expires_at": expires_at,
     }
 
