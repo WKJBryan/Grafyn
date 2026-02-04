@@ -5,20 +5,26 @@
     :style="tileStyle"
     @mousedown="handleMouseDown"
   >
-    <div class="tile-header" @mousedown="handleMouseDown">
+    <div
+      class="tile-header"
+      @mousedown="handleMouseDown"
+    >
       <div class="debate-info">
         <span class="debate-icon">&#9876;</span>
         <span class="debate-title">Debate</span>
         <span class="debate-mode">{{ debate.debate_mode }}</span>
       </div>
       <div class="tile-actions">
-        <span class="status-badge" :class="debate.status">
+        <span
+          class="status-badge"
+          :class="debate.status"
+        >
           {{ debate.status }}
         </span>
         <button
           class="delete-btn"
-          @click.stop="$emit('delete', debate.id)"
           title="Delete debate"
+          @click.stop="$emit('delete', debate.id)"
         >
           &#10005;
         </button>
@@ -36,7 +42,10 @@
     </div>
 
     <!-- Compact Summary View -->
-    <div v-if="!isExpanded" class="debate-summary">
+    <div
+      v-if="!isExpanded"
+      class="debate-summary"
+    >
       <div class="summary-stats">
         <span class="stat">{{ debate.rounds.length }} round{{ debate.rounds.length !== 1 ? 's' : '' }}</span>
         <span class="stat-divider">•</span>
@@ -44,20 +53,38 @@
       </div>
       
       <!-- Show conclusion from last round if available -->
-      <div v-if="lastRoundSummary" class="conclusion-preview">
-        <div class="conclusion-label">Latest Response:</div>
-        <div class="conclusion-text" v-html="lastRoundSummary"></div>
+      <div
+        v-if="lastRoundSummary"
+        class="conclusion-preview"
+      >
+        <div class="conclusion-label">
+          Latest Response:
+        </div>
+        <div
+          class="conclusion-text"
+          v-html="lastRoundSummary"
+        />
       </div>
       
-      <button class="expand-btn" @click.stop="isExpanded = true" v-if="debate.rounds.length > 0">
+      <button
+        v-if="debate.rounds.length > 0"
+        class="expand-btn"
+        @click.stop="isExpanded = true"
+      >
         <span class="expand-icon">&#9660;</span>
         View Full Debate
       </button>
     </div>
 
     <!-- Expanded Full Debate View -->
-    <div v-else class="debate-rounds">
-      <button class="collapse-btn" @click.stop="isExpanded = false">
+    <div
+      v-else
+      class="debate-rounds"
+    >
+      <button
+        class="collapse-btn"
+        @click.stop="isExpanded = false"
+      >
         <span class="collapse-icon">&#9650;</span>
         Collapse
       </button>
@@ -76,13 +103,21 @@
             :key="modelId"
             class="round-response"
           >
-            <div class="response-model">{{ getModelName(modelId) }}</div>
-            <div class="response-content" v-html="renderContent(response)"></div>
+            <div class="response-model">
+              {{ getModelName(modelId) }}
+            </div>
+            <div
+              class="response-content"
+              v-html="renderContent(response)"
+            />
           </div>
         </div>
       </div>
 
-      <div v-if="debate.rounds.length === 0" class="no-rounds">
+      <div
+        v-if="debate.rounds.length === 0"
+        class="no-rounds"
+      >
         No debate rounds yet
       </div>
     </div>
@@ -97,7 +132,10 @@
     />
 
     <!-- Resize handle -->
-    <div class="resize-handle" @mousedown.stop="startResize"></div>
+    <div
+      class="resize-handle"
+      @mousedown.stop="startResize"
+    />
   </div>
 </template>
 

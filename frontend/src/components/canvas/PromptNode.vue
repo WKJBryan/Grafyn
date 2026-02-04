@@ -11,8 +11,8 @@
       <div class="node-actions">
         <button
           class="delete-btn"
-          @click.stop="$emit('delete', tile.id)"
           title="Delete prompt"
+          @click.stop="$emit('delete', tile.id)"
         >
           ×
         </button>
@@ -20,7 +20,12 @@
     </div>
     
     <div class="node-content">
-      <p class="prompt-text" :title="tile.prompt">{{ truncatedPrompt }}</p>
+      <p
+        class="prompt-text"
+        :title="tile.prompt"
+      >
+        {{ truncatedPrompt }}
+      </p>
     </div>
     
     <div class="node-footer">
@@ -29,10 +34,13 @@
     </div>
     
     <!-- Connection point (right side) - visual indicator for edges -->
-    <div class="connection-point out"></div>
+    <div class="connection-point out" />
     
     <!-- Branch indicator if this is a child prompt -->
-    <div v-if="tile.parent_tile_id" class="branch-indicator">
+    <div
+      v-if="tile.parent_tile_id"
+      class="branch-indicator"
+    >
       ⑂
     </div>
   </div>

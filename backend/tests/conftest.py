@@ -4,6 +4,7 @@ import shutil
 from pathlib import Path
 from typing import Generator
 from datetime import datetime, timedelta, timezone
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -17,6 +18,12 @@ from app.services.embedding import EmbeddingService
 from app.services.token_store import TokenStore
 from app.services.priority_scoring import PriorityScoringService, PriorityWeights
 from app.services.priority_settings import PrioritySettingsService
+from app.services.canvas_store import CanvasSessionStore
+from app.services.feedback import FeedbackService
+from app.services.import_service import ImportService
+from app.services.openrouter import OpenRouterService
+from app.services.distillation import DistillationService
+from app.services.link_discovery import LinkDiscoveryService
 
 
 # ============================================================================
@@ -130,6 +137,151 @@ def token_store(temp_token_storage_path: Path) -> TokenStore:
 
 
 # ============================================================================
+# Canvas and Feedback Fixtures
+# ============================================================================
+
+@pytest.fixture
+def canvas_store(tmp_path: Path) -> CanvasSessionStore:
+    """Create a CanvasSessionStore with temporary directory"""
+    canvas_dir = tmp_path / "canvas"
+    canvas_dir.mkdir(parents=True, exist_ok=True)
+    return CanvasSessionStore(data_path=str(canvas_dir))
+
+
+@pytest.fixture
+def canvas_session_data() -> dict:
+    """Sample canvas session creation data"""
+    return {
+        "title": "Test Canvas Session",
+        "description": "A session for testing",
+        "tags": ["test", "canvas"],
+    }
+
+
+@pytest.fixture
+def mock_openrouter_client():
+    """Mock OpenRouter service that doesn't make real API calls"""
+    service = OpenRouterService()
+    service.api_key = "test-key-123"
+    service._models_cache = [
+        {
+            "id": "anthropic/claude-3.5-sonnet",
+            "name": "Claude 3.5 Sonnet",
+            "provider": "anthropic",
+            "context_length": 200000,
+            "pricing": {"prompt": "0.003", "completion": "0.015"},
+            "supports_streaming": True,
+        },
+        {
+            "id": "openai/gpt-4o",
+            "name": "GPT-4o",
+            "provider": "openai",
+            "context_length": 128000,
+            "pricing": {"prompt": "0.005", "completion": "0.015"},
+            "supports_streaming": True,
+        },
+    ]
+    service._cache_expiry = datetime.now(timezone.utc) + timedelta(hours=1)
+    return service
+
+
+@pytest.fixture
+def mock_github_api():
+    """Mock for GitHub Issues API responses"""
+    return {
+        "success": {
+            "number": 42,
+            "html_url": "https://github.com/test/repo/issues/42",
+            "title": "Test Feedback",
+            "state": "open",
+        },
+        "error": {
+            "message": "Bad credentials",
+            "documentation_url": "https://docs.github.com/rest",
+        },
+    }
+
+
+@pytest.fixture
+def feedback_service(monkeypatch) -> FeedbackService:
+    """Create a FeedbackService with test configuration"""
+    monkeypatch.setenv("GITHUB_FEEDBACK_REPO", "test-owner/test-repo")
+    monkeypatch.setenv("GITHUB_FEEDBACK_TOKEN", "ghp_test_token_123")
+    service = FeedbackService()
+    service.repo = "test-owner/test-repo"
+    service.token = "ghp_test_token_123"
+    return service
+
+
+@pytest.fixture
+def import_service(
+    knowledge_store: KnowledgeStore,
+    tmp_path: Path,
+) -> ImportService:
+    """Create an ImportService with temporary directories"""
+    temp_dir = tmp_path / "import_temp"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    return ImportService(
+        knowledge_store=knowledge_store,
+        temp_dir=str(temp_dir),
+    )
+
+
+@pytest.fixture
+def distillation_service(
+    knowledge_store: KnowledgeStore,
+) -> DistillationService:
+    """Create a DistillationService for testing"""
+    return DistillationService(
+        knowledge_store=knowledge_store,
+    )
+
+
+@pytest.fixture
+def link_discovery_service(
+    knowledge_store: KnowledgeStore,
+) -> LinkDiscoveryService:
+    """Create a LinkDiscoveryService for testing"""
+    return LinkDiscoveryService(
+        knowledge_store=knowledge_store,
+    )
+
+
+@pytest.fixture
+def llm_conversation_data() -> dict:
+    """Sample ChatGPT conversation export for import testing"""
+    return {
+        "title": "Python Data Analysis Discussion",
+        "create_time": 1704067200,
+        "update_time": 1704153600,
+        "mapping": {
+            "msg-1": {
+                "id": "msg-1",
+                "message": {
+                    "id": "msg-1",
+                    "author": {"role": "user"},
+                    "content": {"parts": ["How do I analyze CSV data with pandas?"]},
+                    "create_time": 1704067200,
+                },
+                "parent": None,
+                "children": ["msg-2"],
+            },
+            "msg-2": {
+                "id": "msg-2",
+                "message": {
+                    "id": "msg-2",
+                    "author": {"role": "assistant", "metadata": {"model_slug": "gpt-4"}},
+                    "content": {"parts": ["To analyze CSV data with pandas, you can use `pd.read_csv()` to load the data..."]},
+                    "create_time": 1704067260,
+                },
+                "parent": "msg-1",
+                "children": [],
+            },
+        },
+    }
+
+
+# ============================================================================
 # Test Client Fixtures
 # ============================================================================
 
@@ -153,6 +305,12 @@ def test_client(
     graph_index: GraphIndexService,
     priority_scoring_service: PriorityScoringService,
     priority_settings_service: PrioritySettingsService,
+    canvas_store: CanvasSessionStore,
+    feedback_service: FeedbackService,
+    import_service: ImportService,
+    mock_openrouter_client: OpenRouterService,
+    distillation_service: DistillationService,
+    link_discovery_service: LinkDiscoveryService,
 ) -> TestClient:
     """Create a FastAPI TestClient with all services attached"""
     # Attach services to app.state
@@ -161,6 +319,12 @@ def test_client(
     app.state.graph_index = graph_index
     app.state.priority_scoring = priority_scoring_service
     app.state.priority_settings = priority_settings_service
+    app.state.canvas_store = canvas_store
+    app.state.openrouter = mock_openrouter_client
+    app.state.feedback_service = feedback_service
+    app.state.import_service = import_service
+    app.state.distillation = distillation_service
+    app.state.link_discovery = link_discovery_service
 
     return TestClient(app)
 

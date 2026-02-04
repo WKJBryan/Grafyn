@@ -1,12 +1,19 @@
 <template>
   <div class="not-found-view">
     <div class="not-found-container">
-      <h1 class="not-found-title">404</h1>
-      <p class="not-found-message">Page not found</p>
+      <h1 class="not-found-title">
+        404
+      </h1>
+      <p class="not-found-message">
+        Page not found
+      </p>
       <p class="not-found-description">
         The page you're looking for doesn't exist or has been moved.
       </p>
-      <button class="btn btn-primary" @click="goHome">
+      <button
+        class="btn btn-primary"
+        @click="goHome"
+      >
         Go Home
       </button>
     </div>

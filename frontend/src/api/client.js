@@ -183,6 +183,9 @@ export const canvas = {
   deleteTile: (sessionId, tileId) =>
     api.delete(`/canvas/${encodeURIComponent(sessionId)}/tiles/${encodeURIComponent(tileId)}`),
 
+  deleteResponse: (sessionId, tileId, modelId) =>
+    api.delete(`/canvas/${encodeURIComponent(sessionId)}/tiles/${encodeURIComponent(tileId)}/responses/${encodeURIComponent(modelId)}`),
+
   updateViewport: (sessionId, viewport) =>
     api.put(`/canvas/${encodeURIComponent(sessionId)}/viewport`, viewport),
 

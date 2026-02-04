@@ -1,5 +1,5 @@
 """OAuth API router for frontend authentication"""
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from app.mcp.oauth import token_store
 from app.config import get_settings
@@ -108,7 +108,7 @@ async def exchange_code(provider: str, code: str, state: str = None):
 
 
 @router.get("/user")
-async def get_user(credentials: HTTPAuthorizationCredentials = security):
+async def get_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
     """Get current authenticated user info"""
     # Validate token
     if credentials:
@@ -126,7 +126,7 @@ async def get_user(credentials: HTTPAuthorizationCredentials = security):
 
 
 @router.post("/logout")
-async def logout(credentials: HTTPAuthorizationCredentials = security):
+async def logout(credentials: HTTPAuthorizationCredentials = Depends(security)):
     """Logout current user"""
     if credentials:
         token = credentials.credentials

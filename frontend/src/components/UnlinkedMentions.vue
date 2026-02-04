@@ -1,41 +1,67 @@
 <template>
   <div class="unlinked-mentions">
-    <div class="section-header" @click="isExpanded = !isExpanded">
+    <div
+      class="section-header"
+      @click="isExpanded = !isExpanded"
+    >
       <span class="section-icon">{{ isExpanded ? '▼' : '▶' }}</span>
-      <h3 class="section-title">Unlinked Mentions</h3>
-      <span v-if="mentions.length > 0" class="mention-count">{{ mentions.length }}</span>
+      <h3 class="section-title">
+        Unlinked Mentions
+      </h3>
+      <span
+        v-if="mentions.length > 0"
+        class="mention-count"
+      >{{ mentions.length }}</span>
     </div>
     
-    <div v-if="isExpanded" class="mentions-content">
-      <div v-if="loading" class="loading-state">
+    <div
+      v-if="isExpanded"
+      class="mentions-content"
+    >
+      <div
+        v-if="loading"
+        class="loading-state"
+      >
         <span class="loading-spinner">⏳</span>
         <span>Finding mentions...</span>
       </div>
       
-      <div v-else-if="mentions.length === 0" class="empty-state">
+      <div
+        v-else-if="mentions.length === 0"
+        class="empty-state"
+      >
         <span class="empty-icon">✓</span>
         <span>No unlinked mentions found</span>
       </div>
       
-      <div v-else class="mentions-list">
+      <div
+        v-else
+        class="mentions-list"
+      >
         <div 
           v-for="mention in mentions" 
           :key="mention.note_id"
           class="mention-item"
         >
           <div class="mention-header">
-            <span class="mention-title" @click="$emit('navigate', mention.note_id)">
+            <span
+              class="mention-title"
+              @click="$emit('navigate', mention.note_id)"
+            >
               {{ mention.title }}
             </span>
             <button 
               class="link-btn"
-              @click="handleLinkIt(mention)"
               title="Convert to wikilink"
+              @click="handleLinkIt(mention)"
             >
               🔗 Link it
             </button>
           </div>
-          <div v-if="mention.context" class="mention-context">
+          <div
+            v-if="mention.context"
+            class="mention-context"
+          >
             "...{{ mention.context }}..."
           </div>
         </div>

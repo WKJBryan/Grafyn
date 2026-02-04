@@ -72,7 +72,7 @@ def add_mcp_provenance(properties: Optional[dict]) -> dict:
         "label": "Created Via"
     }
     properties["mcp_created_at"] = {
-        "type": "date",
+        "type": "string",
         "value": datetime.now(timezone.utc).isoformat(),
         "label": "MCP Created At"
     }
@@ -340,7 +340,6 @@ async def mcp_update_note(
 
     # Add MCP provenance property if not present
     if not updated_note.frontmatter.get_property("modified_via"):
-        from app.models.note import NoteUpdate
         properties = updated_note.frontmatter.properties.copy()
         properties["modified_via"] = {
             "type": "string",
@@ -348,7 +347,7 @@ async def mcp_update_note(
             "label": "Modified Via"
         }
         properties["mcp_modified_at"] = {
-            "type": "date",
+            "type": "string",
             "value": datetime.now(timezone.utc).isoformat(),
             "label": "MCP Modified At"
         }
@@ -403,8 +402,8 @@ async def mcp_find_or_create_note(
 
     return {
         "action": "created",
-        "note_id": created_note.id,
-        "title": created_note.title,
+        "note_id": created_note["id"],
+        "title": created_note["title"],
         "message": f"Created new note (no existing note met the {note_request.threshold:.1%} similarity threshold)"
     }
 
@@ -442,7 +441,6 @@ async def mcp_set_property(
     note.frontmatter.set_property(prop_request.property_name, typed_property)
 
     # Update the note
-    from app.models.note import NoteUpdate
     update_data = NoteUpdate(properties=note.frontmatter.properties)
     updated_note = knowledge_store.update_note(note_id, update_data)
 

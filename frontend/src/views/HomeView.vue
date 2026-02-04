@@ -5,12 +5,30 @@
       <header class="app-header">
         <div class="header-left">
           <div class="logo-wrapper">
-            <svg class="logo-icon" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor">
-              <circle cx="12" cy="12" r="10"></circle>
-              <line x1="2" y1="12" x2="22" y2="12"></line>
-              <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"></path>
+            <svg
+              class="logo-icon"
+              width="24"
+              height="24"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+            >
+              <circle
+                cx="12"
+                cy="12"
+                r="10"
+              />
+              <line
+                x1="2"
+                y1="12"
+                x2="22"
+                y2="12"
+              />
+              <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z" />
             </svg>
-            <h1 class="logo">Seedream</h1>
+            <h1 class="logo">
+              Seedream
+            </h1>
           </div>
         </div>
         <div class="header-center">
@@ -18,22 +36,46 @@
         </div>
         <div class="header-right">
           <div class="action-buttons">
-            <router-link to="/import" class="btn btn-secondary" title="Import Conversations">
+            <router-link
+              to="/import"
+              class="btn btn-secondary"
+              title="Import Conversations"
+            >
               Import
             </router-link>
-            <router-link to="/canvas" class="btn btn-secondary" title="Multi-LLM Canvas">
+            <router-link
+              to="/canvas"
+              class="btn btn-secondary"
+              title="Multi-LLM Canvas"
+            >
               Canvas
             </router-link>
-            <button class="btn btn-ghost" @click="showFeedbackModal = true" title="Send Feedback">
+            <button
+              class="btn btn-ghost"
+              title="Send Feedback"
+              @click="showFeedbackModal = true"
+            >
               💬
             </button>
-            <button v-if="isDesktop" class="btn btn-ghost" @click="showSettingsModal = true" title="Settings">
+            <button
+              v-if="isDesktop"
+              class="btn btn-ghost"
+              title="Settings"
+              @click="showSettingsModal = true"
+            >
               ⚙️
             </button>
-            <button class="btn btn-ghost" @click="handleThemeToggle" title="Toggle Theme">
+            <button
+              class="btn btn-ghost"
+              title="Toggle Theme"
+              @click="handleThemeToggle"
+            >
               {{ themeIcon }}
             </button>
-            <button class="btn btn-primary" @click="handleNewNote">
+            <button
+              class="btn btn-primary"
+              @click="handleNewNote"
+            >
               + New Note
             </button>
           </div>
@@ -67,7 +109,10 @@
           </div>
           
           <!-- Editor Panel (Overlay) -->
-          <div v-if="selectedNote" class="editor-panel-overlay">
+          <div
+            v-if="selectedNote"
+            class="editor-panel-overlay"
+          >
             <div class="editor-panel">
               <div class="editor-panel-header">
                 <input
@@ -76,8 +121,13 @@
                   class="title-input"
                   placeholder="Note title..."
                   @input="handleDirty"
-                />
-                <button class="close-btn" @click="handleCloseNote">×</button>
+                >
+                <button
+                  class="close-btn"
+                  @click="handleCloseNote"
+                >
+                  ×
+                </button>
               </div>
               <NoteEditor
                 :note="selectedNote"
@@ -92,20 +142,36 @@
         <!-- Right Sidebar: Info, Graph, Backlinks & Mentions -->
         <aside class="sidebar-right">
           <div class="sidebar-section">
-            <div class="section-title">Interactive Graph</div>
+            <div class="section-title">
+              Interactive Graph
+            </div>
             <MiniGraph @navigate="handleNoteSelect" />
           </div>
           
-          <div class="sidebar-section" v-if="selectedNote">
+          <div
+            v-if="selectedNote"
+            class="sidebar-section"
+          >
             <OnThisPage :content="selectedNote.content" />
           </div>
           
-          <div class="sidebar-section" v-if="selectedNoteId">
-            <div class="section-title">Backlinks</div>
-            <BacklinksPanel :note-id="selectedNoteId" @navigate="handleNoteSelect" />
+          <div
+            v-if="selectedNoteId"
+            class="sidebar-section"
+          >
+            <div class="section-title">
+              Backlinks
+            </div>
+            <BacklinksPanel
+              :note-id="selectedNoteId"
+              @navigate="handleNoteSelect"
+            />
           </div>
 
-          <div class="sidebar-section" v-if="selectedNoteId">
+          <div
+            v-if="selectedNoteId"
+            class="sidebar-section"
+          >
             <UnlinkedMentions 
               :note-id="selectedNoteId" 
               :note-title="selectedNote.title"

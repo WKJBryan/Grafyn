@@ -1,13 +1,26 @@
 <template>
-  <div v-if="isOpen" class="modal-overlay" @click.self="handleClose">
+  <div
+    v-if="isOpen"
+    class="modal-overlay"
+    @click.self="handleClose"
+  >
     <div class="modal-content settings-modal">
       <div class="modal-header">
         <h2>{{ isSetup ? '🚀 Welcome to Seedream' : '⚙️ Settings' }}</h2>
-        <button v-if="!isSetup" class="close-btn" @click="handleClose">×</button>
+        <button
+          v-if="!isSetup"
+          class="close-btn"
+          @click="handleClose"
+        >
+          ×
+        </button>
       </div>
 
       <div class="modal-body">
-        <p v-if="isSetup" class="setup-intro">
+        <p
+          v-if="isSetup"
+          class="setup-intro"
+        >
           Let's set up your knowledge base. You can change these settings anytime.
         </p>
 
@@ -22,17 +35,24 @@
           </p>
           <div class="vault-picker">
             <input
-              type="text"
               v-model="vaultPath"
+              type="text"
               class="vault-input"
               placeholder="Click 'Browse' to select a folder..."
               readonly
-            />
-            <button class="browse-btn" @click="pickVaultFolder" :disabled="isLoading">
+            >
+            <button
+              class="browse-btn"
+              :disabled="isLoading"
+              @click="pickVaultFolder"
+            >
               {{ isLoading ? '...' : 'Browse' }}
             </button>
           </div>
-          <p v-if="!vaultPath && isSetup" class="setting-hint warning">
+          <p
+            v-if="!vaultPath && isSetup"
+            class="setting-hint warning"
+          >
             ⚠️ Please select a vault location to continue
           </p>
         </div>
@@ -46,21 +66,33 @@
           </label>
           <p class="setting-description">
             Required for Canvas multi-LLM features. Get a key at
-            <a href="https://openrouter.ai/keys" target="_blank" rel="noopener">openrouter.ai/keys</a>
+            <a
+              href="https://openrouter.ai/keys"
+              target="_blank"
+              rel="noopener"
+            >openrouter.ai/keys</a>
           </p>
           <div class="api-key-input">
             <input
-              :type="showApiKey ? 'text' : 'password'"
               v-model="openrouterKey"
+              :type="showApiKey ? 'text' : 'password'"
               class="key-input"
               placeholder="sk-or-v1-..."
               @blur="validateKey"
-            />
-            <button class="toggle-visibility" @click="showApiKey = !showApiKey" type="button">
+            >
+            <button
+              class="toggle-visibility"
+              type="button"
+              @click="showApiKey = !showApiKey"
+            >
               {{ showApiKey ? '🙈' : '👁️' }}
             </button>
           </div>
-          <div v-if="keyValidationState" class="validation-status" :class="keyValidationState">
+          <div
+            v-if="keyValidationState"
+            class="validation-status"
+            :class="keyValidationState"
+          >
             <span v-if="keyValidationState === 'validating'">⏳ Validating...</span>
             <span v-else-if="keyValidationState === 'valid'">✅ API key is valid</span>
             <span v-else-if="keyValidationState === 'invalid'">❌ Invalid API key</span>
@@ -71,29 +103,56 @@
         </div>
 
         <!-- Theme Section (non-setup only) -->
-        <div v-if="!isSetup" class="setting-section">
+        <div
+          v-if="!isSetup"
+          class="setting-section"
+        >
           <label class="setting-label">
             <span class="label-icon">🎨</span>
             Theme
           </label>
           <div class="theme-options">
-            <label class="theme-option" :class="{ active: theme === 'system' }">
-              <input type="radio" v-model="theme" value="system" />
+            <label
+              class="theme-option"
+              :class="{ active: theme === 'system' }"
+            >
+              <input
+                v-model="theme"
+                type="radio"
+                value="system"
+              >
               <span>System</span>
             </label>
-            <label class="theme-option" :class="{ active: theme === 'light' }">
-              <input type="radio" v-model="theme" value="light" />
+            <label
+              class="theme-option"
+              :class="{ active: theme === 'light' }"
+            >
+              <input
+                v-model="theme"
+                type="radio"
+                value="light"
+              >
               <span>Light</span>
             </label>
-            <label class="theme-option" :class="{ active: theme === 'dark' }">
-              <input type="radio" v-model="theme" value="dark" />
+            <label
+              class="theme-option"
+              :class="{ active: theme === 'dark' }"
+            >
+              <input
+                v-model="theme"
+                type="radio"
+                value="dark"
+              >
               <span>Dark</span>
             </label>
           </div>
         </div>
 
         <!-- MCP Sidecar Section (desktop only, non-setup only) -->
-        <div v-if="!isSetup && isDesktop" class="setting-section">
+        <div
+          v-if="!isSetup && isDesktop"
+          class="setting-section"
+        >
           <label class="setting-label">
             <span class="label-icon">🔌</span>
             MCP Integration
@@ -104,22 +163,38 @@
           </p>
           <div class="mcp-toggle">
             <label class="mcp-checkbox-label">
-              <input type="checkbox" v-model="mcpEnabled" />
+              <input
+                v-model="mcpEnabled"
+                type="checkbox"
+              >
               <span>Enable MCP Server</span>
             </label>
-            <span v-if="mcpStatusText" class="mcp-status-badge" :class="mcpStatusClass">
+            <span
+              v-if="mcpStatusText"
+              class="mcp-status-badge"
+              :class="mcpStatusClass"
+            >
               {{ mcpStatusText }}
             </span>
           </div>
-          <div v-if="mcpEnabled" class="mcp-details">
+          <div
+            v-if="mcpEnabled"
+            class="mcp-details"
+          >
             <div class="mcp-info-row">
               <span class="mcp-info-label">Endpoint:</span>
               <code class="mcp-info-value">{{ mcpUrl || 'http://localhost:8765/sse' }}</code>
             </div>
-            <div v-if="configSnippet" class="config-snippet">
+            <div
+              v-if="configSnippet"
+              class="config-snippet"
+            >
               <div class="snippet-header">
                 <span>Claude Desktop Config</span>
-                <button class="copy-btn" @click="copyConfigSnippet">
+                <button
+                  class="copy-btn"
+                  @click="copyConfigSnippet"
+                >
                   {{ copied ? 'Copied!' : 'Copy' }}
                 </button>
               </div>
@@ -133,11 +208,17 @@
       </div>
 
       <div class="modal-footer">
-        <button v-if="!isSetup" class="cancel-btn" @click="handleClose">Cancel</button>
+        <button
+          v-if="!isSetup"
+          class="cancel-btn"
+          @click="handleClose"
+        >
+          Cancel
+        </button>
         <button
           class="save-btn"
-          @click="saveSettings"
           :disabled="isSetup && !vaultPath || isSaving"
+          @click="saveSettings"
         >
           {{ isSaving ? 'Saving...' : isSetup ? 'Complete Setup' : 'Save Settings' }}
         </button>

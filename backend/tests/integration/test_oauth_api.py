@@ -8,7 +8,7 @@ from fastapi.testclient import TestClient
 from unittest.mock import MagicMock, patch, AsyncMock
 from datetime import datetime, timezone, timedelta
 
-from app.main import create_app
+from app.main import app as _app
 
 
 # ============================================================================
@@ -38,7 +38,7 @@ def mock_token_store():
 @pytest.fixture
 def test_app():
     """Create test application"""
-    app = create_app()
+    app = _app
     # Add minimal required services
     app.state.knowledge_store = MagicMock()
     app.state.vector_search = MagicMock()

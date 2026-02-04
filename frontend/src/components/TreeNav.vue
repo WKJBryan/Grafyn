@@ -1,7 +1,10 @@
 <template>
   <div class="tree-nav">
     <!-- Canvas Exports Section -->
-    <div class="nav-section" v-if="canvasNotes.length > 0">
+    <div
+      v-if="canvasNotes.length > 0"
+      class="nav-section"
+    >
       <div 
         class="section-header clickable" 
         @click="toggleSection('canvas')"
@@ -11,8 +14,14 @@
         <span class="label">Canvas Exports</span>
         <span class="count">({{ canvasNotes.length }})</span>
       </div>
-      <div class="section-content" v-show="expandedSections.canvas">
-        <div v-for="note in canvasNotes" :key="note.id">
+      <div
+        v-show="expandedSections.canvas"
+        class="section-content"
+      >
+        <div
+          v-for="note in canvasNotes"
+          :key="note.id"
+        >
           <div 
             class="nav-item"
             :class="{ active: selectedId === note.id }"
@@ -22,7 +31,10 @@
             <span class="file-name">{{ formatTitle(note.title) }}</span>
           </div>
           <!-- Nested atomics that backlink to this canvas -->
-          <div v-if="getAtomicsFor(note).length > 0" class="nested-items">
+          <div
+            v-if="getAtomicsFor(note).length > 0"
+            class="nested-items"
+          >
             <div 
               v-for="atomic in getAtomicsFor(note)" 
               :key="atomic.id"
@@ -40,9 +52,9 @@
 
     <!-- Topic Folders (grouped by first tag) -->
     <div 
-      class="nav-section" 
       v-for="topic in sortedTopics" 
-      :key="topic.name"
+      :key="topic.name" 
+      class="nav-section"
     >
       <div 
         class="section-header clickable" 
@@ -53,8 +65,14 @@
         <span class="label">{{ formatTopicName(topic.name) }}</span>
         <span class="count">({{ topic.notes.length }})</span>
       </div>
-      <div class="section-content" v-show="expandedSections[topic.name]">
-        <div v-for="note in topic.notes" :key="note.id">
+      <div
+        v-show="expandedSections[topic.name]"
+        class="section-content"
+      >
+        <div
+          v-for="note in topic.notes"
+          :key="note.id"
+        >
           <div 
             class="nav-item"
             :class="{ active: selectedId === note.id }"
@@ -64,7 +82,10 @@
             <span class="file-name">{{ formatTitle(note.title) }}</span>
           </div>
           <!-- Nested atomics under containers -->
-          <div v-if="getAtomicsFor(note).length > 0" class="nested-items">
+          <div
+            v-if="getAtomicsFor(note).length > 0"
+            class="nested-items"
+          >
             <div 
               v-for="atomic in getAtomicsFor(note)" 
               :key="atomic.id"
@@ -81,7 +102,10 @@
     </div>
 
     <!-- Uncategorized Notes -->
-    <div class="nav-section" v-if="uncategorizedNotes.length > 0">
+    <div
+      v-if="uncategorizedNotes.length > 0"
+      class="nav-section"
+    >
       <div 
         class="section-header clickable" 
         @click="toggleSection('uncategorized')"
@@ -91,7 +115,10 @@
         <span class="label">Uncategorized</span>
         <span class="count">({{ uncategorizedNotes.length }})</span>
       </div>
-      <div class="section-content" v-show="expandedSections.uncategorized">
+      <div
+        v-show="expandedSections.uncategorized"
+        class="section-content"
+      >
         <div 
           v-for="note in uncategorizedNotes" 
           :key="note.id"
@@ -106,7 +133,10 @@
     </div>
 
     <!-- Orphan Atomic Notes (not nested under containers) -->
-    <div class="nav-section" v-if="orphanAtomics.length > 0">
+    <div
+      v-if="orphanAtomics.length > 0"
+      class="nav-section"
+    >
       <div 
         class="section-header clickable" 
         @click="toggleSection('atomics')"
@@ -116,8 +146,14 @@
         <span class="label">Atomic Notes</span>
         <span class="count">({{ orphanAtomics.length }})</span>
       </div>
-      <div class="section-content" v-show="expandedSections.atomics">
-        <div v-for="note in orphanAtomics" :key="note.id">
+      <div
+        v-show="expandedSections.atomics"
+        class="section-content"
+      >
+        <div
+          v-for="note in orphanAtomics"
+          :key="note.id"
+        >
           <div 
             class="nav-item"
             :class="{ active: selectedId === note.id }"
@@ -127,7 +163,10 @@
             <span class="file-name">{{ formatAtomicTitle(note.title) }}</span>
           </div>
           <!-- Nested notes that backlink to this atomic -->
-          <div v-if="getAtomicsFor(note).length > 0" class="nested-items">
+          <div
+            v-if="getAtomicsFor(note).length > 0"
+            class="nested-items"
+          >
             <div 
               v-for="child in getAtomicsFor(note)" 
               :key="child.id"

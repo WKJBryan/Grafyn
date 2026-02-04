@@ -1,13 +1,24 @@
 <template>
-  <div class="dialog-overlay" @click.self="$emit('cancel')">
+  <div
+    class="dialog-overlay"
+    @click.self="$emit('cancel')"
+  >
     <div class="dialog-content">
       <div class="dialog-header">
         <h3>{{ branchContext ? 'Branch Prompt' : 'New Prompt' }}</h3>
-        <button class="close-btn" @click="$emit('cancel')">&#10005;</button>
+        <button
+          class="close-btn"
+          @click="$emit('cancel')"
+        >
+          &#10005;
+        </button>
       </div>
 
       <!-- Branch Context Banner -->
-      <div v-if="branchContext" class="branch-context">
+      <div
+        v-if="branchContext"
+        class="branch-context"
+      >
         <span class="branch-icon">⑂</span>
         <span class="branch-text">
           Branching from <strong>{{ branchContext.parentContent?.model?.split('/').pop() || 'response' }}</strong>
@@ -24,12 +35,15 @@
             rows="4"
             class="prompt-input"
             @keydown.ctrl.enter="handleSubmit"
-          ></textarea>
+          />
         </div>
 
         <div class="form-group checkbox-group">
           <label class="checkbox-label">
-            <input type="checkbox" v-model="showSystemPrompt" />
+            <input
+              v-model="showSystemPrompt"
+              type="checkbox"
+            >
             <span>Add system prompt</span>
           </label>
           <textarea
@@ -38,57 +52,81 @@
             placeholder="Optional system prompt..."
             rows="2"
             class="system-input"
-          ></textarea>
+          />
         </div>
 
         <div class="form-group">
           <ModelSelector
-            :models="models"
             v-model="selectedModels"
+            :models="models"
           />
         </div>
 
-        <div class="advanced-toggle" @click="showAdvanced = !showAdvanced">
+        <div
+          class="advanced-toggle"
+          @click="showAdvanced = !showAdvanced"
+        >
           <span>Advanced Options</span>
           <span class="toggle-icon">{{ showAdvanced ? '-' : '+' }}</span>
         </div>
 
-        <div v-if="showAdvanced" class="advanced-options">
+        <div
+          v-if="showAdvanced"
+          class="advanced-options"
+        >
           <div class="form-row">
             <div class="form-group">
               <label for="temperature">Temperature: {{ temperature }}</label>
               <input
                 id="temperature"
-                type="range"
                 v-model.number="temperature"
+                type="range"
                 min="0"
                 max="2"
                 step="0.1"
                 class="slider"
-              />
+              >
             </div>
             <div class="form-group">
               <label for="maxTokens">Max Tokens</label>
               <input
                 id="maxTokens"
-                type="number"
                 v-model.number="maxTokens"
+                type="number"
                 min="100"
                 max="32000"
                 step="100"
                 class="number-input"
-              />
+              >
             </div>
           </div>
 
           <!-- Context Mode Selector -->
           <div class="form-group context-mode-group">
             <label for="contextMode">Context Mode</label>
-            <select id="contextMode" v-model="contextMode" class="select-input">
-              <option value="none">None (no additional context)</option>
-              <option value="semantic">Semantic Search (relevant notes & tiles)</option>
-              <option v-if="branchContext" value="full_history">Full History (all previous turns)</option>
-              <option v-if="branchContext" value="compact">Compact (summary + recent)</option>
+            <select
+              id="contextMode"
+              v-model="contextMode"
+              class="select-input"
+            >
+              <option value="none">
+                None (no additional context)
+              </option>
+              <option value="semantic">
+                Semantic Search (relevant notes & tiles)
+              </option>
+              <option
+                v-if="branchContext"
+                value="full_history"
+              >
+                Full History (all previous turns)
+              </option>
+              <option
+                v-if="branchContext"
+                value="compact"
+              >
+                Compact (summary + recent)
+              </option>
             </select>
             <span class="context-mode-hint">
               {{ contextModeHints[contextMode] }}
@@ -96,7 +134,10 @@
           </div>
           
           <!-- Context Budget Display -->
-          <div v-if="selectedModels.length > 0" class="form-group">
+          <div
+            v-if="selectedModels.length > 0"
+            class="form-group"
+          >
             <ContextBudgetDisplay
               :current-tokens="currentTokens"
               :max-tokens="maxContextTokens"
@@ -106,7 +147,12 @@
       </div>
 
       <div class="dialog-footer">
-        <button class="btn btn-secondary" @click="$emit('cancel')">Cancel</button>
+        <button
+          class="btn btn-secondary"
+          @click="$emit('cancel')"
+        >
+          Cancel
+        </button>
         <button
           class="btn btn-primary"
           :disabled="!canSubmit"

@@ -1,24 +1,37 @@
 <template>
-  <div class="dialog-overlay" @click.self="$emit('cancel')">
+  <div
+    class="dialog-overlay"
+    @click.self="$emit('cancel')"
+  >
     <div class="dialog-content">
       <div class="dialog-header">
         <h3>Add Models</h3>
-        <button class="close-btn" @click="$emit('cancel')">&times;</button>
+        <button
+          class="close-btn"
+          @click="$emit('cancel')"
+        >
+          &times;
+        </button>
       </div>
 
       <div class="dialog-body">
         <ModelSelector
-          :models="filteredModels"
           v-model="selectedModels"
+          :models="filteredModels"
         />
       </div>
 
       <div class="dialog-footer">
-        <button class="btn btn-secondary" @click="$emit('cancel')">Cancel</button>
+        <button
+          class="btn btn-secondary"
+          @click="$emit('cancel')"
+        >
+          Cancel
+        </button>
         <button
           class="btn btn-primary"
-          @click="handleSubmit"
           :disabled="selectedModels.length === 0"
+          @click="handleSubmit"
         >
           Add {{ selectedModels.length }} Model{{ selectedModels.length !== 1 ? 's' : '' }}
         </button>

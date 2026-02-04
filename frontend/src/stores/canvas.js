@@ -369,6 +369,32 @@ export const useCanvasStore = defineStore('canvas', () => {
     }
   }
 
+  async function deleteResponse(tileId, modelId) {
+    if (!currentSession.value) return
+
+    // Find the tile
+    const tile = currentSession.value.prompt_tiles.find(t => t.id === tileId)
+    if (!tile) return
+
+    // Optimistic update
+    const removedResponse = tile.responses[modelId]
+    delete tile.responses[modelId]
+    const modelIndex = tile.models.indexOf(modelId)
+    if (modelIndex !== -1) tile.models.splice(modelIndex, 1)
+
+    try {
+      await canvasApi.deleteResponse(currentSession.value.id, tileId, modelId)
+    } catch (err) {
+      console.error('Failed to delete response:', err)
+      // Revert
+      if (removedResponse) {
+        tile.responses[modelId] = removedResponse
+        tile.models.push(modelId)
+      }
+      throw err
+    }
+  }
+
   async function updateViewport(viewport) {
     if (!currentSession.value) return
 
@@ -789,6 +815,7 @@ export const useCanvasStore = defineStore('canvas', () => {
     updateLLMNodePosition,
     autoArrange,
     deleteTile,
+    deleteResponse,
     updateViewport,
     startDebate,
     continueDebate,

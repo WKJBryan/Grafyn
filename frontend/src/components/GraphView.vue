@@ -1,21 +1,38 @@
 <template>
-  <div class="graph-view" ref="container">
+  <div
+    ref="container"
+    class="graph-view"
+  >
     <div class="graph-toolbar">
-      <div class="toolbar-stats" v-if="stats">
+      <div
+        v-if="stats"
+        class="toolbar-stats"
+      >
         <span class="stat-item">{{ stats.nodes }} Notes</span>
         <span class="stat-divider">•</span>
         <span class="stat-item">{{ stats.edges }} Links</span>
       </div>
       <div class="toolbar-actions">
-        <button class="btn btn-secondary btn-sm" @click="refreshGraph" title="Refresh Graph">
+        <button
+          class="btn btn-secondary btn-sm"
+          title="Refresh Graph"
+          @click="refreshGraph"
+        >
           <span class="icon">&#8634;</span>
         </button>
-        <button class="btn btn-secondary btn-sm" @click="resetZoom" title="Reset Zoom">
-            <span class="icon">&#8693;</span>
+        <button
+          class="btn btn-secondary btn-sm"
+          title="Reset Zoom"
+          @click="resetZoom"
+        >
+          <span class="icon">&#8693;</span>
         </button>
       </div>
     </div>
-    <div class="graph-canvas" ref="canvas"></div>
+    <div
+      ref="canvas"
+      class="graph-canvas"
+    />
     
     <!-- Settings Panel -->
     <GraphSettings 
@@ -25,8 +42,11 @@
       @animate="restartSimulation"
     />
     
-    <div class="loading-overlay" v-if="loading">
-      <div class="spinner"></div>
+    <div
+      v-if="loading"
+      class="loading-overlay"
+    >
+      <div class="spinner" />
       <p>Loading graph...</p>
     </div>
   </div>

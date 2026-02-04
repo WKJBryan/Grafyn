@@ -12,16 +12,24 @@
         :class="['note-item', { selected: note.id === selected }]"
         @click="$emit('select', note.id)"
       >
-        <div class="note-item-title">{{ note.title || 'Untitled' }}</div>
+        <div class="note-item-title">
+          {{ note.title || 'Untitled' }}
+        </div>
         <div class="note-item-meta">
           <span :class="['status', `status-${note.status}`]">
             {{ note.status }}
           </span>
-          <span v-if="note.link_count !== undefined" class="link-count">
+          <span
+            v-if="note.link_count !== undefined"
+            class="link-count"
+          >
             {{ note.link_count }} links
           </span>
         </div>
-        <div v-if="note.tags && note.tags.length > 0" class="note-item-tags">
+        <div
+          v-if="note.tags && note.tags.length > 0"
+          class="note-item-tags"
+        >
           <span
             v-for="(tag, index) in note.tags.slice(0, 3)"
             :key="index"
@@ -29,14 +37,22 @@
           >
             {{ tag }}
           </span>
-          <span v-if="note.tags.length > 3" class="tag">
+          <span
+            v-if="note.tags.length > 3"
+            class="tag"
+          >
             +{{ note.tags.length - 3 }}
           </span>
         </div>
       </div>
       
-      <div v-if="notes.length === 0" class="empty-list">
-        <p class="text-muted">No notes yet</p>
+      <div
+        v-if="notes.length === 0"
+        class="empty-list"
+      >
+        <p class="text-muted">
+          No notes yet
+        </p>
       </div>
     </div>
   </div>

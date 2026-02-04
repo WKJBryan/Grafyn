@@ -433,6 +433,29 @@ class CanvasSessionStore:
 
         return False
 
+    def delete_response(
+        self, session_id: str, tile_id: str, model_id: str
+    ) -> bool:
+        """Delete a single model response from a tile"""
+        session = self._sessions.get(session_id)
+        if not session:
+            return False
+
+        for tile in session.prompt_tiles:
+            if tile.id == tile_id and model_id in tile.responses:
+                del tile.responses[model_id]
+                if model_id in tile.models:
+                    tile.models.remove(model_id)
+                session.updated_at = datetime.now(timezone.utc)
+                self._save(session)
+                logger.info(
+                    f"Deleted response {model_id} from tile {tile_id} "
+                    f"in session {session_id}"
+                )
+                return True
+
+        return False
+
     def save_session(self, session_id: str):
         """Explicitly save a session (call after streaming completes)"""
         session = self._sessions.get(session_id)

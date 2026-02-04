@@ -172,6 +172,17 @@ async def delete_tile(session_id: str, tile_id: str, request: Request):
         raise HTTPException(status_code=404, detail="Tile not found")
 
 
+@router.delete("/{session_id}/tiles/{tile_id}/responses/{model_id}", status_code=204)
+async def delete_response(
+    session_id: str, tile_id: str, model_id: str, request: Request
+):
+    """Delete a single LLM response from a tile"""
+    store = get_canvas_store(request)
+    decoded_model_id = unquote(model_id)
+    if not store.delete_response(session_id, tile_id, decoded_model_id):
+        raise HTTPException(status_code=404, detail="Response not found")
+
+
 @router.get("/{session_id}/edges", response_model=List[TileEdge])
 async def get_tile_edges(session_id: str, request: Request):
     """Get all parent-child tile edges for mind-map visualization (legacy)"""

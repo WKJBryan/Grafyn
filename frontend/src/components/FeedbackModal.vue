@@ -1,9 +1,17 @@
 <template>
-  <div class="feedback-modal-overlay" @click.self="$emit('close')">
+  <div
+    class="feedback-modal-overlay"
+    @click.self="$emit('close')"
+  >
     <div class="feedback-modal">
       <div class="modal-header">
         <h3>Send Feedback</h3>
-        <button class="close-btn" @click="$emit('close')">×</button>
+        <button
+          class="close-btn"
+          @click="$emit('close')"
+        >
+          ×
+        </button>
       </div>
 
       <div class="modal-body">
@@ -37,8 +45,11 @@
             placeholder="Brief summary of your feedback..."
             maxlength="200"
             @input="validateForm"
-          />
-          <span class="char-count" :class="{ error: title.length < 5 || title.length > 200 }">
+          >
+          <span
+            class="char-count"
+            :class="{ error: title.length < 5 || title.length > 200 }"
+          >
             {{ title.length }}/200
           </span>
         </div>
@@ -53,8 +64,11 @@
             maxlength="10000"
             rows="6"
             @input="validateForm"
-          ></textarea>
-          <span class="char-count" :class="{ error: description.length < 10 || description.length > 10000 }">
+          />
+          <span
+            class="char-count"
+            :class="{ error: description.length < 10 || description.length > 10000 }"
+          >
             {{ description.length }}/10000
           </span>
         </div>
@@ -63,14 +77,17 @@
         <div class="system-info-section">
           <label class="checkbox-label">
             <input
-              type="checkbox"
               v-model="includeSystemInfo"
+              type="checkbox"
               @change="loadSystemInfo"
-            />
+            >
             Include system information
           </label>
 
-          <div v-if="includeSystemInfo && systemInfo" class="system-info-preview">
+          <div
+            v-if="includeSystemInfo && systemInfo"
+            class="system-info-preview"
+          >
             <div class="info-item">
               <span class="info-label">Platform:</span>
               <span class="info-value">{{ systemInfo.platform }}</span>
@@ -87,30 +104,48 @@
         </div>
 
         <!-- Error Message -->
-        <div v-if="errorMessage" class="error-message">
+        <div
+          v-if="errorMessage"
+          class="error-message"
+        >
           {{ errorMessage }}
         </div>
 
         <!-- Success Message -->
-        <div v-if="successMessage" class="success-message">
+        <div
+          v-if="successMessage"
+          class="success-message"
+        >
           {{ successMessage }}
-          <a v-if="issueUrl" :href="issueUrl" target="_blank" class="issue-link">
+          <a
+            v-if="issueUrl"
+            :href="issueUrl"
+            target="_blank"
+            class="issue-link"
+          >
             View Issue →
           </a>
         </div>
       </div>
 
       <div class="modal-footer">
-        <button class="btn btn-ghost" @click="$emit('close')" :disabled="isSubmitting">
+        <button
+          class="btn btn-ghost"
+          :disabled="isSubmitting"
+          @click="$emit('close')"
+        >
           {{ submitted ? 'Close' : 'Cancel' }}
         </button>
         <button
           v-if="!submitted"
           class="btn btn-primary"
-          @click="handleSubmit"
           :disabled="!isValid || isSubmitting"
+          @click="handleSubmit"
         >
-          <span v-if="isSubmitting" class="loading-spinner"></span>
+          <span
+            v-if="isSubmitting"
+            class="loading-spinner"
+          />
           {{ isSubmitting ? 'Submitting...' : 'Submit Feedback' }}
         </button>
       </div>

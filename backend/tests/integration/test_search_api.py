@@ -7,7 +7,7 @@ import pytest
 from fastapi.testclient import TestClient
 from unittest.mock import MagicMock
 
-from app.main import create_app
+from app.main import app as _app
 from app.models.note import Note, SearchResult, NoteFrontmatter
 
 
@@ -40,20 +40,8 @@ def mock_vector_search():
     search = MagicMock()
 
     sample_results = [
-        SearchResult(
-            note_id="note-1",
-            title="Machine Learning Basics",
-            snippet="...introduction to machine learning...",
-            score=0.92,
-            tags=["ml", "ai"]
-        ),
-        SearchResult(
-            note_id="note-2",
-            title="Deep Learning Guide",
-            snippet="...neural networks and deep learning...",
-            score=0.85,
-            tags=["deep-learning"]
-        )
+        {"note_id": "note-1", "title": "Machine Learning Basics", "snippet": "...introduction to machine learning...", "score": 0.92, "tags": ["ml", "ai"]},
+        {"note_id": "note-2", "title": "Deep Learning Guide", "snippet": "...neural networks and deep learning...", "score": 0.85, "tags": ["deep-learning"]}
     ]
 
     search.search.return_value = sample_results
@@ -63,7 +51,7 @@ def mock_vector_search():
 @pytest.fixture
 def test_app(mock_knowledge_store, mock_vector_search):
     """Create test application with mocked services"""
-    app = create_app()
+    app = _app
     app.state.knowledge_store = mock_knowledge_store
     app.state.vector_search = mock_vector_search
     return app

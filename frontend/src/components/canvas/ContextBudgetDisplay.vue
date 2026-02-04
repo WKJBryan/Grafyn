@@ -1,5 +1,8 @@
 <template>
-  <div class="context-budget-display" :class="{ warning: isWarning, error: isError }">
+  <div
+    class="context-budget-display"
+    :class="{ warning: isWarning, error: isError }"
+  >
     <div class="budget-header">
       <span class="budget-label">Context Budget</span>
       <span class="budget-count">{{ currentTokens.toLocaleString() }} / {{ maxTokens.toLocaleString() }}</span>
@@ -10,14 +13,23 @@
         class="progress-bar" 
         :style="{ width: `${percentage}%` }"
         :class="{ 'warning-bar': isWarning, 'error-bar': isError }"
-      ></div>
+      />
     </div>
     
     <div class="budget-footer">
       <span class="percentage-text">{{ percentage.toFixed(1) }}%</span>
-      <span v-if="isError" class="status-text error-text">Over limit!</span>
-      <span v-else-if="isWarning" class="status-text warning-text">Approaching limit</span>
-      <span v-else class="status-text">OK</span>
+      <span
+        v-if="isError"
+        class="status-text error-text"
+      >Over limit!</span>
+      <span
+        v-else-if="isWarning"
+        class="status-text warning-text"
+      >Approaching limit</span>
+      <span
+        v-else
+        class="status-text"
+      >OK</span>
     </div>
   </div>
 </template>

@@ -1,9 +1,17 @@
 <template>
-  <div class="topic-selector-overlay" @click.self="$emit('close')">
+  <div
+    class="topic-selector-overlay"
+    @click.self="$emit('close')"
+  >
     <div class="topic-selector">
       <div class="selector-header">
         <h3>Select Note Topic</h3>
-        <button class="close-btn" @click="$emit('close')">×</button>
+        <button
+          class="close-btn"
+          @click="$emit('close')"
+        >
+          ×
+        </button>
       </div>
       
       <div class="selector-body">
@@ -38,11 +46,14 @@
               type="text"
               placeholder="Create new topic or select below..."
               @keyup.enter="handleCreate"
-            />
+            >
           </div>
           
           <!-- Existing topics -->
-          <div class="existing-topics" v-if="existingTopics.length > 0">
+          <div
+            v-if="existingTopics.length > 0"
+            class="existing-topics"
+          >
             <div 
               v-for="topic in existingTopics" 
               :key="topic"
@@ -57,9 +68,9 @@
           <div class="no-topic-option">
             <label class="checkbox-label">
               <input 
-                type="checkbox" 
-                v-model="skipTopic"
-              />
+                v-model="skipTopic" 
+                type="checkbox"
+              >
               Skip - create without topic
             </label>
           </div>
@@ -67,11 +78,16 @@
       </div>
 
       <div class="selector-footer">
-        <button class="btn btn-ghost" @click="$emit('close')">Cancel</button>
+        <button
+          class="btn btn-ghost"
+          @click="$emit('close')"
+        >
+          Cancel
+        </button>
         <button 
           class="btn btn-primary" 
-          @click="handleCreate"
           :disabled="!canCreate"
+          @click="handleCreate"
         >
           Create Note
         </button>

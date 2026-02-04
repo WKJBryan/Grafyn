@@ -1,6 +1,11 @@
 <template>
-  <div class="on-this-page" v-if="headers.length > 0">
-    <div class="otp-header">On this page</div>
+  <div
+    v-if="headers.length > 0"
+    class="on-this-page"
+  >
+    <div class="otp-header">
+      On this page
+    </div>
     <div class="otp-list">
       <div 
         v-for="(header, index) in headers" 

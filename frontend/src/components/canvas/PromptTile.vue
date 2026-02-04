@@ -14,23 +14,26 @@
         <button
           class="select-btn"
           :class="{ active: selected }"
-          @click.stop="$emit('select', tile.id)"
           title="Select for debate"
+          @click.stop="$emit('select', tile.id)"
         >
           <span v-if="selected">&#10003;</span>
           <span v-else>&#9675;</span>
         </button>
         <button
           class="delete-btn"
-          @click.stop="$emit('delete', tile.id)"
           title="Delete tile"
+          @click.stop="$emit('delete', tile.id)"
         >
           &#10005;
         </button>
       </div>
     </div>
 
-    <div class="responses-grid" :style="gridStyle">
+    <div
+      class="responses-grid"
+      :style="gridStyle"
+    >
       <ModelResponseCard
         v-for="(response, modelId) in tile.responses"
         :key="modelId"
@@ -40,12 +43,23 @@
     </div>
 
     <!-- Branch Input Section -->
-    <div class="branch-section" v-if="!isStreaming">
-      <div v-if="!showBranchInput" class="branch-trigger" @click.stop="showBranchInput = true">
+    <div
+      v-if="!isStreaming"
+      class="branch-section"
+    >
+      <div
+        v-if="!showBranchInput"
+        class="branch-trigger"
+        @click.stop="showBranchInput = true"
+      >
         <span class="branch-icon">⑂</span>
         <span>Branch from here...</span>
       </div>
-      <div v-else class="branch-input-container" @click.stop>
+      <div
+        v-else
+        class="branch-input-container"
+        @click.stop
+      >
         <textarea
           ref="branchInputRef"
           v-model="branchPrompt"
@@ -54,13 +68,22 @@
           class="branch-textarea"
           @keydown.ctrl.enter="submitBranch"
           @keydown.escape="closeBranchInput"
-        ></textarea>
+        />
         <div class="branch-options">
           <label class="context-label">Context:</label>
-          <select v-model="branchContextMode" class="context-select">
-            <option value="full_history">Full History</option>
-            <option value="compact">Compact</option>
-            <option value="semantic">Semantic</option>
+          <select
+            v-model="branchContextMode"
+            class="context-select"
+          >
+            <option value="full_history">
+              Full History
+            </option>
+            <option value="compact">
+              Compact
+            </option>
+            <option value="semantic">
+              Semantic
+            </option>
           </select>
         </div>
         <ContextBudgetDisplay
@@ -69,8 +92,17 @@
           :compact="true"
         />
         <div class="branch-actions">
-          <button class="branch-cancel" @click.stop="closeBranchInput">Cancel</button>
-          <button class="branch-submit" @click.stop="submitBranch" :disabled="!branchPrompt.trim()">
+          <button
+            class="branch-cancel"
+            @click.stop="closeBranchInput"
+          >
+            Cancel
+          </button>
+          <button
+            class="branch-submit"
+            :disabled="!branchPrompt.trim()"
+            @click.stop="submitBranch"
+          >
             Send to {{ modelCount }} model{{ modelCount !== 1 ? 's' : '' }}
           </button>
         </div>
@@ -83,7 +115,10 @@
     </div>
 
     <!-- Resize handle -->
-    <div class="resize-handle" @mousedown.stop="startResize"></div>
+    <div
+      class="resize-handle"
+      @mousedown.stop="startResize"
+    />
   </div>
 </template>
 
