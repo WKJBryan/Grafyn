@@ -150,7 +150,7 @@ jobs:
             See the assets below to download and install.
 
             **Auto-update:** If you already have Seedream installed, the app will prompt you to update automatically.
-          releaseDraft: true
+          releaseDraft: false
           prerelease: false
           updaterJsonPreferNsis: true
 
