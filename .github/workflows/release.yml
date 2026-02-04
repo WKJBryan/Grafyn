@@ -77,7 +77,7 @@ jobs:
       # Setup Rust
       # ========================================
       - name: Setup Rust
-        uses: dtolnay/rust-action@stable
+        uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
@@ -140,6 +140,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
           TAURI_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
+          TAURI_CONFIG: '{"tauri":{"bundle":{"externalBin":[]}}}'
         with:
           projectPath: frontend
           args: --target ${{ matrix.target }}
