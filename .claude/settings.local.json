@@ -67,7 +67,36 @@
       "Bash(1 -C frontend/src-tauri)",
       "Bash(find:*)",
       "Bash(rustup target add:*)",
-      "Bash(cmd //c \"C:\\\\Users\\\\bryan\\\\Seedream\\\\frontend\\\\run-tauri-dev.bat\")"
+      "Bash(cmd //c \"C:\\\\Users\\\\bryan\\\\Seedream\\\\frontend\\\\run-tauri-dev.bat\")",
+      "Bash(PYTHONPATH=\"C:/Users/bryan/Seedream/backend\" python -m pytest:*)",
+      "Bash(for f in \"C:\\\\Users\\\\bryan\\\\Seedream\\\\backend\\\\app\\\\routers\"/*.py)",
+      "Bash(done)",
+      "Bash(sort:*)",
+      "Bash(ls -la \"C:\\\\Users\\\\bryan\\\\Seedream\\\\frontend\\\\src-tauri\\\\target\\\\release\\\\bundle\"\" 2>/dev/null || echo \"Bundle directory not found - app may not be built yet \")",
+      "Bash(\"/c/Program Files/GitHub CLI/gh.exe\" auth status)",
+      "Bash(echo $GITHUB_TOKEN)",
+      "Bash(if [ -z \"$GITHUB_TOKEN\" ])",
+      "Bash(then echo \"No GITHUB_TOKEN env var\")",
+      "Bash(fi)",
+      "Bash(./build-tauri.bat)",
+      "Bash(node -e:*)",
+      "Bash(node scripts/bump-version.cjs:*)",
+      "Bash(npx tauri signer generate:*)",
+      "Bash(printf:*)",
+      "Bash(gh auth:*)",
+      "Bash(echo:*)",
+      "Bash(gh run list:*)",
+      "Bash(gh run view:*)",
+      "Bash(git tag:*)",
+      "Bash(gh run watch:*)",
+      "Bash(gh release:*)",
+      "Bash(gh api repos/Building0/Seedream/actions/runs/21667342551/jobs --jq '.jobs[] | select\\(.name | contains\\(\"\"aarch64-apple-darwin\"\"\\)\\) | .id')",
+      "Bash(gh api:*)",
+      "Bash(gh secret:*)",
+      "Bash(ls:*)",
+      "Bash(xargs:*)",
+      "Bash(grep:*)"
     ]
-  }
+  },
+  "outputStyle": "Explanatory"
 }

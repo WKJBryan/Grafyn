@@ -67,12 +67,28 @@ async function createIco() {
 
 async function main() {
   try {
-    // Generate PNG icons
-    await createIcon(32, '32x32.png');
-    await createIcon(128, '128x128.png');
-    await createIcon(256, '128x128@2x.png');
-    await createIcon(512, 'icon.png');
-    await createIcon(1024, 'app-icon.png');
+    const appIconPath = path.join(iconsDir, 'app-icon.png');
+
+    if (fs.existsSync(appIconPath)) {
+      console.log('Generating icons from existing app-icon.png...');
+      const sourceBuffer = fs.readFileSync(appIconPath);
+
+      // Generate PNGs
+      await sharp(sourceBuffer).resize(32, 32).toFile(path.join(iconsDir, '32x32.png'));
+      await sharp(sourceBuffer).resize(128, 128).toFile(path.join(iconsDir, '128x128.png'));
+      await sharp(sourceBuffer).resize(256, 256).toFile(path.join(iconsDir, '128x128@2x.png'));
+      await sharp(sourceBuffer).resize(512, 512).toFile(path.join(iconsDir, 'icon.png'));
+
+      console.log('Generated PNG sizes');
+    } else {
+      console.log('No app-icon.png found, generating placeholders...');
+      // Generate placeholder PNG icons
+      await createIcon(32, '32x32.png');
+      await createIcon(128, '128x128.png');
+      await createIcon(256, '128x128@2x.png');
+      await createIcon(512, 'icon.png');
+      await createIcon(1024, 'app-icon.png');
+    }
 
     // For ICO, just copy the 256 PNG (Tauri's icon command can convert it)
     const icon256 = await sharp(path.join(iconsDir, '128x128@2x.png')).toBuffer();

@@ -3,7 +3,16 @@ nul
 .claude/settings.local.json
 *.key
 .playwright-mcp/canvas-ui.png
-.gitignore
 .playwright-mcp/context-mode-ui.png
 .playwright-mcp/context-mode-complete.png
-.claude/settings.local.json
+
+# Build artifacts & sidecar binaries
+frontend/src-tauri/binaries/
+*.pyc
+__pycache__/
+
+# Runtime data (user-specific)
+data/lancedb/
+data/import/
+data/tokens.json
+import files/
