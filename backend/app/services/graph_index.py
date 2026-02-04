@@ -8,14 +8,19 @@ from app.services.knowledge_store import KnowledgeStore
 
 class GraphIndexService:
     """Service for managing knowledge graph with wikilinks and backlinks"""
-    
-    def __init__(self):
-        """Initialize graph index"""
+
+    def __init__(self, knowledge_store: Optional[KnowledgeStore] = None):
+        """Initialize graph index
+
+        Args:
+            knowledge_store: Optional KnowledgeStore instance for dependency injection.
+                           If not provided, creates a new instance.
+        """
         self._outgoing: Dict[str, Set[str]] = {}  # note_id -> linked note IDs
         self._incoming: Dict[str, Set[str]] = {}  # note_id -> notes linking to it
         self._title_to_id: Dict[str, str] = {}    # title -> note_id (for resolving wikilinks)
         self._id_to_title: Dict[str, str] = {}    # note_id -> title (reverse lookup)
-        self._knowledge_store = KnowledgeStore()
+        self._knowledge_store = knowledge_store or KnowledgeStore()
         self._build_index()
     
     def _build_index(self):

@@ -77,7 +77,7 @@ def merge_tags(yaml_tags: List[str], inline_tags: List[str]) -> List[str]:
     Deleting a #tag from body does NOT remove it from YAML.
     """
     normalized = set(normalize_tag(t) for t in yaml_tags)
-    normalized.update(inline_tags)
+    normalized.update(normalize_tag(t) for t in inline_tags)
     return sorted(normalized)
 
 
