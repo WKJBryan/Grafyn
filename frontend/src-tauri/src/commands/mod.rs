@@ -1,6 +1,7 @@
 pub mod canvas;
 pub mod feedback;
 pub mod graph;
+pub mod mcp;
 pub mod notes;
 pub mod search;
 pub mod settings;
