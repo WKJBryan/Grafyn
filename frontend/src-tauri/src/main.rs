@@ -10,6 +10,7 @@ use services::{
     feedback::FeedbackService,
     graph_index::GraphIndex,
     knowledge_store::KnowledgeStore,
+    mcp_sidecar::McpSidecarService,
     openrouter::OpenRouterService,
     search::SearchService,
     settings::SettingsService,
@@ -27,6 +28,7 @@ pub struct AppState {
     pub openrouter: Arc<RwLock<OpenRouterService>>,
     pub feedback_service: Arc<RwLock<FeedbackService>>,
     pub settings_service: Arc<RwLock<SettingsService>>,
+    pub mcp_sidecar: Arc<McpSidecarService>,
 }
 
 fn main() {
@@ -71,6 +73,23 @@ fn main() {
                 get_feedback_token(),
             );
 
+            // Initialize MCP sidecar service (for Python backend with MCP support)
+            // This enables Claude Desktop and ChatGPT to connect to the knowledge base
+            let mcp_port = std::env::var("MCP_PORT")
+                .ok()
+                .and_then(|p| p.parse().ok());
+            let mcp_sidecar = McpSidecarService::new(
+                vault_path.clone(),
+                data_path.clone(),
+                mcp_port,
+            );
+
+            // Check if MCP sidecar should be enabled (env var overrides settings)
+            let mcp_enabled = std::env::var("MCP_ENABLED")
+                .map(|v| v == "1" || v.to_lowercase() == "true")
+                .unwrap_or_else(|_| settings_service.mcp_enabled());
+            mcp_sidecar.set_enabled(mcp_enabled);
+
             // Build initial indices
             let mut ks = knowledge_store.clone();
             let notes = ks.list_notes().unwrap_or_default();
@@ -79,6 +98,7 @@ fn main() {
             gi.build_index(&notes);
 
             // Create app state
+            let mcp_sidecar_arc = Arc::new(mcp_sidecar);
             let state = AppState {
                 knowledge_store: Arc::new(RwLock::new(knowledge_store)),
                 graph_index: Arc::new(RwLock::new(graph_index)),
@@ -87,9 +107,24 @@ fn main() {
                 openrouter: Arc::new(RwLock::new(openrouter)),
                 feedback_service: Arc::new(RwLock::new(feedback_service)),
                 settings_service: Arc::new(RwLock::new(settings_service)),
+                mcp_sidecar: mcp_sidecar_arc.clone(),
             };
 
             app.manage(state);
+
+            // Start MCP sidecar if enabled (with health monitoring)
+            if mcp_enabled {
+                let app_handle = app.handle();
+                let sidecar = mcp_sidecar_arc.clone();
+                tauri::async_runtime::spawn(async move {
+                    log::info!("MCP sidecar is enabled, starting Python backend...");
+                    if let Err(e) = sidecar.start_monitored(&app_handle).await {
+                        log::error!("Failed to start MCP sidecar: {}", e);
+                    }
+                });
+            } else {
+                log::info!("MCP sidecar is disabled. Set MCP_ENABLED=1 to enable.");
+            }
 
             Ok(())
         })
@@ -134,6 +169,13 @@ fn main() {
             commands::settings::pick_vault_folder,
             commands::settings::validate_openrouter_key,
             commands::settings::get_openrouter_status,
+            // MCP sidecar commands
+            commands::mcp::get_mcp_status,
+            commands::mcp::start_mcp_sidecar,
+            commands::mcp::stop_mcp_sidecar,
+            commands::mcp::restart_mcp_sidecar,
+            commands::mcp::check_mcp_health,
+            commands::mcp::get_mcp_config_snippet,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
