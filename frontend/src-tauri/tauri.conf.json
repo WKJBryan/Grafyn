@@ -11,19 +11,55 @@
   },
   "tauri": {
     "allowlist": {
-      "all": true,
-      "fs": {
-        "all": true,
-        "scope": ["$DOCUMENT/*", "$HOME/*", "$APP/*", "$DATA/*"]
-      },
-      "path": {
+      "clipboard": {
         "all": true
       },
       "dialog": {
         "all": true
       },
+      "fs": {
+        "all": true,
+        "scope": [
+          "$DOCUMENT/*",
+          "$HOME/*",
+          "$APP/*",
+          "$DATA/*"
+        ]
+      },
+      "globalShortcut": {
+        "all": true
+      },
+      "notification": {
+        "all": true
+      },
+      "os": {
+        "all": true
+      },
+      "path": {
+        "all": true
+      },
+      "process": {
+        "all": true
+      },
+      "protocol": {
+        "all": true,
+        "asset": true,
+        "assetScope": [
+          "$DOCUMENT/*",
+          "$HOME/*",
+          "$APP/*",
+          "$DATA/*"
+        ]
+      },
       "shell": {
-        "all": false
+        "sidecar": true,
+        "scope": [
+          {
+            "name": "binaries/seedream-backend",
+            "sidecar": true,
+            "args": true
+          }
+        ]
       },
       "window": {
         "all": true
@@ -36,7 +72,9 @@
       "deb": {
         "depends": []
       },
-      "externalBin": [],
+      "externalBin": [
+        "binaries/seedream-backend"
+      ],
       "icon": [
         "icons/32x32.png",
         "icons/128x128.png",
@@ -66,7 +104,12 @@
       "csp": null
     },
     "updater": {
-      "active": false
+      "active": true,
+      "dialog": true,
+      "pubkey": "PASTE_YOUR_PUBLIC_KEY_HERE",
+      "endpoints": [
+        "https://github.com/Building0/Seedream/releases/latest/download/latest.json"
+      ]
     },
     "windows": [
       {
