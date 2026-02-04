@@ -2,28 +2,49 @@
   <div class="backlinks-panel">
     <div class="panel-header">
       <h3>Backlinks</h3>
-      <span v-if="backlinks.length > 0" class="backlink-count">
+      <span
+        v-if="backlinks.length > 0"
+        class="backlink-count"
+      >
         {{ backlinks.length }}
       </span>
     </div>
 
-    <div v-if="loading" class="loading-state">
-      <p class="text-muted">Loading...</p>
+    <div
+      v-if="loading"
+      class="loading-state"
+    >
+      <p class="text-muted">
+        Loading...
+      </p>
     </div>
 
-    <div v-else-if="backlinks.length === 0" class="empty-state">
-      <p class="text-muted">No backlinks yet</p>
+    <div
+      v-else-if="backlinks.length === 0"
+      class="empty-state"
+    >
+      <p class="text-muted">
+        No backlinks yet
+      </p>
     </div>
 
-    <div v-else class="backlinks-list">
+    <div
+      v-else
+      class="backlinks-list"
+    >
       <div
         v-for="backlink in backlinks"
         :key="backlink.note_id"
         class="backlink-item card card-hover"
         @click="$emit('navigate', backlink.note_id)"
       >
-        <div class="backlink-title">{{ backlink.title }}</div>
-        <div v-if="backlink.context" class="backlink-context">
+        <div class="backlink-title">
+          {{ backlink.title }}
+        </div>
+        <div
+          v-if="backlink.context"
+          class="backlink-context"
+        >
           {{ backlink.context }}
         </div>
       </div>

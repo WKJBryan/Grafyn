@@ -1,32 +1,53 @@
 <template>
-  <div class="canvas-container" ref="container">
+  <div
+    ref="container"
+    class="canvas-container"
+  >
     <div class="canvas-toolbar">
       <div class="toolbar-left">
-        <span class="session-title" v-if="session">{{ session.title }}</span>
-        <span class="toolbar-stats" v-if="session">
+        <span
+          v-if="session"
+          class="session-title"
+        >{{ session.title }}</span>
+        <span
+          v-if="session"
+          class="toolbar-stats"
+        >
           <span class="stat-item">{{ promptTiles.length }} Prompts</span>
           <span class="stat-divider">|</span>
           <span class="stat-item">{{ llmNodes.length }} Responses</span>
           <span class="stat-divider">|</span>
           <span class="stat-item">{{ debates.length }} Debates</span>
         </span>
-        <span v-if="session?.linked_note_id" class="linked-note-badge" title="Saved as note">
+        <span
+          v-if="session?.linked_note_id"
+          class="linked-note-badge"
+          title="Saved as note"
+        >
           Linked
         </span>
       </div>
       <div class="toolbar-actions">
-        <div class="arrange-dropdown" ref="arrangeDropdown">
+        <div
+          ref="arrangeDropdown"
+          class="arrange-dropdown"
+        >
           <button
             class="btn btn-secondary btn-sm"
-            @click="toggleArrangeMenu"
             :disabled="!session || promptTiles.length === 0"
             title="Auto-arrange nodes"
+            @click="toggleArrangeMenu"
           >
             <span class="icon">⊞</span> Arrange
             <span class="dropdown-arrow">▼</span>
           </button>
-          <div class="dropdown-menu" v-if="showArrangeMenu">
-            <div class="dropdown-header">Layout Algorithm</div>
+          <div
+            v-if="showArrangeMenu"
+            class="dropdown-menu"
+          >
+            <div class="dropdown-header">
+              Layout Algorithm
+            </div>
             <button
               class="dropdown-item"
               :class="{ active: layoutAlgorithm === 'hierarchical' }"
@@ -64,28 +85,46 @@
         </div>
         <button
           class="btn btn-secondary btn-sm"
-          @click="handleSaveAsNote"
           :disabled="!session || saving"
           title="Save as Note"
+          @click="handleSaveAsNote"
         >
           {{ saving ? 'Saving...' : 'Save as Note' }}
         </button>
-        <span class="toolbar-divider"></span>
-        <button class="btn btn-secondary btn-sm" @click="resetZoom" title="Reset View">
+        <span class="toolbar-divider" />
+        <button
+          class="btn btn-secondary btn-sm"
+          title="Reset View"
+          @click="resetZoom"
+        >
           <span class="icon">&#8693;</span>
         </button>
-        <button class="btn btn-secondary btn-sm" @click="zoomIn" title="Zoom In">
+        <button
+          class="btn btn-secondary btn-sm"
+          title="Zoom In"
+          @click="zoomIn"
+        >
           <span class="icon">+</span>
         </button>
-        <button class="btn btn-secondary btn-sm" @click="zoomOut" title="Zoom Out">
+        <button
+          class="btn btn-secondary btn-sm"
+          title="Zoom Out"
+          @click="zoomOut"
+        >
           <span class="icon">-</span>
         </button>
         <span class="zoom-level">{{ Math.round(viewport.zoom * 100) }}%</span>
       </div>
     </div>
 
-    <div class="canvas-surface" ref="surface">
-      <div class="canvas-content" :style="transformStyle">
+    <div
+      ref="surface"
+      class="canvas-surface"
+    >
+      <div
+        class="canvas-content"
+        :style="transformStyle"
+      >
         <!-- SVG layer for edges -->
         <svg class="edges-layer">
           <!-- Prompt → LLM edges -->
@@ -156,7 +195,10 @@
     </div>
 
     <!-- Minimap -->
-    <div class="minimap" v-if="session && (promptTiles.length > 0 || llmNodes.length > 0)">
+    <div
+      v-if="session && (promptTiles.length > 0 || llmNodes.length > 0)"
+      class="minimap"
+    >
       <div class="minimap-content">
         <!-- Prompt nodes in minimap -->
         <div
@@ -165,7 +207,7 @@
           class="minimap-node minimap-prompt"
           :style="minimapPromptStyle(tile)"
           @click="panToNode(tile.position)"
-        ></div>
+        />
         <!-- LLM nodes in minimap -->
         <div
           v-for="node in llmNodes"
@@ -173,8 +215,11 @@
           class="minimap-node minimap-llm"
           :style="minimapLLMStyle(node)"
           @click="panToNode(node.response.position)"
-        ></div>
-        <div class="minimap-viewport" :style="minimapViewportStyle"></div>
+        />
+        <div
+          class="minimap-viewport"
+          :style="minimapViewportStyle"
+        />
       </div>
     </div>
 
@@ -182,8 +227,8 @@
     <div class="canvas-floating-actions">
       <button
         class="btn btn-primary"
-        @click="handleNewPromptClick"
         :disabled="!session"
+        @click="handleNewPromptClick"
       >
         + New Prompt
       </button>
@@ -222,22 +267,43 @@
     />
 
     <!-- API Key Required Dialog -->
-    <div v-if="showApiKeyRequired" class="dialog-overlay" @click.self="showApiKeyRequired = false">
+    <div
+      v-if="showApiKeyRequired"
+      class="dialog-overlay"
+      @click.self="showApiKeyRequired = false"
+    >
       <div class="api-key-dialog">
         <div class="dialog-header">
           <h3>🔑 OpenRouter API Key Required</h3>
-          <button class="close-btn" @click="showApiKeyRequired = false">&#10005;</button>
+          <button
+            class="close-btn"
+            @click="showApiKeyRequired = false"
+          >
+            &#10005;
+          </button>
         </div>
         <div class="dialog-body">
           <p>To use the Multi-LLM Canvas, you need to configure your OpenRouter API key.</p>
           <p class="hint">
             OpenRouter provides access to 100+ AI models including GPT-4, Claude, Gemini, and more.
-            <a href="https://openrouter.ai/keys" target="_blank" rel="noopener">Get your API key →</a>
+            <a
+              href="https://openrouter.ai/keys"
+              target="_blank"
+              rel="noopener"
+            >Get your API key →</a>
           </p>
         </div>
         <div class="dialog-footer">
-          <button class="btn btn-secondary" @click="showApiKeyRequired = false">Cancel</button>
-          <button class="btn btn-primary" @click="openSettingsForApiKey">
+          <button
+            class="btn btn-secondary"
+            @click="showApiKeyRequired = false"
+          >
+            Cancel
+          </button>
+          <button
+            class="btn btn-primary"
+            @click="openSettingsForApiKey"
+          >
             Open Settings
           </button>
         </div>
@@ -245,14 +311,20 @@
     </div>
 
     <!-- Loading Overlay -->
-    <div class="loading-overlay" v-if="loading">
-      <div class="spinner"></div>
+    <div
+      v-if="loading"
+      class="loading-overlay"
+    >
+      <div class="spinner" />
       <p>Loading...</p>
     </div>
 
     <!-- Arranging Overlay -->
-    <div class="arranging-overlay" v-if="arranging">
-      <div class="spinner"></div>
+    <div
+      v-if="arranging"
+      class="arranging-overlay"
+    >
+      <div class="spinner" />
       <p>Arranging nodes...</p>
     </div>
 
@@ -655,10 +727,17 @@ async function handleDeletePrompt(tileId) {
 }
 
 async function handleDeleteLLMNode(info) {
-  // TODO: Implement individual LLM node deletion
-  // For now, we just deselect it
+  if (!confirm('Delete this model response? This action cannot be undone.')) {
+    return
+  }
+
   const nodeId = `llm:${info.tileId}:${info.modelId}`
-  selectedNodes.value = selectedNodes.value.filter(id => id !== nodeId)
+  try {
+    await canvasStore.deleteResponse(info.tileId, info.modelId)
+    selectedNodes.value = selectedNodes.value.filter(id => id !== nodeId)
+  } catch (err) {
+    console.error('Failed to delete LLM response:', err)
+  }
 }
 
 // Handle regenerate response

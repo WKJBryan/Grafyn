@@ -2,8 +2,12 @@
   <div class="login-view">
     <div class="login-container">
       <div class="login-card">
-        <h1 class="login-title">Welcome to Seedream</h1>
-        <p class="login-subtitle">Your personal knowledge management system</p>
+        <h1 class="login-title">
+          Welcome to Seedream
+        </h1>
+        <p class="login-subtitle">
+          Your personal knowledge management system
+        </p>
         
         <div class="login-providers">
           <button

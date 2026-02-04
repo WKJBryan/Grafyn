@@ -6,14 +6,21 @@
     </div>
 
     <!-- Selected Models Tags -->
-    <div v-if="selectedModels.length > 0" class="selected-tags">
+    <div
+      v-if="selectedModels.length > 0"
+      class="selected-tags"
+    >
       <span
         v-for="modelId in selectedModels"
         :key="modelId"
         class="model-tag"
       >
         <span class="tag-name">{{ getModelDisplayName(modelId) }}</span>
-        <button class="tag-remove" @click.stop="removeModel(modelId)" title="Remove">&times;</button>
+        <button
+          class="tag-remove"
+          title="Remove"
+          @click.stop="removeModel(modelId)"
+        >&times;</button>
       </span>
     </div>
 
@@ -23,13 +30,28 @@
         type="text"
         placeholder="Search models..."
         class="search-input"
-      />
+      >
     </div>
 
     <div class="quick-actions">
-      <button class="btn btn-sm btn-ghost" @click="selectPopular">Popular</button>
-      <button class="btn btn-sm btn-ghost" @click="selectAll">All</button>
-      <button class="btn btn-sm btn-ghost" @click="clearSelection">Clear</button>
+      <button
+        class="btn btn-sm btn-ghost"
+        @click="selectPopular"
+      >
+        Popular
+      </button>
+      <button
+        class="btn btn-sm btn-ghost"
+        @click="selectAll"
+      >
+        All
+      </button>
+      <button
+        class="btn btn-sm btn-ghost"
+        @click="clearSelection"
+      >
+        Clear
+      </button>
     </div>
 
     <div class="model-groups">
@@ -38,13 +60,19 @@
         :key="provider"
         class="model-group"
       >
-        <div class="group-header" @click="toggleGroup(provider.toLowerCase())">
+        <div
+          class="group-header"
+          @click="toggleGroup(provider.toLowerCase())"
+        >
           <span class="provider-name">{{ provider }}</span>
           <span class="group-count">({{ models.length }})</span>
           <span class="expand-icon">{{ expandedGroups.has(provider.toLowerCase()) ? '-' : '+' }}</span>
         </div>
 
-        <div v-show="expandedGroups.has(provider.toLowerCase())" class="group-models">
+        <div
+          v-show="expandedGroups.has(provider.toLowerCase())"
+          class="group-models"
+        >
           <label
             v-for="model in models"
             :key="model.id"
@@ -52,17 +80,23 @@
             :class="{ selected: selectedModels.includes(model.id) }"
           >
             <input
+              v-model="selectedModels"
               type="checkbox"
               :value="model.id"
-              v-model="selectedModels"
               class="model-checkbox"
-            />
+            >
             <div class="model-info">
               <span class="model-name">{{ model.name }}</span>
               <div class="model-pricing">
-                <span class="pricing-item" title="Input cost per 1M tokens">${{ formatPrice(model.pricing?.prompt) }}</span>
+                <span
+                  class="pricing-item"
+                  title="Input cost per 1M tokens"
+                >${{ formatPrice(model.pricing?.prompt) }}</span>
                 <span class="pricing-divider">/</span>
-                <span class="pricing-item" title="Output cost per 1M tokens">${{ formatPrice(model.pricing?.completion) }}</span>
+                <span
+                  class="pricing-item"
+                  title="Output cost per 1M tokens"
+                >${{ formatPrice(model.pricing?.completion) }}</span>
               </div>
               <span class="model-ctx">{{ formatContextLength(model.context_length) }}</span>
             </div>

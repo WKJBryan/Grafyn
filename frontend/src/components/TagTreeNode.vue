@@ -12,15 +12,24 @@
       >
         {{ isExpanded ? '▼' : '▶' }}
       </span>
-      <span v-else class="expand-spacer"></span>
+      <span
+        v-else
+        class="expand-spacer"
+      />
       
       <span class="tag-icon">🏷️</span>
       <span class="tag-name">{{ name }}</span>
       
-      <span v-if="count > 0" class="tag-count">{{ count }}</span>
+      <span
+        v-if="count > 0"
+        class="tag-count"
+      >{{ count }}</span>
     </div>
     
-    <div v-if="hasChildren && isExpanded" class="node-children">
+    <div
+      v-if="hasChildren && isExpanded"
+      class="node-children"
+    >
       <TagTreeNode
         v-for="(grandchildren, childName) in children"
         :key="childName"

@@ -8,7 +8,7 @@ from fastapi.testclient import TestClient
 from unittest.mock import MagicMock, patch
 import json
 
-from app.main import create_app
+from app.main import app as _app
 from app.models.note import Note, NoteCreate, NoteUpdate, NoteListItem, NoteFrontmatter
 
 
@@ -69,7 +69,7 @@ def mock_graph_index():
 @pytest.fixture
 def test_app(mock_knowledge_store, mock_vector_search, mock_graph_index):
     """Create test application with mocked services"""
-    app = create_app()
+    app = _app
     app.state.knowledge_store = mock_knowledge_store
     app.state.vector_search = mock_vector_search
     app.state.graph_index = mock_graph_index

@@ -7,7 +7,7 @@ import pytest
 from fastapi.testclient import TestClient
 from unittest.mock import MagicMock
 
-from app.main import create_app
+from app.main import app as _app
 from app.models.note import BacklinkInfo, NoteListItem
 
 
@@ -49,10 +49,9 @@ def mock_graph_index():
     # Sample outgoing links
     graph.get_outgoing_links.return_value = ["linked-1", "linked-2", "linked-3"]
 
-    # Sample neighbors
+    # Sample neighbors (adjacency list: Dict[str, List[str]])
     graph.get_neighbors.return_value = {
-        "nodes": ["center", "neighbor-1", "neighbor-2"],
-        "edges": [["center", "neighbor-1"], ["center", "neighbor-2"]]
+        "center": ["neighbor-1", "neighbor-2"]
     }
 
     # Sample unlinked mentions
@@ -74,7 +73,7 @@ def mock_graph_index():
 @pytest.fixture
 def test_app(mock_knowledge_store, mock_graph_index):
     """Create test application with mocked services"""
-    app = create_app()
+    app = _app
     app.state.knowledge_store = mock_knowledge_store
     app.state.graph_index = mock_graph_index
     return app

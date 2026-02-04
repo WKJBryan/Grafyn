@@ -1,43 +1,78 @@
 <template>
-  <div class="graph-settings" :class="{ collapsed: isCollapsed }">
-    <button class="toggle-btn" @click="isCollapsed = !isCollapsed" :title="isCollapsed ? 'Show Settings' : 'Hide Settings'">
+  <div
+    class="graph-settings"
+    :class="{ collapsed: isCollapsed }"
+  >
+    <button
+      class="toggle-btn"
+      :title="isCollapsed ? 'Show Settings' : 'Hide Settings'"
+      @click="isCollapsed = !isCollapsed"
+    >
       <span v-if="isCollapsed">⚙</span>
       <span v-else>×</span>
     </button>
     
-    <div class="settings-content" v-show="!isCollapsed">
+    <div
+      v-show="!isCollapsed"
+      class="settings-content"
+    >
       <!-- Filters Section -->
       <div class="settings-section">
-        <button class="section-header" @click="filtersOpen = !filtersOpen">
-          <span class="chevron" :class="{ open: filtersOpen }">›</span>
+        <button
+          class="section-header"
+          @click="filtersOpen = !filtersOpen"
+        >
+          <span
+            class="chevron"
+            :class="{ open: filtersOpen }"
+          >›</span>
           Filters
         </button>
-        <div class="section-body" v-show="filtersOpen">
+        <div
+          v-show="filtersOpen"
+          class="section-body"
+        >
           <div class="filter-group">
             <label class="checkbox-label">
-              <input type="checkbox" v-model="filters.showContainers" @change="emitFilters">
+              <input
+                v-model="filters.showContainers"
+                type="checkbox"
+                @change="emitFilters"
+              >
               <span class="pill container">Container</span>
             </label>
             <label class="checkbox-label">
-              <input type="checkbox" v-model="filters.showAtomics" @change="emitFilters">
+              <input
+                v-model="filters.showAtomics"
+                type="checkbox"
+                @change="emitFilters"
+              >
               <span class="pill atomic">Atomic</span>
             </label>
             <label class="checkbox-label">
-              <input type="checkbox" v-model="filters.showHubs" @change="emitFilters">
+              <input
+                v-model="filters.showHubs"
+                type="checkbox"
+                @change="emitFilters"
+              >
               <span class="pill hub">Hub</span>
             </label>
             <label class="checkbox-label">
-              <input type="checkbox" v-model="filters.showGeneral" @change="emitFilters">
+              <input
+                v-model="filters.showGeneral"
+                type="checkbox"
+                @change="emitFilters"
+              >
               <span class="pill general">General</span>
             </label>
           </div>
           <div class="search-filter">
             <input 
-              type="text" 
               v-model="filters.search" 
-              @input="emitFilters"
+              type="text" 
               placeholder="Filter by name..."
               class="search-input"
+              @input="emitFilters"
             >
           </div>
         </div>
@@ -45,14 +80,30 @@
       
       <!-- Groups Section -->
       <div class="settings-section">
-        <button class="section-header" @click="groupsOpen = !groupsOpen">
-          <span class="chevron" :class="{ open: groupsOpen }">›</span>
+        <button
+          class="section-header"
+          @click="groupsOpen = !groupsOpen"
+        >
+          <span
+            class="chevron"
+            :class="{ open: groupsOpen }"
+          >›</span>
           Groups
         </button>
-        <div class="section-body" v-show="groupsOpen">
+        <div
+          v-show="groupsOpen"
+          class="section-body"
+        >
           <div class="groups-legend">
-            <div class="legend-item" v-for="(color, type) in groupColors" :key="type">
-              <span class="color-dot" :style="{ background: color }"></span>
+            <div
+              v-for="(color, type) in groupColors"
+              :key="type"
+              class="legend-item"
+            >
+              <span
+                class="color-dot"
+                :style="{ background: color }"
+              />
               <span class="legend-label">{{ type }}</span>
             </div>
           </div>
@@ -61,49 +112,71 @@
       
       <!-- Display Section -->
       <div class="settings-section">
-        <button class="section-header" @click="displayOpen = !displayOpen">
-          <span class="chevron" :class="{ open: displayOpen }">›</span>
+        <button
+          class="section-header"
+          @click="displayOpen = !displayOpen"
+        >
+          <span
+            class="chevron"
+            :class="{ open: displayOpen }"
+          >›</span>
           Display
         </button>
-        <div class="section-body" v-show="displayOpen">
+        <div
+          v-show="displayOpen"
+          class="section-body"
+        >
           <div class="setting-row">
             <label>Arrows</label>
             <label class="toggle-switch">
-              <input type="checkbox" v-model="display.arrows" @change="emitDisplay">
-              <span class="toggle-slider"></span>
+              <input
+                v-model="display.arrows"
+                type="checkbox"
+                @change="emitDisplay"
+              >
+              <span class="toggle-slider" />
             </label>
           </div>
           <div class="setting-row">
             <label>Text fade threshold</label>
             <input 
-              type="range" 
               v-model.number="display.textFade" 
-              @input="emitDisplay"
-              min="0" max="100" step="5"
+              type="range" 
+              min="0"
+              max="100"
+              step="5"
               class="slider"
+              @input="emitDisplay"
             >
           </div>
           <div class="setting-row">
             <label>Node size</label>
             <input 
-              type="range" 
               v-model.number="display.nodeSize" 
-              @input="emitDisplay"
-              min="1" max="30" step="1"
+              type="range" 
+              min="1"
+              max="30"
+              step="1"
               class="slider"
+              @input="emitDisplay"
             >
           </div>
           <div class="setting-row">
             <label>Link thickness</label>
             <input 
-              type="range" 
               v-model.number="display.linkThickness" 
-              @input="emitDisplay"
-              min="0.5" max="5" step="0.5"
+              type="range" 
+              min="0.5"
+              max="5"
+              step="0.5"
               class="slider"
+              @input="emitDisplay"
             >
           </div>
-          <button class="animate-btn" @click="$emit('animate')">
+          <button
+            class="animate-btn"
+            @click="$emit('animate')"
+          >
             Animate
           </button>
         </div>
@@ -111,49 +184,66 @@
       
       <!-- Forces Section -->
       <div class="settings-section">
-        <button class="section-header" @click="forcesOpen = !forcesOpen">
-          <span class="chevron" :class="{ open: forcesOpen }">›</span>
+        <button
+          class="section-header"
+          @click="forcesOpen = !forcesOpen"
+        >
+          <span
+            class="chevron"
+            :class="{ open: forcesOpen }"
+          >›</span>
           Forces
         </button>
-        <div class="section-body" v-show="forcesOpen">
+        <div
+          v-show="forcesOpen"
+          class="section-body"
+        >
           <div class="setting-row">
             <label>Center force</label>
             <input 
-              type="range" 
               v-model.number="forces.center" 
-              @input="emitForces"
-              min="0" max="1" step="0.05"
+              type="range" 
+              min="0"
+              max="1"
+              step="0.05"
               class="slider"
+              @input="emitForces"
             >
           </div>
           <div class="setting-row">
             <label>Repel force</label>
             <input 
-              type="range" 
               v-model.number="forces.repel" 
-              @input="emitForces"
-              min="-1000" max="0" step="50"
+              type="range" 
+              min="-1000"
+              max="0"
+              step="50"
               class="slider"
+              @input="emitForces"
             >
           </div>
           <div class="setting-row">
             <label>Link force</label>
             <input 
-              type="range" 
               v-model.number="forces.link" 
-              @input="emitForces"
-              min="0" max="2" step="0.1"
+              type="range" 
+              min="0"
+              max="2"
+              step="0.1"
               class="slider"
+              @input="emitForces"
             >
           </div>
           <div class="setting-row">
             <label>Link distance</label>
             <input 
-              type="range" 
               v-model.number="forces.distance" 
-              @input="emitForces"
-              min="30" max="300" step="10"
+              type="range" 
+              min="30"
+              max="300"
+              step="10"
               class="slider"
+              @input="emitForces"
             >
           </div>
         </div>

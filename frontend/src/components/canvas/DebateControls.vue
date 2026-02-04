@@ -17,14 +17,17 @@
       </button>
     </div>
 
-    <div v-if="localMode === 'mediated'" class="mediated-input">
+    <div
+      v-if="localMode === 'mediated'"
+      class="mediated-input"
+    >
       <textarea
         v-model="customPrompt"
         placeholder="Enter your debate instruction..."
         rows="2"
         class="prompt-input"
         @keydown.ctrl.enter="handleContinue"
-      ></textarea>
+      />
       <button
         class="btn btn-sm btn-primary"
         :disabled="!customPrompt.trim()"

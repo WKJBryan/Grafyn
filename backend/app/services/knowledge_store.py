@@ -297,7 +297,7 @@ class KnowledgeStore:
             'status': note_data.status,
             'content_type': note_data.content_type.value,
             'note_type': note_data.note_type.value,
-            'properties': {name: prop.model_dump() for name, prop in note_data.properties.items()}
+            'properties': {name: prop.model_dump(mode='json') for name, prop in note_data.properties.items()}
         }
         
         # Write note file
@@ -338,7 +338,7 @@ class KnowledgeStore:
         if note_data.content_type is not None:
             post['content_type'] = note_data.content_type.value
         if note_data.properties is not None:
-            post['properties'] = {name: prop.model_dump() for name, prop in note_data.properties.items()}
+            post['properties'] = {name: prop.model_dump(mode='json') for name, prop in note_data.properties.items()}
         
         # Update modified timestamp
         post['modified'] = datetime.now(timezone.utc)

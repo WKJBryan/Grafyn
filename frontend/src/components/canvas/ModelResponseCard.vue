@@ -1,30 +1,64 @@
 <template>
-  <div class="model-response-card" :class="statusClass">
+  <div
+    class="model-response-card"
+    :class="statusClass"
+  >
     <div class="response-header">
       <span class="model-name">{{ response.model_name }}</span>
-      <span class="status-indicator" :title="response.status">
-        <span v-if="isStreaming" class="streaming-dot"></span>
-        <span v-else-if="response.status === 'completed'" class="status-complete">&#10003;</span>
-        <span v-else-if="response.status === 'error'" class="status-error">&#10005;</span>
-        <span v-else class="status-pending">&#8230;</span>
+      <span
+        class="status-indicator"
+        :title="response.status"
+      >
+        <span
+          v-if="isStreaming"
+          class="streaming-dot"
+        />
+        <span
+          v-else-if="response.status === 'completed'"
+          class="status-complete"
+        >&#10003;</span>
+        <span
+          v-else-if="response.status === 'error'"
+          class="status-error"
+        >&#10005;</span>
+        <span
+          v-else
+          class="status-pending"
+        >&#8230;</span>
       </span>
     </div>
 
-    <div class="response-content" ref="contentRef">
-      <div v-if="response.status === 'pending'" class="loading-state">
+    <div
+      ref="contentRef"
+      class="response-content"
+    >
+      <div
+        v-if="response.status === 'pending'"
+        class="loading-state"
+      >
         <div class="loading-dots">
-          <span></span><span></span><span></span>
+          <span /><span /><span />
         </div>
         <span>Waiting for response...</span>
       </div>
-      <div v-else-if="response.status === 'error'" class="error-state">
+      <div
+        v-else-if="response.status === 'error'"
+        class="error-state"
+      >
         <span class="error-icon">!</span>
         <span class="error-message">{{ response.error_message || 'An error occurred' }}</span>
       </div>
-      <div v-else class="content-text" v-html="renderedContent"></div>
+      <div
+        v-else
+        class="content-text"
+        v-html="renderedContent"
+      />
     </div>
 
-    <div class="response-footer" v-if="response.tokens_used">
+    <div
+      v-if="response.tokens_used"
+      class="response-footer"
+    >
       <span class="tokens">{{ response.tokens_used }} tokens</span>
     </div>
   </div>

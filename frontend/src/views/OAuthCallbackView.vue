@@ -1,20 +1,34 @@
 <template>
   <div class="oauth-callback-view">
     <div class="callback-container">
-      <div v-if="loading" class="callback-message">
-        <div class="spinner"></div>
+      <div
+        v-if="loading"
+        class="callback-message"
+      >
+        <div class="spinner" />
         <p>Completing sign in...</p>
       </div>
       
-      <div v-else-if="error" class="callback-message error">
+      <div
+        v-else-if="error"
+        class="callback-message error"
+      >
         <p>Authentication failed</p>
-        <p class="error-text">{{ error }}</p>
-        <button class="btn btn-primary" @click="handleRetry">
+        <p class="error-text">
+          {{ error }}
+        </p>
+        <button
+          class="btn btn-primary"
+          @click="handleRetry"
+        >
           Try Again
         </button>
       </div>
       
-      <div v-else class="callback-message success">
+      <div
+        v-else
+        class="callback-message success"
+      >
         <p>Successfully signed in!</p>
         <p>Redirecting...</p>
       </div>

@@ -7,14 +7,14 @@
         class="title-input"
         placeholder="Note title..."
         @input="handleDirty"
-      />
+      >
       <div class="editor-actions">
         <button
           v-if="canDistill"
           class="btn btn-accent"
           :disabled="isDistilling"
-          @click="handleDistill"
           title="Extract atomic notes from this container"
+          @click="handleDistill"
         >
           {{ isDistilling ? '⏳ Distilling...' : '⚗️ Distill' }}
         </button>
@@ -58,14 +58,28 @@
         placeholder="Write your note in Markdown..."
         @input="handleDirty"
       />
-      <div v-else class="editor-preview" v-html="renderedContent"></div>
+      <div
+        v-else
+        class="editor-preview"
+        v-html="renderedContent"
+      />
     </div>
 
     <div class="editor-footer">
-      <select v-model="localNote.status" class="status-select" @change="handleDirty">
-        <option value="draft">Draft</option>
-        <option value="canonical">Canonical</option>
-        <option value="evidence">Evidence</option>
+      <select
+        v-model="localNote.status"
+        class="status-select"
+        @change="handleDirty"
+      >
+        <option value="draft">
+          Draft
+        </option>
+        <option value="canonical">
+          Canonical
+        </option>
+        <option value="evidence">
+          Evidence
+        </option>
       </select>
       <input
         v-model="tagsInput"
@@ -73,11 +87,15 @@
         class="tags-input"
         placeholder="Tags (comma-separated)"
         @input="handleTagsInput"
-      />
+      >
     </div>
 
     <!-- Distill Status Message -->
-    <div v-if="distillMessage" class="distill-message" :class="{ error: distillMessage.includes('failed') }">
+    <div
+      v-if="distillMessage"
+      class="distill-message"
+      :class="{ error: distillMessage.includes('failed') }"
+    >
       {{ distillMessage }}
     </div>
   </div>

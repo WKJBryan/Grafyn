@@ -19,13 +19,22 @@
         ref="fileInput"
         type="file"
         accept=".json,.txt,.md,.dms"
-        @change="onFileSelect"
         style="display: none"
-      />
+        @change="onFileSelect"
+      >
 
-      <div v-if="!isUploading" class="upload-content">
+      <div
+        v-if="!isUploading"
+        class="upload-content"
+      >
         <div class="icon">
-          <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+          <svg
+            width="48"
+            height="48"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+          >
             <path
               stroke-linecap="round"
               stroke-linejoin="round"
@@ -43,31 +52,49 @@
         <div class="text">
           <h3>Drop file here or click to browse</h3>
           <p>Supports: ChatGPT (conversations.json), Claude (.dms/.json), Grok (.json), Gemini (.json)</p>
-          <p class="max-size">Maximum file size: {{ maxSize }}MB</p>
+          <p class="max-size">
+            Maximum file size: {{ maxSize }}MB
+          </p>
         </div>
       </div>
 
-      <div v-else class="upload-progress">
-        <div class="spinner"></div>
+      <div
+        v-else
+        class="upload-progress"
+      >
+        <div class="spinner" />
         <p>Uploading file...</p>
       </div>
     </div>
 
-    <div v-if="errors.length > 0" class="error-banner">
-      <div v-for="error in errors" :key="error.type" class="error-item">
+    <div
+      v-if="errors.length > 0"
+      class="error-banner"
+    >
+      <div
+        v-for="error in errors"
+        :key="error.type"
+        class="error-item"
+      >
         <span class="error-icon">⚠️</span>
         <span class="error-message">{{ error.message }}</span>
       </div>
     </div>
 
-    <div v-if="currentJob" class="next-steps">
+    <div
+      v-if="currentJob"
+      class="next-steps"
+    >
       <h3>File Uploaded Successfully!</h3>
       <div class="job-info">
         <p><strong>Job ID:</strong> {{ currentJob.id }}</p>
         <p><strong>File:</strong> {{ currentJob.file_name }}</p>
         <p><strong>Status:</strong> {{ currentJob.status }}</p>
       </div>
-      <button @click="goToReview" class="btn btn-primary">
+      <button
+        class="btn btn-primary"
+        @click="goToReview"
+      >
         Review & Import Conversations →
       </button>
     </div>

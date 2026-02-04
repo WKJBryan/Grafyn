@@ -12,8 +12,8 @@
       <div class="node-actions">
         <button
           class="delete-btn"
-          @click.stop="$emit('delete', debate.id)"
           title="Delete debate"
+          @click.stop="$emit('delete', debate.id)"
         >
           ×
         </button>
@@ -38,21 +38,32 @@
       </div>
       
       <div class="status-row">
-        <span class="status-badge" :class="debate.status">{{ debate.status }}</span>
+        <span
+          class="status-badge"
+          :class="debate.status"
+        >{{ debate.status }}</span>
       </div>
     </div>
     
     <!-- Summary preview in compact view -->
-    <div v-if="lastRoundSummary && !isExpanded" class="conclusion-preview">
-      <div class="conclusion-label">Summary:</div>
-      <div class="conclusion-text" v-html="lastRoundSummary"></div>
+    <div
+      v-if="lastRoundSummary && !isExpanded"
+      class="conclusion-preview"
+    >
+      <div class="conclusion-label">
+        Summary:
+      </div>
+      <div
+        class="conclusion-text"
+        v-html="lastRoundSummary"
+      />
     </div>
     
     <div class="node-footer">
       <button 
         class="expand-btn" 
-        @click.stop="toggleExpand"
         :disabled="!hasRounds"
+        @click.stop="toggleExpand"
       >
         {{ isExpanded ? '▲ Hide Fight' : '⚔ See Fight' }}
       </button>
@@ -66,13 +77,23 @@
     </div>
     
     <!-- Connection points for source tiles (left side) -->
-    <div class="connection-point in"></div>
+    <div class="connection-point in" />
     
     <!-- Expanded view overlay -->
-    <div v-if="isExpanded" class="expanded-overlay" @click.stop @wheel.stop>
+    <div
+      v-if="isExpanded"
+      class="expanded-overlay"
+      @click.stop
+      @wheel.stop
+    >
       <div class="expanded-header">
         <h4>Debate Rounds ({{ debate.rounds?.length || 0 }})</h4>
-        <button class="close-btn" @click.stop="toggleExpand">×</button>
+        <button
+          class="close-btn"
+          @click.stop="toggleExpand"
+        >
+          ×
+        </button>
       </div>
       <div class="rounds-container">
         <div 
@@ -80,7 +101,9 @@
           :key="index"
           class="round-card"
         >
-          <div class="round-header">Round {{ index + 1 }}</div>
+          <div class="round-header">
+            Round {{ index + 1 }}
+          </div>
           <div class="round-responses">
             <div 
               v-for="(response, modelId) in getRoundResponses(round)" 
@@ -88,11 +111,17 @@
               class="round-response"
             >
               <span class="response-model">{{ getModelName(modelId) }}</span>
-              <div class="response-content" v-html="renderContent(response)"></div>
+              <div
+                class="response-content"
+                v-html="renderContent(response)"
+              />
             </div>
           </div>
         </div>
-        <div v-if="!hasRounds" class="no-rounds">
+        <div
+          v-if="!hasRounds"
+          class="no-rounds"
+        >
           No debate rounds yet
         </div>
       </div>

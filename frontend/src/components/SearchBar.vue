@@ -8,20 +8,32 @@
         @input="handleInput"
         @keydown.enter="handleEnter"
         @keydown.escape="handleEscape"
-      />
-      <span v-if="query" class="clear-btn" @click="handleClear">×</span>
+      >
+      <span
+        v-if="query"
+        class="clear-btn"
+        @click="handleClear"
+      >×</span>
     </div>
 
-    <div v-if="showResults && results.length > 0" class="search-results">
+    <div
+      v-if="showResults && results.length > 0"
+      class="search-results"
+    >
       <div
         v-for="result in results"
         :key="result.note_id"
         class="search-result-item"
         @click="handleSelect(result.note_id)"
       >
-        <div class="result-title">{{ result.title }}</div>
+        <div class="result-title">
+          {{ result.title }}
+        </div>
         <div class="result-score">
-          <div class="score-bar" :style="{ width: `${result.score * 100}%` }"></div>
+          <div
+            class="score-bar"
+            :style="{ width: `${result.score * 100}%` }"
+          />
         </div>
       </div>
     </div>

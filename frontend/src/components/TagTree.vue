@@ -1,23 +1,43 @@
 <template>
   <div class="tag-tree">
-    <div class="section-header" @click="isExpanded = !isExpanded">
+    <div
+      class="section-header"
+      @click="isExpanded = !isExpanded"
+    >
       <span class="section-icon">{{ isExpanded ? '▼' : '▶' }}</span>
-      <h3 class="section-title">Tags</h3>
-      <span v-if="totalTags > 0" class="tag-count">{{ totalTags }}</span>
+      <h3 class="section-title">
+        Tags
+      </h3>
+      <span
+        v-if="totalTags > 0"
+        class="tag-count"
+      >{{ totalTags }}</span>
     </div>
     
-    <div v-if="isExpanded" class="tree-content">
-      <div v-if="loading" class="loading-state">
+    <div
+      v-if="isExpanded"
+      class="tree-content"
+    >
+      <div
+        v-if="loading"
+        class="loading-state"
+      >
         <span class="loading-spinner">⏳</span>
         <span>Loading tags...</span>
       </div>
       
-      <div v-else-if="Object.keys(tagTree).length === 0" class="empty-state">
+      <div
+        v-else-if="Object.keys(tagTree).length === 0"
+        class="empty-state"
+      >
         <span class="empty-icon">🏷️</span>
         <span>No tags found</span>
       </div>
       
-      <div v-else class="tree-list">
+      <div
+        v-else
+        class="tree-list"
+      >
         <TagTreeNode
           v-for="(children, tag) in tagTree"
           :key="tag"

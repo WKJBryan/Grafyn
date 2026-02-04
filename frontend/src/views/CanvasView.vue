@@ -5,10 +5,17 @@
       <div class="sidebar-header">
         <h2>Canvas Sessions</h2>
         <div class="header-actions">
-          <button class="btn btn-ghost btn-sm" @click="handleThemeToggle" title="Toggle Theme">
+          <button
+            class="btn btn-ghost btn-sm"
+            title="Toggle Theme"
+            @click="handleThemeToggle"
+          >
             {{ themeIcon }}
           </button>
-          <button class="btn btn-primary btn-sm" @click="createNewSession">
+          <button
+            class="btn btn-primary btn-sm"
+            @click="createNewSession"
+          >
             + New
           </button>
         </div>
@@ -30,23 +37,32 @@
           </div>
           <button
             class="delete-btn"
-            @click.stop="deleteSession(session.id)"
             title="Delete session"
+            @click.stop="deleteSession(session.id)"
           >
             &#10005;
           </button>
         </div>
 
-        <div v-if="sessions.length === 0 && !loading" class="empty-state">
+        <div
+          v-if="sessions.length === 0 && !loading"
+          class="empty-state"
+        >
           <p>No canvas sessions yet</p>
-          <button class="btn btn-primary" @click="createNewSession">
+          <button
+            class="btn btn-primary"
+            @click="createNewSession"
+          >
             Create your first canvas
           </button>
         </div>
       </div>
 
       <div class="sidebar-footer">
-        <router-link to="/" class="back-link">
+        <router-link
+          to="/"
+          class="back-link"
+        >
           &#8592; Back to Notes
         </router-link>
       </div>
@@ -54,11 +70,17 @@
 
     <!-- Main Canvas Area -->
     <main class="canvas-main">
-      <div v-if="!currentSessionId" class="no-session">
+      <div
+        v-if="!currentSessionId"
+        class="no-session"
+      >
         <div class="no-session-content">
           <h2>Multi-LLM Canvas</h2>
           <p>Compare responses from multiple AI models side by side</p>
-          <button class="btn btn-primary btn-lg" @click="createNewSession">
+          <button
+            class="btn btn-primary btn-lg"
+            @click="createNewSession"
+          >
             Create New Canvas
           </button>
         </div>
@@ -73,11 +95,20 @@
     </main>
 
     <!-- Create Session Dialog -->
-    <div v-if="showCreateDialog" class="dialog-overlay" @click.self="showCreateDialog = false">
+    <div
+      v-if="showCreateDialog"
+      class="dialog-overlay"
+      @click.self="showCreateDialog = false"
+    >
       <div class="create-dialog">
         <div class="dialog-header">
           <h3>New Canvas Session</h3>
-          <button class="close-btn" @click="showCreateDialog = false">&#10005;</button>
+          <button
+            class="close-btn"
+            @click="showCreateDialog = false"
+          >
+            &#10005;
+          </button>
         </div>
         <div class="dialog-body">
           <div class="form-group">
@@ -88,7 +119,7 @@
               type="text"
               placeholder="Enter canvas title..."
               @keydown.enter="confirmCreateSession"
-            />
+            >
           </div>
           <div class="form-group">
             <label for="sessionDescription">Description (optional)</label>
@@ -97,11 +128,16 @@
               v-model="newSessionDescription"
               placeholder="Brief description..."
               rows="2"
-            ></textarea>
+            />
           </div>
         </div>
         <div class="dialog-footer">
-          <button class="btn btn-secondary" @click="showCreateDialog = false">Cancel</button>
+          <button
+            class="btn btn-secondary"
+            @click="showCreateDialog = false"
+          >
+            Cancel
+          </button>
           <button
             class="btn btn-primary"
             :disabled="!newSessionTitle.trim()"

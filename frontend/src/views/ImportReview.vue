@@ -1,16 +1,27 @@
 <template>
   <div class="import-review">
     <!-- Initial Loading State -->
-    <div v-if="isLoading || isParsing" class="loading-overlay">
-      <div class="spinner"></div>
+    <div
+      v-if="isLoading || isParsing"
+      class="loading-overlay"
+    >
+      <div class="spinner" />
       <p>{{ isParsing ? 'Parsing file...' : 'Loading conversations...' }}</p>
     </div>
 
     <!-- Error State -->
-    <div v-else-if="loadError" class="error-state">
+    <div
+      v-else-if="loadError"
+      class="error-state"
+    >
       <h3>⚠️ Error Loading Import</h3>
       <p>{{ loadError }}</p>
-      <button @click="goBack" class="btn btn-primary">← Back to Upload</button>
+      <button
+        class="btn btn-primary"
+        @click="goBack"
+      >
+        ← Back to Upload
+      </button>
     </div>
 
     <!-- Main Content -->
@@ -37,249 +48,365 @@
         </div>
       </div>
 
-    <div v-if="isApplying" class="loading-overlay">
-      <div class="spinner"></div>
-      <p>Importing conversations...</p>
-    </div>
+      <div
+        v-if="isApplying"
+        class="loading-overlay"
+      >
+        <div class="spinner" />
+        <p>Importing conversations...</p>
+      </div>
 
-    <div v-else class="content">
-      <!-- Toolbar -->
-      <div class="toolbar">
-        <button @click="assessQuality" class="btn btn-sm btn-ai" :disabled="isAssessing">
-          {{ isAssessing ? '🔄 Assessing...' : '🤖 AI Assess' }}
-        </button>
-
-        <!-- Zettelkasten Controls -->
-        <div class="zettel-controls">
+      <div
+        v-else
+        class="content"
+      >
+        <!-- Toolbar -->
+        <div class="toolbar">
           <button
-            @click="toggleZettel"
-            class="btn btn-sm"
-            :class="zettelEnabled ? 'btn-zettel' : 'btn-ghost'"
-            :title="zettelEnabled ? 'Zettelkasten mode enabled' : 'Zettelkasten mode disabled'"
+            class="btn btn-sm btn-ai"
+            :disabled="isAssessing"
+            @click="assessQuality"
           >
-            {{ zettelEnabled ? '🗃️ Zettelkasten ON' : '🗃️ Zettelkasten OFF' }}
+            {{ isAssessing ? '🔄 Assessing...' : '🤖 AI Assess' }}
           </button>
-          <select
-            v-model="linkModeValue"
-            @change="updateLinkMode"
-            :disabled="!zettelEnabled"
-            class="link-mode-select"
-            title="How notes should be linked"
+
+          <!-- Zettelkasten Controls -->
+          <div class="zettel-controls">
+            <button
+              class="btn btn-sm"
+              :class="zettelEnabled ? 'btn-zettel' : 'btn-ghost'"
+              :title="zettelEnabled ? 'Zettelkasten mode enabled' : 'Zettelkasten mode disabled'"
+              @click="toggleZettel"
+            >
+              {{ zettelEnabled ? '🗃️ Zettelkasten ON' : '🗃️ Zettelkasten OFF' }}
+            </button>
+            <select
+              v-model="linkModeValue"
+              :disabled="!zettelEnabled"
+              class="link-mode-select"
+              title="How notes should be linked"
+              @change="updateLinkMode"
+            >
+              <option value="automatic">
+                Auto-Link
+              </option>
+              <option value="suggested">
+                Suggest Links
+              </option>
+              <option value="manual">
+                Manual Links
+              </option>
+            </select>
+          </div>
+
+          <div class="toolbar-divider" />
+          <button
+            class="btn btn-sm"
+            @click="selectAll"
           >
-            <option value="automatic">Auto-Link</option>
-            <option value="suggested">Suggest Links</option>
-            <option value="manual">Manual Links</option>
+            {{ allSelected ? 'Deselect All' : 'Select All' }}
+          </button>
+          <button
+            class="btn btn-sm btn-success"
+            :disabled="selectedCount === 0"
+            @click="acceptSelected"
+          >
+            Accept ({{ selectedCount }})
+          </button>
+          <button
+            class="btn btn-sm btn-secondary"
+            :disabled="selectedCount === 0"
+            @click="skipSelected"
+          >
+            Skip ({{ selectedCount }})
+          </button>
+          <button
+            class="btn btn-sm btn-primary"
+            @click="batchAcceptAll"
+          >
+            Accept All
+          </button>
+          <button
+            class="btn btn-sm btn-warning"
+            @click="batchSkipAll"
+          >
+            Skip All
+          </button>
+          <div class="spacer" />
+          <button
+            class="btn btn-sm"
+            @click="showFilters = !showFilters"
+          >
+            {{ showFilters ? 'Hide Filters' : 'Show Filters' }}
+          </button>
+        </div>
+
+        <!-- Filters -->
+        <div
+          v-if="showFilters"
+          class="filters"
+        >
+          <label>
+            <input
+              v-model="filterDuplicates"
+              type="checkbox"
+            >
+            Show only duplicates
+          </label>
+          <label>
+            <input
+              v-model="filterWithErrors"
+              type="checkbox"
+            >
+            Show only with errors
+          </label>
+          <select v-model="filterByAction">
+            <option value="all">
+              All Actions
+            </option>
+            <option value="accept">
+              Accept
+            </option>
+            <option value="skip">
+              Skip
+            </option>
+            <option value="merge">
+              Merge
+            </option>
           </select>
         </div>
 
-        <div class="toolbar-divider"></div>
-        <button @click="selectAll" class="btn btn-sm">
-          {{ allSelected ? 'Deselect All' : 'Select All' }}
-        </button>
-        <button @click="acceptSelected" class="btn btn-sm btn-success" :disabled="selectedCount === 0">
-          Accept ({{ selectedCount }})
-        </button>
-        <button @click="skipSelected" class="btn btn-sm btn-secondary" :disabled="selectedCount === 0">
-          Skip ({{ selectedCount }})
-        </button>
-        <button @click="batchAcceptAll" class="btn btn-sm btn-primary">
-          Accept All
-        </button>
-        <button @click="batchSkipAll" class="btn btn-sm btn-warning">
-          Skip All
-        </button>
-        <div class="spacer"></div>
-        <button @click="showFilters = !showFilters" class="btn btn-sm">
-          {{ showFilters ? 'Hide Filters' : 'Show Filters' }}
-        </button>
-      </div>
-
-      <!-- Filters -->
-      <div v-if="showFilters" class="filters">
-        <label>
-          <input type="checkbox" v-model="filterDuplicates" />
-          Show only duplicates
-        </label>
-        <label>
-          <input type="checkbox" v-model="filterWithErrors" />
-          Show only with errors
-        </label>
-        <select v-model="filterByAction">
-          <option value="all">All Actions</option>
-          <option value="accept">Accept</option>
-          <option value="skip">Skip</option>
-          <option value="merge">Merge</option>
-        </select>
-      </div>
-
-      <!-- Conversations List -->
-      <div class="conversations-list">
-        <div
-          v-for="conv in filteredConversations"
-          :key="conv.id"
-          class="conversation-item"
-          :class="{
-            'selected': selectedIds.includes(conv.id),
-            'has-duplicates': conv.duplicate_candidates.length > 0
-          }"
-        >
-          <div class="conversation-header" @click="toggleSelect(conv.id)">
-            <input
-              type="checkbox"
-              :checked="selectedIds.includes(conv.id)"
-              @click.stop="toggleSelect(conv.id)"
-            />
-            <div class="conversation-info">
-              <h3 class="title">{{ conv.title }}</h3>
-              <div class="meta">
-                <span class="badge" :class="getDecisionBadgeClass(conv.id)">
-                  {{ getDecisionLabel(conv.id) }}
-                </span>
-                <span v-if="conv.duplicate_candidates.length > 0" class="badge duplicate">
-                  {{ conv.duplicate_candidates.length }} duplicate(s)
-                </span>
-                <!-- Quality badges -->
-                <span v-if="conv.quality" class="badge quality-badge" :class="getQualityClass(conv.quality)">
-                  {{ getQualitySuggestion(conv.quality) }}
-                </span>
-                <span v-if="conv.quality" class="score-badge" :title="`Relevance: ${Math.round(conv.quality.relevance_score * 100)}%`">
-                  📊 {{ Math.round(conv.quality.relevance_score * 100) }}%
-                </span>
-                <span class="messages-count">
-                  {{ conv.messages.length }} messages
-                </span>
-                <span class="date">
-                  {{ formatDate(conv.metadata.created_at) }}
-                </span>
-              </div>
-            </div>
-            <button @click.stop="expandConversation(conv.id)" class="expand-btn">
-              {{ expandedIds.includes(conv.id) ? '▼' : '▶' }}
-            </button>
-          </div>
-
-          <!-- Expanded Details -->
-          <div v-if="expandedIds.includes(conv.id)" class="conversation-details">
-            <!-- Messages Preview -->
-            <div class="messages-preview">
-              <h4>Message Preview</h4>
-              <div class="message-list">
-                <div
-                  v-for="(msg, idx) in conv.messages.slice(0, 3)"
-                  :key="idx"
-                  class="message-preview-item"
-                  :class="msg.role"
-                >
-                  <strong>{{ msg.role }}:</strong>
-                  <span class="message-text">{{ truncate(msg.content, 150) }}</span>
-                </div>
-                <div v-if="conv.messages.length > 3" class="more-messages">
-                  ... and {{ conv.messages.length - 3 }} more messages
+        <!-- Conversations List -->
+        <div class="conversations-list">
+          <div
+            v-for="conv in filteredConversations"
+            :key="conv.id"
+            class="conversation-item"
+            :class="{
+              'selected': selectedIds.includes(conv.id),
+              'has-duplicates': conv.duplicate_candidates.length > 0
+            }"
+          >
+            <div
+              class="conversation-header"
+              @click="toggleSelect(conv.id)"
+            >
+              <input
+                type="checkbox"
+                :checked="selectedIds.includes(conv.id)"
+                @click.stop="toggleSelect(conv.id)"
+              >
+              <div class="conversation-info">
+                <h3 class="title">
+                  {{ conv.title }}
+                </h3>
+                <div class="meta">
+                  <span
+                    class="badge"
+                    :class="getDecisionBadgeClass(conv.id)"
+                  >
+                    {{ getDecisionLabel(conv.id) }}
+                  </span>
+                  <span
+                    v-if="conv.duplicate_candidates.length > 0"
+                    class="badge duplicate"
+                  >
+                    {{ conv.duplicate_candidates.length }} duplicate(s)
+                  </span>
+                  <!-- Quality badges -->
+                  <span
+                    v-if="conv.quality"
+                    class="badge quality-badge"
+                    :class="getQualityClass(conv.quality)"
+                  >
+                    {{ getQualitySuggestion(conv.quality) }}
+                  </span>
+                  <span
+                    v-if="conv.quality"
+                    class="score-badge"
+                    :title="`Relevance: ${Math.round(conv.quality.relevance_score * 100)}%`"
+                  >
+                    📊 {{ Math.round(conv.quality.relevance_score * 100) }}%
+                  </span>
+                  <span class="messages-count">
+                    {{ conv.messages.length }} messages
+                  </span>
+                  <span class="date">
+                    {{ formatDate(conv.metadata.created_at) }}
+                  </span>
                 </div>
               </div>
+              <button
+                class="expand-btn"
+                @click.stop="expandConversation(conv.id)"
+              >
+                {{ expandedIds.includes(conv.id) ? '▼' : '▶' }}
+              </button>
             </div>
 
-            <!-- Duplicate Candidates -->
-            <div v-if="conv.duplicate_candidates.length > 0" class="duplicates-section">
-              <h4>Duplicates Found</h4>
-              <div class="duplicate-list">
-                <div
-                  v-for="dup in conv.duplicate_candidates"
-                  :key="dup.note_id"
-                  class="duplicate-item"
-                >
-                  <div class="duplicate-info">
-                    <strong>{{ dup.title }}</strong>
-                    <span class="similarity">Similarity: {{ (dup.similarity_score * 100).toFixed(0) }}%</span>
-                    <span v-if="dup.content_type" class="content-type">{{ dup.content_type }}</span>
+            <!-- Expanded Details -->
+            <div
+              v-if="expandedIds.includes(conv.id)"
+              class="conversation-details"
+            >
+              <!-- Messages Preview -->
+              <div class="messages-preview">
+                <h4>Message Preview</h4>
+                <div class="message-list">
+                  <div
+                    v-for="(msg, idx) in conv.messages.slice(0, 3)"
+                    :key="idx"
+                    class="message-preview-item"
+                    :class="msg.role"
+                  >
+                    <strong>{{ msg.role }}:</strong>
+                    <span class="message-text">{{ truncate(msg.content, 150) }}</span>
                   </div>
-                  <div class="duplicate-tags">
-                    <span v-for="tag in dup.tags" :key="tag" class="tag">{{ tag }}</span>
+                  <div
+                    v-if="conv.messages.length > 3"
+                    class="more-messages"
+                  >
+                    ... and {{ conv.messages.length - 3 }} more messages
                   </div>
-                  <div class="duplicate-actions">
-                    <button
-                      @click.stop="viewDuplicate(dup.note_id)"
-                      class="btn btn-xs btn-link"
+                </div>
+              </div>
+
+              <!-- Duplicate Candidates -->
+              <div
+                v-if="conv.duplicate_candidates.length > 0"
+                class="duplicates-section"
+              >
+                <h4>Duplicates Found</h4>
+                <div class="duplicate-list">
+                  <div
+                    v-for="dup in conv.duplicate_candidates"
+                    :key="dup.note_id"
+                    class="duplicate-item"
+                  >
+                    <div class="duplicate-info">
+                      <strong>{{ dup.title }}</strong>
+                      <span class="similarity">Similarity: {{ (dup.similarity_score * 100).toFixed(0) }}%</span>
+                      <span
+                        v-if="dup.content_type"
+                        class="content-type"
+                      >{{ dup.content_type }}</span>
+                    </div>
+                    <div class="duplicate-tags">
+                      <span
+                        v-for="tag in dup.tags"
+                        :key="tag"
+                        class="tag"
+                      >{{ tag }}</span>
+                    </div>
+                    <div class="duplicate-actions">
+                      <button
+                        class="btn btn-xs btn-link"
+                        @click.stop="viewDuplicate(dup.note_id)"
+                      >
+                        View
+                      </button>
+                      <button
+                        class="btn btn-xs btn-secondary"
+                        @click.stop="mergeWith(conv.id, dup.note_id)"
+                      >
+                        Merge
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <!-- Action Options -->
+              <div class="action-options">
+                <h4>Import Options</h4>
+                <div class="distillation-options">
+                  <label class="radio-option">
+                    <input
+                      type="radio"
+                      :name="`distill-${conv.id}`"
+                      value="container_only"
+                      :checked="getDecision(conv.id).distill_option === 'container_only'"
+                      @change="setDistillOption(conv.id, 'container_only')"
                     >
-                      View
-                    </button>
-                    <button
-                      @click.stop="mergeWith(conv.id, dup.note_id)"
-                      class="btn btn-xs btn-secondary"
+                    <span>Container Only (No distillation)</span>
+                  </label>
+                  <label class="radio-option">
+                    <input
+                      type="radio"
+                      :name="`distill-${conv.id}`"
+                      value="auto_distill"
+                      :checked="getDecision(conv.id).distill_option === 'auto_distill'"
+                      @change="setDistillOption(conv.id, 'auto_distill')"
                     >
-                      Merge
-                    </button>
-                  </div>
+                    <span>Auto-Distill (Create atomic notes)</span>
+                  </label>
+                </div>
+
+                <!-- Custom Atomics Toggle -->
+                <div
+                  v-if="getDecision(conv.id).distill_option === 'custom'"
+                  class="custom-atomics"
+                >
+                  <button
+                    class="btn btn-sm btn-secondary"
+                    @click.stop="showCustomAtomics(conv.id)"
+                  >
+                    Configure Custom Atomics
+                  </button>
                 </div>
               </div>
-            </div>
 
-            <!-- Action Options -->
-            <div class="action-options">
-              <h4>Import Options</h4>
-              <div class="distillation-options">
-                <label class="radio-option">
-                  <input
-                    type="radio"
-                    :name="`distill-${conv.id}`"
-                    value="container_only"
-                    :checked="getDecision(conv.id).distill_option === 'container_only'"
-                    @change="setDistillOption(conv.id, 'container_only')"
-                  />
-                  <span>Container Only (No distillation)</span>
-                </label>
-                <label class="radio-option">
-                  <input
-                    type="radio"
-                    :name="`distill-${conv.id}`"
-                    value="auto_distill"
-                    :checked="getDecision(conv.id).distill_option === 'auto_distill'"
-                    @change="setDistillOption(conv.id, 'auto_distill')"
-                  />
-                  <span>Auto-Distill (Create atomic notes)</span>
-                </label>
-              </div>
-
-              <!-- Custom Atomics Toggle -->
-              <div v-if="getDecision(conv.id).distill_option === 'custom'" class="custom-atomics">
-                <button @click.stop="showCustomAtomics(conv.id)" class="btn btn-sm btn-secondary">
-                  Configure Custom Atomics
-                </button>
-              </div>
-            </div>
-
-            <!-- Tags Preview -->
-            <div class="tags-section">
-              <h4>Suggested Tags</h4>
-              <div class="tag-list">
-                <span v-for="tag in conv.suggested_tags" :key="tag" class="tag suggested">
-                  {{ tag }}
-                </span>
+              <!-- Tags Preview -->
+              <div class="tags-section">
+                <h4>Suggested Tags</h4>
+                <div class="tag-list">
+                  <span
+                    v-for="tag in conv.suggested_tags"
+                    :key="tag"
+                    class="tag suggested"
+                  >
+                    {{ tag }}
+                  </span>
+                </div>
               </div>
             </div>
           </div>
         </div>
-      </div>
 
-      <!-- Footer Actions -->
-      <div class="footer">
-        <button @click="goBack" class="btn btn-secondary">
-          ← Back to Upload
-        </button>
-        <div class="spacer"></div>
-        <button @click="submitImport" class="btn btn-primary btn-lg" :disabled="!hasAcceptedConversations">
-          Import Selected ({{ acceptedCount }})
-        </button>
+        <!-- Footer Actions -->
+        <div class="footer">
+          <button
+            class="btn btn-secondary"
+            @click="goBack"
+          >
+            ← Back to Upload
+          </button>
+          <div class="spacer" />
+          <button
+            class="btn btn-primary btn-lg"
+            :disabled="!hasAcceptedConversations"
+            @click="submitImport"
+          >
+            Import Selected ({{ acceptedCount }})
+          </button>
+        </div>
       </div>
-    </div>
     </template>
 
     <!-- Summary Modal -->
-    <div v-if="showSummaryModal" class="modal-overlay">
+    <div
+      v-if="showSummaryModal"
+      class="modal-overlay"
+    >
       <div class="modal">
         <div class="modal-header">
           <h3>Import Summary</h3>
-          <button @click="showSummaryModal = false" class="close-btn">×</button>
+          <button
+            class="close-btn"
+            @click="showSummaryModal = false"
+          >
+            ×
+          </button>
         </div>
         <div class="modal-body">
           <div class="summary-stats">
@@ -307,16 +434,31 @@
           </div>
         </div>
         <div class="modal-footer">
-          <button @click="revertImport" class="btn btn-danger" :disabled="isReverting">
+          <button
+            class="btn btn-danger"
+            :disabled="isReverting"
+            @click="revertImport"
+          >
             {{ isReverting ? 'Reverting...' : '⟲ Revert Import' }}
           </button>
-          <div class="spacer"></div>
-          <button @click="viewNotes" class="btn btn-primary">
+          <div class="spacer" />
+          <button
+            class="btn btn-primary"
+            @click="viewNotes"
+          >
             View Imported Notes
           </button>
         </div>
       </div>
     </div>
+
+    <!-- Custom Atomics Modal -->
+    <CustomAtomicsModal
+      :visible="showCustomAtomicsModal"
+      :conversation-id="customAtomicsConvId"
+      @close="showCustomAtomicsModal = false"
+      @apply="handleApplyCustomAtomics"
+    />
   </div>
 </template>
 
@@ -324,10 +466,12 @@
 import { ref, computed, onMounted } from 'vue'
 import { useImportStore } from '@/stores/import'
 import { useRouter } from 'vue-router'
+import CustomAtomicsModal from '@/components/import/CustomAtomicsModal.vue'
 
 export default {
   name: 'ImportReview',
-  
+  components: { CustomAtomicsModal },
+
   setup() {
     const router = useRouter()
     const importStore = useImportStore()
@@ -506,9 +650,33 @@ export default {
       })
     }
 
+    const customAtomicsConvId = ref(null)
+    const showCustomAtomicsModal = ref(false)
+
     const showCustomAtomics = (id) => {
-      // TODO: Show custom atomics configuration modal
-      console.log('Show custom atomics for', id)
+      customAtomicsConvId.value = id
+      showCustomAtomicsModal.value = true
+    }
+
+    const handleApplyCustomAtomics = (config) => {
+      if (!config.conversationId) return
+      const atoms = config.customAtoms.map(a => ({
+        title: a.title,
+        content: a.content,
+        tags: a.tags,
+        content_type: a.content_type,
+      }))
+      importStore.updateDecision(config.conversationId, {
+        distill_option: 'custom',
+        custom_atoms: atoms.length > 0 ? atoms : null,
+        summarization_settings: {
+          model_id: 'anthropic/claude-3.5-sonnet',
+          detail_level: config.detailLevel,
+          max_tokens: 4096,
+          temperature: 0.3,
+        },
+      })
+      showCustomAtomicsModal.value = false
     }
 
     const submitImport = async () => {
@@ -640,6 +808,9 @@ export default {
       viewDuplicate,
       mergeWith,
       showCustomAtomics,
+      showCustomAtomicsModal,
+      customAtomicsConvId,
+      handleApplyCustomAtomics,
       submitImport,
       viewNotes,
       goBack,

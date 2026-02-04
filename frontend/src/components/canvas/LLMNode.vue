@@ -5,78 +5,117 @@
     :style="nodeStyle"
     @mousedown="handleMouseDown"
   >
-    <div class="node-header" :style="headerStyle">
+    <div
+      class="node-header"
+      :style="headerStyle"
+    >
       <span class="model-badge">{{ modelName }}</span>
       <div class="header-right">
-        <span v-if="isStreaming" class="streaming-indicator">●</span>
-        <span v-else-if="hasError" class="error-indicator">!</span>
-        <span v-else-if="isCompleted" class="complete-indicator">✓</span>
+        <span
+          v-if="isStreaming"
+          class="streaming-indicator"
+        >●</span>
+        <span
+          v-else-if="hasError"
+          class="error-indicator"
+        >!</span>
+        <span
+          v-else-if="isCompleted"
+          class="complete-indicator"
+        >✓</span>
       </div>
     </div>
     
-    <div class="node-content" ref="contentRef" @wheel.stop>
-      <div v-if="isStreaming || isCompleted" class="response-text" v-html="renderedContent"></div>
-      <div v-else-if="hasError" class="error-message">
+    <div
+      ref="contentRef"
+      class="node-content"
+      @wheel.stop
+    >
+      <div
+        v-if="isStreaming || isCompleted"
+        class="response-text"
+        v-html="renderedContent"
+      />
+      <div
+        v-else-if="hasError"
+        class="error-message"
+      >
         <span class="error-icon">⚠️</span>
         <span>{{ response.error_message || 'Error occurred' }}</span>
       </div>
-      <div v-else class="pending-message">
-        <span class="pending-spinner"></span>
+      <div
+        v-else
+        class="pending-message"
+      >
+        <span class="pending-spinner" />
         <span>Waiting...</span>
       </div>
     </div>
     
-    <div class="node-footer" v-if="!isStreaming">
+    <div
+      v-if="!isStreaming"
+      class="node-footer"
+    >
       <button 
         class="branch-btn" 
-        @click.stop="toggleBranch" 
-        :disabled="!isCompleted"
+        :disabled="!isCompleted" 
         title="Branch from this response"
+        @click.stop="toggleBranch"
       >
         ⑂ Branch
       </button>
       <button 
         class="regenerate-btn" 
-        @click.stop="$emit('regenerate', { tileId, modelId })"
         :disabled="!isCompleted"
         title="Regenerate response"
+        @click.stop="$emit('regenerate', { tileId, modelId })"
       >
         ↻
       </button>
       <button 
         class="select-btn"
         :class="{ active: selected }"
-        @click.stop="$emit('select', { tileId, modelId })"
         title="Select for debate"
+        @click.stop="$emit('select', { tileId, modelId })"
       >
         {{ selected ? '✓' : '○' }}
       </button>
       <button
         class="delete-btn"
-        @click.stop="$emit('delete', { tileId, modelId })"
         title="Remove this response"
+        @click.stop="$emit('delete', { tileId, modelId })"
       >
         ×
       </button>
     </div>
     
     <!-- Connection point (left side - input from prompt) -->
-    <div class="connection-point in" :style="{ borderColor: response.color }"></div>
+    <div
+      class="connection-point in"
+      :style="{ borderColor: response.color }"
+    />
     <!-- Connection point (right side - output for branching) -->
-    <div class="connection-point out" v-if="isCompleted"></div>
+    <div
+      v-if="isCompleted"
+      class="connection-point out"
+    />
     
     <!-- Add Model button (+) on right edge -->
     <button
       v-if="isCompleted"
       class="add-model-btn"
-      @click.stop="$emit('show-add-model-dialog', { tileId, modelId })"
       title="Add more models to this conversation"
+      @click.stop="$emit('show-add-model-dialog', { tileId, modelId })"
     >
       +
     </button>
     
     <!-- Branch input overlay -->
-    <div v-if="showBranch" class="branch-overlay" @click.stop>
+    <div
+      v-if="showBranch"
+      class="branch-overlay"
+      @click.stop
+    >
       <textarea
         ref="branchInputRef"
         v-model="branchPrompt"
@@ -85,7 +124,7 @@
         class="branch-textarea"
         @keydown.ctrl.enter="submitBranch"
         @keydown.escape="showBranch = false"
-      ></textarea>
+      />
       
       <!-- Model selection for branch -->
       <div class="branch-models">
@@ -93,37 +132,49 @@
           <span class="models-label">Models:</span>
           <button 
             class="models-toggle" 
-            @click.stop="showModelPicker = !showModelPicker"
             :title="branchModels.length + ' model(s) selected'"
+            @click.stop="showModelPicker = !showModelPicker"
           >
             {{ branchModels.length }} selected ▾
           </button>
         </div>
         
         <!-- Selected model tags -->
-        <div v-if="branchModels.length > 0" class="branch-model-tags">
+        <div
+          v-if="branchModels.length > 0"
+          class="branch-model-tags"
+        >
           <span 
             v-for="mId in branchModels.slice(0, 3)" 
             :key="mId" 
             class="branch-model-tag"
           >
             {{ getShortModelName(mId) }}
-            <button class="tag-remove-btn" @click.stop="removeModel(mId)">×</button>
+            <button
+              class="tag-remove-btn"
+              @click.stop="removeModel(mId)"
+            >×</button>
           </span>
-          <span v-if="branchModels.length > 3" class="more-models">
+          <span
+            v-if="branchModels.length > 3"
+            class="more-models"
+          >
             +{{ branchModels.length - 3 }} more
           </span>
         </div>
         
         <!-- Model picker dropdown -->
-        <div v-if="showModelPicker" class="model-picker-dropdown">
+        <div
+          v-if="showModelPicker"
+          class="model-picker-dropdown"
+        >
           <input 
             v-model="modelSearchQuery" 
             type="text" 
             placeholder="Search models..." 
             class="model-search-input"
             @click.stop
-          />
+          >
           <div class="model-picker-list">
             <label 
               v-for="model in filteredModels" 
@@ -132,31 +183,59 @@
               :class="{ selected: branchModels.includes(model.id) }"
             >
               <input 
+                v-model="branchModels" 
                 type="checkbox" 
-                :value="model.id" 
-                v-model="branchModels"
+                :value="model.id"
                 @click.stop
-              />
+              >
               <span class="model-picker-name">{{ model.name }}</span>
             </label>
           </div>
           <div class="model-picker-actions">
-            <button class="picker-btn" @click.stop="branchModels = [modelId]">Reset</button>
-            <button class="picker-btn picker-btn-done" @click.stop="showModelPicker = false">Done</button>
+            <button
+              class="picker-btn"
+              @click.stop="branchModels = [modelId]"
+            >
+              Reset
+            </button>
+            <button
+              class="picker-btn picker-btn-done"
+              @click.stop="showModelPicker = false"
+            >
+              Done
+            </button>
           </div>
         </div>
       </div>
       
       <div class="branch-options">
-        <select v-model="branchContextMode" class="context-select">
-          <option value="full_history">Full History</option>
-          <option value="compact">Compact</option>
-          <option value="semantic">Semantic</option>
+        <select
+          v-model="branchContextMode"
+          class="context-select"
+        >
+          <option value="full_history">
+            Full History
+          </option>
+          <option value="compact">
+            Compact
+          </option>
+          <option value="semantic">
+            Semantic
+          </option>
         </select>
       </div>
       <div class="branch-actions">
-        <button class="branch-cancel" @click.stop="showBranch = false">Cancel</button>
-        <button class="branch-submit" @click.stop="submitBranch" :disabled="!branchPrompt.trim() || branchModels.length === 0">
+        <button
+          class="branch-cancel"
+          @click.stop="showBranch = false"
+        >
+          Cancel
+        </button>
+        <button
+          class="branch-submit"
+          :disabled="!branchPrompt.trim() || branchModels.length === 0"
+          @click.stop="submitBranch"
+        >
           Send ({{ branchModels.length }})
         </button>
       </div>
