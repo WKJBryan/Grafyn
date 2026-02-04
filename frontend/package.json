@@ -15,7 +15,10 @@
     "test:coverage": "vitest run --coverage",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
-    "tauri:build": "tauri build"
+    "tauri:build": "tauri build",
+    "tauri:build-with-mcp": "node scripts/build-sidecar.cjs && tauri build",
+    "build:sidecar": "node scripts/build-sidecar.cjs",
+    "version:bump": "node scripts/bump-version.cjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^1.6.0",
