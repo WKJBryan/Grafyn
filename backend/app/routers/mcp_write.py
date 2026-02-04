@@ -1,8 +1,11 @@
 """MCP write endpoints with OAuth authentication for ChatGPT integration"""
+import logging
 from fastapi import APIRouter, Depends, HTTPException, Request
 from typing import Optional
 from datetime import datetime, timezone
 from enum import Enum
+
+logger = logging.getLogger(__name__)
 
 from app.models.note import (
     Note,
@@ -89,7 +92,6 @@ async def mcp_create_note_simple(
 
     Send JSON body: {"title": "Note Title", "content": "Note content"}
     """
-    import sys
     import json
 
     # Try to get title from request body
@@ -104,7 +106,7 @@ async def mcp_create_note_simple(
     if not title:
         raise HTTPException(status_code=400, detail="title is required")
 
-    print(f"DEBUG: mcp_create_note_simple called with title={title}", file=sys.stderr)
+    logger.debug("mcp_create_note_simple called with title=%s", title)
 
     services = get_services(request)
     knowledge_store: KnowledgeStore = services["knowledge_store"]
@@ -153,9 +155,7 @@ async def mcp_create_note_simple(
             detail=f"Note with title '{title}' already exists."
         )
     except Exception as e:
-        import traceback
-        print(f"ERROR: {e}", file=sys.stderr)
-        print(f"TRACEBACK: {traceback.format_exc()}", file=sys.stderr)
+        logger.error("Failed to create note: %s", e, exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -171,9 +171,7 @@ async def mcp_create_note(
     This endpoint is called by ChatGPT to save information to the knowledge base.
     All notes created via MCP are tagged with provenance tracking.
     """
-    # Debug logging
-    import sys
-    print(f"DEBUG: mcp_create_note called with title={note_request.title}", file=sys.stderr)
+    logger.debug("mcp_create_note called with title=%s", note_request.title)
 
     services = get_services(request)
     knowledge_store: KnowledgeStore = services["knowledge_store"]
@@ -259,9 +257,7 @@ async def mcp_create_note(
             detail=f"Note with title '{note_request.title}' already exists. Use update_note instead."
         )
     except Exception as e:
-        import traceback
-        print(f"ERROR: {e}", file=sys.stderr)
-        print(f"TRACEBACK: {traceback.format_exc()}", file=sys.stderr)
+        logger.error("Failed to create note: %s", e, exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -491,9 +487,8 @@ async def mcp_search_notes(
 @router.post("/mcp-write/note")
 async def mcp_write_note(request: Request) -> dict:
     """Create note via MCP - simplified endpoint"""
-    import sys
     import json
-    
+
     body_bytes = await request.body()
     data = json.loads(body_bytes)
     
@@ -530,8 +525,8 @@ async def mcp_write_note(request: Request) -> dict:
             tags=note.frontmatter.tags,
         )
         
-        print(f"SUCCESS: Created note {note.id}", file=sys.stderr)
-        
+        logger.debug("Created note %s", note.id)
+
         return {
             "id": note.id,
             "title": note.title,
@@ -542,6 +537,5 @@ async def mcp_write_note(request: Request) -> dict:
     except FileExistsError:
         raise HTTPException(status_code=409, detail=f"Note '{title}' already exists")
     except Exception as e:
-        import traceback
-        print(f"ERROR: {e}\n{traceback.format_exc()}", file=sys.stderr)
+        logger.error("Failed to create note: %s", e, exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))

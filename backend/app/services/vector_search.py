@@ -383,7 +383,7 @@ class VectorSearchService:
     
     def delete_note(self, note_id: str):
         """Remove a note from the index"""
-        self._table.delete("note_id = ?", [note_id])
+        self._table.delete(f"note_id = '{note_id}'")
     
     def clear_all(self):
         """Clear all indexed notes"""

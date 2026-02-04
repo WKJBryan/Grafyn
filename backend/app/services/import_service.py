@@ -251,25 +251,21 @@ class ImportService:
             if progress_callback:
                 progress_callback(f"Processing {i + 1}/{len(decisions)}...")
             
-            print(f"[DEBUG] Processing decision {i+1}: conversation_id={decision.conversation_id}, action={decision.action}")
-            logger.info(f"Processing decision {i+1}: conversation_id={decision.conversation_id}, action={decision.action}")
-            
-            # Debug: Check job state
-            print(f"[DEBUG] Job has parsed_conversations: {job.parsed_conversations is not None}")
+            logger.debug("Processing decision %d: conversation_id=%s, action=%s", i+1, decision.conversation_id, decision.action)
+
+            logger.debug("Job has parsed_conversations: %s", job.parsed_conversations is not None)
             if job.parsed_conversations:
-                print(f"[DEBUG] parsed_conversations count: {len(job.parsed_conversations)}")
-                print(f"[DEBUG] parsed_conversations IDs: {[c.id for c in job.parsed_conversations]}")
-            
+                logger.debug("parsed_conversations count: %d", len(job.parsed_conversations))
+                logger.debug("parsed_conversations IDs: %s", [c.id for c in job.parsed_conversations])
+
             conv = self._find_conversation(job, decision.conversation_id)
-            print(f"[DEBUG] _find_conversation result: {conv is not None}")
+            logger.debug("_find_conversation result: %s", conv is not None)
             if not conv:
-                print(f"[DEBUG] Conversation NOT found: {decision.conversation_id}")
-                logger.warning(f"Conversation not found: {decision.conversation_id}")
+                logger.warning("Conversation not found: %s", decision.conversation_id)
                 skipped += 1
                 continue
             
-            print(f"[DEBUG] Found conversation: {conv.title}")
-            logger.info(f"Found conversation: {conv.title}")
+            logger.debug("Found conversation: %s", conv.title)
             
             try:
                 if decision.action == "skip":

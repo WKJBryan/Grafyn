@@ -3,7 +3,7 @@ import logging
 import re
 import frontmatter
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Union
 from datetime import datetime, timezone
 
 from app.models.note import (
@@ -91,10 +91,22 @@ class KnowledgeStore:
         
         return NoteType.GENERAL
     
+    def extract_wikilinks(self, content: str) -> List[str]:
+        """
+        Extract wikilink targets from content.
+
+        Args:
+            content: Markdown content to parse
+
+        Returns:
+            List of wikilink target titles (preserves duplicates)
+        """
+        return [match.group(1) for match in WIKILINK_PATTERN.finditer(content)]
+
     def extract_wikilinks_with_anchors(self, content: str) -> List[dict]:
         """
         Extract wikilinks with optional heading/block anchors.
-        
+
         Returns list of dicts with 'target' (note title) and 'anchor' (heading/block-id)
         """
         results = []
@@ -259,8 +271,16 @@ class KnowledgeStore:
             backlinks=[]  # Will be populated by graph index
         )
     
-    def create_note(self, note_data: NoteCreate) -> Note:
-        """Create a new note"""
+    def create_note(self, note_data: Union[NoteCreate, dict]) -> Note:
+        """Create a new note
+
+        Args:
+            note_data: Note data as NoteCreate model or dict
+        """
+        # Accept both dict and NoteCreate for flexibility
+        if isinstance(note_data, dict):
+            note_data = NoteCreate(**note_data)
+
         note_id = self._generate_note_id(note_data.title)
         note_path = self._get_note_path(note_id)
         
@@ -287,11 +307,20 @@ class KnowledgeStore:
         
         return self.get_note(note_id)
     
-    def update_note(self, note_id: str, note_data: NoteUpdate) -> Optional[Note]:
-        """Update an existing note"""
+    def update_note(self, note_id: str, note_data: Union[NoteUpdate, dict]) -> Optional[Note]:
+        """Update an existing note
+
+        Args:
+            note_id: ID of the note to update
+            note_data: Update data as NoteUpdate model or dict
+        """
         note_path = self._get_note_path(note_id)
         if not note_path.exists():
             return None
+
+        # Accept both dict and NoteUpdate for flexibility
+        if isinstance(note_data, dict):
+            note_data = NoteUpdate(**note_data)
         
         # Load existing note
         post = frontmatter.load(note_path)

@@ -76,24 +76,32 @@ class PriorityScoringService:
         return weight_map.get(content_type, self.weights.general_weight)
     
     def calculate_recency_score(
-        self, 
-        modified_date: Optional[datetime], 
+        self,
+        modified_date: Optional[datetime],
         base_score: float
     ) -> float:
         """
         Calculate recency score with time decay.
-        
+
         Args:
-            modified_date: When the note was last modified
+            modified_date: When the note was last modified (datetime or ISO string)
             base_score: The base content type score to decay from
-            
+
         Returns:
             Recency-adjusted score
         """
         if not modified_date:
             # If no date, assume recent (no penalty)
             return base_score
-        
+
+        # Handle ISO string dates (from JSON/LanceDB storage)
+        if isinstance(modified_date, str):
+            try:
+                modified_date = datetime.fromisoformat(modified_date.replace('Z', '+00:00'))
+            except (ValueError, TypeError):
+                # If parsing fails, assume recent (no penalty)
+                return base_score
+
         now = datetime.now(timezone.utc)
         age = now - modified_date
         

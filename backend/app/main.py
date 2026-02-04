@@ -179,12 +179,92 @@ app.include_router(feedback.router, prefix="/api/feedback", tags=["feedback"])
 setup_mcp(app)
 
 
-if __name__ == "__main__":
+def run_server(host: str = None, port: int = None, reload: bool = None):
+    """Run the uvicorn server with the specified configuration."""
     import uvicorn
 
     uvicorn.run(
         "app.main:app",
-        host=settings.server_host,
-        port=settings.server_port,
-        reload=settings.environment == "development",
+        host=host or settings.server_host,
+        port=port or settings.server_port,
+        reload=reload if reload is not None else settings.environment == "development",
+    )
+
+
+if __name__ == "__main__":
+    import argparse
+    import os
+
+    # Parse command-line arguments for sidecar mode
+    parser = argparse.ArgumentParser(
+        description="Seedream Knowledge Graph Backend",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Run with default settings (from .env)
+  python -m app.main
+
+  # Run as Tauri sidecar
+  python -m app.main --port 8765 --host 127.0.0.1 --vault-path ~/Documents/Seedream/vault
+
+  # Run in production mode
+  python -m app.main --port 8080 --no-reload --environment production
+        """
+    )
+    parser.add_argument(
+        "--host",
+        type=str,
+        default=None,
+        help="Host to bind to (default: from settings or 0.0.0.0)"
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="Port to bind to (default: from settings or 8080)"
+    )
+    parser.add_argument(
+        "--vault-path",
+        type=str,
+        default=None,
+        help="Path to the vault directory containing markdown notes"
+    )
+    parser.add_argument(
+        "--data-path",
+        type=str,
+        default=None,
+        help="Path to the data directory for LanceDB, canvas sessions, etc."
+    )
+    parser.add_argument(
+        "--no-reload",
+        action="store_true",
+        help="Disable auto-reload (useful for production or sidecar mode)"
+    )
+    parser.add_argument(
+        "--environment",
+        type=str,
+        choices=["development", "production"],
+        default=None,
+        help="Set the environment mode"
+    )
+
+    args = parser.parse_args()
+
+    # Override environment variables based on CLI args
+    # This allows the sidecar to configure paths dynamically
+    if args.vault_path:
+        os.environ["VAULT_PATH"] = args.vault_path
+    if args.data_path:
+        os.environ["DATA_PATH"] = args.data_path
+    if args.environment:
+        os.environ["ENVIRONMENT"] = args.environment
+
+    # Determine reload setting
+    reload = not args.no_reload if args.no_reload else None
+
+    # Run the server
+    run_server(
+        host=args.host,
+        port=args.port,
+        reload=reload,
     )
