@@ -284,6 +284,35 @@ export const settings = {
     ),
 }
 
+// MCP Sidecar API (Desktop only)
+export const mcp = {
+  getStatus: () =>
+    invokeOrHttp('get_mcp_status', {}, () =>
+      Promise.resolve({ enabled: false, status: 'Stopped', mcp_url: '', api_url: '', port: 8765 })
+    ),
+
+  start: () =>
+    invokeOrHttp('start_mcp_sidecar', {}, () =>
+      Promise.resolve({ enabled: false, status: 'Stopped' })
+    ),
+
+  stop: () =>
+    invokeOrHttp('stop_mcp_sidecar', {}, () =>
+      Promise.resolve({ enabled: false, status: 'Stopped' })
+    ),
+
+  restart: () =>
+    invokeOrHttp('restart_mcp_sidecar', {}, () =>
+      Promise.resolve({ enabled: false, status: 'Stopped' })
+    ),
+
+  checkHealth: () =>
+    invokeOrHttp('check_mcp_health', {}, () => Promise.resolve(false)),
+
+  getConfigSnippet: () =>
+    invokeOrHttp('get_mcp_config_snippet', {}, () => Promise.resolve('')),
+}
+
 // Utility function to check if we're in Tauri environment
 export const isDesktopApp = isTauri
 

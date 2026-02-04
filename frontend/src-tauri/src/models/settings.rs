@@ -21,6 +21,10 @@ pub struct UserSettings {
     /// Theme preference (light/dark/system)
     #[serde(default = "default_theme")]
     pub theme: String,
+
+    /// Whether MCP sidecar is enabled
+    #[serde(default)]
+    pub mcp_enabled: bool,
 }
 
 fn default_theme() -> String {
@@ -34,6 +38,7 @@ impl Default for UserSettings {
             openrouter_api_key: None,
             setup_completed: false,
             theme: default_theme(),
+            mcp_enabled: false,
         }
     }
 }
@@ -81,6 +86,7 @@ pub struct SettingsUpdate {
     pub openrouter_api_key: Option<String>,
     pub setup_completed: Option<bool>,
     pub theme: Option<String>,
+    pub mcp_enabled: Option<bool>,
 }
 
 /// Response for settings status check
@@ -91,6 +97,7 @@ pub struct SettingsStatus {
     pub has_openrouter_key: bool,
     pub vault_path: Option<String>,
     pub theme: String,
+    pub mcp_enabled: bool,
 }
 
 impl From<&UserSettings> for SettingsStatus {
@@ -101,6 +108,7 @@ impl From<&UserSettings> for SettingsStatus {
             has_openrouter_key: settings.has_openrouter_key(),
             vault_path: settings.vault_path.clone(),
             theme: settings.theme.clone(),
+            mcp_enabled: settings.mcp_enabled,
         }
     }
 }

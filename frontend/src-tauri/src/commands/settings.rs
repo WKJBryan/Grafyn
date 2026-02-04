@@ -22,10 +22,12 @@ pub async fn get_settings_status(state: State<'_, AppState>) -> Result<SettingsS
 #[tauri::command]
 pub async fn update_settings(
     state: State<'_, AppState>,
+    app_handle: tauri::AppHandle,
     update: SettingsUpdate,
 ) -> Result<UserSettings, String> {
-    // Check if API key is being updated
+    // Capture values before moving update
     let new_api_key = update.openrouter_api_key.clone();
+    let new_mcp_enabled = update.mcp_enabled;
 
     // Update settings
     let mut settings = state.settings_service.write().await;
@@ -36,6 +38,22 @@ pub async fn update_settings(
         let mut openrouter = state.openrouter.write().await;
         openrouter.set_api_key(api_key);
         log::info!("OpenRouter API key updated from settings");
+    }
+
+    // Sync MCP sidecar if mcp_enabled was changed
+    if let Some(mcp_enabled) = new_mcp_enabled {
+        let sidecar = &state.mcp_sidecar;
+        if mcp_enabled {
+            sidecar.set_enabled(true);
+            if let Err(e) = sidecar.start(&app_handle).await {
+                log::error!("Failed to start MCP sidecar from settings: {}", e);
+            }
+        } else {
+            if let Err(e) = sidecar.stop().await {
+                log::error!("Failed to stop MCP sidecar from settings: {}", e);
+            }
+            sidecar.set_enabled(false);
+        }
     }
 
     Ok(result)

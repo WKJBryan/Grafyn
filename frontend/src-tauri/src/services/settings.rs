@@ -75,6 +75,10 @@ impl SettingsService {
             self.settings.theme = theme;
         }
 
+        if let Some(mcp_enabled) = update.mcp_enabled {
+            self.settings.mcp_enabled = mcp_enabled;
+        }
+
         // Persist to disk
         self.save()?;
 
@@ -115,6 +119,11 @@ impl SettingsService {
     pub fn complete_setup(&mut self) -> Result<()> {
         self.settings.setup_completed = true;
         self.save()
+    }
+
+    /// Check if MCP sidecar is enabled in settings
+    pub fn mcp_enabled(&self) -> bool {
+        self.settings.mcp_enabled
     }
 
     /// Clear the OpenRouter API key
