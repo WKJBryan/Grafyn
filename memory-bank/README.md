@@ -1,4 +1,4 @@
-# Seedream Memory Bank
+# Grafyn Memory Bank
 
 > **Purpose:** Central repository for project knowledge, decisions, and practical guidance
 > **Last Updated:** 2025-12-31
@@ -125,7 +125,7 @@ A good ADR should:
 
 - [Technical Documentation](../docs/)
 - [Project README](../README.md)
-- [GitHub Repository](https://github.com/your-org/seedream)
+- [GitHub Repository](https://github.com/your-org/grafyn)
 
 ---
 

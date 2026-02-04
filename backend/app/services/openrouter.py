@@ -30,7 +30,7 @@ class OpenRouterService:
                 headers={
                     "Authorization": f"Bearer {self.api_key}",
                     "HTTP-Referer": settings.app_url,
-                    "X-Title": "Seedream Knowledge Platform",
+                    "X-Title": "Grafyn Knowledge Platform",
                     "Content-Type": "application/json",
                 },
             )

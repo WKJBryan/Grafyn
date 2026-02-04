@@ -1,4 +1,4 @@
-# Seedream Frontend Development Guide
+# Grafyn Frontend Development Guide
 
 > **Part:** Frontend | **Framework:** Vue 3 | **Build Tool:** Vite
 

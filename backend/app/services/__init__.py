@@ -1,1 +1,1 @@
-"""Business logic services for Seedream backend"""
+"""Business logic services for Grafyn backend"""

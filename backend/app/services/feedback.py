@@ -32,7 +32,7 @@ class FeedbackService:
             self._client = httpx.AsyncClient(
                 timeout=httpx.Timeout(30.0),
                 headers={
-                    "User-Agent": "Seedream-Backend",
+                    "User-Agent": "Grafyn-Backend",
                     "Accept": "application/vnd.github+json",
                     "X-GitHub-Api-Version": "2022-11-28",
                 },
@@ -164,7 +164,7 @@ class FeedbackService:
             if feedback.system_info.current_page:
                 body += f"- **Current Page:** {feedback.system_info.current_page}\n"
 
-        body += "\n---\n*Submitted via Seedream Web App*"
+        body += "\n---\n*Submitted via Grafyn Web App*"
 
         return body
 

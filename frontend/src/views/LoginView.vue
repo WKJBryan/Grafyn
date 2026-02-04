@@ -3,7 +3,7 @@
     <div class="login-container">
       <div class="login-card">
         <h1 class="login-title">
-          Welcome to Seedream
+          Welcome to Grafyn
         </h1>
         <p class="login-subtitle">
           Your personal knowledge management system

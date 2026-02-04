@@ -1,1 +1,1 @@
-"""MCP integration for Seedream backend"""
+"""MCP integration for Grafyn backend"""

@@ -1,4 +1,4 @@
-"""Pydantic models for Seedream"""
+"""Pydantic models for Grafyn"""
 from app.models.note import (
     Note,
     NoteCreate,

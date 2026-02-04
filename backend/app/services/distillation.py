@@ -90,8 +90,8 @@ def normalize_all_tags(tags: List[str]) -> List[str]:
 # PROTECTED SECTION LOGIC (Canvas Export)
 # ============================================================================
 
-CANVAS_START = "<!-- SEEDREAM:CANVAS_SNAPSHOT:START -->"
-CANVAS_END = "<!-- SEEDREAM:CANVAS_SNAPSHOT:END -->"
+CANVAS_START = "<!-- GRAFYN:CANVAS_SNAPSHOT:START -->"
+CANVAS_END = "<!-- GRAFYN:CANVAS_SNAPSHOT:END -->"
 
 
 def update_protected_section(existing_content: str, new_snapshot: str) -> str:
@@ -1489,7 +1489,7 @@ Format your response as markdown with ## headings for each atomic unit."""
         """Suggest a hub based on title and tags."""
         # Simple heuristic: use first significant tag as hub
         for tag in tags:
-            if tag not in ('seedream', 'draft'):
+            if tag not in ('grafyn', 'draft'):
                 return f"Hub: {tag.replace('-', ' ').title()}"
         return None
     
@@ -1521,7 +1521,7 @@ Format your response as markdown with ## headings for each atomic unit."""
                 hub_data = NoteCreate(
                     title=hub_title,
                     content=content,
-                    tags=["hub", "seedream"],
+                    tags=["hub", "grafyn"],
                     status="draft"
                 )
                 hub = self.knowledge_store.create_note(hub_data)

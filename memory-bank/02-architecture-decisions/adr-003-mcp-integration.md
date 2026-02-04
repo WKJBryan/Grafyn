@@ -10,14 +10,14 @@ Accepted
 
 ## Context
 
-Seedream aims to integrate with external AI assistants (Claude, ChatGPT, Gemini) to:
+Grafyn aims to integrate with external AI assistants (Claude, ChatGPT, Gemini) to:
 
 1. **Enable AI to query organizational knowledge**: AI assistants can search and retrieve information
 2. **Allow AI to store conversations**: Save chat transcripts as evidence notes
 3. **Support AI-generated drafts**: Create draft notes from AI analysis
 4. **Provide bidirectional integration**: AI can both read and write to knowledge base
 
-We need a standardized protocol for AI assistants to interact with Seedream that is:
+We need a standardized protocol for AI assistants to interact with Grafyn that is:
 
 - **Standardized**: Works with multiple AI providers
 - **Extensible**: Easy to add new tools and capabilities
@@ -53,7 +53,7 @@ We adopted the **Model Context Protocol (MCP)** for AI integration using the `fa
          └───────────────┬───────────────┘
                          │
          ┌───────────────┴───────────────┐
-         │    Seedream Backend /sse         │
+         │    Grafyn Backend /sse         │
          │  ┌─────────────────────────┐   │
          │  │   fastapi-mcp         │   │
          │  │   (MCP Server)        │   │
@@ -105,7 +105,7 @@ async def verify_oauth(authorization: str = Header(None)):
 def setup_mcp(app: FastAPI) -> None:
     mcp = FastApiMCP(
         app,
-        name="Seedream Knowledge Graph",
+        name="Grafyn Knowledge Graph",
         description="Access and query an organizational knowledge base",
         transport="sse"
     )
@@ -173,14 +173,14 @@ def setup_oauth_routes(app: FastAPI):
 
 #### Claude Desktop Configuration
 
-Users configure Claude Desktop to connect to Seedream:
+Users configure Claude Desktop to connect to Grafyn:
 
 **File:** `~/.config/Claude/claude_desktop_config.json`
 
 ```json
 {
   "mcpServers": {
-    "seedream": {
+    "grafyn": {
       "url": "http://localhost:8080/sse",
       "transport": "sse"
     }
@@ -193,7 +193,7 @@ Users configure Claude Desktop to connect to Seedream:
 Users register the MCP server in ChatGPT settings:
 
 ```
-Server Name: Seedream Knowledge Base
+Server Name: Grafyn Knowledge Base
 SSE Endpoint: https://your-name.ngrok.io/sse
 OAuth Provider: GitHub
 Client ID: your-github-client-id
@@ -592,7 +592,7 @@ async def test_mcp_with_oauth():
 ```json
 {
   "mcpServers": {
-    "seedream": {
+    "grafyn": {
       "url": "http://localhost:8080/sse",
       "transport": "sse"
     }

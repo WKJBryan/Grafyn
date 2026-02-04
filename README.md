@@ -1,4 +1,4 @@
-# Seedream
+# Grafyn
 
 A local knowledge graph platform with semantic search, Obsidian-style linking, Multi-LLM Canvas, and MCP (Model Context Protocol) integration. Available as both a web app and a native desktop application.
 
@@ -112,9 +112,9 @@ npm run tauri:build     # macOS/Linux
 ```
 
 **Output locations:**
-- Windows: `src-tauri/target/release/bundle/msi/Seedream_1.0.0_x64.msi`
-- macOS: `src-tauri/target/release/bundle/dmg/Seedream_1.0.0_x64.dmg`
-- Linux: `src-tauri/target/release/bundle/deb/seedream_1.0.0_amd64.deb`
+- Windows: `src-tauri/target/release/bundle/msi/Grafyn_1.0.0_x64.msi`
+- macOS: `src-tauri/target/release/bundle/dmg/Grafyn_1.0.0_x64.dmg`
+- Linux: `src-tauri/target/release/bundle/deb/grafyn_1.0.0_amd64.deb`
 
 ### Docker Setup
 
@@ -235,7 +235,7 @@ Interactive docs available at:
 ## Architecture
 
 ```
-seedream/
+grafyn/
 ├── backend/                    # Python FastAPI backend
 │   ├── app/
 │   │   ├── main.py            # Application entry point

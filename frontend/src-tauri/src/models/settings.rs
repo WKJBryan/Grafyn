@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserSettings {
     /// Path to the vault (markdown notes folder)
-    /// If None, uses default ~/Documents/Seedream/vault
+    /// If None, uses default ~/Documents/Grafyn/vault
     pub vault_path: Option<String>,
 
     /// OpenRouter API key for LLM features (Canvas)
@@ -62,10 +62,10 @@ impl UserSettings {
         if let Some(ref path) = self.vault_path {
             std::path::PathBuf::from(path)
         } else {
-            // Default to ~/Documents/Seedream/vault
+            // Default to ~/Documents/Grafyn/vault
             dirs::document_dir()
                 .unwrap_or_else(|| std::path::PathBuf::from("."))
-                .join("Seedream")
+                .join("Grafyn")
                 .join("vault")
         }
     }
@@ -74,7 +74,7 @@ impl UserSettings {
     pub fn effective_data_path(&self) -> std::path::PathBuf {
         dirs::data_local_dir()
             .unwrap_or_else(|| dirs::document_dir().unwrap_or_else(|| std::path::PathBuf::from(".")))
-            .join("Seedream")
+            .join("Grafyn")
             .join("data")
     }
 }

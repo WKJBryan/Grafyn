@@ -1,14 +1,14 @@
-# Seedream Integration Architecture
+# Grafyn Integration Architecture
 
 > **Type:** Multi-Part Monorepo | **Parts:** Backend + Frontend | **Scan Level:** Exhaustive
 
 ## Overview
 
-Seedream consists of two main parts that communicate via REST API:
+Grafyn consists of two main parts that communicate via REST API:
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│                           Seedream Platform                             │
+│                           Grafyn Platform                             │
 │                                                                      │
 │  ┌──────────────────────┐         ┌──────────────────────────────┐  │
 │  │     Frontend         │  HTTP   │          Backend              │  │
@@ -307,7 +307,7 @@ if note is None:
 ```json
 {
   "mcpServers": {
-    "seedream": {
+    "grafyn": {
       "url": "http://localhost:8080/sse",
       "transport": "sse"
     }
@@ -323,7 +323,7 @@ ChatGPT requires OAuth authentication and a public HTTPS endpoint:
 1. Expose backend via ngrok: `ngrok http 8080`
 2. Register GitHub OAuth app at https://github.com/settings/developers
 3. Configure ChatGPT with:
-   - **Server Name**: Seedream Knowledge Base
+   - **Server Name**: Grafyn Knowledge Base
    - **SSE Endpoint**: `https://your-name.ngrok.io/sse`
    - **OAuth Provider**: GitHub
    - **Client ID**: Your GitHub OAuth app client ID

@@ -1,4 +1,4 @@
-# Seedream API Contracts - Backend
+# Grafyn API Contracts - Backend
 
 > **Part:** Backend | **Endpoints:** 30+ | **Scan Level:** Exhaustive
 
@@ -46,7 +46,7 @@ Get a specific note by ID.
 {
   "id": "Welcome",
   "title": "Welcome",
-  "content": "# Welcome to Seedream\n\nThis is your knowledge base...",
+  "content": "# Welcome to Grafyn\n\nThis is your knowledge base...",
   "frontmatter": {
     "title": "Welcome",
     "created": "2024-12-17T00:00:00",
@@ -793,7 +793,7 @@ Health check endpoint. Rate limited to 30/minute.
 ```json
 {
   "status": "healthy",
-  "service": "seedream",
+  "service": "grafyn",
   "environment": "development"
 }
 ```
@@ -806,7 +806,7 @@ Root endpoint with API info.
 **Response:** `200 OK`
 ```json
 {
-  "name": "Seedream Knowledge Graph",
+  "name": "Grafyn Knowledge Graph",
   "version": "0.1.0",
   "vault_path": "/path/to/vault",
   "docs": "/docs",

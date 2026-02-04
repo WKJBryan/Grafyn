@@ -35,7 +35,7 @@ settings = get_settings()
 
 
 class ImportService:
-    """Service for importing LLM conversations into Seedream"""
+    """Service for importing LLM conversations into Grafyn"""
     
     # Default model for summarization if none specified
     DEFAULT_SUMMARY_MODEL = "anthropic/claude-3.5-sonnet"

@@ -1,7 +1,7 @@
 [package]
-name = "seedream"
-version = "0.0.1"
-description = "Seedream - Knowledge Management Desktop App"
+name = "grafyn"
+version = "0.0.2"
+description = "Grafyn - Knowledge Management Desktop App"
 authors = ["Bryan"]
 license = "MIT"
 repository = ""

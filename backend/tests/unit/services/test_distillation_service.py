@@ -98,9 +98,9 @@ class TestParseInlineTags:
 
     def test_basic_tags(self):
         """Should find simple #tags in text."""
-        content = "This is about #seedream and #canvas"
+        content = "This is about #grafyn and #canvas"
         tags = parse_inline_tags(content)
-        assert "seedream" in tags
+        assert "grafyn" in tags
         assert "canvas" in tags
 
     def test_tags_with_hyphens(self):
@@ -111,9 +111,9 @@ class TestParseInlineTags:
 
     def test_tags_with_slashes(self):
         """Should capture namespace-style tags with slashes."""
-        content = "Filed under #project/seedream"
+        content = "Filed under #project/grafyn"
         tags = parse_inline_tags(content)
-        assert "project/seedream" in tags
+        assert "project/grafyn" in tags
 
     def test_tags_with_underscores(self):
         """Should capture tags with underscores."""
@@ -156,9 +156,9 @@ More text #aftercode
 
     def test_deduplication(self):
         """Duplicate tags should appear only once."""
-        content = "#seedream is great, love #seedream and also #Seedream"
+        content = "#grafyn is great, love #grafyn and also #Grafyn"
         tags = parse_inline_tags(content)
-        assert tags.count("seedream") == 1
+        assert tags.count("grafyn") == 1
 
     def test_empty_content(self):
         """Empty content should return an empty list."""
@@ -199,8 +199,8 @@ class TestMergeTags:
 
     def test_merge_deduplicates(self):
         """Identical tags should appear only once."""
-        result = merge_tags(["seedream"], ["seedream"])
-        assert result.count("seedream") == 1
+        result = merge_tags(["grafyn"], ["grafyn"])
+        assert result.count("grafyn") == 1
 
     def test_merge_normalizes_during_merge(self):
         """Tags should be normalized during the merge."""
@@ -240,10 +240,10 @@ class TestNormalizeAllTags:
 
     def test_normalize_and_deduplicate(self):
         """Should normalize all tags and remove duplicates."""
-        tags = ["#Seedream", "seedream", "Canvas Export"]
+        tags = ["#Grafyn", "grafyn", "Canvas Export"]
         result = normalize_all_tags(tags)
         assert len(result) == 2
-        assert "seedream" in result
+        assert "grafyn" in result
         assert "canvas-export" in result
 
     def test_sorted_output(self):

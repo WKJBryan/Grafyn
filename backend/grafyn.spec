@@ -1,12 +1,12 @@
 # -*- mode: python ; coding: utf-8 -*-
 """
-PyInstaller spec file for Seedream Python backend sidecar.
+PyInstaller spec file for Grafyn Python backend sidecar.
 
 This bundles the FastAPI backend as a standalone executable that Tauri
 can launch as a sidecar process for MCP (Model Context Protocol) support.
 
 Build with:
-    pyinstaller seedream.spec
+    pyinstaller grafyn.spec
 
 Or use the build script:
     python build-exe.py
@@ -17,11 +17,11 @@ from pathlib import Path
 
 # Determine the platform-specific executable name
 if sys.platform == 'win32':
-    exe_name = 'seedream-backend'
+    exe_name = 'grafyn-backend'
 elif sys.platform == 'darwin':
-    exe_name = 'seedream-backend'
+    exe_name = 'grafyn-backend'
 else:
-    exe_name = 'seedream-backend'
+    exe_name = 'grafyn-backend'
 
 # Get the absolute path to the backend directory
 backend_dir = Path(SPECPATH).resolve()

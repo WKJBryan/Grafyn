@@ -1,4 +1,4 @@
-# Security Audit Report - Seedream Knowledge Graph Platform
+# Security Audit Report - Grafyn Knowledge Graph Platform
 
 **Date:** 2026-01-01  
 **Auditor:** Code Simplifier Mode  
@@ -379,7 +379,7 @@ knowledge_store = None  # Global in each router
 
 ## Conclusion
 
-The Seedream platform has several critical security vulnerabilities that require immediate attention. The authentication bypass and insecure token storage are particularly concerning and should be addressed before any production deployment.
+The Grafyn platform has several critical security vulnerabilities that require immediate attention. The authentication bypass and insecure token storage are particularly concerning and should be addressed before any production deployment.
 
 The codebase would also benefit significantly from refactoring to eliminate duplication and improve maintainability, which will make implementing security fixes easier and more consistent.
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Build script for Seedream Python backend sidecar.
+Build script for Grafyn Python backend sidecar.
 
 This script:
 1. Builds the Python backend as a standalone executable using PyInstaller
@@ -27,10 +27,10 @@ def get_target_triple() -> str:
     Get the Rust target triple for the current platform.
 
     Tauri expects sidecar binaries to be named with the target triple suffix:
-    - Windows: seedream-backend-x86_64-pc-windows-msvc.exe
-    - macOS Intel: seedream-backend-x86_64-apple-darwin
-    - macOS ARM: seedream-backend-aarch64-apple-darwin
-    - Linux: seedream-backend-x86_64-unknown-linux-gnu
+    - Windows: grafyn-backend-x86_64-pc-windows-msvc.exe
+    - macOS Intel: grafyn-backend-x86_64-apple-darwin
+    - macOS ARM: grafyn-backend-aarch64-apple-darwin
+    - Linux: grafyn-backend-x86_64-unknown-linux-gnu
     """
     system = platform.system().lower()
     machine = platform.machine().lower()
@@ -79,7 +79,7 @@ def build_executable(backend_dir: Path) -> Path:
     print("\nBuilding executable with PyInstaller...")
     print("This may take several minutes on first build.\n")
 
-    spec_file = backend_dir / 'seedream.spec'
+    spec_file = backend_dir / 'grafyn.spec'
 
     if not spec_file.exists():
         print(f"Error: Spec file not found: {spec_file}")
@@ -100,9 +100,9 @@ def build_executable(backend_dir: Path) -> Path:
     dist_dir = backend_dir / 'dist'
 
     if platform.system() == 'Windows':
-        exe_path = dist_dir / 'seedream-backend.exe'
+        exe_path = dist_dir / 'grafyn-backend.exe'
     else:
-        exe_path = dist_dir / 'seedream-backend'
+        exe_path = dist_dir / 'grafyn-backend'
 
     if not exe_path.exists():
         print(f"\nError: Expected executable not found: {exe_path}")
@@ -127,9 +127,9 @@ def copy_to_tauri(exe_path: Path, backend_dir: Path) -> Path:
 
     # Build the target filename
     if platform.system() == 'Windows':
-        target_name = f'seedream-backend-{target_triple}.exe'
+        target_name = f'grafyn-backend-{target_triple}.exe'
     else:
-        target_name = f'seedream-backend-{target_triple}'
+        target_name = f'grafyn-backend-{target_triple}'
 
     target_path = tauri_binaries / target_name
 
@@ -177,7 +177,7 @@ def verify_dependencies() -> bool:
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Build Seedream Python backend as standalone executable'
+        description='Build Grafyn Python backend as standalone executable'
     )
     parser.add_argument(
         '--clean',
@@ -195,7 +195,7 @@ def main():
     backend_dir = Path(__file__).parent.resolve()
 
     print("=" * 60)
-    print("Seedream Python Backend Build Script")
+    print("Grafyn Python Backend Build Script")
     print("=" * 60)
     print(f"\nPlatform: {platform.system()} {platform.machine()}")
     print(f"Target triple: {get_target_triple()}")

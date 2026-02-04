@@ -1,4 +1,4 @@
-# Seedream Backend Development Guide
+# Grafyn Backend Development Guide
 
 > **Part:** Backend | **Language:** Python 3.11+ | **Framework:** FastAPI
 

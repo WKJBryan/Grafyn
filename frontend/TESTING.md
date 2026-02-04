@@ -2,7 +2,7 @@
 
 ## Overview
 
-Comprehensive test suite for the Seedream Vue 3 frontend using Vitest and @vue/test-utils.
+Comprehensive test suite for the Grafyn Vue 3 frontend using Vitest and @vue/test-utils.
 
 ## Test Infrastructure
 

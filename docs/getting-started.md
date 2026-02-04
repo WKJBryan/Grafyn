@@ -1,4 +1,4 @@
-# Seedream - Getting Started Guide
+# Grafyn - Getting Started Guide
 
 > **Step-by-step setup guide for new developers**
 
@@ -23,7 +23,7 @@ uv --version       # Should show uv version
 
 ```bash
 git clone <repository-url>
-cd Seedream
+cd Grafyn
 ```
 
 ---

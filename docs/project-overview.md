@@ -1,8 +1,8 @@
-# Seedream Knowledge Graph Platform - Project Overview
+# Grafyn Knowledge Graph Platform - Project Overview
 
 ## Executive Summary
 
-Seedream is a **local knowledge graph platform** that enables semantic search, Obsidian-style linking, and MCP (Model Context Protocol) integration. It provides a self-hosted knowledge base with AI-ready capabilities for personal or organizational use.
+Grafyn is a **local knowledge graph platform** that enables semantic search, Obsidian-style linking, and MCP (Model Context Protocol) integration. It provides a self-hosted knowledge base with AI-ready capabilities for personal or organizational use.
 
 ## Key Features
 
@@ -41,7 +41,7 @@ Seedream is a **local knowledge graph platform** that enables semantic search, O
 **Multi-Part Monorepo** with clear separation:
 
 ```
-seedream/
+grafyn/
 ├── backend/     → FastAPI Python service (data, search, MCP, Canvas)
 │   └── app/
 │       ├── main.py           # Application entry point

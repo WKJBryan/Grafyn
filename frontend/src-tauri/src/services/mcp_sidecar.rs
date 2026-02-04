@@ -151,7 +151,7 @@ impl McpSidecarService {
         ];
 
         // Spawn the sidecar process
-        let result = Command::new_sidecar("seedream-backend")
+        let result = Command::new_sidecar("grafyn-backend")
             .map_err(|e| format!("Failed to create sidecar command: {}", e))?
             .args(args)
             .spawn();

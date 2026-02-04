@@ -1,4 +1,4 @@
-# Seedream — How to Run Everything
+# Grafyn — How to Run Everything
 
 ## 1. Desktop App (Tauri) — Recommended for Production Use
 
@@ -20,7 +20,7 @@ npm run tauri:build         # Production build → src-tauri/target/release/bund
 
 **Environment:** `set OPENROUTER_API_KEY=your-key` for the Multi-LLM Canvas feature
 
-**Data location:** `~/Documents/Seedream/` (vault/ for notes, data/ for indexes)
+**Data location:** `~/Documents/Grafyn/` (vault/ for notes, data/ for indexes)
 
 ---
 
@@ -107,7 +107,7 @@ export MCP_ENABLED=1     # macOS/Linux
 ### Connect Claude Desktop
 Add to `claude_desktop_config.json`:
 ```json
-{ "mcpServers": { "seedream-local": { "url": "http://localhost:8765/sse" } } }
+{ "mcpServers": { "grafyn-local": { "url": "http://localhost:8765/sse" } } }
 ```
 
 ---

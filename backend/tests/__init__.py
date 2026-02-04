@@ -1,1 +1,1 @@
-"""Seedream backend tests"""
+"""Grafyn backend tests"""

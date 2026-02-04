@@ -1,10 +1,10 @@
 # ChatGPT MCP Connection Setup Guide
 
-This guide explains how to connect ChatGPT to your Seedream knowledge base using MCP (Model Context Protocol).
+This guide explains how to connect ChatGPT to your Grafyn knowledge base using MCP (Model Context Protocol).
 
 ## Prerequisites
 
-- Seedream backend running on port 8080
+- Grafyn backend running on port 8080
 - ngrok account (free) for public tunneling
 - GitHub account for OAuth
 
@@ -16,7 +16,7 @@ First, expose your local backend to the internet:
 
 ```bash
 # Option A: Using pyngrok (Python)
-cd C:\Users\bryan\Seedream
+cd C:\Users\bryan\Grafyn
 .venv\Scripts\python.exe -c "
 from dotenv import load_dotenv
 load_dotenv()
@@ -42,7 +42,7 @@ ngrok http 8080
 1. Go to: https://github.com/settings/developers
 2. Click **"OAuth Apps"** → **"New OAuth App"**
 3. Fill in the form:
-   - **Application name**: `Seedream ChatGPT MCP`
+   - **Application name**: `Grafyn ChatGPT MCP`
    - **Homepage URL**: `https://your-ngrok-url.ngrok-free.dev`
    - **Authorization callback URL**: `https://your-ngrok-url.ngrok-free.dev/auth/callback`
 4. Click **"Register application"**
@@ -55,7 +55,7 @@ ngrok http 8080
 
 Update **both** `.env` files with your credentials:
 
-### File 1: `C:\Users\bryan\Seedream\.env`
+### File 1: `C:\Users\bryan\Grafyn\.env`
 
 ```bash
 # OAuth Configuration (for ChatGPT MCP)
@@ -70,7 +70,7 @@ TOKEN_ENCRYPTION_KEY=9p-LlCYNIDYXYCD6HfbnkdX8Z3JzpGVlpts1jB8EZOQ=
 NGROK_AUTH_TOKEN=your-ngrok-authtoken
 ```
 
-### File 2: `C:\Users\bryan\Seedream\backend\.env`
+### File 2: `C:\Users\bryan\Grafyn\backend\.env`
 
 ```bash
 # Same values as above
@@ -86,7 +86,7 @@ NGROK_AUTH_TOKEN=your-ngrok-authtoken
 ## Step 4: Start the Backend
 
 ```bash
-cd C:\Users\bryan\Seedream
+cd C:\Users\bryan\Grafyn
 .venv\Scripts\python.exe -m backend.app.main
 ```
 
@@ -114,7 +114,7 @@ curl https://your-ngrok-url.ngrok-free.dev/sse
 ```
 
 Expected responses:
-- Health: `{"status":"healthy","service":"seedream","environment":"development"}`
+- Health: `{"status":"healthy","service":"grafyn","environment":"development"}`
 - OAuth: `{"authorization_url":"https://github.com/login/oauth/authorize?client_id=YOUR_CLIENT_ID...}`
 - SSE: `event: endpoint\ndata: /sse/messages/?session_id=...`
 

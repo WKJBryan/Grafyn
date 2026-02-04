@@ -8,7 +8,7 @@ Accepted
 
 ## Context
 
-As part of enabling ChatGPT to connect to Seedream's MCP server ([ADR-003](./adr-003-mcp-integration.md)), we need to implement authentication. Unlike Claude Desktop which runs locally and can connect without authentication, ChatGPT requires OAuth 2.0 authentication for security reasons.
+As part of enabling ChatGPT to connect to Grafyn's MCP server ([ADR-003](./adr-003-mcp-integration.md)), we need to implement authentication. Unlike Claude Desktop which runs locally and can connect without authentication, ChatGPT requires OAuth 2.0 authentication for security reasons.
 
 ### Requirements
 
@@ -135,7 +135,7 @@ async def verify_oauth(authorization: str = Header(None)):
 def setup_mcp(app: FastAPI) -> None:
     mcp = FastApiMCP(
         app,
-        name="Seedream Knowledge Graph",
+        name="Grafyn Knowledge Graph",
         description="Access and query an organizational knowledge base",
         transport="sse"
     )
@@ -280,7 +280,7 @@ def get_token(token_id):
 from sqlalchemy import create_engine, Column, String, DateTime
 from datetime import datetime, timedelta
 
-engine = create_engine('postgresql://user:pass@localhost/seedream')
+engine = create_engine('postgresql://user:pass@localhost/grafyn')
 
 class OAuthToken(Base):
     __tablename__ = 'oauth_tokens'
@@ -341,7 +341,7 @@ async def test_invalid_token():
 1. Go to https://github.com/settings/developers
 2. Click "New OAuth App"
 3. Fill in the form:
-   - **Application name**: Seedream Knowledge Base
+   - **Application name**: Grafyn Knowledge Base
    - **Homepage URL**: https://your-name.ngrok.io
    - **Authorization callback URL**: https://your-name.ngrok.io/auth/callback
 4. Click "Register application"
@@ -377,7 +377,7 @@ ngrok http 8080
 Register MCP server in ChatGPT settings:
 
 ```
-Server Name: Seedream Knowledge Base
+Server Name: Grafyn Knowledge Base
 SSE Endpoint: https://your-name.ngrok.io/sse
 OAuth Provider: GitHub
 Client ID: your-github-client-id

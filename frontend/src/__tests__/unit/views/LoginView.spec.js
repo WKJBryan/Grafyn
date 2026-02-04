@@ -66,7 +66,7 @@ describe('LoginView', () => {
     it('displays welcome title', () => {
       wrapper = mount(LoginView)
 
-      expect(wrapper.find('.login-title').text()).toBe('Welcome to Seedream')
+      expect(wrapper.find('.login-title').text()).toBe('Welcome to Grafyn')
     })
 
     it('displays subtitle', () => {

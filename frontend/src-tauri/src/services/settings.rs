@@ -17,7 +17,7 @@ impl SettingsService {
         let config_dir = dirs::config_dir()
             .or_else(|| dirs::data_local_dir())
             .unwrap_or_else(|| PathBuf::from("."))
-            .join("Seedream");
+            .join("Grafyn");
 
         std::fs::create_dir_all(&config_dir).ok();
         let config_path = config_dir.join("settings.json");

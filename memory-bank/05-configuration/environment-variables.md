@@ -1,13 +1,13 @@
 # Environment Variables Reference
 
-> **Purpose:** Document all environment variables for Seedream configuration
+> **Purpose:** Document all environment variables for Grafyn configuration
 > **Created:** 2025-12-31
 > **Last Updated:** 2025-12-31
 > **Status:** Active
 
 ## Overview
 
-This document lists all environment variables used by Seedream backend and frontend for configuration.
+This document lists all environment variables used by Grafyn backend and frontend for configuration.
 
 ## Backend Environment Variables
 
@@ -85,13 +85,13 @@ CORS_ORIGINS=*
 
 ```bash
 # Production configuration
-VAULT_PATH=/var/lib/seedream/vault
-DATA_PATH=/var/lib/seedream/data
+VAULT_PATH=/var/lib/grafyn/vault
+DATA_PATH=/var/lib/grafyn/data
 SERVER_HOST=0.0.0.0
 SERVER_PORT=8080
 EMBEDDING_MODEL=all-MiniLM-L6-v2
 LOG_LEVEL=WARNING
-LOG_FILE=/var/log/seedream/backend.log
+LOG_FILE=/var/log/grafyn/backend.log
 CORS_ORIGINS=https://app.yourdomain.com
 
 # OAuth (required for ChatGPT)
@@ -250,13 +250,13 @@ For production, use secrets management:
 export DATABASE_PASSWORD="your-password"
 
 # Using secrets manager (AWS)
-export DATABASE_PASSWORD=$(aws secretsmanager get-secret-value --secret-id seedream-db-password)
+export DATABASE_PASSWORD=$(aws secretsmanager get-secret-value --secret-id grafyn-db-password)
 
 # Using Docker secrets
-docker run -e DATABASE_PASSWORD_FILE=/run/secrets/db_password seedream
+docker run -e DATABASE_PASSWORD_FILE=/run/secrets/db_password grafyn
 
 # Using secrets for OAuth (recommended for production)
-export GITHUB_CLIENT_SECRET=$(aws secretsmanager get-secret-value --secret-id seedream-github-client-secret)
+export GITHUB_CLIENT_SECRET=$(aws secretsmanager get-secret-value --secret-id grafyn-github-client-secret)
 ```
 
 ## Troubleshooting

@@ -1,13 +1,13 @@
 # API Endpoints Quick Reference
 
-> **Purpose:** Concise reference for all Seedream API endpoints
+> **Purpose:** Concise reference for all Grafyn API endpoints
 > **Created:** 2025-12-31
 > **Last Updated:** 2025-12-31
 > **Status:** Active
 
 ## Overview
 
-Quick reference for all 14 API endpoints in Seedream backend.
+Quick reference for all 14 API endpoints in Grafyn backend.
 
 ## Base URL
 
@@ -56,7 +56,7 @@ GET /api/notes/{note_id}
 {
   "id": "Welcome",
   "title": "Welcome",
-  "content": "# Welcome to Seedream\n\nThis is your knowledge base...",
+  "content": "# Welcome to Grafyn\n\nThis is your knowledge base...",
   "frontmatter": {
     "title": "Welcome",
     "created": "2024-12-17T00:00:00",
@@ -329,7 +329,7 @@ GET /health
 ```json
 {
   "status": "healthy",
-  "service": "seedream"
+  "service": "grafyn"
 }
 ```
 
@@ -344,7 +344,7 @@ GET /
 **Response:** 200 OK
 ```json
 {
-  "name": "Seedream Knowledge Graph",
+  "name": "Grafyn Knowledge Graph",
   "version": "0.1.0",
   "vault_path": "/path/to/vault",
   "docs": "/docs",

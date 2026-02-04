@@ -1,1 +1,1 @@
-"""Seedream Backend Application"""
+"""Grafyn Backend Application"""

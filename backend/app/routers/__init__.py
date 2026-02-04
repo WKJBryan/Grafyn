@@ -1,1 +1,1 @@
-"""API routers for Seedream backend"""
+"""API routers for Grafyn backend"""

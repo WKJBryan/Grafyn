@@ -1,4 +1,4 @@
-"""Configuration management for Seedream backend"""
+"""Configuration management for Grafyn backend"""
 
 from pathlib import Path
 from pydantic_settings import BaseSettings

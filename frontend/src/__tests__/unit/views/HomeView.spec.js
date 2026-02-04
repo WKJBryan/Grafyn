@@ -115,7 +115,7 @@ describe('HomeView', () => {
       await flushPromises()
 
       expect(wrapper.find('.app-header').exists()).toBe(true)
-      expect(wrapper.find('.logo').text()).toBe('Seedream')
+      expect(wrapper.find('.logo').text()).toBe('Grafyn')
     })
 
     it('renders TreeNav in left sidebar', async () => {
