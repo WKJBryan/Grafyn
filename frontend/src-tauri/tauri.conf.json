@@ -106,7 +106,7 @@
     "updater": {
       "active": true,
       "dialog": true,
-      "pubkey": "PASTE_YOUR_PUBLIC_KEY_HERE",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDZCOUJDQ0JFOTE5MzFDNDUKUldSRkhKT1J2c3liYTA0a1haK3ZQdTRZM0xkUlNLaEVPNThTMmcwa0ZFYUdpY0MvdGlNS2hseHYK",
       "endpoints": [
         "https://github.com/Building0/Seedream/releases/latest/download/latest.json"
       ]
