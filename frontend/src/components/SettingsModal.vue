@@ -91,6 +91,45 @@
             </label>
           </div>
         </div>
+
+        <!-- MCP Sidecar Section (desktop only, non-setup only) -->
+        <div v-if="!isSetup && isDesktop" class="setting-section">
+          <label class="setting-label">
+            <span class="label-icon">🔌</span>
+            MCP Integration
+            <span class="optional-badge">Advanced</span>
+          </label>
+          <p class="setting-description">
+            Enable the MCP sidecar to connect Claude Desktop or ChatGPT to your knowledge base.
+          </p>
+          <div class="mcp-toggle">
+            <label class="mcp-checkbox-label">
+              <input type="checkbox" v-model="mcpEnabled" />
+              <span>Enable MCP Server</span>
+            </label>
+            <span v-if="mcpStatusText" class="mcp-status-badge" :class="mcpStatusClass">
+              {{ mcpStatusText }}
+            </span>
+          </div>
+          <div v-if="mcpEnabled" class="mcp-details">
+            <div class="mcp-info-row">
+              <span class="mcp-info-label">Endpoint:</span>
+              <code class="mcp-info-value">{{ mcpUrl || 'http://localhost:8765/sse' }}</code>
+            </div>
+            <div v-if="configSnippet" class="config-snippet">
+              <div class="snippet-header">
+                <span>Claude Desktop Config</span>
+                <button class="copy-btn" @click="copyConfigSnippet">
+                  {{ copied ? 'Copied!' : 'Copy' }}
+                </button>
+              </div>
+              <pre class="snippet-code">{{ configSnippet }}</pre>
+            </div>
+            <p class="setting-hint">
+              Paste this into Claude Desktop &rarr; Settings &rarr; Developer &rarr; Edit Config
+            </p>
+          </div>
+        </div>
       </div>
 
       <div class="modal-footer">
@@ -108,8 +147,8 @@
 </template>
 
 <script setup>
-import { ref, watch, onMounted } from 'vue'
-import { settings as settingsApi, isDesktopApp } from '@/api/client'
+import { ref, computed, watch, onMounted } from 'vue'
+import { settings as settingsApi, mcp as mcpApi, isDesktopApp } from '@/api/client'
 
 const props = defineProps({
   modelValue: {
@@ -129,11 +168,46 @@ const isLoading = ref(false)
 const isSaving = ref(false)
 const showApiKey = ref(false)
 
+const isDesktop = isDesktopApp()
+
 // Form state
 const vaultPath = ref('')
 const openrouterKey = ref('')
 const theme = ref('system')
 const keyValidationState = ref(null) // 'validating' | 'valid' | 'invalid' | null
+
+// MCP state
+const mcpEnabled = ref(false)
+const mcpStatus = ref('Stopped') // 'Stopped' | 'Starting' | 'Running' | 'Failed'
+const mcpUrl = ref('')
+const configSnippet = ref('')
+const copied = ref(false)
+
+const mcpStatusClass = computed(() => {
+  if (typeof mcpStatus.value === 'object') {
+    // SidecarStatus is an enum — Running is { Running: { port, url } }
+    if (mcpStatus.value.Running) return 'running'
+    if (mcpStatus.value.Failed) return 'failed'
+    return 'stopped'
+  }
+  const s = String(mcpStatus.value).toLowerCase()
+  if (s === 'running' || s.startsWith('running')) return 'running'
+  if (s === 'starting') return 'starting'
+  if (s === 'failed' || s.startsWith('failed')) return 'failed'
+  return 'stopped'
+})
+
+const mcpStatusText = computed(() => {
+  if (typeof mcpStatus.value === 'object') {
+    if (mcpStatus.value.Running) return 'Running'
+    if (mcpStatus.value.Failed) return 'Failed'
+    if (mcpStatus.value === 'Starting') return 'Starting'
+    return 'Stopped'
+  }
+  const s = String(mcpStatus.value)
+  if (s === 'Stopped') return mcpEnabled.value ? 'Stopped' : ''
+  return s
+})
 
 // Sync with v-model
 watch(() => props.modelValue, (val) => {
@@ -147,6 +221,36 @@ watch(isOpen, (val) => {
   emit('update:modelValue', val)
 })
 
+// Load MCP status and config snippet
+const loadMcpStatus = async () => {
+  if (!isDesktop) return
+  try {
+    const status = await mcpApi.getStatus()
+    if (status) {
+      mcpStatus.value = status.status
+      mcpUrl.value = status.mcp_url
+    }
+    const snippet = await mcpApi.getConfigSnippet()
+    if (snippet) {
+      configSnippet.value = snippet
+    }
+  } catch (e) {
+    console.error('Failed to load MCP status:', e)
+  }
+}
+
+// Copy Claude Desktop config snippet to clipboard
+const copyConfigSnippet = async () => {
+  if (!configSnippet.value) return
+  try {
+    await navigator.clipboard.writeText(configSnippet.value)
+    copied.value = true
+    setTimeout(() => { copied.value = false }, 2000)
+  } catch (e) {
+    console.error('Failed to copy:', e)
+  }
+}
+
 // Load current settings when modal opens
 const loadCurrentSettings = async () => {
   if (!isDesktopApp()) return
@@ -157,6 +261,12 @@ const loadCurrentSettings = async () => {
       vaultPath.value = currentSettings.vault_path || ''
       openrouterKey.value = currentSettings.openrouter_api_key || ''
       theme.value = currentSettings.theme || 'system'
+      mcpEnabled.value = currentSettings.mcp_enabled || false
+    }
+
+    // Load MCP status if enabled
+    if (mcpEnabled.value) {
+      await loadMcpStatus()
     }
   } catch (e) {
     console.error('Failed to load settings:', e)
@@ -213,6 +323,7 @@ const saveSettings = async () => {
       vault_path: vaultPath.value || null,
       openrouter_api_key: openrouterKey.value || null,
       theme: theme.value,
+      mcp_enabled: mcpEnabled.value,
     }
 
     if (props.isSetup) {
@@ -521,6 +632,131 @@ onMounted(() => {
 .save-btn:disabled {
   opacity: 0.5;
   cursor: not-allowed;
+}
+
+/* MCP Section */
+.mcp-toggle {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.mcp-checkbox-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  font-size: 0.9rem;
+  color: var(--text-primary, #1a1a1a);
+}
+
+.mcp-checkbox-label input[type="checkbox"] {
+  width: 16px;
+  height: 16px;
+  accent-color: var(--accent-color, #7c3aed);
+}
+
+.mcp-status-badge {
+  font-size: 0.75rem;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.mcp-status-badge.running {
+  background: #d1fae5;
+  color: #065f46;
+}
+
+.mcp-status-badge.starting {
+  background: #fef3c7;
+  color: #92400e;
+}
+
+.mcp-status-badge.stopped {
+  background: var(--bg-secondary, #f5f5f5);
+  color: var(--text-secondary, #666);
+}
+
+.mcp-status-badge.failed {
+  background: #fee2e2;
+  color: #991b1b;
+}
+
+.mcp-details {
+  padding: 12px;
+  background: var(--bg-secondary, #f9f9f9);
+  border: 1px solid var(--border-color, #e0e0e0);
+  border-radius: 8px;
+}
+
+.mcp-info-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+  font-size: 0.85rem;
+}
+
+.mcp-info-label {
+  font-weight: 600;
+  color: var(--text-secondary, #666);
+}
+
+.mcp-info-value {
+  font-family: monospace;
+  font-size: 0.8rem;
+  padding: 2px 6px;
+  background: var(--bg-primary, #fff);
+  border: 1px solid var(--border-color, #e0e0e0);
+  border-radius: 4px;
+  color: var(--text-primary, #1a1a1a);
+}
+
+.config-snippet {
+  margin-top: 8px;
+}
+
+.snippet-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 6px;
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: var(--text-secondary, #666);
+}
+
+.copy-btn {
+  padding: 3px 10px;
+  font-size: 0.75rem;
+  background: var(--accent-color, #7c3aed);
+  color: white;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: background 0.2s;
+}
+
+.copy-btn:hover {
+  background: var(--accent-hover, #6d28d9);
+}
+
+.snippet-code {
+  margin: 0;
+  padding: 10px;
+  background: var(--bg-primary, #fff);
+  border: 1px solid var(--border-color, #e0e0e0);
+  border-radius: 6px;
+  font-family: monospace;
+  font-size: 0.78rem;
+  line-height: 1.5;
+  overflow-x: auto;
+  white-space: pre;
+  color: var(--text-primary, #1a1a1a);
 }
 
 /* Dark mode support */
