@@ -1,6 +1,6 @@
 [package]
 name = "seedream"
-version = "1.0.0"
+version = "0.0.1"
 description = "Seedream - Knowledge Management Desktop App"
 authors = ["Bryan"]
 license = "MIT"
