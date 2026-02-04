@@ -94,7 +94,7 @@ The desktop app uses a **pure Rust backend** with Vue frontend in a single binar
 │  │  (notes, search, graph, canvas,           │  │
 │  │   settings, feedback, mcp)                │  │
 │  └──────────────────────────────────────────┘  │
-│  ~/Documents/Seedream/                          │
+│  ~/Documents/Grafyn/                          │
 │  ├── vault/  (markdown notes)                   │
 │  └── data/   (search index, canvas, settings)   │
 └────────────────────────────────────────────────┘
@@ -353,7 +353,7 @@ python build-exe.py    # Bundles to frontend/src-tauri/binaries/
 
 **Connecting Claude Desktop:** Add to `claude_desktop_config.json`:
 ```json
-{ "mcpServers": { "seedream-local": { "url": "http://localhost:8765/sse" } } }
+{ "mcpServers": { "grafyn-local": { "url": "http://localhost:8765/sse" } } }
 ```
 
 **Connecting ChatGPT:** Requires OAuth. See `CHATGPT_MCP_SETUP_GUIDE.md`.
@@ -371,6 +371,6 @@ python build-exe.py    # Bundles to frontend/src-tauri/binaries/
 
 **Build output:** `frontend/src-tauri/target/release/bundle/` (MSI, DMG, or DEB)
 
-**Data location:** `~/Documents/Seedream/` (`vault/` for notes, `data/` for indexes)
+**Data location:** `~/Documents/Grafyn/` (`vault/` for notes, `data/` for indexes)
 
 **Environment variables:** `OPENROUTER_API_KEY`, `GITHUB_FEEDBACK_REPO`, `GITHUB_FEEDBACK_TOKEN`, `RUST_LOG=info`

@@ -119,7 +119,7 @@ pub async fn get_mcp_config_snippet(state: State<'_, AppState>) -> Result<String
 
     let config = serde_json::json!({
         "mcpServers": {
-            "seedream-local": {
+            "grafyn-local": {
                 "url": mcp_url
             }
         }

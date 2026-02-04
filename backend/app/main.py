@@ -1,4 +1,4 @@
-"""Main FastAPI application for Seedream"""
+"""Main FastAPI application for Grafyn"""
 
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
@@ -96,7 +96,7 @@ async def lifespan(app: FastAPI):
 
 # Create FastAPI application
 app = FastAPI(
-    title="Seedream",
+    title="Grafyn",
     description="Knowledge Graph Platform with Semantic Search and MCP",
     version="0.1.0",
     docs_url="/docs",
@@ -141,7 +141,7 @@ async def root():
     """API root endpoint with basic information"""
     vault_path = str(Path(settings.vault_path).resolve())
     return {
-        "name": "Seedream Knowledge Graph",
+        "name": "Grafyn Knowledge Graph",
         "version": "0.1.0",
         "vault_path": vault_path,
         "docs": "/docs",
@@ -157,7 +157,7 @@ async def health_check(request: Request):
     """Health check endpoint"""
     return {
         "status": "healthy",
-        "service": "seedream",
+        "service": "grafyn",
         "environment": settings.environment,
     }
 
@@ -197,7 +197,7 @@ if __name__ == "__main__":
 
     # Parse command-line arguments for sidecar mode
     parser = argparse.ArgumentParser(
-        description="Seedream Knowledge Graph Backend",
+        description="Grafyn Knowledge Graph Backend",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -205,7 +205,7 @@ Examples:
   python -m app.main
 
   # Run as Tauri sidecar
-  python -m app.main --port 8765 --host 127.0.0.1 --vault-path ~/Documents/Seedream/vault
+  python -m app.main --port 8765 --host 127.0.0.1 --vault-path ~/Documents/Grafyn/vault
 
   # Run in production mode
   python -m app.main --port 8080 --no-reload --environment production

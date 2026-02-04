@@ -1,4 +1,4 @@
-# Seedream Knowledge Graph Platform - Project Documentation
+# Grafyn Knowledge Graph Platform - Project Documentation
 
 > **Generated:** 2026-01-11 | **Scan Level:** Exhaustive | **Mode:** Full Rescan
 

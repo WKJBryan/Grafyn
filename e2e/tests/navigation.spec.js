@@ -13,7 +13,7 @@ test.describe('Navigation and Layout', () => {
       await page.goto('/')
       await waitForAppReady(page)
 
-      await expect(page.locator('.logo')).toContainText('Seedream')
+      await expect(page.locator('.logo')).toContainText('Grafyn')
     })
 
     test('should display sidebar', async ({ page }) => {

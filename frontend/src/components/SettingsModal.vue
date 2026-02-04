@@ -6,7 +6,7 @@
   >
     <div class="modal-content settings-modal">
       <div class="modal-header">
-        <h2>{{ isSetup ? '🚀 Welcome to Seedream' : '⚙️ Settings' }}</h2>
+        <h2>{{ isSetup ? '🚀 Welcome to Grafyn' : '⚙️ Settings' }}</h2>
         <button
           v-if="!isSetup"
           class="close-btn"

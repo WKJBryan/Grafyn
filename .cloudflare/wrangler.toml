@@ -1,0 +1,8 @@
+name = "grafyn-updater"
+main = "worker.js"
+compatibility_date = "2024-12-01"
+
+# R2 bucket binding
+[[r2_buckets]]
+binding = "RELEASES"
+bucket_name = "grafyn-releases"

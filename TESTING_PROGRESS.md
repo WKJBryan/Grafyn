@@ -2,7 +2,7 @@
 
 ## Summary
 
-Comprehensive test suite implementation for the Seedream knowledge graph platform.
+Comprehensive test suite implementation for the Grafyn knowledge graph platform.
 
 | Category | Status | Tests |
 |----------|--------|-------|

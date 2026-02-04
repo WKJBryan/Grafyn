@@ -32,7 +32,7 @@ Check out [[Another Note]] for more info.
 export const sampleNotes = [
   {
     title: 'Getting Started',
-    content: 'Welcome to Seedream!\n\nThis is your first note.',
+    content: 'Welcome to Grafyn!\n\nThis is your first note.',
     status: 'canonical',
     tags: ['welcome', 'tutorial'],
   },

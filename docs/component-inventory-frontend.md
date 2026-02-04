@@ -1,4 +1,4 @@
-# Seedream Component Inventory - Frontend
+# Grafyn Component Inventory - Frontend
 
 > **Part:** Frontend | **Components:** 14 | **Views:** 5 | **Stores:** 3 | **Scan Level:** Exhaustive
 

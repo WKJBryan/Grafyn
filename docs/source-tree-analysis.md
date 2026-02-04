@@ -1,11 +1,11 @@
-# Seedream Source Tree Analysis
+# Grafyn Source Tree Analysis
 
 > **Scan Level:** Exhaustive | **Total Files Scanned:** 30+
 
 ## Project Structure Overview
 
 ```
-seedream/                        # Project root
+grafyn/                        # Project root
 ├── .gitignore                   # Git ignore rules
 ├── README.md                    # Project documentation
 ├── pyproject.toml               # Python dependencies (uv)

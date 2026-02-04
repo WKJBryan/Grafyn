@@ -1,4 +1,4 @@
-"""Pytest configuration and shared fixtures for Seedream backend tests"""
+"""Pytest configuration and shared fixtures for Grafyn backend tests"""
 import os
 import shutil
 from pathlib import Path

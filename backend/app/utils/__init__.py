@@ -1,4 +1,4 @@
-"""Utility modules for Seedream backend"""
+"""Utility modules for Grafyn backend"""
 
 from .dependencies import (
     get_knowledge_store,

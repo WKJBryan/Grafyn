@@ -1,4 +1,4 @@
-# Seedream Backend Architecture
+# Grafyn Backend Architecture
 
 > **Part:** Backend | **Type:** FastAPI Python Service | **Scan Level:** Exhaustive
 
@@ -46,7 +46,7 @@ async def lifespan(app: FastAPI):
     yield
 
 app = FastAPI(
-    title="Seedream",
+    title="Grafyn",
     description="Knowledge Graph Platform with Semantic Search and MCP",
     version="0.1.0",
     lifespan=lifespan
@@ -353,7 +353,7 @@ def setup_mcp(app: FastAPI) -> None:
     
     mcp = FastApiMCP(
         app,
-        name="Seedream Knowledge Graph",
+        name="Grafyn Knowledge Graph",
         description="Access and query an organizational knowledge base",
     )
     mcp.mount()  # Mounts at /sse

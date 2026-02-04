@@ -18,7 +18,7 @@ test.describe('Authentication', () => {
     test('should display welcome message', async ({ page }) => {
       await page.goto('/login')
 
-      await expect(page.locator('.login-title, h1')).toContainText('Seedream')
+      await expect(page.locator('.login-title, h1')).toContainText('Grafyn')
     })
 
     test('should display GitHub login button', async ({ page }) => {

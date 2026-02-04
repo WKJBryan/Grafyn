@@ -6,8 +6,8 @@
     "distDir": "../dist"
   },
   "package": {
-    "productName": "Seedream",
-    "version": "0.0.1"
+    "productName": "Grafyn",
+    "version": "0.0.2"
   },
   "tauri": {
     "allowlist": {
@@ -55,7 +55,7 @@
         "sidecar": true,
         "scope": [
           {
-            "name": "binaries/seedream-backend",
+            "name": "binaries/grafyn-backend",
             "sidecar": true,
             "args": true
           }
@@ -73,7 +73,7 @@
         "depends": []
       },
       "externalBin": [
-        "binaries/seedream-backend"
+        "binaries/grafyn-backend"
       ],
       "icon": [
         "icons/32x32.png",
@@ -82,7 +82,7 @@
         "icons/icon.icns",
         "icons/icon.ico"
       ],
-      "identifier": "com.seedream.app",
+      "identifier": "com.grafyn.app",
       "longDescription": "A knowledge management system with semantic search, graph visualization, and multi-LLM canvas",
       "macOS": {
         "entitlements": null,
@@ -108,7 +108,7 @@
       "dialog": true,
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDZCOUJDQ0JFOTE5MzFDNDUKUldSRkhKT1J2c3liYTA0a1haK3ZQdTRZM0xkUlNLaEVPNThTMmcwa0ZFYUdpY0MvdGlNS2hseHYK",
       "endpoints": [
-        "https://github.com/Building0/Seedream/releases/latest/download/latest.json"
+        "https://grafyn-updater.workers.dev/latest.json"
       ]
     },
     "windows": [
@@ -116,7 +116,7 @@
         "fullscreen": false,
         "height": 800,
         "resizable": true,
-        "title": "Seedream",
+        "title": "Grafyn",
         "width": 1200,
         "minWidth": 800,
         "minHeight": 600,

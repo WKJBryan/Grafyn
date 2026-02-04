@@ -1,4 +1,4 @@
-"""MCP write tools for Seedream - define schemas for write operations"""
+"""MCP write tools for Grafyn - define schemas for write operations"""
 from pydantic import BaseModel, Field
 from typing import Optional, List
 from enum import Enum

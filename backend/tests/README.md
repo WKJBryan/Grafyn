@@ -1,6 +1,6 @@
-# Seedream Backend Tests
+# Grafyn Backend Tests
 
-Comprehensive test suite for the Seedream knowledge graph platform backend.
+Comprehensive test suite for the Grafyn knowledge graph platform backend.
 
 ## Test Coverage Summary
 

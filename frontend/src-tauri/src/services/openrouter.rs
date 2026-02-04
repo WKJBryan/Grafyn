@@ -116,8 +116,8 @@ impl OpenRouterService {
             .client
             .post(format!("{}/chat/completions", OPENROUTER_API_URL))
             .header("Authorization", format!("Bearer {}", self.api_key))
-            .header("HTTP-Referer", "https://seedream.app")
-            .header("X-Title", "Seedream")
+            .header("HTTP-Referer", "https://grafyn.app")
+            .header("X-Title", "Grafyn")
             .json(&request)
             .send()
             .await
@@ -172,8 +172,8 @@ impl OpenRouterService {
             .client
             .post(format!("{}/chat/completions", OPENROUTER_API_URL))
             .header("Authorization", format!("Bearer {}", self.api_key))
-            .header("HTTP-Referer", "https://seedream.app")
-            .header("X-Title", "Seedream")
+            .header("HTTP-Referer", "https://grafyn.app")
+            .header("X-Title", "Grafyn")
             .json(&request)
             .send()
             .await

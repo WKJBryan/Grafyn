@@ -1,4 +1,4 @@
-# Seedream Frontend Architecture
+# Grafyn Frontend Architecture
 
 > **Part:** Frontend | **Type:** Vue 3 SPA | **Scan Level:** Exhaustive
 

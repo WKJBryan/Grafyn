@@ -17,7 +17,7 @@ class TestTagNormalization:
     
     def test_normalize_tag_lowercase(self):
         """Tags should be lowercased"""
-        assert normalize_tag("Seedream") == "seedream"
+        assert normalize_tag("Grafyn") == "grafyn"
         assert normalize_tag("TEXT-TO-3D") == "text-to-3d"
     
     def test_normalize_tag_strip_hash(self):
@@ -40,9 +40,9 @@ class TestInlineTagParsing:
     
     def test_parse_basic_tags(self):
         """Should find basic #tags"""
-        content = "This is about #seedream and #canvas"
+        content = "This is about #grafyn and #canvas"
         tags = parse_inline_tags(content)
-        assert "seedream" in tags
+        assert "grafyn" in tags
         assert "canvas" in tags
     
     def test_parse_tags_with_hyphens(self):
@@ -53,9 +53,9 @@ class TestInlineTagParsing:
     
     def test_parse_tags_with_slashes(self):
         """Should capture namespace tags"""
-        content = "This is #project/seedream"
+        content = "This is #project/grafyn"
         tags = parse_inline_tags(content)
-        assert "project/seedream" in tags
+        assert "project/grafyn" in tags
     
     def test_ignores_headings(self):
         """# Title should NOT be parsed as a tag"""
@@ -98,9 +98,9 @@ More text #aftercode
     
     def test_deduplicates_tags(self):
         """Same tag appearing multiple times should only appear once"""
-        content = "#seedream is great, love #seedream"
+        content = "#grafyn is great, love #grafyn"
         tags = parse_inline_tags(content)
-        assert tags.count("seedream") == 1
+        assert tags.count("grafyn") == 1
 
 
 class TestTagMerging:
@@ -116,10 +116,10 @@ class TestTagMerging:
     
     def test_merge_deduplicates(self):
         """Same tag in both should only appear once"""
-        yaml_tags = ["seedream"]
-        inline_tags = ["seedream"]
+        yaml_tags = ["grafyn"]
+        inline_tags = ["grafyn"]
         merged = merge_tags(yaml_tags, inline_tags)
-        assert merged.count("seedream") == 1
+        assert merged.count("grafyn") == 1
     
     def test_merge_normalizes(self):
         """Tags should be normalized during merge"""
@@ -230,10 +230,10 @@ class TestNormalizeAllTags:
     
     def test_normalizes_and_dedupes(self):
         """Should normalize and remove duplicates"""
-        tags = ["#Seedream", "seedream", "Canvas Export"]
+        tags = ["#Grafyn", "grafyn", "Canvas Export"]
         result = normalize_all_tags(tags)
         assert len(result) == 2
-        assert "seedream" in result
+        assert "grafyn" in result
         assert "canvas-export" in result
     
     def test_sorts_alphabetically(self):

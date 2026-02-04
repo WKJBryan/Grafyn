@@ -1,7 +1,7 @@
 {
-  "name": "seedream-e2e",
+  "name": "grafyn-e2e",
   "version": "1.0.0",
-  "description": "End-to-end tests for Seedream",
+  "description": "End-to-end tests for Grafyn",
   "type": "module",
   "scripts": {
     "test": "playwright test",

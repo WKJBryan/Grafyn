@@ -1,6 +1,6 @@
-# Seedream Backend
+# Grafyn Backend
 
-FastAPI-based backend for the Seedream knowledge graph platform with semantic search and MCP integration.
+FastAPI-based backend for the Grafyn knowledge graph platform with semantic search and MCP integration.
 
 ## Features
 
@@ -173,7 +173,7 @@ Once the server is running, access the interactive API documentation:
 1. Go to https://github.com/settings/developers
 2. Click "New OAuth App"
 3. Fill in the form:
-   - **Application name**: Seedream Knowledge Base
+   - **Application name**: Grafyn Knowledge Base
    - **Homepage URL**: https://your-name.ngrok.io
    - **Authorization callback URL**: https://your-name.ngrok.io/auth/callback
 4. Click "Register application"
@@ -208,7 +208,7 @@ ngrok http 8080
 In ChatGPT settings, register the MCP server:
 
 ```
-Server Name: Seedream Knowledge Base
+Server Name: Grafyn Knowledge Base
 SSE Endpoint: https://your-name.ngrok.io/sse
 OAuth Provider: GitHub
 Client ID: your-github-client-id

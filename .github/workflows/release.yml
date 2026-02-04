@@ -145,11 +145,11 @@ jobs:
           tauriScript: npx tauri
           args: --target ${{ matrix.target }} --config '{"tauri":{"bundle":{"externalBin":[]}}}'
           tagName: v__VERSION__
-          releaseName: 'Seedream v__VERSION__'
+          releaseName: 'Grafyn v__VERSION__'
           releaseBody: |
             See the assets below to download and install.
 
-            **Auto-update:** If you already have Seedream installed, the app will prompt you to update automatically.
+            **Auto-update:** If you already have Grafyn installed, the app will prompt you to update automatically.
           releaseDraft: false
           prerelease: false
           updaterJsonPreferNsis: true
@@ -192,10 +192,80 @@ jobs:
           if-no-files-found: warn
 
   # ============================================================================
+  # Upload to Cloudflare R2 (for auto-update distribution)
+  # ============================================================================
+  upload-to-r2:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Get version from tag
+        id: version
+        run: echo "version=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+
+      - name: Download release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p release-assets
+          cd release-assets
+
+          # Download all assets from the GitHub Release
+          gh release download "${{ steps.version.outputs.version }}" \
+            --repo "${{ github.repository }}" \
+            --pattern "*" \
+            || echo "Some assets may not be available yet"
+
+          echo "Downloaded assets:"
+          ls -la
+
+      - name: Rewrite latest.json URLs
+        env:
+          WORKER_URL: ${{ vars.CLOUDFLARE_WORKER_URL || 'https://grafyn-updater.workers.dev' }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          if [ -f release-assets/latest.json ]; then
+            echo "Original latest.json:"
+            cat release-assets/latest.json
+
+            # Rewrite GitHub URLs to Worker download URLs
+            # Matches: https://github.com/<owner>/<repo>/releases/download/<tag>/<filename>
+            sed -i "s|https://github.com/[^/]*/[^/]*/releases/download/[^/]*/|${WORKER_URL}/download/${VERSION}/|g" release-assets/latest.json
+
+            echo ""
+            echo "Rewritten latest.json:"
+            cat release-assets/latest.json
+          else
+            echo "WARNING: latest.json not found in release assets"
+          fi
+
+      - name: Upload to R2
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: |
+            r2 object put grafyn-releases/latest.json --file release-assets/latest.json --content-type application/json 2>/dev/null || true
+            for file in release-assets/*; do
+              filename=$(basename "$file")
+              if [ "$filename" != "latest.json" ]; then
+                echo "Uploading $filename..."
+                r2 object put "grafyn-releases/${{ steps.version.outputs.version }}/$filename" --file "$file" 2>/dev/null || true
+              fi
+            done
+            echo "Upload complete!"
+
+  # ============================================================================
   # Summary
   # ============================================================================
   build-summary:
-    needs: build
+    needs: [build, upload-to-r2]
     runs-on: ubuntu-latest
     if: always()
 

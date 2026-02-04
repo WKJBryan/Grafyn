@@ -1,6 +1,6 @@
-# Seedream Frontend
+# Grafyn Frontend
 
-A Vue 3 Single Page Application for the Seedream knowledge management system.
+A Vue 3 Single Page Application for the Grafyn knowledge management system.
 
 ## Tech Stack
 
@@ -173,4 +173,4 @@ If OAuth authentication fails:
 
 ## License
 
-This project is part of the Seedream knowledge management system.
+This project is part of the Grafyn knowledge management system.

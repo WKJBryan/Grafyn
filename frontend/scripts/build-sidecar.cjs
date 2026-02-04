@@ -44,7 +44,7 @@ function getTargetTriple() {
 function getExpectedBinaryName() {
     const triple = getTargetTriple();
     const ext = process.platform === 'win32' ? '.exe' : '';
-    return `seedream-backend-${triple}${ext}`;
+    return `grafyn-backend-${triple}${ext}`;
 }
 
 console.log('========================================');

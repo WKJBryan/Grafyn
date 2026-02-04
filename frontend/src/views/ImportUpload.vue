@@ -3,7 +3,7 @@
     <div class="header">
       <h2>Import LLM Conversations</h2>
       <p class="subtitle">
-        Upload exports from ChatGPT, Claude, Grok, or Gemini to import them into Seedream
+        Upload exports from ChatGPT, Claude, Grok, or Gemini to import them into Grafyn
       </p>
     </div>
 

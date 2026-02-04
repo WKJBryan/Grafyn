@@ -1,4 +1,4 @@
-"""MCP server setup for Seedream backend"""
+"""MCP server setup for Grafyn backend"""
 from fastapi import FastAPI, Depends, Header, HTTPException
 from fastapi_mcp import FastApiMCP
 
@@ -17,7 +17,7 @@ def setup_mcp(app: FastAPI) -> None:
 
     mcp = FastApiMCP(
         app,
-        name="Seedream Knowledge Graph",
+        name="Grafyn Knowledge Graph",
         description="Access and query an organizational knowledge base",
         # Exclude import endpoints to prevent recursion from self-referential models
         exclude_tags=["import"],

@@ -135,7 +135,7 @@ impl FeedbackService {
         self.client
             .head(format!("{}/rate_limit", GITHUB_API_URL))
             .header("Authorization", format!("Bearer {}", self.token))
-            .header("User-Agent", "Seedream-Desktop")
+            .header("User-Agent", "Grafyn-Desktop")
             .send()
             .await
             .map(|r| r.status().is_success())
@@ -169,7 +169,7 @@ impl FeedbackService {
             .client
             .post(format!("{}/repos/{}/{}/issues", GITHUB_API_URL, owner, repo))
             .header("Authorization", format!("Bearer {}", self.token))
-            .header("User-Agent", "Seedream-Desktop")
+            .header("User-Agent", "Grafyn-Desktop")
             .header("Accept", "application/vnd.github+json")
             .header("X-GitHub-Api-Version", "2022-11-28")
             .json(&request_body)
@@ -220,7 +220,7 @@ impl FeedbackService {
             }
         }
 
-        body.push_str("\n---\n*Submitted via Seedream Desktop App*");
+        body.push_str("\n---\n*Submitted via Grafyn Desktop App*");
 
         body
     }

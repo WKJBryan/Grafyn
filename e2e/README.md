@@ -1,6 +1,6 @@
-# Seedream E2E Tests
+# Grafyn E2E Tests
 
-End-to-end tests for the Seedream knowledge management platform using Playwright.
+End-to-end tests for the Grafyn knowledge management platform using Playwright.
 
 ## Setup
 
