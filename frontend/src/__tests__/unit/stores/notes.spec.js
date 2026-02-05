@@ -145,16 +145,18 @@ describe('Notes Store', () => {
 
   describe('loadNotes()', () => {
     it('sets loading to true during request', async () => {
-      const store = useNotesStore()
+      let resolve
       vi.spyOn(apiClient.notes, 'list').mockImplementation(
-        () => new Promise(() => {}) // Never resolves
+        () => new Promise((r) => { resolve = r })
       )
 
+      const store = useNotesStore()
       const promise = store.loadNotes()
 
       expect(store.loading).toBe(true)
 
-      await promise.catch(() => {}) // Prevent unhandled rejection
+      resolve([])
+      await promise
     })
 
     it('populates notes array on success', async () => {
@@ -242,8 +244,9 @@ describe('Notes Store', () => {
     })
 
     it('sets loading state during request', async () => {
+      let resolve
       vi.spyOn(apiClient.notes, 'get').mockImplementation(
-        () => new Promise(() => {})
+        () => new Promise((r) => { resolve = r })
       )
 
       const store = useNotesStore()
@@ -251,7 +254,8 @@ describe('Notes Store', () => {
 
       expect(store.loading).toBe(true)
 
-      await promise.catch(() => {})
+      resolve({ id: 'note-1', title: 'Test' })
+      await promise
     })
 
     it('handles errors correctly', async () => {

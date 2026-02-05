@@ -4,7 +4,7 @@
  * Tests cover:
  * - 3-column layout rendering (TreeNav, Main, MiniGraph)
  * - Navigation interactions
- * - Graph toggling
+ * - Graph (always visible) with editor overlay
  * - Search integration
  */
 
@@ -12,6 +12,14 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { mount, flushPromises } from '@vue/test-utils'
 import HomeView from '@/views/HomeView.vue'
 import * as apiClient from '@/api/client'
+
+// Mock theme store
+vi.mock('@/stores/theme', () => ({
+  useThemeStore: vi.fn(() => ({
+    theme: 'dark',
+    toggleTheme: vi.fn(),
+  })),
+}))
 
 // Mock child components
 vi.mock('@/components/SearchBar.vue', () => ({
@@ -41,7 +49,7 @@ vi.mock('@/components/NoteEditor.vue', () => ({
       </div>
     `,
     props: ['note'],
-    emits: ['save', 'delete'],
+    emits: ['save', 'delete', 'close'],
   },
 }))
 
@@ -78,12 +86,58 @@ vi.mock('@/components/GraphView.vue', () => ({
   },
 }))
 
+vi.mock('@/components/TagTree.vue', () => ({
+  default: {
+    name: 'TagTree',
+    template: '<div class="tag-tree-stub"></div>',
+    props: ['tags'],
+    emits: ['filter'],
+  },
+}))
+
+vi.mock('@/components/UnlinkedMentions.vue', () => ({
+  default: {
+    name: 'UnlinkedMentions',
+    template: '<div class="unlinked-mentions-stub"></div>',
+    props: ['noteId', 'noteTitle'],
+    emits: ['navigate', 'link-created'],
+  },
+}))
+
+vi.mock('@/components/TopicSelector.vue', () => ({
+  default: {
+    name: 'TopicSelector',
+    template: '<div class="topic-selector-stub"></div>',
+    props: ['existingTopics'],
+    emits: ['create', 'close'],
+  },
+}))
+
+vi.mock('@/components/FeedbackModal.vue', () => ({
+  default: {
+    name: 'FeedbackModal',
+    template: '<div class="feedback-modal-stub"></div>',
+    emits: ['close', 'submitted'],
+  },
+}))
+
+vi.mock('@/components/SettingsModal.vue', () => ({
+  default: {
+    name: 'SettingsModal',
+    template: '<div class="settings-modal-stub"></div>',
+    props: ['modelValue', 'isSetup'],
+    emits: ['update:modelValue', 'saved', 'setup-complete'],
+  },
+}))
+
 describe('HomeView', () => {
   let wrapper
 
   beforeEach(() => {
     vi.clearAllMocks()
-    vi.spyOn(window, 'confirm').mockReturnValue(true) // Default to confirm
+    vi.spyOn(window, 'confirm').mockReturnValue(true)
+    // Mock isDesktopApp
+    vi.spyOn(apiClient, 'isDesktopApp').mockReturnValue(false)
   })
 
   afterEach(() => {
@@ -193,31 +247,23 @@ describe('HomeView', () => {
   })
 
   // ============================================================================
-  // Full Graph View
+  // Full Graph View (Always Visible)
   // ============================================================================
 
   describe('Full Graph View', () => {
-    it('toggles full graph when logo is clicked', async () => {
+    it('shows graph container by default', async () => {
       vi.spyOn(apiClient.notes, 'list').mockResolvedValue([])
 
       wrapper = mount(HomeView)
       await flushPromises()
 
-      // Initially hidden
-      expect(wrapper.find('.full-graph-container').exists()).toBe(false)
-
-      // Click logo
-      await wrapper.find('.logo-wrapper').trigger('click')
-      await nextTick()
-
-      // Should be visible
       expect(wrapper.find('.full-graph-container').exists()).toBe(true)
-      expect(wrapper.find('.editor-container').exists()).toBe(false)
+      expect(wrapper.find('.full-graph-stub').exists()).toBe(true)
     })
 
-    it('navigates to note from full graph', async () => {
+    it('opens editor overlay when graph node is clicked', async () => {
       vi.spyOn(apiClient.notes, 'list').mockResolvedValue([])
-      const getSpy = vi.spyOn(apiClient.notes, 'get').mockResolvedValue({
+      vi.spyOn(apiClient.notes, 'get').mockResolvedValue({
         id: 'note-5',
         title: 'Graph Note',
       })
@@ -225,21 +271,13 @@ describe('HomeView', () => {
       wrapper = mount(HomeView)
       await flushPromises()
 
-      // Open graph
-      await wrapper.find('.logo-wrapper').trigger('click')
-
-      // Click node in graph
       await wrapper.find('.full-graph-stub').trigger('click')
       await flushPromises()
 
-      // Should load note and close graph
-      expect(getSpy).toHaveBeenCalledWith('note-5')
-      expect(wrapper.find('.full-graph-container').exists()).toBe(false)
+      // Editor opens as overlay, graph stays visible
+      expect(wrapper.find('.editor-panel-overlay').exists()).toBe(true)
       expect(wrapper.find('.note-editor-stub').exists()).toBe(true)
+      expect(wrapper.find('.full-graph-container').exists()).toBe(true)
     })
   })
 })
-
-function nextTick() {
-  return new Promise(resolve => setTimeout(resolve, 0))
-}
