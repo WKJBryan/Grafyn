@@ -224,8 +224,12 @@ class LinkDiscoveryService:
             note_summary += f"SUMMARY: {summary_match.group(1).strip()}\n"
 
         # Build context of existing notes
+        def _note_preview(n):
+            first_line = n.content.split('\n')[0]
+            return re.sub(r'^#+\s+', '', first_line)[:100]
+
         context = "\n".join(
-            f"- {n.title}: {re.sub(r'^#+\s+', '', n.content.split('\\n')[0])[:100]}..."
+            f"- {n.title}: {_note_preview(n)}..."
             for n in context_notes
         )
 
