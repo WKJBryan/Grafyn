@@ -16,3 +16,40 @@ data/lancedb/
 data/import/
 data/tokens.json
 import files/
+
+# ── Python ──
+.venv/
+venv/
+*.egg-info/
+uv.lock
+
+# ── Node ──
+node_modules/
+
+# ── Rust ──
+target/
+
+# ── IDE / Editor ──
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ── OS ──
+.DS_Store
+Thumbs.db
+
+# ── Testing / Coverage ──
+.pytest_cache/
+.coverage
+htmlcov/
+.ruff_cache/
+
+# ── Temporary / Error logs ──
+error.txt
+error_output.txt
+
+# ── Cloudflare Worker ──
+.cloudflare/node_modules/
+.cloudflare/.wrangler/
