@@ -15,7 +15,7 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { mount } from '@vue/test-utils'
+import { mount, flushPromises } from '@vue/test-utils'
 import { nextTick } from 'vue'
 import SearchBar from '@/components/SearchBar.vue'
 import * as apiClient from '@/api/client'
@@ -215,7 +215,7 @@ describe('SearchBar', () => {
 
       await wrapper.find('input').setValue('test')
       vi.advanceTimersByTime(300)
-      await nextTick()
+      await flushPromises()
 
       const results = wrapper.findAll('.search-result-item')
       expect(results).toHaveLength(2)
@@ -232,7 +232,7 @@ describe('SearchBar', () => {
 
       await wrapper.find('input').setValue('test')
       vi.advanceTimersByTime(300)
-      await nextTick()
+      await flushPromises()
 
       const scoreBar = wrapper.find('.score-bar')
       expect(scoreBar.attributes('style')).toContain('width: 75%')
@@ -247,12 +247,12 @@ describe('SearchBar', () => {
 
       await wrapper.find('input').setValue('test')
       vi.advanceTimersByTime(300)
-      await nextTick()
+      await flushPromises()
 
       expect(wrapper.find('.search-results').exists()).toBe(true)
 
       await wrapper.find('input').setValue('')
-      await nextTick()
+      await flushPromises()
 
       expect(wrapper.find('.search-results').exists()).toBe(false)
     })
@@ -287,7 +287,7 @@ describe('SearchBar', () => {
 
       await wrapper.find('input').setValue('test')
       vi.advanceTimersByTime(300)
-      await nextTick()
+      await flushPromises()
 
       const results = wrapper.findAll('.search-result-item')
       await results[0].trigger('click')
@@ -305,7 +305,7 @@ describe('SearchBar', () => {
 
       await wrapper.find('input').setValue('test')
       vi.advanceTimersByTime(300)
-      await nextTick()
+      await flushPromises()
 
       await wrapper.find('.search-result-item').trigger('click')
 
@@ -331,7 +331,7 @@ describe('SearchBar', () => {
 
       await wrapper.find('input').setValue('test')
       vi.advanceTimersByTime(300)
-      await nextTick()
+      await flushPromises()
 
       await wrapper.find('input').trigger('keydown.enter')
 
@@ -346,7 +346,7 @@ describe('SearchBar', () => {
 
       await wrapper.find('input').setValue('test')
       vi.advanceTimersByTime(300)
-      await nextTick()
+      await flushPromises()
 
       await wrapper.find('input').trigger('keydown.enter')
 
@@ -362,7 +362,7 @@ describe('SearchBar', () => {
 
       await wrapper.find('input').setValue('test')
       vi.advanceTimersByTime(300)
-      await nextTick()
+      await flushPromises()
 
       expect(wrapper.find('.search-results').exists()).toBe(true)
 
@@ -398,7 +398,7 @@ describe('SearchBar', () => {
 
       await wrapper.find('input').setValue('test')
       vi.advanceTimersByTime(300)
-      await nextTick()
+      await flushPromises()
 
       expect(wrapper.find('.search-results').exists()).toBe(true)
 
@@ -433,13 +433,13 @@ describe('SearchBar', () => {
 
       await wrapper.find('input').setValue('test')
       vi.advanceTimersByTime(300)
-      await nextTick()
+      await flushPromises()
 
       expect(wrapper.find('.search-results').exists()).toBe(true)
 
       // Click outside
       document.body.click()
-      await nextTick()
+      await flushPromises()
 
       expect(wrapper.find('.search-results').exists()).toBe(false)
 
@@ -455,13 +455,13 @@ describe('SearchBar', () => {
 
       await wrapper.find('input').setValue('test')
       vi.advanceTimersByTime(300)
-      await nextTick()
+      await flushPromises()
 
       expect(wrapper.find('.search-results').exists()).toBe(true)
 
       // Click inside search bar
       wrapper.find('.search-bar').element.click()
-      await nextTick()
+      await flushPromises()
 
       expect(wrapper.find('.search-results').exists()).toBe(true)
 

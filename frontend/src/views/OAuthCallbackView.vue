@@ -60,7 +60,8 @@ onMounted(async () => {
   
   try {
     await authStore.handleOAuthCallback(provider, code)
-    
+    loading.value = false
+
     // Redirect to the page the user was trying to access, or home
     const redirect = route.query.redirect || '/'
     router.push(redirect)

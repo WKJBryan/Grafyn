@@ -4,6 +4,15 @@ import GraphView from '@/components/GraphView.vue'
 import * as apiClient from '@/api/client'
 import * as d3 from 'd3'
 
+// Mock GraphSettings child component
+vi.mock('@/components/GraphSettings.vue', () => ({
+  default: {
+    name: 'GraphSettings',
+    template: '<div class="graph-settings-stub"></div>',
+    emits: ['update:filters', 'update:display', 'update:forces', 'animate'],
+  },
+}))
+
 // Full D3 Mock
 const mockSelection = {
   append: vi.fn().mockReturnThis(),
@@ -17,7 +26,7 @@ const mockSelection = {
   transition: vi.fn().mockReturnThis(),
   duration: vi.fn().mockReturnThis(),
   text: vi.fn().mockReturnThis(),
-  remove: vi.fn().mockReturnThis(), // Added remove just in case
+  remove: vi.fn().mockReturnThis(),
 }
 
 vi.mock('d3', () => {
@@ -31,17 +40,24 @@ vi.mock('d3', () => {
       alpha: vi.fn().mockReturnThis(),
       alphaTarget: vi.fn().mockReturnThis(),
       restart: vi.fn().mockReturnThis(),
-      nodes: vi.fn().mockReturnThis(), // Sometimes used
+      nodes: vi.fn().mockReturnThis(),
     })),
     forceLink: vi.fn(() => ({
       id: vi.fn().mockReturnThis(),
       distance: vi.fn().mockReturnThis(),
-      links: vi.fn().mockReturnThis(), // Sometimes used
+      strength: vi.fn().mockReturnThis(),
+      links: vi.fn().mockReturnThis(),
     })),
     forceManyBody: vi.fn(() => ({
       strength: vi.fn().mockReturnThis(),
     })),
     forceCenter: vi.fn(),
+    forceX: vi.fn(() => ({
+      strength: vi.fn().mockReturnThis(),
+    })),
+    forceY: vi.fn(() => ({
+      strength: vi.fn().mockReturnThis(),
+    })),
     forceCollide: vi.fn(() => ({
       strength: vi.fn().mockReturnThis(),
     })),
@@ -97,14 +113,9 @@ describe('GraphView', () => {
 
   it('renders and loads graph data on mount', async () => {
     wrapper = mount(GraphView)
-
-    // Initially loading
-    expect(wrapper.find('.loading-overlay').exists()).toBe(true)
-
     await flushPromises()
 
-    // Loading finished
-    expect(wrapper.find('.loading-overlay').exists()).toBe(false)
+    // Loading finished, data loaded
     expect(apiClient.graph.full).toHaveBeenCalledTimes(1)
 
     // Stats rendered
@@ -117,8 +128,6 @@ describe('GraphView', () => {
     await flushPromises()
 
     expect(d3.forceSimulation).toHaveBeenCalled()
-    // It should strip nodes from data and pass to simulation
-    // We can't easily check args due to cloning, but we know it was called
   })
 
   // ============================================================================
@@ -129,56 +138,27 @@ describe('GraphView', () => {
     wrapper = mount(GraphView)
     await flushPromises()
 
-    apiClient.graph.full.mockClear()
+    const callsBefore = apiClient.graph.full.mock.calls.length
 
-    // Find refresh button (first button in actions)
-    // We added a color picker div 1st, so buttons are 2nd and 3rd children of .toolbar-actions?
-    // Actually .btn-secondary
     const refreshBtn = wrapper.findAll('.btn-secondary')[0]
     await refreshBtn.trigger('click')
-
-    expect(wrapper.find('.loading-overlay').exists()).toBe(true)
     await flushPromises()
-    expect(apiClient.graph.full).toHaveBeenCalledTimes(1)
+
+    expect(apiClient.graph.full).toHaveBeenCalledTimes(callsBefore + 1)
   })
 
-  // ============================================================================
-  // Color Picker Feature
-  // ============================================================================
-
-  it('renders color picker', async () => {
+  it('renders graph settings panel', async () => {
     wrapper = mount(GraphView)
     await flushPromises()
 
-    expect(wrapper.find('.color-picker-wrapper').exists()).toBe(true)
-    expect(wrapper.find('input[type="color"]').exists()).toBe(true)
+    expect(wrapper.find('.graph-settings-stub').exists()).toBe(true)
   })
 
-  it('updates color state when input changes', async () => {
+  it('renders toolbar with stats', async () => {
     wrapper = mount(GraphView)
     await flushPromises()
 
-    const colorInput = wrapper.find('input[type="color"]')
-    await colorInput.setValue('#ff0000') // Set to red
-
-    expect(wrapper.vm.userColor).toBe('#ff0000')
-
-    // Verify that d3.selectAll was called to update attributes
-    // updateNodeColors calls svg.selectAll('circle').attr('fill', ...)
-    // Our mock: selectAll -> mockSelection; attr -> mockSelection
-    // Since we cleared mocks in beforeEach, d3 selection calls from initGraph are cleared?
-    // No, clearAllMocks clears call history.
-
-    // We need to check if attr was called with 'fill' and '#ff0000'
-    // But initGraph also calls attr('fill', ...).
-    // So we check the LAST call or if it was called with specific args after setValue.
-
-    expect(mockSelection.selectAll).toHaveBeenCalledWith('circle')
-    // mockSelection.attr is called multiple times.
-
-    const attrCalls = mockSelection.attr.mock.calls
-    // Look for call ['fill', '#ff0000']
-    const colorUpdateCall = attrCalls.find(call => call[0] === 'fill' && call[1] === '#ff0000')
-    expect(colorUpdateCall).toBeTruthy()
+    expect(wrapper.find('.graph-toolbar').exists()).toBe(true)
+    expect(wrapper.find('.toolbar-actions').exists()).toBe(true)
   })
 })

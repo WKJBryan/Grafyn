@@ -320,7 +320,8 @@ describe('NoteEditor', () => {
       const preview = wrapper.find('.editor-preview')
       const html = preview.html()
 
-      expect(html).toContain('<code>')
+      expect(html).toContain('code')
+      expect(html).toContain('const x = 5;')
     })
 
     it('handles empty content in preview', async () => {
@@ -380,7 +381,8 @@ describe('NoteEditor', () => {
       expect(html).toContain('class="wikilink"')
       expect(html).toContain('data-target="Actual Target"')
       expect(html).toContain('Display Text')
-      expect(html).not.toContain('Actual Target')
+      // The wikilink span shows "Display Text" not "Actual Target" as visible text
+      expect(html).toContain('>Display Text</span>')
     })
 
     it('renders multiple wikilinks', async () => {

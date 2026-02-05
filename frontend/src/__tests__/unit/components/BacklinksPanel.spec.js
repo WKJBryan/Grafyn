@@ -102,7 +102,7 @@ describe('BacklinksPanel', () => {
   // ============================================================================
 
   describe('Loading State', () => {
-    it('shows loading state initially', () => {
+    it('shows loading state initially', async () => {
       vi.spyOn(apiClient.graph, 'backlinks').mockImplementation(
         () => new Promise(() => {}) // Never resolves
       )
@@ -110,6 +110,8 @@ describe('BacklinksPanel', () => {
       wrapper = mount(BacklinksPanel, {
         props: { noteId: 'note-1' },
       })
+
+      await nextTick()
 
       expect(wrapper.find('.loading-state').exists()).toBe(true)
       expect(wrapper.text()).toContain('Loading...')
@@ -128,7 +130,7 @@ describe('BacklinksPanel', () => {
       expect(wrapper.find('.loading-state').exists()).toBe(false)
     })
 
-    it('does not show backlinks list during loading', () => {
+    it('does not show backlinks list during loading', async () => {
       vi.spyOn(apiClient.graph, 'backlinks').mockImplementation(
         () => new Promise(() => {})
       )
@@ -136,6 +138,8 @@ describe('BacklinksPanel', () => {
       wrapper = mount(BacklinksPanel, {
         props: { noteId: 'note-1' },
       })
+
+      await nextTick()
 
       expect(wrapper.find('.backlinks-list').exists()).toBe(false)
       expect(wrapper.find('.empty-state').exists()).toBe(false)
@@ -240,7 +244,7 @@ describe('BacklinksPanel', () => {
     it('displays backlink context when available', async () => {
       const mockBacklinks = [
         {
-          id: 'note-1',
+          note_id: 'note-1',
           title: 'Note 1',
           context: 'This is the context around the wikilink',
         },
@@ -546,14 +550,14 @@ describe('BacklinksPanel', () => {
       await nextTick()
 
       const context = wrapper.find('.backlink-context')
-      expect(context.text()).toBe(longContext)
+      expect(context.text()).toBe(longContext.trim())
       // CSS -webkit-line-clamp should handle truncation
     })
 
     it('handles special characters in titles', async () => {
       const mockBacklinks = [
         {
-          id: 'note-1',
+          note_id: 'note-1',
           title: '特殊字符 🎉 @#$%',
           context: 'Context with émojis 🚀',
         },
