@@ -227,7 +227,7 @@ jobs:
 
       - name: Rewrite latest.json URLs
         env:
-          WORKER_URL: ${{ vars.CLOUDFLARE_WORKER_URL || 'https://grafyn-updater.workers.dev' }}
+          WORKER_URL: ${{ vars.CLOUDFLARE_WORKER_URL || 'https://grafyn-updater.grafyn-updater.workers.dev' }}
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           if [ -f release-assets/latest.json ]; then

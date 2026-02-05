@@ -108,7 +108,7 @@
       "dialog": true,
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDZCOUJDQ0JFOTE5MzFDNDUKUldSRkhKT1J2c3liYTA0a1haK3ZQdTRZM0xkUlNLaEVPNThTMmcwa0ZFYUdpY0MvdGlNS2hseHYK",
       "endpoints": [
-        "https://grafyn-updater.workers.dev/latest.json"
+        "https://grafyn-updater.grafyn-updater.workers.dev/latest.json"
       ]
     },
     "windows": [
