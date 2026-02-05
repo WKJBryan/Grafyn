@@ -118,16 +118,28 @@ jobs:
         run: npm ci
 
       # ========================================
-      # Generate Icons (if missing)
+      # Validate Icons (regenerate if invalid)
       # ========================================
-      - name: Generate app icons
+      - name: Validate and regenerate icons
         working-directory: frontend
         run: |
-          if [ ! -f "src-tauri/icons/icon.ico" ]; then
-            echo "Generating placeholder icons..."
+          # Use Node.js to check icon format (portable across all CI runners)
+          node -e "
+            const fs = require('fs');
+            const ico = 'src-tauri/icons/icon.ico';
+            if (!fs.existsSync(ico)) { console.log('REGEN'); process.exit(0); }
+            const magic = fs.readFileSync(ico).slice(0, 4).toString('hex');
+            console.log('icon.ico magic: ' + magic);
+            if (magic !== '00000100') { console.log('REGEN'); } else { console.log('VALID'); }
+          " > /tmp/icon-check.txt
+          cat /tmp/icon-check.txt
+
+          if grep -q "REGEN" /tmp/icon-check.txt; then
+            echo "Regenerating icons..."
             node scripts/generate-icons.cjs
+            npx tauri icon src-tauri/icons/app-icon.png
           else
-            echo "Icons already exist"
+            echo "Icons are valid"
           fi
         shell: bash
 
