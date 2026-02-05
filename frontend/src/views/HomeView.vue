@@ -169,11 +169,11 @@
           </div>
 
           <div
-            v-if="selectedNoteId"
+            v-if="selectedNoteId && selectedNote"
             class="sidebar-section"
           >
-            <UnlinkedMentions 
-              :note-id="selectedNoteId" 
+            <UnlinkedMentions
+              :note-id="selectedNoteId"
               :note-title="selectedNote.title"
               @navigate="handleNoteSelect"
               @link-created="handleCreateLink"

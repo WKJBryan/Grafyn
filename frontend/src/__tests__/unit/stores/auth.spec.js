@@ -169,8 +169,9 @@ describe('Auth Store', () => {
     })
 
     it('sets loading state during request', async () => {
+      let resolve
       vi.spyOn(apiClient.oauth, 'getAuthorizationUrl').mockImplementation(
-        () => new Promise(() => {}) // Never resolves
+        () => new Promise((r) => { resolve = r })
       )
 
       delete window.location
@@ -181,7 +182,8 @@ describe('Auth Store', () => {
 
       expect(store.loading).toBe(true)
 
-      await promise.catch(() => {})
+      resolve({ authorization_url: 'https://example.com' })
+      await promise
     })
 
     it('handles errors correctly', async () => {
