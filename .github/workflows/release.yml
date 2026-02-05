@@ -159,9 +159,20 @@ jobs:
           tagName: v__VERSION__
           releaseName: 'Grafyn v__VERSION__'
           releaseBody: |
-            See the assets below to download and install.
+            ## Download
 
-            **Auto-update:** If you already have Grafyn installed, the app will prompt you to update automatically.
+            | Platform | File | Notes |
+            |----------|------|-------|
+            | **Windows (64-bit)** | `Grafyn_*_x64-setup.exe` | Most Windows PCs |
+            | **Windows (ARM)** | `Grafyn_*_arm64-setup.exe` | Surface Pro X, Snapdragon laptops |
+            | **macOS (Apple Silicon)** | `Grafyn_*_aarch64.dmg` | M1/M2/M3/M4 Macs |
+            | **macOS (Intel)** | `Grafyn_*_x64.dmg` | Older Intel Macs |
+            | **Linux (Debian/Ubuntu)** | `Grafyn_*_amd64.deb` | `sudo dpkg -i` to install |
+            | **Linux (Universal)** | `Grafyn_*_amd64.AppImage` | `chmod +x` and run — works on any distro |
+
+            > **Already installed?** Grafyn will prompt you to update automatically.
+            >
+            > Files ending in `.sig`, `.zip`, or `latest.json` are for auto-update — you don't need to download those.
           releaseDraft: false
           prerelease: false
           updaterJsonPreferNsis: true
@@ -175,7 +186,6 @@ jobs:
         with:
           name: windows-${{ matrix.arch }}
           path: |
-            frontend/src-tauri/target/${{ matrix.target }}/release/bundle/msi/*.msi
             frontend/src-tauri/target/${{ matrix.target }}/release/bundle/nsis/*.exe
           retention-days: 7
           if-no-files-found: warn
@@ -199,7 +209,6 @@ jobs:
           path: |
             frontend/src-tauri/target/${{ matrix.target }}/release/bundle/deb/*.deb
             frontend/src-tauri/target/${{ matrix.target }}/release/bundle/appimage/*.AppImage
-            frontend/src-tauri/target/${{ matrix.target }}/release/bundle/rpm/*.rpm
           retention-days: 7
           if-no-files-found: warn
 
