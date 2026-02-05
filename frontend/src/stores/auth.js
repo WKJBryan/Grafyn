@@ -70,7 +70,6 @@ export const useAuthStore = defineStore('auth', () => {
 
   async function logout() {
     loading.value = true
-    error.value = null
     try {
       await oauthApi.logout()
     } catch (err) {
