@@ -387,7 +387,7 @@ async def mcp_find_or_create_note(
                     "note_id": existing_note.id,
                     "title": existing_note.title,
                     "similarity": result["score"],
-                    "message": f"Found existing note with {result["score"]:.1%} similarity"
+                    "message": f"Found existing note with {result['score']:.1%} similarity"
                 }
 
     # No good match found, create new note
