@@ -1,6 +1,6 @@
 """MCP write endpoints with OAuth authentication for ChatGPT integration"""
 import logging
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from typing import Optional
 from datetime import datetime, timezone
 from enum import Enum
@@ -20,6 +20,7 @@ from app.models.note import (
 from app.services.knowledge_store import KnowledgeStore
 from app.services.vector_search import VectorSearchService
 from app.mcp.oauth import verify_oauth
+from app.utils.dependencies import get_knowledge_store, get_vector_search
 from app.mcp.write_tools import (
     CreateNoteRequest,
     UpdateNoteRequest,
@@ -43,17 +44,12 @@ async def mcp_test() -> dict:
 
 
 @router.post("/mcp/test/simple")
-async def mcp_test_simple(title: str, content: str = "") -> dict:
+async def mcp_test_simple(
+    title: str = Query(..., min_length=1, max_length=500),
+    content: str = Query("", max_length=5000),
+) -> dict:
     """Simple test endpoint without Pydantic models"""
     return {"status": "ok", "title": title, "content": content}
-
-
-def get_services(request: Request):
-    """Get required services from app state"""
-    return {
-        "knowledge_store": request.app.state.knowledge_store,
-        "vector_search": request.app.state.vector_search,
-    }
 
 
 def add_mcp_provenance(properties: Optional[dict]) -> dict:
@@ -97,7 +93,12 @@ async def mcp_create_note_simple(
     # Try to get title from request body
     body = await request.body()
     if body:
-        data = json.loads(body)
+        if len(body) > 1_000_000:
+            raise HTTPException(status_code=413, detail="Request body too large")
+        try:
+            data = json.loads(body)
+        except json.JSONDecodeError:
+            raise HTTPException(status_code=400, detail="Invalid JSON")
         title = data.get("title", title)
         content = data.get("content", content)
         tags = data.get("tags", tags)
@@ -108,9 +109,8 @@ async def mcp_create_note_simple(
 
     logger.debug("mcp_create_note_simple called with title=%s", title)
 
-    services = get_services(request)
-    knowledge_store: KnowledgeStore = services["knowledge_store"]
-    vector_search: VectorSearchService = services["vector_search"]
+    knowledge_store = get_knowledge_store(request)
+    vector_search = get_vector_search(request)
 
     # Parse tags
     if isinstance(tags, list):
@@ -173,9 +173,8 @@ async def mcp_create_note(
     """
     logger.debug("mcp_create_note called with title=%s", note_request.title)
 
-    services = get_services(request)
-    knowledge_store: KnowledgeStore = services["knowledge_store"]
-    vector_search: VectorSearchService = services["vector_search"]
+    knowledge_store = get_knowledge_store(request)
+    vector_search = get_vector_search(request)
 
     # Map string values to ContentType enum
     content_type_map = {
@@ -275,9 +274,8 @@ async def mcp_update_note(
     - append: Add new content to the end
     - prepend: Add new content to the beginning
     """
-    services = get_services(request)
-    knowledge_store: KnowledgeStore = services["knowledge_store"]
-    vector_search: VectorSearchService = services["vector_search"]
+    knowledge_store = get_knowledge_store(request)
+    vector_search = get_vector_search(request)
 
     # Check if note exists
     existing_note = knowledge_store.get_note(note_id)
@@ -367,9 +365,8 @@ async def mcp_find_or_create_note(
     This prevents duplicate notes on the same topic. Searches using semantic
     search and returns existing note if similarity >= threshold.
     """
-    services = get_services(request)
-    knowledge_store: KnowledgeStore = services["knowledge_store"]
-    vector_search: VectorSearchService = services["vector_search"]
+    knowledge_store = get_knowledge_store(request)
+    vector_search = get_vector_search(request)
 
     # Search for existing notes
     results = vector_search.search(
@@ -419,8 +416,7 @@ async def mcp_set_property(
 
     Properties are typed key-value pairs stored in note frontmatter.
     """
-    services = get_services(request)
-    knowledge_store: KnowledgeStore = services["knowledge_store"]
+    knowledge_store = get_knowledge_store(request)
 
     # Check if note exists
     note = knowledge_store.get_note(note_id)
@@ -464,7 +460,7 @@ async def mcp_search_notes(
     if request is None:
         return []
 
-    vector_search: VectorSearchService = request.app.state.vector_search
+    vector_search = get_vector_search(request)
 
     results = vector_search.search(
         query=q,
@@ -482,13 +478,18 @@ async def mcp_search_notes(
         for r in results
     ]
 
-@router.post("/mcp-write/note")
+@router.post("/mcp-write/note", dependencies=[] if dev_mode else [Depends(verify_oauth)])
 async def mcp_write_note(request: Request) -> dict:
     """Create note via MCP - simplified endpoint"""
     import json
 
     body_bytes = await request.body()
-    data = json.loads(body_bytes)
+    if len(body_bytes) > 1_000_000:
+        raise HTTPException(status_code=413, detail="Request body too large")
+    try:
+        data = json.loads(body_bytes)
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
     
     title = data.get("title")
     if not title:
@@ -498,9 +499,8 @@ async def mcp_write_note(request: Request) -> dict:
     tags = data.get("tags", [])
     status = data.get("status", "draft")
     
-    services = get_services(request)
-    knowledge_store: KnowledgeStore = services["knowledge_store"]
-    vector_search: VectorSearchService = services["vector_search"]
+    knowledge_store = get_knowledge_store(request)
+    vector_search = get_vector_search(request)
     
     # Create NoteCreate
     note_data = NoteCreate(

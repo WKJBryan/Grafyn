@@ -155,6 +155,17 @@
       :is-setup="false"
       @saved="handleSettingsSaved"
     />
+
+    <ConfirmDialog
+      :visible="showDeleteConfirm"
+      title="Delete Canvas Session"
+      message="Are you sure you want to delete this canvas session? This cannot be undone."
+      confirm-label="Delete"
+      cancel-label="Cancel"
+      variant="danger"
+      @confirm="confirmDeleteSession"
+      @cancel="showDeleteConfirm = false"
+    />
   </div>
 </template>
 
@@ -166,6 +177,7 @@ import { useThemeStore } from '@/stores/theme'
 import { isDesktopApp } from '@/api/client'
 import CanvasContainer from '@/components/canvas/CanvasContainer.vue'
 import SettingsModal from '@/components/SettingsModal.vue'
+import ConfirmDialog from '@/components/ConfirmDialog.vue'
 
 const route = useRoute()
 const router = useRouter()
@@ -177,6 +189,8 @@ const showCreateDialog = ref(false)
 const newSessionTitle = ref('')
 const newSessionDescription = ref('')
 const showSettingsModal = ref(false)
+const showDeleteConfirm = ref(false)
+const pendingDeleteSessionId = ref(null)
 const isDesktop = isDesktopApp()
 
 // Computed property to get the current theme icon
@@ -232,9 +246,15 @@ async function confirmCreateSession() {
   }
 }
 
-async function deleteSession(sessionId) {
-  if (!confirm('Are you sure you want to delete this canvas session?')) return
+function deleteSession(sessionId) {
+  pendingDeleteSessionId.value = sessionId
+  showDeleteConfirm.value = true
+}
 
+async function confirmDeleteSession() {
+  const sessionId = pendingDeleteSessionId.value
+  showDeleteConfirm.value = false
+  pendingDeleteSessionId.value = null
   try {
     await canvasStore.deleteSession(sessionId)
     if (currentSessionId.value === sessionId) {
@@ -390,10 +410,14 @@ function formatDate(dateStr) {
   display: flex;
   align-items: center;
   gap: var(--spacing-xs);
+  padding: var(--spacing-xs) var(--spacing-sm);
+  border-radius: var(--radius-sm);
+  transition: all 150ms ease;
 }
 
 .back-link:hover {
   color: var(--accent-primary);
+  background: var(--bg-hover);
 }
 
 .canvas-main {

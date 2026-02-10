@@ -4,16 +4,9 @@ from typing import List, Optional
 from app.models.note import (
     Note, NoteCreate, NoteUpdate, NoteListItem, TypedProperty, PropertyType
 )
-from app.services.knowledge_store import KnowledgeStore
-from app.services.vector_search import VectorSearchService
-from app.services.graph_index import GraphIndexService
+from app.utils.dependencies import get_knowledge_store, get_vector_search, get_graph_index
 
 router = APIRouter()
-
-
-def get_knowledge_store(request: Request) -> KnowledgeStore:
-    """Get knowledge store from app state"""
-    return request.app.state.knowledge_store
 
 
 @router.get("", response_model=List[NoteListItem])
@@ -37,7 +30,7 @@ async def get_note(note_id: str, request: Request):
 async def create_note(note_data: NoteCreate, request: Request):
     """Create a new note"""
     knowledge_store = get_knowledge_store(request)
-    vector_search: VectorSearchService = request.app.state.vector_search
+    vector_search = get_vector_search(request)
     
     try:
         note = knowledge_store.create_note(note_data)
@@ -61,7 +54,7 @@ async def create_note(note_data: NoteCreate, request: Request):
 async def update_note(note_id: str, note_data: NoteUpdate, request: Request):
     """Update an existing note"""
     knowledge_store = get_knowledge_store(request)
-    vector_search: VectorSearchService = request.app.state.vector_search
+    vector_search = get_vector_search(request)
     
     note = knowledge_store.update_note(note_id, note_data)
     if note is None:
@@ -84,17 +77,26 @@ async def update_note(note_id: str, note_data: NoteUpdate, request: Request):
 async def delete_note(note_id: str, request: Request):
     """Delete a note"""
     knowledge_store = get_knowledge_store(request)
+    vector_search = get_vector_search(request)
+    graph_index = get_graph_index(request)
+
     success = knowledge_store.delete_note(note_id)
     if not success:
         raise HTTPException(status_code=404, detail="Note not found")
+
+    # Remove from vector search index
+    vector_search.delete_note(note_id)
+
+    # Rebuild graph to remove stale edges
+    graph_index.build_index()
 
 
 @router.post("/reindex", response_model=dict)
 async def reindex_notes(request: Request):
     """Reindex all notes for search and graph"""
     knowledge_store = get_knowledge_store(request)
-    vector_search: VectorSearchService = request.app.state.vector_search
-    graph_index: GraphIndexService = request.app.state.graph_index
+    vector_search = get_vector_search(request)
+    graph_index = get_graph_index(request)
 
     notes = knowledge_store.get_all_content()
 

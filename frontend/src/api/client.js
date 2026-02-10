@@ -316,6 +316,45 @@ export const mcp = {
     invokeOrHttp('get_mcp_config_snippet', {}, () => Promise.resolve('')),
 }
 
+// Memory API
+export const memory = {
+  recall: (query, contextNoteIds = [], limit = 5) =>
+    invokeOrHttp('recall_relevant', { request: { query, context_note_ids: contextNoteIds, limit } }, () =>
+      api.post('/memory/recall', { query, context_note_ids: contextNoteIds, limit })
+    ),
+
+  contradictions: (noteId) =>
+    invokeOrHttp('find_contradictions', { noteId }, () =>
+      api.post(`/memory/contradictions/${encodeURIComponent(noteId)}`)
+    ),
+
+  extract: (messages) =>
+    invokeOrHttp('extract_claims', { request: { messages } }, () =>
+      api.post('/memory/extract', { messages })
+    ),
+}
+
+// Zettelkasten Link Discovery API (HTTP only — uses Python backend)
+export const zettelkasten = {
+  discoverLinks: (noteId, mode = 'suggested', maxLinks = 10) =>
+    api.get(`/zettel/notes/${encodeURIComponent(noteId)}/discover-links`, {
+      params: { mode, max_links: maxLinks },
+    }),
+
+  applyLinks: (noteId, linkIds) =>
+    api.post(`/zettel/notes/${encodeURIComponent(noteId)}/discover-links/apply`, {
+      link_ids: linkIds,
+    }),
+
+  createLink: (sourceId, targetId, linkType = 'related') =>
+    api.post(
+      `/zettel/notes/${encodeURIComponent(sourceId)}/link/${encodeURIComponent(targetId)}`,
+      { link_type: linkType }
+    ),
+
+  getLinkTypes: () => api.get('/zettel/link-types'),
+}
+
 // Utility function to check if we're in Tauri environment
 export const isDesktopApp = isTauri
 

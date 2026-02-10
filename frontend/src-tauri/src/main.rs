@@ -11,6 +11,7 @@ use services::{
     graph_index::GraphIndex,
     knowledge_store::KnowledgeStore,
     mcp_sidecar::McpSidecarService,
+    memory::MemoryService,
     openrouter::OpenRouterService,
     search::SearchService,
     settings::SettingsService,
@@ -29,6 +30,7 @@ pub struct AppState {
     pub feedback_service: Arc<RwLock<FeedbackService>>,
     pub settings_service: Arc<RwLock<SettingsService>>,
     pub mcp_sidecar: Arc<McpSidecarService>,
+    pub memory_service: Arc<RwLock<MemoryService>>,
 }
 
 fn main() {
@@ -36,9 +38,14 @@ fn main() {
 
     tauri::Builder::default()
         .setup(|app| {
-            // Load user settings first
-            let settings_service = SettingsService::load()
-                .expect("Failed to load settings");
+            // Load user settings first (fall back to defaults on error)
+            let settings_service = match SettingsService::load() {
+                Ok(s) => s,
+                Err(e) => {
+                    log::error!("Failed to load settings: {}. Using defaults.", e);
+                    SettingsService::load_defaults()
+                }
+            };
 
             let vault_path = settings_service.vault_path();
             let data_path = settings_service.data_path();
@@ -47,14 +54,33 @@ fn main() {
             log::info!("Data path: {:?}", data_path);
 
             // Create directories if they don't exist
-            std::fs::create_dir_all(&vault_path).ok();
-            std::fs::create_dir_all(&data_path).ok();
+            if let Err(e) = std::fs::create_dir_all(&vault_path) {
+                log::error!("Failed to create vault directory {}: {}", vault_path.display(), e);
+            }
+            if let Err(e) = std::fs::create_dir_all(&data_path) {
+                log::error!("Failed to create data directory {}: {}", data_path.display(), e);
+            }
 
             // Initialize services
             let knowledge_store = KnowledgeStore::new(vault_path.clone());
             let graph_index = GraphIndex::new();
-            let search_service = SearchService::new(data_path.clone())
-                .expect("Failed to initialize search service");
+            let search_service = match SearchService::new(data_path.clone()) {
+                Ok(s) => s,
+                Err(e) => {
+                    log::error!("Failed to initialize search service: {}. Attempting index rebuild.", e);
+                    // Try deleting corrupted index and retrying
+                    let index_path = data_path.join("search_index");
+                    if index_path.exists() {
+                        if let Err(rm_err) = std::fs::remove_dir_all(&index_path) {
+                            log::error!("Failed to remove corrupted index: {}", rm_err);
+                        }
+                    }
+                    SearchService::new(data_path.clone()).unwrap_or_else(|e2| {
+                        log::error!("Search service initialization failed after rebuild: {}", e2);
+                        std::process::exit(1);
+                    })
+                }
+            };
             let canvas_store = CanvasStore::new(data_path.join("canvas"));
 
             // Get OpenRouter API key from settings, fall back to environment
@@ -97,6 +123,9 @@ fn main() {
             let mut gi = graph_index.clone();
             gi.build_index(&notes);
 
+            // Initialize memory service
+            let memory_service = MemoryService::new();
+
             // Create app state
             let mcp_sidecar_arc = Arc::new(mcp_sidecar);
             let state = AppState {
@@ -108,6 +137,7 @@ fn main() {
                 feedback_service: Arc::new(RwLock::new(feedback_service)),
                 settings_service: Arc::new(RwLock::new(settings_service)),
                 mcp_sidecar: mcp_sidecar_arc.clone(),
+                memory_service: Arc::new(RwLock::new(memory_service)),
             };
 
             app.manage(state);
@@ -176,9 +206,16 @@ fn main() {
             commands::mcp::restart_mcp_sidecar,
             commands::mcp::check_mcp_health,
             commands::mcp::get_mcp_config_snippet,
+            // Memory commands
+            commands::memory::recall_relevant,
+            commands::memory::find_contradictions,
+            commands::memory::extract_claims,
         ])
         .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .unwrap_or_else(|e| {
+            log::error!("Error while running tauri application: {}", e);
+            std::process::exit(1);
+        });
 }
 
 /// Get feedback repository from compile-time env or runtime env

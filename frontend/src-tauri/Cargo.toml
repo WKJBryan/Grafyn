@@ -1,6 +1,6 @@
 [package]
 name = "grafyn"
-version = "0.0.3"
+version = "0.0.4"
 description = "Grafyn - Knowledge Management Desktop App"
 authors = ["Bryan"]
 license = "MIT"
@@ -56,7 +56,6 @@ chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1.6", features = ["v4", "serde"] }
 
 # Error handling
-thiserror = "1.0"
 anyhow = "1.0"
 
 # HTTP client for OpenRouter

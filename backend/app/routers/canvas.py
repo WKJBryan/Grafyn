@@ -26,29 +26,14 @@ from app.models.canvas import (
     NodeEdge,
     ArrangeRequest,
 )
-from app.services.canvas_store import CanvasSessionStore
-from app.services.openrouter import OpenRouterService
-from app.services.vector_search import VectorSearchService
 from app.services.distillation import update_protected_section
 from app.middleware.rate_limit import limiter
+from app.utils.dependencies import (
+    get_canvas_store, get_openrouter, get_vector_search, get_knowledge_store,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
-
-
-def get_canvas_store(request: Request) -> CanvasSessionStore:
-    """Get canvas store from app state"""
-    return request.app.state.canvas_store
-
-
-def get_openrouter(request: Request) -> OpenRouterService:
-    """Get OpenRouter service from app state"""
-    return request.app.state.openrouter
-
-
-def get_vector_search(request: Request) -> VectorSearchService:
-    """Get vector search service from app state"""
-    return request.app.state.vector_search
 
 
 # --- Session Management ---
@@ -1015,7 +1000,7 @@ async def update_debate_status(
 async def export_to_note(session_id: str, request: Request):
     """Export canvas session as a markdown note"""
     store = get_canvas_store(request)
-    knowledge_store = request.app.state.knowledge_store
+    knowledge_store = get_knowledge_store(request)
 
     session = store.get_session(session_id)
     if not session:

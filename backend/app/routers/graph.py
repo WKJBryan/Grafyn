@@ -2,20 +2,9 @@
 from fastapi import APIRouter, HTTPException, Query, Request
 from typing import List, Dict
 from app.models.note import BacklinkInfo
-from app.services.graph_index import GraphIndexService
-from app.services.knowledge_store import KnowledgeStore
+from app.utils.dependencies import get_graph_index, get_knowledge_store
 
 router = APIRouter()
-
-
-def get_graph_index(request: Request) -> GraphIndexService:
-    """Get graph index service from app state"""
-    return request.app.state.graph_index
-
-
-def get_knowledge_store(request: Request) -> KnowledgeStore:
-    """Get knowledge store from app state"""
-    return request.app.state.knowledge_store
 
 
 @router.get("/backlinks/{note_id}", response_model=List[BacklinkInfo])

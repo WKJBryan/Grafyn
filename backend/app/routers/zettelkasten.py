@@ -4,8 +4,7 @@ from typing import Optional
 import logging
 
 from app.models.distillation import LinkMode, LinkType, DistillResponse
-from app.services.link_discovery import LinkDiscoveryService
-from app.services.distillation import DistillationService
+from app.utils.dependencies import get_knowledge_store, get_distillation, get_link_discovery
 
 logger = logging.getLogger(__name__)
 
@@ -34,9 +33,7 @@ async def distill_zettelkasten(
     Returns:
         DistillResponse with created note IDs and candidates
     """
-    distillation: Optional[DistillationService] = getattr(
-        request.app.state, 'distillation', None
-    )
+    distillation = get_distillation(request)
 
     if not distillation:
         raise HTTPException(
@@ -45,7 +42,7 @@ async def distill_zettelkasten(
         )
 
     # Check if note exists
-    note = request.app.state.knowledge_store.get_note(note_id)
+    note = get_knowledge_store(request).get_note(note_id)
     if not note:
         raise HTTPException(status_code=404, detail="Note not found")
 
@@ -80,9 +77,7 @@ async def discover_links(
     Returns:
         List of link candidates with confidence scores
     """
-    link_service: Optional[LinkDiscoveryService] = getattr(
-        request.app.state, 'link_discovery', None
-    )
+    link_service = get_link_discovery(request)
 
     if not link_service:
         raise HTTPException(
@@ -90,7 +85,7 @@ async def discover_links(
             detail="Link discovery service not available"
         )
 
-    note = request.app.state.knowledge_store.get_note(note_id)
+    note = get_knowledge_store(request).get_note(note_id)
     if not note:
         raise HTTPException(status_code=404, detail="Note not found")
 
@@ -135,9 +130,7 @@ async def create_link(
     Returns:
         Status of the link creation
     """
-    link_service: Optional[LinkDiscoveryService] = getattr(
-        request.app.state, 'link_discovery', None
-    )
+    link_service = get_link_discovery(request)
 
     if not link_service:
         raise HTTPException(
@@ -146,8 +139,9 @@ async def create_link(
         )
 
     # Validate notes exist
-    source = request.app.state.knowledge_store.get_note(source_id)
-    target = request.app.state.knowledge_store.get_note(target_id)
+    knowledge_store = get_knowledge_store(request)
+    source = knowledge_store.get_note(source_id)
+    target = knowledge_store.get_note(target_id)
 
     if not source:
         raise HTTPException(status_code=404, detail=f"Source note {source_id} not found")
@@ -300,9 +294,7 @@ async def apply_discovered_links(
     Returns:
         Number of links created
     """
-    link_service: Optional[LinkDiscoveryService] = getattr(
-        request.app.state, 'link_discovery', None
-    )
+    link_service = get_link_discovery(request)
 
     if not link_service:
         raise HTTPException(
@@ -310,13 +302,14 @@ async def apply_discovered_links(
             detail="Link discovery service not available"
         )
 
-    source = request.app.state.knowledge_store.get_note(note_id)
+    knowledge_store = get_knowledge_store(request)
+    source = knowledge_store.get_note(note_id)
     if not source:
         raise HTTPException(status_code=404, detail="Note not found")
 
     created_count = 0
     for target_id in link_ids:
-        target = request.app.state.knowledge_store.get_note(target_id)
+        target = knowledge_store.get_note(target_id)
         if not target:
             continue
 

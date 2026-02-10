@@ -22,7 +22,9 @@ pub struct KnowledgeStore {
 impl KnowledgeStore {
     pub fn new(vault_path: PathBuf) -> Self {
         // Ensure vault directory exists
-        std::fs::create_dir_all(&vault_path).ok();
+        if let Err(e) = std::fs::create_dir_all(&vault_path) {
+            log::error!("Failed to create vault directory {}: {}", vault_path.display(), e);
+        }
         Self { vault_path }
     }
 

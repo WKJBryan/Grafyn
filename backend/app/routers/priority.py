@@ -3,14 +3,12 @@ from fastapi import APIRouter, Request, HTTPException
 from typing import Dict, Any
 
 from app.services.priority_scoring import PriorityWeights, ContentType
-from app.services.priority_settings import PrioritySettingsService
+from app.utils.dependencies import (
+    get_priority_settings as get_priority_settings_service,
+    get_priority_scoring,
+)
 
 router = APIRouter()
-
-
-def get_priority_settings_service(request: Request) -> PrioritySettingsService:
-    """Get priority settings service from app state"""
-    return request.app.state.priority_settings
 
 
 @router.get("/config", response_model=Dict[str, Any])
@@ -80,8 +78,9 @@ async def update_priority_weights(
     updated_weights = service.update_weights(weights)
     
     # Update priority scoring service if available
-    if hasattr(request.app.state, 'priority_scoring'):
-        request.app.state.priority_scoring.update_weights(updated_weights)
+    priority_scoring = get_priority_scoring(request)
+    if priority_scoring:
+        priority_scoring.update_weights(updated_weights)
     
     return updated_weights
 
@@ -109,8 +108,9 @@ async def reset_priority_weights(
     default_weights = service.reset_to_defaults()
     
     # Update priority scoring service if available
-    if hasattr(request.app.state, 'priority_scoring'):
-        request.app.state.priority_scoring.update_weights(default_weights)
+    priority_scoring = get_priority_scoring(request)
+    if priority_scoring:
+        priority_scoring.update_weights(default_weights)
     
     return default_weights
 

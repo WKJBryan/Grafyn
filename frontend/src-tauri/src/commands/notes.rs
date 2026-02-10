@@ -25,8 +25,12 @@ pub async fn create_note(note: NoteCreate, state: State<'_, AppState>) -> Result
     // Update search index
     {
         let mut search = state.search_service.write().await;
-        search.index_note(&created_note).ok();
-        search.commit().ok();
+        if let Err(e) = search.index_note(&created_note) {
+            log::error!("Failed to index note '{}': {}", created_note.id, e);
+        }
+        if let Err(e) = search.commit() {
+            log::error!("Failed to commit search index after creating note '{}': {}", created_note.id, e);
+        }
     }
 
     // Update graph index
@@ -51,8 +55,12 @@ pub async fn update_note(
     // Update search index
     {
         let mut search = state.search_service.write().await;
-        search.index_note(&updated_note).ok();
-        search.commit().ok();
+        if let Err(e) = search.index_note(&updated_note) {
+            log::error!("Failed to index note '{}': {}", updated_note.id, e);
+        }
+        if let Err(e) = search.commit() {
+            log::error!("Failed to commit search index after updating note '{}': {}", updated_note.id, e);
+        }
     }
 
     // Update graph index
@@ -73,8 +81,12 @@ pub async fn delete_note(id: String, state: State<'_, AppState>) -> Result<(), S
     // Remove from search index
     {
         let mut search = state.search_service.write().await;
-        search.remove_note(&id).ok();
-        search.commit().ok();
+        if let Err(e) = search.remove_note(&id) {
+            log::error!("Failed to remove note '{}' from search index: {}", id, e);
+        }
+        if let Err(e) = search.commit() {
+            log::error!("Failed to commit search index after deleting note '{}': {}", id, e);
+        }
     }
 
     // Remove from graph index

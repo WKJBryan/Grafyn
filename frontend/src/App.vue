@@ -1,11 +1,12 @@
 <template>
   <div id="app">
     <router-view />
+    <ToastNotification />
   </div>
 </template>
 
 <script setup>
-// App root component - router-view renders the matched route component
+import ToastNotification from '@/components/ToastNotification.vue'
 </script>
 
 <style>

@@ -15,6 +15,7 @@ from app.models.import_models import (
     SummarizationSettings,
 )
 from app.services.import_service import ImportService
+from app.utils.dependencies import get_import_service, get_knowledge_store
 from app.config import get_settings
 
 logger = logging.getLogger(__name__)
@@ -26,11 +27,6 @@ router = APIRouter(tags=["import"])
 class AssessRequest(BaseModel):
     """Request body for quality assessment endpoint"""
     summarization_settings: Optional[SummarizationSettings] = None
-
-
-def get_import_service(request: Request) -> ImportService:
-    """Get import service instance from app state."""
-    return request.app.state.import_service
 
 
 @router.post("/upload", response_model=ImportJob)
@@ -185,7 +181,7 @@ async def revert_import(
     Revert the last import by deleting all notes created during that import.
     """
     try:
-        result = await service.revert_import(job_id, request.app.state.knowledge_store)
+        result = await service.revert_import(job_id, get_knowledge_store(request))
         return result
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))

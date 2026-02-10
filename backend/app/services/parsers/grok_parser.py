@@ -117,7 +117,7 @@ class GrokParser(BaseParser):
         # Extract mode info from messages
         mode_info = set()
         for msg in messages:
-            if msg.metadata and "mode" in msg.metadata:
+            if msg.metadata and msg.metadata.get("mode"):
                 mode_info.add(msg.metadata["mode"])
 
         # Parse timestamp

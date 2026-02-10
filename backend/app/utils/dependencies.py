@@ -25,6 +25,8 @@ from app.services.priority_settings import PrioritySettingsService
 from app.services.distillation import DistillationService
 from app.services.link_discovery import LinkDiscoveryService
 from app.services.import_service import ImportService
+from app.services.feedback import FeedbackService
+from app.services.memory import MemoryService
 
 
 def get_knowledge_store(request: Request) -> KnowledgeStore:
@@ -75,3 +77,13 @@ def get_link_discovery(request: Request) -> LinkDiscoveryService:
 def get_import_service(request: Request) -> ImportService:
     """Get import service singleton from app state."""
     return request.app.state.import_service
+
+
+def get_feedback_service(request: Request) -> FeedbackService:
+    """Get feedback service singleton from app state."""
+    return request.app.state.feedback_service
+
+
+def get_memory_service(request: Request) -> MemoryService:
+    """Get memory service singleton from app state."""
+    return request.app.state.memory_service

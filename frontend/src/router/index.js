@@ -45,7 +45,7 @@ const routes = [
     meta: { requiresAuth: false }
   },
   {
-    path: '/pathMatch(.*)*',
+    path: '/:pathMatch(.*)*',
     name: 'not-found',
     component: () => import('../views/NotFoundView.vue'),
     meta: { requiresAuth: false }
