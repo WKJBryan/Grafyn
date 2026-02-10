@@ -12,6 +12,23 @@ pub struct SettingsService {
 }
 
 impl SettingsService {
+    /// Create a SettingsService with default settings (used as fallback)
+    pub fn load_defaults() -> Self {
+        let config_dir = dirs::config_dir()
+            .or_else(|| dirs::data_local_dir())
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("Grafyn");
+
+        if let Err(e) = std::fs::create_dir_all(&config_dir) {
+            log::error!("Failed to create config directory {}: {}", config_dir.display(), e);
+        }
+
+        Self {
+            config_path: config_dir.join("settings.json"),
+            settings: UserSettings::default(),
+        }
+    }
+
     /// Load settings from disk or create defaults
     pub fn load() -> Result<Self> {
         let config_dir = dirs::config_dir()
@@ -19,7 +36,9 @@ impl SettingsService {
             .unwrap_or_else(|| PathBuf::from("."))
             .join("Grafyn");
 
-        std::fs::create_dir_all(&config_dir).ok();
+        if let Err(e) = std::fs::create_dir_all(&config_dir) {
+            log::error!("Failed to create config directory {}: {}", config_dir.display(), e);
+        }
         let config_path = config_dir.join("settings.json");
 
         let settings = if config_path.exists() {

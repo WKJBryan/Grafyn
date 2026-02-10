@@ -10,6 +10,15 @@
       >
       <div class="editor-actions">
         <button
+          v-if="note.id"
+          class="btn btn-secondary"
+          :disabled="isDiscovering"
+          title="Discover potential links to other notes"
+          @click="handleDiscoverLinks"
+        >
+          {{ isDiscovering ? '⏳ Discovering...' : 'Discover Links' }}
+        </button>
+        <button
           v-if="canDistill"
           class="btn btn-accent"
           :disabled="isDistilling"
@@ -98,13 +107,27 @@
     >
       {{ distillMessage }}
     </div>
+
+    <!-- Link Candidate Modal -->
+    <LinkCandidateModal
+      v-if="showLinkModal"
+      :note-id="note.id"
+      :candidates="linkCandidates"
+      :loading="isDiscovering"
+      :error="linkError"
+      @close="showLinkModal = false"
+      @retry="handleDiscoverLinks"
+      @applied="handleLinksApplied"
+    />
   </div>
 </template>
 
 <script setup>
 import { ref, computed, watch } from 'vue'
 import { marked } from 'marked'
-import { notes } from '@/api/client'
+import { notes, zettelkasten } from '@/api/client'
+import { useToast } from '@/composables/useToast'
+import LinkCandidateModal from './LinkCandidateModal.vue'
 
 const props = defineProps({
   note: {
@@ -114,6 +137,7 @@ const props = defineProps({
 })
 
 const emit = defineEmits(['save', 'delete', 'distill-success', 'close'])
+const toast = useToast()
 
 const localNote = ref({ ...props.note })
 const mode = ref('edit')
@@ -121,6 +145,10 @@ const isDirty = ref(false)
 const tagsInput = ref(props.note.tags ? props.note.tags.join(', ') : '')
 const isDistilling = ref(false)
 const distillMessage = ref('')
+const showLinkModal = ref(false)
+const isDiscovering = ref(false)
+const linkCandidates = ref([])
+const linkError = ref(null)
 
 // Computed: can distill if status is evidence, has canvas-export tag, or source is mcp
 const canDistill = computed(() => {
@@ -194,7 +222,7 @@ function handleTagsInput() {
 
 function handleSave() {
   if (!localNote.value.title.trim()) {
-    alert('Please enter a title')
+    toast.warning('Please enter a title')
     return
   }
   
@@ -209,9 +237,7 @@ function handleSave() {
 }
 
 function handleDelete() {
-  if (confirm('Are you sure you want to delete this note?')) {
-    emit('delete', props.note.id)
-  }
+  emit('delete', props.note.id)
 }
 
 async function handleDistill() {
@@ -240,6 +266,30 @@ async function handleDistill() {
   } finally {
     isDistilling.value = false
   }
+}
+
+async function handleDiscoverLinks() {
+  if (isDiscovering.value || !props.note.id) return
+
+  isDiscovering.value = true
+  linkError.value = null
+  linkCandidates.value = []
+  showLinkModal.value = true
+
+  try {
+    const result = await zettelkasten.discoverLinks(props.note.id, 'suggested')
+    linkCandidates.value = result.links || []
+  } catch (e) {
+    console.error('Link discovery failed:', e)
+    linkError.value = e.response?.data?.detail || 'Link discovery failed. Is the Python backend running?'
+  } finally {
+    isDiscovering.value = false
+  }
+}
+
+function handleLinksApplied() {
+  showLinkModal.value = false
+  linkCandidates.value = []
 }
 </script>
 

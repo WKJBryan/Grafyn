@@ -257,11 +257,11 @@ import { ref, reactive } from 'vue'
 
 const emit = defineEmits(['update:filters', 'update:display', 'update:forces', 'animate'])
 
-const isCollapsed = ref(false)
+const isCollapsed = ref(true)
 const filtersOpen = ref(true)
 const groupsOpen = ref(true)
-const displayOpen = ref(true)
-const forcesOpen = ref(true)
+const displayOpen = ref(false)
+const forcesOpen = ref(false)
 
 const filters = reactive({
   showContainers: true,
@@ -328,9 +328,11 @@ emitForces()
 
 .graph-settings.collapsed {
   width: 44px;
+  min-height: 44px;
   background: transparent;
   border: none;
   box-shadow: none;
+  overflow: visible;
 }
 
 .toggle-btn {

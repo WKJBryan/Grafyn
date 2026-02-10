@@ -24,8 +24,46 @@
           Let's set up your knowledge base. You can change these settings anytime.
         </p>
 
-        <!-- Vault Path Section -->
-        <div class="setting-section">
+        <div
+          v-if="isSetup"
+          class="setup-steps"
+        >
+          <div
+            class="step"
+            :class="{ active: true, done: vaultPath }"
+          >
+            <span class="step-number">1</span>
+            <span class="step-label">Vault Location</span>
+          </div>
+          <div
+            class="step-connector"
+            :class="{ done: vaultPath }"
+          />
+          <div
+            class="step"
+            :class="{ active: vaultPath, done: vaultPath && (openrouterKey || keyValidationState === 'valid') }"
+          >
+            <span class="step-number">2</span>
+            <span class="step-label">API Key (Optional)</span>
+          </div>
+          <div
+            class="step-connector"
+            :class="{ done: vaultPath }"
+          />
+          <div
+            class="step"
+            :class="{ active: vaultPath }"
+          >
+            <span class="step-number">3</span>
+            <span class="step-label">Complete</span>
+          </div>
+        </div>
+
+        <!-- Vault Path Section (Desktop only) -->
+        <div
+          v-if="isDesktop || isSetup"
+          class="setting-section"
+        >
           <label class="setting-label">
             <span class="label-icon">📁</span>
             Vault Location
@@ -57,8 +95,11 @@
           </p>
         </div>
 
-        <!-- OpenRouter API Key Section -->
-        <div class="setting-section">
+        <!-- OpenRouter API Key Section (Desktop only) -->
+        <div
+          v-if="isDesktop || isSetup"
+          class="setting-section"
+        >
           <label class="setting-label">
             <span class="label-icon">🤖</span>
             OpenRouter API Key
@@ -205,6 +246,46 @@
             </p>
           </div>
         </div>
+
+        <!-- Import Section (non-setup only) -->
+        <div
+          v-if="!isSetup"
+          class="setting-section"
+        >
+          <label class="setting-label">
+            <span class="label-icon">📥</span>
+            Import
+          </label>
+          <p class="setting-description">
+            Import conversations from ChatGPT, Claude, Grok, and Gemini into your knowledge base.
+          </p>
+          <button
+            class="action-btn"
+            @click="goToImport"
+          >
+            Import LLM Conversations
+          </button>
+        </div>
+
+        <!-- Feedback Section (non-setup only) -->
+        <div
+          v-if="!isSetup"
+          class="setting-section"
+        >
+          <label class="setting-label">
+            <span class="label-icon">💬</span>
+            Feedback
+          </label>
+          <p class="setting-description">
+            Report bugs, request features, or share your thoughts.
+          </p>
+          <button
+            class="action-btn"
+            @click="openFeedback"
+          >
+            Send Feedback
+          </button>
+        </div>
       </div>
 
       <div class="modal-footer">
@@ -229,7 +310,10 @@
 
 <script setup>
 import { ref, computed, watch, onMounted } from 'vue'
+import { useRouter } from 'vue-router'
 import { settings as settingsApi, mcp as mcpApi, isDesktopApp } from '@/api/client'
+import { useToast } from '@/composables/useToast'
+import { useThemeStore } from '@/stores/theme'
 
 const props = defineProps({
   modelValue: {
@@ -242,13 +326,16 @@ const props = defineProps({
   },
 })
 
-const emit = defineEmits(['update:modelValue', 'saved', 'setup-complete'])
+const emit = defineEmits(['update:modelValue', 'saved', 'setup-complete', 'open-feedback'])
 
 const isOpen = ref(props.modelValue)
 const isLoading = ref(false)
 const isSaving = ref(false)
 const showApiKey = ref(false)
 
+const router = useRouter()
+const toast = useToast()
+const themeStore = useThemeStore()
 const isDesktop = isDesktopApp()
 
 // Form state
@@ -288,6 +375,16 @@ const mcpStatusText = computed(() => {
   const s = String(mcpStatus.value)
   if (s === 'Stopped') return mcpEnabled.value ? 'Stopped' : ''
   return s
+})
+
+// Apply theme changes immediately via themeStore
+watch(theme, (newTheme) => {
+  if (newTheme === 'system') {
+    const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches
+    themeStore.setTheme(prefersDark ? 'dark' : 'light')
+  } else {
+    themeStore.setTheme(newTheme)
+  }
 })
 
 // Sync with v-model
@@ -357,7 +454,7 @@ const loadCurrentSettings = async () => {
 // Pick vault folder using native dialog
 const pickVaultFolder = async () => {
   if (!isDesktopApp()) {
-    alert('Folder picker is only available in the desktop app')
+    toast.warning('Folder picker is only available in the desktop app')
     return
   }
 
@@ -394,7 +491,7 @@ const validateKey = async () => {
 // Save settings
 const saveSettings = async () => {
   if (props.isSetup && !vaultPath.value) {
-    alert('Please select a vault location')
+    toast.warning('Please select a vault location')
     return
   }
 
@@ -422,10 +519,22 @@ const saveSettings = async () => {
     isOpen.value = false
   } catch (e) {
     console.error('Failed to save settings:', e)
-    alert('Failed to save settings: ' + e.message)
+    toast.error('Failed to save settings: ' + e.message)
   } finally {
     isSaving.value = false
   }
+}
+
+// Navigate to import page
+const goToImport = () => {
+  isOpen.value = false
+  router.push('/import')
+}
+
+// Open feedback modal (emit to parent)
+const openFeedback = () => {
+  isOpen.value = false
+  emit('open-feedback')
 }
 
 // Handle close (only allowed if not in setup mode)
@@ -838,6 +947,81 @@ onMounted(() => {
   overflow-x: auto;
   white-space: pre;
   color: var(--text-primary, #1a1a1a);
+}
+
+.setup-steps {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0;
+  margin-bottom: 24px;
+}
+
+.step {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  opacity: 0.4;
+  transition: opacity 0.3s;
+}
+
+.step.active {
+  opacity: 1;
+}
+
+.step.done .step-number {
+  background: var(--accent-success, #859900);
+  color: white;
+}
+
+.step-number {
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.75rem;
+  font-weight: 600;
+  background: var(--bg-tertiary, #eee);
+  color: var(--text-primary, #1a1a1a);
+}
+
+.step-label {
+  font-size: 0.8rem;
+  color: var(--text-secondary, #666);
+}
+
+.step-connector {
+  width: 32px;
+  height: 2px;
+  background: var(--bg-tertiary, #e0e0e0);
+  margin: 0 8px;
+  transition: background 0.3s;
+}
+
+.step-connector.done {
+  background: var(--accent-success, #859900);
+}
+
+.action-btn {
+  padding: 10px 16px;
+  background: var(--bg-secondary, #f5f5f5);
+  border: 1px solid var(--border-color, #e0e0e0);
+  border-radius: 8px;
+  font-weight: 500;
+  cursor: pointer;
+  color: var(--text-primary, #1a1a1a);
+  font-size: 0.9rem;
+  transition: all 0.2s;
+  width: 100%;
+  text-align: left;
+}
+
+.action-btn:hover {
+  background: var(--accent-color, #7c3aed);
+  color: white;
+  border-color: var(--accent-color, #7c3aed);
 }
 
 /* Dark mode support */

@@ -104,7 +104,17 @@
       "WebFetch(domain:v1.tauri.app)",
       "WebFetch(domain:github.com)",
       "Bash(\"C:\\\\Program Files\\\\nodejs\\\\node.exe\" \"C:\\\\Users\\\\bryan\\\\Seedream\\\\frontend\\\\node_modules\\\\vitest\\\\vitest.mjs\" run --reporter=verbose --root \"C:\\\\Users\\\\bryan\\\\Seedream\\\\frontend\")",
-      "Skill(commit-commands:commit-push-pr)"
+      "Skill(commit-commands:commit-push-pr)",
+      "Bash(npx tauri icon --help:*)",
+      "Bash(xxd:*)",
+      "Bash(node scripts/generate-icons.cjs:*)",
+      "Bash(gh pr list:*)",
+      "Bash(timeout:*)",
+      "Bash(git status:*)",
+      "Bash(npm run build:*)",
+      "mcp__plugin_playwright_playwright__browser_evaluate",
+      "mcp__plugin_playwright_playwright__browser_press_key",
+      "mcp__plugin_playwright_playwright__browser_console_messages"
     ]
   },
   "outputStyle": "Explanatory"

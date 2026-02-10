@@ -49,6 +49,16 @@
       <div class="spinner" />
       <p>Loading graph...</p>
     </div>
+
+    <div
+      v-if="!loading && stats && stats.nodes === 0"
+      class="graph-empty-state"
+    >
+      <p>Your knowledge graph is empty.</p>
+      <p class="empty-hint">
+        Create notes with [[wikilinks]] to build connections.
+      </p>
+    </div>
   </div>
 </template>
 
@@ -487,7 +497,8 @@ function resetZoom() {
 .loading-overlay {
   position: absolute;
   inset: 0;
-  background: rgba(15, 15, 16, 0.8);
+  background: rgba(0, 0, 0, 0.5);
+  backdrop-filter: blur(4px);
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -530,5 +541,29 @@ function resetZoom() {
 /* In light mode, use subtle shadow for readability */
 :root[data-theme="light"] .graph-canvas :deep(.graph-node-label) {
   text-shadow: 0 1px 2px rgba(255, 255, 255, 0.8);
+}
+
+.graph-empty-state {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-muted);
+  text-align: center;
+  z-index: 5;
+}
+
+.graph-empty-state p {
+  margin: 0;
+  font-size: 0.9rem;
+}
+
+.empty-hint {
+  margin-top: var(--spacing-sm) !important;
+  font-size: 0.8rem !important;
+  color: var(--text-muted);
+  opacity: 0.7;
 }
 </style>

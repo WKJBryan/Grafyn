@@ -37,13 +37,6 @@
         <div class="header-right">
           <div class="action-buttons">
             <router-link
-              to="/import"
-              class="btn btn-secondary"
-              title="Import Conversations"
-            >
-              Import
-            </router-link>
-            <router-link
               to="/canvas"
               class="btn btn-secondary"
               title="Multi-LLM Canvas"
@@ -52,25 +45,10 @@
             </router-link>
             <button
               class="btn btn-ghost"
-              title="Send Feedback"
-              @click="showFeedbackModal = true"
-            >
-              💬
-            </button>
-            <button
-              v-if="isDesktop"
-              class="btn btn-ghost"
               title="Settings"
               @click="showSettingsModal = true"
             >
               ⚙️
-            </button>
-            <button
-              class="btn btn-ghost"
-              title="Toggle Theme"
-              @click="handleThemeToggle"
-            >
-              {{ themeIcon }}
             </button>
             <button
               class="btn btn-primary"
@@ -101,6 +79,21 @@
 
         <!-- Center: Graph (Always Visible) -->
         <main class="main-content">
+          <div
+            v-if="notes.length === 0 && !isSetupMode"
+            class="empty-state-banner"
+          >
+            <div class="empty-state-content">
+              <h2>Welcome to Grafyn</h2>
+              <p>Your knowledge graph is empty. Create your first note to get started.</p>
+              <button
+                class="btn btn-primary"
+                @click="handleNewNote"
+              >
+                + Create Your First Note
+              </button>
+            </div>
+          </div>
           <div class="full-graph-container">
             <div class="graph-header">
               <h2>Knowledge Graph</h2>
@@ -179,6 +172,31 @@
               @link-created="handleCreateLink"
             />
           </div>
+
+          <div
+            v-if="contradictions.length > 0"
+            class="sidebar-section"
+          >
+            <div class="section-title warning-title">
+              Contradictions
+              <span class="contradiction-count">{{ contradictions.length }}</span>
+            </div>
+            <div class="contradictions-list">
+              <div
+                v-for="c in contradictions"
+                :key="c.note_id"
+                class="contradiction-item"
+                @click="handleNoteSelect(c.note_id)"
+              >
+                <div class="contradiction-title">
+                  {{ c.title }}
+                </div>
+                <div class="contradiction-detail">
+                  {{ c.details }}
+                </div>
+              </div>
+            </div>
+          </div>
         </aside>
       </div>
     </div>
@@ -198,19 +216,32 @@
       @submitted="handleFeedbackSubmitted"
     />
 
-    <!-- Settings Modal (Desktop only) -->
+    <!-- Settings Modal -->
     <SettingsModal
       v-model="showSettingsModal"
       :is-setup="isSetupMode"
       @saved="handleSettingsSaved"
       @setup-complete="handleSetupComplete"
+      @open-feedback="handleOpenFeedback"
+    />
+
+    <!-- Delete Confirmation Dialog -->
+    <ConfirmDialog
+      :visible="showDeleteConfirm"
+      title="Delete Note"
+      message="Are you sure you want to delete this note? This cannot be undone."
+      confirm-label="Delete"
+      cancel-label="Cancel"
+      variant="danger"
+      @confirm="confirmDeleteNote"
+      @cancel="showDeleteConfirm = false"
     />
   </div>
 </template>
 
 <script setup>
-import { ref, onMounted, computed, watch } from 'vue'
-import { notes as notesApi, settings as settingsApi, isDesktopApp } from '../api/client'
+import { ref, watch, onMounted, computed } from 'vue'
+import { notes as notesApi, memory, settings as settingsApi, isDesktopApp } from '../api/client'
 import SearchBar from '../components/SearchBar.vue'
 import NoteEditor from '../components/NoteEditor.vue'
 import BacklinksPanel from '../components/BacklinksPanel.vue'
@@ -223,24 +254,23 @@ import GraphView from '../components/GraphView.vue'
 import TopicSelector from '../components/TopicSelector.vue'
 import FeedbackModal from '../components/FeedbackModal.vue'
 import SettingsModal from '../components/SettingsModal.vue'
-import { useThemeStore } from '../stores/theme'
+import ConfirmDialog from '../components/ConfirmDialog.vue'
+import { useToast } from '../composables/useToast'
 
 const notes = ref([])
 const selectedNoteId = ref(null)
 const selectedNote = ref(null)
-const themeStore = useThemeStore()
+const toast = useToast()
 const selectedTags = ref([])
+const showDeleteConfirm = ref(false)
+const pendingDeleteId = ref(null)
 const isDirty = ref(false)
 const showTopicSelector = ref(false)
 const showFeedbackModal = ref(false)
 const showSettingsModal = ref(false)
 const isSetupMode = ref(false)
 const isDesktop = isDesktopApp()
-
-// Computed property to get the current theme icon
-const themeIcon = computed(() => {
-  return themeStore.theme === 'dark' ? '🌙' : '☀️'
-})
+const contradictions = ref([])
 
 // Extract all unique tags
 const allTags = computed(() => {
@@ -289,7 +319,7 @@ function handleTagFilter(tags) {
 }
 
 // Function to handle creating a link from unlinked mentions
-async function handleCreateLink({ sourceNoteId, targetTitle, context }) {
+async function handleCreateLink({ sourceNoteId, targetTitle }) {
   try {
     // 1. Get the source note content
     const sourceNote = await notesApi.get(sourceNoteId)
@@ -312,17 +342,39 @@ async function handleCreateLink({ sourceNoteId, targetTitle, context }) {
     // Also refresh the collection to update link counts etc
     await loadNotes()
     
-    // 5. Notify user (could be toast)
-    console.log(`Linked "${targetTitle}" in "${sourceNote.title}"`)
-    
+    // 5. Notify user
+    toast.success(`Linked "${targetTitle}" in "${sourceNote.title}"`)
+
   } catch (error) {
     console.error('Failed to create link:', error)
+    toast.error('Failed to create link')
   }
 }
 
-// Function to toggle theme
-function handleThemeToggle() {
-  themeStore.toggleTheme()
+// Load contradictions when selected note changes
+watch(selectedNoteId, async (newId) => {
+  if (newId) {
+    try {
+      const data = await memory.contradictions(newId)
+      const items = data.contradictions || data // unwrap Pydantic wrapper (web) or flat array (Tauri)
+      contradictions.value = (Array.isArray(items) ? items : []).map(c => ({
+        note_id: c.note_id,
+        title: c.title,
+        details: c.details || `${c.conflicting_field}: "${c.this_value}" vs "${c.other_value}"`,
+        similarity_score: c.similarity_score,
+      }))
+    } catch {
+      // Contradiction check is optional
+      contradictions.value = []
+    }
+  } else {
+    contradictions.value = []
+  }
+})
+
+// Open feedback modal from Settings
+function handleOpenFeedback() {
+  showFeedbackModal.value = true
 }
 
 // Check for first-run setup (desktop only)
@@ -345,7 +397,9 @@ onMounted(async () => {
   // Check if setup is needed (desktop only)
   await checkSetup()
 
-  await loadNotes()
+  if (!isSetupMode.value) {
+    await loadNotes()
+  }
 })
 
 async function loadNotes() {
@@ -426,23 +480,31 @@ async function handleSaveNote(id, data) {
     await loadNotes()
     await loadSelectedNote()
     isDirty.value = false
+    toast.success('Note saved')
   } catch (error) {
     console.error('Failed to save note:', error)
+    toast.error('Failed to save note')
   }
 }
 
 async function handleDeleteNote(id) {
-  if (!confirm('Are you sure you want to delete this note?')) {
-    return
-  }
+  pendingDeleteId.value = id
+  showDeleteConfirm.value = true
+}
 
+async function confirmDeleteNote() {
+  const id = pendingDeleteId.value
+  showDeleteConfirm.value = false
+  pendingDeleteId.value = null
   try {
     await notesApi.delete(id)
     selectedNoteId.value = null
     selectedNote.value = null
     await loadNotes()
+    toast.success('Note deleted')
   } catch (error) {
     console.error('Failed to delete note:', error)
+    toast.error('Failed to delete note')
   }
 }
 
@@ -451,9 +513,8 @@ function handleCloseNote() {
   selectedNote.value = null
 }
 
-function handleFeedbackSubmitted(response) {
-  console.log('Feedback submitted:', response)
-  // Modal will close itself after showing success message
+function handleFeedbackSubmitted() {
+  toast.success('Feedback submitted successfully')
 }
 
 function handleSettingsSaved() {
@@ -591,6 +652,31 @@ function handleSetupComplete() {
   letter-spacing: 0.05em;
 }
 
+/* Empty State Banner */
+.empty-state-banner {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--spacing-xl);
+}
+
+.empty-state-content {
+  text-align: center;
+  max-width: 400px;
+}
+
+.empty-state-content h2 {
+  color: var(--text-primary);
+  margin: 0 0 var(--spacing-sm) 0;
+  font-size: 1.5rem;
+}
+
+.empty-state-content p {
+  color: var(--text-secondary);
+  margin: 0 0 var(--spacing-lg) 0;
+  line-height: 1.5;
+}
+
 /* Full Graph View (Always Visible) */
 .full-graph-container {
   flex: 1;
@@ -687,6 +773,54 @@ function handleSetupComplete() {
 
 .close-btn:hover {
   color: var(--text-primary);
+}
+
+/* Contradictions Section */
+.warning-title {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-sm);
+  color: #f59e0b;
+}
+
+.contradiction-count {
+  font-size: 0.7rem;
+  font-weight: 600;
+  padding: 1px 6px;
+  border-radius: var(--radius-sm);
+  background: rgba(245, 158, 11, 0.1);
+  color: #f59e0b;
+}
+
+.contradictions-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-xs);
+}
+
+.contradiction-item {
+  padding: var(--spacing-sm);
+  border-left: 2px solid #f59e0b;
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+  cursor: pointer;
+  transition: background var(--transition-fast);
+}
+
+.contradiction-item:hover {
+  background: var(--bg-hover);
+}
+
+.contradiction-title {
+  font-size: 0.85rem;
+  font-weight: 500;
+  color: var(--text-primary);
+  margin-bottom: 2px;
+}
+
+.contradiction-detail {
+  font-size: 0.75rem;
+  color: #f59e0b;
+  line-height: 1.4;
 }
 
 /* Responsive Design */

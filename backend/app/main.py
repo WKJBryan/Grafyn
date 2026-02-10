@@ -6,7 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pathlib import Path
 
 from app.config import get_settings
-from app.routers import notes, search, graph, oauth, canvas, distill, priority, feedback
+from app.routers import notes, search, graph, oauth, canvas, distill, priority, feedback, memory
 from app.routers.conversation_import import router as import_router
 from app.routers import mcp_write
 from app.routers import zettelkasten
@@ -22,6 +22,7 @@ from app.services.distillation import DistillationService
 from app.services.link_discovery import LinkDiscoveryService
 from app.services.import_service import ImportService
 from app.services.feedback import FeedbackService
+from app.services.memory import MemoryService
 from app.middleware.logging import LoggingMiddleware
 from app.middleware.security import (
     SecurityHeadersMiddleware,
@@ -75,6 +76,13 @@ async def lifespan(app: FastAPI):
     # Feedback service for bug reports and feature requests
     feedback_service = FeedbackService()
 
+    # Memory layer service
+    memory_service = MemoryService(
+        knowledge_store=knowledge_store,
+        vector_search=vector_search,
+        graph_index=graph_index,
+    )
+
     app.state.knowledge_store = knowledge_store
     app.state.vector_search = vector_search
     app.state.graph_index = graph_index
@@ -86,6 +94,7 @@ async def lifespan(app: FastAPI):
     app.state.link_discovery = link_discovery
     app.state.import_service = import_service
     app.state.feedback_service = feedback_service
+    app.state.memory_service = memory_service
 
     yield
 
@@ -174,6 +183,7 @@ app.include_router(import_router, prefix="/api/import", tags=["import"])
 app.include_router(mcp_write.router, prefix="/api", tags=["mcp-write"])
 app.include_router(zettelkasten.router, prefix="/api/zettel", tags=["zettelkasten"])
 app.include_router(feedback.router, prefix="/api/feedback", tags=["feedback"])
+app.include_router(memory.router, prefix="/api/memory", tags=["memory"])
 
 # Setup MCP server
 setup_mcp(app)

@@ -24,6 +24,7 @@ from app.services.import_service import ImportService
 from app.services.openrouter import OpenRouterService
 from app.services.distillation import DistillationService
 from app.services.link_discovery import LinkDiscoveryService
+from app.services.memory import MemoryService
 
 
 # ============================================================================
@@ -248,6 +249,20 @@ def link_discovery_service(
 
 
 @pytest.fixture
+def memory_service(
+    knowledge_store: KnowledgeStore,
+    vector_search: VectorSearchService,
+    graph_index: GraphIndexService,
+) -> MemoryService:
+    """Create a MemoryService for testing"""
+    return MemoryService(
+        knowledge_store=knowledge_store,
+        vector_search=vector_search,
+        graph_index=graph_index,
+    )
+
+
+@pytest.fixture
 def llm_conversation_data() -> dict:
     """Sample ChatGPT conversation export for import testing"""
     return {
@@ -311,6 +326,7 @@ def test_client(
     mock_openrouter_client: OpenRouterService,
     distillation_service: DistillationService,
     link_discovery_service: LinkDiscoveryService,
+    memory_service: MemoryService,
 ) -> TestClient:
     """Create a FastAPI TestClient with all services attached"""
     # Attach services to app.state
@@ -325,6 +341,7 @@ def test_client(
     app.state.import_service = import_service
     app.state.distillation = distillation_service
     app.state.link_discovery = link_discovery_service
+    app.state.memory_service = memory_service
 
     return TestClient(app)
 

@@ -7,19 +7,9 @@ from app.models.distillation import (
     ExtractionMethod,
 )
 from app.models.note import Note
-from app.services.distillation import (
-    DistillationService,
-    normalize_tag,
-    merge_tags,
-    parse_inline_tags,
-)
+from app.utils.dependencies import get_distillation as get_distillation_service, get_knowledge_store
 
 router = APIRouter()
-
-
-def get_distillation_service(request: Request) -> DistillationService:
-    """Get distillation service singleton from app state."""
-    return request.app.state.distillation
 
 
 @router.post("/{note_id}/distill", response_model=DistillResponse)
@@ -51,7 +41,7 @@ async def distill_note(
     service = get_distillation_service(request)
     
     # Verify note exists
-    note = request.app.state.knowledge_store.get_note(note_id)
+    note = get_knowledge_store(request).get_note(note_id)
     if not note:
         raise HTTPException(status_code=404, detail="Note not found")
     

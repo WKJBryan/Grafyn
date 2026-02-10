@@ -11,6 +11,8 @@ from .dependencies import (
     get_distillation,
     get_link_discovery,
     get_import_service,
+    get_feedback_service,
+    get_memory_service,
 )
 
 __all__ = [
@@ -24,4 +26,6 @@ __all__ = [
     "get_distillation",
     "get_link_discovery",
     "get_import_service",
+    "get_feedback_service",
+    "get_memory_service",
 ]

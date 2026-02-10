@@ -259,23 +259,3 @@ fn create_snippet(content: &str, query: &str, max_len: usize) -> String {
 
     snippet
 }
-
-// Implement Clone manually since IndexWriter is not Clone
-impl Clone for SearchService {
-    fn clone(&self) -> Self {
-        // Create a new writer for the clone
-        let writer = self.index.writer(50_000_000).ok();
-
-        Self {
-            index: self.index.clone(),
-            reader: self.reader.clone(),
-            writer,
-            schema: self.schema.clone(),
-            id_field: self.id_field,
-            title_field: self.title_field,
-            content_field: self.content_field,
-            tags_field: self.tags_field,
-            status_field: self.status_field,
-        }
-    }
-}

@@ -3,13 +3,9 @@
 from fastapi import APIRouter, Request
 from app.models.feedback import FeedbackCreate, FeedbackResponse, FeedbackStatus
 from app.middleware.rate_limit import limiter
+from app.utils.dependencies import get_feedback_service
 
 router = APIRouter()
-
-
-def get_feedback_service(request: Request):
-    """Get feedback service from app state"""
-    return request.app.state.feedback_service
 
 
 @router.post("", response_model=FeedbackResponse, status_code=201)

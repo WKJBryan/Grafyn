@@ -2,26 +2,9 @@
 from fastapi import APIRouter, Query, Request, HTTPException
 from typing import List, Optional
 from app.models.note import SearchResult
-from app.services.vector_search import VectorSearchService
-from app.services.knowledge_store import KnowledgeStore
-from app.services.priority_scoring import PriorityScoringService
+from app.utils.dependencies import get_knowledge_store, get_vector_search, get_priority_scoring
 
 router = APIRouter()
-
-
-def get_vector_search(request: Request) -> VectorSearchService:
-    """Get vector search service from app state"""
-    return request.app.state.vector_search
-
-
-def get_knowledge_store(request: Request) -> KnowledgeStore:
-    """Get knowledge store from app state"""
-    return request.app.state.knowledge_store
-
-
-def get_priority_scoring(request: Request) -> Optional[PriorityScoringService]:
-    """Get priority scoring service from app state (optional)"""
-    return getattr(request.app.state, 'priority_scoring', None)
 
 
 @router.get("", response_model=List[SearchResult])

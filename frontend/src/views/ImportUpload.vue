@@ -1,5 +1,14 @@
 <template>
   <div class="import-upload">
+    <nav class="page-nav">
+      <router-link
+        to="/"
+        class="nav-back"
+      >
+        &larr; Back to Notes
+      </router-link>
+    </nav>
+
     <div class="header">
       <h2>Import LLM Conversations</h2>
       <p class="subtitle">
@@ -185,42 +194,64 @@ export default {
 .import-upload {
   max-width: 800px;
   margin: 0 auto;
-  padding: 2rem;
+  padding: var(--spacing-lg);
+}
+
+.page-nav {
+  margin-bottom: var(--spacing-lg);
+}
+
+.nav-back {
+  color: var(--text-secondary);
+  text-decoration: none;
+  font-size: 0.875rem;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--spacing-xs);
+  padding: var(--spacing-xs) var(--spacing-sm);
+  border-radius: var(--radius-sm);
+  transition: all var(--transition-fast);
+}
+
+.nav-back:hover {
+  color: var(--accent-primary);
+  background: var(--bg-hover);
 }
 
 .header {
   text-align: center;
-  margin-bottom: 2rem;
+  margin-bottom: var(--spacing-lg);
 }
 
 .header h2 {
   font-size: 1.5rem;
-  margin-bottom: 0.5rem;
+  margin-bottom: var(--spacing-sm);
+  color: var(--text-primary);
 }
 
 .subtitle {
-  color: #666;
+  color: var(--text-muted);
   font-size: 0.95rem;
 }
 
 .upload-zone {
-  border: 2px dashed #ccc;
-  border-radius: 8px;
+  border: 2px dashed var(--bg-tertiary);
+  border-radius: var(--radius-md);
   padding: 3rem;
   text-align: center;
   cursor: pointer;
   transition: all 0.3s ease;
-  background: #fafafa;
+  background: var(--bg-secondary);
 }
 
 .upload-zone:hover {
-  border-color: #4a90e2;
-  background: #f0f7ff;
+  border-color: var(--accent-secondary);
+  background: var(--bg-hover);
 }
 
 .upload-zone.dragging {
-  border-color: #4a90e2;
-  background: #e8f4fd;
+  border-color: var(--accent-secondary);
+  background: var(--bg-tertiary);
 }
 
 .upload-content {
@@ -231,22 +262,23 @@ export default {
 }
 
 .icon {
-  color: #4a90e2;
-  margin-bottom: 0.5rem;
+  color: var(--accent-secondary);
+  margin-bottom: var(--spacing-sm);
 }
 
 .text h3 {
-  margin: 0 0 0.5rem;
+  margin: 0 0 var(--spacing-sm);
+  color: var(--text-primary);
 }
 
 .text p {
-  color: #666;
-  margin: 0.25rem 0;
+  color: var(--text-muted);
+  margin: var(--spacing-xs) 0;
 }
 
 .max-size {
   font-size: 0.85rem;
-  color: #999;
+  color: var(--text-muted);
 }
 
 .upload-progress {
@@ -254,13 +286,14 @@ export default {
   flex-direction: column;
   align-items: center;
   gap: 1rem;
+  color: var(--text-primary);
 }
 
 .spinner {
   width: 40px;
   height: 40px;
-  border: 4px solid #f3f3f3;
-  border-top: 4px solid #4a90e2;
+  border: 4px solid var(--bg-tertiary);
+  border-top: 4px solid var(--accent-secondary);
   border-radius: 50%;
   animation: spin 1s linear infinite;
 }
@@ -271,18 +304,18 @@ export default {
 }
 
 .error-banner {
-  margin-top: 1.5rem;
-  padding: 1rem;
-  background: #fee;
-  border: 1px solid #fcc;
-  border-radius: 4px;
+  margin-top: var(--spacing-lg);
+  padding: var(--spacing-md);
+  background: rgba(220, 50, 47, 0.1);
+  border: 1px solid rgba(220, 50, 47, 0.3);
+  border-radius: var(--radius-sm);
 }
 
 .error-item {
   display: flex;
   align-items: center;
-  gap: 0.5rem;
-  padding: 0.5rem 0;
+  gap: var(--spacing-sm);
+  padding: var(--spacing-sm) 0;
 }
 
 .error-icon {
@@ -290,46 +323,49 @@ export default {
 }
 
 .error-message {
-  color: #c00;
+  color: var(--accent-danger);
 }
 
 .next-steps {
-  margin-top: 2rem;
-  padding: 1.5rem;
-  background: #f0f7ff;
-  border-radius: 8px;
+  margin-top: var(--spacing-lg);
+  padding: var(--spacing-lg);
+  background: var(--bg-secondary);
+  border: 1px solid var(--bg-tertiary);
+  border-radius: var(--radius-md);
 }
 
 .next-steps h3 {
   margin-top: 0;
+  color: var(--text-primary);
 }
 
 .job-info {
-  background: white;
-  padding: 1rem;
-  border-radius: 4px;
-  margin-bottom: 1rem;
+  background: var(--bg-tertiary);
+  padding: var(--spacing-md);
+  border-radius: var(--radius-sm);
+  margin-bottom: var(--spacing-md);
 }
 
 .job-info p {
-  margin: 0.5rem 0;
+  margin: var(--spacing-sm) 0;
+  color: var(--text-primary);
 }
 
 .btn {
   padding: 0.75rem 1.5rem;
   border: none;
-  border-radius: 4px;
+  border-radius: var(--radius-sm);
   font-size: 1rem;
   cursor: pointer;
-  transition: background 0.2s;
+  transition: background var(--transition-fast);
 }
 
 .btn-primary {
-  background: #4a90e2;
+  background: var(--accent-primary);
   color: white;
 }
 
 .btn-primary:hover {
-  background: #357abd;
+  opacity: 0.9;
 }
 </style>
