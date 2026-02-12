@@ -156,10 +156,9 @@ export const canvas = {
   getModels: () =>
     invokeOrHttp('get_available_models', {}, () => api.get('/canvas/models/available')),
 
-  // Send prompt to models
+  // Send prompt to models (Tauri: returns tile_id, streams via events)
   sendPrompt: (sessionId, request) =>
     invokeOrHttp('send_prompt', { sessionId, request }, () =>
-      // For HTTP, this is typically done via SSE - simplified here
       api.post(`/canvas/${encodeURIComponent(sessionId)}/prompt`, request)
     ),
 
@@ -172,30 +171,58 @@ export const canvas = {
     ),
 
   updateLLMNodePosition: (sessionId, tileId, modelId, position) =>
-    api.put(
-      `/canvas/${encodeURIComponent(sessionId)}/tiles/${encodeURIComponent(tileId)}/responses/${encodeURIComponent(modelId)}/position`,
-      position
+    invokeOrHttp('update_llm_node_position', { sessionId, tileId, modelId, position }, () =>
+      api.put(
+        `/canvas/${encodeURIComponent(sessionId)}/tiles/${encodeURIComponent(tileId)}/responses/${encodeURIComponent(modelId)}/position`,
+        position
+      )
     ),
 
   autoArrange: (sessionId, positions) =>
-    api.post(`/canvas/${encodeURIComponent(sessionId)}/arrange`, { positions }),
+    invokeOrHttp('auto_arrange', { sessionId, positions }, () =>
+      api.post(`/canvas/${encodeURIComponent(sessionId)}/arrange`, { positions })
+    ),
 
   deleteTile: (sessionId, tileId) =>
-    api.delete(`/canvas/${encodeURIComponent(sessionId)}/tiles/${encodeURIComponent(tileId)}`),
+    invokeOrHttp('delete_tile', { sessionId, tileId }, () =>
+      api.delete(`/canvas/${encodeURIComponent(sessionId)}/tiles/${encodeURIComponent(tileId)}`)
+    ),
 
   deleteResponse: (sessionId, tileId, modelId) =>
-    api.delete(`/canvas/${encodeURIComponent(sessionId)}/tiles/${encodeURIComponent(tileId)}/responses/${encodeURIComponent(modelId)}`),
+    invokeOrHttp('delete_response', { sessionId, tileId, modelId }, () =>
+      api.delete(`/canvas/${encodeURIComponent(sessionId)}/tiles/${encodeURIComponent(tileId)}/responses/${encodeURIComponent(modelId)}`)
+    ),
 
   updateViewport: (sessionId, viewport) =>
-    api.put(`/canvas/${encodeURIComponent(sessionId)}/viewport`, viewport),
-
-  updateDebateStatus: (sessionId, debateId, status) =>
-    api.put(`/canvas/${encodeURIComponent(sessionId)}/debate/${encodeURIComponent(debateId)}/status`, null, {
-      params: { status },
-    }),
+    invokeOrHttp('update_viewport', { sessionId, viewport }, () =>
+      api.put(`/canvas/${encodeURIComponent(sessionId)}/viewport`, viewport)
+    ),
 
   exportToNote: (sessionId) =>
-    api.post(`/canvas/${encodeURIComponent(sessionId)}/export-note`),
+    invokeOrHttp('export_to_note', { sessionId }, () =>
+      api.post(`/canvas/${encodeURIComponent(sessionId)}/export-note`)
+    ),
+
+  // Debate commands
+  startDebate: (sessionId, request) =>
+    invokeOrHttp('start_debate', { sessionId, request }, () =>
+      api.post(`/canvas/${encodeURIComponent(sessionId)}/debate`, request)
+    ),
+
+  continueDebate: (sessionId, debateId, request) =>
+    invokeOrHttp('continue_debate', { sessionId, debateId, request }, () =>
+      api.post(`/canvas/${encodeURIComponent(sessionId)}/debate/${encodeURIComponent(debateId)}/continue`, request)
+    ),
+
+  addModelsToTile: (sessionId, tileId, request) =>
+    invokeOrHttp('add_models_to_tile', { sessionId, tileId, request }, () =>
+      api.post(`/canvas/${encodeURIComponent(sessionId)}/tile/${encodeURIComponent(tileId)}/add-models`, request)
+    ),
+
+  regenerateResponse: (sessionId, tileId, modelId) =>
+    invokeOrHttp('regenerate_response', { sessionId, tileId, modelId }, () =>
+      api.post(`/canvas/${encodeURIComponent(sessionId)}/tile/${encodeURIComponent(tileId)}/regenerate/${encodeURIComponent(modelId)}`)
+    ),
 
   getNodeEdges: (sessionId) => api.get(`/canvas/${encodeURIComponent(sessionId)}/node-edges`),
 

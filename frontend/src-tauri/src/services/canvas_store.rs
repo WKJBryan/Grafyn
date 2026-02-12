@@ -1,9 +1,10 @@
 use crate::models::canvas::{
-    CanvasSession, PromptTile, SessionCreate, SessionMeta, SessionUpdate, TilePosition,
-    TilePositionUpdate,
+    CanvasSession, CanvasViewport, Debate, LLMNodePositionUpdate,
+    PromptTile, SessionCreate, SessionMeta, SessionUpdate, TilePosition, TilePositionUpdate,
 };
 use anyhow::{Context, Result};
 use chrono::Utc;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use walkdir::WalkDir;
 
@@ -113,6 +114,44 @@ impl CanvasStore {
         Ok(session)
     }
 
+    /// Delete a prompt tile and its children from a session
+    pub fn delete_tile(&mut self, session_id: &str, tile_id: &str) -> Result<()> {
+        let mut session = self.get_session(session_id)?;
+
+        // Remove tile and any children that reference it as parent
+        session.prompt_tiles.retain(|t| t.id != tile_id && t.parent_tile_id.as_deref() != Some(tile_id));
+
+        // Also check debates - remove if matching ID
+        session.debates.retain(|d| d.id != tile_id);
+
+        session.updated_at = Utc::now();
+        self.write_session_file(&session)?;
+        Ok(())
+    }
+
+    /// Delete a single model response from a tile
+    pub fn delete_response(&mut self, session_id: &str, tile_id: &str, model_id: &str) -> Result<()> {
+        let mut session = self.get_session(session_id)?;
+
+        if let Some(tile) = session.prompt_tiles.iter_mut().find(|t| t.id == tile_id) {
+            tile.responses.remove(model_id);
+            tile.models.retain(|m| m != model_id);
+        }
+
+        session.updated_at = Utc::now();
+        self.write_session_file(&session)?;
+        Ok(())
+    }
+
+    /// Update viewport zoom/pan state
+    pub fn update_viewport(&mut self, session_id: &str, viewport: CanvasViewport) -> Result<()> {
+        let mut session = self.get_session(session_id)?;
+        session.viewport = viewport;
+        session.updated_at = Utc::now();
+        self.write_session_file(&session)?;
+        Ok(())
+    }
+
     /// Update a tile's position
     pub fn update_tile_position(
         &mut self,
@@ -122,6 +161,7 @@ impl CanvasStore {
     ) -> Result<CanvasSession> {
         let mut session = self.get_session(session_id)?;
 
+        // Check prompt tiles
         if let Some(tile) = session.prompt_tiles.iter_mut().find(|t| t.id == tile_id) {
             tile.position.x = position.x;
             tile.position.y = position.y;
@@ -133,9 +173,113 @@ impl CanvasStore {
             }
         }
 
+        // Also check debates
+        if let Some(debate) = session.debates.iter_mut().find(|d| d.id == tile_id) {
+            debate.position.x = position.x;
+            debate.position.y = position.y;
+            if let Some(width) = position.width {
+                debate.position.width = width;
+            }
+            if let Some(height) = position.height {
+                debate.position.height = height;
+            }
+        }
+
         session.updated_at = Utc::now();
         self.write_session_file(&session)?;
         Ok(session)
+    }
+
+    /// Update an individual LLM response node's position
+    pub fn update_llm_node_position(
+        &mut self,
+        session_id: &str,
+        tile_id: &str,
+        model_id: &str,
+        position: LLMNodePositionUpdate,
+    ) -> Result<()> {
+        let mut session = self.get_session(session_id)?;
+
+        if let Some(tile) = session.prompt_tiles.iter_mut().find(|t| t.id == tile_id) {
+            if let Some(response) = tile.responses.get_mut(model_id) {
+                response.position.x = position.x;
+                response.position.y = position.y;
+                if let Some(width) = position.width {
+                    response.position.width = width;
+                }
+                if let Some(height) = position.height {
+                    response.position.height = height;
+                }
+            }
+        }
+
+        session.updated_at = Utc::now();
+        self.write_session_file(&session)?;
+        Ok(())
+    }
+
+    /// Batch update positions for auto-arrange
+    pub fn batch_update_positions(
+        &mut self,
+        session_id: &str,
+        positions: HashMap<String, TilePosition>,
+    ) -> Result<()> {
+        let mut session = self.get_session(session_id)?;
+
+        for (node_id, position) in &positions {
+            let parts: Vec<&str> = node_id.splitn(3, ':').collect();
+
+            match parts.first().copied() {
+                Some("prompt") if parts.len() >= 2 => {
+                    let tile_id = parts[1];
+                    if let Some(tile) = session.prompt_tiles.iter_mut().find(|t| t.id == tile_id) {
+                        tile.position = position.clone();
+                    }
+                }
+                Some("llm") if parts.len() >= 3 => {
+                    let tile_id = parts[1];
+                    let model_id = parts[2];
+                    if let Some(tile) = session.prompt_tiles.iter_mut().find(|t| t.id == tile_id) {
+                        if let Some(response) = tile.responses.get_mut(model_id) {
+                            response.position = position.clone();
+                        }
+                    }
+                }
+                Some("debate") if parts.len() >= 2 => {
+                    let debate_id = parts[1];
+                    if let Some(debate) = session.debates.iter_mut().find(|d| d.id == debate_id) {
+                        debate.position = position.clone();
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        session.updated_at = Utc::now();
+        self.write_session_file(&session)?;
+        Ok(())
+    }
+
+    /// Add a debate to a session
+    pub fn add_debate(&mut self, session_id: &str, debate: Debate) -> Result<()> {
+        let mut session = self.get_session(session_id)?;
+        session.debates.push(debate);
+        session.updated_at = Utc::now();
+        self.write_session_file(&session)?;
+        Ok(())
+    }
+
+    /// Update a debate's rounds
+    pub fn update_debate(&mut self, session_id: &str, debate: &Debate) -> Result<()> {
+        let mut session = self.get_session(session_id)?;
+
+        if let Some(existing) = session.debates.iter_mut().find(|d| d.id == debate.id) {
+            *existing = debate.clone();
+        }
+
+        session.updated_at = Utc::now();
+        self.write_session_file(&session)?;
+        Ok(())
     }
 
     /// Update a tile's response content (for streaming)
@@ -158,6 +302,11 @@ impl CanvasStore {
 
         self.write_session_file(&session)?;
         Ok(())
+    }
+
+    /// Save a full session object (used after streaming completes)
+    pub fn save_session(&self, session: &CanvasSession) -> Result<()> {
+        self.write_session_file(session)
     }
 
     /// Get the file path for a session ID

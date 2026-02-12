@@ -2,9 +2,7 @@
 nul
 .claude/settings.local.json
 *.key
-.playwright-mcp/canvas-ui.png
-.playwright-mcp/context-mode-ui.png
-.playwright-mcp/context-mode-complete.png
+.playwright-mcp/
 
 # Build artifacts & sidecar binaries
 frontend/src-tauri/binaries/

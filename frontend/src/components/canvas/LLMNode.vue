@@ -100,16 +100,48 @@
       class="connection-point out"
     />
     
-    <!-- Add Model button (+) on right edge -->
+    <!-- Follow-up button (+) on right edge -->
     <button
       v-if="isCompleted"
-      class="add-model-btn"
-      title="Add more models to this conversation"
-      @click.stop="$emit('show-add-model-dialog', { tileId, modelId })"
+      class="followup-btn"
+      title="Quick follow-up with this model"
+      @click.stop="toggleFollowup"
     >
       +
     </button>
-    
+
+    <!-- Follow-up input overlay -->
+    <div
+      v-if="showFollowup"
+      class="followup-overlay"
+      @click.stop
+    >
+      <textarea
+        ref="followupInputRef"
+        v-model="followupPrompt"
+        placeholder="Follow up..."
+        rows="2"
+        class="followup-textarea"
+        @keydown.ctrl.enter="submitFollowup"
+        @keydown.escape="showFollowup = false"
+      />
+      <div class="followup-actions">
+        <button
+          class="followup-cancel"
+          @click.stop="showFollowup = false"
+        >
+          Cancel
+        </button>
+        <button
+          class="followup-submit"
+          :disabled="!followupPrompt.trim()"
+          @click.stop="submitFollowup"
+        >
+          Send
+        </button>
+      </div>
+    </div>
+
     <!-- Branch input overlay -->
     <div
       v-if="showBranch"
@@ -274,15 +306,20 @@ const props = defineProps({
   }
 })
 
-const emit = defineEmits(['drag', 'branch', 'select', 'delete', 'regenerate', 'show-add-model-dialog'])
+const emit = defineEmits(['drag', 'branch', 'select', 'delete', 'regenerate', 'follow-up'])
 
 // Refs
 const contentRef = ref(null)
 const branchInputRef = ref(null)
+const followupInputRef = ref(null)
 
 // Dragging state
 const isDragging = ref(false)
 const dragStart = ref({ x: 0, y: 0, nodeX: 0, nodeY: 0 })
+
+// Follow-up state
+const showFollowup = ref(false)
+const followupPrompt = ref('')
 
 // Branch state
 const showBranch = ref(false)
@@ -365,8 +402,9 @@ function removeModel(modelId) {
 // Methods
 function handleMouseDown(e) {
   // Ignore clicks on interactive elements and scrollable content
-  if (e.target.closest('.node-footer') || 
+  if (e.target.closest('.node-footer') ||
       e.target.closest('.branch-overlay') ||
+      e.target.closest('.followup-overlay') ||
       e.target.closest('.node-content') ||
       e.target.closest('button')) {
     return
@@ -423,13 +461,41 @@ function toggleBranch() {
 
 function submitBranch() {
   if (!branchPrompt.value.trim() || branchModels.value.length === 0) return
-  
+
   emit('branch', props.tileId, props.modelId, branchPrompt.value.trim(), branchContextMode.value, branchModels.value)
   showBranch.value = false
   branchPrompt.value = ''
   branchModels.value = []
   showModelPicker.value = false
 }
+
+// Follow-up methods
+function toggleFollowup() {
+  showFollowup.value = !showFollowup.value
+  if (!showFollowup.value) {
+    followupPrompt.value = ''
+  }
+}
+
+function submitFollowup() {
+  if (!followupPrompt.value.trim()) return
+
+  emit('follow-up', {
+    tileId: props.tileId,
+    modelId: props.modelId,
+    prompt: followupPrompt.value.trim()
+  })
+  showFollowup.value = false
+  followupPrompt.value = ''
+}
+
+// Watch for follow-up input focus
+watch(showFollowup, async (isShowing) => {
+  if (isShowing) {
+    await nextTick()
+    followupInputRef.value?.focus()
+  }
+})
 
 // Cleanup on unmount
 onBeforeUnmount(() => {
@@ -716,8 +782,8 @@ onBeforeUnmount(() => {
   cursor: not-allowed;
 }
 
-/* Add Model button (+) */
-.add-model-btn {
+/* Follow-up button (+) */
+.followup-btn {
   position: absolute;
   right: -14px;
   top: 35%;
@@ -725,8 +791,8 @@ onBeforeUnmount(() => {
   height: 28px;
   border-radius: 50%;
   background: var(--bg-secondary);
-  border: 2px solid var(--accent-green);
-  color: var(--accent-green);
+  border: 2px solid var(--accent-blue);
+  color: var(--accent-blue);
   font-size: 1.25rem;
   font-weight: bold;
   display: flex;
@@ -739,15 +805,87 @@ onBeforeUnmount(() => {
   z-index: 5;
 }
 
-.llm-node:hover .add-model-btn {
+.llm-node:hover .followup-btn {
   opacity: 1;
   transform: scale(1);
 }
 
-.add-model-btn:hover {
-  background: var(--accent-green);
+.followup-btn:hover {
+  background: var(--accent-blue);
   color: white;
   transform: scale(1.1);
+}
+
+/* Follow-up overlay */
+.followup-overlay {
+  position: absolute;
+  bottom: 100%;
+  left: 0;
+  right: 0;
+  background: var(--bg-secondary);
+  border: 1px solid var(--accent-blue);
+  border-radius: var(--radius-md);
+  padding: var(--spacing-sm);
+  margin-bottom: var(--spacing-xs);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.3);
+  z-index: 10;
+}
+
+.followup-textarea {
+  width: 100%;
+  padding: var(--spacing-sm);
+  background: var(--bg-tertiary);
+  border: 1px solid var(--bg-tertiary);
+  border-radius: var(--radius-sm);
+  color: var(--text-primary);
+  font-size: 0.8125rem;
+  font-family: inherit;
+  resize: none;
+}
+
+.followup-textarea:focus {
+  outline: none;
+  border-color: var(--accent-blue);
+}
+
+.followup-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--spacing-xs);
+  margin-top: var(--spacing-xs);
+}
+
+.followup-cancel, .followup-submit {
+  padding: 4px 12px;
+  border-radius: var(--radius-sm);
+  font-size: 0.75rem;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.followup-cancel {
+  background: transparent;
+  border: 1px solid var(--bg-tertiary);
+  color: var(--text-muted);
+}
+
+.followup-cancel:hover {
+  border-color: var(--text-muted);
+}
+
+.followup-submit {
+  background: var(--accent-blue);
+  border: none;
+  color: white;
+}
+
+.followup-submit:hover:not(:disabled) {
+  filter: brightness(1.15);
+}
+
+.followup-submit:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 
 /* Branch overlay */

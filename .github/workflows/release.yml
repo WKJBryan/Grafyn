@@ -21,9 +21,61 @@ env:
 
 jobs:
   # ============================================================================
+  # Create Release - Single job to avoid duplicate drafts from matrix race
+  # ============================================================================
+  create-release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    outputs:
+      release_id: ${{ steps.create.outputs.result }}
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get version from tag
+        id: version
+        run: echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+
+      - name: Create draft release
+        id: create
+        uses: actions/github-script@v7
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        with:
+          script: |
+            const { data } = await github.rest.repos.createRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tag_name: `v${process.env.VERSION}`,
+              name: `Grafyn v${process.env.VERSION}`,
+              body: [
+                '## Download',
+                '',
+                '| Platform | File | Notes |',
+                '|----------|------|-------|',
+                '| **Windows (64-bit)** | `Grafyn_*_x64-setup.exe` | Most Windows PCs |',
+                '| **Windows (ARM)** | `Grafyn_*_arm64-setup.exe` | Surface Pro X, Snapdragon laptops |',
+                '| **macOS** | `Grafyn_*_aarch64.dmg` | M1/M2/M3/M4 Macs (also runs on Intel via Rosetta 2) |',
+                '| **Linux (Debian/Ubuntu)** | `Grafyn_*_amd64.deb` | `sudo dpkg -i` to install |',
+                '| **Linux (Universal)** | `Grafyn_*_amd64.AppImage` | `chmod +x` and run — works on any distro |',
+                '',
+                '> **Already installed?** Grafyn will prompt you to update automatically.',
+                '>',
+                '> Files ending in `.sig`, `.zip`, or `latest.json` are for auto-update — you don\'t need to download those.',
+              ].join('\n'),
+              draft: true,
+              prerelease: false,
+            });
+            return data.id;
+
+  # ============================================================================
   # Build Matrix - All Platforms & Architectures
   # ============================================================================
   build:
+    needs: create-release
+    if: always() && (needs.create-release.result == 'success' || !startsWith(github.ref, 'refs/tags/v'))
     permissions:
       contents: write
 
@@ -41,11 +93,7 @@ jobs:
             arch: arm64
             os_name: windows
 
-          # macOS
-          - platform: macos-latest
-            target: x86_64-apple-darwin
-            arch: x64
-            os_name: macos
+          # macOS (ARM only — Rosetta 2 handles x64 on Apple Silicon)
           - platform: macos-latest
             target: aarch64-apple-darwin
             arch: arm64
@@ -144,7 +192,7 @@ jobs:
         shell: bash
 
       # ========================================
-      # Build Tauri App & Create Release
+      # Build Tauri App & Upload to Release
       # ========================================
       - name: Build Tauri app
         uses: tauri-apps/tauri-action@v0
@@ -156,25 +204,7 @@ jobs:
           projectPath: frontend
           tauriScript: npx tauri
           args: --target ${{ matrix.target }} --config '{"tauri":{"bundle":{"externalBin":[]}}}'
-          tagName: v__VERSION__
-          releaseName: 'Grafyn v__VERSION__'
-          releaseBody: |
-            ## Download
-
-            | Platform | File | Notes |
-            |----------|------|-------|
-            | **Windows (64-bit)** | `Grafyn_*_x64-setup.exe` | Most Windows PCs |
-            | **Windows (ARM)** | `Grafyn_*_arm64-setup.exe` | Surface Pro X, Snapdragon laptops |
-            | **macOS (Apple Silicon)** | `Grafyn_*_aarch64.dmg` | M1/M2/M3/M4 Macs |
-            | **macOS (Intel)** | `Grafyn_*_x64.dmg` | Older Intel Macs |
-            | **Linux (Debian/Ubuntu)** | `Grafyn_*_amd64.deb` | `sudo dpkg -i` to install |
-            | **Linux (Universal)** | `Grafyn_*_amd64.AppImage` | `chmod +x` and run — works on any distro |
-
-            > **Already installed?** Grafyn will prompt you to update automatically.
-            >
-            > Files ending in `.sig`, `.zip`, or `latest.json` are for auto-update — you don't need to download those.
-          releaseDraft: false
-          prerelease: false
+          releaseId: ${{ needs.create-release.outputs.release_id }}
           updaterJsonPreferNsis: true
 
       # ========================================
@@ -213,10 +243,34 @@ jobs:
           if-no-files-found: warn
 
   # ============================================================================
+  # Publish Release - Mark draft as published after all builds complete
+  # ============================================================================
+  publish-release:
+    needs: [create-release, build]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Publish release
+        uses: actions/github-script@v7
+        env:
+          RELEASE_ID: ${{ needs.create-release.outputs.release_id }}
+        with:
+          script: |
+            await github.rest.repos.updateRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              release_id: parseInt(process.env.RELEASE_ID),
+              draft: false,
+            });
+
+  # ============================================================================
   # Upload to Cloudflare R2 (for auto-update distribution)
   # ============================================================================
   upload-to-r2:
-    needs: build
+    needs: [build, publish-release]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
@@ -286,7 +340,7 @@ jobs:
   # Summary
   # ============================================================================
   build-summary:
-    needs: [build, upload-to-r2]
+    needs: [create-release, build, publish-release, upload-to-r2]
     runs-on: ubuntu-latest
     if: always()
 
@@ -299,7 +353,6 @@ jobs:
           echo "|----------|--------------|--------|" >> $GITHUB_STEP_SUMMARY
           echo "| Windows | x64 | ${{ needs.build.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Windows | ARM64 | ${{ needs.build.result }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| macOS | x64 (Intel) | ${{ needs.build.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| macOS | ARM64 (Apple Silicon) | ${{ needs.build.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Linux | x64 | ${{ needs.build.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY

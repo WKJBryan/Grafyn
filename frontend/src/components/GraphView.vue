@@ -35,7 +35,8 @@
     />
     
     <!-- Settings Panel -->
-    <GraphSettings 
+    <GraphSettings
+      v-if="showSettings"
       @update:filters="handleFiltersUpdate"
       @update:display="handleDisplayUpdate"
       @update:forces="handleForcesUpdate"
@@ -76,6 +77,10 @@ const props = defineProps({
   height: {
     type: Number,
     default: 0
+  },
+  showSettings: {
+    type: Boolean,
+    default: true
   }
 })
 

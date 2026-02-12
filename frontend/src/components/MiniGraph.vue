@@ -1,8 +1,9 @@
 <template>
   <div class="mini-graph">
-    <GraphView 
-      :width="300" 
-      :height="250" 
+    <GraphView
+      :width="300"
+      :height="250"
+      :show-settings="false"
       @node-click="handleNodeClick"
     />
   </div>

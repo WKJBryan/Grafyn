@@ -12,7 +12,7 @@ pub struct CanvasSession {
     #[serde(default)]
     pub prompt_tiles: Vec<PromptTile>,
     #[serde(default)]
-    pub debates: Vec<DebateRound>,
+    pub debates: Vec<Debate>,
     #[serde(default)]
     pub viewport: CanvasViewport,
     pub created_at: DateTime<Utc>,
@@ -79,6 +79,8 @@ pub struct PromptTile {
     pub context_mode: ContextMode,
     #[serde(default)]
     pub parent_tile_id: Option<String>,
+    #[serde(default)]
+    pub parent_model_id: Option<String>,
 }
 
 impl Default for PromptTile {
@@ -93,6 +95,7 @@ impl Default for PromptTile {
             created_at: Utc::now(),
             context_mode: ContextMode::default(),
             parent_tile_id: None,
+            parent_model_id: None,
         }
     }
 }
@@ -117,14 +120,16 @@ impl Default for TilePosition {
     }
 }
 
-/// Context mode for branching conversations
+/// Context mode for branching conversations.
+/// Values match what the frontend sends: none, full_history, compact, semantic.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ContextMode {
+    None,
     #[default]
-    Inherit,
-    Fresh,
-    Selective,
+    FullHistory,
+    Compact,
+    Semantic,
 }
 
 /// Response from a single model
@@ -140,6 +145,8 @@ pub struct ModelResponse {
     #[serde(default)]
     pub tokens_used: Option<u32>,
     pub created_at: DateTime<Utc>,
+    #[serde(default)]
+    pub position: TilePosition,
 }
 
 impl Default for ModelResponse {
@@ -153,6 +160,12 @@ impl Default for ModelResponse {
             error: None,
             tokens_used: None,
             created_at: Utc::now(),
+            position: TilePosition {
+                x: 0.0,
+                y: 0.0,
+                width: 280.0,
+                height: 200.0,
+            },
         }
     }
 }
@@ -168,10 +181,47 @@ pub enum ResponseStatus {
     Error,
 }
 
-/// A debate round between models
+/// A debate between models (restructured from DebateRound)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Debate {
+    pub id: String,
+    #[serde(default)]
+    pub participating_models: Vec<String>,
+    #[serde(default)]
+    pub source_tile_ids: Vec<String>,
+    #[serde(default)]
+    pub rounds: Vec<DebateRound>,
+    #[serde(default = "default_debate_status")]
+    pub status: String,
+    #[serde(default)]
+    pub position: TilePosition,
+    #[serde(default)]
+    pub debate_mode: String,
+    pub created_at: DateTime<Utc>,
+}
+
+fn default_debate_status() -> String {
+    "active".to_string()
+}
+
+impl Default for Debate {
+    fn default() -> Self {
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            participating_models: Vec::new(),
+            source_tile_ids: Vec::new(),
+            rounds: Vec::new(),
+            status: "active".to_string(),
+            position: TilePosition::default(),
+            debate_mode: "auto".to_string(),
+            created_at: Utc::now(),
+        }
+    }
+}
+
+/// A single round in a debate
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DebateRound {
-    pub id: String,
     pub round_number: u32,
     pub topic: String,
     pub responses: Vec<DebateResponse>,
@@ -248,6 +298,20 @@ pub struct PromptRequest {
     pub context_mode: ContextMode,
     #[serde(default)]
     pub parent_tile_id: Option<String>,
+    #[serde(default)]
+    pub parent_model_id: Option<String>,
+    #[serde(default = "default_temperature")]
+    pub temperature: f64,
+    #[serde(default = "default_max_tokens")]
+    pub max_tokens: u32,
+}
+
+fn default_temperature() -> f64 {
+    0.7
+}
+
+fn default_max_tokens() -> u32 {
+    2048
 }
 
 /// Available LLM model information
@@ -274,6 +338,109 @@ pub struct ModelPricing {
 /// Update tile position request
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TilePositionUpdate {
+    pub x: f64,
+    pub y: f64,
+    #[serde(default)]
+    pub width: Option<f64>,
+    #[serde(default)]
+    pub height: Option<f64>,
+}
+
+/// Streaming events emitted to the Tauri frontend via window.emit()
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum CanvasStreamEvent {
+    TileCreated {
+        session_id: String,
+        tile: PromptTile,
+    },
+    Chunk {
+        session_id: String,
+        tile_id: String,
+        model_id: String,
+        chunk: String,
+    },
+    Complete {
+        session_id: String,
+        tile_id: String,
+        model_id: String,
+        tokens_used: Option<u32>,
+    },
+    Error {
+        session_id: String,
+        tile_id: String,
+        model_id: String,
+        error: String,
+    },
+    SessionSaved {
+        session_id: String,
+    },
+    DebateCreated {
+        session_id: String,
+        debate: Debate,
+    },
+    RoundStart {
+        session_id: String,
+        debate_id: String,
+        round_number: u32,
+    },
+    DebateChunk {
+        session_id: String,
+        debate_id: String,
+        model_id: String,
+        chunk: String,
+    },
+    ModelComplete {
+        session_id: String,
+        debate_id: String,
+        model_id: String,
+    },
+    DebateError {
+        session_id: String,
+        debate_id: String,
+        model_id: String,
+        error: String,
+    },
+    DebateComplete {
+        session_id: String,
+        debate_id: String,
+    },
+}
+
+/// Request to start a debate
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DebateStartRequest {
+    pub source_tile_ids: Vec<String>,
+    pub participating_models: Vec<String>,
+    #[serde(default = "default_debate_mode")]
+    pub debate_mode: String,
+    #[serde(default = "default_max_rounds")]
+    pub max_rounds: u32,
+}
+
+fn default_debate_mode() -> String {
+    "auto".to_string()
+}
+
+fn default_max_rounds() -> u32 {
+    3
+}
+
+/// Request to continue a debate
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DebateContinueRequest {
+    pub prompt: String,
+}
+
+/// Request to add models to an existing tile
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AddModelsRequest {
+    pub model_ids: Vec<String>,
+}
+
+/// LLM node position update request
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LLMNodePositionUpdate {
     pub x: f64,
     pub y: f64,
     #[serde(default)]

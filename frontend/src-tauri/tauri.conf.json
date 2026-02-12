@@ -116,11 +116,12 @@
         "fullscreen": false,
         "height": 800,
         "resizable": true,
-        "title": "Grafyn",
+        "title": "Grafyn v0.0.4",
         "width": 1200,
         "minWidth": 800,
         "minHeight": 600,
-        "center": true
+        "center": true,
+        "visible": false
       }
     ]
   }

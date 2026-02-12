@@ -6,8 +6,121 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Grafyn - Knowledge Management</title>
   </head>
-  <body>
+  <body style="margin:0;background:#002b36;">
+    <style>
+      .loading-bar {
+        width: 40%;
+        height: 100%;
+        background: linear-gradient(90deg, #268bd2, #6c71c4);
+        border-radius: 2px;
+        animation: loading 1.5s ease-in-out infinite;
+      }
+      @keyframes loading {
+        0% { transform: translateX(-100%); }
+        100% { transform: translateX(350%); }
+      }
+      .net-edge {
+        stroke-dasharray: 60;
+        stroke-dashoffset: 60;
+        animation: drawEdge 1.5s ease forwards;
+      }
+      @keyframes drawEdge {
+        to { stroke-dashoffset: 0; }
+      }
+      .net-node {
+        opacity: 0;
+        transform-box: fill-box;
+        transform-origin: center;
+        animation: fadeInPulse 0.6s ease forwards;
+      }
+      @keyframes fadeInPulse {
+        0% { opacity: 0; transform: scale(0.5); }
+        70% { opacity: 1; transform: scale(1.15); }
+        100% { opacity: 1; transform: scale(1); }
+      }
+      .crystal-facet {
+        opacity: 0;
+        animation: shimmerIn 0.8s ease forwards;
+      }
+      @keyframes shimmerIn {
+        0% { opacity: 0; }
+        100% { opacity: var(--facet-opacity, 0.8); }
+      }
+    </style>
+
+    <!-- Splash overlay — lives outside #app, removed by JS when app is ready -->
+    <div id="splash-screen" style="position:fixed;inset:0;z-index:9999;display:flex;flex-direction:column;align-items:center;justify-content:center;background:#002b36;font-family:Inter,system-ui,sans-serif;">
+
+      <!-- Inline SVG: simplified Grafyn logo with animations -->
+      <svg width="120" height="120" viewBox="0 0 120 120" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <linearGradient id="netGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+            <stop offset="0%" stop-color="#268bd2"/>
+            <stop offset="100%" stop-color="#6c71c4"/>
+          </linearGradient>
+        </defs>
+
+        <!-- Network edges (upper-right) -->
+        <g stroke="url(#netGrad)" stroke-width="1.2" fill="none">
+          <line class="net-edge" x1="78" y1="15" x2="98" y2="24" style="animation-delay:.1s"/>
+          <line class="net-edge" x1="78" y1="15" x2="62" y2="26" style="animation-delay:.2s"/>
+          <line class="net-edge" x1="78" y1="15" x2="88" y2="38" style="animation-delay:.15s"/>
+          <line class="net-edge" x1="98" y1="24" x2="88" y2="38" style="animation-delay:.25s"/>
+          <line class="net-edge" x1="98" y1="24" x2="104" y2="50" style="animation-delay:.3s"/>
+          <line class="net-edge" x1="62" y1="26" x2="52" y2="42" style="animation-delay:.35s"/>
+          <line class="net-edge" x1="62" y1="26" x2="88" y2="38" style="animation-delay:.28s"/>
+          <line class="net-edge" x1="88" y1="38" x2="74" y2="52" style="animation-delay:.4s"/>
+          <line class="net-edge" x1="52" y1="42" x2="74" y2="52" style="animation-delay:.45s"/>
+          <line class="net-edge" x1="104" y1="50" x2="74" y2="52" style="animation-delay:.5s"/>
+        </g>
+
+        <!-- Network nodes -->
+        <circle class="net-node" cx="78" cy="15" r="3" fill="#6c71c4" style="animation-delay:.2s"/>
+        <circle class="net-node" cx="98" cy="24" r="2.5" fill="#5e81ac" style="animation-delay:.3s"/>
+        <circle class="net-node" cx="62" cy="26" r="2.5" fill="#268bd2" style="animation-delay:.35s"/>
+        <circle class="net-node" cx="88" cy="38" r="3" fill="#6c71c4" style="animation-delay:.4s"/>
+        <circle class="net-node" cx="52" cy="42" r="2" fill="#268bd2" style="animation-delay:.45s"/>
+        <circle class="net-node" cx="104" cy="50" r="2" fill="#5e81ac" style="animation-delay:.5s"/>
+        <circle class="net-node" cx="74" cy="52" r="3" fill="#6c71c4" style="animation-delay:.55s"/>
+
+        <!-- Connecting beam -->
+        <line class="net-edge" x1="74" y1="52" x2="50" y2="62" stroke="#2aa198" stroke-width="1" opacity="0.7" style="animation-delay:.65s"/>
+
+        <!-- Crystal facets (lower-left) -->
+        <polygon class="crystal-facet" points="50,62 60,76 40,80" fill="#2aa198" style="--facet-opacity:.9;animation-delay:.6s"/>
+        <polygon class="crystal-facet" points="60,76 54,94 40,80" fill="#2aa198" style="--facet-opacity:.7;animation-delay:.7s"/>
+        <polygon class="crystal-facet" points="54,94 38,104 40,80" fill="#2aa198" style="--facet-opacity:.5;animation-delay:.8s"/>
+        <polygon class="crystal-facet" points="38,104 22,94 40,80" fill="#2aa198" style="--facet-opacity:.6;animation-delay:.85s"/>
+        <polygon class="crystal-facet" points="22,94 16,78 40,80" fill="#2aa198" style="--facet-opacity:.8;animation-delay:.9s"/>
+        <polygon class="crystal-facet" points="16,78 30,64 40,80" fill="#2aa198" style="--facet-opacity:.4;animation-delay:.95s"/>
+        <polygon class="crystal-facet" points="30,64 50,62 40,80" fill="#2aa198" style="--facet-opacity:1;animation-delay:.65s"/>
+
+        <!-- Crystal edge outlines -->
+        <g stroke="#3dbfb3" stroke-width="0.5" fill="none" class="crystal-facet" style="--facet-opacity:.3;animation-delay:1s">
+          <polygon points="50,62 60,76 54,94 38,104 22,94 16,78 30,64"/>
+          <line x1="40" y1="80" x2="50" y2="62"/>
+          <line x1="40" y1="80" x2="60" y2="76"/>
+          <line x1="40" y1="80" x2="54" y2="94"/>
+          <line x1="40" y1="80" x2="38" y2="104"/>
+          <line x1="40" y1="80" x2="22" y2="94"/>
+          <line x1="40" y1="80" x2="16" y2="78"/>
+          <line x1="40" y1="80" x2="30" y2="64"/>
+        </g>
+      </svg>
+
+      <!-- App name -->
+      <p style="color:#839496;font-size:1rem;font-weight:600;letter-spacing:2px;margin:24px 0 8px;">GRAFYN</p>
+
+      <!-- Animated loading bar -->
+      <div style="width:200px;height:3px;background:#073642;border-radius:2px;overflow:hidden;">
+        <div class="loading-bar"></div>
+      </div>
+
+      <p style="color:#586e75;font-size:.75rem;margin-top:12px;">Loading...</p>
+    </div>
+
     <div id="app"></div>
+
     <script type="module" src="/src/main.js"></script>
   </body>
 </html>
