@@ -11,7 +11,6 @@ pub struct SearchService {
     index: Index,
     reader: IndexReader,
     writer: Option<IndexWriter>,
-    schema: Schema,
     // Field references
     id_field: Field,
     title_field: Field,
@@ -58,7 +57,6 @@ impl SearchService {
             index,
             reader,
             writer: Some(writer),
-            schema,
             id_field,
             title_field,
             content_field,

@@ -117,7 +117,7 @@ fn main() {
             mcp_sidecar.set_enabled(mcp_enabled);
 
             // Build initial indices
-            let mut ks = knowledge_store.clone();
+            let ks = knowledge_store.clone();
             let notes = ks.list_notes().unwrap_or_default();
 
             let mut gi = graph_index.clone();
@@ -184,6 +184,16 @@ fn main() {
             commands::canvas::get_available_models,
             commands::canvas::send_prompt,
             commands::canvas::update_tile_position,
+            commands::canvas::delete_tile,
+            commands::canvas::delete_response,
+            commands::canvas::update_viewport,
+            commands::canvas::update_llm_node_position,
+            commands::canvas::auto_arrange,
+            commands::canvas::export_to_note,
+            commands::canvas::start_debate,
+            commands::canvas::continue_debate,
+            commands::canvas::add_models_to_tile,
+            commands::canvas::regenerate_response,
             // Feedback commands
             commands::feedback::submit_feedback,
             commands::feedback::get_system_info,

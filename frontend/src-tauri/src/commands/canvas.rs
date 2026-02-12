@@ -1,10 +1,14 @@
 use crate::models::canvas::{
-    AvailableModel, CanvasSession, ModelResponse, PromptRequest, PromptTile, ResponseStatus,
-    SessionCreate, SessionMeta, SessionUpdate, TilePositionUpdate,
+    AddModelsRequest, AvailableModel, CanvasSession, CanvasStreamEvent,
+    CanvasViewport, Debate, DebateContinueRequest, DebateResponse, DebateRound,
+    DebateStartRequest, LLMNodePositionUpdate, ModelResponse, PromptRequest, PromptTile,
+    ResponseStatus, SessionCreate, SessionMeta, SessionUpdate, TilePosition, TilePositionUpdate,
 };
+use crate::models::note::{NoteCreate, NoteStatus};
 use crate::services::openrouter::ChatMessage;
 use crate::AppState;
 use chrono::Utc;
+use futures::StreamExt;
 use std::collections::HashMap;
 use tauri::State;
 
@@ -60,20 +64,27 @@ pub async fn get_available_models(state: State<'_, AppState>) -> Result<Vec<Avai
         .map_err(|e| e.to_string())
 }
 
-/// Send a prompt to multiple models and get responses
+/// Send a prompt to multiple models with streaming responses via Tauri events.
+/// Returns the tile_id immediately; actual responses stream via "canvas-stream" events.
 #[tauri::command]
 pub async fn send_prompt(
+    window: tauri::Window,
     session_id: String,
     request: PromptRequest,
     state: State<'_, AppState>,
-) -> Result<PromptTile, String> {
+) -> Result<String, String> {
     let tile_id = uuid::Uuid::new_v4().to_string();
     let now = Utc::now();
 
-    // Create initial responses map
+    // Compute LLM node positions (offset from prompt tile)
+    let prompt_pos = request.position.clone().unwrap_or_default();
+    let llm_start_x = prompt_pos.x + prompt_pos.width + 80.0;
+
+    // Create initial responses map with positions
     let mut responses: HashMap<String, ModelResponse> = HashMap::new();
-    for model_id in &request.models {
+    for (i, model_id) in request.models.iter().enumerate() {
         let model_name = model_id.split('/').last().unwrap_or(model_id).to_string();
+        let llm_y = prompt_pos.y + (i as f64) * 280.0;
         responses.insert(
             model_id.clone(),
             ModelResponse {
@@ -85,85 +96,170 @@ pub async fn send_prompt(
                 error: None,
                 tokens_used: None,
                 created_at: now,
+                position: TilePosition {
+                    x: llm_start_x,
+                    y: llm_y,
+                    width: 280.0,
+                    height: 200.0,
+                },
             },
         );
     }
 
     // Create the tile
-    let mut tile = PromptTile {
+    let tile = PromptTile {
         id: tile_id.clone(),
         prompt: request.prompt.clone(),
         system_prompt: request.system_prompt.clone(),
         models: request.models.clone(),
         responses: responses.clone(),
-        position: request.position.unwrap_or_default(),
+        position: prompt_pos,
         created_at: now,
         context_mode: request.context_mode,
         parent_tile_id: request.parent_tile_id,
+        parent_model_id: request.parent_model_id,
     };
 
-    // Add tile to session
+    // Save tile to session
     {
         let mut store = state.canvas_store.write().await;
         store.add_tile(&session_id, tile.clone()).map_err(|e| e.to_string())?;
     }
 
-    // Send requests to each model (sequentially for simplicity)
-    let messages = vec![ChatMessage {
-        role: "user".to_string(),
-        content: request.prompt.clone(),
-    }];
+    // Emit TileCreated event
+    let _ = window.emit(
+        "canvas-stream",
+        CanvasStreamEvent::TileCreated {
+            session_id: session_id.clone(),
+            tile: tile.clone(),
+        },
+    );
 
-    for model_id in &request.models {
-        // Update status to streaming
-        if let Some(response) = tile.responses.get_mut(model_id) {
-            response.status = ResponseStatus::Streaming;
-        }
+    // Clone what we need for the spawned task
+    let openrouter_arc = state.openrouter.clone();
+    let canvas_store_arc = state.canvas_store.clone();
+    let models = request.models.clone();
+    let prompt = request.prompt.clone();
+    let system_prompt = request.system_prompt.clone();
+    let temperature = request.temperature;
+    let max_tokens = request.max_tokens;
+    let tile_id_clone = tile_id.clone();
+    let session_id_clone = session_id.clone();
 
-        // Send request
-        let openrouter = state.openrouter.read().await;
-        let result = openrouter
-            .chat(model_id, messages.clone(), request.system_prompt.as_deref())
-            .await;
-        drop(openrouter); // Release lock before updating store
+    // Spawn async task for streaming (doesn't block the IPC response)
+    tauri::async_runtime::spawn(async move {
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: prompt,
+        }];
 
-        // Update response
-        if let Some(response) = tile.responses.get_mut(model_id) {
-            match result {
-                Ok(content) => {
-                    response.content = content;
-                    response.status = ResponseStatus::Completed;
+        for model_id in &models {
+            let openrouter = openrouter_arc.read().await;
+            let stream_result = openrouter
+                .chat_stream(
+                    model_id,
+                    messages.clone(),
+                    system_prompt.as_deref(),
+                    Some(temperature),
+                    Some(max_tokens),
+                )
+                .await;
+            drop(openrouter); // Release lock
+
+            match stream_result {
+                Ok(stream) => {
+                    let mut stream = Box::pin(stream);
+                    let mut full_content = String::new();
+
+                    while let Some(chunk_result) = stream.next().await {
+                        match chunk_result {
+                            Ok(chunk) => {
+                                if !chunk.is_empty() {
+                                    full_content.push_str(&chunk);
+                                    let _ = window.emit(
+                                        "canvas-stream",
+                                        CanvasStreamEvent::Chunk {
+                                            session_id: session_id_clone.clone(),
+                                            tile_id: tile_id_clone.clone(),
+                                            model_id: model_id.clone(),
+                                            chunk,
+                                        },
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                let _ = window.emit(
+                                    "canvas-stream",
+                                    CanvasStreamEvent::Error {
+                                        session_id: session_id_clone.clone(),
+                                        tile_id: tile_id_clone.clone(),
+                                        model_id: model_id.clone(),
+                                        error: e.to_string(),
+                                    },
+                                );
+                                break;
+                            }
+                        }
+                    }
+
+                    // Update store with final content
+                    {
+                        let mut store = canvas_store_arc.write().await;
+                        let _ = store.update_tile_response(
+                            &session_id_clone,
+                            &tile_id_clone,
+                            model_id,
+                            &full_content,
+                            ResponseStatus::Completed,
+                        );
+                    }
+
+                    let _ = window.emit(
+                        "canvas-stream",
+                        CanvasStreamEvent::Complete {
+                            session_id: session_id_clone.clone(),
+                            tile_id: tile_id_clone.clone(),
+                            model_id: model_id.clone(),
+                            tokens_used: None,
+                        },
+                    );
                 }
                 Err(e) => {
-                    response.error = Some(e.to_string());
-                    response.status = ResponseStatus::Error;
+                    // Update store with error
+                    {
+                        let mut store = canvas_store_arc.write().await;
+                        let _ = store.update_tile_response(
+                            &session_id_clone,
+                            &tile_id_clone,
+                            model_id,
+                            &e.to_string(),
+                            ResponseStatus::Error,
+                        );
+                    }
+
+                    let _ = window.emit(
+                        "canvas-stream",
+                        CanvasStreamEvent::Error {
+                            session_id: session_id_clone.clone(),
+                            tile_id: tile_id_clone.clone(),
+                            model_id: model_id.clone(),
+                            error: e.to_string(),
+                        },
+                    );
                 }
             }
         }
 
-        // Save updated tile to session
-        {
-            let mut store = state.canvas_store.write().await;
-            if let Ok(mut session) = store.get_session(&session_id) {
-                if let Some(t) = session.prompt_tiles.iter_mut().find(|t| t.id == tile_id) {
-                    *t = tile.clone();
-                }
-                session.updated_at = Utc::now();
-                let _ = store.update_session(
-                    &session_id,
-                    SessionUpdate {
-                        title: Some(session.title),
-                        description: session.description,
-                        tags: Some(session.tags),
-                        status: Some(session.status),
-                        viewport: Some(session.viewport),
-                    },
-                );
-            }
-        }
-    }
+        // Emit session saved
+        let _ = window.emit(
+            "canvas-stream",
+            CanvasStreamEvent::SessionSaved {
+                session_id: session_id_clone,
+            },
+        );
+    });
 
-    Ok(tile)
+    Ok(tile_id)
 }
 
 /// Update a tile's position
@@ -178,5 +274,813 @@ pub async fn update_tile_position(
     store
         .update_tile_position(&session_id, &tile_id, position)
         .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Delete a prompt tile and its children
+#[tauri::command]
+pub async fn delete_tile(
+    session_id: String,
+    tile_id: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let mut store = state.canvas_store.write().await;
+    store.delete_tile(&session_id, &tile_id).map_err(|e| e.to_string())
+}
+
+/// Delete a single model response from a tile
+#[tauri::command]
+pub async fn delete_response(
+    session_id: String,
+    tile_id: String,
+    model_id: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let mut store = state.canvas_store.write().await;
+    store
+        .delete_response(&session_id, &tile_id, &model_id)
+        .map_err(|e| e.to_string())
+}
+
+/// Update viewport zoom/pan state
+#[tauri::command]
+pub async fn update_viewport(
+    session_id: String,
+    viewport: CanvasViewport,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let mut store = state.canvas_store.write().await;
+    store.update_viewport(&session_id, viewport).map_err(|e| e.to_string())
+}
+
+/// Update an LLM response node's position
+#[tauri::command]
+pub async fn update_llm_node_position(
+    session_id: String,
+    tile_id: String,
+    model_id: String,
+    position: LLMNodePositionUpdate,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let mut store = state.canvas_store.write().await;
+    store
+        .update_llm_node_position(&session_id, &tile_id, &model_id, position)
+        .map_err(|e| e.to_string())
+}
+
+/// Auto-arrange all nodes (batch position update)
+#[tauri::command]
+pub async fn auto_arrange(
+    session_id: String,
+    positions: HashMap<String, TilePosition>,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let mut store = state.canvas_store.write().await;
+    store
+        .batch_update_positions(&session_id, positions)
+        .map_err(|e| e.to_string())
+}
+
+/// Export canvas session to a note (returns note info)
+#[tauri::command]
+pub async fn export_to_note(
+    session_id: String,
+    state: State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    let store = state.canvas_store.read().await;
+    let session = store.get_session(&session_id).map_err(|e| e.to_string())?;
+    drop(store);
+
+    // Build markdown content from session
+    let mut content = format!("# {}\n\n", session.title);
+
+    if let Some(desc) = &session.description {
+        content.push_str(&format!("{}\n\n", desc));
+    }
+
+    for tile in &session.prompt_tiles {
+        content.push_str(&format!("## Prompt\n\n{}\n\n", tile.prompt));
+
+        for (model_id, response) in &tile.responses {
+            if response.status == ResponseStatus::Completed {
+                content.push_str(&format!(
+                    "### {} ({})\n\n{}\n\n",
+                    response.model_name, model_id, response.content
+                ));
+            }
+        }
+    }
+
+    for debate in &session.debates {
+        content.push_str("## Debate\n\n");
+        for round in &debate.rounds {
+            content.push_str(&format!("### Round {} - {}\n\n", round.round_number, round.topic));
+            for resp in &round.responses {
+                content.push_str(&format!(
+                    "**{} ({}):**\n\n{}\n\n",
+                    resp.model_name, resp.model_id, resp.content
+                ));
+            }
+        }
+    }
+
+    // Create note via knowledge store
+    let mut ks = state.knowledge_store.write().await;
+
+    let note = ks.create_note(NoteCreate {
+        title: session.title.clone(),
+        content,
+        status: NoteStatus::Evidence,
+        tags: session.tags.clone(),
+        properties: HashMap::new(),
+    }).map_err(|e| e.to_string())?;
+
+    Ok(serde_json::json!({
+        "note_id": note.id,
+        "title": note.title,
+        "updated": false,
+    }))
+}
+
+/// Start a debate between models with streaming via Tauri events
+#[tauri::command]
+pub async fn start_debate(
+    window: tauri::Window,
+    session_id: String,
+    request: DebateStartRequest,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let debate_id = uuid::Uuid::new_v4().to_string();
+    let now = Utc::now();
+
+    // Collect source content from tiles
+    let store = state.canvas_store.read().await;
+    let session = store.get_session(&session_id).map_err(|e| e.to_string())?;
+    drop(store);
+
+    let mut source_content = String::new();
+    for tile_id in &request.source_tile_ids {
+        if let Some(tile) = session.prompt_tiles.iter().find(|t| &t.id == tile_id) {
+            source_content.push_str(&format!("Prompt: {}\n", tile.prompt));
+            for model_id in &request.participating_models {
+                if let Some(resp) = tile.responses.get(model_id) {
+                    source_content.push_str(&format!(
+                        "{} responded: {}\n",
+                        resp.model_name, resp.content
+                    ));
+                }
+            }
+        }
+    }
+
+    // Calculate position (to the right of source tiles)
+    let max_x = session.prompt_tiles.iter()
+        .flat_map(|t| t.responses.values().map(|r| r.position.x + r.position.width))
+        .fold(0.0_f64, f64::max);
+
+    let debate = Debate {
+        id: debate_id.clone(),
+        participating_models: request.participating_models.clone(),
+        source_tile_ids: request.source_tile_ids.clone(),
+        rounds: Vec::new(),
+        status: "active".to_string(),
+        position: TilePosition {
+            x: max_x + 100.0,
+            y: 100.0,
+            width: 400.0,
+            height: 300.0,
+        },
+        debate_mode: request.debate_mode.clone(),
+        created_at: now,
+    };
+
+    // Save debate to session
+    {
+        let mut store = state.canvas_store.write().await;
+        store.add_debate(&session_id, debate.clone()).map_err(|e| e.to_string())?;
+    }
+
+    // Emit debate created
+    let _ = window.emit(
+        "canvas-stream",
+        CanvasStreamEvent::DebateCreated {
+            session_id: session_id.clone(),
+            debate: debate.clone(),
+        },
+    );
+
+    // Spawn async task for debate streaming
+    let openrouter_arc = state.openrouter.clone();
+    let canvas_store_arc = state.canvas_store.clone();
+    let models = request.participating_models.clone();
+    let max_rounds = request.max_rounds;
+    let debate_id_clone = debate_id.clone();
+    let session_id_clone = session_id.clone();
+
+    tauri::async_runtime::spawn(async move {
+        let mut debate_state = debate;
+
+        for round_num in 1..=max_rounds {
+            let _ = window.emit(
+                "canvas-stream",
+                CanvasStreamEvent::RoundStart {
+                    session_id: session_id_clone.clone(),
+                    debate_id: debate_id_clone.clone(),
+                    round_number: round_num,
+                },
+            );
+
+            let mut round_responses = Vec::new();
+
+            // Build debate context
+            let mut context = format!(
+                "You are participating in a structured debate.\n\nOriginal context:\n{}\n\n",
+                source_content
+            );
+
+            // Add previous rounds for context
+            for prev_round in &debate_state.rounds {
+                context.push_str(&format!("Round {}:\n", prev_round.round_number));
+                for resp in &prev_round.responses {
+                    context.push_str(&format!("{}: {}\n", resp.model_name, resp.content));
+                }
+                context.push('\n');
+            }
+
+            context.push_str(&format!(
+                "Round {} - Present your analysis. Be concise and insightful. If other models have responded before you, engage with their points.",
+                round_num
+            ));
+
+            for model_id in &models {
+                let model_name = model_id.split('/').last().unwrap_or(model_id).to_string();
+                let messages = vec![ChatMessage {
+                    role: "user".to_string(),
+                    content: context.clone(),
+                }];
+
+                let openrouter = openrouter_arc.read().await;
+                let stream_result = openrouter
+                    .chat_stream(model_id, messages, None, Some(0.7), Some(1024))
+                    .await;
+                drop(openrouter);
+
+                match stream_result {
+                    Ok(stream) => {
+                        let mut stream = Box::pin(stream);
+                        let mut full_content = String::new();
+
+                        while let Some(chunk_result) = stream.next().await {
+                            match chunk_result {
+                                Ok(chunk) => {
+                                    if !chunk.is_empty() {
+                                        full_content.push_str(&chunk);
+                                        let _ = window.emit(
+                                            "canvas-stream",
+                                            CanvasStreamEvent::DebateChunk {
+                                                session_id: session_id_clone.clone(),
+                                                debate_id: debate_id_clone.clone(),
+                                                model_id: model_id.clone(),
+                                                chunk,
+                                            },
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    let _ = window.emit(
+                                        "canvas-stream",
+                                        CanvasStreamEvent::DebateError {
+                                            session_id: session_id_clone.clone(),
+                                            debate_id: debate_id_clone.clone(),
+                                            model_id: model_id.clone(),
+                                            error: e.to_string(),
+                                        },
+                                    );
+                                    break;
+                                }
+                            }
+                        }
+
+                        round_responses.push(DebateResponse {
+                            model_id: model_id.clone(),
+                            model_name: model_name.clone(),
+                            content: full_content,
+                            stance: None,
+                        });
+
+                        let _ = window.emit(
+                            "canvas-stream",
+                            CanvasStreamEvent::ModelComplete {
+                                session_id: session_id_clone.clone(),
+                                debate_id: debate_id_clone.clone(),
+                                model_id: model_id.clone(),
+                            },
+                        );
+                    }
+                    Err(e) => {
+                        let _ = window.emit(
+                            "canvas-stream",
+                            CanvasStreamEvent::DebateError {
+                                session_id: session_id_clone.clone(),
+                                debate_id: debate_id_clone.clone(),
+                                model_id: model_id.clone(),
+                                error: e.to_string(),
+                            },
+                        );
+                    }
+                }
+            }
+
+            // Save round
+            let round = DebateRound {
+                round_number: round_num,
+                topic: format!("Round {}", round_num),
+                responses: round_responses,
+                created_at: Utc::now(),
+            };
+            debate_state.rounds.push(round);
+
+            // Persist after each round
+            {
+                let mut store = canvas_store_arc.write().await;
+                let _ = store.update_debate(&session_id_clone, &debate_state);
+            }
+        }
+
+        // Mark debate as complete
+        debate_state.status = "completed".to_string();
+        {
+            let mut store = canvas_store_arc.write().await;
+            let _ = store.update_debate(&session_id_clone, &debate_state);
+        }
+
+        let _ = window.emit(
+            "canvas-stream",
+            CanvasStreamEvent::DebateComplete {
+                session_id: session_id_clone,
+                debate_id: debate_id_clone,
+            },
+        );
+    });
+
+    Ok(debate_id)
+}
+
+/// Continue a debate with a new round
+#[tauri::command]
+pub async fn continue_debate(
+    window: tauri::Window,
+    session_id: String,
+    debate_id: String,
+    request: DebateContinueRequest,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let store = state.canvas_store.read().await;
+    let session = store.get_session(&session_id).map_err(|e| e.to_string())?;
+    drop(store);
+
+    let debate = session
+        .debates
+        .iter()
+        .find(|d| d.id == debate_id)
+        .ok_or_else(|| "Debate not found".to_string())?
+        .clone();
+
+    let openrouter_arc = state.openrouter.clone();
+    let canvas_store_arc = state.canvas_store.clone();
+    let models = debate.participating_models.clone();
+
+    tauri::async_runtime::spawn(async move {
+        let mut debate_state = debate;
+        let round_num = debate_state.rounds.len() as u32 + 1;
+
+        let _ = window.emit(
+            "canvas-stream",
+            CanvasStreamEvent::RoundStart {
+                session_id: session_id.clone(),
+                debate_id: debate_id.clone(),
+                round_number: round_num,
+            },
+        );
+
+        let mut round_responses = Vec::new();
+
+        // Build context from previous rounds + new prompt
+        let mut context = String::from("Previous debate rounds:\n\n");
+        for round in &debate_state.rounds {
+            context.push_str(&format!("Round {}:\n", round.round_number));
+            for resp in &round.responses {
+                context.push_str(&format!("{}: {}\n", resp.model_name, resp.content));
+            }
+            context.push('\n');
+        }
+        context.push_str(&format!("New prompt: {}\n\nRespond to this new direction.", request.prompt));
+
+        for model_id in &models {
+            let model_name = model_id.split('/').last().unwrap_or(model_id).to_string();
+            let messages = vec![ChatMessage {
+                role: "user".to_string(),
+                content: context.clone(),
+            }];
+
+            let openrouter = openrouter_arc.read().await;
+            let stream_result = openrouter
+                .chat_stream(model_id, messages, None, Some(0.7), Some(1024))
+                .await;
+            drop(openrouter);
+
+            match stream_result {
+                Ok(stream) => {
+                    let mut stream = Box::pin(stream);
+                    let mut full_content = String::new();
+
+                    while let Some(chunk_result) = stream.next().await {
+                        match chunk_result {
+                            Ok(chunk) => {
+                                if !chunk.is_empty() {
+                                    full_content.push_str(&chunk);
+                                    let _ = window.emit(
+                                        "canvas-stream",
+                                        CanvasStreamEvent::DebateChunk {
+                                            session_id: session_id.clone(),
+                                            debate_id: debate_id.clone(),
+                                            model_id: model_id.clone(),
+                                            chunk,
+                                        },
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                let _ = window.emit(
+                                    "canvas-stream",
+                                    CanvasStreamEvent::DebateError {
+                                        session_id: session_id.clone(),
+                                        debate_id: debate_id.clone(),
+                                        model_id: model_id.clone(),
+                                        error: e.to_string(),
+                                    },
+                                );
+                                break;
+                            }
+                        }
+                    }
+
+                    round_responses.push(DebateResponse {
+                        model_id: model_id.clone(),
+                        model_name,
+                        content: full_content,
+                        stance: None,
+                    });
+
+                    let _ = window.emit(
+                        "canvas-stream",
+                        CanvasStreamEvent::ModelComplete {
+                            session_id: session_id.clone(),
+                            debate_id: debate_id.clone(),
+                            model_id: model_id.clone(),
+                        },
+                    );
+                }
+                Err(e) => {
+                    let _ = window.emit(
+                        "canvas-stream",
+                        CanvasStreamEvent::DebateError {
+                            session_id: session_id.clone(),
+                            debate_id: debate_id.clone(),
+                            model_id: model_id.clone(),
+                            error: e.to_string(),
+                        },
+                    );
+                }
+            }
+        }
+
+        // Save round
+        let round = DebateRound {
+            round_number: round_num,
+            topic: request.prompt,
+            responses: round_responses,
+            created_at: Utc::now(),
+        };
+        debate_state.rounds.push(round);
+
+        {
+            let mut store = canvas_store_arc.write().await;
+            let _ = store.update_debate(&session_id, &debate_state);
+        }
+
+        let _ = window.emit(
+            "canvas-stream",
+            CanvasStreamEvent::DebateComplete {
+                session_id,
+                debate_id,
+            },
+        );
+    });
+
+    Ok(())
+}
+
+/// Add new models to an existing tile (same prompt, new model responses)
+#[tauri::command]
+pub async fn add_models_to_tile(
+    window: tauri::Window,
+    session_id: String,
+    tile_id: String,
+    request: AddModelsRequest,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    // Get the tile's prompt
+    let store = state.canvas_store.read().await;
+    let session = store.get_session(&session_id).map_err(|e| e.to_string())?;
+    drop(store);
+
+    let tile = session
+        .prompt_tiles
+        .iter()
+        .find(|t| t.id == tile_id)
+        .ok_or_else(|| "Tile not found".to_string())?
+        .clone();
+
+    let now = Utc::now();
+
+    // Calculate positions for new models
+    let existing_count = tile.responses.len();
+    let prompt_pos = &tile.position;
+    let llm_start_x = prompt_pos.x + prompt_pos.width + 80.0;
+
+    // Add initial pending responses
+    {
+        let store = state.canvas_store.write().await;
+        let mut session = store.get_session(&session_id).map_err(|e| e.to_string())?;
+        if let Some(t) = session.prompt_tiles.iter_mut().find(|t| t.id == tile_id) {
+            for (i, model_id) in request.model_ids.iter().enumerate() {
+                let model_name = model_id.split('/').last().unwrap_or(model_id).to_string();
+                let llm_y = prompt_pos.y + ((existing_count + i) as f64) * 280.0;
+                t.models.push(model_id.clone());
+                t.responses.insert(
+                    model_id.clone(),
+                    ModelResponse {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        model_id: model_id.clone(),
+                        model_name,
+                        content: String::new(),
+                        status: ResponseStatus::Pending,
+                        error: None,
+                        tokens_used: None,
+                        created_at: now,
+                        position: TilePosition {
+                            x: llm_start_x,
+                            y: llm_y,
+                            width: 280.0,
+                            height: 200.0,
+                        },
+                    },
+                );
+            }
+            session.updated_at = Utc::now();
+            store.save_session(&session).map_err(|e| e.to_string())?;
+        }
+    }
+
+    // Spawn streaming task
+    let openrouter_arc = state.openrouter.clone();
+    let canvas_store_arc = state.canvas_store.clone();
+    let model_ids = request.model_ids;
+    let prompt = tile.prompt.clone();
+    let system_prompt = tile.system_prompt.clone();
+
+    tauri::async_runtime::spawn(async move {
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: prompt,
+        }];
+
+        for model_id in &model_ids {
+            let openrouter = openrouter_arc.read().await;
+            let stream_result = openrouter
+                .chat_stream(model_id, messages.clone(), system_prompt.as_deref(), Some(0.7), Some(2048))
+                .await;
+            drop(openrouter);
+
+            match stream_result {
+                Ok(stream) => {
+                    let mut stream = Box::pin(stream);
+                    let mut full_content = String::new();
+
+                    while let Some(chunk_result) = stream.next().await {
+                        match chunk_result {
+                            Ok(chunk) => {
+                                if !chunk.is_empty() {
+                                    full_content.push_str(&chunk);
+                                    let _ = window.emit(
+                                        "canvas-stream",
+                                        CanvasStreamEvent::Chunk {
+                                            session_id: session_id.clone(),
+                                            tile_id: tile_id.clone(),
+                                            model_id: model_id.clone(),
+                                            chunk,
+                                        },
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                let _ = window.emit(
+                                    "canvas-stream",
+                                    CanvasStreamEvent::Error {
+                                        session_id: session_id.clone(),
+                                        tile_id: tile_id.clone(),
+                                        model_id: model_id.clone(),
+                                        error: e.to_string(),
+                                    },
+                                );
+                                break;
+                            }
+                        }
+                    }
+
+                    {
+                        let mut store = canvas_store_arc.write().await;
+                        let _ = store.update_tile_response(
+                            &session_id, &tile_id, model_id, &full_content,
+                            ResponseStatus::Completed,
+                        );
+                    }
+
+                    let _ = window.emit(
+                        "canvas-stream",
+                        CanvasStreamEvent::Complete {
+                            session_id: session_id.clone(),
+                            tile_id: tile_id.clone(),
+                            model_id: model_id.clone(),
+                            tokens_used: None,
+                        },
+                    );
+                }
+                Err(e) => {
+                    {
+                        let mut store = canvas_store_arc.write().await;
+                        let _ = store.update_tile_response(
+                            &session_id, &tile_id, model_id, &e.to_string(),
+                            ResponseStatus::Error,
+                        );
+                    }
+                    let _ = window.emit(
+                        "canvas-stream",
+                        CanvasStreamEvent::Error {
+                            session_id: session_id.clone(),
+                            tile_id: tile_id.clone(),
+                            model_id: model_id.clone(),
+                            error: e.to_string(),
+                        },
+                    );
+                }
+            }
+        }
+
+        let _ = window.emit(
+            "canvas-stream",
+            CanvasStreamEvent::SessionSaved {
+                session_id,
+            },
+        );
+    });
+
+    Ok(())
+}
+
+/// Regenerate a single model's response
+#[tauri::command]
+pub async fn regenerate_response(
+    window: tauri::Window,
+    session_id: String,
+    tile_id: String,
+    model_id: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    // Get the tile's prompt
+    let store = state.canvas_store.read().await;
+    let session = store.get_session(&session_id).map_err(|e| e.to_string())?;
+    drop(store);
+
+    let tile = session
+        .prompt_tiles
+        .iter()
+        .find(|t| t.id == tile_id)
+        .ok_or_else(|| "Tile not found".to_string())?;
+
+    if !tile.responses.contains_key(&model_id) {
+        return Err("Response not found".to_string());
+    }
+
+    let prompt = tile.prompt.clone();
+    let system_prompt = tile.system_prompt.clone();
+
+    // Reset response to streaming
+    {
+        let mut store = state.canvas_store.write().await;
+        let _ = store.update_tile_response(
+            &session_id, &tile_id, &model_id, "",
+            ResponseStatus::Streaming,
+        );
+    }
+
+    let openrouter_arc = state.openrouter.clone();
+    let canvas_store_arc = state.canvas_store.clone();
+
+    tauri::async_runtime::spawn(async move {
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: prompt,
+        }];
+
+        let openrouter = openrouter_arc.read().await;
+        let stream_result = openrouter
+            .chat_stream(&model_id, messages, system_prompt.as_deref(), Some(0.7), Some(2048))
+            .await;
+        drop(openrouter);
+
+        match stream_result {
+            Ok(stream) => {
+                let mut stream = Box::pin(stream);
+                let mut full_content = String::new();
+
+                while let Some(chunk_result) = stream.next().await {
+                    match chunk_result {
+                        Ok(chunk) => {
+                            if !chunk.is_empty() {
+                                full_content.push_str(&chunk);
+                                let _ = window.emit(
+                                    "canvas-stream",
+                                    CanvasStreamEvent::Chunk {
+                                        session_id: session_id.clone(),
+                                        tile_id: tile_id.clone(),
+                                        model_id: model_id.clone(),
+                                        chunk,
+                                    },
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            let _ = window.emit(
+                                "canvas-stream",
+                                CanvasStreamEvent::Error {
+                                    session_id: session_id.clone(),
+                                    tile_id: tile_id.clone(),
+                                    model_id: model_id.clone(),
+                                    error: e.to_string(),
+                                },
+                            );
+                            break;
+                        }
+                    }
+                }
+
+                {
+                    let mut store = canvas_store_arc.write().await;
+                    let _ = store.update_tile_response(
+                        &session_id, &tile_id, &model_id, &full_content,
+                        ResponseStatus::Completed,
+                    );
+                }
+
+                let _ = window.emit(
+                    "canvas-stream",
+                    CanvasStreamEvent::Complete {
+                        session_id: session_id.clone(),
+                        tile_id: tile_id.clone(),
+                        model_id: model_id.clone(),
+                        tokens_used: None,
+                    },
+                );
+            }
+            Err(e) => {
+                {
+                    let mut store = canvas_store_arc.write().await;
+                    let _ = store.update_tile_response(
+                        &session_id, &tile_id, &model_id, &e.to_string(),
+                        ResponseStatus::Error,
+                    );
+                }
+                let _ = window.emit(
+                    "canvas-stream",
+                    CanvasStreamEvent::Error {
+                        session_id: session_id.clone(),
+                        tile_id: tile_id.clone(),
+                        model_id: model_id.clone(),
+                        error: e.to_string(),
+                    },
+                );
+            }
+        }
+
+        let _ = window.emit(
+            "canvas-stream",
+            CanvasStreamEvent::SessionSaved {
+                session_id,
+            },
+        );
+    });
+
     Ok(())
 }

@@ -114,7 +114,14 @@
       "Bash(npm run build:*)",
       "mcp__plugin_playwright_playwright__browser_evaluate",
       "mcp__plugin_playwright_playwright__browser_press_key",
-      "mcp__plugin_playwright_playwright__browser_console_messages"
+      "mcp__plugin_playwright_playwright__browser_console_messages",
+      "Bash(npx yaml-lint:*)",
+      "Bash(if not exist \"C:\\\\Users\\\\bryan\\\\Seedream\\\\cleanup\" mkdir \"C:\\\\Users\\\\bryan\\\\Seedream\\\\cleanup\")",
+      "Bash(cargo build:*)",
+      "Bash(npx tauri build:*)",
+      "WebFetch(domain:docs.rs)",
+      "WebFetch(domain:www.shuttle.dev)",
+      "Bash(cargo test:*)"
     ]
   },
   "outputStyle": "Explanatory"

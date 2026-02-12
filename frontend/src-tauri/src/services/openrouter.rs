@@ -90,6 +90,8 @@ impl OpenRouterService {
         model: &str,
         messages: Vec<ChatMessage>,
         system_prompt: Option<&str>,
+        temperature: Option<f64>,
+        max_tokens: Option<u32>,
     ) -> Result<String> {
         if !self.is_configured() {
             return Err(anyhow::anyhow!("OpenRouter API key not configured"));
@@ -110,6 +112,8 @@ impl OpenRouterService {
             model: model.to_string(),
             messages: all_messages,
             stream: Some(false),
+            temperature,
+            max_tokens,
         };
 
         let response = self
@@ -146,6 +150,8 @@ impl OpenRouterService {
         model: &str,
         messages: Vec<ChatMessage>,
         system_prompt: Option<&str>,
+        temperature: Option<f64>,
+        max_tokens: Option<u32>,
     ) -> Result<impl futures::Stream<Item = Result<String>>> {
         if !self.is_configured() {
             return Err(anyhow::anyhow!("OpenRouter API key not configured"));
@@ -166,6 +172,8 @@ impl OpenRouterService {
             model: model.to_string(),
             messages: all_messages,
             stream: Some(true),
+            temperature,
+            max_tokens,
         };
 
         let response = self
@@ -298,6 +306,10 @@ struct ChatRequest {
     messages: Vec<ChatMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -35,7 +35,17 @@
     
     <!-- Connection point (right side) - visual indicator for edges -->
     <div class="connection-point out" />
-    
+
+    <!-- Add Model button (+) on right edge -->
+    <button
+      v-if="hasCompletedResponse"
+      class="add-model-btn"
+      title="Add more models"
+      @click.stop="$emit('show-add-model-dialog', { tileId: tile.id })"
+    >
+      +
+    </button>
+
     <!-- Branch indicator if this is a child prompt -->
     <div
       v-if="tile.parent_tile_id"
@@ -60,7 +70,7 @@ const props = defineProps({
   }
 })
 
-const emit = defineEmits(['drag', 'delete'])
+const emit = defineEmits(['drag', 'delete', 'show-add-model-dialog'])
 
 // Dragging state
 const isDragging = ref(false)
@@ -68,6 +78,10 @@ const dragStart = ref({ x: 0, y: 0, nodeX: 0, nodeY: 0 })
 
 // Computed
 const modelCount = computed(() => Object.keys(props.tile.responses).length)
+
+const hasCompletedResponse = computed(() =>
+  Object.values(props.tile.responses).some(r => r.status === 'completed')
+)
 
 const truncatedPrompt = computed(() => {
   const prompt = props.tile.prompt
@@ -90,7 +104,7 @@ function formatTime(dateStr) {
 
 function handleMouseDown(e) {
   // Ignore clicks on interactive elements
-  if (e.target.closest('.node-actions') || e.target.closest('.delete-btn')) {
+  if (e.target.closest('.node-actions') || e.target.closest('.delete-btn') || e.target.closest('.add-model-btn')) {
     return
   }
   if (e.button !== 0) return
@@ -153,7 +167,7 @@ onBeforeUnmount(() => {
   box-shadow: 0 4px 16px color-mix(in srgb, var(--accent-primary) 20%, transparent);
   display: flex;
   flex-direction: column;
-  overflow: hidden;
+  overflow: visible;
   transition: left 0.5s ease-out, top 0.5s ease-out, box-shadow 0.15s, border-color 0.15s, transform 0.1s;
   user-select: none;
   cursor: grab;
@@ -285,5 +299,39 @@ onBeforeUnmount(() => {
   justify-content: center;
   font-size: 0.5rem;
   color: var(--accent-primary);
+}
+
+/* Add Model button (+) */
+.add-model-btn {
+  position: absolute;
+  right: -14px;
+  top: 25%;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  background: var(--bg-secondary);
+  border: 2px solid var(--accent-green);
+  color: var(--accent-green);
+  font-size: 1.25rem;
+  font-weight: bold;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: all 0.15s;
+  opacity: 0;
+  transform: scale(0.8);
+  z-index: 5;
+}
+
+.prompt-node:hover .add-model-btn {
+  opacity: 1;
+  transform: scale(1);
+}
+
+.add-model-btn:hover {
+  background: var(--accent-green);
+  color: white;
+  transform: scale(1.1);
 }
 </style>

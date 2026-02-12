@@ -159,6 +159,7 @@
           :selected="selectedNodes.includes(`prompt:${tile.id}`)"
           @drag="handlePromptDrag"
           @delete="handleDeletePrompt"
+          @show-add-model-dialog="handleShowAddModelDialog"
         />
 
         <!-- LLM Response Nodes -->
@@ -176,7 +177,7 @@
           @select="handleNodeSelect"
           @delete="handleDeleteLLMNode"
           @regenerate="handleRegenerate"
-          @show-add-model-dialog="handleShowAddModelDialog"
+          @follow-up="handleFollowUp"
         />
 
         <!-- Debate Nodes -->
@@ -750,7 +751,7 @@ async function handleRegenerate({ tileId, modelId }) {
 }
 
 // Handle showing the add model dialog
-function handleShowAddModelDialog({ tileId, modelId }) {
+function handleShowAddModelDialog({ tileId }) {
   // Find the tile and get all existing model IDs
   const tile = promptTiles.value.find(t => t.id === tileId)
   if (!tile) return
@@ -762,6 +763,11 @@ function handleShowAddModelDialog({ tileId, modelId }) {
     existingModelIds
   }
   showAddModelDialog.value = true
+}
+
+// Handle follow-up from LLM node (quick continuation with same model)
+function handleFollowUp({ tileId, modelId, prompt }) {
+  handleLLMBranch(tileId, modelId, prompt, 'full_history', [modelId])
 }
 
 // Handle add model dialog submit
@@ -863,6 +869,11 @@ async function handlePromptSubmit({ prompt, models, systemPrompt, temperature, m
     }
   } catch (err) {
     console.error('Failed to send prompt:', err)
+    saveMessage.value = {
+      type: 'error',
+      text: err.message || 'Failed to send prompt'
+    }
+    setTimeout(() => { saveMessage.value = null }, 5000)
   }
 }
 
@@ -915,6 +926,11 @@ async function handleStartDebate() {
     clearSelection()
   } catch (err) {
     console.error('Failed to start debate:', err)
+    saveMessage.value = {
+      type: 'error',
+      text: err.message || 'Failed to start debate'
+    }
+    setTimeout(() => { saveMessage.value = null }, 5000)
   }
 }
 
