@@ -28,10 +28,19 @@ pub async fn update_settings(
     // Capture values before moving update
     let new_api_key = update.openrouter_api_key.clone();
     let new_mcp_enabled = update.mcp_enabled;
+    let vault_path_changed = update.vault_path.is_some();
 
     // Update settings
     let mut settings = state.settings_service.write().await;
     let result = settings.update(update).map_err(|e| e.to_string())?;
+
+    // Get new vault path while we still hold the lock
+    let new_vault_path = if vault_path_changed {
+        Some(settings.get().effective_vault_path())
+    } else {
+        None
+    };
+    drop(settings); // Release settings lock before acquiring others
 
     // Sync OpenRouter service if API key was updated
     if let Some(api_key) = new_api_key {
@@ -54,6 +63,41 @@ pub async fn update_settings(
             }
             sidecar.set_enabled(false);
         }
+    }
+
+    // Sync KnowledgeStore, SearchService, and GraphIndex if vault path changed
+    if let Some(new_vault_path) = new_vault_path {
+        // Update KnowledgeStore to new vault
+        {
+            let mut ks = state.knowledge_store.write().await;
+            ks.set_vault_path(new_vault_path);
+        }
+
+        // Read all notes from new vault and rebuild indices
+        let notes = {
+            let ks = state.knowledge_store.read().await;
+            let metas = ks.list_notes().unwrap_or_default();
+            metas
+                .iter()
+                .filter_map(|m| ks.get_note(&m.id).ok())
+                .collect::<Vec<_>>()
+        };
+
+        // Rebuild search index
+        {
+            let mut search = state.search_service.write().await;
+            if let Err(e) = search.reindex_all(&notes) {
+                log::error!("Failed to reindex after vault change: {}", e);
+            }
+        }
+
+        // Rebuild graph index
+        {
+            let mut graph = state.graph_index.write().await;
+            graph.build_from_notes(&notes);
+        }
+
+        log::info!("Services rebuilt for new vault path");
     }
 
     Ok(result)

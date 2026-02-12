@@ -35,7 +35,7 @@ A local knowledge graph platform with semantic search, Obsidian-style linking, M
 | Mode | Backend | Use Case |
 |------|---------|----------|
 | **Web** | Python/FastAPI | Development, MCP integration, multi-user |
-| **Desktop** | Rust/Tauri | Single-user, portable, offline-capable |
+| **Desktop** | Rust/Tauri | Single-user, portable, offline-capable, live vault switching |
 
 ## Tech Stack
 
@@ -342,6 +342,17 @@ Comprehensive documentation in the `docs/` directory:
 - [Backend Development Guide](docs/development-guide-backend.md)
 - [Frontend Development Guide](docs/development-guide-frontend.md)
 - [Chat Ingestion Guide](docs/chat-ingestion-guide.md)
+
+## CI/CD
+
+Releases are built automatically when a `v*` tag is pushed. The workflow in `.github/workflows/release.yml` runs in four phases:
+
+1. **Create release** — a single draft GitHub release is created
+2. **Build** — 4 parallel matrix jobs (Windows x64/ARM, macOS ARM, Linux x64) build Tauri bundles and upload artifacts to the draft release
+3. **Publish release** — the draft is marked as published once all builds complete
+4. **Upload to R2** — assets are mirrored to Cloudflare R2 for auto-update distribution
+
+Manual builds can be triggered via `workflow_dispatch` without creating a release.
 
 ## Contributing
 
