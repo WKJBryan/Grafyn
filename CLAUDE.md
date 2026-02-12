@@ -92,24 +92,13 @@ The desktop app uses a **pure Rust backend** with Vue frontend in a single binar
 │  │            Rust Backend                   │  │
 │  │  Commands → Services → Local Filesystem   │  │
 │  │  (notes, search, graph, canvas,           │  │
-│  │   settings, feedback, mcp)                │  │
+│  │   settings, feedback, mcp, memory)        │  │
 │  └──────────────────────────────────────────┘  │
 │  ~/Documents/Grafyn/                          │
 │  ├── vault/  (markdown notes)                   │
 │  └── data/   (search index, canvas, settings)   │
 └────────────────────────────────────────────────┘
 ```
-
-**Rust Crate Mapping (Python → Rust):**
-
-| Python Library | Rust Crate | Purpose |
-|----------------|------------|---------|
-| FastAPI | Tauri commands | API layer via IPC |
-| LanceDB | Tantivy | Full-text search |
-| sentence-transformers | (future: rust-bert) | Embeddings |
-| Pydantic | serde | Data serialization |
-| python-frontmatter | gray_matter | YAML parsing |
-| aiofiles | tokio::fs | Async file I/O |
 
 ### Web Backend Service Layer
 
@@ -161,26 +150,28 @@ async def example(request: Request):
 | `feedback.py` | `/api/feedback` | 2 | Submit feedback, check status |
 | `oauth.py` | `/auth` | 4 | GitHub OAuth flow |
 
-### Tauri IPC Commands
+### Tauri IPC Commands (53 total across 8 modules)
 
 | Module | Commands | Purpose |
 |--------|----------|---------|
 | `commands/notes.rs` | `list_notes`, `get_note`, `create_note`, `update_note`, `delete_note` | Note CRUD |
 | `commands/search.rs` | `search_notes`, `find_similar`, `reindex` | Full-text search |
 | `commands/graph.rs` | `get_backlinks`, `get_outgoing`, `get_neighbors`, `get_unlinked`, `rebuild_graph` | Link graph |
-| `commands/canvas.rs` | `list_sessions`, `get_session`, `create_session`, `update_session`, `delete_session`, `get_available_models`, `send_prompt`, `update_tile_position` | Multi-LLM canvas |
+| `commands/canvas.rs` | `list_sessions`, `get_session`, `create_session`, `update_session`, `delete_session`, `get_available_models`, `send_prompt`, `update_tile_position`, `delete_tile`, `delete_response`, `update_viewport`, `update_llm_node_position`, `auto_arrange`, `export_to_note`, `start_debate`, `continue_debate`, `add_models_to_tile`, `regenerate_response` | Multi-LLM canvas (streaming via `canvas-stream` Tauri events) |
 | `commands/settings.rs` | `get_settings`, `get_settings_status`, `update_settings`, `complete_setup`, `pick_vault_folder`, `validate_openrouter_key`, `get_openrouter_status` | App settings & first-run setup |
 | `commands/feedback.rs` | `submit_feedback`, `get_system_info`, `feedback_status`, `get_pending_feedback`, `retry_pending_feedback`, `clear_pending_feedback` | Feedback with offline queue |
 | `commands/mcp.rs` | `get_mcp_status`, `start_mcp_sidecar`, `stop_mcp_sidecar`, `restart_mcp_sidecar`, `check_mcp_health`, `get_mcp_config_snippet` | MCP sidecar lifecycle |
+| `commands/memory.rs` | `recall_relevant`, `find_contradictions`, `extract_claims` | Memory recall & contradiction detection |
 
 ### Frontend API Client
 
 ```javascript
 // src/api/client.js auto-detects Tauri vs web environment
-import { notes, search, graph, auth, canvas, isDesktopApp } from '@/api/client'
+import { notes, search, graph, canvas, settings, mcp, memory, zettelkasten, feedback, isDesktopApp } from '@/api/client'
 
 // In Tauri: Uses invoke() for direct IPC to Rust backend
 // In Web: Uses Axios HTTP calls to Python backend
+// Canvas streaming: Tauri uses canvas-stream events, web uses HTTP SSE
 ```
 
 **Pinia Stores:** `auth.js`, `notes.js`, `canvas.js`, `import.js`, `theme.js`
@@ -265,7 +256,12 @@ Configurable search result ranking. Factors: `recency_weight`, `content_type_wei
 
 ### Multi-LLM Canvas
 
-Compare responses from multiple LLM models simultaneously via OpenRouter. Features: parallel model streaming (SSE), infinite canvas with D3.js zoom/pan, model debate mode, session persistence in `data/canvas/`.
+Compare responses from multiple LLM models simultaneously via OpenRouter. Features: parallel model streaming, infinite canvas with D3.js zoom/pan, model debate mode, session persistence in `data/canvas/`.
+
+**Streaming architecture (dual-path):**
+- **Desktop (Tauri):** Commands return immediately, spawn async tasks, stream via `canvas-stream` Tauri events (`TileCreated`, `Chunk`, `Complete`, `Error`, `SessionSaved`, debate variants). Frontend listens via `@tauri-apps/api/event`.
+- **Web:** Standard HTTP SSE (Server-Sent Events) via `fetch()` to Python backend.
+- Streaming commands: `send_prompt`, `start_debate`, `continue_debate`, `add_models_to_tile`, `regenerate_response`
 
 ### Conversation Import
 
@@ -278,6 +274,11 @@ Submit bug reports, feature requests, and general feedback. Creates GitHub Issue
 ### Settings System (Desktop)
 
 First-run setup wizard and persistent settings. Manages vault path, OpenRouter API key, MCP configuration, and theme preferences. Settings stored as JSON in app data directory. Frontend: `SettingsModal.vue`.
+
+**Runtime sync pattern:** When settings change via `update_settings`, dependent services are updated in-place — no restart required. The pattern (in `commands/settings.rs`): capture changed fields before moving the update, apply settings, then sync each affected service:
+- **OpenRouter API key** → `openrouter.set_api_key()`
+- **MCP enabled** → `mcp_sidecar.start()` / `stop()`
+- **Vault path** → `knowledge_store.set_vault_path()` + rebuild search index + rebuild graph index
 
 ## Configuration
 
@@ -302,35 +303,6 @@ cp backend/.env.example .env
 | `GITHUB_FEEDBACK_REPO` | `""` | Target repo for feedback issues (format: `owner/repo`) |
 | `GITHUB_FEEDBACK_TOKEN` | `""` | GitHub PAT with `issues:write` scope |
 | `TOKEN_ENCRYPTION_KEY` | — | Generate: `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"` |
-
-## Common Patterns
-
-### Adding a New Router Endpoint
-
-```python
-# In routers/example.py
-from fastapi import APIRouter, Request
-from app.middleware.rate_limit import limiter
-
-router = APIRouter()
-
-@router.get("/example")
-@limiter.limit("10 per minute")
-async def example(request: Request):
-    service = request.app.state.knowledge_store
-    return service.some_method()
-
-# In main.py — register the router:
-app.include_router(example.router, prefix="/api/example", tags=["example"])
-```
-
-### Frontend Data Flow
-
-```
-User Action → Vue Component → Pinia Store Action → API Client → Backend
-                                      ↓
-                                 State update → Reactivity re-render
-```
 
 ## MCP Sidecar (Desktop + Claude/ChatGPT)
 
@@ -357,6 +329,28 @@ python build-exe.py    # Bundles to frontend/src-tauri/binaries/
 ```
 
 **Connecting ChatGPT:** Requires OAuth. See `CHATGPT_MCP_SETUP_GUIDE.md`.
+
+## CI/CD Release Pipeline
+
+`.github/workflows/release.yml` — triggered by `v*` tags and `workflow_dispatch`.
+
+```
+create-release → build (4-job matrix) → publish-release → upload-to-r2 → build-summary
+```
+
+| Job | Purpose |
+|-----|---------|
+| `create-release` | Creates a single **draft** GitHub release (avoids matrix race condition) |
+| `build` | 4-platform matrix (Win x64/ARM, macOS ARM, Linux x64) via `tauri-action` with `releaseId` |
+| `publish-release` | Marks draft → published after all builds upload artifacts |
+| `upload-to-r2` | Downloads release assets, rewrites `latest.json` URLs, uploads to Cloudflare R2 |
+| `build-summary` | Writes build status table to GitHub Actions summary |
+
+**Key detail:** The `build` matrix receives `releaseId` from `create-release` so `tauri-action` uploads to an existing release instead of each job racing to create one. For `workflow_dispatch` (no tag), `create-release` is skipped and builds produce artifacts only.
+
+**Required secrets:** `TAURI_PRIVATE_KEY`, `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`
+
+**Required vars:** `CLOUDFLARE_WORKER_URL` (optional, has default)
 
 ## Deployment Notes
 

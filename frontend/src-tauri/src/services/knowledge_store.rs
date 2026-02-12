@@ -1,10 +1,9 @@
-use crate::models::note::{Note, NoteCreate, NoteFrontmatter, NoteMeta, NoteStatus, NoteUpdate};
+use crate::models::note::{Note, NoteCreate, NoteFrontmatter, NoteMeta, NoteUpdate};
 use anyhow::{Context, Result};
 use chrono::Utc;
 use gray_matter::{engine::YAML, Matter};
 use lazy_static::lazy_static;
 use regex::Regex;
-use std::collections::HashMap;
 use std::path::PathBuf;
 use walkdir::WalkDir;
 
@@ -26,6 +25,15 @@ impl KnowledgeStore {
             log::error!("Failed to create vault directory {}: {}", vault_path.display(), e);
         }
         Self { vault_path }
+    }
+
+    /// Update the vault path at runtime (e.g., after settings change)
+    pub fn set_vault_path(&mut self, vault_path: PathBuf) {
+        if let Err(e) = std::fs::create_dir_all(&vault_path) {
+            log::error!("Failed to create vault directory {}: {}", vault_path.display(), e);
+        }
+        log::info!("Vault path updated to {:?}", vault_path);
+        self.vault_path = vault_path;
     }
 
     /// List all notes in the vault (metadata only)
