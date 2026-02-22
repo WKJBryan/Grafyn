@@ -55,7 +55,7 @@
         "sidecar": true,
         "scope": [
           {
-            "name": "binaries/grafyn-backend",
+            "name": "binaries/grafyn-mcp",
             "sidecar": true,
             "args": true
           }
@@ -73,7 +73,7 @@
         "depends": []
       },
       "externalBin": [
-        "binaries/grafyn-backend"
+        "binaries/grafyn-mcp"
       ],
       "icon": [
         "icons/32x32.png",

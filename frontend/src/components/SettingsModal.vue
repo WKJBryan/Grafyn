@@ -189,7 +189,7 @@
           </div>
         </div>
 
-        <!-- MCP Sidecar Section (desktop only, non-setup only) -->
+        <!-- MCP Integration Section (desktop only, non-setup only) -->
         <div
           v-if="!isSetup && isDesktop"
           class="setting-section"
@@ -200,39 +200,18 @@
             <span class="optional-badge">Advanced</span>
           </label>
           <p class="setting-description">
-            Enable the MCP sidecar to connect Claude Desktop or ChatGPT to your knowledge base.
+            Connect Claude Desktop to your knowledge base. The MCP server runs as a native binary
+            launched by Claude Desktop — no configuration needed in Grafyn.
           </p>
-          <div class="mcp-toggle">
-            <label class="mcp-checkbox-label">
-              <input
-                :checked="mcpEnabled"
-                type="checkbox"
-                :disabled="mcpToggling"
-                @change="toggleMcp"
-              >
-              <span>Enable MCP Server</span>
-            </label>
-            <span
-              v-if="mcpStatusText"
-              class="mcp-status-badge"
-              :class="mcpStatusClass"
-            >
-              {{ mcpStatusText }}
-            </span>
-          </div>
-          <p
-            v-if="mcpErrorMessage"
-            class="mcp-error"
-          >
-            {{ mcpErrorMessage }}
-          </p>
-          <div
-            v-if="mcpEnabled"
-            class="mcp-details"
-          >
+          <div class="mcp-details">
             <div class="mcp-info-row">
-              <span class="mcp-info-label">Endpoint:</span>
-              <code class="mcp-info-value">{{ mcpUrl || 'http://localhost:8765/sse' }}</code>
+              <span class="mcp-info-label">Status:</span>
+              <span
+                class="mcp-status-badge"
+                :class="mcpAvailable ? 'running' : 'stopped'"
+              >
+                {{ mcpAvailable ? 'Binary found' : 'Binary not found' }}
+              </span>
             </div>
             <div
               v-if="configSnippet"
@@ -317,7 +296,7 @@
 </template>
 
 <script setup>
-import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
+import { ref, watch, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { settings as settingsApi, mcp as mcpApi, isDesktopApp } from '@/api/client'
 import { useToast } from '@/composables/useToast'
@@ -353,46 +332,9 @@ const theme = ref('system')
 const keyValidationState = ref(null) // 'validating' | 'valid' | 'invalid' | null
 
 // MCP state
-const mcpEnabled = ref(false)
-const mcpStatus = ref('Stopped') // 'Stopped' | 'Starting' | 'Running' | 'Failed'
-const mcpUrl = ref('')
+const mcpAvailable = ref(false)
 const configSnippet = ref('')
 const copied = ref(false)
-const mcpToggling = ref(false)
-const mcpUnlisteners = []
-
-const mcpStatusClass = computed(() => {
-  if (typeof mcpStatus.value === 'object') {
-    // SidecarStatus is an enum — Running is { Running: { port, url } }
-    if (mcpStatus.value.Running) return 'running'
-    if (mcpStatus.value.Failed) return 'failed'
-    return 'stopped'
-  }
-  const s = String(mcpStatus.value).toLowerCase()
-  if (s === 'running' || s.startsWith('running')) return 'running'
-  if (s === 'starting') return 'starting'
-  if (s === 'failed' || s.startsWith('failed')) return 'failed'
-  return 'stopped'
-})
-
-const mcpStatusText = computed(() => {
-  if (typeof mcpStatus.value === 'object') {
-    if (mcpStatus.value.Running) return 'Running'
-    if (mcpStatus.value.Failed) return 'Failed'
-    if (mcpStatus.value === 'Starting') return 'Starting'
-    return 'Stopped'
-  }
-  const s = String(mcpStatus.value)
-  if (s === 'Stopped') return mcpEnabled.value ? 'Stopped' : ''
-  return s
-})
-
-const mcpErrorMessage = computed(() => {
-  if (typeof mcpStatus.value === 'object' && mcpStatus.value.Failed) {
-    return mcpStatus.value.Failed.error
-  }
-  return null
-})
 
 // Apply theme changes immediately via themeStore
 watch(theme, (newTheme) => {
@@ -422,82 +364,11 @@ const loadMcpStatus = async () => {
   try {
     const status = await mcpApi.getStatus()
     if (status) {
-      mcpStatus.value = status.status
-      mcpUrl.value = status.mcp_url
-    }
-    const snippet = await mcpApi.getConfigSnippet()
-    if (snippet) {
-      configSnippet.value = snippet
+      mcpAvailable.value = status.available
+      configSnippet.value = status.config_snippet || ''
     }
   } catch (e) {
     console.error('Failed to load MCP status:', e)
-  }
-}
-
-// Toggle MCP sidecar on/off
-const toggleMcp = async (event) => {
-  const enabling = event.target.checked
-  mcpToggling.value = true
-
-  try {
-    if (enabling) {
-      mcpEnabled.value = true
-      mcpStatus.value = 'Starting'
-      const result = await mcpApi.start()
-      mcpStatus.value = result.status
-      mcpUrl.value = result.mcp_url || ''
-      // Also persist the setting
-      await settingsApi.update({ mcp_enabled: true })
-    } else {
-      await mcpApi.stop()
-      mcpEnabled.value = false
-      mcpStatus.value = 'Stopped'
-      mcpUrl.value = ''
-      await settingsApi.update({ mcp_enabled: false })
-    }
-  } catch (e) {
-    console.error('MCP toggle failed:', e)
-    toast.error('MCP sidecar failed: ' + (e.message || e))
-    // Revert checkbox state on failure
-    if (enabling) {
-      mcpEnabled.value = false
-      mcpStatus.value = { Failed: { error: String(e.message || e) } }
-    } else {
-      mcpEnabled.value = true
-    }
-  } finally {
-    mcpToggling.value = false
-  }
-}
-
-// Listen to Tauri sidecar events for real-time status updates
-const setupMcpEventListeners = async () => {
-  if (!isDesktop) return
-  try {
-    const { listen } = await import('@tauri-apps/api/event')
-
-    const unlistenReady = await listen('mcp-sidecar-ready', (event) => {
-      mcpStatus.value = { Running: { port: 8765, url: event.payload } }
-      mcpUrl.value = event.payload || ''
-    })
-    mcpUnlisteners.push(unlistenReady)
-
-    const unlistenError = await listen('mcp-sidecar-error', (event) => {
-      mcpStatus.value = { Failed: { error: event.payload } }
-    })
-    mcpUnlisteners.push(unlistenError)
-
-    const unlistenStopped = await listen('mcp-sidecar-stopped', () => {
-      if (!mcpEnabled.value) {
-        mcpStatus.value = 'Stopped'
-      } else {
-        // Sidecar crashed while enabled — show as failed
-        mcpStatus.value = { Failed: { error: 'Sidecar process terminated unexpectedly' } }
-      }
-    })
-    mcpUnlisteners.push(unlistenStopped)
-  } catch (e) {
-    console.error('Failed to set up MCP event listeners:', e)
   }
 }
 
@@ -523,13 +394,10 @@ const loadCurrentSettings = async () => {
       vaultPath.value = currentSettings.vault_path || ''
       openrouterKey.value = currentSettings.openrouter_api_key || ''
       theme.value = currentSettings.theme || 'system'
-      mcpEnabled.value = currentSettings.mcp_enabled || false
     }
 
-    // Load MCP status if enabled
-    if (mcpEnabled.value) {
-      await loadMcpStatus()
-    }
+    // Load MCP status (binary availability + config snippet)
+    await loadMcpStatus()
   } catch (e) {
     console.error('Failed to load settings:', e)
   }
@@ -585,7 +453,6 @@ const saveSettings = async () => {
       vault_path: vaultPath.value || null,
       openrouter_api_key: openrouterKey.value || null,
       theme: theme.value,
-      mcp_enabled: mcpEnabled.value,
     }
 
     if (props.isSetup) {
@@ -633,12 +500,6 @@ onMounted(() => {
   if (isOpen.value) {
     loadCurrentSettings()
   }
-  setupMcpEventListeners()
-})
-
-onUnmounted(() => {
-  mcpUnlisteners.forEach((fn) => fn())
-  mcpUnlisteners.length = 0
 })
 </script>
 
@@ -915,28 +776,6 @@ onUnmounted(() => {
 }
 
 /* MCP Section */
-.mcp-toggle {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  margin-bottom: 12px;
-}
-
-.mcp-checkbox-label {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  cursor: pointer;
-  font-size: 0.9rem;
-  color: var(--text-primary, #1a1a1a);
-}
-
-.mcp-checkbox-label input[type="checkbox"] {
-  width: 16px;
-  height: 16px;
-  accent-color: var(--accent-color, #7c3aed);
-}
-
 .mcp-status-badge {
   font-size: 0.75rem;
   font-weight: 600;
@@ -951,11 +790,6 @@ onUnmounted(() => {
   color: #065f46;
 }
 
-.mcp-status-badge.starting {
-  background: #fef3c7;
-  color: #92400e;
-}
-
 .mcp-status-badge.stopped {
   background: var(--bg-secondary, #f5f5f5);
   color: var(--text-secondary, #666);
@@ -964,23 +798,6 @@ onUnmounted(() => {
 .mcp-status-badge.failed {
   background: #fee2e2;
   color: #991b1b;
-}
-
-.mcp-error {
-  margin: 8px 0 0;
-  padding: 8px 12px;
-  font-size: 0.82rem;
-  line-height: 1.4;
-  color: #991b1b;
-  background: #fee2e2;
-  border-radius: 6px;
-  border: 1px solid #fecaca;
-}
-
-:root.dark .mcp-error {
-  color: #fca5a5;
-  background: rgba(239, 68, 68, 0.15);
-  border-color: rgba(239, 68, 68, 0.3);
 }
 
 .mcp-details {

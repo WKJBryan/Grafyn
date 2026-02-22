@@ -81,6 +81,10 @@ const props = defineProps({
   showSettings: {
     type: Boolean,
     default: true
+  },
+  refreshKey: {
+    type: Number,
+    default: 0
   }
 })
 
@@ -152,6 +156,11 @@ onMounted(() => {
     resizeObserver.disconnect()
     if (simulation) simulation.stop()
   })
+})
+
+// Re-fetch graph when parent signals data changed
+watch(() => props.refreshKey, (newVal, oldVal) => {
+  if (newVal !== oldVal) loadGraph()
 })
 
 async function loadGraph() {

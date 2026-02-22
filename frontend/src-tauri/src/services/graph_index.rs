@@ -205,6 +205,42 @@ impl GraphIndex {
         self.note_meta.get(note_id).cloned()
     }
 
+    /// Get the full graph structure for visualization
+    pub fn get_full_graph(&self) -> FullGraph {
+        let mut nodes = Vec::new();
+        let mut links = Vec::new();
+
+        // Build nodes from all known notes
+        for (id, meta) in &self.note_meta {
+            let backlink_count = self
+                .backlinks
+                .get(id)
+                .map(|s| s.len())
+                .unwrap_or(0);
+
+            nodes.push(GraphNode {
+                id: id.clone(),
+                label: meta.title.clone(),
+                val: backlink_count + 1,
+                note_type: meta.status.to_string(),
+                tags: meta.tags.clone(),
+                group: "#6b7280".to_string(),
+            });
+        }
+
+        // Build links from outgoing map
+        for (source, targets) in &self.outgoing {
+            for target in targets {
+                links.push(GraphLink {
+                    source: source.clone(),
+                    target: target.clone(),
+                });
+            }
+        }
+
+        FullGraph { nodes, links }
+    }
+
     /// Get statistics about the graph
     pub fn stats(&self) -> GraphStats {
         let total_notes = self.note_meta.len();
@@ -223,6 +259,31 @@ impl GraphIndex {
             orphan_notes,
         }
     }
+}
+
+/// Full graph structure for visualization (nodes + links)
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct FullGraph {
+    pub nodes: Vec<GraphNode>,
+    pub links: Vec<GraphLink>,
+}
+
+/// A node in the full graph visualization
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct GraphNode {
+    pub id: String,
+    pub label: String,
+    pub val: usize,
+    pub note_type: String,
+    pub tags: Vec<String>,
+    pub group: String,
+}
+
+/// A directed link between two nodes
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct GraphLink {
+    pub source: String,
+    pub target: String,
 }
 
 /// Statistics about the note graph

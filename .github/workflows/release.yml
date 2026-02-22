@@ -192,6 +192,21 @@ jobs:
         shell: bash
 
       # ========================================
+      # Build MCP Binary (native Rust, no Tauri)
+      # ========================================
+      - name: Build MCP binary
+        working-directory: frontend/src-tauri
+        shell: bash
+        run: |
+          EXT=""
+          if [[ "${{ matrix.os_name }}" == "windows" ]]; then
+            EXT=".exe"
+          fi
+          cargo build --release --bin grafyn-mcp --no-default-features --features mcp --target ${{ matrix.target }}
+          cp "target/${{ matrix.target }}/release/grafyn-mcp${EXT}" "binaries/grafyn-mcp-${{ matrix.target }}${EXT}"
+          echo "Built grafyn-mcp for ${{ matrix.target }}"
+
+      # ========================================
       # Build Tauri App & Upload to Release
       # ========================================
       - name: Build Tauri app
@@ -203,7 +218,7 @@ jobs:
         with:
           projectPath: frontend
           tauriScript: npx tauri
-          args: --target ${{ matrix.target }} --config '{"tauri":{"bundle":{"externalBin":[]}}}'
+          args: --target ${{ matrix.target }}
           releaseId: ${{ needs.create-release.outputs.release_id }}
           updaterJsonPreferNsis: true
 

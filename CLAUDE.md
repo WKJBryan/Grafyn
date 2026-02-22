@@ -8,6 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 |-----------|-------|-------------|------|
 | **Backend (Python)** | FastAPI, LanceDB, sentence-transformers, OpenRouter | `backend/app/main.py` | 8080 |
 | **Backend (Rust)** | Tauri, Tantivy, petgraph, reqwest | `frontend/src-tauri/src/main.rs` | N/A |
+| **MCP Server** | rmcp, Tantivy, stdio transport | `frontend/src-tauri/src/mcp.rs` | stdio |
 | **Frontend** | Vue 3, Vite, Pinia, D3.js | `frontend/src/main.js` | 5173 |
 
 ## Deployment Modes
@@ -16,7 +17,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 |------|---------|-------------|----------|
 | **Web** | Python/FastAPI | N/A | Development, MCP integration |
 | **Desktop** | Rust/Tauri | ~15-30MB | Production desktop app |
-| **Desktop + MCP** | Rust + Python sidecar | ~70-100MB | Desktop app with Claude/ChatGPT integration |
+| **Desktop + MCP** | Rust/Tauri + native MCP binary | ~25-40MB | Desktop app with Claude Desktop integration |
 
 ## Development Commands
 
@@ -150,7 +151,7 @@ async def example(request: Request):
 | `feedback.py` | `/api/feedback` | 2 | Submit feedback, check status |
 | `oauth.py` | `/auth` | 4 | GitHub OAuth flow |
 
-### Tauri IPC Commands (53 total across 8 modules)
+### Tauri IPC Commands (49 total across 8 modules)
 
 | Module | Commands | Purpose |
 |--------|----------|---------|
@@ -160,7 +161,7 @@ async def example(request: Request):
 | `commands/canvas.rs` | `list_sessions`, `get_session`, `create_session`, `update_session`, `delete_session`, `get_available_models`, `send_prompt`, `update_tile_position`, `delete_tile`, `delete_response`, `update_viewport`, `update_llm_node_position`, `auto_arrange`, `export_to_note`, `start_debate`, `continue_debate`, `add_models_to_tile`, `regenerate_response` | Multi-LLM canvas (streaming via `canvas-stream` Tauri events) |
 | `commands/settings.rs` | `get_settings`, `get_settings_status`, `update_settings`, `complete_setup`, `pick_vault_folder`, `validate_openrouter_key`, `get_openrouter_status` | App settings & first-run setup |
 | `commands/feedback.rs` | `submit_feedback`, `get_system_info`, `feedback_status`, `get_pending_feedback`, `retry_pending_feedback`, `clear_pending_feedback` | Feedback with offline queue |
-| `commands/mcp.rs` | `get_mcp_status`, `start_mcp_sidecar`, `stop_mcp_sidecar`, `restart_mcp_sidecar`, `check_mcp_health`, `get_mcp_config_snippet` | MCP sidecar lifecycle |
+| `commands/mcp.rs` | `get_mcp_status`, `get_mcp_config_snippet` | MCP config for Claude Desktop |
 | `commands/memory.rs` | `recall_relevant`, `find_contradictions`, `extract_claims` | Memory recall & contradiction detection |
 
 ### Frontend API Client
@@ -245,6 +246,9 @@ Configurable search result ranking. Factors: `recency_weight`, `content_type_wei
 
 ### MCP Integration
 
+**Desktop (Rust):** Native `grafyn-mcp` binary using `rmcp` crate, stdio transport. See [MCP Server](#mcp-server-desktop--claude-desktop) section.
+
+**Web (Python):** SSE-based MCP via `fastapi-mcp`:
 - **Endpoint:** `/sse` (Server-Sent Events for MCP protocol)
 - **Library:** `fastapi-mcp` wraps FastAPI routes as MCP tools
 - **Setup:** `setup_mcp(app)` in `main.py` auto-exposes tagged endpoints
@@ -252,7 +256,8 @@ Configurable search result ranking. Factors: `recency_weight`, `content_type_wei
 - **Write operations:** Notes created via MCP are tagged with `source: chatgpt-mcp`, `created_via: mcp`
 - **Dev mode:** Set `ENVIRONMENT=development` to bypass OAuth
 
-**MCP module files:** `mcp/server.py`, `mcp/tools.py`, `mcp/oauth.py`, `mcp/write_tools.py`
+**MCP module files (Python):** `mcp/server.py`, `mcp/tools.py`, `mcp/oauth.py`, `mcp/write_tools.py`
+**MCP files (Rust):** `src/mcp.rs` (binary entry point), `src/mcp_tools.rs` (9 tool definitions)
 
 ### Multi-LLM Canvas
 
@@ -277,7 +282,6 @@ First-run setup wizard and persistent settings. Manages vault path, OpenRouter A
 
 **Runtime sync pattern:** When settings change via `update_settings`, dependent services are updated in-place — no restart required. The pattern (in `commands/settings.rs`): capture changed fields before moving the update, apply settings, then sync each affected service:
 - **OpenRouter API key** → `openrouter.set_api_key()`
-- **MCP enabled** → `mcp_sidecar.start()` / `stop()`
 - **Vault path** → `knowledge_store.set_vault_path()` + rebuild search index + rebuild graph index
 
 ## Configuration
@@ -304,31 +308,40 @@ cp backend/.env.example .env
 | `GITHUB_FEEDBACK_TOKEN` | `""` | GitHub PAT with `issues:write` scope |
 | `TOKEN_ENCRYPTION_KEY` | — | Generate: `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"` |
 
-## MCP Sidecar (Desktop + Claude/ChatGPT)
+## MCP Server (Desktop + Claude Desktop)
 
-The desktop app can bundle a Python backend sidecar for MCP support, allowing Claude Desktop and ChatGPT to connect to your local knowledge base.
+The desktop app bundles a native Rust MCP server binary (`grafyn-mcp`) that Claude Desktop launches directly via stdio transport. No Python, no sidecar process management — just a ~10MB binary that reuses the same Rust services as the Tauri app.
 
 ```
-Tauri App → spawns Python sidecar (localhost:8765) → /sse endpoint
-                                                          ↑
-                                              Claude Desktop / ChatGPT
+Claude Desktop → launches grafyn-mcp (stdio) → reads/writes vault files
+                                              → queries Tantivy search index
+                                              → traverses link graph
 ```
 
-**Building the sidecar:**
+**Architecture:** The `grafyn-mcp` binary is a second `[[bin]]` target in the same `Cargo.toml`, compiled with `--no-default-features --features mcp` (no Tauri). It shares `services/` and `models/` modules with the Tauri app.
+
+**Concurrent access:** The MCP binary tries to acquire the Tantivy writer lock. If the Tauri app holds it, it falls back to read-only search (queries work, index updates are skipped). File I/O to the vault is always safe.
+
+**Building locally:**
 ```bash
-cd backend
-pip install pyinstaller
-python build-exe.py    # Bundles to frontend/src-tauri/binaries/
+cd frontend/src-tauri
+cargo build --release --bin grafyn-mcp --no-default-features --features mcp
 ```
 
-**Enabling at runtime:** `set MCP_ENABLED=1` (Windows) or `export MCP_ENABLED=1`
+**9 MCP tools:** `list_notes`, `get_note`, `create_note`, `update_note`, `delete_note`, `search_notes`, `get_backlinks`, `get_outgoing`, `recall_relevant`
 
 **Connecting Claude Desktop:** Add to `claude_desktop_config.json`:
 ```json
-{ "mcpServers": { "grafyn-local": { "url": "http://localhost:8765/sse" } } }
+{
+  "mcpServers": {
+    "grafyn": {
+      "command": "path/to/grafyn-mcp",
+      "args": ["--vault", "path/to/vault", "--data", "path/to/data"]
+    }
+  }
+}
 ```
-
-**Connecting ChatGPT:** Requires OAuth. See `CHATGPT_MCP_SETUP_GUIDE.md`.
+The Grafyn Settings UI shows this config snippet with the correct paths pre-filled.
 
 ## CI/CD Release Pipeline
 
@@ -341,7 +354,7 @@ create-release → build (4-job matrix) → publish-release → upload-to-r2 →
 | Job | Purpose |
 |-----|---------|
 | `create-release` | Creates a single **draft** GitHub release (avoids matrix race condition) |
-| `build` | 4-platform matrix (Win x64/ARM, macOS ARM, Linux x64) via `tauri-action` with `releaseId` |
+| `build` | 4-platform matrix: builds MCP binary first, then `tauri-action` (with `releaseId`) bundles it |
 | `publish-release` | Marks draft → published after all builds upload artifacts |
 | `upload-to-r2` | Downloads release assets, rewrites `latest.json` URLs, uploads to Cloudflare R2 |
 | `build-summary` | Writes build status table to GitHub Actions summary |

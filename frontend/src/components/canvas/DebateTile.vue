@@ -99,7 +99,7 @@
         </div>
         <div class="round-responses">
           <div
-            v-for="(response, modelId) in round"
+            v-for="(response, modelId) in getRoundResponses(round)"
             :key="modelId"
             class="round-response"
           >
@@ -172,18 +172,39 @@ const tileStyle = computed(() => ({
 // Get a summary from the last round for the compact view (no truncation, scrollable)
 const lastRoundSummary = computed(() => {
   if (!props.debate.rounds || props.debate.rounds.length === 0) return null
-  
+
   const lastRound = props.debate.rounds[props.debate.rounds.length - 1]
-  const models = Object.keys(lastRound)
-  if (models.length === 0) return null
-  
+  if (!lastRound) return null
+
+  const responses = getRoundResponses(lastRound)
+  const modelIds = Object.keys(responses)
+  if (modelIds.length === 0) return null
+
   // Get the first model's response as summary
-  const firstResponse = lastRound[models[0]]
-  if (!firstResponse) return null
-  
+  const firstResponse = responses[modelIds[0]]
+  if (!firstResponse || typeof firstResponse !== 'string') return null
+
   marked.setOptions({ breaks: true, gfm: true })
   return marked(firstResponse)
 })
+
+// Helper to normalize round data structure
+function getRoundResponses(round) {
+  if (!round) return {}
+  // Handle Rust DebateRound: { round_number, topic, responses: Vec<DebateResponse>, created_at }
+  if (round.responses && Array.isArray(round.responses)) {
+    const result = {}
+    for (const resp of round.responses) {
+      result[resp.model_id] = resp.content
+    }
+    return result
+  }
+  // Legacy fallback: already a { model_id: content } map (web backend)
+  if (typeof round === 'object' && !Array.isArray(round) && !('round_number' in round)) {
+    return round
+  }
+  return {}
+}
 
 // Methods
 function getModelName(modelId) {

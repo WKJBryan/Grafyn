@@ -65,6 +65,56 @@ impl SearchService {
         })
     }
 
+    /// Open the search index in read-only mode (no writer lock acquired).
+    ///
+    /// This allows the MCP binary to coexist with a running Tauri app, since
+    /// Tantivy only permits one IndexWriter per directory. In read-only mode,
+    /// search queries work normally but index_note/remove_note/reindex_all are
+    /// no-ops (they require the writer).
+    pub fn new_readonly(data_path: PathBuf) -> Result<Self> {
+        let index_path = data_path.join("search_index");
+
+        // In read-only mode, the index must already exist
+        if !index_path.join("meta.json").exists() {
+            anyhow::bail!(
+                "Search index not found at {}. Run the Grafyn app first to create it.",
+                index_path.display()
+            );
+        }
+
+        let index = Index::open_in_dir(&index_path)
+            .context("Failed to open existing index in read-only mode")?;
+
+        let schema = index.schema();
+        let id_field = schema.get_field("id").context("Missing id field")?;
+        let title_field = schema.get_field("title").context("Missing title field")?;
+        let content_field = schema.get_field("content").context("Missing content field")?;
+        let tags_field = schema.get_field("tags").context("Missing tags field")?;
+        let status_field = schema.get_field("status").context("Missing status field")?;
+
+        let reader = index
+            .reader_builder()
+            .reload_policy(ReloadPolicy::OnCommitWithDelay)
+            .try_into()
+            .context("Failed to create index reader")?;
+
+        Ok(Self {
+            index,
+            reader,
+            writer: None, // No writer — read-only mode
+            id_field,
+            title_field,
+            content_field,
+            tags_field,
+            status_field,
+        })
+    }
+
+    /// Whether this service has write capabilities (index updates).
+    pub fn is_readonly(&self) -> bool {
+        self.writer.is_none()
+    }
+
     /// Index a note
     pub fn index_note(&mut self, note: &Note) -> Result<()> {
         let writer = self.writer.as_mut().context("Writer not available")?;
