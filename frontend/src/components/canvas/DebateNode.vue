@@ -185,6 +185,7 @@ const lastRoundSummary = computed(() => {
   
   marked.setOptions({ breaks: true, gfm: true })
   // Show full content (scrollable in UI)
+  if (typeof firstResponse !== 'string') return null
   return marked(firstResponse)
 })
 
@@ -205,11 +206,18 @@ function getModelName(modelId) {
 // Helper to normalize round data structure
 function getRoundResponses(round) {
   if (!round) return {}
-  // If it's already an object with model keys, return it
-  if (typeof round === 'object' && !Array.isArray(round)) {
+  // Handle Rust DebateRound: { round_number, topic, responses: Vec<DebateResponse>, created_at }
+  if (round.responses && Array.isArray(round.responses)) {
+    const result = {}
+    for (const resp of round.responses) {
+      result[resp.model_id] = resp.content
+    }
+    return result
+  }
+  // Legacy fallback: already a { model_id: content } map (web backend)
+  if (typeof round === 'object' && !Array.isArray(round) && !('round_number' in round)) {
     return round
   }
-  // If it's something else, wrap it
   return {}
 }
 

@@ -98,7 +98,10 @@
             <div class="graph-header">
               <h2>Knowledge Graph</h2>
             </div>
-            <GraphView @node-click="handleGraphNodeClick" />
+            <GraphView
+              :refresh-key="graphRefreshKey"
+              @node-click="handleGraphNodeClick"
+            />
           </div>
           
           <!-- Editor Panel (Overlay) -->
@@ -138,7 +141,10 @@
             <div class="section-title">
               Interactive Graph
             </div>
-            <MiniGraph @navigate="handleNoteSelect" />
+            <MiniGraph
+              :refresh-key="graphRefreshKey"
+              @navigate="handleNoteSelect"
+            />
           </div>
           
           <div
@@ -271,6 +277,7 @@ const showSettingsModal = ref(false)
 const isSetupMode = ref(false)
 const isDesktop = isDesktopApp()
 const contradictions = ref([])
+const graphRefreshKey = ref(0)
 
 // Extract all unique tags
 const allTags = computed(() => {
@@ -406,6 +413,7 @@ async function loadNotes() {
   try {
     const data = await notesApi.list()
     notes.value = data
+    graphRefreshKey.value++
   } catch (error) {
     console.error('Failed to load notes:', error)
   }

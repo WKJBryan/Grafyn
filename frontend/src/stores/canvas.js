@@ -515,6 +515,9 @@ export const useCanvasStore = defineStore('canvas', () => {
           max_rounds: maxRounds
         }
 
+        let debateCompleteResolve
+        const debateCompletePromise = new Promise(resolve => { debateCompleteResolve = resolve })
+
         const unlisten = await setupTauriStreamListener(sessionId, {
           debate_created: (data) => {
             if (currentSession.value && data.debate) {
@@ -522,9 +525,7 @@ export const useCanvasStore = defineStore('canvas', () => {
             }
           },
           round_start: () => {},
-          debate_chunk: () => {
-            // Could update UI for streaming debate content
-          },
+          debate_chunk: () => {},
           model_complete: (data) => {
             streamingModels.value.delete(data.model_id)
           },
@@ -534,12 +535,18 @@ export const useCanvasStore = defineStore('canvas', () => {
           },
           debate_complete: async () => {
             await loadSession(sessionId)
+            debateCompleteResolve()
           }
         })
 
         try {
           const debateId = await canvasApi.startDebate(sessionId, request)
-          await waitForModelsComplete(participatingModels, 180000)
+          // Wait for debate_complete (the real end signal), not model_complete
+          // model_complete fires per-round, so polling streamingModels resolves too early
+          await Promise.race([
+            debateCompletePromise,
+            new Promise(resolve => setTimeout(resolve, 180000))
+          ])
           return debateId
         } finally {
           unlisten()
@@ -637,6 +644,9 @@ export const useCanvasStore = defineStore('canvas', () => {
         // === Tauri path ===
         const request = { prompt }
 
+        let debateCompleteResolve
+        const debateCompletePromise = new Promise(resolve => { debateCompleteResolve = resolve })
+
         const unlisten = await setupTauriStreamListener(sessionId, {
           debate_chunk: () => {},
           model_complete: (data) => {
@@ -647,12 +657,16 @@ export const useCanvasStore = defineStore('canvas', () => {
           },
           debate_complete: async () => {
             await loadSession(sessionId)
+            debateCompleteResolve()
           }
         })
 
         try {
           await canvasApi.continueDebate(sessionId, debateId, request)
-          await waitForModelsComplete(participatingModels, 180000)
+          await Promise.race([
+            debateCompletePromise,
+            new Promise(resolve => setTimeout(resolve, 180000))
+          ])
         } finally {
           unlisten()
         }

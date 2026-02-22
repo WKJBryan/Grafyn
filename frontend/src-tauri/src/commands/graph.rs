@@ -1,5 +1,5 @@
 use crate::models::note::{GraphNeighbor, NoteMeta};
-use crate::services::graph_index::GraphStats;
+use crate::services::graph_index::{FullGraph, GraphStats};
 use crate::AppState;
 use tauri::State;
 
@@ -32,6 +32,13 @@ pub async fn get_neighbors(
 pub async fn get_unlinked(state: State<'_, AppState>) -> Result<Vec<NoteMeta>, String> {
     let graph = state.graph_index.read().await;
     Ok(graph.get_unlinked())
+}
+
+/// Get the full graph structure (nodes + links) for visualization
+#[tauri::command]
+pub async fn get_full_graph(state: State<'_, AppState>) -> Result<FullGraph, String> {
+    let graph = state.graph_index.read().await;
+    Ok(graph.get_full_graph())
 }
 
 /// Rebuild the graph index from all notes

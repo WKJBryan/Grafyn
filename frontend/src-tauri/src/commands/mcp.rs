@@ -1,129 +1,104 @@
-//! MCP Sidecar Commands
+//! MCP Configuration Commands
 //!
-//! Tauri IPC commands for managing the Python backend sidecar that provides
-//! MCP (Model Context Protocol) support for Claude Desktop and ChatGPT.
+//! Tauri IPC commands for the native Rust MCP server (grafyn-mcp binary).
+//! Unlike the old Python sidecar, the MCP server is a standalone binary that
+//! Claude Desktop launches directly via stdio — no process management needed.
 
-use crate::services::mcp_sidecar::SidecarStatus;
 use crate::AppState;
 use tauri::State;
 
-/// Response containing MCP server information
+/// MCP status and configuration information
 #[derive(serde::Serialize)]
 pub struct McpInfo {
-    /// Whether MCP sidecar is enabled
-    pub enabled: bool,
-    /// Current status of the sidecar
-    pub status: SidecarStatus,
-    /// MCP endpoint URL (for Claude Desktop config)
-    pub mcp_url: String,
-    /// API base URL
-    pub api_url: String,
-    /// Port the server is running on
-    pub port: u16,
+    /// Whether the grafyn-mcp binary was found
+    pub available: bool,
+    /// Path to the grafyn-mcp binary (if found)
+    pub binary_path: Option<String>,
+    /// Claude Desktop config snippet
+    pub config_snippet: String,
 }
 
-/// Get MCP sidecar status and connection information
+/// Get MCP status and configuration
+///
+/// Returns whether the MCP binary is available and the config snippet
+/// for Claude Desktop integration.
 #[tauri::command]
 pub async fn get_mcp_status(state: State<'_, AppState>) -> Result<McpInfo, String> {
-    let sidecar = &state.mcp_sidecar;
+    let binary_path = find_mcp_binary();
+    let settings = state.settings_service.read().await;
+    let vault_path = settings.vault_path();
+    let data_path = settings.data_path();
+
+    let config_snippet = build_config_snippet(
+        binary_path.as_deref(),
+        &vault_path.to_string_lossy(),
+        &data_path.to_string_lossy(),
+    );
 
     Ok(McpInfo {
-        enabled: sidecar.is_enabled(),
-        status: sidecar.status().await,
-        mcp_url: sidecar.mcp_url(),
-        api_url: sidecar.api_url(),
-        port: crate::services::mcp_sidecar::DEFAULT_MCP_PORT,
+        available: binary_path.is_some(),
+        binary_path,
+        config_snippet,
     })
 }
 
-/// Start the MCP sidecar
-#[tauri::command]
-pub async fn start_mcp_sidecar(
-    state: State<'_, AppState>,
-    app_handle: tauri::AppHandle,
-) -> Result<McpInfo, String> {
-    let sidecar = &state.mcp_sidecar;
-
-    // Enable the sidecar
-    sidecar.set_enabled(true);
-
-    // Start it
-    sidecar.start(&app_handle).await?;
-
-    // Return updated status
-    Ok(McpInfo {
-        enabled: sidecar.is_enabled(),
-        status: sidecar.status().await,
-        mcp_url: sidecar.mcp_url(),
-        api_url: sidecar.api_url(),
-        port: crate::services::mcp_sidecar::DEFAULT_MCP_PORT,
-    })
-}
-
-/// Stop the MCP sidecar
-#[tauri::command]
-pub async fn stop_mcp_sidecar(state: State<'_, AppState>) -> Result<McpInfo, String> {
-    let sidecar = &state.mcp_sidecar;
-
-    // Stop it
-    sidecar.stop().await?;
-
-    // Disable the sidecar
-    sidecar.set_enabled(false);
-
-    // Return updated status
-    Ok(McpInfo {
-        enabled: sidecar.is_enabled(),
-        status: sidecar.status().await,
-        mcp_url: sidecar.mcp_url(),
-        api_url: sidecar.api_url(),
-        port: crate::services::mcp_sidecar::DEFAULT_MCP_PORT,
-    })
-}
-
-/// Restart the MCP sidecar
-#[tauri::command]
-pub async fn restart_mcp_sidecar(
-    state: State<'_, AppState>,
-    app_handle: tauri::AppHandle,
-) -> Result<McpInfo, String> {
-    let sidecar = &state.mcp_sidecar;
-
-    // Restart it
-    sidecar.restart(&app_handle).await?;
-
-    // Return updated status
-    Ok(McpInfo {
-        enabled: sidecar.is_enabled(),
-        status: sidecar.status().await,
-        mcp_url: sidecar.mcp_url(),
-        api_url: sidecar.api_url(),
-        port: crate::services::mcp_sidecar::DEFAULT_MCP_PORT,
-    })
-}
-
-/// Check if the MCP sidecar is healthy
-#[tauri::command]
-pub async fn check_mcp_health(state: State<'_, AppState>) -> Result<bool, String> {
-    let sidecar = &state.mcp_sidecar;
-    Ok(sidecar.health_check().await)
-}
-
-/// Get the MCP URL for Claude Desktop configuration
+/// Get the Claude Desktop config snippet for MCP integration
 ///
-/// Returns a JSON snippet that users can add to their claude_desktop_config.json
+/// Returns a JSON string that users can paste into claude_desktop_config.json
 #[tauri::command]
 pub async fn get_mcp_config_snippet(state: State<'_, AppState>) -> Result<String, String> {
-    let sidecar = &state.mcp_sidecar;
-    let mcp_url = sidecar.mcp_url();
+    let binary_path = find_mcp_binary();
+    let settings = state.settings_service.read().await;
+    let vault_path = settings.vault_path();
+    let data_path = settings.data_path();
+
+    Ok(build_config_snippet(
+        binary_path.as_deref(),
+        &vault_path.to_string_lossy(),
+        &data_path.to_string_lossy(),
+    ))
+}
+
+/// Find the grafyn-mcp binary adjacent to the current executable.
+///
+/// Tauri bundles external binaries in the same directory as the main app.
+fn find_mcp_binary() -> Option<String> {
+    let exe_dir = std::env::current_exe()
+        .ok()?
+        .parent()?
+        .to_path_buf();
+
+    // Check for platform-specific binary name
+    let binary_name = if cfg!(target_os = "windows") {
+        "grafyn-mcp.exe"
+    } else {
+        "grafyn-mcp"
+    };
+
+    let binary_path = exe_dir.join(binary_name);
+    if binary_path.exists() {
+        Some(binary_path.to_string_lossy().to_string())
+    } else {
+        None
+    }
+}
+
+/// Build the Claude Desktop config snippet JSON.
+fn build_config_snippet(binary_path: Option<&str>, vault_path: &str, data_path: &str) -> String {
+    let cmd = binary_path.unwrap_or(if cfg!(target_os = "windows") {
+        "grafyn-mcp.exe"
+    } else {
+        "grafyn-mcp"
+    });
 
     let config = serde_json::json!({
         "mcpServers": {
-            "grafyn-local": {
-                "url": mcp_url
+            "grafyn": {
+                "command": cmd,
+                "args": ["--vault", vault_path, "--data", data_path]
             }
         }
     });
 
-    Ok(serde_json::to_string_pretty(&config).unwrap_or_default())
+    serde_json::to_string_pretty(&config).unwrap_or_default()
 }

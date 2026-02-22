@@ -587,6 +587,14 @@ pub async fn start_debate(
                                 error: e.to_string(),
                             },
                         );
+                        let _ = window.emit(
+                            "canvas-stream",
+                            CanvasStreamEvent::ModelComplete {
+                                session_id: session_id_clone.clone(),
+                                debate_id: debate_id_clone.clone(),
+                                model_id: model_id.clone(),
+                            },
+                        );
                     }
                 }
             }
@@ -749,6 +757,14 @@ pub async fn continue_debate(
                             debate_id: debate_id.clone(),
                             model_id: model_id.clone(),
                             error: e.to_string(),
+                        },
+                    );
+                    let _ = window.emit(
+                        "canvas-stream",
+                        CanvasStreamEvent::ModelComplete {
+                            session_id: session_id.clone(),
+                            debate_id: debate_id.clone(),
+                            model_id: model_id.clone(),
                         },
                     );
                 }

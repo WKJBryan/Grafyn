@@ -4,6 +4,7 @@
       :width="300"
       :height="250"
       :show-settings="false"
+      :refresh-key="refreshKey"
       @node-click="handleNodeClick"
     />
   </div>
@@ -11,6 +12,13 @@
 
 <script setup>
 import GraphView from './GraphView.vue'
+
+defineProps({
+  refreshKey: {
+    type: Number,
+    default: 0
+  }
+})
 
 const emit = defineEmits(['navigate'])
 

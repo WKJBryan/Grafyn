@@ -122,7 +122,7 @@ export const graph = {
 
   rebuild: () => invokeOrHttp('rebuild_graph', {}, () => api.post('/graph/rebuild')),
 
-  full: () => api.get('/graph/full'),
+  full: () => invokeOrHttp('get_full_graph', {}, () => api.get('/graph/full')),
 
   unlinked: () => invokeOrHttp('get_unlinked', {}, () => api.get('/graph/unlinked')),
 }
@@ -314,30 +314,12 @@ export const settings = {
     ),
 }
 
-// MCP Sidecar API (Desktop only)
+// MCP API (Desktop only — native Rust MCP server)
 export const mcp = {
   getStatus: () =>
     invokeOrHttp('get_mcp_status', {}, () =>
-      Promise.resolve({ enabled: false, status: 'Stopped', mcp_url: '', api_url: '', port: 8765 })
+      Promise.resolve({ available: false, binary_path: null, config_snippet: '' })
     ),
-
-  start: () =>
-    invokeOrHttp('start_mcp_sidecar', {}, () =>
-      Promise.resolve({ enabled: false, status: 'Stopped' })
-    ),
-
-  stop: () =>
-    invokeOrHttp('stop_mcp_sidecar', {}, () =>
-      Promise.resolve({ enabled: false, status: 'Stopped' })
-    ),
-
-  restart: () =>
-    invokeOrHttp('restart_mcp_sidecar', {}, () =>
-      Promise.resolve({ enabled: false, status: 'Stopped' })
-    ),
-
-  checkHealth: () =>
-    invokeOrHttp('check_mcp_health', {}, () => Promise.resolve(false)),
 
   getConfigSnippet: () =>
     invokeOrHttp('get_mcp_config_snippet', {}, () => Promise.resolve('')),

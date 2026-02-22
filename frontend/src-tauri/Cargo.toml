@@ -7,13 +7,23 @@ license = "MIT"
 repository = ""
 edition = "2021"
 
+# Two binaries: Tauri desktop app and standalone MCP server
+[[bin]]
+name = "grafyn"
+path = "src/main.rs"
+required-features = ["tauri-app"]
+
+[[bin]]
+name = "grafyn-mcp"
+path = "src/mcp.rs"
+required-features = ["mcp"]
+
 [build-dependencies]
-tauri-build = { version = "1.5", features = [] }
+tauri-build = { version = "1.5", features = [], optional = true }
 
 [dependencies]
-# Tauri core
-# Note: Using explicit features instead of api-all to enable shell-sidecar without shell-all
-tauri = { version = "1.8", features = [
+# Tauri core (optional — only needed for the desktop app binary)
+tauri = { version = "1.8", optional = true, features = [
     "clipboard-all",
     "dialog-all",
     "fs-all",
@@ -69,6 +79,13 @@ env_logger = "0.11"
 # System paths
 dirs = "5.0"
 
+# MCP server (optional — only needed for the grafyn-mcp binary)
+rmcp = { version = "0.15", features = ["server", "transport-io"], optional = true }
+schemars = { version = "1", optional = true }
+clap = { version = "4", features = ["derive"], optional = true }
+
 [features]
-default = ["custom-protocol"]
-custom-protocol = ["tauri/custom-protocol"]
+default = ["tauri-app", "custom-protocol"]
+tauri-app = ["dep:tauri", "dep:tauri-build"]
+custom-protocol = ["tauri-app", "tauri/custom-protocol"]
+mcp = ["dep:rmcp", "dep:schemars", "dep:clap"]
