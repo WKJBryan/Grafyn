@@ -75,7 +75,7 @@ describe('SearchBar', () => {
 
   describe('Search Debouncing', () => {
     it('debounces search input with 300ms delay', async () => {
-      const mockSearch = vi.spyOn(apiClient.search, 'query').mockResolvedValue([])
+      const mockSearch = vi.spyOn(apiClient.memory, 'recall').mockResolvedValue({ results: [] })
 
       wrapper = mount(SearchBar)
 
@@ -93,11 +93,11 @@ describe('SearchBar', () => {
       await nextTick()
 
       expect(mockSearch).toHaveBeenCalledTimes(1)
-      expect(mockSearch).toHaveBeenCalledWith('test', { limit: 5 })
+      expect(mockSearch).toHaveBeenCalledWith('test', [], 5)
     })
 
     it('resets debounce timer on each keystroke', async () => {
-      const mockSearch = vi.spyOn(apiClient.search, 'query').mockResolvedValue([])
+      const mockSearch = vi.spyOn(apiClient.memory, 'recall').mockResolvedValue({ results: [] })
 
       wrapper = mount(SearchBar)
 
@@ -120,11 +120,11 @@ describe('SearchBar', () => {
       await nextTick()
 
       expect(mockSearch).toHaveBeenCalledTimes(1)
-      expect(mockSearch).toHaveBeenCalledWith('tes', { limit: 5 })
+      expect(mockSearch).toHaveBeenCalledWith('tes', [], 5)
     })
 
     it('does not search if query is empty', async () => {
-      const mockSearch = vi.spyOn(apiClient.search, 'query')
+      const mockSearch = vi.spyOn(apiClient.memory, 'recall')
 
       wrapper = mount(SearchBar)
 
@@ -136,7 +136,7 @@ describe('SearchBar', () => {
     })
 
     it('does not search if query is only whitespace', async () => {
-      const mockSearch = vi.spyOn(apiClient.search, 'query')
+      const mockSearch = vi.spyOn(apiClient.memory, 'recall')
 
       wrapper = mount(SearchBar)
 
@@ -155,8 +155,8 @@ describe('SearchBar', () => {
   describe('Search API Calls', () => {
     it('calls search API with correct parameters', async () => {
       const mockSearch = vi
-        .spyOn(apiClient.search, 'query')
-        .mockResolvedValue([])
+        .spyOn(apiClient.memory, 'recall')
+        .mockResolvedValue({ results: [] })
 
       wrapper = mount(SearchBar)
 
@@ -164,11 +164,11 @@ describe('SearchBar', () => {
       vi.advanceTimersByTime(300)
       await nextTick()
 
-      expect(mockSearch).toHaveBeenCalledWith('test query', { limit: 5 })
+      expect(mockSearch).toHaveBeenCalledWith('test query', [], 5)
     })
 
     it('limits results to 5', async () => {
-      const mockSearch = vi.spyOn(apiClient.search, 'query').mockResolvedValue([])
+      const mockSearch = vi.spyOn(apiClient.memory, 'recall').mockResolvedValue({ results: [] })
 
       wrapper = mount(SearchBar)
 
@@ -176,13 +176,13 @@ describe('SearchBar', () => {
       vi.advanceTimersByTime(300)
       await nextTick()
 
-      expect(mockSearch).toHaveBeenCalledWith('test', { limit: 5 })
+      expect(mockSearch).toHaveBeenCalledWith('test', [], 5)
     })
 
     it('handles search errors gracefully', async () => {
       const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
       const mockSearch = vi
-        .spyOn(apiClient.search, 'query')
+        .spyOn(apiClient.memory, 'recall')
         .mockRejectedValue(new Error('Search failed'))
 
       wrapper = mount(SearchBar)
@@ -209,7 +209,7 @@ describe('SearchBar', () => {
         { note_id: 'note-2', title: 'Test Note 2', score: 0.85 },
       ]
 
-      vi.spyOn(apiClient.search, 'query').mockResolvedValue(mockResults)
+      vi.spyOn(apiClient.memory, 'recall').mockResolvedValue({ results: mockResults })
 
       wrapper = mount(SearchBar)
 
@@ -226,7 +226,7 @@ describe('SearchBar', () => {
     it('shows score bars for results', async () => {
       const mockResults = [{ note_id: 'note-1', title: 'Test Note', score: 0.75 }]
 
-      vi.spyOn(apiClient.search, 'query').mockResolvedValue(mockResults)
+      vi.spyOn(apiClient.memory, 'recall').mockResolvedValue({ results: mockResults })
 
       wrapper = mount(SearchBar)
 
@@ -241,7 +241,7 @@ describe('SearchBar', () => {
     it('does not show results when query is cleared', async () => {
       const mockResults = [{ note_id: 'note-1', title: 'Test Note', score: 0.95 }]
 
-      vi.spyOn(apiClient.search, 'query').mockResolvedValue(mockResults)
+      vi.spyOn(apiClient.memory, 'recall').mockResolvedValue({ results: mockResults })
 
       wrapper = mount(SearchBar)
 
@@ -258,7 +258,7 @@ describe('SearchBar', () => {
     })
 
     it('does not show dropdown when no results', async () => {
-      vi.spyOn(apiClient.search, 'query').mockResolvedValue([])
+      vi.spyOn(apiClient.memory, 'recall').mockResolvedValue({ results: [] })
 
       wrapper = mount(SearchBar)
 
@@ -281,7 +281,7 @@ describe('SearchBar', () => {
         { note_id: 'note-2', title: 'Test Note 2', score: 0.85 },
       ]
 
-      vi.spyOn(apiClient.search, 'query').mockResolvedValue(mockResults)
+      vi.spyOn(apiClient.memory, 'recall').mockResolvedValue({ results: mockResults })
 
       wrapper = mount(SearchBar)
 
@@ -299,7 +299,7 @@ describe('SearchBar', () => {
     it('clears input and results after selection', async () => {
       const mockResults = [{ note_id: 'note-1', title: 'Test Note', score: 0.95 }]
 
-      vi.spyOn(apiClient.search, 'query').mockResolvedValue(mockResults)
+      vi.spyOn(apiClient.memory, 'recall').mockResolvedValue({ results: mockResults })
 
       wrapper = mount(SearchBar)
 
@@ -325,7 +325,7 @@ describe('SearchBar', () => {
         { note_id: 'note-2', title: 'Second Note', score: 0.85 },
       ]
 
-      vi.spyOn(apiClient.search, 'query').mockResolvedValue(mockResults)
+      vi.spyOn(apiClient.memory, 'recall').mockResolvedValue({ results: mockResults })
 
       wrapper = mount(SearchBar)
 
@@ -340,7 +340,7 @@ describe('SearchBar', () => {
     })
 
     it('does not emit select on Enter if no results', async () => {
-      vi.spyOn(apiClient.search, 'query').mockResolvedValue([])
+      vi.spyOn(apiClient.memory, 'recall').mockResolvedValue({ results: [] })
 
       wrapper = mount(SearchBar)
 
@@ -356,7 +356,7 @@ describe('SearchBar', () => {
     it('clears query and results on Escape key', async () => {
       const mockResults = [{ note_id: 'note-1', title: 'Test Note', score: 0.95 }]
 
-      vi.spyOn(apiClient.search, 'query').mockResolvedValue(mockResults)
+      vi.spyOn(apiClient.memory, 'recall').mockResolvedValue({ results: mockResults })
 
       wrapper = mount(SearchBar)
 
@@ -392,7 +392,7 @@ describe('SearchBar', () => {
     it('clears results when clear button is clicked', async () => {
       const mockResults = [{ note_id: 'note-1', title: 'Test Note', score: 0.95 }]
 
-      vi.spyOn(apiClient.search, 'query').mockResolvedValue(mockResults)
+      vi.spyOn(apiClient.memory, 'recall').mockResolvedValue({ results: mockResults })
 
       wrapper = mount(SearchBar)
 
@@ -427,7 +427,7 @@ describe('SearchBar', () => {
     it('hides results when clicking outside', async () => {
       const mockResults = [{ note_id: 'note-1', title: 'Test Note', score: 0.95 }]
 
-      vi.spyOn(apiClient.search, 'query').mockResolvedValue(mockResults)
+      vi.spyOn(apiClient.memory, 'recall').mockResolvedValue({ results: mockResults })
 
       wrapper = mount(SearchBar, { attachTo: document.body })
 
@@ -449,7 +449,7 @@ describe('SearchBar', () => {
     it('keeps results visible when clicking inside search bar', async () => {
       const mockResults = [{ note_id: 'note-1', title: 'Test Note', score: 0.95 }]
 
-      vi.spyOn(apiClient.search, 'query').mockResolvedValue(mockResults)
+      vi.spyOn(apiClient.memory, 'recall').mockResolvedValue({ results: mockResults })
 
       wrapper = mount(SearchBar, { attachTo: document.body })
 
@@ -507,7 +507,7 @@ describe('SearchBar', () => {
   describe('Edge Cases', () => {
     it('handles very long search queries', async () => {
       const longQuery = 'a'.repeat(1000)
-      const mockSearch = vi.spyOn(apiClient.search, 'query').mockResolvedValue([])
+      const mockSearch = vi.spyOn(apiClient.memory, 'recall').mockResolvedValue({ results: [] })
 
       wrapper = mount(SearchBar)
 
@@ -515,12 +515,12 @@ describe('SearchBar', () => {
       vi.advanceTimersByTime(300)
       await nextTick()
 
-      expect(mockSearch).toHaveBeenCalledWith(longQuery, { limit: 5 })
+      expect(mockSearch).toHaveBeenCalledWith(longQuery, [], 5)
     })
 
     it('handles special characters in search query', async () => {
       const specialQuery = '@#$%^&*()[]{}|;:\'",.<>?/~`'
-      const mockSearch = vi.spyOn(apiClient.search, 'query').mockResolvedValue([])
+      const mockSearch = vi.spyOn(apiClient.memory, 'recall').mockResolvedValue({ results: [] })
 
       wrapper = mount(SearchBar)
 
@@ -528,12 +528,12 @@ describe('SearchBar', () => {
       vi.advanceTimersByTime(300)
       await nextTick()
 
-      expect(mockSearch).toHaveBeenCalledWith(specialQuery, { limit: 5 })
+      expect(mockSearch).toHaveBeenCalledWith(specialQuery, [], 5)
     })
 
     it('handles unicode characters in search', async () => {
       const unicodeQuery = '你好世界 🌍'
-      const mockSearch = vi.spyOn(apiClient.search, 'query').mockResolvedValue([])
+      const mockSearch = vi.spyOn(apiClient.memory, 'recall').mockResolvedValue({ results: [] })
 
       wrapper = mount(SearchBar)
 
@@ -541,11 +541,11 @@ describe('SearchBar', () => {
       vi.advanceTimersByTime(300)
       await nextTick()
 
-      expect(mockSearch).toHaveBeenCalledWith(unicodeQuery, { limit: 5 })
+      expect(mockSearch).toHaveBeenCalledWith(unicodeQuery, [], 5)
     })
 
     it('handles rapid consecutive searches', async () => {
-      const mockSearch = vi.spyOn(apiClient.search, 'query').mockResolvedValue([])
+      const mockSearch = vi.spyOn(apiClient.memory, 'recall').mockResolvedValue({ results: [] })
 
       wrapper = mount(SearchBar)
 
@@ -561,7 +561,7 @@ describe('SearchBar', () => {
 
       // Should only search once with final query
       expect(mockSearch).toHaveBeenCalledTimes(1)
-      expect(mockSearch).toHaveBeenCalledWith('aaaaaaaaaa', { limit: 5 })
+      expect(mockSearch).toHaveBeenCalledWith('aaaaaaaaaa', [], 5)
     })
   })
 })

@@ -14,9 +14,22 @@
  * - Event emissions
  */
 
-import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { mount } from '@vue/test-utils'
 import NoteEditor from '@/components/NoteEditor.vue'
+
+const mockToast = vi.hoisted(() => ({
+  toasts: { value: [] },
+  success: vi.fn(),
+  error: vi.fn(),
+  warning: vi.fn(),
+  info: vi.fn(),
+  remove: vi.fn(),
+}))
+
+vi.mock('@/composables/useToast', () => ({
+  useToast: () => mockToast,
+}))
 
 describe('NoteEditor', () => {
   let wrapper
@@ -36,6 +49,7 @@ describe('NoteEditor', () => {
     if (wrapper) {
       wrapper.unmount()
     }
+    vi.clearAllMocks()
   })
 
   // ============================================================================
@@ -438,9 +452,6 @@ describe('NoteEditor', () => {
     })
 
     it('does not save when title is empty', async () => {
-      // Mock alert
-      global.alert = vi.fn()
-
       wrapper = mount(NoteEditor, {
         props: { note: mockNote },
       })
@@ -454,13 +465,11 @@ describe('NoteEditor', () => {
       )
       await saveButton.trigger('click')
 
-      expect(global.alert).toHaveBeenCalledWith('Please enter a title')
+      expect(mockToast.warning).toHaveBeenCalledWith('Please enter a title')
       expect(wrapper.emitted('save')).toBeFalsy()
     })
 
     it('does not save when title is only whitespace', async () => {
-      global.alert = vi.fn()
-
       wrapper = mount(NoteEditor, {
         props: { note: mockNote },
       })
@@ -473,7 +482,7 @@ describe('NoteEditor', () => {
       )
       await saveButton.trigger('click')
 
-      expect(global.alert).toHaveBeenCalled()
+      expect(mockToast.warning).toHaveBeenCalled()
       expect(wrapper.emitted('save')).toBeFalsy()
     })
 
@@ -499,26 +508,7 @@ describe('NoteEditor', () => {
   // ============================================================================
 
   describe('Delete Functionality', () => {
-    it('shows confirmation dialog when delete is clicked', async () => {
-      global.confirm = vi.fn(() => false)
-
-      wrapper = mount(NoteEditor, {
-        props: { note: mockNote },
-      })
-
-      const deleteButton = wrapper.findAll('button').find((btn) =>
-        btn.text().includes('Delete')
-      )
-      await deleteButton.trigger('click')
-
-      expect(global.confirm).toHaveBeenCalledWith(
-        'Are you sure you want to delete this note?'
-      )
-    })
-
-    it('emits delete event when confirmed', async () => {
-      global.confirm = vi.fn(() => true)
-
+    it('emits delete event with note ID when delete is clicked', async () => {
       wrapper = mount(NoteEditor, {
         props: { note: mockNote },
       })
@@ -530,21 +520,6 @@ describe('NoteEditor', () => {
 
       expect(wrapper.emitted('delete')).toBeTruthy()
       expect(wrapper.emitted('delete')[0]).toEqual(['test-note-1'])
-    })
-
-    it('does not emit delete event when cancelled', async () => {
-      global.confirm = vi.fn(() => false)
-
-      wrapper = mount(NoteEditor, {
-        props: { note: mockNote },
-      })
-
-      const deleteButton = wrapper.findAll('button').find((btn) =>
-        btn.text().includes('Delete')
-      )
-      await deleteButton.trigger('click')
-
-      expect(wrapper.emitted('delete')).toBeFalsy()
     })
   })
 
