@@ -86,7 +86,7 @@
       },
       "resources": [],
       "shortDescription": "Knowledge Management Desktop App",
-      "targets": ["nsis", "dmg", "deb", "appimage"],
+      "targets": ["nsis", "dmg", "deb", "appimage", "updater"],
       "windows": {
         "certificateThumbprint": null,
         "digestAlgorithm": "sha256",
