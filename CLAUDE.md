@@ -56,6 +56,8 @@ npm run tauri:build      # Production build → src-tauri/target/release/bundle/
 
 Environment: `set OPENROUTER_API_KEY=your-key` (Windows) or `export OPENROUTER_API_KEY=your-key`
 
+**Version bump:** `npm run version:bump -- X.Y.Z` updates `package.json`, `tauri.conf.json` (version + window title), and `Cargo.toml` in one step.
+
 ### Testing
 
 ```bash
@@ -355,7 +357,7 @@ create-release → build (4-job matrix) → publish-release → upload-to-r2 →
 
 **Key detail:** The `build` matrix receives `releaseId` from `create-release` so `tauri-action` uploads to an existing release instead of each job racing to create one. For `workflow_dispatch` (no tag), `create-release` is skipped and builds produce artifacts only.
 
-**Required secrets:** `TAURI_PRIVATE_KEY`, `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`
+**Required secrets:** `TAURI_PRIVATE_KEY`, `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`, `FEEDBACK_REPO`, `FEEDBACK_TOKEN`
 
 **Required vars:** `CLOUDFLARE_WORKER_URL` (optional, has default)
 
@@ -370,7 +372,7 @@ create-release → build (4-job matrix) → publish-release → upload-to-r2 →
 
 ### Desktop (Tauri)
 
-**Build output:** `frontend/src-tauri/target/release/bundle/` (MSI, DMG, or DEB)
+**Build output:** `frontend/src-tauri/target/release/bundle/` (NSIS `.exe`, DMG, DEB, or AppImage)
 
 **Data location:** `~/Documents/Grafyn/` (`vault/` for notes, `data/` for indexes)
 
