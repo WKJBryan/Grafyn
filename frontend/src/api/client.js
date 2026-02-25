@@ -83,9 +83,15 @@ export const notes = {
 
   reindex: () => invokeOrHttp('reindex', {}, () => api.post('/notes/reindex')),
 
-  // Distillation API (HTTP only for now)
-  distill: (id, request) => api.post(`/notes/${encodeURIComponent(id)}/distill`, request),
-  normalizeTags: (id) => api.post(`/notes/${encodeURIComponent(id)}/normalize-tags`),
+  distill: (id, request) =>
+    invokeOrHttp('distill_note', { id, request }, () =>
+      api.post(`/notes/${encodeURIComponent(id)}/distill`, request)
+    ),
+
+  normalizeTags: (id) =>
+    invokeOrHttp('normalize_tags', { id }, () =>
+      api.post(`/notes/${encodeURIComponent(id)}/normalize-tags`)
+    ),
 }
 
 // Search API

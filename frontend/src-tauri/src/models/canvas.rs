@@ -389,17 +389,20 @@ pub enum CanvasStreamEvent {
         debate_id: String,
         model_id: String,
         chunk: String,
+        round_number: u32,
     },
     ModelComplete {
         session_id: String,
         debate_id: String,
         model_id: String,
+        round_number: u32,
     },
     DebateError {
         session_id: String,
         debate_id: String,
         model_id: String,
         error: String,
+        round_number: u32,
     },
     DebateComplete {
         session_id: String,

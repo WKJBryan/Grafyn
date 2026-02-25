@@ -424,6 +424,25 @@ pub async fn export_to_note(
         properties: HashMap::new(),
     }).map_err(|e| e.to_string())?;
 
+    drop(ks);
+
+    // Update search index (mirrors create_note in notes.rs)
+    {
+        let mut search = state.search_service.write().await;
+        if let Err(e) = search.index_note(&note) {
+            log::error!("Failed to index exported note '{}': {}", note.id, e);
+        }
+        if let Err(e) = search.commit() {
+            log::error!("Failed to commit search index after export '{}': {}", note.id, e);
+        }
+    }
+
+    // Update graph index so backlinks/outgoing links are discoverable
+    {
+        let mut graph = state.graph_index.write().await;
+        graph.update_note(&note);
+    }
+
     Ok(serde_json::json!({
         "note_id": note.id,
         "title": note.title,
@@ -519,8 +538,6 @@ pub async fn start_debate(
                 },
             );
 
-            let mut round_responses = Vec::new();
-
             // Build debate context
             let mut context = format!(
                 "You are participating in a structured debate.\n\nOriginal context:\n{}\n\n",
@@ -541,90 +558,147 @@ pub async fn start_debate(
                 round_num
             ));
 
-            for model_id in &models {
-                let model_name = model_id.split('/').last().unwrap_or(model_id).to_string();
+            // Stream all models concurrently within this round using JoinSet
+            let mut join_set = tokio::task::JoinSet::new();
+
+            for model_id in models.clone() {
+                let model_name = model_id.split('/').last().unwrap_or(&model_id).to_string();
                 let messages = vec![ChatMessage {
                     role: "user".to_string(),
                     content: context.clone(),
                 }];
+                let openrouter_arc = openrouter_arc.clone();
+                let window = window.clone();
+                let session_id = session_id_clone.clone();
+                let debate_id = debate_id_clone.clone();
 
-                let openrouter = openrouter_arc.read().await;
-                let stream_result = openrouter
-                    .chat_stream(model_id, messages, None, Some(0.7), Some(1024))
-                    .await;
-                drop(openrouter);
+                join_set.spawn(async move {
+                    let openrouter = openrouter_arc.read().await;
+                    let stream_result = openrouter
+                        .chat_stream(&model_id, messages, None, Some(0.7), Some(1024))
+                        .await;
+                    drop(openrouter);
 
-                match stream_result {
-                    Ok(stream) => {
-                        let mut stream = Box::pin(stream);
-                        let mut full_content = String::new();
+                    match stream_result {
+                        Ok(stream) => {
+                            let mut stream = Box::pin(stream);
+                            let mut full_content = String::new();
 
-                        while let Some(chunk_result) = stream.next().await {
-                            match chunk_result {
-                                Ok(chunk) => {
-                                    if !chunk.is_empty() {
-                                        full_content.push_str(&chunk);
+                            loop {
+                                match tokio::time::timeout(
+                                    Duration::from_secs(60),
+                                    stream.next(),
+                                )
+                                .await
+                                {
+                                    Ok(Some(Ok(chunk))) => {
+                                        if !chunk.is_empty() {
+                                            full_content.push_str(&chunk);
+                                            let _ = window.emit(
+                                                "canvas-stream",
+                                                CanvasStreamEvent::DebateChunk {
+                                                    session_id: session_id.clone(),
+                                                    debate_id: debate_id.clone(),
+                                                    model_id: model_id.clone(),
+                                                    chunk,
+                                                    round_number: round_num,
+                                                },
+                                            );
+                                        }
+                                    }
+                                    Ok(Some(Err(e))) => {
                                         let _ = window.emit(
                                             "canvas-stream",
-                                            CanvasStreamEvent::DebateChunk {
-                                                session_id: session_id_clone.clone(),
-                                                debate_id: debate_id_clone.clone(),
+                                            CanvasStreamEvent::DebateError {
+                                                session_id: session_id.clone(),
+                                                debate_id: debate_id.clone(),
                                                 model_id: model_id.clone(),
-                                                chunk,
+                                                error: e.to_string(),
+                                                round_number: round_num,
                                             },
                                         );
+                                        return DebateResponse {
+                                            model_id,
+                                            model_name,
+                                            content: full_content,
+                                            stance: None,
+                                        };
+                                    }
+                                    Ok(None) => break, // Stream ended naturally
+                                    Err(_) => {
+                                        let _ = window.emit(
+                                            "canvas-stream",
+                                            CanvasStreamEvent::DebateError {
+                                                session_id: session_id.clone(),
+                                                debate_id: debate_id.clone(),
+                                                model_id: model_id.clone(),
+                                                error: "Stream idle timeout (60s)".to_string(),
+                                                round_number: round_num,
+                                            },
+                                        );
+                                        return DebateResponse {
+                                            model_id,
+                                            model_name,
+                                            content: full_content,
+                                            stance: None,
+                                        };
                                     }
                                 }
-                                Err(e) => {
-                                    let _ = window.emit(
-                                        "canvas-stream",
-                                        CanvasStreamEvent::DebateError {
-                                            session_id: session_id_clone.clone(),
-                                            debate_id: debate_id_clone.clone(),
-                                            model_id: model_id.clone(),
-                                            error: e.to_string(),
-                                        },
-                                    );
-                                    break;
-                                }
+                            }
+
+                            let _ = window.emit(
+                                "canvas-stream",
+                                CanvasStreamEvent::ModelComplete {
+                                    session_id: session_id.clone(),
+                                    debate_id: debate_id.clone(),
+                                    model_id: model_id.clone(),
+                                    round_number: round_num,
+                                },
+                            );
+
+                            DebateResponse {
+                                model_id,
+                                model_name,
+                                content: full_content,
+                                stance: None,
                             }
                         }
-
-                        round_responses.push(DebateResponse {
-                            model_id: model_id.clone(),
-                            model_name: model_name.clone(),
-                            content: full_content,
-                            stance: None,
-                        });
-
-                        let _ = window.emit(
-                            "canvas-stream",
-                            CanvasStreamEvent::ModelComplete {
-                                session_id: session_id_clone.clone(),
-                                debate_id: debate_id_clone.clone(),
-                                model_id: model_id.clone(),
-                            },
-                        );
+                        Err(e) => {
+                            let _ = window.emit(
+                                "canvas-stream",
+                                CanvasStreamEvent::DebateError {
+                                    session_id: session_id.clone(),
+                                    debate_id: debate_id.clone(),
+                                    model_id: model_id.clone(),
+                                    error: e.to_string(),
+                                    round_number: round_num,
+                                },
+                            );
+                            let _ = window.emit(
+                                "canvas-stream",
+                                CanvasStreamEvent::ModelComplete {
+                                    session_id: session_id.clone(),
+                                    debate_id: debate_id.clone(),
+                                    model_id: model_id.clone(),
+                                    round_number: round_num,
+                                },
+                            );
+                            DebateResponse {
+                                model_id,
+                                model_name,
+                                content: e.to_string(),
+                                stance: None,
+                            }
+                        }
                     }
-                    Err(e) => {
-                        let _ = window.emit(
-                            "canvas-stream",
-                            CanvasStreamEvent::DebateError {
-                                session_id: session_id_clone.clone(),
-                                debate_id: debate_id_clone.clone(),
-                                model_id: model_id.clone(),
-                                error: e.to_string(),
-                            },
-                        );
-                        let _ = window.emit(
-                            "canvas-stream",
-                            CanvasStreamEvent::ModelComplete {
-                                session_id: session_id_clone.clone(),
-                                debate_id: debate_id_clone.clone(),
-                                model_id: model_id.clone(),
-                            },
-                        );
-                    }
+                });
+            }
+
+            // Collect all model responses from this round
+            let mut round_responses = Vec::new();
+            while let Some(result) = join_set.join_next().await {
+                if let Ok(response) = result {
+                    round_responses.push(response);
                 }
             }
 
@@ -700,8 +774,6 @@ pub async fn continue_debate(
             },
         );
 
-        let mut round_responses = Vec::new();
-
         // Build context from previous rounds + new prompt
         let mut context = String::from("Previous debate rounds:\n\n");
         for round in &debate_state.rounds {
@@ -713,90 +785,147 @@ pub async fn continue_debate(
         }
         context.push_str(&format!("New prompt: {}\n\nRespond to this new direction.", request.prompt));
 
-        for model_id in &models {
-            let model_name = model_id.split('/').last().unwrap_or(model_id).to_string();
+        // Stream all models concurrently using JoinSet
+        let mut join_set = tokio::task::JoinSet::new();
+
+        for model_id in models {
+            let model_name = model_id.split('/').last().unwrap_or(&model_id).to_string();
             let messages = vec![ChatMessage {
                 role: "user".to_string(),
                 content: context.clone(),
             }];
+            let openrouter_arc = openrouter_arc.clone();
+            let window = window.clone();
+            let session_id = session_id.clone();
+            let debate_id = debate_id.clone();
 
-            let openrouter = openrouter_arc.read().await;
-            let stream_result = openrouter
-                .chat_stream(model_id, messages, None, Some(0.7), Some(1024))
-                .await;
-            drop(openrouter);
+            join_set.spawn(async move {
+                let openrouter = openrouter_arc.read().await;
+                let stream_result = openrouter
+                    .chat_stream(&model_id, messages, None, Some(0.7), Some(1024))
+                    .await;
+                drop(openrouter);
 
-            match stream_result {
-                Ok(stream) => {
-                    let mut stream = Box::pin(stream);
-                    let mut full_content = String::new();
+                match stream_result {
+                    Ok(stream) => {
+                        let mut stream = Box::pin(stream);
+                        let mut full_content = String::new();
 
-                    while let Some(chunk_result) = stream.next().await {
-                        match chunk_result {
-                            Ok(chunk) => {
-                                if !chunk.is_empty() {
-                                    full_content.push_str(&chunk);
+                        loop {
+                            match tokio::time::timeout(
+                                Duration::from_secs(60),
+                                stream.next(),
+                            )
+                            .await
+                            {
+                                Ok(Some(Ok(chunk))) => {
+                                    if !chunk.is_empty() {
+                                        full_content.push_str(&chunk);
+                                        let _ = window.emit(
+                                            "canvas-stream",
+                                            CanvasStreamEvent::DebateChunk {
+                                                session_id: session_id.clone(),
+                                                debate_id: debate_id.clone(),
+                                                model_id: model_id.clone(),
+                                                chunk,
+                                                round_number: round_num,
+                                            },
+                                        );
+                                    }
+                                }
+                                Ok(Some(Err(e))) => {
                                     let _ = window.emit(
                                         "canvas-stream",
-                                        CanvasStreamEvent::DebateChunk {
+                                        CanvasStreamEvent::DebateError {
                                             session_id: session_id.clone(),
                                             debate_id: debate_id.clone(),
                                             model_id: model_id.clone(),
-                                            chunk,
+                                            error: e.to_string(),
+                                            round_number: round_num,
                                         },
                                     );
+                                    return DebateResponse {
+                                        model_id,
+                                        model_name,
+                                        content: full_content,
+                                        stance: None,
+                                    };
+                                }
+                                Ok(None) => break, // Stream ended naturally
+                                Err(_) => {
+                                    let _ = window.emit(
+                                        "canvas-stream",
+                                        CanvasStreamEvent::DebateError {
+                                            session_id: session_id.clone(),
+                                            debate_id: debate_id.clone(),
+                                            model_id: model_id.clone(),
+                                            error: "Stream idle timeout (60s)".to_string(),
+                                            round_number: round_num,
+                                        },
+                                    );
+                                    return DebateResponse {
+                                        model_id,
+                                        model_name,
+                                        content: full_content,
+                                        stance: None,
+                                    };
                                 }
                             }
-                            Err(e) => {
-                                let _ = window.emit(
-                                    "canvas-stream",
-                                    CanvasStreamEvent::DebateError {
-                                        session_id: session_id.clone(),
-                                        debate_id: debate_id.clone(),
-                                        model_id: model_id.clone(),
-                                        error: e.to_string(),
-                                    },
-                                );
-                                break;
-                            }
+                        }
+
+                        let _ = window.emit(
+                            "canvas-stream",
+                            CanvasStreamEvent::ModelComplete {
+                                session_id: session_id.clone(),
+                                debate_id: debate_id.clone(),
+                                model_id: model_id.clone(),
+                                round_number: round_num,
+                            },
+                        );
+
+                        DebateResponse {
+                            model_id,
+                            model_name,
+                            content: full_content,
+                            stance: None,
                         }
                     }
-
-                    round_responses.push(DebateResponse {
-                        model_id: model_id.clone(),
-                        model_name,
-                        content: full_content,
-                        stance: None,
-                    });
-
-                    let _ = window.emit(
-                        "canvas-stream",
-                        CanvasStreamEvent::ModelComplete {
-                            session_id: session_id.clone(),
-                            debate_id: debate_id.clone(),
-                            model_id: model_id.clone(),
-                        },
+                    Err(e) => {
+                        let _ = window.emit(
+                            "canvas-stream",
+                            CanvasStreamEvent::DebateError {
+                                session_id: session_id.clone(),
+                                debate_id: debate_id.clone(),
+                                model_id: model_id.clone(),
+                                error: e.to_string(),
+                                round_number: round_num,
+                            },
+                        );
+                        let _ = window.emit(
+                            "canvas-stream",
+                            CanvasStreamEvent::ModelComplete {
+                                session_id: session_id.clone(),
+                                debate_id: debate_id.clone(),
+                                model_id: model_id.clone(),
+                                round_number: round_num,
+                            },
                     );
+                        DebateResponse {
+                            model_id,
+                            model_name,
+                            content: e.to_string(),
+                            stance: None,
+                        }
+                    }
                 }
-                Err(e) => {
-                    let _ = window.emit(
-                        "canvas-stream",
-                        CanvasStreamEvent::DebateError {
-                            session_id: session_id.clone(),
-                            debate_id: debate_id.clone(),
-                            model_id: model_id.clone(),
-                            error: e.to_string(),
-                        },
-                    );
-                    let _ = window.emit(
-                        "canvas-stream",
-                        CanvasStreamEvent::ModelComplete {
-                            session_id: session_id.clone(),
-                            debate_id: debate_id.clone(),
-                            model_id: model_id.clone(),
-                        },
-                    );
-                }
+            });
+        }
+
+        // Collect all model responses from this round
+        let mut round_responses = Vec::new();
+        while let Some(result) = join_set.join_next().await {
+            if let Ok(response) = result {
+                round_responses.push(response);
             }
         }
 

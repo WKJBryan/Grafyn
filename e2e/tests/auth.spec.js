@@ -1,8 +1,8 @@
 /**
  * E2E Tests: Authentication Flow
  *
- * Tests OAuth login and session management
- * Note: Full OAuth flow requires mocking or test accounts
+ * Tests OAuth login and session management.
+ * Updated: button text changed to "Continue with GitHub" / "Continue with Google".
  */
 
 import { test, expect } from '@playwright/test'
@@ -12,35 +12,41 @@ test.describe('Authentication', () => {
     test('should display login page', async ({ page }) => {
       await page.goto('/login')
 
-      await expect(page.locator('.login-view, .login-container')).toBeVisible()
+      await expect(page.locator('.login-view')).toBeVisible()
     })
 
     test('should display welcome message', async ({ page }) => {
       await page.goto('/login')
 
-      await expect(page.locator('.login-title, h1')).toContainText('Grafyn')
+      await expect(page.locator('.login-title')).toContainText('Grafyn')
     })
 
     test('should display GitHub login button', async ({ page }) => {
       await page.goto('/login')
 
-      await expect(page.locator('button:has-text("GitHub")')).toBeVisible()
+      await expect(page.locator('button:has-text("Continue with GitHub")')).toBeVisible()
     })
 
     test('should display Google login button', async ({ page }) => {
       await page.goto('/login')
 
-      await expect(page.locator('button:has-text("Google")')).toBeVisible()
+      await expect(page.locator('button:has-text("Continue with Google")')).toBeVisible()
     })
 
     test('should have styled login buttons', async ({ page }) => {
       await page.goto('/login')
 
-      const githubBtn = page.locator('button:has-text("GitHub")')
-      const googleBtn = page.locator('button:has-text("Google")')
+      const githubBtn = page.locator('button:has-text("Continue with GitHub")')
+      const googleBtn = page.locator('button:has-text("Continue with Google")')
 
       await expect(githubBtn).toHaveClass(/btn-primary/)
       await expect(googleBtn).toHaveClass(/btn-secondary/)
+    })
+
+    test('should display subtitle text', async ({ page }) => {
+      await page.goto('/login')
+
+      await expect(page.locator('.login-subtitle')).toContainText('knowledge management')
     })
   })
 
@@ -48,10 +54,9 @@ test.describe('Authentication', () => {
     test('should initiate GitHub OAuth on button click', async ({ page }) => {
       await page.goto('/login')
 
-      // Set up request interception
       const [request] = await Promise.all([
         page.waitForRequest(req => req.url().includes('/api/oauth/authorize/github')),
-        page.click('button:has-text("GitHub")'),
+        page.click('button:has-text("Continue with GitHub")'),
       ])
 
       expect(request.url()).toContain('/api/oauth/authorize/github')
@@ -62,7 +67,7 @@ test.describe('Authentication', () => {
 
       const [request] = await Promise.all([
         page.waitForRequest(req => req.url().includes('/api/oauth/authorize/google')),
-        page.click('button:has-text("Google")'),
+        page.click('button:has-text("Continue with Google")'),
       ])
 
       expect(request.url()).toContain('/api/oauth/authorize/google')
@@ -71,9 +76,7 @@ test.describe('Authentication', () => {
 
   test.describe('OAuth Callback', () => {
     test('should display loading state during callback', async ({ page }) => {
-      // Mock the callback endpoint
       await page.route('**/api/oauth/callback/**', route => {
-        // Delay response to see loading state
         setTimeout(() => {
           route.fulfill({
             status: 200,
@@ -132,7 +135,6 @@ test.describe('Authentication', () => {
     })
 
     test('should redirect to home after successful login', async ({ page }) => {
-      // Mock successful OAuth callback
       await page.route('**/api/oauth/callback/**', route => {
         route.fulfill({
           status: 200,
@@ -203,11 +205,9 @@ test.describe('Authentication', () => {
     })
 
     test('should handle 401 by redirecting to login', async ({ page }) => {
-      // Set up a token
       await page.goto('/')
       await page.evaluate(() => localStorage.setItem('auth_token', 'expired-token'))
 
-      // Mock 401 response
       await page.route('**/api/notes', route => {
         route.fulfill({
           status: 401,
@@ -222,7 +222,6 @@ test.describe('Authentication', () => {
     })
 
     test('should clear token on logout', async ({ page }) => {
-      // Set up initial state
       await page.goto('/')
       await page.evaluate(() => localStorage.setItem('auth_token', 'test-token'))
 
@@ -234,7 +233,6 @@ test.describe('Authentication', () => {
         })
       })
 
-      // Find and click logout if available
       const logoutBtn = page.locator('button:has-text("Logout"), a:has-text("Logout")')
       if (await logoutBtn.isVisible()) {
         await logoutBtn.click()

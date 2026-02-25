@@ -141,6 +141,48 @@ pub struct SearchResult {
     pub snippet: Option<String>,
 }
 
+/// Request for distilling a container note into atomic notes
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DistillRequest {
+    #[serde(default = "default_auto")]
+    pub mode: String,
+    #[serde(default = "default_auto")]
+    pub extraction_method: String,
+}
+
+fn default_auto() -> String {
+    "auto".to_string()
+}
+
+/// Response from distilling a note
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DistillResponse {
+    #[serde(default)]
+    pub created_note_ids: Vec<String>,
+    #[serde(default)]
+    pub hub_updates: Vec<HubUpdate>,
+    #[serde(default)]
+    pub container_updated: bool,
+    pub message: String,
+    #[serde(default)]
+    pub extraction_method_used: String,
+    #[serde(default = "default_completed")]
+    pub status: String,
+}
+
+fn default_completed() -> String {
+    "completed".to_string()
+}
+
+/// Hub update information from distillation
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HubUpdate {
+    pub hub_id: String,
+    pub hub_title: String,
+    pub action: String,
+    pub atomic_ids_added: Vec<String>,
+}
+
 /// Graph neighbor information
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GraphNeighbor {

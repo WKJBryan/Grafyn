@@ -12,6 +12,7 @@ __pycache__/
 # Runtime data (user-specific)
 data/lancedb/
 data/import/
+data/canvas/
 data/tokens.json
 import files/
 

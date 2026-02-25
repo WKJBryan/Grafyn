@@ -7,7 +7,7 @@
   },
   "package": {
     "productName": "Grafyn",
-    "version": "0.0.5"
+    "version": "0.0.6"
   },
   "tauri": {
     "allowlist": {
@@ -86,7 +86,13 @@
       },
       "resources": [],
       "shortDescription": "Knowledge Management Desktop App",
-      "targets": ["nsis", "dmg", "deb", "appimage", "updater"],
+      "targets": [
+        "nsis",
+        "dmg",
+        "deb",
+        "appimage",
+        "updater"
+      ],
       "windows": {
         "certificateThumbprint": null,
         "digestAlgorithm": "sha256",
@@ -109,7 +115,7 @@
         "fullscreen": false,
         "height": 800,
         "resizable": true,
-        "title": "Grafyn v0.0.5",
+        "title": "Grafyn v0.0.6",
         "width": 1200,
         "minWidth": 800,
         "minHeight": 600,

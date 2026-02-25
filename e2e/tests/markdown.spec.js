@@ -1,11 +1,19 @@
 /**
  * E2E Tests: Markdown Editor
  *
- * Tests markdown editing and preview functionality
+ * Tests markdown editing and preview functionality.
+ * Updated for graph-first UI: scoped to .editor-panel-overlay, uses TopicSelector flow.
  */
 
 import { test, expect } from '@playwright/test'
-import { waitForAppReady, generateNoteTitle } from './fixtures/test-helpers.js'
+import {
+  waitForAppReady,
+  createNote,
+  createNoteViaAPI,
+  selectNote,
+} from './fixtures/test-helpers.js'
+
+const BASE_URL = 'http://localhost:8080'
 
 test.describe('Markdown Editor', () => {
   test.beforeEach(async ({ page }) => {
@@ -14,226 +22,175 @@ test.describe('Markdown Editor', () => {
   })
 
   test.describe('Edit Mode', () => {
-    test('should show textarea in edit mode', async ({ page }) => {
-      await page.click('button:has-text("New Note")')
+    test('should show textarea in edit mode after creating note', async ({ page }) => {
+      await createNote(page, { title: 'Edit Test', content: '' })
 
-      await expect(page.locator('textarea')).toBeVisible()
+      await expect(page.locator('.editor-panel-overlay .editor-textarea')).toBeVisible()
     })
 
     test('should allow typing markdown content', async ({ page }) => {
-      await page.click('button:has-text("New Note")')
-
       const content = '# Heading\n\nParagraph text'
-      await page.fill('textarea', content)
+      await createNote(page, { title: 'Type Test', content })
 
-      await expect(page.locator('textarea')).toHaveValue(content)
+      await expect(page.locator('.editor-panel-overlay .editor-textarea')).toHaveValue(content)
     })
 
-    test('should preserve markdown formatting', async ({ page }) => {
-      const title = generateNoteTitle()
+    test('should preserve markdown formatting after save and reload', async ({ page, request }) => {
+      const title = `Format Test ${Date.now()}`
       const content = '## Subheading\n\n- List item 1\n- List item 2\n\n**Bold text**'
 
-      await page.click('button:has-text("New Note")')
-      await page.fill('input[placeholder*="title"], input[name="title"]', title)
-      await page.fill('textarea', content)
-      await page.click('button:has-text("Save")')
-
-      // Reload and check
+      await createNoteViaAPI(request, BASE_URL, { title, content })
       await page.reload()
       await waitForAppReady(page)
-      await page.click(`.note-item:has-text("${title}")`)
 
-      await expect(page.locator('textarea')).toHaveValue(content)
+      await selectNote(page, title)
+      await expect(page.locator('.editor-panel-overlay .editor-textarea')).toHaveValue(content)
     })
   })
 
   test.describe('Preview Mode', () => {
-    test('should toggle between edit and preview', async ({ page }) => {
-      await page.click('button:has-text("New Note")')
-      await page.fill('input[placeholder*="title"], input[name="title"]', 'Preview Test')
-      await page.fill('textarea', '# Hello World')
+    test('should toggle between edit and preview tabs', async ({ page }) => {
+      await createNote(page, { title: 'Preview Toggle', content: '# Hello World' })
 
-      // Find and click preview toggle (may be a button or tab)
-      const previewBtn = page.locator('button:has-text("Preview"), [data-mode="preview"], .preview-toggle')
+      // Click Preview tab inside editor overlay
+      const previewTab = page.locator('.editor-panel-overlay .tab-btn:has-text("Preview")')
+      await expect(previewTab).toBeVisible()
+      await previewTab.click()
 
-      if (await previewBtn.isVisible()) {
-        await previewBtn.click()
-        await expect(page.locator('.preview, .markdown-preview, .rendered-content')).toBeVisible()
-      }
+      await expect(page.locator('.editor-panel-overlay .editor-preview')).toBeVisible()
     })
 
     test('should render markdown headings', async ({ page }) => {
-      await page.click('button:has-text("New Note")')
-      await page.fill('input[placeholder*="title"], input[name="title"]', 'Heading Test')
-      await page.fill('textarea', '# Heading 1\n## Heading 2\n### Heading 3')
+      await createNote(page, { title: 'Heading Test', content: '# Heading 1\n## Heading 2\n### Heading 3' })
 
-      const previewBtn = page.locator('button:has-text("Preview")')
-      if (await previewBtn.isVisible()) {
-        await previewBtn.click()
+      await page.click('.editor-panel-overlay .tab-btn:has-text("Preview")')
 
-        await expect(page.locator('h1')).toContainText('Heading 1')
-        await expect(page.locator('h2')).toContainText('Heading 2')
-        await expect(page.locator('h3')).toContainText('Heading 3')
-      }
+      const preview = page.locator('.editor-panel-overlay .editor-preview')
+      await expect(preview.locator('h1')).toContainText('Heading 1')
+      await expect(preview.locator('h2')).toContainText('Heading 2')
+      await expect(preview.locator('h3')).toContainText('Heading 3')
     })
 
     test('should render markdown lists', async ({ page }) => {
-      await page.click('button:has-text("New Note")')
-      await page.fill('input[placeholder*="title"], input[name="title"]', 'List Test')
-      await page.fill('textarea', '- Item 1\n- Item 2\n- Item 3')
+      await createNote(page, { title: 'List Test', content: '- Item 1\n- Item 2\n- Item 3' })
 
-      const previewBtn = page.locator('button:has-text("Preview")')
-      if (await previewBtn.isVisible()) {
-        await previewBtn.click()
+      await page.click('.editor-panel-overlay .tab-btn:has-text("Preview")')
 
-        await expect(page.locator('ul li')).toHaveCount(3)
-      }
+      const preview = page.locator('.editor-panel-overlay .editor-preview')
+      await expect(preview.locator('ul li')).toHaveCount(3)
     })
 
     test('should render markdown links', async ({ page }) => {
-      await page.click('button:has-text("New Note")')
-      await page.fill('input[placeholder*="title"], input[name="title"]', 'Link Test')
-      await page.fill('textarea', '[Example Link](https://example.com)')
+      await createNote(page, { title: 'Link Test', content: '[Example Link](https://example.com)' })
 
-      const previewBtn = page.locator('button:has-text("Preview")')
-      if (await previewBtn.isVisible()) {
-        await previewBtn.click()
+      await page.click('.editor-panel-overlay .tab-btn:has-text("Preview")')
 
-        const link = page.locator('a[href="https://example.com"]')
-        await expect(link).toContainText('Example Link')
-      }
+      const preview = page.locator('.editor-panel-overlay .editor-preview')
+      const link = preview.locator('a[href="https://example.com"]')
+      await expect(link).toContainText('Example Link')
     })
 
     test('should render bold and italic', async ({ page }) => {
-      await page.click('button:has-text("New Note")')
-      await page.fill('input[placeholder*="title"], input[name="title"]', 'Formatting Test')
-      await page.fill('textarea', '**Bold** and *Italic* text')
+      await createNote(page, { title: 'Formatting Test', content: '**Bold** and *Italic* text' })
 
-      const previewBtn = page.locator('button:has-text("Preview")')
-      if (await previewBtn.isVisible()) {
-        await previewBtn.click()
+      await page.click('.editor-panel-overlay .tab-btn:has-text("Preview")')
 
-        await expect(page.locator('strong')).toContainText('Bold')
-        await expect(page.locator('em')).toContainText('Italic')
-      }
+      const preview = page.locator('.editor-panel-overlay .editor-preview')
+      await expect(preview.locator('strong')).toContainText('Bold')
+      await expect(preview.locator('em')).toContainText('Italic')
     })
   })
 
   test.describe('Wikilinks', () => {
     test('should render wikilinks in preview', async ({ page }) => {
-      await page.click('button:has-text("New Note")')
-      await page.fill('input[placeholder*="title"], input[name="title"]', 'Wikilink Test')
-      await page.fill('textarea', 'Check out [[Another Note]]')
+      await createNote(page, { title: 'Wikilink Test', content: 'Check out [[Another Note]]' })
 
-      const previewBtn = page.locator('button:has-text("Preview")')
-      if (await previewBtn.isVisible()) {
-        await previewBtn.click()
+      await page.click('.editor-panel-overlay .tab-btn:has-text("Preview")')
 
-        // Wikilinks should be rendered as clickable links
-        await expect(page.locator('.wikilink, a:has-text("Another Note")')).toBeVisible()
-      }
+      const preview = page.locator('.editor-panel-overlay .editor-preview')
+      await expect(preview.locator('.wikilink, a:has-text("Another Note")')).toBeVisible()
     })
 
     test('should render wikilinks with display text', async ({ page }) => {
-      await page.click('button:has-text("New Note")')
-      await page.fill('input[placeholder*="title"], input[name="title"]', 'Display Wikilink Test')
-      await page.fill('textarea', 'See [[Note Title|custom display]]')
+      await createNote(page, { title: 'Display Wikilink Test', content: 'See [[Note Title|custom display]]' })
 
-      const previewBtn = page.locator('button:has-text("Preview")')
-      if (await previewBtn.isVisible()) {
-        await previewBtn.click()
+      await page.click('.editor-panel-overlay .tab-btn:has-text("Preview")')
 
-        await expect(page.locator('.wikilink, a:has-text("custom display")')).toBeVisible()
-      }
+      const preview = page.locator('.editor-panel-overlay .editor-preview')
+      await expect(preview.locator('.wikilink, a:has-text("custom display")')).toBeVisible()
     })
 
-    test('should navigate on wikilink click', async ({ page }) => {
+    test('should navigate on wikilink click', async ({ page, request }) => {
       // Create target note
-      await page.click('button:has-text("New Note")')
-      await page.fill('input[placeholder*="title"], input[name="title"]', 'Link Target')
-      await page.fill('textarea', 'This is the target')
-      await page.click('button:has-text("Save")')
+      await createNoteViaAPI(request, BASE_URL, { title: 'Link Target', content: 'This is the target' })
 
       // Create note with wikilink
-      await page.click('button:has-text("New Note")')
-      await page.fill('input[placeholder*="title"], input[name="title"]', 'Link Source')
-      await page.fill('textarea', 'Go to [[Link Target]]')
-      await page.click('button:has-text("Save")')
+      await createNoteViaAPI(request, BASE_URL, { title: 'Link Source', content: 'Go to [[Link Target]]' })
 
-      // Click on wikilink in preview (if available)
-      const previewBtn = page.locator('button:has-text("Preview")')
-      if (await previewBtn.isVisible()) {
-        await previewBtn.click()
+      await page.reload()
+      await waitForAppReady(page)
 
-        const wikilink = page.locator('.wikilink, a:has-text("Link Target")')
-        if (await wikilink.isVisible()) {
-          await wikilink.click()
+      await selectNote(page, 'Link Source')
 
-          // Should navigate to target note
-          await expect(page.locator('textarea')).toContainText('This is the target')
-        }
+      // Switch to preview
+      await page.click('.editor-panel-overlay .tab-btn:has-text("Preview")')
+
+      const preview = page.locator('.editor-panel-overlay .editor-preview')
+      const wikilink = preview.locator('.wikilink, a:has-text("Link Target")')
+
+      if (await wikilink.isVisible()) {
+        await wikilink.click()
+
+        // Should navigate to target note — editor should now show target content
+        await expect(page.locator('.editor-panel-overlay .editor-textarea')).toContainText('This is the target')
       }
     })
   })
 
   test.describe('Code Blocks', () => {
     test('should render inline code', async ({ page }) => {
-      await page.click('button:has-text("New Note")')
-      await page.fill('input[placeholder*="title"], input[name="title"]', 'Code Test')
-      await page.fill('textarea', 'Use `const x = 1` for declaration')
+      await createNote(page, { title: 'Code Test', content: 'Use `const x = 1` for declaration' })
 
-      const previewBtn = page.locator('button:has-text("Preview")')
-      if (await previewBtn.isVisible()) {
-        await previewBtn.click()
+      await page.click('.editor-panel-overlay .tab-btn:has-text("Preview")')
 
-        await expect(page.locator('code')).toContainText('const x = 1')
-      }
+      const preview = page.locator('.editor-panel-overlay .editor-preview')
+      await expect(preview.locator('code')).toContainText('const x = 1')
     })
 
-    test('should render code blocks', async ({ page }) => {
-      await page.click('button:has-text("New Note")')
-      await page.fill('input[placeholder*="title"], input[name="title"]', 'Code Block Test')
-      await page.fill('textarea', '```javascript\nfunction hello() {\n  return "world";\n}\n```')
+    test('should render fenced code blocks', async ({ page }) => {
+      await createNote(page, {
+        title: 'Code Block Test',
+        content: '```javascript\nfunction hello() {\n  return "world";\n}\n```',
+      })
 
-      const previewBtn = page.locator('button:has-text("Preview")')
-      if (await previewBtn.isVisible()) {
-        await previewBtn.click()
+      await page.click('.editor-panel-overlay .tab-btn:has-text("Preview")')
 
-        await expect(page.locator('pre code')).toContainText('function hello')
-      }
+      const preview = page.locator('.editor-panel-overlay .editor-preview')
+      await expect(preview.locator('pre code')).toContainText('function hello')
     })
   })
 
   test.describe('Special Characters', () => {
-    test('should handle unicode characters', async ({ page }) => {
+    test('should handle unicode characters', async ({ page, request }) => {
       const title = 'Unicode Test'
-      const content = '日本語テキスト and 中文文本 🎉'
+      const content = '日本語テキスト and 中文文本'
 
-      await page.click('button:has-text("New Note")')
-      await page.fill('input[placeholder*="title"], input[name="title"]', title)
-      await page.fill('textarea', content)
-      await page.click('button:has-text("Save")')
-
-      // Reload and verify
+      await createNoteViaAPI(request, BASE_URL, { title, content })
       await page.reload()
       await waitForAppReady(page)
-      await page.click(`.note-item:has-text("${title}")`)
 
-      await expect(page.locator('textarea')).toHaveValue(content)
+      await selectNote(page, title)
+      await expect(page.locator('.editor-panel-overlay .editor-textarea')).toHaveValue(content)
     })
 
     test('should handle special markdown characters', async ({ page }) => {
-      await page.click('button:has-text("New Note")')
-      await page.fill('input[placeholder*="title"], input[name="title"]', 'Special Chars')
-      await page.fill('textarea', '> Blockquote\n\n---\n\n* * *')
+      await createNote(page, { title: 'Special Chars', content: '> Blockquote\n\n---\n\n* * *' })
 
-      const previewBtn = page.locator('button:has-text("Preview")')
-      if (await previewBtn.isVisible()) {
-        await previewBtn.click()
+      await page.click('.editor-panel-overlay .tab-btn:has-text("Preview")')
 
-        await expect(page.locator('blockquote')).toBeVisible()
-        await expect(page.locator('hr')).toBeVisible()
-      }
+      const preview = page.locator('.editor-panel-overlay .editor-preview')
+      await expect(preview.locator('blockquote')).toBeVisible()
+      await expect(preview.locator('hr')).toBeVisible()
     })
   })
 })

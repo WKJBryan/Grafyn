@@ -183,6 +183,9 @@ fn main() {
             commands::settings::pick_vault_folder,
             commands::settings::validate_openrouter_key,
             commands::settings::get_openrouter_status,
+            // Distill commands
+            commands::distill::distill_note,
+            commands::distill::normalize_tags,
             // MCP commands
             commands::mcp::get_mcp_status,
             commands::mcp::get_mcp_config_snippet,
