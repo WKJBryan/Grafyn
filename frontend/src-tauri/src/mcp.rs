@@ -9,6 +9,10 @@
 //! If paths are not specified, reads from Grafyn's settings.json,
 //! falling back to default ~/Documents/Grafyn/ paths.
 
+// The MCP binary shares modules with the Tauri app but only uses a subset.
+// Suppress dead_code warnings for the unused services/models.
+#![allow(dead_code)]
+
 mod models;
 mod services;
 mod mcp_tools;
