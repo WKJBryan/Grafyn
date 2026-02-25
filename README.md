@@ -110,9 +110,9 @@ npm run tauri:build
 ```
 
 **Output locations:**
-- Windows: `src-tauri/target/release/bundle/msi/Grafyn_1.0.0_x64.msi`
-- macOS: `src-tauri/target/release/bundle/dmg/Grafyn_1.0.0_x64.dmg`
-- Linux: `src-tauri/target/release/bundle/deb/grafyn_1.0.0_amd64.deb`
+- Windows: `src-tauri/target/release/bundle/nsis/Grafyn_0.0.5_x64-setup.exe`
+- macOS: `src-tauri/target/release/bundle/dmg/Grafyn_0.0.5_aarch64.dmg`
+- Linux: `src-tauri/target/release/bundle/deb/grafyn_0.0.5_amd64.deb`
 
 ### Docker Setup
 
