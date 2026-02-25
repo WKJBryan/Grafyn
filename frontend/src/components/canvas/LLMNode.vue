@@ -32,7 +32,11 @@
       @wheel.stop
     >
       <div
-        v-if="isStreaming || isCompleted"
+        v-if="isStreaming"
+        class="response-text streaming-text"
+      >{{ response.content }}</div>
+      <div
+        v-else-if="isCompleted"
         class="response-text"
         v-html="renderedContent"
       />
@@ -352,10 +356,10 @@ const headerStyle = computed(() => ({
 }))
 
 const renderedContent = computed(() => {
-  if (!props.response.content) return ''
+  if (!props.response.content || props.isStreaming) return ''
   marked.setOptions({ breaks: true, gfm: true })
   // Truncate for display if very long
-  const content = props.response.content.length > 3000 
+  const content = props.response.content.length > 3000
     ? props.response.content.slice(0, 3000) + '\n\n*[Content truncated...]*'
     : props.response.content
   return marked(content)
@@ -639,6 +643,11 @@ onBeforeUnmount(() => {
 .node-content :deep(ul), .node-content :deep(ol) {
   margin: var(--spacing-xs) 0;
   padding-left: var(--spacing-md);
+}
+
+.streaming-text {
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 .pending-message, .error-message {

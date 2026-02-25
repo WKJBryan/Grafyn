@@ -50,13 +50,7 @@ npm run format       # Format code
 ```bash
 cd frontend
 npm install
-
-# Windows (sets up VS environment automatically)
-./run-tauri-dev.bat      # Dev mode with hot reload
-./build-tauri.bat        # Debug build
-
-# macOS/Linux (or from VS Developer Command Prompt on Windows)
-npm run tauri:dev        # Dev mode
+npm run tauri:dev        # Dev mode with hot reload
 npm run tauri:build      # Production build → src-tauri/target/release/bundle/
 ```
 

@@ -125,7 +125,7 @@ A good ADR should:
 
 - [Technical Documentation](../docs/)
 - [Project README](../README.md)
-- [GitHub Repository](https://github.com/your-org/grafyn)
+- [GitHub Repository](https://github.com/WKJBryan/Grafyn)
 
 ---
 

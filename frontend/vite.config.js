@@ -2,6 +2,9 @@ import { defineConfig } from 'vite'
 import vue from '@vitejs/plugin-vue'
 import { fileURLToPath, URL } from 'node:url'
 
+// Tauri CLI sets TAURI_PLATFORM before running beforeDevCommand
+const isTauri = !!process.env.TAURI_PLATFORM
+
 // https://vitejs.dev/config/
 export default defineConfig({
   plugins: [vue()],
@@ -16,8 +19,8 @@ export default defineConfig({
     port: 5173,
     // Tauri expects a fixed port
     strictPort: true,
-    proxy: {
-      // Only used when running web version with Python backend
+    // Proxy to Python backend only in web mode; Tauri uses IPC invoke() instead
+    proxy: isTauri ? undefined : {
       '/api': {
         target: 'http://localhost:8080',
         changeOrigin: true,

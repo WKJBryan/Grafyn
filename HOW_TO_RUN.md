@@ -6,12 +6,6 @@ The full desktop experience: single binary, Rust backend, Vue frontend in a WebV
 
 ```bash
 cd frontend
-
-# Windows (auto-sets up VS build environment)
-./run-tauri-dev.bat        # Dev mode with hot reload
-./build-tauri.bat          # Debug build
-
-# macOS/Linux (or VS Developer Command Prompt on Windows)
 npm run tauri:dev           # Dev mode with hot reload
 npm run tauri:build         # Production build → src-tauri/target/release/bundle/
 ```

@@ -282,6 +282,29 @@ impl CanvasStore {
         Ok(())
     }
 
+    /// Batch update multiple tile responses in a single read/write cycle.
+    /// Used after parallel streaming completes to avoid N separate file I/O operations.
+    pub fn batch_update_tile_responses(
+        &mut self,
+        session_id: &str,
+        tile_id: &str,
+        updates: &[(String, String, crate::models::canvas::ResponseStatus)],
+    ) -> Result<()> {
+        let mut session = self.get_session(session_id)?;
+
+        if let Some(tile) = session.prompt_tiles.iter_mut().find(|t| t.id == tile_id) {
+            for (model_id, content, status) in updates {
+                if let Some(response) = tile.responses.get_mut(model_id) {
+                    response.content = content.clone();
+                    response.status = status.clone();
+                }
+            }
+        }
+
+        self.write_session_file(&session)?;
+        Ok(())
+    }
+
     /// Update a tile's response content (for streaming)
     pub fn update_tile_response(
         &mut self,
