@@ -170,26 +170,24 @@ jobs:
       # ========================================
       - name: Validate and regenerate icons
         working-directory: frontend
+        shell: bash
         run: |
-          # Use Node.js to check icon format (portable across all CI runners)
-          node -e "
+          # Check icon.ico exists and has valid Windows icon magic bytes
+          # Uses Node.js exit code directly — no temp files needed
+          if node -e "
             const fs = require('fs');
             const ico = 'src-tauri/icons/icon.ico';
-            if (!fs.existsSync(ico)) { console.log('REGEN'); process.exit(0); }
+            if (!fs.existsSync(ico)) process.exit(1);
             const magic = fs.readFileSync(ico).slice(0, 4).toString('hex');
             console.log('icon.ico magic: ' + magic);
-            if (magic !== '00000100') { console.log('REGEN'); } else { console.log('VALID'); }
-          " > /tmp/icon-check.txt
-          cat /tmp/icon-check.txt
-
-          if grep -q "REGEN" /tmp/icon-check.txt; then
+            if (magic !== '00000100') process.exit(1);
+          "; then
+            echo "Icons are valid"
+          else
             echo "Regenerating icons..."
             node scripts/generate-icons.cjs
             npx tauri icon src-tauri/icons/app-icon.png
-          else
-            echo "Icons are valid"
           fi
-        shell: bash
 
       # ========================================
       # Build MCP Binary (native Rust, no Tauri)
@@ -203,6 +201,7 @@ jobs:
             EXT=".exe"
           fi
           cargo build --release --bin grafyn-mcp --no-default-features --features mcp --target ${{ matrix.target }}
+          mkdir -p binaries
           cp "target/${{ matrix.target }}/release/grafyn-mcp${EXT}" "binaries/grafyn-mcp-${{ matrix.target }}${EXT}"
           echo "Built grafyn-mcp for ${{ matrix.target }}"
 
