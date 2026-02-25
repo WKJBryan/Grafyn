@@ -1,10 +1,10 @@
 [package]
 name = "grafyn"
-version = "0.0.4"
+version = "0.0.5"
 description = "Grafyn - Knowledge Management Desktop App"
 authors = ["Bryan"]
 license = "MIT"
-repository = ""
+repository = "https://github.com/WKJBryan/Grafyn"
 edition = "2021"
 
 # Two binaries: Tauri desktop app and standalone MCP server
@@ -33,7 +33,6 @@ tauri = { version = "1.8", optional = true, features = [
     "path-all",
     "process-all",
     "protocol-all",
-    "shell-sidecar",
     "updater",
     "window-all"
 ] }

@@ -102,13 +102,11 @@ npm install
 # Generate app icons (required for first build)
 node scripts/generate-icons.cjs
 
-# Development mode
-npm run tauri:dev       # macOS/Linux
-./run-tauri-dev.bat     # Windows
+# Development mode (all platforms)
+npm run tauri:dev
 
 # Production build
-npm run tauri:build     # macOS/Linux
-./build-tauri.bat       # Windows
+npm run tauri:build
 ```
 
 **Output locations:**

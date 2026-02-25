@@ -341,7 +341,7 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted, onBeforeUnmount, watch } from 'vue'
+import { ref, computed, onMounted, onBeforeUnmount, watch, shallowRef } from 'vue'
 import * as d3 from 'd3'
 import { useCanvasStore } from '@/stores/canvas'
 import { settings as settingsApi, isDesktopApp } from '@/api/client'
@@ -421,29 +421,46 @@ const selectedLLMNodes = computed(() => {
     })
 })
 
-// Compute Prompt → LLM edge paths
-const promptToLLMEdges = computed(() => {
-  const edges = []
-  
+// Edge paths — cached via position snapshot to avoid recomputation during streaming.
+// Content changes (chunks) don't affect edges; only position/structure changes do.
+const promptToLLMEdges = shallowRef([])
+const branchEdges = shallowRef([])
+const debateEdgePaths = shallowRef([])
+// Build a string from positions + structure only (no content).
+// Cheap O(n) string concat that serves as a cache key for edge recomputation.
+function buildEdgeSnapshot() {
+  const parts = []
+  for (const tile of promptTiles.value) {
+    const p = tile.position
+    parts.push(`p:${tile.id}:${p.x}:${p.y}:${p.width}:${p.height}:${tile.parent_tile_id || ''}:${tile.parent_model_id || ''}`)
+    for (const [modelId, response] of Object.entries(tile.responses)) {
+      const rp = response.position
+      parts.push(`l:${tile.id}:${modelId}:${rp.x}:${rp.y}:${rp.width}:${rp.height}`)
+    }
+  }
+  for (const debate of debates.value) {
+    const dp = debate.position
+    const stids = (debate.source_tile_ids || []).join(',')
+    const pmodels = (debate.participating_models || []).join(',')
+    parts.push(`d:${debate.id}:${dp.x}:${dp.y}:${dp.width}:${dp.height}:${stids}:${pmodels}`)
+  }
+  return parts.join('|')
+}
+
+function recomputeEdges() {
+  // Prompt → LLM edges
+  const p2l = []
   for (const tile of promptTiles.value) {
     const promptPos = tile.position
-    
     for (const [modelId, response] of Object.entries(tile.responses)) {
       const llmPos = response.position
-      
-      // Source: right side of prompt node
       const sourceX = promptPos.x + (promptPos.width || 200)
       const sourceY = promptPos.y + (promptPos.height || 120) / 2
-      
-      // Target: left side of LLM node
       const targetX = llmPos.x
       const targetY = llmPos.y + (llmPos.height || 200) / 2
-      
-      // Create bezier curve
       const midX = (sourceX + targetX) / 2
       const path = `M ${sourceX} ${sourceY} C ${midX} ${sourceY}, ${midX} ${targetY}, ${targetX} ${targetY}`
-      
-      edges.push({
+      p2l.push({
         source: `prompt:${tile.id}`,
         target: `llm:${tile.id}:${modelId}`,
         color: response.color || '#7c5cff',
@@ -451,76 +468,47 @@ const promptToLLMEdges = computed(() => {
       })
     }
   }
-  
-  return edges
-})
+  promptToLLMEdges.value = p2l
 
-// Compute LLM → Prompt branch edge paths
-const branchEdges = computed(() => {
-  const edges = []
-  
+  // Branch edges (LLM → child Prompt)
+  const br = []
   for (const tile of promptTiles.value) {
     if (!tile.parent_tile_id || !tile.parent_model_id) continue
-    
-    // Find parent tile
     const parentTile = promptTiles.value.find(t => t.id === tile.parent_tile_id)
     if (!parentTile || !parentTile.responses[tile.parent_model_id]) continue
-    
-    const parentResponse = parentTile.responses[tile.parent_model_id]
-    const parentPos = parentResponse.position
+    const parentPos = parentTile.responses[tile.parent_model_id].position
     const childPos = tile.position
-    
-    // Source: right side of parent LLM node
     const sourceX = parentPos.x + (parentPos.width || 280)
     const sourceY = parentPos.y + (parentPos.height || 200) / 2
-    
-    // Target: left side of child prompt node
     const targetX = childPos.x
     const targetY = childPos.y + (childPos.height || 120) / 2
-    
-    // Create bezier curve
     const midX = (sourceX + targetX) / 2
     const path = `M ${sourceX} ${sourceY} C ${midX} ${sourceY}, ${midX} ${targetY}, ${targetX} ${targetY}`
-    
-    edges.push({
+    br.push({
       source: `llm:${tile.parent_tile_id}:${tile.parent_model_id}`,
       target: `prompt:${tile.id}`,
       path
     })
   }
-  
-  return edges
-})
+  branchEdges.value = br
 
-// Compute Debate edge paths (LLM → Debate)
-const debateEdgePaths = computed(() => {
-  const edges = []
-  
+  // Debate edges (LLM → Debate)
+  const de = []
   for (const debate of debates.value) {
     const debatePos = debate.position
-    
     for (const sourceTileId of debate.source_tile_ids || []) {
       const sourceTile = promptTiles.value.find(t => t.id === sourceTileId)
       if (!sourceTile) continue
-      
       for (const modelId of debate.participating_models || []) {
         if (!sourceTile.responses[modelId]) continue
-        
         const llmPos = sourceTile.responses[modelId].position
-        
-        // Source: right side of LLM node
         const sourceX = llmPos.x + (llmPos.width || 280)
         const sourceY = llmPos.y + (llmPos.height || 200) / 2
-        
-        // Target: left side of debate node
         const targetX = debatePos.x
         const targetY = debatePos.y + (debatePos.height || 150) / 2
-        
-        // Create bezier curve
         const midX = (sourceX + targetX) / 2
         const path = `M ${sourceX} ${sourceY} C ${midX} ${sourceY}, ${midX} ${targetY}, ${targetX} ${targetY}`
-        
-        edges.push({
+        de.push({
           source: `llm:${sourceTileId}:${modelId}`,
           target: `debate:${debate.id}`,
           path
@@ -528,9 +516,14 @@ const debateEdgePaths = computed(() => {
       }
     }
   }
-  
-  return edges
-})
+  debateEdgePaths.value = de
+}
+
+// Recompute edges only when positions or structure change, not on content updates
+const edgeSnapshot = computed(() => buildEdgeSnapshot())
+watch(edgeSnapshot, () => {
+  recomputeEdges()
+}, { immediate: true })
 
 const transformStyle = computed(() => ({
   transform: `translate(${viewport.value.x}px, ${viewport.value.y}px) scale(${viewport.value.zoom})`

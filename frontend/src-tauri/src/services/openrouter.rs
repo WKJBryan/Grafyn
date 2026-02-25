@@ -3,6 +3,7 @@ use anyhow::{Context, Result};
 use futures::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 
 const OPENROUTER_API_URL: &str = "https://openrouter.ai/api/v1";
 
@@ -16,7 +17,10 @@ pub struct OpenRouterService {
 impl OpenRouterService {
     pub fn new(api_key: String) -> Self {
         Self {
-            client: Client::new(),
+            client: Client::builder()
+                .connect_timeout(Duration::from_secs(10))
+                .build()
+                .unwrap_or_else(|_| Client::new()),
             api_key,
         }
     }
@@ -52,6 +56,7 @@ impl OpenRouterService {
             .client
             .get(format!("{}/models", OPENROUTER_API_URL))
             .header("Authorization", format!("Bearer {}", self.api_key))
+            .timeout(Duration::from_secs(15))
             .send()
             .await
             .context("Failed to fetch models")?;
@@ -123,6 +128,7 @@ impl OpenRouterService {
             .header("HTTP-Referer", "https://grafyn.app")
             .header("X-Title", "Grafyn")
             .json(&request)
+            .timeout(Duration::from_secs(60))
             .send()
             .await
             .context("Failed to send chat request")?;
@@ -192,14 +198,49 @@ impl OpenRouterService {
             return Err(anyhow::anyhow!("OpenRouter API error: {}", error_text));
         }
 
-        let stream = response.bytes_stream().map(|result| {
-            result
-                .map_err(|e| anyhow::anyhow!("Stream error: {}", e))
-                .and_then(|bytes| {
-                    let text = String::from_utf8_lossy(&bytes);
-                    parse_sse_chunk(&text)
-                })
-        });
+        // Buffer raw bytes and split on SSE event boundaries (\n\n) to prevent
+        // content loss from TCP chunk splitting. Without this, partial JSON lines
+        // silently fail at serde_json::from_str and tokens are dropped.
+        let byte_stream = Box::pin(response.bytes_stream());
+
+        let stream = futures::stream::unfold(
+            (byte_stream, String::new()),
+            |(mut inner, mut buffer)| async move {
+                loop {
+                    // Check for complete SSE event in buffer
+                    if let Some(pos) = buffer.find("\n\n") {
+                        let event = buffer[..pos].to_string();
+                        buffer = buffer[pos + 2..].to_string();
+                        return Some((parse_sse_chunk(&event), (inner, buffer)));
+                    }
+
+                    // Need more data from the byte stream
+                    match inner.next().await {
+                        Some(Ok(bytes)) => {
+                            buffer.push_str(&String::from_utf8_lossy(&bytes));
+                        }
+                        Some(Err(e)) => {
+                            return Some((
+                                Err(anyhow::anyhow!("Stream error: {}", e)),
+                                (inner, buffer),
+                            ));
+                        }
+                        None => {
+                            // Stream ended — flush remaining buffer
+                            if !buffer.trim().is_empty() {
+                                let remaining = std::mem::take(&mut buffer);
+                                if let Ok(content) = parse_sse_chunk(&remaining) {
+                                    if !content.is_empty() {
+                                        return Some((Ok(content), (inner, buffer)));
+                                    }
+                                }
+                            }
+                            return None;
+                        }
+                    }
+                }
+            },
+        );
 
         Ok(stream)
     }

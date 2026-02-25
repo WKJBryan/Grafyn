@@ -10,6 +10,7 @@ use crate::AppState;
 use chrono::Utc;
 use futures::StreamExt;
 use std::collections::HashMap;
+use std::time::Duration;
 use tauri::State;
 
 /// List all canvas sessions
@@ -153,104 +154,132 @@ pub async fn send_prompt(
             content: prompt,
         }];
 
-        for model_id in &models {
-            let openrouter = openrouter_arc.read().await;
-            let stream_result = openrouter
-                .chat_stream(
-                    model_id,
-                    messages.clone(),
-                    system_prompt.as_deref(),
-                    Some(temperature),
-                    Some(max_tokens),
-                )
-                .await;
-            drop(openrouter); // Release lock
+        // Stream all models concurrently using JoinSet
+        let mut join_set = tokio::task::JoinSet::new();
 
-            match stream_result {
-                Ok(stream) => {
-                    let mut stream = Box::pin(stream);
-                    let mut full_content = String::new();
+        for model_id in models {
+            let messages = messages.clone();
+            let system_prompt = system_prompt.clone();
+            let openrouter_arc = openrouter_arc.clone();
+            let window = window.clone();
+            let session_id = session_id_clone.clone();
+            let tile_id = tile_id_clone.clone();
 
-                    while let Some(chunk_result) = stream.next().await {
-                        match chunk_result {
-                            Ok(chunk) => {
-                                if !chunk.is_empty() {
-                                    full_content.push_str(&chunk);
+            join_set.spawn(async move {
+                let openrouter = openrouter_arc.read().await;
+                let stream_result = openrouter
+                    .chat_stream(
+                        &model_id,
+                        messages,
+                        system_prompt.as_deref(),
+                        Some(temperature),
+                        Some(max_tokens),
+                    )
+                    .await;
+                drop(openrouter);
+
+                match stream_result {
+                    Ok(stream) => {
+                        let mut stream = Box::pin(stream);
+                        let mut full_content = String::new();
+
+                        loop {
+                            match tokio::time::timeout(
+                                Duration::from_secs(60),
+                                stream.next(),
+                            )
+                            .await
+                            {
+                                Ok(Some(Ok(chunk))) => {
+                                    if !chunk.is_empty() {
+                                        full_content.push_str(&chunk);
+                                        let _ = window.emit(
+                                            "canvas-stream",
+                                            CanvasStreamEvent::Chunk {
+                                                session_id: session_id.clone(),
+                                                tile_id: tile_id.clone(),
+                                                model_id: model_id.clone(),
+                                                chunk,
+                                            },
+                                        );
+                                    }
+                                }
+                                Ok(Some(Err(e))) => {
                                     let _ = window.emit(
                                         "canvas-stream",
-                                        CanvasStreamEvent::Chunk {
-                                            session_id: session_id_clone.clone(),
-                                            tile_id: tile_id_clone.clone(),
+                                        CanvasStreamEvent::Error {
+                                            session_id: session_id.clone(),
+                                            tile_id: tile_id.clone(),
                                             model_id: model_id.clone(),
-                                            chunk,
+                                            error: e.to_string(),
                                         },
                                     );
+                                    return (model_id, e.to_string(), ResponseStatus::Error);
+                                }
+                                Ok(None) => break, // Stream ended naturally
+                                Err(_) => {
+                                    let _ = window.emit(
+                                        "canvas-stream",
+                                        CanvasStreamEvent::Error {
+                                            session_id: session_id.clone(),
+                                            tile_id: tile_id.clone(),
+                                            model_id: model_id.clone(),
+                                            error: "Stream idle timeout (60s)".to_string(),
+                                        },
+                                    );
+                                    return (model_id, full_content, ResponseStatus::Error);
                                 }
                             }
-                            Err(e) => {
-                                let _ = window.emit(
-                                    "canvas-stream",
-                                    CanvasStreamEvent::Error {
-                                        session_id: session_id_clone.clone(),
-                                        tile_id: tile_id_clone.clone(),
-                                        model_id: model_id.clone(),
-                                        error: e.to_string(),
-                                    },
-                                );
-                                break;
-                            }
                         }
-                    }
 
-                    // Update store with final content
-                    {
-                        let mut store = canvas_store_arc.write().await;
-                        let _ = store.update_tile_response(
-                            &session_id_clone,
-                            &tile_id_clone,
-                            model_id,
-                            &full_content,
-                            ResponseStatus::Completed,
+                        // Emit per-model completion immediately
+                        let _ = window.emit(
+                            "canvas-stream",
+                            CanvasStreamEvent::Complete {
+                                session_id: session_id.clone(),
+                                tile_id: tile_id.clone(),
+                                model_id: model_id.clone(),
+                                tokens_used: None,
+                            },
                         );
-                    }
 
-                    let _ = window.emit(
-                        "canvas-stream",
-                        CanvasStreamEvent::Complete {
-                            session_id: session_id_clone.clone(),
-                            tile_id: tile_id_clone.clone(),
-                            model_id: model_id.clone(),
-                            tokens_used: None,
-                        },
-                    );
-                }
-                Err(e) => {
-                    // Update store with error
-                    {
-                        let mut store = canvas_store_arc.write().await;
-                        let _ = store.update_tile_response(
-                            &session_id_clone,
-                            &tile_id_clone,
-                            model_id,
-                            &e.to_string(),
-                            ResponseStatus::Error,
+                        (model_id, full_content, ResponseStatus::Completed)
+                    }
+                    Err(e) => {
+                        let _ = window.emit(
+                            "canvas-stream",
+                            CanvasStreamEvent::Error {
+                                session_id: session_id.clone(),
+                                tile_id: tile_id.clone(),
+                                model_id: model_id.clone(),
+                                error: e.to_string(),
+                            },
                         );
+                        (model_id, e.to_string(), ResponseStatus::Error)
                     }
-
-                    let _ = window.emit(
-                        "canvas-stream",
-                        CanvasStreamEvent::Error {
-                            session_id: session_id_clone.clone(),
-                            tile_id: tile_id_clone.clone(),
-                            model_id: model_id.clone(),
-                            error: e.to_string(),
-                        },
-                    );
                 }
+            });
+        }
+
+        // Wait for all models and collect results
+        let mut results = Vec::new();
+        while let Some(result) = join_set.join_next().await {
+            if let Ok(r) = result {
+                results.push(r);
             }
         }
 
-        // Emit session saved
+        // Batch update store with all results in a single write
+        {
+            let mut store = canvas_store_arc.write().await;
+            let _ = store.batch_update_tile_responses(
+                &session_id_clone,
+                &tile_id_clone,
+                &results,
+            );
+        }
+
+        // Emit session saved after all models complete
         let _ = window.emit(
             "canvas-stream",
             CanvasStreamEvent::SessionSaved {
@@ -872,86 +901,122 @@ pub async fn add_models_to_tile(
             content: prompt,
         }];
 
-        for model_id in &model_ids {
-            let openrouter = openrouter_arc.read().await;
-            let stream_result = openrouter
-                .chat_stream(model_id, messages.clone(), system_prompt.as_deref(), Some(0.7), Some(2048))
-                .await;
-            drop(openrouter);
+        // Stream all new models concurrently using JoinSet
+        let mut join_set = tokio::task::JoinSet::new();
 
-            match stream_result {
-                Ok(stream) => {
-                    let mut stream = Box::pin(stream);
-                    let mut full_content = String::new();
+        for model_id in model_ids {
+            let messages = messages.clone();
+            let system_prompt = system_prompt.clone();
+            let openrouter_arc = openrouter_arc.clone();
+            let window = window.clone();
+            let session_id = session_id.clone();
+            let tile_id = tile_id.clone();
 
-                    while let Some(chunk_result) = stream.next().await {
-                        match chunk_result {
-                            Ok(chunk) => {
-                                if !chunk.is_empty() {
-                                    full_content.push_str(&chunk);
+            join_set.spawn(async move {
+                let openrouter = openrouter_arc.read().await;
+                let stream_result = openrouter
+                    .chat_stream(&model_id, messages, system_prompt.as_deref(), Some(0.7), Some(2048))
+                    .await;
+                drop(openrouter);
+
+                match stream_result {
+                    Ok(stream) => {
+                        let mut stream = Box::pin(stream);
+                        let mut full_content = String::new();
+
+                        loop {
+                            match tokio::time::timeout(
+                                Duration::from_secs(60),
+                                stream.next(),
+                            )
+                            .await
+                            {
+                                Ok(Some(Ok(chunk))) => {
+                                    if !chunk.is_empty() {
+                                        full_content.push_str(&chunk);
+                                        let _ = window.emit(
+                                            "canvas-stream",
+                                            CanvasStreamEvent::Chunk {
+                                                session_id: session_id.clone(),
+                                                tile_id: tile_id.clone(),
+                                                model_id: model_id.clone(),
+                                                chunk,
+                                            },
+                                        );
+                                    }
+                                }
+                                Ok(Some(Err(e))) => {
                                     let _ = window.emit(
                                         "canvas-stream",
-                                        CanvasStreamEvent::Chunk {
+                                        CanvasStreamEvent::Error {
                                             session_id: session_id.clone(),
                                             tile_id: tile_id.clone(),
                                             model_id: model_id.clone(),
-                                            chunk,
+                                            error: e.to_string(),
                                         },
                                     );
+                                    return (model_id, e.to_string(), ResponseStatus::Error);
+                                }
+                                Ok(None) => break,
+                                Err(_) => {
+                                    let _ = window.emit(
+                                        "canvas-stream",
+                                        CanvasStreamEvent::Error {
+                                            session_id: session_id.clone(),
+                                            tile_id: tile_id.clone(),
+                                            model_id: model_id.clone(),
+                                            error: "Stream idle timeout (60s)".to_string(),
+                                        },
+                                    );
+                                    return (model_id, full_content, ResponseStatus::Error);
                                 }
                             }
-                            Err(e) => {
-                                let _ = window.emit(
-                                    "canvas-stream",
-                                    CanvasStreamEvent::Error {
-                                        session_id: session_id.clone(),
-                                        tile_id: tile_id.clone(),
-                                        model_id: model_id.clone(),
-                                        error: e.to_string(),
-                                    },
-                                );
-                                break;
-                            }
                         }
-                    }
 
-                    {
-                        let mut store = canvas_store_arc.write().await;
-                        let _ = store.update_tile_response(
-                            &session_id, &tile_id, model_id, &full_content,
-                            ResponseStatus::Completed,
+                        let _ = window.emit(
+                            "canvas-stream",
+                            CanvasStreamEvent::Complete {
+                                session_id: session_id.clone(),
+                                tile_id: tile_id.clone(),
+                                model_id: model_id.clone(),
+                                tokens_used: None,
+                            },
                         );
-                    }
 
-                    let _ = window.emit(
-                        "canvas-stream",
-                        CanvasStreamEvent::Complete {
-                            session_id: session_id.clone(),
-                            tile_id: tile_id.clone(),
-                            model_id: model_id.clone(),
-                            tokens_used: None,
-                        },
-                    );
-                }
-                Err(e) => {
-                    {
-                        let mut store = canvas_store_arc.write().await;
-                        let _ = store.update_tile_response(
-                            &session_id, &tile_id, model_id, &e.to_string(),
-                            ResponseStatus::Error,
-                        );
+                        (model_id, full_content, ResponseStatus::Completed)
                     }
-                    let _ = window.emit(
-                        "canvas-stream",
-                        CanvasStreamEvent::Error {
-                            session_id: session_id.clone(),
-                            tile_id: tile_id.clone(),
-                            model_id: model_id.clone(),
-                            error: e.to_string(),
-                        },
-                    );
+                    Err(e) => {
+                        let _ = window.emit(
+                            "canvas-stream",
+                            CanvasStreamEvent::Error {
+                                session_id: session_id.clone(),
+                                tile_id: tile_id.clone(),
+                                model_id: model_id.clone(),
+                                error: e.to_string(),
+                            },
+                        );
+                        (model_id, e.to_string(), ResponseStatus::Error)
+                    }
                 }
+            });
+        }
+
+        // Wait for all models and collect results
+        let mut results = Vec::new();
+        while let Some(result) = join_set.join_next().await {
+            if let Ok(r) = result {
+                results.push(r);
             }
+        }
+
+        // Batch update store
+        {
+            let mut store = canvas_store_arc.write().await;
+            let _ = store.batch_update_tile_responses(
+                &session_id,
+                &tile_id,
+                &results,
+            );
         }
 
         let _ = window.emit(

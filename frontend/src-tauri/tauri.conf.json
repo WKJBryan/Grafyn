@@ -7,7 +7,7 @@
   },
   "package": {
     "productName": "Grafyn",
-    "version": "0.0.4"
+    "version": "0.0.5"
   },
   "tauri": {
     "allowlist": {
@@ -52,14 +52,7 @@
         ]
       },
       "shell": {
-        "sidecar": true,
-        "scope": [
-          {
-            "name": "binaries/grafyn-mcp",
-            "sidecar": true,
-            "args": true
-          }
-        ]
+        "sidecar": false
       },
       "window": {
         "all": true
@@ -116,7 +109,7 @@
         "fullscreen": false,
         "height": 800,
         "resizable": true,
-        "title": "Grafyn v0.0.4",
+        "title": "Grafyn v0.0.5",
         "width": 1200,
         "minWidth": 800,
         "minHeight": 600,
