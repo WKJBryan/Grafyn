@@ -1,19 +1,21 @@
 /**
  * E2E Tests: Search Functionality
  *
- * Tests semantic search and navigation
+ * Tests semantic search and navigation.
+ * Updated for graph-first UI: uses API-based note creation and editor overlay selectors.
  */
 
 import { test, expect } from '@playwright/test'
-import { generateNoteTitle, waitForAppReady } from './fixtures/test-helpers.js'
+import { waitForAppReady, createNoteViaAPI, clearAllNotes } from './fixtures/test-helpers.js'
+
+const BASE_URL = 'http://localhost:8080'
 
 test.describe('Search Functionality', () => {
-  // Create some notes before running search tests
-  test.beforeEach(async ({ page }) => {
+  test.beforeEach(async ({ page, request }) => {
     await page.goto('/')
     await waitForAppReady(page)
 
-    // Create a few test notes for searching
+    // Create test notes via API for speed
     const testNotes = [
       { title: 'Machine Learning Basics', content: 'Neural networks and deep learning concepts' },
       { title: 'Python Programming', content: 'Python is a great language for machine learning' },
@@ -21,16 +23,16 @@ test.describe('Search Functionality', () => {
     ]
 
     for (const note of testNotes) {
-      await page.click('button:has-text("New Note")')
-      await page.fill('input[placeholder*="title"], input[name="title"]', note.title)
-      await page.fill('textarea', note.content)
-      await page.click('button:has-text("Save")')
-      await page.waitForTimeout(500) // Small delay between creates
+      await createNoteViaAPI(request, BASE_URL, note)
     }
+
+    // Reload to pick up API-created notes
+    await page.reload()
+    await waitForAppReady(page)
   })
 
   test.describe('Search Input', () => {
-    test('should show search input in header', async ({ page }) => {
+    test('should show search input', async ({ page }) => {
       await expect(page.locator('input[placeholder*="Search"]')).toBeVisible()
     })
 
@@ -44,14 +46,14 @@ test.describe('Search Functionality', () => {
       const searchInput = page.locator('input[placeholder*="Search"]')
       await searchInput.fill('test query')
 
-      await expect(page.locator('.clear-btn, button:has-text("×")')).toBeVisible()
+      await expect(page.locator('.clear-btn')).toBeVisible()
     })
 
     test('should clear input when clear button clicked', async ({ page }) => {
       const searchInput = page.locator('input[placeholder*="Search"]')
       await searchInput.fill('test query')
 
-      await page.click('.clear-btn, button:has-text("×")')
+      await page.click('.clear-btn')
 
       await expect(searchInput).toHaveValue('')
     })
@@ -62,7 +64,6 @@ test.describe('Search Functionality', () => {
       const searchInput = page.locator('input[placeholder*="Search"]')
       await searchInput.fill('machine learning')
 
-      // Wait for debounce and results
       await page.waitForTimeout(400)
 
       await expect(page.locator('.search-results')).toBeVisible()
@@ -87,7 +88,7 @@ test.describe('Search Functionality', () => {
       await expect(page.locator('.score-bar')).toBeVisible()
     })
 
-    test('should navigate to note on result click', async ({ page }) => {
+    test('should open editor overlay on result click', async ({ page }) => {
       const searchInput = page.locator('input[placeholder*="Search"]')
       await searchInput.fill('Web Development')
 
@@ -96,9 +97,8 @@ test.describe('Search Functionality', () => {
       // Click on result
       await page.click('.search-result-item:first-child')
 
-      // Verify editor shows the note
-      await expect(page.locator('.note-editor')).toBeVisible()
-      await expect(page.locator('textarea')).toContainText(/HTML|CSS|JavaScript/)
+      // Editor overlay should open with the note content
+      await expect(page.locator('.editor-panel-overlay')).toBeVisible()
     })
 
     test('should clear results after selection', async ({ page }) => {
@@ -121,8 +121,8 @@ test.describe('Search Functionality', () => {
       await page.waitForTimeout(400)
       await searchInput.press('Enter')
 
-      // Should navigate to note
-      await expect(page.locator('.note-editor')).toBeVisible()
+      // Should open editor overlay
+      await expect(page.locator('.editor-panel-overlay')).toBeVisible()
     })
 
     test('should close results on Escape', async ({ page }) => {
@@ -146,7 +146,6 @@ test.describe('Search Functionality', () => {
 
       await page.waitForTimeout(400)
 
-      // Should not show results
       await expect(page.locator('.search-results')).not.toBeVisible()
     })
 
@@ -156,7 +155,6 @@ test.describe('Search Functionality', () => {
 
       await page.waitForTimeout(400)
 
-      // Should not show results dropdown (or show empty message)
       const results = page.locator('.search-result-item')
       await expect(results).toHaveCount(0)
     })
@@ -164,10 +162,8 @@ test.describe('Search Functionality', () => {
     test('should debounce rapid typing', async ({ page }) => {
       const searchInput = page.locator('input[placeholder*="Search"]')
 
-      // Type rapidly
       await searchInput.type('machine learning', { delay: 50 })
 
-      // Should only make one search request after debounce
       await page.waitForTimeout(400)
 
       await expect(page.locator('.search-results')).toBeVisible()

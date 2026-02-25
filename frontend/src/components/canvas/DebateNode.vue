@@ -22,7 +22,11 @@
     
     <div class="node-content">
       <div class="stats">
-        <span class="stat">{{ debate.rounds.length }} round{{ debate.rounds.length !== 1 ? 's' : '' }}</span>
+        <span
+          v-if="isDebateStreaming"
+          class="live-badge"
+        >LIVE</span>
+        <span class="stat">{{ displayRounds.length }} round{{ displayRounds.length !== 1 ? 's' : '' }}</span>
         <span class="stat-divider">•</span>
         <span class="stat">{{ debate.participating_models.length }} models</span>
       </div>
@@ -60,9 +64,9 @@
     </div>
     
     <div class="node-footer">
-      <button 
-        class="expand-btn" 
-        :disabled="!hasRounds"
+      <button
+        class="expand-btn"
+        :disabled="!hasRounds && !isDebateStreaming"
         @click.stop="toggleExpand"
       >
         {{ isExpanded ? '▲ Hide Fight' : '⚔ See Fight' }}
@@ -87,7 +91,7 @@
       @wheel.stop
     >
       <div class="expanded-header">
-        <h4>Debate Rounds ({{ debate.rounds?.length || 0 }})</h4>
+        <h4>Debate Rounds ({{ displayRounds.length }})</h4>
         <button
           class="close-btn"
           @click.stop="toggleExpand"
@@ -96,8 +100,8 @@
         </button>
       </div>
       <div class="rounds-container">
-        <div 
-          v-for="(round, index) in debate.rounds" 
+        <div
+          v-for="(round, index) in displayRounds"
           :key="index"
           class="round-card"
         >
@@ -105,8 +109,8 @@
             Round {{ index + 1 }}
           </div>
           <div class="round-responses">
-            <div 
-              v-for="(response, modelId) in getRoundResponses(round)" 
+            <div
+              v-for="(response, modelId) in getRoundResponses(round)"
               :key="modelId"
               class="round-response"
             >
@@ -118,8 +122,31 @@
             </div>
           </div>
         </div>
+        <!-- Show currently streaming round -->
         <div
-          v-if="!hasRounds"
+          v-if="currentStreamingModels && Object.keys(currentStreamingModels).length > 0"
+          class="round-card streaming"
+        >
+          <div class="round-header">
+            Round {{ (streamingContent?.currentRound || displayRounds.length + 1) }}
+            <span class="live-badge live-badge-sm">LIVE</span>
+          </div>
+          <div class="round-responses">
+            <div
+              v-for="(content, modelId) in currentStreamingModels"
+              :key="modelId"
+              class="round-response"
+            >
+              <span class="response-model">{{ getModelName(modelId) }}</span>
+              <div
+                class="response-content"
+                v-html="renderContent(content)"
+              />
+            </div>
+          </div>
+        </div>
+        <div
+          v-if="!hasRounds && !isDebateStreaming"
           class="no-rounds"
         >
           No debate rounds yet
@@ -141,6 +168,10 @@ const props = defineProps({
   isExpanded: {
     type: Boolean,
     default: false
+  },
+  streamingContent: {
+    type: Object,
+    default: null
   }
 })
 
@@ -156,9 +187,40 @@ const localExpanded = ref(false)
 // Computed
 const isActive = computed(() => props.debate.status === 'active')
 
-const hasRounds = computed(() => {
-  return props.debate.rounds && props.debate.rounds.length > 0
+// Whether this debate is currently streaming
+const isDebateStreaming = computed(() => props.streamingContent != null)
+
+// Currently streaming model content (for the in-progress round)
+const currentStreamingModels = computed(() => {
+  if (!props.streamingContent) return null
+  return props.streamingContent.models
 })
+
+// Merge persisted rounds with completed streaming rounds
+const displayRounds = computed(() => {
+  const persisted = props.debate.rounds || []
+  if (!props.streamingContent?.completedRounds?.length) return persisted
+
+  // Streaming completedRounds that aren't yet persisted
+  const persistedCount = persisted.length
+  const streamingCompleted = props.streamingContent.completedRounds
+    .filter(sr => sr.round_number > persistedCount)
+    .map(sr => ({
+      round_number: sr.round_number,
+      topic: `Round ${sr.round_number}`,
+      // Convert { models: { modelId: text } } to responses array format
+      responses: Object.entries(sr.models).map(([modelId, content]) => ({
+        model_id: modelId,
+        model_name: modelId.split('/').pop() || modelId,
+        content
+      })),
+      created_at: new Date().toISOString()
+    }))
+
+  return [...persisted, ...streamingCompleted]
+})
+
+const hasRounds = computed(() => displayRounds.value.length > 0)
 
 const nodeStyle = computed(() => ({
   left: `${props.debate.position.x}px`,
@@ -170,19 +232,20 @@ const nodeStyle = computed(() => ({
 // Get a summary from the last round for the compact view
 const lastRoundSummary = computed(() => {
   if (!hasRounds.value) return null
-  
-  const lastRound = props.debate.rounds[props.debate.rounds.length - 1]
+
+  const rounds = displayRounds.value
+  const lastRound = rounds[rounds.length - 1]
   if (!lastRound) return null
-  
+
   // Handle both object format and other formats
   const responses = getRoundResponses(lastRound)
   const modelIds = Object.keys(responses)
   if (modelIds.length === 0) return null
-  
+
   // Get the first model's response as summary
   const firstResponse = responses[modelIds[0]]
   if (!firstResponse) return null
-  
+
   marked.setOptions({ breaks: true, gfm: true })
   // Show full content (scrollable in UI)
   if (typeof firstResponse !== 'string') return null
@@ -701,5 +764,35 @@ onBeforeUnmount(() => {
   color: var(--text-muted);
   padding: var(--spacing-lg);
   font-size: 0.875rem;
+}
+
+/* LIVE badge */
+.live-badge {
+  font-size: 0.5625rem;
+  font-weight: 700;
+  color: var(--accent-red, #ef4444);
+  background: color-mix(in srgb, var(--accent-red, #ef4444) 15%, transparent);
+  padding: 2px 6px;
+  border-radius: var(--radius-sm);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  animation: pulse-live 1.5s ease-in-out infinite;
+}
+
+.live-badge-sm {
+  font-size: 0.5rem;
+  padding: 1px 4px;
+  margin-left: var(--spacing-xs);
+}
+
+@keyframes pulse-live {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
+
+/* Streaming round card */
+.round-card.streaming {
+  border: 1px solid color-mix(in srgb, var(--accent-green) 40%, transparent);
+  box-shadow: 0 0 8px color-mix(in srgb, var(--accent-green) 15%, transparent);
 }
 </style>

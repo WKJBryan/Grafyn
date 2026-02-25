@@ -186,6 +186,7 @@
           :key="`debate-${debate.id}`"
           :debate="debate"
           :is-expanded="expandedDebates.includes(debate.id)"
+          :streaming-content="debateStreamingContent[debate.id] || null"
           @drag="handleDebateDrag"
           @delete="handleDeleteDebate"
           @expand="expandDebate"
@@ -393,6 +394,7 @@ const debates = computed(() => canvasStore.debates)
 const availableModels = computed(() => canvasStore.availableModels)
 const loading = computed(() => canvasStore.loading)
 const streamingModels = computed(() => canvasStore.streamingModels)
+const debateStreamingContent = computed(() => canvasStore.debateStreamingContent)
 const tileEdges = computed(() => canvasStore.tileEdges)
 const debateEdges = computed(() => canvasStore.debateEdges)
 

@@ -154,6 +154,9 @@ jobs:
           cd e2e
           npx playwright install --with-deps chromium
 
+      - name: Create test vault directory
+        run: mkdir -p /tmp/test_vault /tmp/test_data
+
       - name: Start backend server
         run: |
           cd backend
@@ -163,9 +166,6 @@ jobs:
           ENVIRONMENT: test
           VAULT_PATH: /tmp/test_vault
           DATA_PATH: /tmp/test_data
-
-      - name: Create test vault directory
-        run: mkdir -p /tmp/test_vault /tmp/test_data
 
       - name: Start frontend server
         run: |

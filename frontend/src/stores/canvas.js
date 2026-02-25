@@ -10,6 +10,8 @@ export const useCanvasStore = defineStore('canvas', () => {
   const loading = ref(false)
   const error = ref(null)
   const streamingModels = ref(new Set())
+  // Debate streaming state: { [debateId]: { currentRound, models: { [modelId]: text }, completedRounds: [] } }
+  const debateStreamingContent = ref({})
 
   // Getters
   const promptTiles = computed(() => currentSession.value?.prompt_tiles || [])
@@ -173,6 +175,21 @@ export const useCanvasStore = defineStore('canvas', () => {
     // Mark models as streaming
     models.forEach(m => streamingModels.value.add(m))
 
+    // Calculate position for new tile when branching from a parent response
+    let position = undefined
+    if (parentTileId && parentModelId) {
+      const parentTile = currentSession.value.prompt_tiles.find(t => t.id === parentTileId)
+      if (parentTile && parentTile.responses[parentModelId]) {
+        const parentPos = parentTile.responses[parentModelId].position
+        position = {
+          x: parentPos.x,
+          y: parentPos.y + (parentPos.height || 200) + 60,
+          width: 400,
+          height: 300
+        }
+      }
+    }
+
     try {
       if (isDesktopApp()) {
         // === Tauri path: IPC + event-based streaming ===
@@ -187,7 +204,8 @@ export const useCanvasStore = defineStore('canvas', () => {
           max_tokens: maxTokens,
           parent_tile_id: parentTileId,
           parent_model_id: parentModelId,
-          context_mode: contextMode
+          context_mode: contextMode,
+          position
         }
 
         // Set up event listener BEFORE calling invoke
@@ -238,7 +256,8 @@ export const useCanvasStore = defineStore('canvas', () => {
             max_tokens: maxTokens,
             parent_tile_id: parentTileId,
             parent_model_id: parentModelId,
-            context_mode: contextMode
+            context_mode: contextMode,
+            position
           })
         })
 
@@ -524,8 +543,29 @@ export const useCanvasStore = defineStore('canvas', () => {
               currentSession.value.debates.push(data.debate)
             }
           },
-          round_start: () => {},
-          debate_chunk: () => {},
+          round_start: (data) => {
+            const debateId = data.debate_id
+            const existing = debateStreamingContent.value[debateId]
+            if (existing && Object.keys(existing.models).length > 0) {
+              // Snapshot current round into completedRounds
+              existing.completedRounds.push({
+                round_number: existing.currentRound,
+                models: { ...existing.models }
+              })
+            }
+            debateStreamingContent.value[debateId] = {
+              ...(existing || {}),
+              currentRound: data.round_number,
+              models: {},
+              completedRounds: existing?.completedRounds || []
+            }
+          },
+          debate_chunk: (data) => {
+            const state = debateStreamingContent.value[data.debate_id]
+            if (state && state.currentRound === data.round_number) {
+              state.models[data.model_id] = (state.models[data.model_id] || '') + data.chunk
+            }
+          },
           model_complete: (data) => {
             streamingModels.value.delete(data.model_id)
           },
@@ -533,7 +573,16 @@ export const useCanvasStore = defineStore('canvas', () => {
             console.error(`Debate error for ${data.model_id}:`, data.error)
             streamingModels.value.delete(data.model_id)
           },
-          debate_complete: async () => {
+          debate_complete: async (data) => {
+            // Snapshot final round if it has content
+            const state = debateStreamingContent.value[data.debate_id]
+            if (state && Object.keys(state.models).length > 0) {
+              state.completedRounds.push({
+                round_number: state.currentRound,
+                models: { ...state.models }
+              })
+            }
+            delete debateStreamingContent.value[data.debate_id]
             await loadSession(sessionId)
             debateCompleteResolve()
           }
@@ -605,6 +654,31 @@ export const useCanvasStore = defineStore('canvas', () => {
             case 'debate_created':
               debateId = event.debate_id
               break
+            case 'round_start': {
+              if (!debateId) break
+              const existing = debateStreamingContent.value[debateId]
+              if (existing && Object.keys(existing.models).length > 0) {
+                existing.completedRounds.push({
+                  round_number: existing.currentRound,
+                  models: { ...existing.models }
+                })
+              }
+              debateStreamingContent.value[debateId] = {
+                ...(existing || {}),
+                currentRound: event.round_number,
+                models: {},
+                completedRounds: existing?.completedRounds || []
+              }
+              break
+            }
+            case 'debate_chunk': {
+              if (!debateId) break
+              const state = debateStreamingContent.value[debateId]
+              if (state && state.currentRound === event.round_number) {
+                state.models[event.model_id] = (state.models[event.model_id] || '') + event.chunk
+              }
+              break
+            }
             case 'model_complete':
               streamingModels.value.delete(event.model_id)
               break
@@ -612,9 +686,20 @@ export const useCanvasStore = defineStore('canvas', () => {
               console.error(`Debate error for ${event.model_id}:`, event.error)
               streamingModels.value.delete(event.model_id)
               break
-            case 'debate_complete':
+            case 'debate_complete': {
+              if (debateId) {
+                const state = debateStreamingContent.value[debateId]
+                if (state && Object.keys(state.models).length > 0) {
+                  state.completedRounds.push({
+                    round_number: state.currentRound,
+                    models: { ...state.models }
+                  })
+                }
+                delete debateStreamingContent.value[debateId]
+              }
               await loadSession(sessionId)
               break
+            }
           }
         } catch (e) {
           console.error('Failed to parse debate SSE event:', e)
@@ -648,14 +733,34 @@ export const useCanvasStore = defineStore('canvas', () => {
         const debateCompletePromise = new Promise(resolve => { debateCompleteResolve = resolve })
 
         const unlisten = await setupTauriStreamListener(sessionId, {
-          debate_chunk: () => {},
+          round_start: (data) => {
+            debateStreamingContent.value[debateId] = {
+              currentRound: data.round_number,
+              models: {},
+              completedRounds: []
+            }
+          },
+          debate_chunk: (data) => {
+            const state = debateStreamingContent.value[data.debate_id]
+            if (state && state.currentRound === data.round_number) {
+              state.models[data.model_id] = (state.models[data.model_id] || '') + data.chunk
+            }
+          },
           model_complete: (data) => {
             streamingModels.value.delete(data.model_id)
           },
           debate_error: (data) => {
             streamingModels.value.delete(data.model_id)
           },
-          debate_complete: async () => {
+          debate_complete: async (data) => {
+            const state = debateStreamingContent.value[data.debate_id]
+            if (state && Object.keys(state.models).length > 0) {
+              state.completedRounds.push({
+                round_number: state.currentRound,
+                models: { ...state.models }
+              })
+            }
+            delete debateStreamingContent.value[data.debate_id]
             await loadSession(sessionId)
             debateCompleteResolve()
           }
@@ -699,8 +804,39 @@ export const useCanvasStore = defineStore('canvas', () => {
 
             try {
               const event = JSON.parse(data)
-              if (event.type === 'round_complete' || event.type === 'debate_complete') {
-                await loadSession(sessionId)
+              switch (event.type) {
+                case 'round_start':
+                  debateStreamingContent.value[debateId] = {
+                    currentRound: event.round_number,
+                    models: {},
+                    completedRounds: []
+                  }
+                  break
+                case 'debate_chunk': {
+                  const state = debateStreamingContent.value[debateId]
+                  if (state && state.currentRound === event.round_number) {
+                    state.models[event.model_id] = (state.models[event.model_id] || '') + event.chunk
+                  }
+                  break
+                }
+                case 'model_complete':
+                  streamingModels.value.delete(event.model_id)
+                  break
+                case 'round_complete':
+                case 'debate_complete': {
+                  const state = debateStreamingContent.value[debateId]
+                  if (state && Object.keys(state.models).length > 0) {
+                    state.completedRounds.push({
+                      round_number: state.currentRound,
+                      models: { ...state.models }
+                    })
+                  }
+                  if (event.type === 'debate_complete') {
+                    delete debateStreamingContent.value[debateId]
+                  }
+                  await loadSession(sessionId)
+                  break
+                }
               }
             } catch (e) {
               console.error('Failed to parse continue debate SSE event:', e)
@@ -755,6 +891,7 @@ export const useCanvasStore = defineStore('canvas', () => {
     loading.value = false
     error.value = null
     streamingModels.value.clear()
+    debateStreamingContent.value = {}
   }
 
   // Branching helper - get parent response content for context
@@ -1014,6 +1151,7 @@ export const useCanvasStore = defineStore('canvas', () => {
     loading,
     error,
     streamingModels,
+    debateStreamingContent,
     // Getters
     promptTiles,
     debates,

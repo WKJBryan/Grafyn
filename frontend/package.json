@@ -1,6 +1,6 @@
 {
   "name": "grafyn-frontend",
-  "version": "0.0.5",
+  "version": "0.0.6",
   "type": "module",
   "description": "Grafyn frontend - Vue 3 SPA for knowledge management",
   "scripts": {
@@ -16,8 +16,6 @@
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build",
-    "tauri:build-with-mcp": "node scripts/build-sidecar.cjs && tauri build",
-    "build:sidecar": "node scripts/build-sidecar.cjs",
     "version:bump": "node scripts/bump-version.cjs",
     "generate-icons": "node scripts/generate-icons.cjs && npx tauri icon src-tauri/icons/app-icon.png"
   },

@@ -1,6 +1,11 @@
 /**
  * E2E Test Helpers and Fixtures
+ *
+ * Updated for graph-first UI with overlay editor panels, TopicSelector modal,
+ * TreeNav navigation, and ConfirmDialog.
  */
+
+const API_BASE = 'http://localhost:8080/api'
 
 /**
  * Generate a unique note title for testing
@@ -51,7 +56,8 @@ export const sampleNotes = [
 ]
 
 /**
- * Wait for the app to be fully loaded
+ * Wait for the app to be fully loaded.
+ * The home view uses a graph-first layout with TreeNav in the left sidebar.
  */
 export async function waitForAppReady(page) {
   await page.waitForSelector('.home-view', { state: 'visible' })
@@ -59,73 +65,173 @@ export async function waitForAppReady(page) {
 }
 
 /**
- * Create a note via the UI
+ * Complete the TopicSelector modal that appears when creating a new note.
+ *
+ * @param {import('@playwright/test').Page} page
+ * @param {Object} options
+ * @param {string} [options.noteType] - 'Note', 'Source', or 'Map of Content'
+ * @param {string} [options.topic] - Topic name to select or create
+ * @param {boolean} [options.skipTopic=true] - Check "Skip - create without topic"
  */
-export async function createNote(page, { title, content, status = 'draft', tags = [] }) {
-  // Click New Note button
+export async function completeTopicSelector(page, { noteType, topic, skipTopic = true } = {}) {
+  await page.waitForSelector('.topic-selector-overlay', { state: 'visible' })
+
+  // Select note type if specified (default is "Note" which is pre-selected)
+  if (noteType) {
+    await page.click(`.type-option:has-text("${noteType}")`)
+  }
+
+  if (topic) {
+    // Type a new topic or select existing
+    const topicInput = page.locator('.new-topic-input input')
+    await topicInput.fill(topic)
+
+    // Check if it matches an existing topic chip
+    const existingChip = page.locator(`.topic-chip:has-text("${topic}")`)
+    if (await existingChip.isVisible({ timeout: 500 }).catch(() => false)) {
+      await existingChip.click()
+    }
+  } else if (skipTopic) {
+    // Check the "Skip - create without topic" checkbox
+    const skipCheckbox = page.locator('.no-topic-option input[type="checkbox"]')
+    if (!(await skipCheckbox.isChecked())) {
+      await skipCheckbox.check()
+    }
+  }
+
+  // Click "Create Note"
+  await page.click('.selector-footer .btn-primary')
+
+  // Wait for editor overlay to open
+  await page.waitForSelector('.editor-panel-overlay', { state: 'visible' })
+}
+
+/**
+ * Create a note via the UI (TopicSelector → Editor Overlay → Save).
+ *
+ * @param {import('@playwright/test').Page} page
+ * @param {Object} data
+ * @param {string} data.title
+ * @param {string} data.content
+ * @param {string} [data.status='draft']
+ * @param {string[]} [data.tags=[]]
+ * @param {Object} [topicOptions] - Options for TopicSelector
+ */
+export async function createNote(page, { title, content, status = 'draft', tags = [] }, topicOptions) {
+  // Click "+ New Note" button in header
   await page.click('button:has-text("New Note")')
 
-  // Wait for editor
-  await page.waitForSelector('.note-editor')
+  // Complete TopicSelector modal
+  await completeTopicSelector(page, topicOptions)
 
-  // Fill in title
-  await page.fill('input[placeholder*="title"]', title)
-
-  // Fill in content
-  await page.fill('textarea', content)
+  // Fill in editor overlay fields
+  await page.fill('.editor-panel-overlay .title-input', title)
+  await page.fill('.editor-panel-overlay .editor-textarea', content)
 
   // Select status if not draft
   if (status !== 'draft') {
-    await page.selectOption('select', status)
+    await page.selectOption('.editor-panel-overlay .status-select', status)
   }
 
   // Add tags
   if (tags.length > 0) {
-    await page.fill('input[placeholder*="tag"]', tags.join(', '))
+    await page.fill('.editor-panel-overlay .tags-input', tags.join(', '))
   }
 
   // Save
-  await page.click('button:has-text("Save")')
+  await page.click('.editor-panel-overlay button:has-text("Save")')
 
-  // Wait for save to complete
+  // Wait for save response
   await page.waitForResponse(resp =>
     resp.url().includes('/api/notes') && resp.status() === 200
   )
 }
 
 /**
- * Select a note from the list
+ * Create a note via API (faster, for test setup — skips UI).
+ *
+ * @param {import('@playwright/test').APIRequestContext} request
+ * @param {string} baseURL
+ * @param {Object} data
+ * @param {string} data.title
+ * @param {string} data.content
+ * @param {string} [data.status='draft']
+ * @param {string[]} [data.tags=[]]
+ * @returns {Promise<Object>} Created note
  */
-export async function selectNote(page, title) {
-  await page.click(`.note-item:has-text("${title}")`)
-  await page.waitForSelector('.note-editor')
+export async function createNoteViaAPI(request, baseURL, { title, content, status = 'draft', tags = [] }) {
+  const response = await request.post(`${baseURL}/api/notes`, {
+    data: { title, content, status, tags },
+  })
+  return response.json()
 }
 
 /**
- * Delete the currently selected note
+ * Select a note from the TreeNav in the left sidebar.
+ */
+export async function selectNote(page, title) {
+  await page.click(`.tree-nav .nav-item:has-text("${title}")`)
+  await page.waitForSelector('.editor-panel-overlay', { state: 'visible' })
+}
+
+/**
+ * Close the editor overlay panel.
+ */
+export async function closeEditorOverlay(page) {
+  await page.click('.editor-panel-overlay .close-btn')
+  await page.waitForSelector('.editor-panel-overlay', { state: 'hidden' })
+}
+
+/**
+ * Delete the currently open note using the ConfirmDialog.
  */
 export async function deleteNote(page) {
-  // Click delete button
-  await page.click('button:has-text("Delete")')
+  // Click delete button in editor overlay
+  await page.click('.editor-panel-overlay button:has-text("Delete")')
 
-  // Accept confirmation dialog
-  page.on('dialog', dialog => dialog.accept())
+  // Wait for ConfirmDialog to appear
+  await page.waitForSelector('.confirm-dialog', { state: 'visible' })
 
-  // Wait for delete to complete
+  // Click the confirm "Delete" button in the dialog
+  await page.click('.confirm-dialog .btn-danger')
+
+  // Wait for delete response
   await page.waitForResponse(resp =>
     resp.url().includes('/api/notes') && resp.request().method() === 'DELETE'
   )
 }
 
 /**
- * Search for a note
+ * Confirm the ConfirmDialog by clicking the confirm button.
+ */
+export async function confirmDelete(page) {
+  await page.waitForSelector('.confirm-dialog', { state: 'visible' })
+  await page.click('.confirm-dialog .btn-danger')
+}
+
+/**
+ * Cancel the ConfirmDialog.
+ */
+export async function cancelDelete(page) {
+  await page.waitForSelector('.confirm-dialog', { state: 'visible' })
+  await page.click('.confirm-dialog .btn-secondary')
+  await page.waitForSelector('.confirm-dialog', { state: 'hidden' })
+}
+
+/**
+ * Search for a note using the SearchBar.
  */
 export async function searchNote(page, query) {
-  // Click on search input
   await page.fill('input[placeholder*="Search"]', query)
-
-  // Wait for search results
   await page.waitForSelector('.search-results', { state: 'visible' })
+}
+
+/**
+ * Select a note from the TreeNav by title.
+ * Alias for selectNote with more descriptive name.
+ */
+export async function selectNoteFromTree(page, title) {
+  return selectNote(page, title)
 }
 
 /**
