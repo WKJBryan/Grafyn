@@ -336,18 +336,13 @@ jobs:
             echo "WARNING: latest.json not found in release assets"
           fi
 
-      - name: Install wrangler
-        uses: cloudflare/wrangler-action@v3
-        with:
-          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          command: whoami
-
       - name: Upload to R2
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
+          npm i -g wrangler@3
+
           # Upload latest.json first (if it exists)
           if [ -f release-assets/latest.json ]; then
             echo "Uploading latest.json..."
