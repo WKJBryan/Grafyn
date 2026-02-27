@@ -8,24 +8,27 @@ use regex::Regex;
 use tauri::State;
 
 lazy_static! {
-    /// Inline tag pattern: # followed by letter, then letters/digits/hyphens/underscores
+    /// Inline tag pattern: # followed by letter/digit, then letters/digits/hyphens/underscores
     /// Must not be preceded by ` or # (to skip code and headings)
+    /// Matches Python's INLINE_TAG_PATTERN: allows digit-first tags (#3d) and single-char (#a)
     static ref INLINE_TAG_RE: Regex =
-        Regex::new(r"(?<![`#])#([a-zA-Z][a-zA-Z0-9_/\-]+)").unwrap();
+        Regex::new(r"(?<![`#])#([a-zA-Z0-9][a-zA-Z0-9_/\-]*)").unwrap();
     /// Fenced code block removal
     static ref FENCED_CODE_RE: Regex = Regex::new(r"(?s)```.*?```").unwrap();
     /// Inline code removal
     static ref INLINE_CODE_RE: Regex = Regex::new(r"`[^`]+`").unwrap();
+    /// Whitespace run for tag normalization (collapse multiple spaces → single hyphen)
+    static ref WHITESPACE_RUN: Regex = Regex::new(r"\s+").unwrap();
 }
 
 // ── Tag utilities ──────────────────────────────────────────────────────────
 
-/// Normalize a single tag: lowercase, strip leading #, spaces→hyphens
+/// Normalize a single tag: lowercase, strip leading #, collapse whitespace→hyphens, strip edge hyphens
 fn normalize_tag(tag: &str) -> String {
-    tag.trim_start_matches('#')
-        .to_lowercase()
-        .trim()
-        .replace(' ', "-")
+    let result = tag.trim_start_matches('#').to_lowercase();
+    let result = result.trim();
+    let result = WHITESPACE_RUN.replace_all(result, "-");
+    result.trim_matches('-').to_string()
 }
 
 /// Normalize and deduplicate a list of tags
@@ -115,12 +118,54 @@ const META_SECTIONS: &[&str] = &[
     "updates",
 ];
 
-/// Extract atomic candidates by splitting on H2 headings (rules-based)
+/// Extract up to 5 summary bullet points from a section body
+fn extract_summary_bullets(body: &str) -> Vec<String> {
+    body.lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            if trimmed.starts_with("- ") {
+                Some(trimmed[2..].to_string())
+            } else if trimmed.starts_with("* ") {
+                Some(trimmed[2..].to_string())
+            } else {
+                None
+            }
+        })
+        .take(5)
+        .collect()
+}
+
+/// Build inherited container tags (excluding meta tags)
+fn inherited_tags(container_tags: &[String]) -> Vec<String> {
+    container_tags
+        .iter()
+        .filter(|t| !["chat", "canvas-export", "evidence"].contains(&t.as_str()))
+        .cloned()
+        .collect()
+}
+
+/// Merge section tags with inherited tags, sort, and limit to 5
+fn merge_and_limit_tags(section_tags: Vec<String>, inherited: &[String]) -> Vec<String> {
+    let mut all_tags: std::collections::HashSet<String> = section_tags.into_iter().collect();
+    all_tags.extend(inherited.iter().cloned());
+    let mut tags: Vec<String> = all_tags.into_iter().collect();
+    tags.sort();
+    tags.truncate(5);
+    tags
+}
+
+/// Extract atomic candidates by splitting on H2 headings (rules-based).
+///
+/// When an H2 section contains H3 sub-headings (e.g. `## Conversation History`
+/// with `### Message N` children), performs a secondary split on H3 to produce
+/// individual candidates from each sub-section. This handles imported
+/// conversation container notes which pack all content under a single H2.
 fn extract_candidates_rules(
     content: &str,
     container_tags: &[String],
 ) -> Vec<AtomicCandidate> {
     let mut candidates = Vec::new();
+    let inherited = inherited_tags(container_tags);
 
     // Split on \n## (keeping content before first ## is skipped)
     let sections: Vec<&str> = content.split("\n## ").collect();
@@ -144,39 +189,51 @@ fn extract_candidates_rules(
             continue;
         }
 
-        // Extract summary bullets (up to 5)
-        let summary: Vec<String> = body
-            .lines()
-            .filter_map(|line| {
-                let trimmed = line.trim();
-                if trimmed.starts_with("- ") {
-                    Some(trimmed[2..].to_string())
-                } else if trimmed.starts_with("* ") {
-                    Some(trimmed[2..].to_string())
-                } else {
-                    None
+        // Check for H3 sub-headings — if present, extract each as a candidate
+        let h3_sections: Vec<&str> = body.split("\n### ").collect();
+        if h3_sections.len() > 1 {
+            // H3 sub-headings present — extract each as a candidate
+            for h3_section in h3_sections.iter().skip(1) {
+                let h3_lines: Vec<&str> = h3_section.lines().collect();
+                if h3_lines.is_empty() {
+                    continue;
                 }
-            })
-            .take(5)
-            .collect();
+                let h3_title = h3_lines[0].trim().to_string();
+                let h3_body = h3_lines[1..].join("\n").trim().to_string();
 
-        // Extract inline tags from section
+                if h3_body.len() < 50 {
+                    continue;
+                }
+
+                let summary = extract_summary_bullets(&h3_body);
+                let section_tags = parse_inline_tags(&h3_body);
+                let recommended_tags = merge_and_limit_tags(section_tags, &inherited);
+                let suggested_hub = suggest_hub(&h3_title, &recommended_tags);
+
+                let summary = if summary.is_empty() {
+                    if h3_body.len() > 200 {
+                        vec![format!("{}...", &h3_body[..200])]
+                    } else {
+                        vec![h3_body.clone()]
+                    }
+                } else {
+                    summary
+                };
+
+                candidates.push(AtomicCandidate {
+                    title: format!("Atomic: {}", h3_title),
+                    summary,
+                    recommended_tags,
+                    suggested_hub,
+                });
+            }
+            continue; // skip H2-level candidate since we extracted H3 children
+        }
+
+        // Normal H2 section — extract as single candidate
+        let summary = extract_summary_bullets(&body);
         let section_tags = parse_inline_tags(&body);
-
-        // Inherit container tags (excluding meta tags)
-        let inherited: Vec<String> = container_tags
-            .iter()
-            .filter(|t| !["chat", "canvas-export", "evidence"].contains(&t.as_str()))
-            .cloned()
-            .collect();
-
-        // Merge and limit to 5
-        let mut all_tags: std::collections::HashSet<String> = section_tags.into_iter().collect();
-        all_tags.extend(inherited);
-        let mut recommended_tags: Vec<String> = all_tags.into_iter().collect();
-        recommended_tags.sort();
-        recommended_tags.truncate(5);
-
+        let recommended_tags = merge_and_limit_tags(section_tags, &inherited);
         let suggested_hub = suggest_hub(&title, &recommended_tags);
 
         let summary = if summary.is_empty() {
@@ -401,13 +458,14 @@ pub async fn distill_note(
     let extraction_method_used = if use_llm { "llm" } else { "rules" };
 
     // 3. Extract candidates
+    let mut llm_fallback_msg: Option<String> = None;
     let candidates = if use_llm {
         // LLM path: summarize then extract from summary
         match summarize_with_llm(&note.content, &state).await {
             Ok(summary) => extract_candidates_rules(&summary, &note.tags),
             Err(e) => {
                 log::warn!("LLM summarization failed, falling back to rules: {}", e);
-                // Fallback to rules
+                llm_fallback_msg = Some(format!("LLM summarization failed ({}), fell back to rules-based extraction", e));
                 extract_candidates_rules(&note.content, &note.tags)
             }
         }
@@ -555,14 +613,22 @@ pub async fn distill_note(
     };
 
     let count = created_ids.len();
+    let message = if let Some(fallback) = llm_fallback_msg {
+        format!(
+            "Auto-created {} draft atomic notes. {}",
+            count, fallback
+        )
+    } else {
+        format!(
+            "Auto-created {} draft atomic notes using {}",
+            count, extraction_method_used
+        )
+    };
     Ok(DistillResponse {
         created_note_ids: created_ids,
         hub_updates,
         container_updated,
-        message: format!(
-            "Auto-created {} draft atomic notes using {}",
-            count, extraction_method_used
-        ),
+        message,
         extraction_method_used: extraction_method_used.to_string(),
         status: "completed".to_string(),
     })

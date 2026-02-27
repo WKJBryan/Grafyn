@@ -31,7 +31,7 @@ class Settings(BaseSettings):
     canvas_data_path: str = "../data/canvas"
 
     # Import Configuration
-    import_max_file_size: int = 100  # MB
+    import_max_file_size: int = 1024  # MB
     import_temp_dir: str = "../data/import/temp"
     import_auto_distill: bool = True
     import_distillation_model: str = "anthropic/claude-3-haiku"

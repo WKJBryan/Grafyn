@@ -245,82 +245,92 @@ class ImportService:
         
         if progress_callback:
             progress_callback(f"Processing {len(decisions)} conversations...")
-        
-        # Process each decision
-        for i, decision in enumerate(decisions):
-            if progress_callback:
-                progress_callback(f"Processing {i + 1}/{len(decisions)}...")
-            
-            logger.debug("Processing decision %d: conversation_id=%s, action=%s", i+1, decision.conversation_id, decision.action)
 
-            logger.debug("Job has parsed_conversations: %s", job.parsed_conversations is not None)
-            if job.parsed_conversations:
-                logger.debug("parsed_conversations count: %d", len(job.parsed_conversations))
-                logger.debug("parsed_conversations IDs: %s", [c.id for c in job.parsed_conversations])
+        # Process each decision — graph rebuild is deferred to one batch call
+        try:
+            for i, decision in enumerate(decisions):
+                if progress_callback:
+                    progress_callback(f"Processing {i + 1}/{len(decisions)}...")
 
-            conv = self._find_conversation(job, decision.conversation_id)
-            logger.debug("_find_conversation result: %s", conv is not None)
-            if not conv:
-                logger.warning("Conversation not found: %s", decision.conversation_id)
-                skipped += 1
-                continue
-            
-            logger.debug("Found conversation: %s", conv.title)
-            
-            try:
-                if decision.action == "skip":
+                logger.debug("Processing decision %d: conversation_id=%s, action=%s", i+1, decision.conversation_id, decision.action)
+
+                logger.debug("Job has parsed_conversations: %s", job.parsed_conversations is not None)
+                if job.parsed_conversations:
+                    logger.debug("parsed_conversations count: %d", len(job.parsed_conversations))
+                    logger.debug("parsed_conversations IDs: %s", [c.id for c in job.parsed_conversations])
+
+                conv = self._find_conversation(job, decision.conversation_id)
+                logger.debug("_find_conversation result: %s", conv is not None)
+                if not conv:
+                    logger.warning("Conversation not found: %s", decision.conversation_id)
                     skipped += 1
                     continue
-                
-                elif decision.action == "accept":
-                    # Create container note
-                    logger.info(f"Creating container note for: {conv.title}")
-                    container_id = await self._create_container_note(conv)
-                    logger.info(f"Container note result: {container_id}")
-                    if container_id:
-                        imported += 1
-                        container_notes += 1
-                        created_ids.append(container_id)
-                        
-                        # Distill if requested
-                        if decision.distill_option != "container_only":
-                            atomics = await self._distill_container(
-                                container_id,
-                                conv,
-                                decision
+
+                logger.debug("Found conversation: %s", conv.title)
+
+                try:
+                    if decision.action == "skip":
+                        skipped += 1
+                        continue
+
+                    elif decision.action == "accept":
+                        # Create container note
+                        logger.info(f"Creating container note for: {conv.title}")
+                        container_id = await self._create_container_note(conv)
+                        logger.info(f"Container note result: {container_id}")
+                        if container_id:
+                            imported += 1
+                            container_notes += 1
+                            created_ids.append(container_id)
+
+                            # Distill if requested (defer_graph_rebuild since we batch at end)
+                            if decision.distill_option != "container_only":
+                                atomics = await self._distill_container(
+                                    container_id,
+                                    conv,
+                                    decision
+                                )
+                                atomic_notes += len(atomics)
+                                created_ids.extend(atomics)
+
+                    elif decision.action == "merge":
+                        # Merge with existing note
+                        if decision.target_note_id:
+                            success = await self._merge_conversation(
+                                decision.target_note_id,
+                                conv
                             )
-                            atomic_notes += len(atomics)
-                            created_ids.extend(atomics)
-                
-                elif decision.action == "merge":
-                    # Merge with existing note
-                    if decision.target_note_id:
-                        success = await self._merge_conversation(
-                            decision.target_note_id,
-                            conv
-                        )
-                        if success:
-                            merged += 1
-                            created_ids.append(decision.target_note_id)
-                        else:
-                            failed += 1
-                            errors.append(ImportErrorDetail(
-                                type="system",
-                                message=f"Failed to merge conversation {conv.id}",
-                                severity="error",
-                                conversation_id=conv.id
-                            ))
-                
-            except Exception as e:
-                failed += 1
-                errors.append(ImportErrorDetail(
-                    type="system",
-                    message=f"Failed to import conversation {conv.id}: {str(e)}",
-                    severity="error",
-                    conversation_id=conv.id
-                ))
-                logger.error(f"Import failed for conversation {conv.id}: {e}")
-        
+                            if success:
+                                merged += 1
+                                created_ids.append(decision.target_note_id)
+                            else:
+                                failed += 1
+                                errors.append(ImportErrorDetail(
+                                    type="system",
+                                    message=f"Failed to merge conversation {conv.id}",
+                                    severity="error",
+                                    conversation_id=conv.id
+                                ))
+
+                except Exception as e:
+                    failed += 1
+                    errors.append(ImportErrorDetail(
+                        type="system",
+                        message=f"Failed to import conversation {conv.id}: {str(e)}",
+                        severity="error",
+                        conversation_id=conv.id
+                    ))
+                    logger.error(f"Import failed for conversation {conv.id}: {e}")
+        finally:
+            # Single graph rebuild after all notes are created — avoids O(N²)
+            # rebuilds that previously happened once per note creation
+            if self.graph_index:
+                try:
+                    logger.info("Rebuilding graph index after import batch")
+                    self.graph_index.build_index()
+                except Exception as e:
+                    logger.error(f"Failed to rebuild graph index after import: {e}")
+
         # Update job status
         job.status = "completed"
         job.updated_at = datetime.now(timezone.utc)
@@ -815,24 +825,24 @@ Respond in this exact JSON format:
                 return conv
         return None
     
+    # Messages per chunk for container note structure.  Each chunk gets
+    # its own H2 heading so rules-based distillation can extract
+    # candidates from H2 sections instead of one giant blob.
+    MESSAGES_PER_CHUNK = 8
+
     async def _create_container_note(
         self,
         conversation: ParsedConversation
     ) -> Optional[str]:
-        """Create a container note from conversation."""
-        # Build conversation history markdown
-        history_parts = []
-        for msg in conversation.messages:
-            role_header = f"### Message {msg.index + 1} - {msg.role.upper()}"
-            if msg.timestamp:
-                role_header += f" - {msg.timestamp.strftime('%Y-%m-%d %H:%M')}"
-            if msg.model:
-                role_header += f" ({msg.model})"
-            
-            history_parts.append(f"{role_header}\n\n{msg.content}\n")
-        
-        history = "\n".join(history_parts)
-        
+        """Create a container note from conversation.
+
+        Messages are grouped into chunks of ~MESSAGES_PER_CHUNK under
+        separate H2 headings (e.g. "## Part 1", "## Part 2") so that
+        rules-based distillation can split on H2 and produce meaningful
+        candidates. Previously all messages lived under a single
+        "## Conversation History" H2, causing rules-based extraction
+        to produce only 1 giant candidate.
+        """
         # Build metadata table
         metadata_table = f"""| Property | Value |
 |---------|-------|
@@ -841,10 +851,10 @@ Respond in this exact JSON format:
 | Messages | {conversation.metadata.message_count} |
 | Models Used | {', '.join(conversation.metadata.model_info)} |
 | Source ID | {conversation.id} |"""
-        
+
         if conversation.metadata.source_url:
             metadata_table += f"\n| Source URL | [{conversation.id}]({conversation.metadata.source_url}) |"
-        
+
         # Build quality summary section if available
         quality_section = ""
         if conversation.quality and conversation.quality.detailed_summary:
@@ -855,7 +865,7 @@ Respond in this exact JSON format:
 ### Key Topics
 {chr(10).join(f"- {t}" for t in conversation.quality.key_topics) if conversation.quality.key_topics else "No key topics identified."}
 """
-        
+
         # Build related notes section with wikilinks
         related_section = ""
         if conversation.suggested_links:
@@ -864,20 +874,68 @@ Respond in this exact JSON format:
                 linked_note = self.knowledge_store.get_note(link_id)
                 if linked_note:
                     wikilinks.append(f"- [[{linked_note.title}]]")
-            
+
             if wikilinks:
                 related_section = f"""
 ## Related Notes
 {chr(10).join(wikilinks)}
 """
-        
+
+        # Build conversation history as chunked H2 sections
+        # Each chunk of ~MESSAGES_PER_CHUNK messages gets its own H2 heading
+        # so rules-based distillation can extract per-chunk candidates
+        messages = conversation.messages
+        chunk_size = self.MESSAGES_PER_CHUNK
+        history_sections = []
+
+        if len(messages) <= chunk_size:
+            # Small conversation — single section is fine
+            parts = []
+            for msg in messages:
+                role_header = f"### Message {msg.index + 1} - {msg.role.upper()}"
+                if msg.timestamp:
+                    role_header += f" - {msg.timestamp.strftime('%Y-%m-%d %H:%M')}"
+                if msg.model:
+                    role_header += f" ({msg.model})"
+                parts.append(f"{role_header}\n\n{msg.content}\n")
+            history_sections.append(f"## Conversation History\n{chr(10).join(parts)}")
+        else:
+            # Large conversation — split into numbered parts
+            for chunk_idx in range(0, len(messages), chunk_size):
+                chunk = messages[chunk_idx:chunk_idx + chunk_size]
+                chunk_num = chunk_idx // chunk_size + 1
+
+                # Use first assistant message snippet as topic hint
+                topic_hint = ""
+                for msg in chunk:
+                    if msg.role == "assistant" and msg.content:
+                        hint_text = msg.content[:80].replace('\n', ' ').strip()
+                        if len(hint_text) > 60:
+                            hint_text = hint_text[:60] + "..."
+                        topic_hint = f": {hint_text}"
+                        break
+
+                parts = []
+                for msg in chunk:
+                    role_header = f"### Message {msg.index + 1} - {msg.role.upper()}"
+                    if msg.timestamp:
+                        role_header += f" - {msg.timestamp.strftime('%Y-%m-%d %H:%M')}"
+                    if msg.model:
+                        role_header += f" ({msg.model})"
+                    parts.append(f"{role_header}\n\n{msg.content}\n")
+
+                history_sections.append(
+                    f"## Part {chunk_num}{topic_hint}\n{chr(10).join(parts)}"
+                )
+
+        history = "\n".join(history_sections)
+
         # Build full note content
         content = f"""# Conversation: {conversation.title}
 {quality_section}
 ## Metadata
 {metadata_table}
 {related_section}
-## Conversation History
 {history}
 
 ## Sources
@@ -912,11 +970,9 @@ Respond in this exact JSON format:
                     note.title,
                     note.content
                 )
-            
-            # Update knowledge graph
-            if self.graph_index and note:
-                self.graph_index.build_index()
-            
+
+            # Graph rebuild deferred to apply_import() for batch efficiency
+
             return note.id if note else None
         except Exception as e:
             logger.error(f"Failed to create container note: {e}")
@@ -936,12 +992,14 @@ Respond in this exact JSON format:
         from app.models.distillation import DistillMode, DistillRequest, ExtractionMethod
         
         if decision.distill_option == "auto_distill":
-            # Auto distill using LLM
+            # Auto distill using LLM — defer graph rebuild since apply_import batches it
             request = DistillRequest(
                 mode=DistillMode.AUTO,
                 extraction_method=ExtractionMethod.AUTO
             )
-            response = await self.distillation_service.distill(container_id, request)
+            response = await self.distillation_service.distill(
+                container_id, request, defer_graph_rebuild=True
+            )
             return response.created_note_ids or []
         
         elif decision.distill_option == "custom" and decision.custom_atoms:
@@ -988,15 +1046,14 @@ Respond in this exact JSON format:
             
             if note and self.vector_search:
                 self.vector_search.index_note(note.id, note.title, note.content)
-            
-            if note and self.graph_index:
-                self.graph_index.build_index()
-            
+
+            # Graph rebuild deferred to apply_import() for batch efficiency
+
             return note.id if note else None
         except Exception as e:
             logger.error(f"Failed to create atomic note: {e}")
             return None
-    
+
     async def _merge_conversation(
         self,
         target_note_id: str,

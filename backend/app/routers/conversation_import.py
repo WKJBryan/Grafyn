@@ -1,6 +1,8 @@
 """LLM import router for conversation import"""
 
 import logging
+import tempfile
+from pathlib import Path
 from typing import List, Optional
 
 from fastapi import APIRouter, UploadFile, File, Request, HTTPException, Depends
@@ -23,6 +25,9 @@ settings = get_settings()
 
 router = APIRouter(tags=["import"])
 
+# 1MB chunk size for streaming upload to disk
+UPLOAD_CHUNK_SIZE = 1024 * 1024
+
 
 class AssessRequest(BaseModel):
     """Request body for quality assessment endpoint"""
@@ -36,11 +41,39 @@ async def upload_file(
     """
     Upload LLM export file and create import job.
 
+    Streams the upload to a temp file in 1MB chunks to avoid buffering
+    large files (up to 1GB) entirely in memory.
+
     Supported formats: ChatGPT (conversations.json), Claude (.dms/.json), Grok (.json), Gemini (.json)
     """
     try:
-        # Read file content
-        file_content = await file.read()
+        # Stream file to disk in chunks to handle large files (up to 1GB)
+        temp_dir = Path(settings.import_temp_dir)
+        temp_dir.mkdir(parents=True, exist_ok=True)
+
+        with tempfile.NamedTemporaryFile(
+            dir=str(temp_dir), suffix=Path(file.filename or "upload").suffix,
+            delete=False
+        ) as tmp:
+            total_bytes = 0
+            while True:
+                chunk = await file.read(UPLOAD_CHUNK_SIZE)
+                if not chunk:
+                    break
+                total_bytes += len(chunk)
+                tmp.write(chunk)
+            tmp_path = tmp.name
+
+        logger.info(f"Streamed {total_bytes / (1024*1024):.1f}MB upload to {tmp_path}")
+
+        # Read the temp file content for processing
+        file_content = Path(tmp_path).read_bytes()
+
+        # Clean up temp file
+        try:
+            Path(tmp_path).unlink()
+        except OSError:
+            pass
 
         # Create import job
         job = await service.upload_file(file_content, file.filename)
