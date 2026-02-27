@@ -123,7 +123,7 @@ export default {
     const importStore = useImportStore()
     const fileInput = ref(null)
     const isDragging = ref(false)
-    const maxSize = 100
+    const maxSize = 1024
 
     const onDragOver = () => {
       isDragging.value = true

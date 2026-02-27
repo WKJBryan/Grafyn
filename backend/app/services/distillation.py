@@ -53,8 +53,10 @@ INLINE_TAG_PATTERN = re.compile(r'(?<![`#])#([a-zA-Z0-9][a-zA-Z0-9_/\-]*)')
 
 
 def normalize_tag(tag: str) -> str:
-    """Normalize tag: lowercase, strip '#', spaces → hyphens."""
-    return tag.lstrip('#').lower().strip().replace(' ', '-')
+    """Normalize tag: lowercase, strip '#', collapse whitespace → hyphens, strip edge hyphens."""
+    result = tag.lstrip('#').lower().strip()
+    result = re.sub(r'\s+', '-', result)  # collapse multiple spaces → single hyphen
+    return result.strip('-')              # strip leading/trailing hyphens
 
 
 def parse_inline_tags(content: str) -> List[str]:
@@ -82,8 +84,8 @@ def merge_tags(yaml_tags: List[str], inline_tags: List[str]) -> List[str]:
 
 
 def normalize_all_tags(tags: List[str]) -> List[str]:
-    """Normalize and deduplicate a list of tags."""
-    return sorted(set(normalize_tag(t) for t in tags))
+    """Normalize, deduplicate, and filter empty tags."""
+    return sorted(t for t in set(normalize_tag(t) for t in tags) if t)
 
 
 # ============================================================================
@@ -526,7 +528,8 @@ class DistillationService:
         self,
         note_id: str,
         request: DistillRequest,
-        progress_callback: Optional[Callable[[str], None]] = None
+        progress_callback: Optional[Callable[[str], None]] = None,
+        defer_graph_rebuild: bool = False
     ) -> DistillResponse:
         """
         Main distillation entry point.
@@ -539,6 +542,8 @@ class DistillationService:
             note_id: ID of the container note to distill
             request: Distillation request with mode and options
             progress_callback: Optional callback for progress updates
+            defer_graph_rebuild: If True, skip per-note graph rebuilds (caller
+                handles the final rebuild, e.g. during batch import)
         """
         note = self.knowledge_store.get_note(note_id)
         if not note:
@@ -547,7 +552,7 @@ class DistillationService:
         if request.mode == DistillMode.SUGGEST:
             return self._suggest(note, request)
         elif request.mode == DistillMode.AUTO:
-            return await self._auto(note, request, progress_callback)
+            return await self._auto(note, request, progress_callback, defer_graph_rebuild)
         else:
             return self._apply(note, request)
 
@@ -649,6 +654,13 @@ class DistillationService:
         container_updated = False
         if created_ids:
             container_updated = self._update_container(note.id, created_ids)
+
+        # Single graph rebuild after all notes are created
+        if self.graph_index and created_ids:
+            try:
+                self.graph_index.build_index()
+            except Exception as e:
+                logger.error(f"Failed to rebuild graph index after zettel distill: {e}")
 
         if progress_callback:
             progress_callback(f"Completed: Created {len(created_ids)} Zettelkasten atomic notes")
@@ -917,12 +929,7 @@ class DistillationService:
                 except Exception as e:
                     logger.error(f"Failed to index note {new_note.id}: {e}")
 
-            # Update knowledge graph
-            if self.graph_index:
-                try:
-                    self.graph_index.build_index()
-                except Exception as e:
-                    logger.error(f"Failed to update graph index: {e}")
+            # Graph rebuild deferred to caller for batch efficiency
 
             return new_note.id if new_note else None
 
@@ -968,16 +975,18 @@ Format your response as markdown with ## headings for each atomic unit."""
         self,
         note: Note,
         request: DistillRequest,
-        progress_callback: Optional[Callable[[str], None]] = None
+        progress_callback: Optional[Callable[[str], None]] = None,
+        defer_graph_rebuild: bool = False
     ) -> DistillResponse:
         """
         AUTO mode: Summarize with LLM, then auto-create all atomics as drafts.
         No user review needed - drafts can be reviewed/promoted later.
-        
+
         Args:
             note: Container note to distill
             request: Distillation request with extraction method preference
             progress_callback: Optional callback for progress updates
+            defer_graph_rebuild: If True, skip per-note graph rebuilds
         """
         # Determine extraction method
         extraction_method = request.extraction_method
@@ -993,7 +1002,8 @@ Format your response as markdown with ## headings for each atomic unit."""
         candidates: List[AtomicNoteCandidate] = []
         summary: Optional[str] = None
         extraction_method_used = extraction_method.value
-        
+        llm_fallback_msg: Optional[str] = None
+
         try:
             if extraction_method == ExtractionMethod.LLM:
                 # Use LLM summarization
@@ -1027,13 +1037,14 @@ Format your response as markdown with ## headings for each atomic unit."""
             # Fallback to rule-based extraction if LLM fails
             if extraction_method == ExtractionMethod.LLM:
                 logger.info("Falling back to rule-based extraction")
+                llm_fallback_msg = f"LLM summarization failed ({e}), fell back to rules-based extraction"
                 if progress_callback:
                     progress_callback("LLM extraction failed, falling back to rules...")
-                
+
                 try:
                     candidates = self._extract_candidates(note)
                     extraction_method_used = ExtractionMethod.RULES.value
-                    
+
                     if progress_callback:
                         progress_callback(f"Extracted {len(candidates)} atomic notes using rules (fallback)")
                 except Exception as fallback_error:
@@ -1093,10 +1104,21 @@ Format your response as markdown with ## headings for each atomic unit."""
         container_updated = False
         if created_ids:
             container_updated = self._update_container(note.id, created_ids)
-        
+
+        # Single graph rebuild after all notes are created (unless deferred to caller)
+        if not defer_graph_rebuild and self.graph_index and created_ids:
+            try:
+                self.graph_index.build_index()
+            except Exception as e:
+                logger.error(f"Failed to rebuild graph index after distill: {e}")
+
         if progress_callback:
             progress_callback(f"Completed: Created {len(created_ids)} draft atomic notes")
-        
+
+        msg = f"Auto-created {len(created_ids)} draft atomic notes using {extraction_method_used}"
+        if llm_fallback_msg:
+            msg = f"Auto-created {len(created_ids)} draft atomic notes. {llm_fallback_msg}"
+
         return DistillResponse(
             summary=summary,
             candidates=[],  # Not needed for AUTO mode
@@ -1104,11 +1126,11 @@ Format your response as markdown with ## headings for each atomic unit."""
             updated_note_ids=[],
             hub_updates=hub_updates,
             container_updated=container_updated,
-            message=f"Auto-created {len(created_ids)} draft atomic notes using {extraction_method_used}",
+            message=msg,
             extraction_method_used=extraction_method_used,
             status="completed"
         )
-    
+
     def _suggest(self, note: Note, request: DistillRequest) -> DistillResponse:
         """Extract candidates and find potential duplicates."""
         candidates = self._extract_candidates(note)
@@ -1197,62 +1219,100 @@ Format your response as markdown with ## headings for each atomic unit."""
     def _extract_candidates(self, note: Note) -> List[AtomicNoteCandidate]:
         """
         Extract atomic note candidates from container content.
-        This is a rule-based extraction - can be enhanced with LLM later.
+
+        Splits on H2 headings. When an H2 section contains H3 sub-headings
+        (e.g. '## Conversation History' with '### Message N' children),
+        performs a secondary split on H3 to produce individual candidates
+        from each sub-section. This handles imported conversation container
+        notes which pack all content under a single H2.
         """
         candidates = []
         content = note.content
-        
+
+        container_tags = [t for t in note.frontmatter.tags
+                         if t not in ('chat', 'canvas-export', 'evidence')]
+
         # Find H2 sections as potential atomics
         sections = re.split(r'\n## ', content)
-        
+
         for i, section in enumerate(sections[1:], 1):  # Skip content before first ##
             lines = section.strip().split('\n')
             if not lines:
                 continue
-            
+
             title = lines[0].strip()
             body = '\n'.join(lines[1:]).strip()
-            
+
             # Skip meta sections
             if title.lower() in ('metadata', 'extracted atomic notes', 'sources', 'updates'):
                 continue
-            
+
             # Skip if too short
             if len(body) < 50:
                 continue
-            
-            # Extract summary bullets
-            summary = []
-            for line in body.split('\n'):
-                line = line.strip()
-                if line.startswith('- ') or line.startswith('* '):
-                    summary.append(line[2:])
-                    if len(summary) >= 5:
-                        break
-            
-            # Extract inline tags from section
+
+            # Check if section contains H3 sub-headings — if so, split on ###
+            # to produce individual candidates (handles Conversation History sections)
+            h3_sections = re.split(r'\n### ', body)
+            if len(h3_sections) > 1:
+                # H3 sub-headings present — extract each as a candidate
+                for h3_section in h3_sections[1:]:  # skip content before first ###
+                    h3_lines = h3_section.strip().split('\n')
+                    if not h3_lines:
+                        continue
+                    h3_title = h3_lines[0].strip()
+                    h3_body = '\n'.join(h3_lines[1:]).strip()
+
+                    if len(h3_body) < 50:
+                        continue
+
+                    h3_summary = self._extract_summary_bullets(h3_body)
+                    h3_tags = parse_inline_tags(h3_body)
+                    recommended = list(set(h3_tags + container_tags))[:5]
+
+                    candidates.append(AtomicNoteCandidate(
+                        id=str(uuid.uuid4()),
+                        title=f"Atomic: {h3_title}",
+                        summary=h3_summary or ([h3_body[:200] + "..."] if len(h3_body) > 200 else [h3_body]),
+                        key_claims=[],
+                        open_questions=[],
+                        recommended_tags=recommended,
+                        confidence=0.7,
+                        suggested_hub=self._suggest_hub(h3_title, recommended),
+                        source_section=h3_title
+                    ))
+                continue  # skip the H2-level candidate since we extracted H3 children
+
+            # Normal H2 section — extract as single candidate
+            summary = self._extract_summary_bullets(body)
             section_tags = parse_inline_tags(body)
-            
-            # Inherit some tags from container
-            container_tags = [t for t in note.frontmatter.tags 
-                           if t not in ('chat', 'canvas-export', 'evidence')]
-            
             recommended_tags = list(set(section_tags + container_tags))[:5]
-            
-            candidate = AtomicNoteCandidate(
+
+            candidates.append(AtomicNoteCandidate(
                 id=str(uuid.uuid4()),
                 title=f"Atomic: {title}",
-                summary=summary or [body[:200] + "..."] if len(body) > 200 else [body],
+                summary=summary or ([body[:200] + "..."] if len(body) > 200 else [body]),
                 key_claims=[],
                 open_questions=[],
                 recommended_tags=recommended_tags,
                 confidence=0.7,
                 suggested_hub=self._suggest_hub(title, recommended_tags),
                 source_section=title
-            )
-            candidates.append(candidate)
-        
+            ))
+
         return candidates
+
+    @staticmethod
+    def _extract_summary_bullets(body: str) -> List[str]:
+        """Extract up to 5 summary bullet points from a section body."""
+        summary = []
+        for line in body.split('\n'):
+            line = line.strip()
+            if line.startswith('- ') or line.startswith('* '):
+                summary.append(line[2:])
+                if len(summary) >= 5:
+                    break
+        return summary
     
     def _extract_candidates_from_summary(
         self,
@@ -1429,20 +1489,18 @@ Format your response as markdown with ## headings for each atomic unit."""
             # Index for vector search
             if self.vector_search and new_note:
                 self.vector_search.index_note(
-                    new_note.id, 
-                    new_note.title, 
+                    new_note.id,
+                    new_note.title,
                     new_note.content
                 )
-            
-            # Update knowledge graph
-            if self.graph_index and new_note:
-                self.graph_index.build_index()
-            
+
+            # Graph rebuild deferred to caller (distill/apply_import) for batch efficiency
+
             return new_note.id if new_note else None
         except Exception as e:
             logger.error(f"Failed to create atomic note: {e}")
             return None
-    
+
     def _append_to_note(
         self,
         note_id: str,
@@ -1486,12 +1544,28 @@ Format your response as markdown with ## headings for each atomic unit."""
             return False
     
     def _suggest_hub(self, title: str, tags: List[str]) -> Optional[str]:
-        """Suggest a hub based on title and tags."""
-        # Simple heuristic: use first significant tag as hub
-        for tag in tags:
-            if tag not in ('grafyn', 'draft'):
-                return f"Hub: {tag.replace('-', ' ').title()}"
-        return None
+        """Suggest a hub based on title and tags.
+
+        Matches Rust's scoring algorithm: pick the tag whose hyphen-split
+        words appear most often in the title.  Ties broken by tag length
+        (longer = more specific).
+        """
+        title_lower = title.lower()
+        significant = [t for t in tags if t not in ('grafyn', 'draft')]
+        if not significant:
+            return None
+
+        best = significant[0]
+        best_score = (0, 0)
+        for tag in significant:
+            words = [w for w in tag.split('-') if w]
+            word_matches = sum(1 for w in words if w in title_lower)
+            score = (word_matches, len(tag))
+            if score > best_score:
+                best_score = score
+                best = tag
+
+        return f"Hub: {best.replace('-', ' ').title()}"
     
     def _update_hub(self, hub_title: str, atomic_id: str) -> Optional[HubUpdate]:
         """Get or create hub and add atomic link."""
