@@ -16,6 +16,9 @@ lazy_static! {
 #[derive(Debug, Clone)]
 pub struct KnowledgeStore {
     vault_path: PathBuf,
+    /// In-memory cache of note metadata, kept in sync with disk.
+    /// Eliminates WalkDir + YAML parse on every list_notes() call.
+    meta_cache: Vec<NoteMeta>,
 }
 
 impl KnowledgeStore {
@@ -24,7 +27,12 @@ impl KnowledgeStore {
         if let Err(e) = std::fs::create_dir_all(&vault_path) {
             log::error!("Failed to create vault directory {}: {}", vault_path.display(), e);
         }
-        Self { vault_path }
+        let mut store = Self {
+            vault_path,
+            meta_cache: Vec::new(),
+        };
+        store.refresh_cache();
+        store
     }
 
     /// Update the vault path at runtime (e.g., after settings change)
@@ -34,10 +42,11 @@ impl KnowledgeStore {
         }
         log::info!("Vault path updated to {:?}", vault_path);
         self.vault_path = vault_path;
+        self.refresh_cache();
     }
 
-    /// List all notes in the vault (metadata only)
-    pub fn list_notes(&self) -> Result<Vec<NoteMeta>> {
+    /// Rebuild the metadata cache from disk
+    fn refresh_cache(&mut self) {
         let mut notes = Vec::new();
 
         for entry in WalkDir::new(&self.vault_path)
@@ -54,9 +63,13 @@ impl KnowledgeStore {
             }
         }
 
-        // Sort by updated_at descending
         notes.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
-        Ok(notes)
+        self.meta_cache = notes;
+    }
+
+    /// List all notes in the vault (metadata only, served from cache)
+    pub fn list_notes(&self) -> Result<Vec<NoteMeta>> {
+        Ok(self.meta_cache.clone())
     }
 
     /// Get a full note by ID
@@ -88,6 +101,10 @@ impl KnowledgeStore {
         note.wikilinks = self.extract_wikilinks(&note.content);
 
         self.write_note_file(&note)?;
+
+        // Update cache: insert at front (newest first)
+        self.meta_cache.insert(0, NoteMeta::from(&note));
+
         Ok(note)
     }
 
@@ -114,6 +131,19 @@ impl KnowledgeStore {
 
         note.updated_at = Utc::now();
         self.write_note_file(&note)?;
+
+        // Update cache: replace existing entry and re-sort to front
+        let meta = NoteMeta::from(&note);
+        if let Some(pos) = self.meta_cache.iter().position(|m| m.id == id) {
+            self.meta_cache[pos] = meta.clone();
+            // Move to front since it's the most recently updated
+            let item = self.meta_cache.remove(pos);
+            self.meta_cache.insert(0, item);
+        } else {
+            // Not in cache (shouldn't happen), insert at front
+            self.meta_cache.insert(0, meta);
+        }
+
         Ok(note)
     }
 
@@ -121,6 +151,10 @@ impl KnowledgeStore {
     pub fn delete_note(&mut self, id: &str) -> Result<()> {
         let path = self.note_path(id);
         std::fs::remove_file(&path).with_context(|| format!("Failed to delete note: {}", id))?;
+
+        // Remove from cache
+        self.meta_cache.retain(|m| m.id != id);
+
         Ok(())
     }
 

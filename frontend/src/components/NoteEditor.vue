@@ -281,7 +281,7 @@ async function handleDiscoverLinks() {
     linkCandidates.value = result.links || []
   } catch (e) {
     console.error('Link discovery failed:', e)
-    linkError.value = e.response?.data?.detail || 'Link discovery failed. Is the Python backend running?'
+    linkError.value = e.response?.data?.detail || e.message || e.toString() || 'Link discovery failed'
   } finally {
     isDiscovering.value = false
   }

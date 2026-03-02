@@ -88,7 +88,7 @@ The desktop app uses a **pure Rust backend** with Vue frontend in a single binar
 │  ┌──────────────────▼───────────────────────┐  │
 │  │            Rust Backend                   │  │
 │  │  Commands → Services → Local Filesystem   │  │
-│  │  (notes, search, graph, canvas,           │  │
+│  │  (notes, search, graph, canvas, distill,   │  │
 │  │   settings, feedback, mcp, memory)        │  │
 │  └──────────────────────────────────────────┘  │
 │  ~/Documents/Grafyn/                          │
@@ -111,7 +111,7 @@ async def example(request: Request):
     return knowledge_store.list_notes()
 ```
 
-**Available helpers:** `get_knowledge_store`, `get_vector_search`, `get_graph_index`, `get_openrouter`, `get_canvas_store`, `get_priority_scoring`, `get_priority_settings`, `get_distillation`, `get_link_discovery`, `get_import_service`
+**Available helpers:** `get_knowledge_store`, `get_vector_search`, `get_graph_index`, `get_openrouter`, `get_canvas_store`, `get_priority_scoring`, `get_priority_settings`, `get_distillation`, `get_link_discovery`, `get_import_service`, `get_feedback_service`, `get_memory_service`
 
 ### Core Services
 
@@ -130,6 +130,7 @@ async def example(request: Request):
 | `PriorityScoringService` | `services/priority_scoring.py` | Search result ranking with configurable weights |
 | `PrioritySettingsService` | `services/priority_settings.py` | Priority weight persistence (JSON) |
 | `FeedbackService` | `services/feedback.py` | GitHub Issues integration for bug reports/feature requests |
+| `MemoryService` | `services/memory.py` | Semantic recall, contradiction detection, conversation extraction |
 
 ### Router Quick Reference
 
@@ -137,24 +138,26 @@ async def example(request: Request):
 |--------|--------|-----------|---------|
 | `notes.py` | `/api/notes` | 12 | CRUD, list, reindex, properties |
 | `search.py` | `/api/search` | 2 | Query, similar |
-| `graph.py` | `/api/graph` | 6 | Backlinks, outgoing, neighbors, unlinked |
-| `canvas.py` | `/api/canvas` | 9 | Sessions, prompts, debates, SSE streaming |
-| `mcp_write.py` | `/api/mcp-write` | 4 | MCP write operations (create, update, find-or-create) |
+| `graph.py` | `/api/graph` | 7 | Backlinks, outgoing, neighbors, unlinked |
+| `canvas.py` | `/api/canvas` | 22 | Sessions, prompts, debates, SSE streaming |
+| `mcp_write.py` | `/api/mcp-write` | 9 | MCP write operations (create, update, find-or-create) |
 | `distill.py` | `/api/distill` | 2 | Distill note, normalize tags |
 | `priority.py` | `/api/priority` | 7 | Priority scoring configuration |
 | `conversation_import.py` | `/api/import` | 7 | LLM conversation import workflow |
-| `zettelkasten.py` | `/api/zettel` | 7 | Link discovery for Zettelkasten method |
+| `zettelkasten.py` | `/api/zettel` | 6 | Link discovery for Zettelkasten method |
 | `feedback.py` | `/api/feedback` | 2 | Submit feedback, check status |
 | `oauth.py` | `/auth` | 4 | GitHub OAuth flow |
+| `memory.py` | `/api/memory` | 3 | Recall, contradictions, extract |
 
-### Tauri IPC Commands (49 total across 8 modules)
+### Tauri IPC Commands (52 total across 9 modules)
 
 | Module | Commands | Purpose |
 |--------|----------|---------|
 | `commands/notes.rs` | `list_notes`, `get_note`, `create_note`, `update_note`, `delete_note` | Note CRUD |
 | `commands/search.rs` | `search_notes`, `find_similar`, `reindex` | Full-text search |
-| `commands/graph.rs` | `get_backlinks`, `get_outgoing`, `get_neighbors`, `get_unlinked`, `rebuild_graph` | Link graph |
+| `commands/graph.rs` | `get_backlinks`, `get_outgoing`, `get_neighbors`, `get_unlinked`, `get_full_graph`, `rebuild_graph` | Link graph |
 | `commands/canvas.rs` | `list_sessions`, `get_session`, `create_session`, `update_session`, `delete_session`, `get_available_models`, `send_prompt`, `update_tile_position`, `delete_tile`, `delete_response`, `update_viewport`, `update_llm_node_position`, `auto_arrange`, `export_to_note`, `start_debate`, `continue_debate`, `add_models_to_tile`, `regenerate_response` | Multi-LLM canvas (streaming via `canvas-stream` Tauri events) |
+| `commands/distill.rs` | `distill_note`, `normalize_tags` | Rules-based + LLM distillation workflow |
 | `commands/settings.rs` | `get_settings`, `get_settings_status`, `update_settings`, `complete_setup`, `pick_vault_folder`, `validate_openrouter_key`, `get_openrouter_status` | App settings & first-run setup |
 | `commands/feedback.rs` | `submit_feedback`, `get_system_info`, `feedback_status`, `get_pending_feedback`, `retry_pending_feedback`, `clear_pending_feedback` | Feedback with offline queue |
 | `commands/mcp.rs` | `get_mcp_status`, `get_mcp_config_snippet` | MCP config for Claude Desktop |

@@ -349,25 +349,32 @@ export const memory = {
     ),
 }
 
-// Zettelkasten Link Discovery API (HTTP only — uses Python backend)
+// Zettelkasten Link Discovery API
 export const zettelkasten = {
   discoverLinks: (noteId, mode = 'suggested', maxLinks = 10) =>
-    api.get(`/zettel/notes/${encodeURIComponent(noteId)}/discover-links`, {
-      params: { mode, max_links: maxLinks },
-    }),
-
-  applyLinks: (noteId, linkIds) =>
-    api.post(`/zettel/notes/${encodeURIComponent(noteId)}/discover-links/apply`, {
-      link_ids: linkIds,
-    }),
-
-  createLink: (sourceId, targetId, linkType = 'related') =>
-    api.post(
-      `/zettel/notes/${encodeURIComponent(sourceId)}/link/${encodeURIComponent(targetId)}`,
-      { link_type: linkType }
+    invokeOrHttp('discover_links', { noteId, mode, maxLinks }, () =>
+      api.get(`/zettel/notes/${encodeURIComponent(noteId)}/discover-links`, {
+        params: { mode, max_links: maxLinks },
+      })
     ),
 
-  getLinkTypes: () => api.get('/zettel/link-types'),
+  applyLinks: (noteId, linkIds) =>
+    invokeOrHttp('apply_links', { noteId, request: { link_ids: linkIds } }, () =>
+      api.post(`/zettel/notes/${encodeURIComponent(noteId)}/discover-links/apply`, {
+        link_ids: linkIds,
+      })
+    ),
+
+  createLink: (sourceId, targetId, linkType = 'related') =>
+    invokeOrHttp('create_link', { sourceId, targetId, linkType }, () =>
+      api.post(
+        `/zettel/notes/${encodeURIComponent(sourceId)}/link/${encodeURIComponent(targetId)}`,
+        { link_type: linkType }
+      )
+    ),
+
+  getLinkTypes: () =>
+    invokeOrHttp('get_link_types', {}, () => api.get('/zettel/link-types')),
 }
 
 // Utility function to check if we're in Tauri environment

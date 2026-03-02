@@ -8,23 +8,35 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use walkdir::WalkDir;
 
-/// Service for managing canvas sessions (JSON file storage)
+/// Service for managing canvas sessions (JSON file storage) with in-memory cache.
+///
+/// The cache eliminates repeated disk reads — every get_session/list_sessions call
+/// returns from memory. Writes update the cache first then flush to disk (write-through).
 #[derive(Debug, Clone)]
 pub struct CanvasStore {
     data_path: PathBuf,
+    /// Full session cache, populated lazily on first access per session.
+    session_cache: HashMap<String, CanvasSession>,
+    /// Whether the session list cache has been populated from disk.
+    list_cache_ready: bool,
 }
 
 impl CanvasStore {
     pub fn new(data_path: PathBuf) -> Self {
         // Ensure directory exists
         std::fs::create_dir_all(&data_path).ok();
-        Self { data_path }
+        Self {
+            data_path,
+            session_cache: HashMap::new(),
+            list_cache_ready: false,
+        }
     }
 
-    /// List all sessions (metadata only)
-    pub fn list_sessions(&self) -> Result<Vec<SessionMeta>> {
-        let mut sessions = Vec::new();
-
+    /// Ensure all sessions are loaded into cache (called once, on first list)
+    fn ensure_list_cache(&mut self) {
+        if self.list_cache_ready {
+            return;
+        }
         for entry in WalkDir::new(&self.data_path)
             .min_depth(1)
             .max_depth(1)
@@ -34,21 +46,49 @@ impl CanvasStore {
             let path = entry.path();
             if path.extension().map_or(false, |ext| ext == "json") {
                 if let Ok(session) = self.read_session_file(path) {
-                    sessions.push(SessionMeta::from(&session));
+                    self.session_cache.insert(session.id.clone(), session);
                 }
             }
         }
+        self.list_cache_ready = true;
+    }
+
+    /// List all sessions (metadata only)
+    pub fn list_sessions(&mut self) -> Result<Vec<SessionMeta>> {
+        self.ensure_list_cache();
+        let mut sessions: Vec<SessionMeta> = self
+            .session_cache
+            .values()
+            .map(SessionMeta::from)
+            .collect();
 
         // Sort by updated_at descending
         sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
         Ok(sessions)
     }
 
-    /// Get a full session by ID
-    pub fn get_session(&self, id: &str) -> Result<CanvasSession> {
+    /// Get a full session by ID (from cache, falls back to disk)
+    pub fn get_session(&mut self, id: &str) -> Result<CanvasSession> {
+        if let Some(session) = self.session_cache.get(id) {
+            return Ok(session.clone());
+        }
+        // Cache miss: load from disk
         let path = self.session_path(id);
-        self.read_session_file(&path)
-            .with_context(|| format!("Session not found: {}", id))
+        let session = self.read_session_file(&path)
+            .with_context(|| format!("Session not found: {}", id))?;
+        self.session_cache.insert(id.to_string(), session.clone());
+        Ok(session)
+    }
+
+    /// Get a mutable reference to a cached session, loading from disk if needed
+    fn get_session_mut(&mut self, id: &str) -> Result<&mut CanvasSession> {
+        if !self.session_cache.contains_key(id) {
+            let path = self.session_path(id);
+            let session = self.read_session_file(&path)
+                .with_context(|| format!("Session not found: {}", id))?;
+            self.session_cache.insert(id.to_string(), session);
+        }
+        Ok(self.session_cache.get_mut(id).unwrap())
     }
 
     /// Create a new session
@@ -70,12 +110,13 @@ impl CanvasStore {
         };
 
         self.write_session_file(&session)?;
+        self.session_cache.insert(id, session.clone());
         Ok(session)
     }
 
     /// Update an existing session
     pub fn update_session(&mut self, id: &str, update: SessionUpdate) -> Result<CanvasSession> {
-        let mut session = self.get_session(id)?;
+        let session = self.get_session_mut(id)?;
 
         if let Some(title) = update.title {
             session.title = title;
@@ -94,6 +135,7 @@ impl CanvasStore {
         }
 
         session.updated_at = Utc::now();
+        let session = session.clone();
         self.write_session_file(&session)?;
         Ok(session)
     }
@@ -102,21 +144,23 @@ impl CanvasStore {
     pub fn delete_session(&mut self, id: &str) -> Result<()> {
         let path = self.session_path(id);
         std::fs::remove_file(&path).with_context(|| format!("Failed to delete session: {}", id))?;
+        self.session_cache.remove(id);
         Ok(())
     }
 
     /// Add a prompt tile to a session
     pub fn add_tile(&mut self, session_id: &str, tile: PromptTile) -> Result<CanvasSession> {
-        let mut session = self.get_session(session_id)?;
+        let session = self.get_session_mut(session_id)?;
         session.prompt_tiles.push(tile);
         session.updated_at = Utc::now();
+        let session = session.clone();
         self.write_session_file(&session)?;
         Ok(session)
     }
 
     /// Delete a prompt tile and its children from a session
     pub fn delete_tile(&mut self, session_id: &str, tile_id: &str) -> Result<()> {
-        let mut session = self.get_session(session_id)?;
+        let session = self.get_session_mut(session_id)?;
 
         // Remove tile and any children that reference it as parent
         session.prompt_tiles.retain(|t| t.id != tile_id && t.parent_tile_id.as_deref() != Some(tile_id));
@@ -125,13 +169,14 @@ impl CanvasStore {
         session.debates.retain(|d| d.id != tile_id);
 
         session.updated_at = Utc::now();
+        let session = session.clone();
         self.write_session_file(&session)?;
         Ok(())
     }
 
     /// Delete a single model response from a tile
     pub fn delete_response(&mut self, session_id: &str, tile_id: &str, model_id: &str) -> Result<()> {
-        let mut session = self.get_session(session_id)?;
+        let session = self.get_session_mut(session_id)?;
 
         if let Some(tile) = session.prompt_tiles.iter_mut().find(|t| t.id == tile_id) {
             tile.responses.remove(model_id);
@@ -139,15 +184,17 @@ impl CanvasStore {
         }
 
         session.updated_at = Utc::now();
+        let session = session.clone();
         self.write_session_file(&session)?;
         Ok(())
     }
 
     /// Update viewport zoom/pan state
     pub fn update_viewport(&mut self, session_id: &str, viewport: CanvasViewport) -> Result<()> {
-        let mut session = self.get_session(session_id)?;
+        let session = self.get_session_mut(session_id)?;
         session.viewport = viewport;
         session.updated_at = Utc::now();
+        let session = session.clone();
         self.write_session_file(&session)?;
         Ok(())
     }
@@ -159,7 +206,7 @@ impl CanvasStore {
         tile_id: &str,
         position: TilePositionUpdate,
     ) -> Result<CanvasSession> {
-        let mut session = self.get_session(session_id)?;
+        let session = self.get_session_mut(session_id)?;
 
         // Check prompt tiles
         if let Some(tile) = session.prompt_tiles.iter_mut().find(|t| t.id == tile_id) {
@@ -186,6 +233,7 @@ impl CanvasStore {
         }
 
         session.updated_at = Utc::now();
+        let session = session.clone();
         self.write_session_file(&session)?;
         Ok(session)
     }
@@ -198,7 +246,7 @@ impl CanvasStore {
         model_id: &str,
         position: LLMNodePositionUpdate,
     ) -> Result<()> {
-        let mut session = self.get_session(session_id)?;
+        let session = self.get_session_mut(session_id)?;
 
         if let Some(tile) = session.prompt_tiles.iter_mut().find(|t| t.id == tile_id) {
             if let Some(response) = tile.responses.get_mut(model_id) {
@@ -214,6 +262,7 @@ impl CanvasStore {
         }
 
         session.updated_at = Utc::now();
+        let session = session.clone();
         self.write_session_file(&session)?;
         Ok(())
     }
@@ -224,7 +273,7 @@ impl CanvasStore {
         session_id: &str,
         positions: HashMap<String, TilePosition>,
     ) -> Result<()> {
-        let mut session = self.get_session(session_id)?;
+        let session = self.get_session_mut(session_id)?;
 
         for (node_id, position) in &positions {
             let parts: Vec<&str> = node_id.splitn(3, ':').collect();
@@ -256,28 +305,31 @@ impl CanvasStore {
         }
 
         session.updated_at = Utc::now();
+        let session = session.clone();
         self.write_session_file(&session)?;
         Ok(())
     }
 
     /// Add a debate to a session
     pub fn add_debate(&mut self, session_id: &str, debate: Debate) -> Result<()> {
-        let mut session = self.get_session(session_id)?;
+        let session = self.get_session_mut(session_id)?;
         session.debates.push(debate);
         session.updated_at = Utc::now();
+        let session = session.clone();
         self.write_session_file(&session)?;
         Ok(())
     }
 
     /// Update a debate's rounds
     pub fn update_debate(&mut self, session_id: &str, debate: &Debate) -> Result<()> {
-        let mut session = self.get_session(session_id)?;
+        let session = self.get_session_mut(session_id)?;
 
         if let Some(existing) = session.debates.iter_mut().find(|d| d.id == debate.id) {
             *existing = debate.clone();
         }
 
         session.updated_at = Utc::now();
+        let session = session.clone();
         self.write_session_file(&session)?;
         Ok(())
     }
@@ -290,7 +342,7 @@ impl CanvasStore {
         tile_id: &str,
         updates: &[(String, String, crate::models::canvas::ResponseStatus)],
     ) -> Result<()> {
-        let mut session = self.get_session(session_id)?;
+        let session = self.get_session_mut(session_id)?;
 
         if let Some(tile) = session.prompt_tiles.iter_mut().find(|t| t.id == tile_id) {
             for (model_id, content, status) in updates {
@@ -301,6 +353,7 @@ impl CanvasStore {
             }
         }
 
+        let session = session.clone();
         self.write_session_file(&session)?;
         Ok(())
     }
@@ -314,7 +367,7 @@ impl CanvasStore {
         content: &str,
         status: crate::models::canvas::ResponseStatus,
     ) -> Result<()> {
-        let mut session = self.get_session(session_id)?;
+        let session = self.get_session_mut(session_id)?;
 
         if let Some(tile) = session.prompt_tiles.iter_mut().find(|t| t.id == tile_id) {
             if let Some(response) = tile.responses.get_mut(model_id) {
@@ -323,12 +376,14 @@ impl CanvasStore {
             }
         }
 
+        let session = session.clone();
         self.write_session_file(&session)?;
         Ok(())
     }
 
     /// Save a full session object (used after streaming completes)
-    pub fn save_session(&self, session: &CanvasSession) -> Result<()> {
+    pub fn save_session(&mut self, session: &CanvasSession) -> Result<()> {
+        self.session_cache.insert(session.id.clone(), session.clone());
         self.write_session_file(session)
     }
 

@@ -16,14 +16,14 @@ use tauri::State;
 /// List all canvas sessions
 #[tauri::command]
 pub async fn list_sessions(state: State<'_, AppState>) -> Result<Vec<SessionMeta>, String> {
-    let store = state.canvas_store.read().await;
+    let mut store = state.canvas_store.write().await;
     store.list_sessions().map_err(|e| e.to_string())
 }
 
 /// Get a single session by ID
 #[tauri::command]
 pub async fn get_session(id: String, state: State<'_, AppState>) -> Result<CanvasSession, String> {
-    let store = state.canvas_store.read().await;
+    let mut store = state.canvas_store.write().await;
     store.get_session(&id).map_err(|e| e.to_string())
 }
 
@@ -376,7 +376,7 @@ pub async fn export_to_note(
     session_id: String,
     state: State<'_, AppState>,
 ) -> Result<serde_json::Value, String> {
-    let store = state.canvas_store.read().await;
+    let mut store = state.canvas_store.write().await;
     let session = store.get_session(&session_id).map_err(|e| e.to_string())?;
     drop(store);
 
@@ -462,7 +462,7 @@ pub async fn start_debate(
     let now = Utc::now();
 
     // Collect source content from tiles
-    let store = state.canvas_store.read().await;
+    let mut store = state.canvas_store.write().await;
     let session = store.get_session(&session_id).map_err(|e| e.to_string())?;
     drop(store);
 
@@ -746,7 +746,7 @@ pub async fn continue_debate(
     request: DebateContinueRequest,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let store = state.canvas_store.read().await;
+    let mut store = state.canvas_store.write().await;
     let session = store.get_session(&session_id).map_err(|e| e.to_string())?;
     drop(store);
 
@@ -965,7 +965,7 @@ pub async fn add_models_to_tile(
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     // Get the tile's prompt
-    let store = state.canvas_store.read().await;
+    let mut store = state.canvas_store.write().await;
     let session = store.get_session(&session_id).map_err(|e| e.to_string())?;
     drop(store);
 
@@ -985,7 +985,7 @@ pub async fn add_models_to_tile(
 
     // Add initial pending responses
     {
-        let store = state.canvas_store.write().await;
+        let mut store = state.canvas_store.write().await;
         let mut session = store.get_session(&session_id).map_err(|e| e.to_string())?;
         if let Some(t) = session.prompt_tiles.iter_mut().find(|t| t.id == tile_id) {
             for (i, model_id) in request.model_ids.iter().enumerate() {
@@ -1169,7 +1169,7 @@ pub async fn regenerate_response(
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     // Get the tile's prompt
-    let store = state.canvas_store.read().await;
+    let mut store = state.canvas_store.write().await;
     let session = store.get_session(&session_id).map_err(|e| e.to_string())?;
     drop(store);
 
