@@ -196,3 +196,45 @@ pub enum LinkType {
     Outgoing,
     Backlink,
 }
+
+// ── Zettelkasten link discovery types ─────────────────────────────────────
+
+/// A candidate link discovered between notes
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ZettelLinkCandidate {
+    pub target_id: String,
+    pub target_title: String,
+    pub link_type: String,
+    pub confidence: f64,
+    pub reason: String,
+}
+
+/// Response from the discover_links command
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiscoverLinksResponse {
+    pub note_id: String,
+    pub links: Vec<ZettelLinkCandidate>,
+}
+
+/// Request to apply discovered links
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApplyLinksRequest {
+    pub link_ids: Vec<String>,
+}
+
+/// Response from applying discovered links
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApplyLinksResponse {
+    pub note_id: String,
+    pub links_created: usize,
+    pub links_attempted: usize,
+}
+
+/// Response from creating a single link
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateLinkResponse {
+    pub status: String,
+    pub source: String,
+    pub target: String,
+    pub link_type: String,
+}

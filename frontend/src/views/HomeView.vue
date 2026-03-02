@@ -358,22 +358,26 @@ async function handleCreateLink({ sourceNoteId, targetTitle }) {
   }
 }
 
-// Load contradictions when selected note changes
-watch(selectedNoteId, async (newId) => {
+// Load contradictions when selected note changes (debounced to avoid hammering API during rapid navigation)
+let contradictionTimer = null
+watch(selectedNoteId, (newId) => {
+  clearTimeout(contradictionTimer)
   if (newId) {
-    try {
-      const data = await memory.contradictions(newId)
-      const items = data.contradictions || data // unwrap Pydantic wrapper (web) or flat array (Tauri)
-      contradictions.value = (Array.isArray(items) ? items : []).map(c => ({
-        note_id: c.note_id,
-        title: c.title,
-        details: c.details || `${c.conflicting_field}: "${c.this_value}" vs "${c.other_value}"`,
-        similarity_score: c.similarity_score,
-      }))
-    } catch {
-      // Contradiction check is optional
-      contradictions.value = []
-    }
+    contradictionTimer = setTimeout(async () => {
+      try {
+        const data = await memory.contradictions(newId)
+        const items = data.contradictions || data // unwrap Pydantic wrapper (web) or flat array (Tauri)
+        contradictions.value = (Array.isArray(items) ? items : []).map(c => ({
+          note_id: c.note_id,
+          title: c.title,
+          details: c.details || `${c.conflicting_field}: "${c.this_value}" vs "${c.other_value}"`,
+          similarity_score: c.similarity_score,
+        }))
+      } catch {
+        // Contradiction check is optional
+        contradictions.value = []
+      }
+    }, 300)
   } else {
     contradictions.value = []
   }

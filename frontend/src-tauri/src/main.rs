@@ -28,7 +28,8 @@ pub struct AppState {
     pub openrouter: Arc<RwLock<OpenRouterService>>,
     pub feedback_service: Arc<RwLock<FeedbackService>>,
     pub settings_service: Arc<RwLock<SettingsService>>,
-    pub memory_service: Arc<RwLock<MemoryService>>,
+    /// MemoryService is stateless — no lock needed, just Arc for shared ownership
+    pub memory_service: Arc<MemoryService>,
 }
 
 fn main() {
@@ -97,25 +98,41 @@ fn main() {
                 get_feedback_token(),
             );
 
-            // Build initial indices
-            let ks = knowledge_store.clone();
-            let note_metas = ks.list_notes().unwrap_or_default();
+            // Build initial indices — parallelize note loading across threads
+            let note_metas = knowledge_store.list_notes().unwrap_or_default();
+            let note_ids: Vec<String> = note_metas.iter().map(|m| m.id.clone()).collect();
 
-            // Load full notes (with wikilinks) so the graph can build link edges
-            let mut full_notes = Vec::new();
-            for meta in &note_metas {
-                if let Ok(note) = ks.get_note(&meta.id) {
-                    full_notes.push(note);
-                }
-            }
+            let full_notes: Vec<_> = {
+                let ks = &knowledge_store;
+                let notes = std::sync::Mutex::new(Vec::with_capacity(note_ids.len()));
+                let num_threads = std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(4)
+                    .min(note_ids.len().max(1));
+                let chunk_size = note_ids.len().div_ceil(num_threads).max(1);
+
+                std::thread::scope(|s| {
+                    for chunk in note_ids.chunks(chunk_size) {
+                        let notes = &notes;
+                        s.spawn(move || {
+                            let mut batch = Vec::new();
+                            for id in chunk {
+                                if let Ok(note) = ks.get_note(id) {
+                                    batch.push(note);
+                                }
+                            }
+                            notes.lock().unwrap().extend(batch);
+                        });
+                    }
+                });
+
+                notes.into_inner().unwrap()
+            };
 
             let mut graph_index = graph_index;
             graph_index.build_from_notes(&full_notes);
 
-            // Initialize memory service
-            let memory_service = MemoryService::new();
-
-            // Create app state
+            // Create app state (MemoryService is stateless — no RwLock needed)
             let state = AppState {
                 knowledge_store: Arc::new(RwLock::new(knowledge_store)),
                 graph_index: Arc::new(RwLock::new(graph_index)),
@@ -124,7 +141,7 @@ fn main() {
                 openrouter: Arc::new(RwLock::new(openrouter)),
                 feedback_service: Arc::new(RwLock::new(feedback_service)),
                 settings_service: Arc::new(RwLock::new(settings_service)),
-                memory_service: Arc::new(RwLock::new(memory_service)),
+                memory_service: Arc::new(MemoryService::new()),
             };
 
             app.manage(state);
@@ -193,6 +210,11 @@ fn main() {
             commands::memory::recall_relevant,
             commands::memory::find_contradictions,
             commands::memory::extract_claims,
+            // Zettelkasten commands
+            commands::zettelkasten::discover_links,
+            commands::zettelkasten::apply_links,
+            commands::zettelkasten::create_link,
+            commands::zettelkasten::get_link_types,
         ])
         .run(tauri::generate_context!())
         .unwrap_or_else(|e| {

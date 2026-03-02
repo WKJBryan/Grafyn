@@ -8,7 +8,7 @@ Accepted
 
 ## Context
 
-OrgAI needs a technology stack that supports:
+Grafyn needs a technology stack that supports:
 
 1. **Local-first deployment**: Self-hosted without cloud dependencies
 2. **Semantic search**: Vector embeddings and similarity search
@@ -24,12 +24,12 @@ The project requires both backend (API, search, storage) and frontend (UI, visua
 We selected the following technology stack:
 
 ### Backend
-- **Framework**: FastAPI 0.104+
+- **Framework**: FastAPI 0.128+
 - **Language**: Python 3.10+
-- **Vector Database**: LanceDB 0.3+
-- **Embeddings**: sentence-transformers 2.2+
+- **Vector Database**: LanceDB 0.26+
+- **Embeddings**: sentence-transformers 5.2+
 - **Data Validation**: Pydantic 2.5+
-- **MCP Integration**: fastapi-mcp 0.1+
+- **MCP Integration**: fastapi-mcp 0.1+ (web deployment only; desktop uses native Rust MCP binary via rmcp crate)
 
 ### Frontend
 - **Framework**: Vue 3.4+ (Composition API)
@@ -42,6 +42,12 @@ We selected the following technology stack:
 - **Notes**: Markdown files in `vault/` directory
 - **Vectors**: LanceDB in `data/` directory
 - **Graph Index**: In-memory adjacency lists
+
+### Desktop Deployment (Tauri)
+- **Framework**: Tauri v1 with Rust backend
+- **Search**: Tantivy full-text search engine
+- **Graph**: petgraph for in-memory graph operations
+- **MCP**: rmcp crate with stdio transport
 
 ## Consequences
 
@@ -203,12 +209,12 @@ src/
 
 **Backend (requirements.txt):**
 ```
-fastapi>=0.104.0
+fastapi>=0.128.0
 uvicorn>=0.24.0
 pydantic>=2.5.0
 pydantic-settings>=2.1.0
-lancedb>=0.3.0
-sentence-transformers>=2.2.0
+lancedb>=0.26.0
+sentence-transformers>=5.2.0
 python-frontmatter>=1.0.0
 fastapi-mcp>=0.1.0
 python-dotenv>=1.0.0
@@ -250,4 +256,4 @@ python-dotenv>=1.0.0
 
 ---
 
-**Status:** This decision is active and forms the foundation of the OrgAI technology stack.
+**Status:** This decision is active and forms the foundation of the Grafyn technology stack.

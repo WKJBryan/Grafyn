@@ -1,12 +1,12 @@
 # Testing Patterns
 
-> **Purpose:** Document testing patterns and best practices for OrgAI project
+> **Purpose:** Document testing patterns and best practices for Grafyn project
 > **Created:** 2025-12-31
 > **Status:** Active
 
 ## Overview
 
-This document describes testing patterns and conventions used in OrgAI project to ensure code quality and reliability.
+This document describes testing patterns and conventions used in Grafyn project to ensure code quality and reliability.
 
 ## Test Organization
 

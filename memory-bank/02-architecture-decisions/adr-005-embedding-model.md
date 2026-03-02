@@ -8,7 +8,7 @@ Accepted
 
 ## Context
 
-OrgAI requires an embedding model for semantic search that:
+Grafyn requires an embedding model for semantic search that:
 
 1. **Provides high-quality semantic understanding**: Accurate similarity matching
 2. **Runs locally**: No API calls or internet connection required

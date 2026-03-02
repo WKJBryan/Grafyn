@@ -1,6 +1,6 @@
-# OrgAI Project History
+# Grafyn Project History
 
-> **Purpose:** Document the inception, background, and origins of the OrgAI Knowledge Graph Platform
+> **Purpose:** Document the inception, background, and origins of the Grafyn Knowledge Graph Platform
 > **Created:** 2025-12-31
 > **Status:** Complete
 
@@ -8,7 +8,7 @@
 
 ### Origin Story
 
-OrgAI was conceived as a solution to the growing challenge of managing organizational knowledge in an AI-driven world. The project emerged from the recognition that:
+Grafyn was conceived as a solution to the growing challenge of managing organizational knowledge in an AI-driven world. The project emerged from the recognition that:
 
 1. **Knowledge Fragmentation**: Organizations store information across multiple platforms (documents, chats, wikis, emails)
 2. **AI Integration Gap**: AI assistants lack context from organizational knowledge bases
@@ -17,7 +17,7 @@ OrgAI was conceived as a solution to the growing challenge of managing organizat
 
 ### Initial Vision
 
-The original vision for OrgAI was to create:
+The original vision for Grafyn was to create:
 
 - A **local-first** knowledge management system that respects privacy
 - **Obsidian-compatible** note storage for easy migration and interoperability
@@ -101,8 +101,8 @@ The original vision for OrgAI was to create:
 
 ### Phase 3: MCP Integration (Mid)
 
-- Implemented fastapi-mcp integration
-- Exposed 6 MCP tools for AI assistant access
+- Implemented fastapi-mcp integration (web); native Rust MCP binary added later for desktop
+- Exposed 9 MCP tools for AI assistant access
 - Created chat ingestion workflows
 - Documented MCP setup procedures
 
@@ -152,11 +152,11 @@ The original vision for OrgAI was to create:
 
 ### Initial Development
 
-The project was initially developed as a proof-of-concept for local knowledge management with AI integration.
+The project has evolved from a proof-of-concept into a production Tauri desktop app for local knowledge management with AI integration.
 
 ### Community Contributions
 
-As of 2025-12-31, the project is open for community contributions. Key areas for contribution:
+The project is a private repository. Key areas for future development:
 
 - Frontend improvements (graph visualization, UI enhancements)
 - Backend features (authentication, caching, performance)
@@ -213,7 +213,7 @@ As of 2025-12-31, the project is open for community contributions. Key areas for
 
 ### Differentiation
 
-OrgAI differentiates itself through:
+Grafyn differentiates itself through:
 
 - **AI-Native**: Built from the ground up for AI integration via MCP
 - **Web-Based**: Accessible from any device, not just desktop

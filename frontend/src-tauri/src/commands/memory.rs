@@ -10,9 +10,8 @@ pub async fn recall_relevant(
 ) -> Result<Vec<RecallResult>, String> {
     let search = state.search_service.read().await;
     let graph = state.graph_index.read().await;
-    let memory = state.memory_service.read().await;
 
-    memory.recall_relevant(
+    state.memory_service.recall_relevant(
         &search,
         &graph,
         &request.query,
@@ -29,9 +28,8 @@ pub async fn find_contradictions(
 ) -> Result<Vec<Contradiction>, String> {
     let search = state.search_service.read().await;
     let store = state.knowledge_store.read().await;
-    let memory = state.memory_service.read().await;
 
-    memory.find_contradictions(&search, &store, &note_id)
+    state.memory_service.find_contradictions(&search, &store, &note_id)
 }
 
 /// Extract claims from conversation
@@ -40,6 +38,5 @@ pub async fn extract_claims(
     request: ExtractRequest,
     state: State<'_, AppState>,
 ) -> Result<Vec<ExtractedClaim>, String> {
-    let memory = state.memory_service.read().await;
-    Ok(memory.extract_from_conversation(&request.messages))
+    Ok(state.memory_service.extract_from_conversation(&request.messages))
 }

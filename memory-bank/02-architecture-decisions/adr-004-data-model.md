@@ -8,7 +8,7 @@ Accepted
 
 ## Context
 
-OrgAI needs a data model for storing and managing knowledge that:
+Grafyn needs a data model for storing and managing knowledge that:
 
 1. **Supports Obsidian compatibility**: Use standard Markdown with YAML frontmatter
 2. **Enables semantic search**: Store content and metadata for embeddings
@@ -211,7 +211,7 @@ WIKILINK_PATTERN = re.compile(r'\[\[([^\]|]+)(?:\|[^\]]+)?\]\]')
 - Not human-readable
 - Requires custom tools
 - Not portable
-- Lock-in to OrgAI
+- Lock-in to Grafyn
 - Can't use existing editors
 
 ### Auto-linking (Keyword-based)

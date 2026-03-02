@@ -2,8 +2,6 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { mount, flushPromises } from '@vue/test-utils'
 import GraphView from '@/components/GraphView.vue'
 import * as apiClient from '@/api/client'
-import * as d3 from 'd3'
-
 // Mock GraphSettings child component
 vi.mock('@/components/GraphSettings.vue', () => ({
   default: {
@@ -29,53 +27,64 @@ const mockSelection = {
   remove: vi.fn().mockReturnThis(),
 }
 
-vi.mock('d3', () => {
-  return {
-    select: vi.fn(() => mockSelection),
-    selectAll: vi.fn(() => mockSelection),
-    forceSimulation: vi.fn(() => ({
-      force: vi.fn().mockReturnThis(),
-      on: vi.fn().mockReturnThis(),
-      stop: vi.fn(),
-      alpha: vi.fn().mockReturnThis(),
-      alphaTarget: vi.fn().mockReturnThis(),
-      restart: vi.fn().mockReturnThis(),
-      nodes: vi.fn().mockReturnThis(),
-    })),
-    forceLink: vi.fn(() => ({
-      id: vi.fn().mockReturnThis(),
-      distance: vi.fn().mockReturnThis(),
-      strength: vi.fn().mockReturnThis(),
-      links: vi.fn().mockReturnThis(),
-    })),
-    forceManyBody: vi.fn(() => ({
-      strength: vi.fn().mockReturnThis(),
-    })),
-    forceCenter: vi.fn(),
-    forceX: vi.fn(() => ({
-      strength: vi.fn().mockReturnThis(),
-    })),
-    forceY: vi.fn(() => ({
-      strength: vi.fn().mockReturnThis(),
-    })),
-    forceCollide: vi.fn(() => ({
-      strength: vi.fn().mockReturnThis(),
-    })),
-    zoom: vi.fn(() => {
-      const zoomBehavior = vi.fn()
-      zoomBehavior.scaleExtent = vi.fn().mockReturnThis()
-      zoomBehavior.on = vi.fn().mockReturnThis()
-      zoomBehavior.transform = vi.fn()
-      return zoomBehavior
-    }),
-    zoomIdentity: {},
-    drag: vi.fn(() => {
-      const dragBehavior = vi.fn()
-      dragBehavior.on = vi.fn().mockReturnThis()
-      return dragBehavior
-    }),
-  }
-})
+vi.mock('d3-selection', () => ({
+  select: vi.fn(() => mockSelection),
+}))
+
+vi.mock('d3-force', () => ({
+  forceSimulation: vi.fn(() => ({
+    force: vi.fn().mockReturnThis(),
+    on: vi.fn().mockReturnThis(),
+    stop: vi.fn(),
+    alpha: vi.fn().mockReturnThis(),
+    alphaTarget: vi.fn().mockReturnThis(),
+    restart: vi.fn().mockReturnThis(),
+    nodes: vi.fn().mockReturnThis(),
+    alphaDecay: vi.fn().mockReturnThis(),
+  })),
+  forceLink: vi.fn(() => ({
+    id: vi.fn().mockReturnThis(),
+    distance: vi.fn().mockReturnThis(),
+    strength: vi.fn().mockReturnThis(),
+    links: vi.fn().mockReturnThis(),
+  })),
+  forceManyBody: vi.fn(() => ({
+    strength: vi.fn().mockReturnThis(),
+  })),
+  forceCenter: vi.fn(() => ({
+    strength: vi.fn().mockReturnThis(),
+  })),
+  forceX: vi.fn(() => ({
+    strength: vi.fn().mockReturnThis(),
+  })),
+  forceY: vi.fn(() => ({
+    strength: vi.fn().mockReturnThis(),
+  })),
+  forceCollide: vi.fn(() => ({
+    strength: vi.fn().mockReturnThis(),
+  })),
+}))
+
+vi.mock('d3-zoom', () => ({
+  zoom: vi.fn(() => {
+    const zoomBehavior = vi.fn()
+    zoomBehavior.scaleExtent = vi.fn().mockReturnThis()
+    zoomBehavior.on = vi.fn().mockReturnThis()
+    zoomBehavior.transform = vi.fn()
+    return zoomBehavior
+  }),
+  zoomIdentity: {},
+}))
+
+vi.mock('d3-drag', () => ({
+  drag: vi.fn(() => {
+    const dragBehavior = vi.fn()
+    dragBehavior.on = vi.fn().mockReturnThis()
+    return dragBehavior
+  }),
+}))
+
+vi.mock('d3-transition', () => ({}))
 
 describe('GraphView', () => {
   let wrapper

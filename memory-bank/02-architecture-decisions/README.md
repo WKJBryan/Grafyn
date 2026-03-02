@@ -1,6 +1,6 @@
 # Architecture Decision Records (ADRs)
 
-> **Purpose:** Record significant architectural decisions made in the OrgAI project
+> **Purpose:** Record significant architectural decisions made in the Grafyn project
 > **Format:** Based on Michael Nygard's ADR template
 > **Status:** Active
 

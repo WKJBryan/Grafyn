@@ -1,5 +1,5 @@
 import { defineStore } from 'pinia'
-import { ref, computed } from 'vue'
+import { ref, shallowRef, computed, triggerRef } from 'vue'
 import { canvas as canvasApi, isDesktopApp } from '@/api/client'
 
 export const useCanvasStore = defineStore('canvas', () => {
@@ -9,9 +9,17 @@ export const useCanvasStore = defineStore('canvas', () => {
   const availableModels = ref([])
   const loading = ref(false)
   const error = ref(null)
-  const streamingModels = ref(new Set())
+  // shallowRef avoids deep reactivity tracking — these update on every SSE chunk,
+  // so deep proxying wastes cycles. Use triggerRef() after mutations to notify watchers.
+  const streamingModels = shallowRef(new Set())
   // Debate streaming state: { [debateId]: { currentRound, models: { [modelId]: text }, completedRounds: [] } }
+  // Kept as ref() (not shallowRef) because deeply nested mutations need automatic reactivity for streaming display
   const debateStreamingContent = ref({})
+
+  // shallowRef mutation helpers — wrap mutation + triggerRef
+  function addStreaming(modelId) { streamingModels.value.add(modelId); triggerRef(streamingModels) }
+  function removeStreaming(modelId) { removeStreaming(modelId); triggerRef(streamingModels) }
+  function clearStreaming() { clearStreaming(); triggerRef(streamingModels) }
 
   // Getters
   const promptTiles = computed(() => currentSession.value?.prompt_tiles || [])
@@ -173,7 +181,7 @@ export const useCanvasStore = defineStore('canvas', () => {
     error.value = null
 
     // Mark models as streaming
-    models.forEach(m => streamingModels.value.add(m))
+    models.forEach(m => addStreaming(m))
 
     // Calculate position for new tile when branching from a parent response
     let position = undefined
@@ -222,11 +230,11 @@ export const useCanvasStore = defineStore('canvas', () => {
           },
           complete: (data) => {
             updateTileResponseLocal(data.tile_id, data.model_id, modelContent[data.model_id], 'completed')
-            streamingModels.value.delete(data.model_id)
+            removeStreaming(data.model_id)
           },
           error: (data) => {
             updateTileResponseLocal(data.tile_id, data.model_id, data.error, 'error')
-            streamingModels.value.delete(data.model_id)
+            removeStreaming(data.model_id)
           },
           session_saved: async () => {
             await loadSession(sessionId)
@@ -272,7 +280,7 @@ export const useCanvasStore = defineStore('canvas', () => {
       console.error('Failed to send prompt:', err)
       throw err
     } finally {
-      models.forEach(m => streamingModels.value.delete(m))
+      models.forEach(m => removeStreaming(m))
     }
   }
 
@@ -328,12 +336,12 @@ export const useCanvasStore = defineStore('canvas', () => {
 
             case 'complete':
               updateTileResponseLocal(tileId, event.model_id, modelContent[event.model_id], 'completed')
-              streamingModels.value.delete(event.model_id)
+              removeStreaming(event.model_id)
               break
 
             case 'error':
               updateTileResponseLocal(tileId, event.model_id, event.error, 'error')
-              streamingModels.value.delete(event.model_id)
+              removeStreaming(event.model_id)
               break
 
             case 'session_saved':
@@ -359,10 +367,20 @@ export const useCanvasStore = defineStore('canvas', () => {
     }
   }
 
+  // Debounce timers for position persistence — optimistic updates are instant,
+  // but backend writes (JSON serialize + disk I/O) are debounced to avoid
+  // hammering the backend at 60fps during drag operations.
+  const _positionTimers = {}
+
+  function _debouncedPersist(key, fn, delay = 150) {
+    clearTimeout(_positionTimers[key])
+    _positionTimers[key] = setTimeout(fn, delay)
+  }
+
   async function updateTilePosition(tileId, position) {
     if (!currentSession.value) return
 
-    // Optimistic update
+    // Optimistic update (instant — keeps UI smooth during drag)
     const tile = currentSession.value.prompt_tiles.find(t => t.id === tileId)
     if (tile) {
       tile.position = { ...tile.position, ...position }
@@ -374,29 +392,35 @@ export const useCanvasStore = defineStore('canvas', () => {
       debate.position = { ...debate.position, ...position }
     }
 
-    // Persist to backend (debounced in component)
-    try {
-      await canvasApi.updateTilePosition(currentSession.value.id, tileId, position)
-    } catch (err) {
-      console.error('Failed to update tile position:', err)
-    }
+    // Persist to backend (debounced — only writes after drag pauses)
+    const sessionId = currentSession.value.id
+    _debouncedPersist(`tile:${tileId}`, async () => {
+      try {
+        await canvasApi.updateTilePosition(sessionId, tileId, position)
+      } catch (err) {
+        console.error('Failed to update tile position:', err)
+      }
+    })
   }
 
   async function updateLLMNodePosition(tileId, modelId, position) {
     if (!currentSession.value) return
 
-    // Optimistic update
+    // Optimistic update (instant)
     const tile = currentSession.value.prompt_tiles.find(t => t.id === tileId)
     if (tile && tile.responses[modelId]) {
       tile.responses[modelId].position = { ...tile.responses[modelId].position, ...position }
     }
 
-    // Persist to backend
-    try {
-      await canvasApi.updateLLMNodePosition(currentSession.value.id, tileId, modelId, position)
-    } catch (err) {
-      console.error('Failed to update LLM node position:', err)
-    }
+    // Persist to backend (debounced)
+    const sessionId = currentSession.value.id
+    _debouncedPersist(`llm:${tileId}:${modelId}`, async () => {
+      try {
+        await canvasApi.updateLLMNodePosition(sessionId, tileId, modelId, position)
+      } catch (err) {
+        console.error('Failed to update LLM node position:', err)
+      }
+    })
   }
 
   async function autoArrange(positions) {
@@ -506,11 +530,15 @@ export const useCanvasStore = defineStore('canvas', () => {
 
     currentSession.value.viewport = viewport
 
-    try {
-      await canvasApi.updateViewport(currentSession.value.id, viewport)
-    } catch (err) {
-      console.error('Failed to update viewport:', err)
-    }
+    // Debounce viewport persistence (fires on every zoom/pan frame)
+    const sessionId = currentSession.value.id
+    _debouncedPersist('viewport', async () => {
+      try {
+        await canvasApi.updateViewport(sessionId, viewport)
+      } catch (err) {
+        console.error('Failed to update viewport:', err)
+      }
+    })
   }
 
   async function startDebate(tileIds, participatingModels, mode = 'auto', maxRounds = 3) {
@@ -522,7 +550,7 @@ export const useCanvasStore = defineStore('canvas', () => {
     error.value = null
 
     // Mark models as streaming
-    participatingModels.forEach(m => streamingModels.value.add(m))
+    participatingModels.forEach(m => addStreaming(m))
 
     try {
       if (isDesktopApp()) {
@@ -567,11 +595,11 @@ export const useCanvasStore = defineStore('canvas', () => {
             }
           },
           model_complete: (data) => {
-            streamingModels.value.delete(data.model_id)
+            removeStreaming(data.model_id)
           },
           debate_error: (data) => {
             console.error(`Debate error for ${data.model_id}:`, data.error)
-            streamingModels.value.delete(data.model_id)
+            removeStreaming(data.model_id)
           },
           debate_complete: async (data) => {
             // Snapshot final round if it has content
@@ -624,7 +652,7 @@ export const useCanvasStore = defineStore('canvas', () => {
       console.error('Failed to start debate:', err)
       throw err
     } finally {
-      participatingModels.forEach(m => streamingModels.value.delete(m))
+      participatingModels.forEach(m => removeStreaming(m))
     }
   }
 
@@ -680,11 +708,11 @@ export const useCanvasStore = defineStore('canvas', () => {
               break
             }
             case 'model_complete':
-              streamingModels.value.delete(event.model_id)
+              removeStreaming(event.model_id)
               break
             case 'debate_error':
               console.error(`Debate error for ${event.model_id}:`, event.error)
-              streamingModels.value.delete(event.model_id)
+              removeStreaming(event.model_id)
               break
             case 'debate_complete': {
               if (debateId) {
@@ -722,7 +750,7 @@ export const useCanvasStore = defineStore('canvas', () => {
     }
 
     const participatingModels = debate.participating_models
-    participatingModels.forEach(m => streamingModels.value.add(m))
+    participatingModels.forEach(m => addStreaming(m))
 
     try {
       if (isDesktopApp()) {
@@ -747,10 +775,10 @@ export const useCanvasStore = defineStore('canvas', () => {
             }
           },
           model_complete: (data) => {
-            streamingModels.value.delete(data.model_id)
+            removeStreaming(data.model_id)
           },
           debate_error: (data) => {
-            streamingModels.value.delete(data.model_id)
+            removeStreaming(data.model_id)
           },
           debate_complete: async (data) => {
             const state = debateStreamingContent.value[data.debate_id]
@@ -820,7 +848,7 @@ export const useCanvasStore = defineStore('canvas', () => {
                   break
                 }
                 case 'model_complete':
-                  streamingModels.value.delete(event.model_id)
+                  removeStreaming(event.model_id)
                   break
                 case 'round_complete':
                 case 'debate_complete': {
@@ -848,7 +876,7 @@ export const useCanvasStore = defineStore('canvas', () => {
       error.value = err.message || 'Failed to continue debate'
       throw err
     } finally {
-      participatingModels.forEach(m => streamingModels.value.delete(m))
+      participatingModels.forEach(m => removeStreaming(m))
     }
   }
 
@@ -890,7 +918,7 @@ export const useCanvasStore = defineStore('canvas', () => {
     availableModels.value = []
     loading.value = false
     error.value = null
-    streamingModels.value.clear()
+    clearStreaming()
     debateStreamingContent.value = {}
   }
 
@@ -928,7 +956,7 @@ export const useCanvasStore = defineStore('canvas', () => {
     error.value = null
 
     // Mark new models as streaming
-    newModelIds.forEach(m => streamingModels.value.add(m))
+    newModelIds.forEach(m => addStreaming(m))
 
     try {
       if (isDesktopApp()) {
@@ -945,11 +973,11 @@ export const useCanvasStore = defineStore('canvas', () => {
           },
           complete: (data) => {
             updateTileResponseLocal(tileId, data.model_id, modelContent[data.model_id], 'completed')
-            streamingModels.value.delete(data.model_id)
+            removeStreaming(data.model_id)
           },
           error: (data) => {
             updateTileResponseLocal(tileId, data.model_id, data.error, 'error')
-            streamingModels.value.delete(data.model_id)
+            removeStreaming(data.model_id)
           },
           session_saved: async () => {
             await loadSession(sessionId)
@@ -1001,11 +1029,11 @@ export const useCanvasStore = defineStore('canvas', () => {
                   break
                 case 'complete':
                   updateTileResponseLocal(tileId, event.model_id, modelContent[event.model_id], 'completed')
-                  streamingModels.value.delete(event.model_id)
+                  removeStreaming(event.model_id)
                   break
                 case 'error':
                   updateTileResponseLocal(tileId, event.model_id, event.error, 'error')
-                  streamingModels.value.delete(event.model_id)
+                  removeStreaming(event.model_id)
                   break
                 case 'session_saved':
                   await loadSession(sessionId)
@@ -1022,7 +1050,7 @@ export const useCanvasStore = defineStore('canvas', () => {
       console.error('Failed to add models to tile:', err)
       throw err
     } finally {
-      newModelIds.forEach(m => streamingModels.value.delete(m))
+      newModelIds.forEach(m => removeStreaming(m))
     }
   }
 
@@ -1041,7 +1069,7 @@ export const useCanvasStore = defineStore('canvas', () => {
     error.value = null
 
     // Mark model as streaming
-    streamingModels.value.add(modelId)
+    addStreaming(modelId)
 
     // Clear existing content
     updateTileResponseLocal(tileId, modelId, '', 'streaming')
@@ -1061,13 +1089,13 @@ export const useCanvasStore = defineStore('canvas', () => {
           complete: (data) => {
             if (data.model_id === modelId) {
               updateTileResponseLocal(tileId, modelId, content, 'completed')
-              streamingModels.value.delete(modelId)
+              removeStreaming(modelId)
             }
           },
           error: (data) => {
             if (data.model_id === modelId) {
               updateTileResponseLocal(tileId, modelId, data.error, 'error')
-              streamingModels.value.delete(modelId)
+              removeStreaming(modelId)
             }
           },
           session_saved: async () => {
@@ -1118,11 +1146,11 @@ export const useCanvasStore = defineStore('canvas', () => {
                   break
                 case 'complete':
                   updateTileResponseLocal(tileId, modelId, content, 'completed')
-                  streamingModels.value.delete(modelId)
+                  removeStreaming(modelId)
                   break
                 case 'error':
                   updateTileResponseLocal(tileId, modelId, event.error, 'error')
-                  streamingModels.value.delete(modelId)
+                  removeStreaming(modelId)
                   break
                 case 'session_saved':
                   await loadSession(sessionId)
@@ -1139,7 +1167,7 @@ export const useCanvasStore = defineStore('canvas', () => {
       console.error('Failed to regenerate response:', err)
       throw err
     } finally {
-      streamingModels.value.delete(modelId)
+      removeStreaming(modelId)
     }
   }
 

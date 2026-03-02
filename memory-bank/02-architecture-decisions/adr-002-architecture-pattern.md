@@ -8,7 +8,7 @@ Accepted
 
 ## Context
 
-OrgAI backend needs to handle multiple concerns:
+Grafyn backend needs to handle multiple concerns:
 
 1. **Note Management**: CRUD operations with Markdown/YAML parsing
 2. **Semantic Search**: Vector embeddings and similarity search
@@ -31,11 +31,10 @@ We adopted a **Service Layer Architecture Pattern** with clear separation of con
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│                      API Layer (Routers)                   │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────┐   │
-│  │ notes.py    │  │ search.py   │  │ graph.py            │   │
-│  │ 6 endpoints │  │ 2 endpoints │  │ 4 endpoints         │   │
-│  └─────────────┘  └─────────────┘  └─────────────────────┘   │
+│                      API Layer (11 Routers)                 │
+│  notes(12) search(2) graph(7) canvas(22) mcp_write(9)      │
+│  distill(2) priority(7) import(7) zettel(6) feedback(2)     │
+│  memory(3) oauth(4)                                         │
 ├──────────────────────────────────────────────────────────────┤
 │                     Service Layer                            │
 │  ┌────────────────┐ ┌─────────────────┐ ┌─────────────────┐  │
@@ -139,7 +138,7 @@ class EmbeddingService:
 
 ### Router Layer
 
-**Files:** `routers/notes.py`, `routers/search.py`, `routers/graph.py`
+**Files:** `routers/notes.py`, `routers/search.py`, `routers/graph.py`, `routers/canvas.py`, `routers/mcp_write.py`, `routers/distill.py`, `routers/priority.py`, `routers/conversation_import.py`, `routers/zettelkasten.py`, `routers/feedback.py`, `routers/memory.py`, `routers/oauth.py`
 
 **Responsibilities:**
 - HTTP request/response handling
@@ -229,23 +228,13 @@ async def get_note(note_id: str):
 ### Service Initialization
 
 ```python
-# In main.py
-from app.services import (
-    KnowledgeStore,
-    VectorSearchService,
-    GraphIndexService,
-    EmbeddingService
-)
-
-# Initialize services
-settings = get_settings()
-knowledge_store = KnowledgeStore(settings.vault_path)
-embedding_service = EmbeddingService(settings.embedding_model)
-vector_search = VectorSearchService(
-    settings.data_path,
-    embedding_service
-)
-graph_index = GraphIndexService(knowledge_store)
+# In main.py — services initialized via lifespan, attached to app.state
+# 14+ services including:
+# KnowledgeStore, VectorSearchService, GraphIndexService, EmbeddingService,
+# OpenRouterService, CanvasSessionStore, DistillationService, ImportService,
+# LinkDiscoveryService, PriorityScoringService, PrioritySettingsService,
+# TokenStore, FeedbackService, MemoryService
+# Access via dependency helpers in app/utils/dependencies.py
 ```
 
 ### Service Dependencies
@@ -344,4 +333,4 @@ def test_get_note_endpoint():
 
 ---
 
-**Status:** This decision is active and forms the core of OrgAI backend architecture.
+**Status:** This decision is active and forms the core of Grafyn backend architecture.

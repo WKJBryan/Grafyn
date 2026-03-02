@@ -1,12 +1,12 @@
 # Frontend Development Patterns
 
-> **Purpose:** Document common patterns and best practices for OrgAI frontend development
+> **Purpose:** Document common patterns and best practices for Grafyn frontend development
 > **Created:** 2025-12-31
 > **Status:** Active
 
 ## Overview
 
-This document describes common patterns and conventions used in OrgAI frontend (Vue 3) to ensure consistency and maintainability.
+This document describes common patterns and conventions used in Grafyn frontend (Vue 3) to ensure consistency and maintainability.
 
 ## Component Pattern
 

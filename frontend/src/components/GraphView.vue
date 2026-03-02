@@ -65,7 +65,11 @@
 
 <script setup>
 import { ref, onMounted, onBeforeUnmount, watch } from 'vue'
-import * as d3 from 'd3'
+import { select } from 'd3-selection'
+import { zoom as d3Zoom, zoomIdentity } from 'd3-zoom'
+import { forceSimulation, forceLink, forceManyBody, forceCenter, forceCollide, forceX, forceY } from 'd3-force'
+import { drag as d3Drag } from 'd3-drag'
+import 'd3-transition'
 import { graph as graphApi } from '../api/client'
 import GraphSettings from './GraphSettings.vue'
 
@@ -218,7 +222,7 @@ function initGraph() {
   if (canvas.value) canvas.value.innerHTML = ''
   
   // Create SVG
-  svg = d3.select(canvas.value)
+  svg = select(canvas.value)
     .append('svg')
     .attr('width', '100%')
     .attr('height', '100%')
@@ -242,7 +246,7 @@ function initGraph() {
   zoomGroup = svg.append('g')
   
   // Zoom behavior
-  zoom = d3.zoom()
+  zoom = d3Zoom()
     .scaleExtent([0.1, 4])
     .on('zoom', (event) => {
       currentZoomLevel = event.transform.k
@@ -253,12 +257,12 @@ function initGraph() {
   svg.call(zoom)
   
   // Simulation with configurable forces
-  simulation = d3.forceSimulation(nodes)
-    .force('link', d3.forceLink(links).id(d => d.id).distance(currentForces.value.distance).strength(currentForces.value.link))
-    .force('charge', d3.forceManyBody().strength(currentForces.value.repel))
-    .force('x', d3.forceX(width / 2).strength(currentForces.value.center))
-    .force('y', d3.forceY(height / 2).strength(currentForces.value.center))
-    .force('collide', d3.forceCollide(30).strength(0.7))
+  simulation = forceSimulation(nodes)
+    .force('link', forceLink(links).id(d => d.id).distance(currentForces.value.distance).strength(currentForces.value.link))
+    .force('charge', forceManyBody().strength(currentForces.value.repel))
+    .force('x', forceX(width / 2).strength(currentForces.value.center))
+    .force('y', forceY(height / 2).strength(currentForces.value.center))
+    .force('collide', forceCollide(30).strength(0.7))
     
   // Draw lines
   const link = zoomGroup.append('g')
@@ -278,7 +282,7 @@ function initGraph() {
     .data(nodes)
     .join('g')
     .attr('class', 'node-group')
-    .call(drag(simulation))
+    .call(makeDrag(simulation))
     .on('click', (event, d) => {
       event.stopPropagation()
       emit('node-click', d.id)
@@ -342,7 +346,7 @@ function updateTextOpacity() {
 
 function updateDimensions() {
   if (simulation) {
-    simulation.force('center', d3.forceCenter(width / 2, height / 2).strength(currentForces.value.center))
+    simulation.force('center', forceCenter(width / 2, height / 2).strength(currentForces.value.center))
     simulation.alpha(0.3).restart()
   }
 }
@@ -425,25 +429,25 @@ function restartSimulation() {
   }
 }
 
-function drag(simulation) {
+function makeDrag(simulation) {
   function dragstarted(event) {
     if (!event.active) simulation.alphaTarget(0.3).restart()
     event.subject.fx = event.subject.x
     event.subject.fy = event.subject.y
   }
-  
+
   function dragged(event) {
     event.subject.fx = event.x
     event.subject.fy = event.y
   }
-  
+
   function dragended(event) {
     if (!event.active) simulation.alphaTarget(0)
     event.subject.fx = null
     event.subject.fy = null
   }
-  
-  return d3.drag()
+
+  return d3Drag()
     .on('start', dragstarted)
     .on('drag', dragged)
     .on('end', dragended)
@@ -457,7 +461,7 @@ function resetZoom() {
   if (svg && zoom) {
     svg.transition()
       .duration(750)
-      .call(zoom.transform, d3.zoomIdentity)
+      .call(zoom.transform, zoomIdentity)
   }
 }
 </script>

@@ -1,12 +1,12 @@
 # Coding Standards and Conventions
 
-> **Purpose:** Define coding standards and conventions for OrgAI project
+> **Purpose:** Define coding standards and conventions for Grafyn project
 > **Created:** 2025-12-31
 > **Status:** Active
 
 ## Overview
 
-This document defines coding standards and conventions for the OrgAI project to ensure consistency, readability, and maintainability across the codebase.
+This document defines coding standards and conventions for the Grafyn project to ensure consistency, readability, and maintainability across the codebase.
 
 ## General Principles
 

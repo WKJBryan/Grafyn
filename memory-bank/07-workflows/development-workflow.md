@@ -1,12 +1,12 @@
 # Development Workflow
 
-> **Purpose:** Define standard development workflow for OrgAI project
+> **Purpose:** Define standard development workflow for Grafyn project
 > **Created:** 2025-12-31
 > **Status:** Active
 
 ## Overview
 
-This document defines the standard development workflow for contributing to OrgAI project.
+This document defines the standard development workflow for contributing to Grafyn project.
 
 ## Development Workflow Diagram
 
@@ -282,7 +282,7 @@ git push origin feature/your-feature-name
 gh pr create --title "Add new feature" --body "Description..."
 
 # Or create via GitHub web interface
-# Visit: https://github.com/your-org/orgai/compare/main...feature/your-feature-name
+# Visit: https://github.com/WKJBryan/Grafyn/compare/main...feature/your-feature-name
 ```
 
 ### Pull Request Template

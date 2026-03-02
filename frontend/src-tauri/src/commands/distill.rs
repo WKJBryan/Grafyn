@@ -288,7 +288,7 @@ async fn summarize_with_llm(
     let openrouter = state.openrouter.read().await;
     openrouter
         .chat(
-            "anthropic/claude-3-haiku",
+            "anthropic/claude-3.5-haiku",
             messages,
             None,
             Some(0.7),

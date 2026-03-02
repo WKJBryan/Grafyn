@@ -343,7 +343,10 @@
 
 <script setup>
 import { ref, computed, onMounted, onBeforeUnmount, watch, shallowRef } from 'vue'
-import * as d3 from 'd3'
+import { select } from 'd3-selection'
+import { zoom as d3Zoom, zoomIdentity } from 'd3-zoom'
+import { forceSimulation, forceLink, forceManyBody, forceCenter, forceCollide } from 'd3-force'
+import 'd3-transition'
 import { useCanvasStore } from '@/stores/canvas'
 import { settings as settingsApi, isDesktopApp } from '@/api/client'
 import PromptNode from './PromptNode.vue'
@@ -579,10 +582,10 @@ function panToNode(position) {
   viewport.value = { ...viewport.value, x: newX, y: newY }
   
   if (zoom && surface.value) {
-    const transform = d3.zoomIdentity
+    const transform = zoomIdentity
       .translate(newX, newY)
       .scale(viewport.value.zoom)
-    d3.select(surface.value)
+    select(surface.value)
       .transition()
       .duration(300)
       .call(zoom.transform, transform)
@@ -597,10 +600,10 @@ watch(() => props.sessionId, async (newId) => {
     if (session.value?.viewport) {
       viewport.value = { ...session.value.viewport }
       if (zoom && surface.value) {
-        const transform = d3.zoomIdentity
+        const transform = zoomIdentity
           .translate(viewport.value.x, viewport.value.y)
           .scale(viewport.value.zoom)
-        d3.select(surface.value).call(zoom.transform, transform)
+        select(surface.value).call(zoom.transform, transform)
       }
     }
     emit('session-loaded', session.value)
@@ -639,16 +642,16 @@ onBeforeUnmount(() => {
 
 // Methods
 function initZoom() {
-  zoom = d3.zoom()
+  zoom = d3Zoom()
     .scaleExtent([0.1, 3])
     .filter((event) => {
       // Allow all non-wheel events
       if (event.type !== 'wheel') return true
       // Block wheel events from inside nodes (let them scroll)
-      if (event.target.closest('.prompt-node') || 
-          event.target.closest('.llm-node') || 
+      if (event.target.closest('.prompt-node') ||
+          event.target.closest('.llm-node') ||
           event.target.closest('.debate-node') ||
-          event.target.closest('.prompt-tile') || 
+          event.target.closest('.prompt-tile') ||
           event.target.closest('.debate-tile')) {
         return false
       }
@@ -663,22 +666,22 @@ function initZoom() {
     })
 
   if (surface.value) {
-    d3.select(surface.value).call(zoom)
+    select(surface.value).call(zoom)
   }
 }
 
 function resetZoom() {
   if (surface.value && zoom) {
-    d3.select(surface.value)
+    select(surface.value)
       .transition()
       .duration(500)
-      .call(zoom.transform, d3.zoomIdentity)
+      .call(zoom.transform, zoomIdentity)
   }
 }
 
 function zoomIn() {
   if (surface.value && zoom) {
-    d3.select(surface.value)
+    select(surface.value)
       .transition()
       .duration(300)
       .call(zoom.scaleBy, 1.3)
@@ -687,7 +690,7 @@ function zoomIn() {
 
 function zoomOut() {
   if (surface.value && zoom) {
-    d3.select(surface.value)
+    select(surface.value)
       .transition()
       .duration(300)
       .call(zoom.scaleBy, 0.7)
@@ -1154,11 +1157,11 @@ async function handleAutoArrange(algorithm = 'hierarchical') {
       }
       
       // Run force simulation
-      const simulation = d3.forceSimulation(nodes)
-        .force('link', d3.forceLink(links).id(d => d.id).distance(150))
-        .force('charge', d3.forceManyBody().strength(-300))
-        .force('center', d3.forceCenter(400, 300))
-        .force('collision', d3.forceCollide().radius(d => (d.width + d.height) / 4))
+      const simulation = forceSimulation(nodes)
+        .force('link', forceLink(links).id(d => d.id).distance(150))
+        .force('charge', forceManyBody().strength(-300))
+        .force('center', forceCenter(400, 300))
+        .force('collision', forceCollide().radius(d => (d.width + d.height) / 4))
         .stop()
       
       // Run simulation for 300 iterations

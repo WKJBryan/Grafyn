@@ -1,4 +1,4 @@
-# OrgAI Project Milestones
+# Grafyn Project Milestones
 
 > **Purpose:** Track key achievements, releases, and project milestones
 > **Created:** 2025-12-31
@@ -8,7 +8,7 @@
 
 ```mermaid
 timeline
-    title OrgAI Project Milestones
+    title Grafyn Project Milestones
     section 2024
       Dec 17 : v0.1.0 Initial Release
               : Core features implemented
@@ -67,10 +67,10 @@ timeline
 - Basic documentation
 
 **Metrics:**
-- 14 API endpoints
-- 4 backend services
-- 6 MCP tools
-- 5 Vue components
+- 80+ API endpoints
+- 14+ backend services
+- 9 MCP tools
+- 20+ Vue components
 
 ---
 
@@ -92,12 +92,15 @@ timeline
 - Chat ingestion workflows
 
 **MCP Tools:**
-1. `query_knowledge` - Semantic search
+1. `list_notes` - List all notes
 2. `get_note` - Retrieve note content
-3. `list_notes` - List notes with filtering
-4. `get_backlinks` - Get note connections
-5. `ingest_chat` - Store conversations
-6. `create_draft` - Create draft notes
+3. `create_note` - Create a new note
+4. `update_note` - Update an existing note
+5. `delete_note` - Delete a note
+6. `search_notes` - Full-text search
+7. `get_backlinks` - Get note backlinks
+8. `get_outgoing` - Get outgoing links
+9. `recall_relevant` - Semantic recall from memory
 
 ---
 
@@ -217,6 +220,8 @@ timeline
 ---
 
 ## Planned Milestones
+
+> **Note:** These milestones were defined during initial planning (Q1/Q2 2025 targets). The project has since evolved significantly with Tauri desktop app, multi-LLM canvas, distillation module, and conversation import features.
 
 ### M8: Security Hardening (Q1 2025)
 
@@ -411,11 +416,11 @@ timeline
 
 ### Development Metrics
 
-| Metric | v0.1.0 | v0.2.0 | v1.0.0 (Target) |
+| Metric | v0.1.0 | v0.0.6 | v1.0.0 (Target) |
 |--------|--------|--------|-----------------|
-| API Endpoints | 14 | 14 | 20+ |
-| Backend Services | 4 | 4 | 6+ |
-| Vue Components | 5 | 6 | 10+ |
+| API Endpoints | 14 | 80+ | 20+ |
+| Backend Services | 4 | 14+ | 6+ |
+| Vue Components | 5 | 20+ | 10+ |
 | Test Coverage | 0% | 70% | 80%+ |
 | Documentation | Basic | Comprehensive | Complete |
 

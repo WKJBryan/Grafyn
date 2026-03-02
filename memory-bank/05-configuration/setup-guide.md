@@ -1,12 +1,12 @@
 # Setup Guide
 
-> **Purpose:** Guide for setting up OrgAI development environment
+> **Purpose:** Guide for setting up Grafyn development environment
 > **Created:** 2025-12-31
 > **Status:** Active
 
 ## Overview
 
-This guide provides step-by-step instructions for setting up OrgAI development environment on your local machine.
+This guide provides step-by-step instructions for setting up Grafyn development environment on your local machine.
 
 ## Prerequisites
 
@@ -32,8 +32,8 @@ This guide provides step-by-step instructions for setting up OrgAI development e
 ### 1. Clone Repository
 
 ```bash
-git clone https://github.com/your-org/orgai.git
-cd orgai
+git clone https://github.com/WKJBryan/Grafyn.git
+cd Grafyn
 ```
 
 ### 2. Create Virtual Environment
@@ -78,6 +78,11 @@ DATA_PATH=../data
 SERVER_HOST=0.0.0.0
 SERVER_PORT=8080
 EMBEDDING_MODEL=all-MiniLM-L6-v2
+ENVIRONMENT=development
+OPENROUTER_API_KEY=your-openrouter-key
+GITHUB_FEEDBACK_REPO=owner/repo
+GITHUB_FEEDBACK_TOKEN=your-github-pat
+TOKEN_ENCRYPTION_KEY=generate-with-fernet
 ```
 
 ### 5. Create Directories
@@ -115,9 +120,6 @@ uvicorn app.main:app --host 0.0.0.0 --port 8080 --workers 4
 ### 8. Verify Backend
 
 ```bash
-# Check health endpoint
-curl http://localhost:8080/health
-
 # Check API docs
 # Open browser to: http://localhost:8080/docs
 ```
@@ -176,7 +178,7 @@ npm run preview
 
 ```bash
 # Open browser to: http://localhost:5173
-# Should see OrgAI interface
+# Should see Grafyn interface
 ```
 
 ## Development Workflow
@@ -208,7 +210,7 @@ npm run dev
 
 ### VS Code Extensions
 
-Recommended extensions for OrgAI development:
+Recommended extensions for Grafyn development:
 
 | Extension | Purpose |
 |-----------|---------|
@@ -457,7 +459,6 @@ After setup, verify:
 - [ ] .env file configured
 - [ ] Directories created (vault, data)
 - [ ] Server starts without errors
-- [ ] Health endpoint returns 200
 - [ ] API docs accessible at /docs
 - [ ] Tests pass: `pytest`
 

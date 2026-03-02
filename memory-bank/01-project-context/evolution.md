@@ -1,6 +1,6 @@
-# OrgAI Project Evolution
+# Grafyn Project Evolution
 
-> **Purpose:** Track how the OrgAI project has evolved over time
+> **Purpose:** Track how the Grafyn project has evolved over time
 > **Created:** 2025-12-31
 > **Status:** Active
 
@@ -14,7 +14,7 @@
 - Wikilink parsing and backlink tracking
 - Semantic search using sentence-transformers
 - Basic Vue 3 web interface
-- MCP integration with 6 tools
+- MCP integration with 9 tools
 
 **Architecture:**
 - FastAPI backend with service layer pattern
@@ -26,7 +26,6 @@
 - No authentication/authorization
 - No pagination for large datasets
 - Limited error handling
-- No frontend tests
 - Basic logging (print statements)
 
 ### v0.2.0 - Quality Improvements (2024-12-21)
@@ -59,10 +58,11 @@
 
 ```
 FastAPI App
-├── Routers (notes, search, graph)
-├── Services (4 services)
+├── Routers (11 routers)
+├── Services (14+ services)
 ├── Models (Pydantic schemas)
-└── MCP Integration
+├── MCP Integration
+└── Tauri Desktop Backend (Rust)
 ```
 
 **Characteristics:**
@@ -71,16 +71,15 @@ FastAPI App
 - In-memory graph index
 - Basic error handling
 
-#### Current Design (v0.2.0)
+#### Current Design (v0.0.6)
 
 ```
-FastAPI App
-├── Routers (notes, search, graph)
-├── Services (4 services with logging)
-├── Models (Pydantic schemas)
-├── Logging Configuration
-├── MCP Integration
-└── Test Suite (unit + integration)
+FastAPI App / Tauri Rust Backend (dual deployment)
+├── Routers (11: notes, search, graph, canvas, mcp_write, distill, priority, import, zettelkasten, feedback, memory)
+├── Services (14+: knowledge, vector search, graph, embedding, openrouter, canvas, distillation, import, link discovery, priority scoring, priority settings, token, feedback, memory)
+├── Models (Pydantic schemas / Rust structs)
+├── MCP Integration (Python SSE + native Rust binary)
+└── Test Suite (backend unit + integration + security, frontend unit + E2E)
 ```
 
 **Improvements:**
@@ -158,13 +157,13 @@ Vue 3 App
 ### MCP Integration
 
 #### Initial Implementation
-- 6 MCP tools exposed
+- 9 MCP tools exposed
 - Basic tool definitions
 - Claude Desktop support
 - Documentation for setup
 
 #### Current Implementation
-- Same 6 tools (stable)
+- 9 tools (native Rust binary for Claude Desktop, Python SSE for web)
 - Improved error handling
 - Better logging
 - Comprehensive documentation
@@ -178,14 +177,14 @@ Vue 3 App
 |-----------|--------|--------|--------|
 | Backend Services | 0% | 70%+ | +70% |
 | API Endpoints | 0% | 80%+ | +80% |
-| Frontend Components | 0% | 0% | 0% |
+| Frontend Components | 0% | Tests exist | Tests exist |
 | Integration Tests | 0% | 60%+ | +60% |
 
 ### Code Metrics
 
-| Metric | v0.1.0 | v0.2.0 | Change |
+| Metric | v0.1.0 | v0.0.6 | Change |
 |--------|--------|--------|--------|
-| Backend Lines | ~800 | ~800 | 0% |
+| Backend Lines | ~800 | 5,000+ | +500% |
 | Test Lines | 0 | 1,600+ | +1,600 |
 | Documentation | Basic | Comprehensive | +200% |
 | Logging Coverage | 0% | 100% | +100% |
@@ -285,7 +284,7 @@ Vue 3 App
 1. ⚠️ CORS too permissive
 2. ⚠️ No authentication/authorization
 3. ⚠️ No pagination for large datasets
-4. ⚠️ No frontend tests
+4. ⚠️ Limited frontend test coverage
 5. ⚠️ No caching layer
 
 ## Migration Path

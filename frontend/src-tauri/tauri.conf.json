@@ -11,9 +11,6 @@
   },
   "tauri": {
     "allowlist": {
-      "clipboard": {
-        "all": true
-      },
       "dialog": {
         "all": true
       },
@@ -25,15 +22,6 @@
           "$APP/*",
           "$DATA/*"
         ]
-      },
-      "globalShortcut": {
-        "all": true
-      },
-      "notification": {
-        "all": true
-      },
-      "os": {
-        "all": true
       },
       "path": {
         "all": true
