@@ -26,6 +26,7 @@ tauri-build = { version = "1.5", features = [], optional = true }
 tauri = { version = "1.8", optional = true, features = [
     "dialog-all",
     "fs-all",
+    "linux-ipc-protocol",
     "path-all",
     "process-all",
     "protocol-all",
