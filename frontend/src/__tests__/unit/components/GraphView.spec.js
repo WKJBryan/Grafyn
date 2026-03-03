@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { mount, flushPromises } from '@vue/test-utils'
 import GraphView from '@/components/GraphView.vue'
 import * as apiClient from '@/api/client'
+import { forceSimulation } from 'd3-force'
 // Mock GraphSettings child component
 vi.mock('@/components/GraphSettings.vue', () => ({
   default: {
@@ -136,7 +137,7 @@ describe('GraphView', () => {
     wrapper = mount(GraphView)
     await flushPromises()
 
-    expect(d3.forceSimulation).toHaveBeenCalled()
+    expect(forceSimulation).toHaveBeenCalled()
   })
 
   // ============================================================================
