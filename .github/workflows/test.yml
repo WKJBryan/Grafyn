@@ -32,9 +32,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.0-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev
 
-      - name: Build MCP binary (needed by Tauri build script)
+      - name: Prepare build artifacts for Tauri
         run: |
           cd frontend/src-tauri
+          # Tauri's generate_context!() requires distDir to exist at compile time
+          mkdir -p ../dist && echo '<html></html>' > ../dist/index.html
+          # Tauri's build script requires the MCP external binary
           cargo build --bin grafyn-mcp --no-default-features --features mcp
           mkdir -p binaries
           cp target/debug/grafyn-mcp "binaries/grafyn-mcp-$(rustc -vV | grep host | awk '{print $2}')"
