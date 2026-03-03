@@ -1,10 +1,11 @@
 //! MCP Tool Definitions for Grafyn
 //!
-//! Implements 9 MCP tools that expose the knowledge base to Claude Desktop
+//! Implements 10 MCP tools that expose the knowledge base to Claude Desktop
 //! and other MCP clients via the rmcp crate.
 
-use crate::models::note::{NoteCreate, NoteUpdate};
+use crate::models::note::{NoteCreate, NoteStatus, NoteUpdate};
 use crate::services::graph_index::GraphIndex;
+use crate::services::import;
 use crate::services::knowledge_store::KnowledgeStore;
 use crate::services::memory::MemoryService;
 use crate::services::search::SearchService;
@@ -113,6 +114,15 @@ pub struct RecallParams {
 
 fn default_recall_limit() -> usize {
     5
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ImportParams {
+    #[schemars(description = "Absolute path to a conversation export file (JSON or DMS). Supports ChatGPT, Claude, Grok, and Gemini formats.")]
+    pub file_path: String,
+    #[schemars(description = "IDs of specific conversations to import. Empty array imports all.")]
+    #[serde(default)]
+    pub conversation_ids: Vec<String>,
 }
 
 // ── Tool response helpers ────────────────────────────────────────────────────
@@ -385,6 +395,93 @@ impl GrafynMcpServer {
             })
             .collect();
         json_result(&response)
+    }
+
+    #[tool(description = "Import conversations from ChatGPT, Claude, Grok, or Gemini export files as evidence notes. Auto-detects format. Returns created note IDs.")]
+    async fn import_conversation(
+        &self,
+        Parameters(params): Parameters<ImportParams>,
+    ) -> Result<CallToolResult, McpError> {
+        // Read the file
+        let content = match std::fs::read_to_string(&params.file_path) {
+            Ok(c) => c,
+            Err(e) => return err_result(format!("Failed to read file: {}", e)),
+        };
+
+        // Auto-detect and parse
+        let platform = import::detect_platform(&content)
+            .unwrap_or("unknown");
+        let all_conversations = match import::parse_content(&content) {
+            Ok(c) => c,
+            Err(e) => return err_result(format!("Failed to parse: {}", e)),
+        };
+
+        // Filter to selected conversations
+        let to_import = if params.conversation_ids.is_empty() {
+            all_conversations
+        } else {
+            all_conversations
+                .into_iter()
+                .filter(|c| params.conversation_ids.contains(&c.id))
+                .collect()
+        };
+
+        let mut created_ids = Vec::new();
+        let mut errors = Vec::new();
+
+        for conv in &to_import {
+            let markdown = import::format_as_markdown(conv);
+            let mut tags = conv.suggested_tags.clone();
+            if !tags.contains(&"import".to_string()) {
+                tags.push("import".to_string());
+            }
+            tags.truncate(5);
+
+            let note_create = NoteCreate {
+                title: conv.title.clone(),
+                content: markdown,
+                status: NoteStatus::Evidence,
+                tags,
+                properties: {
+                    let mut props = std::collections::HashMap::new();
+                    props.insert("source".into(), serde_json::Value::String(conv.platform.clone()));
+                    props.insert("source_id".into(), serde_json::Value::String(conv.id.clone()));
+                    props.insert("created_via".into(), serde_json::Value::String("mcp-import".into()));
+                    props
+                },
+            };
+
+            let mut ks = self.knowledge_store.write().await;
+            match ks.create_note(note_create) {
+                Ok(note) => {
+                    // Index in search (if writable)
+                    {
+                        let mut search = self.search_service.write().await;
+                        if !search.is_readonly() {
+                            let _ = search.index_note(&note);
+                            let _ = search.commit();
+                        }
+                    }
+                    // Update graph
+                    {
+                        let mut graph = self.graph_index.write().await;
+                        graph.update_note(&note);
+                    }
+                    created_ids.push(note.id);
+                }
+                Err(e) => {
+                    errors.push(format!("Failed to create '{}': {}", conv.title, e));
+                }
+            }
+        }
+
+        let result = serde_json::json!({
+            "platform": platform,
+            "imported": created_ids.len(),
+            "note_ids": created_ids,
+            "errors": errors,
+        });
+        json_result(&result)
     }
 
     #[tool(description = "Search with graph-aware boosting. Notes connected to context notes via wikilinks get a relevance boost. Best for finding related knowledge.")]

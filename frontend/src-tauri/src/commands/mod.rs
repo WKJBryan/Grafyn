@@ -1,10 +1,14 @@
 pub mod canvas;
+pub mod chat;
 pub mod distill;
 pub mod feedback;
 pub mod graph;
+pub mod import;
 pub mod mcp;
 pub mod memory;
 pub mod notes;
+pub mod priority;
+pub mod retrieval;
 pub mod search;
 pub mod settings;
 pub mod zettelkasten;

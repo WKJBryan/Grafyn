@@ -1,6 +1,6 @@
 import { defineStore } from 'pinia'
 import { ref, shallowRef, computed, triggerRef } from 'vue'
-import { canvas as canvasApi, isDesktopApp } from '@/api/client'
+import { canvas as canvasApi } from '@/api/client'
 
 export const useCanvasStore = defineStore('canvas', () => {
   // State
@@ -9,7 +9,7 @@ export const useCanvasStore = defineStore('canvas', () => {
   const availableModels = ref([])
   const loading = ref(false)
   const error = ref(null)
-  // shallowRef avoids deep reactivity tracking — these update on every SSE chunk,
+  // shallowRef avoids deep reactivity tracking — these update on every streaming chunk,
   // so deep proxying wastes cycles. Use triggerRef() after mutations to notify watchers.
   const streamingModels = shallowRef(new Set())
   // Debate streaming state: { [debateId]: { currentRound, models: { [modelId]: text }, completedRounds: [] } }
@@ -18,8 +18,8 @@ export const useCanvasStore = defineStore('canvas', () => {
 
   // shallowRef mutation helpers — wrap mutation + triggerRef
   function addStreaming(modelId) { streamingModels.value.add(modelId); triggerRef(streamingModels) }
-  function removeStreaming(modelId) { removeStreaming(modelId); triggerRef(streamingModels) }
-  function clearStreaming() { clearStreaming(); triggerRef(streamingModels) }
+  function removeStreaming(modelId) { streamingModels.value.delete(modelId); triggerRef(streamingModels) }
+  function clearStreaming() { streamingModels.value.clear(); triggerRef(streamingModels) }
 
   // Getters
   const promptTiles = computed(() => currentSession.value?.prompt_tiles || [])
@@ -158,7 +158,7 @@ export const useCanvasStore = defineStore('canvas', () => {
   }
 
   // Helper to set up Tauri event listener for canvas-stream events
-  // Returns { unlisten } cleanup handle
+  // Returns unlisten cleanup handle
   async function setupTauriStreamListener(sessionId, handlers) {
     const { listen } = await import('@tauri-apps/api/event')
     const unlisten = await listen('canvas-stream', (event) => {
@@ -199,81 +199,52 @@ export const useCanvasStore = defineStore('canvas', () => {
     }
 
     try {
-      if (isDesktopApp()) {
-        // === Tauri path: IPC + event-based streaming ===
-        const modelContent = {}
-        models.forEach(m => { modelContent[m] = '' })
+      const modelContent = {}
+      models.forEach(m => { modelContent[m] = '' })
 
-        const request = {
-          prompt,
-          models,
-          system_prompt: systemPrompt,
-          temperature,
-          max_tokens: maxTokens,
-          parent_tile_id: parentTileId,
-          parent_model_id: parentModelId,
-          context_mode: contextMode,
-          position
-        }
+      const request = {
+        prompt,
+        models,
+        system_prompt: systemPrompt,
+        temperature,
+        max_tokens: maxTokens,
+        parent_tile_id: parentTileId,
+        parent_model_id: parentModelId,
+        context_mode: contextMode,
+        position
+      }
 
-        // Set up event listener BEFORE calling invoke
-        const unlisten = await setupTauriStreamListener(sessionId, {
-          tile_created: (data) => {
-            // Add tile to local state
-            if (currentSession.value && data.tile) {
-              currentSession.value.prompt_tiles.push(data.tile)
-            }
-          },
-          chunk: (data) => {
-            modelContent[data.model_id] = (modelContent[data.model_id] || '') + data.chunk
-            updateTileResponseLocal(data.tile_id, data.model_id, modelContent[data.model_id], 'streaming')
-          },
-          complete: (data) => {
-            updateTileResponseLocal(data.tile_id, data.model_id, modelContent[data.model_id], 'completed')
-            removeStreaming(data.model_id)
-          },
-          error: (data) => {
-            updateTileResponseLocal(data.tile_id, data.model_id, data.error, 'error')
-            removeStreaming(data.model_id)
-          },
-          session_saved: async () => {
-            await loadSession(sessionId)
+      // Set up event listener BEFORE calling invoke
+      const unlisten = await setupTauriStreamListener(sessionId, {
+        tile_created: (data) => {
+          if (currentSession.value && data.tile) {
+            currentSession.value.prompt_tiles.push(data.tile)
           }
-        })
-
-        try {
-          // invoke returns tile_id immediately; streaming happens via events
-          const tileId = await canvasApi.sendPrompt(sessionId, request)
-          // Wait briefly for streams to complete, then clean up
-          // The listener stays active until all models finish or timeout
-          await waitForModelsComplete(models, 120000)
-          return tileId
-        } finally {
-          unlisten()
+        },
+        chunk: (data) => {
+          modelContent[data.model_id] = (modelContent[data.model_id] || '') + data.chunk
+          updateTileResponseLocal(data.tile_id, data.model_id, modelContent[data.model_id], 'streaming')
+        },
+        complete: (data) => {
+          updateTileResponseLocal(data.tile_id, data.model_id, modelContent[data.model_id], 'completed')
+          removeStreaming(data.model_id)
+        },
+        error: (data) => {
+          updateTileResponseLocal(data.tile_id, data.model_id, data.error, 'error')
+          removeStreaming(data.model_id)
+        },
+        session_saved: async () => {
+          await loadSession(sessionId)
         }
-      } else {
-        // === Web path: HTTP SSE streaming (original behavior) ===
-        const response = await fetch(`/api/canvas/${sessionId}/prompt`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            prompt,
-            models,
-            system_prompt: systemPrompt,
-            temperature,
-            max_tokens: maxTokens,
-            parent_tile_id: parentTileId,
-            parent_model_id: parentModelId,
-            context_mode: contextMode,
-            position
-          })
-        })
+      })
 
-        if (!response.ok) {
-          throw new Error(`HTTP error: ${response.status}`)
-        }
-
-        return await processSSEStream(response, sessionId, models)
+      try {
+        // invoke returns tile_id immediately; streaming happens via events
+        const tileId = await canvasApi.sendPrompt(sessionId, request)
+        await waitForModelsComplete(models, 120000)
+        return tileId
+      } finally {
+        unlisten()
       }
     } catch (err) {
       error.value = err.message || 'Failed to send prompt'
@@ -298,63 +269,6 @@ export const useCanvasStore = defineStore('canvas', () => {
       }
       check()
     })
-  }
-
-  // Process HTTP SSE stream (for web mode)
-  async function processSSEStream(response, sessionId, models) {
-    const reader = response.body.getReader()
-    const decoder = new TextDecoder()
-
-    let tileId = null
-    const modelContent = {}
-    models.forEach(m => { modelContent[m] = '' })
-
-    while (true) {
-      const { done, value } = await reader.read()
-      if (done) break
-
-      const text = decoder.decode(value)
-      const lines = text.split('\n')
-
-      for (const line of lines) {
-        if (!line.startsWith('data: ')) continue
-        const data = line.slice(6)
-        if (data === '[DONE]') break
-
-        try {
-          const event = JSON.parse(data)
-
-          switch (event.type) {
-            case 'tile_created':
-              tileId = event.tile_id
-              break
-
-            case 'chunk':
-              modelContent[event.model_id] += event.chunk
-              updateTileResponseLocal(tileId, event.model_id, modelContent[event.model_id], 'streaming')
-              break
-
-            case 'complete':
-              updateTileResponseLocal(tileId, event.model_id, modelContent[event.model_id], 'completed')
-              removeStreaming(event.model_id)
-              break
-
-            case 'error':
-              updateTileResponseLocal(tileId, event.model_id, event.error, 'error')
-              removeStreaming(event.model_id)
-              break
-
-            case 'session_saved':
-              await loadSession(sessionId)
-              break
-          }
-        } catch (e) {
-          console.error('Failed to parse SSE event:', e)
-        }
-      }
-    }
-
-    return tileId
   }
 
   function updateTileResponseLocal(tileId, modelId, content, status) {
@@ -553,99 +467,77 @@ export const useCanvasStore = defineStore('canvas', () => {
     participatingModels.forEach(m => addStreaming(m))
 
     try {
-      if (isDesktopApp()) {
-        // === Tauri path ===
-        const request = {
-          source_tile_ids: tileIds,
-          participating_models: participatingModels,
-          debate_mode: mode,
-          max_rounds: maxRounds
-        }
+      const request = {
+        source_tile_ids: tileIds,
+        participating_models: participatingModels,
+        debate_mode: mode,
+        max_rounds: maxRounds
+      }
 
-        let debateCompleteResolve
-        const debateCompletePromise = new Promise(resolve => { debateCompleteResolve = resolve })
+      let debateCompleteResolve
+      const debateCompletePromise = new Promise(resolve => { debateCompleteResolve = resolve })
 
-        const unlisten = await setupTauriStreamListener(sessionId, {
-          debate_created: (data) => {
-            if (currentSession.value && data.debate) {
-              currentSession.value.debates.push(data.debate)
-            }
-          },
-          round_start: (data) => {
-            const debateId = data.debate_id
-            const existing = debateStreamingContent.value[debateId]
-            if (existing && Object.keys(existing.models).length > 0) {
-              // Snapshot current round into completedRounds
-              existing.completedRounds.push({
-                round_number: existing.currentRound,
-                models: { ...existing.models }
-              })
-            }
-            debateStreamingContent.value[debateId] = {
-              ...(existing || {}),
-              currentRound: data.round_number,
-              models: {},
-              completedRounds: existing?.completedRounds || []
-            }
-          },
-          debate_chunk: (data) => {
-            const state = debateStreamingContent.value[data.debate_id]
-            if (state && state.currentRound === data.round_number) {
-              state.models[data.model_id] = (state.models[data.model_id] || '') + data.chunk
-            }
-          },
-          model_complete: (data) => {
-            removeStreaming(data.model_id)
-          },
-          debate_error: (data) => {
-            console.error(`Debate error for ${data.model_id}:`, data.error)
-            removeStreaming(data.model_id)
-          },
-          debate_complete: async (data) => {
-            // Snapshot final round if it has content
-            const state = debateStreamingContent.value[data.debate_id]
-            if (state && Object.keys(state.models).length > 0) {
-              state.completedRounds.push({
-                round_number: state.currentRound,
-                models: { ...state.models }
-              })
-            }
-            delete debateStreamingContent.value[data.debate_id]
-            await loadSession(sessionId)
-            debateCompleteResolve()
+      const unlisten = await setupTauriStreamListener(sessionId, {
+        debate_created: (data) => {
+          if (currentSession.value && data.debate) {
+            currentSession.value.debates.push(data.debate)
           }
-        })
-
-        try {
-          const debateId = await canvasApi.startDebate(sessionId, request)
-          // Wait for debate_complete (the real end signal), not model_complete
-          // model_complete fires per-round, so polling streamingModels resolves too early
-          await Promise.race([
-            debateCompletePromise,
-            new Promise(resolve => setTimeout(resolve, 180000))
-          ])
-          return debateId
-        } finally {
-          unlisten()
+        },
+        round_start: (data) => {
+          const debateId = data.debate_id
+          const existing = debateStreamingContent.value[debateId]
+          if (existing && Object.keys(existing.models).length > 0) {
+            // Snapshot current round into completedRounds
+            existing.completedRounds.push({
+              round_number: existing.currentRound,
+              models: { ...existing.models }
+            })
+          }
+          debateStreamingContent.value[debateId] = {
+            ...(existing || {}),
+            currentRound: data.round_number,
+            models: {},
+            completedRounds: existing?.completedRounds || []
+          }
+        },
+        debate_chunk: (data) => {
+          const state = debateStreamingContent.value[data.debate_id]
+          if (state && state.currentRound === data.round_number) {
+            state.models[data.model_id] = (state.models[data.model_id] || '') + data.chunk
+          }
+        },
+        model_complete: (data) => {
+          removeStreaming(data.model_id)
+        },
+        debate_error: (data) => {
+          console.error(`Debate error for ${data.model_id}:`, data.error)
+          removeStreaming(data.model_id)
+        },
+        debate_complete: async (data) => {
+          // Snapshot final round if it has content
+          const state = debateStreamingContent.value[data.debate_id]
+          if (state && Object.keys(state.models).length > 0) {
+            state.completedRounds.push({
+              round_number: state.currentRound,
+              models: { ...state.models }
+            })
+          }
+          delete debateStreamingContent.value[data.debate_id]
+          await loadSession(sessionId)
+          debateCompleteResolve()
         }
-      } else {
-        // === Web path: HTTP SSE ===
-        const response = await fetch(`/api/canvas/${sessionId}/debate`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            source_tile_ids: tileIds,
-            participating_models: participatingModels,
-            debate_mode: mode,
-            max_rounds: maxRounds
-          })
-        })
+      })
 
-        if (!response.ok) {
-          throw new Error(`HTTP error: ${response.status}`)
-        }
-
-        return await processDebateSSEStream(response, sessionId, participatingModels)
+      try {
+        const debateId = await canvasApi.startDebate(sessionId, request)
+        // Wait for debate_complete (the real end signal), not model_complete
+        await Promise.race([
+          debateCompletePromise,
+          new Promise(resolve => setTimeout(resolve, 180000))
+        ])
+        return debateId
+      } finally {
+        unlisten()
       }
     } catch (err) {
       error.value = err.message || 'Failed to start debate'
@@ -654,88 +546,6 @@ export const useCanvasStore = defineStore('canvas', () => {
     } finally {
       participatingModels.forEach(m => removeStreaming(m))
     }
-  }
-
-  // Process debate SSE stream (web mode)
-  async function processDebateSSEStream(response, sessionId, participatingModels) {
-    const reader = response.body.getReader()
-    const decoder = new TextDecoder()
-
-    let debateId = null
-
-    while (true) {
-      const { done, value } = await reader.read()
-      if (done) break
-
-      const text = decoder.decode(value)
-      const lines = text.split('\n')
-
-      for (const line of lines) {
-        if (!line.startsWith('data: ')) continue
-        const data = line.slice(6)
-        if (data === '[DONE]') break
-
-        try {
-          const event = JSON.parse(data)
-
-          switch (event.type) {
-            case 'debate_created':
-              debateId = event.debate_id
-              break
-            case 'round_start': {
-              if (!debateId) break
-              const existing = debateStreamingContent.value[debateId]
-              if (existing && Object.keys(existing.models).length > 0) {
-                existing.completedRounds.push({
-                  round_number: existing.currentRound,
-                  models: { ...existing.models }
-                })
-              }
-              debateStreamingContent.value[debateId] = {
-                ...(existing || {}),
-                currentRound: event.round_number,
-                models: {},
-                completedRounds: existing?.completedRounds || []
-              }
-              break
-            }
-            case 'debate_chunk': {
-              if (!debateId) break
-              const state = debateStreamingContent.value[debateId]
-              if (state && state.currentRound === event.round_number) {
-                state.models[event.model_id] = (state.models[event.model_id] || '') + event.chunk
-              }
-              break
-            }
-            case 'model_complete':
-              removeStreaming(event.model_id)
-              break
-            case 'debate_error':
-              console.error(`Debate error for ${event.model_id}:`, event.error)
-              removeStreaming(event.model_id)
-              break
-            case 'debate_complete': {
-              if (debateId) {
-                const state = debateStreamingContent.value[debateId]
-                if (state && Object.keys(state.models).length > 0) {
-                  state.completedRounds.push({
-                    round_number: state.currentRound,
-                    models: { ...state.models }
-                  })
-                }
-                delete debateStreamingContent.value[debateId]
-              }
-              await loadSession(sessionId)
-              break
-            }
-          }
-        } catch (e) {
-          console.error('Failed to parse debate SSE event:', e)
-        }
-      }
-    }
-
-    return debateId
   }
 
   async function continueDebate(debateId, prompt) {
@@ -753,124 +563,53 @@ export const useCanvasStore = defineStore('canvas', () => {
     participatingModels.forEach(m => addStreaming(m))
 
     try {
-      if (isDesktopApp()) {
-        // === Tauri path ===
-        const request = { prompt }
+      const request = { prompt }
 
-        let debateCompleteResolve
-        const debateCompletePromise = new Promise(resolve => { debateCompleteResolve = resolve })
+      let debateCompleteResolve
+      const debateCompletePromise = new Promise(resolve => { debateCompleteResolve = resolve })
 
-        const unlisten = await setupTauriStreamListener(sessionId, {
-          round_start: (data) => {
-            debateStreamingContent.value[debateId] = {
-              currentRound: data.round_number,
-              models: {},
-              completedRounds: []
-            }
-          },
-          debate_chunk: (data) => {
-            const state = debateStreamingContent.value[data.debate_id]
-            if (state && state.currentRound === data.round_number) {
-              state.models[data.model_id] = (state.models[data.model_id] || '') + data.chunk
-            }
-          },
-          model_complete: (data) => {
-            removeStreaming(data.model_id)
-          },
-          debate_error: (data) => {
-            removeStreaming(data.model_id)
-          },
-          debate_complete: async (data) => {
-            const state = debateStreamingContent.value[data.debate_id]
-            if (state && Object.keys(state.models).length > 0) {
-              state.completedRounds.push({
-                round_number: state.currentRound,
-                models: { ...state.models }
-              })
-            }
-            delete debateStreamingContent.value[data.debate_id]
-            await loadSession(sessionId)
-            debateCompleteResolve()
+      const unlisten = await setupTauriStreamListener(sessionId, {
+        round_start: (data) => {
+          debateStreamingContent.value[debateId] = {
+            currentRound: data.round_number,
+            models: {},
+            completedRounds: []
           }
-        })
-
-        try {
-          await canvasApi.continueDebate(sessionId, debateId, request)
-          await Promise.race([
-            debateCompletePromise,
-            new Promise(resolve => setTimeout(resolve, 180000))
-          ])
-        } finally {
-          unlisten()
-        }
-      } else {
-        // === Web path ===
-        const response = await fetch(`/api/canvas/${sessionId}/debate/${debateId}/continue`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ prompt })
-        })
-
-        if (!response.ok) {
-          throw new Error(`HTTP error: ${response.status}`)
-        }
-
-        const reader = response.body.getReader()
-        const decoder = new TextDecoder()
-
-        while (true) {
-          const { done, value } = await reader.read()
-          if (done) break
-
-          const text = decoder.decode(value)
-          const lines = text.split('\n')
-
-          for (const line of lines) {
-            if (!line.startsWith('data: ')) continue
-            const data = line.slice(6)
-            if (data === '[DONE]') break
-
-            try {
-              const event = JSON.parse(data)
-              switch (event.type) {
-                case 'round_start':
-                  debateStreamingContent.value[debateId] = {
-                    currentRound: event.round_number,
-                    models: {},
-                    completedRounds: []
-                  }
-                  break
-                case 'debate_chunk': {
-                  const state = debateStreamingContent.value[debateId]
-                  if (state && state.currentRound === event.round_number) {
-                    state.models[event.model_id] = (state.models[event.model_id] || '') + event.chunk
-                  }
-                  break
-                }
-                case 'model_complete':
-                  removeStreaming(event.model_id)
-                  break
-                case 'round_complete':
-                case 'debate_complete': {
-                  const state = debateStreamingContent.value[debateId]
-                  if (state && Object.keys(state.models).length > 0) {
-                    state.completedRounds.push({
-                      round_number: state.currentRound,
-                      models: { ...state.models }
-                    })
-                  }
-                  if (event.type === 'debate_complete') {
-                    delete debateStreamingContent.value[debateId]
-                  }
-                  await loadSession(sessionId)
-                  break
-                }
-              }
-            } catch (e) {
-              console.error('Failed to parse continue debate SSE event:', e)
-            }
+        },
+        debate_chunk: (data) => {
+          const state = debateStreamingContent.value[data.debate_id]
+          if (state && state.currentRound === data.round_number) {
+            state.models[data.model_id] = (state.models[data.model_id] || '') + data.chunk
           }
+        },
+        model_complete: (data) => {
+          removeStreaming(data.model_id)
+        },
+        debate_error: (data) => {
+          removeStreaming(data.model_id)
+        },
+        debate_complete: async (data) => {
+          const state = debateStreamingContent.value[data.debate_id]
+          if (state && Object.keys(state.models).length > 0) {
+            state.completedRounds.push({
+              round_number: state.currentRound,
+              models: { ...state.models }
+            })
+          }
+          delete debateStreamingContent.value[data.debate_id]
+          await loadSession(sessionId)
+          debateCompleteResolve()
         }
+      })
+
+      try {
+        await canvasApi.continueDebate(sessionId, debateId, request)
+        await Promise.race([
+          debateCompletePromise,
+          new Promise(resolve => setTimeout(resolve, 180000))
+        ])
+      } finally {
+        unlisten()
       }
     } catch (err) {
       error.value = err.message || 'Failed to continue debate'
@@ -901,6 +640,124 @@ export const useCanvasStore = defineStore('canvas', () => {
       error.value = err.message || 'Failed to export to note'
       console.error('Failed to export canvas to note:', err)
       throw err
+    }
+  }
+
+  // Add new models to an existing tile (same prompt, different models)
+  async function addModelToTile(tileId, newModelIds) {
+    if (!currentSession.value) {
+      throw new Error('No active session')
+    }
+
+    const tile = currentSession.value.prompt_tiles.find(t => t.id === tileId)
+    if (!tile) {
+      throw new Error('Tile not found')
+    }
+
+    const sessionId = currentSession.value.id
+    error.value = null
+
+    // Mark new models as streaming
+    newModelIds.forEach(m => addStreaming(m))
+
+    try {
+      const modelContent = {}
+      newModelIds.forEach(m => { modelContent[m] = '' })
+
+      const request = { model_ids: newModelIds }
+
+      const unlisten = await setupTauriStreamListener(sessionId, {
+        chunk: (data) => {
+          modelContent[data.model_id] = (modelContent[data.model_id] || '') + data.chunk
+          updateTileResponseLocal(tileId, data.model_id, modelContent[data.model_id], 'streaming')
+        },
+        complete: (data) => {
+          updateTileResponseLocal(tileId, data.model_id, modelContent[data.model_id], 'completed')
+          removeStreaming(data.model_id)
+        },
+        error: (data) => {
+          updateTileResponseLocal(tileId, data.model_id, data.error, 'error')
+          removeStreaming(data.model_id)
+        },
+        session_saved: async () => {
+          await loadSession(sessionId)
+        }
+      })
+
+      try {
+        await canvasApi.addModelsToTile(sessionId, tileId, request)
+        await waitForModelsComplete(newModelIds, 120000)
+      } finally {
+        unlisten()
+      }
+    } catch (err) {
+      error.value = err.message || 'Failed to add models'
+      console.error('Failed to add models to tile:', err)
+      throw err
+    } finally {
+      newModelIds.forEach(m => removeStreaming(m))
+    }
+  }
+
+  // Regenerate response for a specific model
+  async function regenerateResponse(tileId, modelId) {
+    if (!currentSession.value) {
+      throw new Error('No active session')
+    }
+
+    const tile = currentSession.value.prompt_tiles.find(t => t.id === tileId)
+    if (!tile || !tile.responses[modelId]) {
+      throw new Error('Response not found')
+    }
+
+    const sessionId = currentSession.value.id
+    error.value = null
+
+    // Mark model as streaming
+    addStreaming(modelId)
+
+    // Clear existing content
+    updateTileResponseLocal(tileId, modelId, '', 'streaming')
+
+    try {
+      let content = ''
+
+      const unlisten = await setupTauriStreamListener(sessionId, {
+        chunk: (data) => {
+          if (data.model_id === modelId) {
+            content += data.chunk
+            updateTileResponseLocal(tileId, modelId, content, 'streaming')
+          }
+        },
+        complete: (data) => {
+          if (data.model_id === modelId) {
+            updateTileResponseLocal(tileId, modelId, content, 'completed')
+            removeStreaming(modelId)
+          }
+        },
+        error: (data) => {
+          if (data.model_id === modelId) {
+            updateTileResponseLocal(tileId, modelId, data.error, 'error')
+            removeStreaming(modelId)
+          }
+        },
+        session_saved: async () => {
+          await loadSession(sessionId)
+        }
+      })
+
+      try {
+        await canvasApi.regenerateResponse(sessionId, tileId, modelId)
+        await waitForModelsComplete([modelId], 120000)
+      } finally {
+        unlisten()
+      }
+    } catch (err) {
+      error.value = err.message || 'Failed to regenerate response'
+      console.error('Failed to regenerate response:', err)
+      throw err
+    } finally {
+      removeStreaming(modelId)
     }
   }
 
@@ -939,236 +796,6 @@ export const useCanvasStore = defineStore('canvas', () => {
   // Branch from a specific model response
   async function branchFromResponse(parentTileId, parentModelId, newPrompt, models, systemPrompt = null, temperature = 0.7, maxTokens = 2048, contextMode = 'full_history') {
     return sendPrompt(newPrompt, models, systemPrompt, temperature, maxTokens, parentTileId, parentModelId, contextMode)
-  }
-
-  // Add new models to an existing tile (same prompt, different models)
-  async function addModelToTile(tileId, newModelIds) {
-    if (!currentSession.value) {
-      throw new Error('No active session')
-    }
-
-    const tile = currentSession.value.prompt_tiles.find(t => t.id === tileId)
-    if (!tile) {
-      throw new Error('Tile not found')
-    }
-
-    const sessionId = currentSession.value.id
-    error.value = null
-
-    // Mark new models as streaming
-    newModelIds.forEach(m => addStreaming(m))
-
-    try {
-      if (isDesktopApp()) {
-        // === Tauri path ===
-        const modelContent = {}
-        newModelIds.forEach(m => { modelContent[m] = '' })
-
-        const request = { model_ids: newModelIds }
-
-        const unlisten = await setupTauriStreamListener(sessionId, {
-          chunk: (data) => {
-            modelContent[data.model_id] = (modelContent[data.model_id] || '') + data.chunk
-            updateTileResponseLocal(tileId, data.model_id, modelContent[data.model_id], 'streaming')
-          },
-          complete: (data) => {
-            updateTileResponseLocal(tileId, data.model_id, modelContent[data.model_id], 'completed')
-            removeStreaming(data.model_id)
-          },
-          error: (data) => {
-            updateTileResponseLocal(tileId, data.model_id, data.error, 'error')
-            removeStreaming(data.model_id)
-          },
-          session_saved: async () => {
-            await loadSession(sessionId)
-          }
-        })
-
-        try {
-          await canvasApi.addModelsToTile(sessionId, tileId, request)
-          await waitForModelsComplete(newModelIds, 120000)
-        } finally {
-          unlisten()
-        }
-      } else {
-        // === Web path ===
-        const response = await fetch(`/api/canvas/${sessionId}/tile/${tileId}/add-models`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ model_ids: newModelIds })
-        })
-
-        if (!response.ok) {
-          throw new Error(`HTTP error: ${response.status}`)
-        }
-
-        const reader = response.body.getReader()
-        const decoder = new TextDecoder()
-        const modelContent = {}
-        newModelIds.forEach(m => { modelContent[m] = '' })
-
-        while (true) {
-          const { done, value } = await reader.read()
-          if (done) break
-
-          const text = decoder.decode(value)
-          const lines = text.split('\n')
-
-          for (const line of lines) {
-            if (!line.startsWith('data: ')) continue
-            const data = line.slice(6)
-            if (data === '[DONE]') break
-
-            try {
-              const event = JSON.parse(data)
-
-              switch (event.type) {
-                case 'chunk':
-                  modelContent[event.model_id] += event.chunk
-                  updateTileResponseLocal(tileId, event.model_id, modelContent[event.model_id], 'streaming')
-                  break
-                case 'complete':
-                  updateTileResponseLocal(tileId, event.model_id, modelContent[event.model_id], 'completed')
-                  removeStreaming(event.model_id)
-                  break
-                case 'error':
-                  updateTileResponseLocal(tileId, event.model_id, event.error, 'error')
-                  removeStreaming(event.model_id)
-                  break
-                case 'session_saved':
-                  await loadSession(sessionId)
-                  break
-              }
-            } catch (e) {
-              console.error('Failed to parse SSE event:', e)
-            }
-          }
-        }
-      }
-    } catch (err) {
-      error.value = err.message || 'Failed to add models'
-      console.error('Failed to add models to tile:', err)
-      throw err
-    } finally {
-      newModelIds.forEach(m => removeStreaming(m))
-    }
-  }
-
-  // Regenerate response for a specific model
-  async function regenerateResponse(tileId, modelId) {
-    if (!currentSession.value) {
-      throw new Error('No active session')
-    }
-
-    const tile = currentSession.value.prompt_tiles.find(t => t.id === tileId)
-    if (!tile || !tile.responses[modelId]) {
-      throw new Error('Response not found')
-    }
-
-    const sessionId = currentSession.value.id
-    error.value = null
-
-    // Mark model as streaming
-    addStreaming(modelId)
-
-    // Clear existing content
-    updateTileResponseLocal(tileId, modelId, '', 'streaming')
-
-    try {
-      if (isDesktopApp()) {
-        // === Tauri path ===
-        let content = ''
-
-        const unlisten = await setupTauriStreamListener(sessionId, {
-          chunk: (data) => {
-            if (data.model_id === modelId) {
-              content += data.chunk
-              updateTileResponseLocal(tileId, modelId, content, 'streaming')
-            }
-          },
-          complete: (data) => {
-            if (data.model_id === modelId) {
-              updateTileResponseLocal(tileId, modelId, content, 'completed')
-              removeStreaming(modelId)
-            }
-          },
-          error: (data) => {
-            if (data.model_id === modelId) {
-              updateTileResponseLocal(tileId, modelId, data.error, 'error')
-              removeStreaming(modelId)
-            }
-          },
-          session_saved: async () => {
-            await loadSession(sessionId)
-          }
-        })
-
-        try {
-          await canvasApi.regenerateResponse(sessionId, tileId, modelId)
-          await waitForModelsComplete([modelId], 120000)
-        } finally {
-          unlisten()
-        }
-      } else {
-        // === Web path ===
-        const response = await fetch(`/api/canvas/${sessionId}/tile/${tileId}/regenerate/${encodeURIComponent(modelId)}`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' }
-        })
-
-        if (!response.ok) {
-          throw new Error(`HTTP error: ${response.status}`)
-        }
-
-        const reader = response.body.getReader()
-        const decoder = new TextDecoder()
-        let content = ''
-
-        while (true) {
-          const { done, value } = await reader.read()
-          if (done) break
-
-          const text = decoder.decode(value)
-          const lines = text.split('\n')
-
-          for (const line of lines) {
-            if (!line.startsWith('data: ')) continue
-            const data = line.slice(6)
-            if (data === '[DONE]') break
-
-            try {
-              const event = JSON.parse(data)
-
-              switch (event.type) {
-                case 'chunk':
-                  content += event.chunk
-                  updateTileResponseLocal(tileId, modelId, content, 'streaming')
-                  break
-                case 'complete':
-                  updateTileResponseLocal(tileId, modelId, content, 'completed')
-                  removeStreaming(modelId)
-                  break
-                case 'error':
-                  updateTileResponseLocal(tileId, modelId, event.error, 'error')
-                  removeStreaming(modelId)
-                  break
-                case 'session_saved':
-                  await loadSession(sessionId)
-                  break
-              }
-            } catch (e) {
-              console.error('Failed to parse SSE event:', e)
-            }
-          }
-        }
-      }
-    } catch (err) {
-      error.value = err.message || 'Failed to regenerate response'
-      console.error('Failed to regenerate response:', err)
-      throw err
-    } finally {
-      removeStreaming(modelId)
-    }
   }
 
   return {

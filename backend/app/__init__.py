@@ -1,1 +1,0 @@
-"""Grafyn Backend Application"""
