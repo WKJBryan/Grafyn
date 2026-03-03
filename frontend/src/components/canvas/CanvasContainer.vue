@@ -398,9 +398,6 @@ const availableModels = computed(() => canvasStore.availableModels)
 const loading = computed(() => canvasStore.loading)
 const streamingModels = computed(() => canvasStore.streamingModels)
 const debateStreamingContent = computed(() => canvasStore.debateStreamingContent)
-const tileEdges = computed(() => canvasStore.tileEdges)
-const debateEdges = computed(() => canvasStore.debateEdges)
-
 // Flatten all LLM responses into individual node objects
 const llmNodes = computed(() => {
   const nodes = []
@@ -536,8 +533,6 @@ const transformStyle = computed(() => ({
 
 // Minimap scale (canvas is max ~5000x5000, minimap is 150x100)
 const MINIMAP_SCALE = 0.02
-const MINIMAP_WIDTH = 150
-const MINIMAP_HEIGHT = 100
 
 function minimapPromptStyle(tile) {
   return {
@@ -1005,7 +1000,7 @@ async function handleAutoArrange(algorithm = 'hierarchical') {
       
       const rootTiles = promptTiles.value.filter(t => !t.parent_tile_id)
       
-      function layoutPromptTree(tile, startX, startY) {
+      const layoutPromptTree = (tile, startX, startY) => {
         let treeHeight = 0
         let currentY = startY
         
@@ -1022,7 +1017,7 @@ async function handleAutoArrange(algorithm = 'hierarchical') {
         if (responses.length === 0) {
           treeHeight = PROMPT_HEIGHT
         } else {
-          for (const [modelId, response] of responses) {
+          for (const [modelId, _response] of responses) {
             positions[`llm:${tile.id}:${modelId}`] = {
               x: llmX,
               y: currentY,
@@ -1191,7 +1186,7 @@ async function handleAutoArrange(algorithm = 'hierarchical') {
           height: PROMPT_HEIGHT
         })
         
-        for (const [modelId, response] of Object.entries(tile.responses || {})) {
+        for (const [modelId, _response] of Object.entries(tile.responses || {})) {
           nodes.push({
             id: `llm:${tile.id}:${modelId}`,
             width: LLM_WIDTH,

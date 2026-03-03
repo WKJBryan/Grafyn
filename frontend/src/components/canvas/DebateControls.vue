@@ -70,7 +70,7 @@
 </template>
 
 <script setup>
-import { ref, watch } from 'vue'
+import { ref } from 'vue'
 
 const props = defineProps({
   debate: {
@@ -84,11 +84,6 @@ const emit = defineEmits(['continue', 'pause', 'resume', 'end'])
 // Local state
 const localMode = ref(props.debate.debate_mode || 'auto')
 const customPrompt = ref('')
-
-// Watch for mode changes
-watch(localMode, (newMode) => {
-  // Could emit mode change event if needed
-})
 
 // Methods
 function handleContinue() {

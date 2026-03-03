@@ -104,8 +104,8 @@ let simulation = null
 let svg = null
 let zoom = null
 let zoomGroup = null
-let width = 800
-let height = 600
+let canvasWidth = 800
+let canvasHeight = 600
 let currentZoomLevel = 1
 
 // Graph data
@@ -145,8 +145,8 @@ onMounted(() => {
   const resizeObserver = new ResizeObserver(entries => {
     for (const entry of entries) {
       if (entry.contentRect.width > 0 && entry.contentRect.height > 0) {
-        width = entry.contentRect.width
-        height = entry.contentRect.height
+        canvasWidth = entry.contentRect.width
+        canvasHeight = entry.contentRect.height
         updateDimensions()
       }
     }
@@ -226,7 +226,7 @@ function initGraph() {
     .append('svg')
     .attr('width', '100%')
     .attr('height', '100%')
-    .attr('viewBox', [0, 0, width, height])
+    .attr('viewBox', [0, 0, canvasWidth, canvasHeight])
   
   // Add arrow marker definition
   const defs = svg.append('defs')
@@ -260,8 +260,8 @@ function initGraph() {
   simulation = forceSimulation(nodes)
     .force('link', forceLink(links).id(d => d.id).distance(currentForces.value.distance).strength(currentForces.value.link))
     .force('charge', forceManyBody().strength(currentForces.value.repel))
-    .force('x', forceX(width / 2).strength(currentForces.value.center))
-    .force('y', forceY(height / 2).strength(currentForces.value.center))
+    .force('x', forceX(canvasWidth / 2).strength(currentForces.value.center))
+    .force('y', forceY(canvasHeight / 2).strength(currentForces.value.center))
     .force('collide', forceCollide(30).strength(0.7))
     
   // Draw lines
@@ -346,7 +346,7 @@ function updateTextOpacity() {
 
 function updateDimensions() {
   if (simulation) {
-    simulation.force('center', forceCenter(width / 2, height / 2).strength(currentForces.value.center))
+    simulation.force('center', forceCenter(canvasWidth / 2, canvasHeight / 2).strength(currentForces.value.center))
     simulation.alpha(0.3).restart()
   }
 }
@@ -409,8 +409,8 @@ function handleForcesUpdate(forces) {
 function restartSimulation() {
   if (simulation) {
     // Reset all nodes to center of the graph
-    const centerX = width / 2
-    const centerY = height / 2
+    const centerX = canvasWidth / 2
+    const centerY = canvasHeight / 2
     
     nodes.forEach(node => {
       // Reset position to center with some random spread

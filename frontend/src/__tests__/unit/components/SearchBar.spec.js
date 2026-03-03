@@ -181,7 +181,7 @@ describe('SearchBar', () => {
 
     it('handles search errors gracefully', async () => {
       const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
-      const mockSearch = vi
+      vi
         .spyOn(apiClient.memory, 'recall')
         .mockRejectedValue(new Error('Search failed'))
 

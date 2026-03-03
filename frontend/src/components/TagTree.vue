@@ -53,7 +53,7 @@
 </template>
 
 <script setup>
-import { ref, computed, watch, onMounted, defineAsyncComponent } from 'vue'
+import { ref, computed, defineAsyncComponent } from 'vue'
 
 // Self-referencing component for recursive tree rendering
 const TagTreeNode = defineAsyncComponent(() => import('./TagTreeNode.vue'))
