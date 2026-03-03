@@ -34,7 +34,9 @@
       <div
         v-if="isStreaming"
         class="response-text streaming-text"
-      >{{ response.content }}</div>
+      >
+        {{ response.content }}
+      </div>
       <div
         v-else-if="isCompleted"
         class="response-text"

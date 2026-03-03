@@ -315,7 +315,7 @@ function getAtomicsFor(containerNote) {
     const atomicTitle = atomic.title?.toLowerCase() || ''
     if (containerNote.source === 'canvas' || containerNote.title?.startsWith('Canvas:')) {
       // Check if atomic mentions key parts of the canvas title
-      const titleParts = containerTitleClean.split(/[\s\/]+/).filter(w => w.length > 2)
+      const titleParts = containerTitleClean.split(/[\s/]+/).filter(w => w.length > 2)
       if (titleParts.length > 0 && titleParts.some(part => atomicTitle.includes(part))) {
         return true
       }

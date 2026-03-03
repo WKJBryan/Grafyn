@@ -191,7 +191,7 @@ const newSessionDescription = ref('')
 const showSettingsModal = ref(false)
 const showDeleteConfirm = ref(false)
 const pendingDeleteSessionId = ref(null)
-const isDesktop = isDesktopApp()
+const _isDesktop = isDesktopApp()
 
 // Computed property to get the current theme icon
 const themeIcon = computed(() => {
@@ -265,7 +265,7 @@ async function confirmDeleteSession() {
   }
 }
 
-function onSessionLoaded(session) {
+function onSessionLoaded(_session) {
   // Could update page title, etc.
 }
 

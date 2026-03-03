@@ -32,7 +32,7 @@ export const graph = {
 
   outgoing: (id) => invoke('get_outgoing', { noteId: id }),
 
-  neighbors: (id, depth = 1) => invoke('get_neighbors', { noteId: id }),
+  neighbors: (id) => invoke('get_neighbors', { noteId: id }),
 
   rebuild: () => invoke('rebuild_graph', {}),
 

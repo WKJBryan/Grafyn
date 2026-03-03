@@ -85,7 +85,7 @@ afterAll(() => {
 /**
  * Create a fresh Pinia instance for testing
  */
-export function createTestingPinia(options = {}) {
+export function createTestingPinia(_options = {}) {
   const pinia = createPinia()
   setActivePinia(pinia)
   return pinia
@@ -246,23 +246,23 @@ export const mockApiHandlers = {
       ? Promise.resolve({ data: { ...note, ...data } })
       : Promise.reject({ response: { status: 404 } })
   },
-  deleteNote: (id) => Promise.resolve({ data: null }),
+  deleteNote: (_id) => Promise.resolve({ data: null }),
 
   // Search API
-  search: (query) => Promise.resolve({ data: mockSearchResults }),
+  search: (_query) => Promise.resolve({ data: mockSearchResults }),
 
   // Graph API
-  getBacklinks: (id) => Promise.resolve({ data: mockBacklinks }),
-  getOutgoing: (id) => Promise.resolve({ data: [] }),
+  getBacklinks: (_id) => Promise.resolve({ data: mockBacklinks }),
+  getOutgoing: (_id) => Promise.resolve({ data: [] }),
 
   // Auth API
-  getAuthUrl: (provider) =>
+  getAuthUrl: (_provider) =>
     Promise.resolve({
       data: {
         authorization_url: `https://github.com/login/oauth/authorize?client_id=test&state=test_state`,
       },
     }),
-  exchangeCode: (provider, code) =>
+  exchangeCode: (_provider, _code) =>
     Promise.resolve({
       data: {
         access_token: mockAuthToken,

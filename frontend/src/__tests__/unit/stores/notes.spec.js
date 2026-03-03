@@ -193,7 +193,7 @@ describe('Notes Store', () => {
     })
 
     it('sets error message on failure', async () => {
-      const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+      vi.spyOn(console, 'error').mockImplementation(() => {})
       vi.spyOn(apiClient.notes, 'list').mockRejectedValue(
         new Error('Network error')
       )

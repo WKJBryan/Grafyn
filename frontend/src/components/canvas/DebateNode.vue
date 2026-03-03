@@ -181,9 +181,6 @@ const emit = defineEmits(['drag', 'delete', 'expand', 'collapse', 'continue'])
 const isDragging = ref(false)
 const dragStart = ref({ x: 0, y: 0, nodeX: 0, nodeY: 0 })
 
-// Local expanded state (if not controlled by parent)
-const localExpanded = ref(false)
-
 // Computed
 const isActive = computed(() => props.debate.status === 'active')
 

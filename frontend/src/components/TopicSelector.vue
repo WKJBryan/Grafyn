@@ -99,7 +99,7 @@
 <script setup>
 import { ref, computed } from 'vue'
 
-const props = defineProps({
+defineProps({
   existingTopics: {
     type: Array,
     default: () => []
