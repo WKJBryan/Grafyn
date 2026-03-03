@@ -2,7 +2,7 @@ use crate::models::memory::{ExtractRequest, ExtractedClaim, Contradiction, Recal
 use crate::AppState;
 use tauri::State;
 
-/// Recall relevant notes with graph-aware boosting
+/// Recall relevant notes using the temporal + graph-aware retrieval pipeline
 #[tauri::command]
 pub async fn recall_relevant(
     request: RecallRequest,
@@ -10,14 +10,31 @@ pub async fn recall_relevant(
 ) -> Result<Vec<RecallResult>, String> {
     let search = state.search_service.read().await;
     let graph = state.graph_index.read().await;
+    let priority = state.priority_service.read().await;
+    let retrieval = state.retrieval_service.read().await;
 
-    state.memory_service.recall_relevant(
+    let results = retrieval.retrieve(
         &search,
         &graph,
+        &priority,
         &request.query,
-        &request.context_note_ids,
         request.limit,
-    )
+        &request.context_note_ids,
+    )?;
+
+    // Convert RetrievalResult → RecallResult
+    Ok(results
+        .into_iter()
+        .map(|r| RecallResult {
+            note_id: r.note.id,
+            title: r.note.title,
+            snippet: r.snippet,
+            score: r.score,
+            tags: r.note.tags,
+            graph_boost: 0.0, // now integrated into the composite score
+            total_score: r.score,
+        })
+        .collect())
 }
 
 /// Find contradictions for a note

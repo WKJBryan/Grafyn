@@ -12,6 +12,8 @@ use services::{
     knowledge_store::KnowledgeStore,
     memory::MemoryService,
     openrouter::OpenRouterService,
+    priority::PriorityScoringService,
+    retrieval::RetrievalService,
     search::SearchService,
     settings::SettingsService,
 };
@@ -28,6 +30,8 @@ pub struct AppState {
     pub openrouter: Arc<RwLock<OpenRouterService>>,
     pub feedback_service: Arc<RwLock<FeedbackService>>,
     pub settings_service: Arc<RwLock<SettingsService>>,
+    pub priority_service: Arc<RwLock<PriorityScoringService>>,
+    pub retrieval_service: Arc<RwLock<RetrievalService>>,
     /// MemoryService is stateless — no lock needed, just Arc for shared ownership
     pub memory_service: Arc<MemoryService>,
 }
@@ -90,6 +94,12 @@ fn main() {
                 .unwrap_or_default();
             let openrouter = OpenRouterService::new(api_key);
 
+            // Initialize priority scoring service
+            let priority_service = PriorityScoringService::new(data_path.clone());
+
+            // Initialize retrieval service
+            let retrieval_service = RetrievalService::new(data_path.clone());
+
             // Initialize feedback service with compile-time credentials
             // These are embedded during build so users don't need to configure anything
             let feedback_service = FeedbackService::new_with_credentials(
@@ -141,6 +151,8 @@ fn main() {
                 openrouter: Arc::new(RwLock::new(openrouter)),
                 feedback_service: Arc::new(RwLock::new(feedback_service)),
                 settings_service: Arc::new(RwLock::new(settings_service)),
+                priority_service: Arc::new(RwLock::new(priority_service)),
+                retrieval_service: Arc::new(RwLock::new(retrieval_service)),
                 memory_service: Arc::new(MemoryService::new()),
             };
 
@@ -210,11 +222,25 @@ fn main() {
             commands::memory::recall_relevant,
             commands::memory::find_contradictions,
             commands::memory::extract_claims,
+            // Priority commands
+            commands::priority::get_priority_settings,
+            commands::priority::update_priority_settings,
+            commands::priority::reset_priority_settings,
             // Zettelkasten commands
             commands::zettelkasten::discover_links,
             commands::zettelkasten::apply_links,
             commands::zettelkasten::create_link,
             commands::zettelkasten::get_link_types,
+            // Import commands
+            commands::import::preview_import,
+            commands::import::apply_import,
+            commands::import::get_supported_formats,
+            // Retrieval commands
+            commands::retrieval::retrieve_relevant,
+            commands::retrieval::get_retrieval_config,
+            commands::retrieval::update_retrieval_config,
+            // Chat commands
+            commands::chat::chat_send,
         ])
         .run(tauri::generate_context!())
         .unwrap_or_else(|e| {

@@ -1,697 +1,400 @@
 /**
- * Unit tests for API client
+ * Unit tests for Tauri-only API client
  *
  * Tests cover:
- * - Axios instance configuration
- * - Request interceptor (adds auth token from localStorage)
- * - Response interceptor (extracts data, handles 401)
- * - Notes API methods (list, get, create, update, delete, reindex)
+ * - Notes API methods (list, get, create, update, delete, reindex, distill, normalizeTags)
  * - Search API methods (query, similar)
- * - Graph API methods (backlinks, outgoing, neighbors, unlinkedMentions, rebuild)
- * - OAuth API methods (getAuthorizationUrl, exchangeCode, getUser, logout)
- * - URL encoding for note IDs with special characters
- * - Error handling
+ * - Graph API methods (backlinks, outgoing, neighbors, rebuild, full, unlinked)
+ * - Canvas API methods (list, get, create, update, delete, getModels, sendPrompt, etc.)
+ * - Feedback API methods (submit, status, getSystemInfo, getPending, retryPending)
+ * - Settings API methods (get, getStatus, update, completeSetup, pickVaultFolder, etc.)
+ * - MCP API methods (getStatus, getConfigSnippet)
+ * - Memory API methods (recall, contradictions, extract)
+ * - Zettelkasten API methods (discoverLinks, applyLinks, createLink, getLinkTypes)
+ * - isDesktopApp always returns true
  */
 
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import axios from 'axios'
+import { describe, it, expect, vi, beforeEach } from 'vitest'
 
-// Mock axios before importing the client
-vi.mock('axios', () => {
-  const mockAxiosInstance = {
-    get: vi.fn(),
-    post: vi.fn(),
-    put: vi.fn(),
-    delete: vi.fn(),
-    interceptors: {
-      request: {
-        use: vi.fn(),
-      },
-      response: {
-        use: vi.fn(),
-      },
-    },
-  }
+// vi.hoisted ensures mockInvoke is declared before vi.mock's hoisted factory runs
+const { mockInvoke } = vi.hoisted(() => ({ mockInvoke: vi.fn() }))
+vi.mock('@tauri-apps/api/tauri', () => ({
+  invoke: mockInvoke,
+}))
 
-  return {
-    default: {
-      create: vi.fn(() => mockAxiosInstance),
-    },
-  }
-})
+import {
+  notes,
+  search,
+  graph,
+  canvas,
+  feedback,
+  settings,
+  mcp,
+  memory,
+  zettelkasten,
+  isDesktopApp,
+} from '@/api/client'
 
-describe('API Client', () => {
-  let mockAxiosInstance
-  let requestInterceptor
-  let responseSuccessInterceptor
-  let responseErrorInterceptor
-  let localStorageMock
-
-  beforeEach(async () => {
-    vi.clearAllMocks()
-
-    // Setup localStorage mock
-    localStorageMock = {
-      getItem: vi.fn((key) => localStorageMock._storage[key] || null),
-      setItem: vi.fn((key, value) => {
-        localStorageMock._storage[key] = value
-      }),
-      removeItem: vi.fn((key) => {
-        delete localStorageMock._storage[key]
-      }),
-      _storage: {},
-    }
-    global.localStorage = localStorageMock
-
-    // Mock window.location
-    delete window.location
-    window.location = { href: '' }
-
-    // Get the mock axios instance
-    mockAxiosInstance = axios.create()
-
-    // Capture interceptors
-    mockAxiosInstance.interceptors.request.use.mockImplementation((fn) => {
-      requestInterceptor = fn
-    })
-    mockAxiosInstance.interceptors.response.use.mockImplementation(
-      (successFn, errorFn) => {
-        responseSuccessInterceptor = successFn
-        responseErrorInterceptor = errorFn
-      }
-    )
-
-    // Re-import the module to trigger interceptor setup
-    vi.resetModules()
-    await import('@/api/client')
+describe('API Client (Tauri)', () => {
+  beforeEach(() => {
+    mockInvoke.mockReset()
   })
 
-  afterEach(() => {
-    vi.resetModules()
-  })
-
-  // ============================================================================
-  // Axios Instance Configuration Tests
-  // ============================================================================
-
-  describe('Axios Instance Configuration', () => {
-    it('creates axios instance with correct base configuration', async () => {
-      vi.resetModules()
-      await import('@/api/client')
-
-      expect(axios.create).toHaveBeenCalledWith({
-        baseURL: '/api',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-      })
+  describe('isDesktopApp', () => {
+    it('always returns true', () => {
+      expect(isDesktopApp()).toBe(true)
     })
   })
 
   // ============================================================================
-  // Request Interceptor Tests
-  // ============================================================================
-
-  describe('Request Interceptor', () => {
-    it('adds Authorization header when token exists', async () => {
-      localStorageMock._storage['auth_token'] = 'test-bearer-token'
-
-      const config = { headers: {} }
-      const result = requestInterceptor(config)
-
-      expect(result.headers.Authorization).toBe('Bearer test-bearer-token')
-    })
-
-    it('does not add Authorization header when no token', async () => {
-      const config = { headers: {} }
-      const result = requestInterceptor(config)
-
-      expect(result.headers.Authorization).toBeUndefined()
-    })
-
-    it('preserves existing config properties', async () => {
-      localStorageMock._storage['auth_token'] = 'token'
-
-      const config = {
-        headers: { 'X-Custom': 'value' },
-        params: { key: 'value' },
-        data: { foo: 'bar' },
-      }
-      const result = requestInterceptor(config)
-
-      expect(result.headers['X-Custom']).toBe('value')
-      expect(result.params).toEqual({ key: 'value' })
-      expect(result.data).toEqual({ foo: 'bar' })
-    })
-  })
-
-  // ============================================================================
-  // Response Interceptor Tests
-  // ============================================================================
-
-  describe('Response Interceptor', () => {
-    it('extracts data from successful response', () => {
-      const response = {
-        data: { notes: [{ id: '1', title: 'Test' }] },
-        status: 200,
-      }
-
-      const result = responseSuccessInterceptor(response)
-
-      expect(result).toEqual({ notes: [{ id: '1', title: 'Test' }] })
-    })
-
-    it('handles 401 error by clearing token and redirecting', async () => {
-      localStorageMock._storage['auth_token'] = 'invalid-token'
-
-      const error = {
-        response: { status: 401 },
-      }
-
-      await expect(responseErrorInterceptor(error)).rejects.toEqual(error)
-
-      expect(localStorageMock.removeItem).toHaveBeenCalledWith('auth_token')
-      expect(window.location.href).toBe('/login')
-    })
-
-    it('passes through non-401 errors', async () => {
-      const error = {
-        response: { status: 500, data: { message: 'Server error' } },
-      }
-
-      await expect(responseErrorInterceptor(error)).rejects.toEqual(error)
-
-      expect(localStorageMock.removeItem).not.toHaveBeenCalled()
-      expect(window.location.href).toBe('')
-    })
-
-    it('handles network errors without response', async () => {
-      const error = new Error('Network Error')
-
-      await expect(responseErrorInterceptor(error)).rejects.toEqual(error)
-
-      expect(localStorageMock.removeItem).not.toHaveBeenCalled()
-    })
-  })
-
-  // ============================================================================
-  // Notes API Tests
+  // Notes API
   // ============================================================================
 
   describe('Notes API', () => {
-    let notes
-
-    beforeEach(async () => {
-      vi.resetModules()
-      const client = await import('@/api/client')
-      notes = client.notes
+    it('list() invokes list_notes', async () => {
+      mockInvoke.mockResolvedValue([{ id: '1', title: 'Test' }])
+      const result = await notes.list()
+      expect(mockInvoke).toHaveBeenCalledWith('list_notes', {})
+      expect(result).toEqual([{ id: '1', title: 'Test' }])
     })
 
-    it('list() calls GET /notes', async () => {
-      mockAxiosInstance.get.mockResolvedValue([{ id: '1', title: 'Test' }])
-
-      await notes.list()
-
-      expect(mockAxiosInstance.get).toHaveBeenCalledWith('/notes')
+    it('get() invokes get_note with id', async () => {
+      mockInvoke.mockResolvedValue({ id: 'n1', title: 'Note' })
+      await notes.get('n1')
+      expect(mockInvoke).toHaveBeenCalledWith('get_note', { id: 'n1' })
     })
 
-    it('get() calls GET /notes/:id with encoded ID', async () => {
-      mockAxiosInstance.get.mockResolvedValue({ id: 'note-1', title: 'Test' })
-
-      await notes.get('note-1')
-
-      expect(mockAxiosInstance.get).toHaveBeenCalledWith('/notes/note-1')
+    it('create() invokes create_note with note data', async () => {
+      const data = { title: 'New', content: 'Body' }
+      mockInvoke.mockResolvedValue({ id: 'new', ...data })
+      await notes.create(data)
+      expect(mockInvoke).toHaveBeenCalledWith('create_note', { note: data })
     })
 
-    it('get() encodes special characters in ID', async () => {
-      mockAxiosInstance.get.mockResolvedValue({})
-
-      await notes.get('note with spaces')
-
-      expect(mockAxiosInstance.get).toHaveBeenCalledWith(
-        '/notes/note%20with%20spaces'
-      )
+    it('update() invokes update_note with id and update', async () => {
+      const data = { title: 'Updated' }
+      mockInvoke.mockResolvedValue({ id: 'n1', ...data })
+      await notes.update('n1', data)
+      expect(mockInvoke).toHaveBeenCalledWith('update_note', { id: 'n1', update: data })
     })
 
-    it('create() calls POST /notes with data', async () => {
-      const noteData = { title: 'New Note', content: 'Content' }
-      mockAxiosInstance.post.mockResolvedValue({ id: 'new-id', ...noteData })
-
-      await notes.create(noteData)
-
-      expect(mockAxiosInstance.post).toHaveBeenCalledWith('/notes', noteData)
+    it('delete() invokes delete_note with id', async () => {
+      mockInvoke.mockResolvedValue(null)
+      await notes.delete('n1')
+      expect(mockInvoke).toHaveBeenCalledWith('delete_note', { id: 'n1' })
     })
 
-    it('update() calls PUT /notes/:id with data', async () => {
-      const updateData = { title: 'Updated Title' }
-      mockAxiosInstance.put.mockResolvedValue({ id: 'note-1', ...updateData })
-
-      await notes.update('note-1', updateData)
-
-      expect(mockAxiosInstance.put).toHaveBeenCalledWith(
-        '/notes/note-1',
-        updateData
-      )
-    })
-
-    it('update() encodes special characters in ID', async () => {
-      mockAxiosInstance.put.mockResolvedValue({})
-
-      await notes.update('special/note?id=1', { title: 'Test' })
-
-      expect(mockAxiosInstance.put).toHaveBeenCalledWith(
-        '/notes/special%2Fnote%3Fid%3D1',
-        { title: 'Test' }
-      )
-    })
-
-    it('delete() calls DELETE /notes/:id', async () => {
-      mockAxiosInstance.delete.mockResolvedValue()
-
-      await notes.delete('note-1')
-
-      expect(mockAxiosInstance.delete).toHaveBeenCalledWith('/notes/note-1')
-    })
-
-    it('delete() encodes special characters in ID', async () => {
-      mockAxiosInstance.delete.mockResolvedValue()
-
-      await notes.delete('note#1')
-
-      expect(mockAxiosInstance.delete).toHaveBeenCalledWith('/notes/note%231')
-    })
-
-    it('reindex() calls POST /notes/reindex', async () => {
-      mockAxiosInstance.post.mockResolvedValue({ status: 'success' })
-
+    it('reindex() invokes reindex', async () => {
+      mockInvoke.mockResolvedValue(null)
       await notes.reindex()
+      expect(mockInvoke).toHaveBeenCalledWith('reindex', {})
+    })
 
-      expect(mockAxiosInstance.post).toHaveBeenCalledWith('/notes/reindex')
+    it('distill() invokes distill_note with id and request', async () => {
+      const request = { mode: 'rules' }
+      mockInvoke.mockResolvedValue({})
+      await notes.distill('n1', request)
+      expect(mockInvoke).toHaveBeenCalledWith('distill_note', { id: 'n1', request })
+    })
+
+    it('normalizeTags() invokes normalize_tags with id', async () => {
+      mockInvoke.mockResolvedValue({})
+      await notes.normalizeTags('n1')
+      expect(mockInvoke).toHaveBeenCalledWith('normalize_tags', { id: 'n1' })
     })
   })
 
   // ============================================================================
-  // Search API Tests
+  // Search API
   // ============================================================================
 
   describe('Search API', () => {
-    let search
-
-    beforeEach(async () => {
-      vi.resetModules()
-      const client = await import('@/api/client')
-      search = client.search
-    })
-
-    it('query() calls GET /search with query params', async () => {
-      mockAxiosInstance.get.mockResolvedValue([])
-
-      await search.query('test query')
-
-      expect(mockAxiosInstance.get).toHaveBeenCalledWith('/search', {
-        params: { q: 'test query', limit: 10, semantic: true },
-      })
+    it('query() invokes search_notes with defaults', async () => {
+      mockInvoke.mockResolvedValue([])
+      await search.query('test')
+      expect(mockInvoke).toHaveBeenCalledWith('search_notes', { query: 'test', limit: 10 })
     })
 
     it('query() uses custom limit', async () => {
-      mockAxiosInstance.get.mockResolvedValue([])
-
+      mockInvoke.mockResolvedValue([])
       await search.query('test', { limit: 5 })
-
-      expect(mockAxiosInstance.get).toHaveBeenCalledWith('/search', {
-        params: { q: 'test', limit: 5, semantic: true },
-      })
+      expect(mockInvoke).toHaveBeenCalledWith('search_notes', { query: 'test', limit: 5 })
     })
 
-    it('query() allows disabling semantic search', async () => {
-      mockAxiosInstance.get.mockResolvedValue([])
-
-      await search.query('test', { semantic: false })
-
-      expect(mockAxiosInstance.get).toHaveBeenCalledWith('/search', {
-        params: { q: 'test', limit: 10, semantic: false },
-      })
+    it('similar() invokes find_similar with defaults', async () => {
+      mockInvoke.mockResolvedValue([])
+      await search.similar('n1')
+      expect(mockInvoke).toHaveBeenCalledWith('find_similar', { noteId: 'n1', limit: 5 })
     })
 
-    it('similar() calls GET /search/similar/:id with limit', async () => {
-      mockAxiosInstance.get.mockResolvedValue([])
-
-      await search.similar('note-1', 3)
-
-      expect(mockAxiosInstance.get).toHaveBeenCalledWith(
-        '/search/similar/note-1',
-        { params: { limit: 3 } }
-      )
-    })
-
-    it('similar() uses default limit of 5', async () => {
-      mockAxiosInstance.get.mockResolvedValue([])
-
-      await search.similar('note-1')
-
-      expect(mockAxiosInstance.get).toHaveBeenCalledWith(
-        '/search/similar/note-1',
-        { params: { limit: 5 } }
-      )
-    })
-
-    it('similar() encodes special characters in ID', async () => {
-      mockAxiosInstance.get.mockResolvedValue([])
-
-      await search.similar('note with spaces')
-
-      expect(mockAxiosInstance.get).toHaveBeenCalledWith(
-        '/search/similar/note%20with%20spaces',
-        { params: { limit: 5 } }
-      )
+    it('similar() uses custom limit', async () => {
+      mockInvoke.mockResolvedValue([])
+      await search.similar('n1', 3)
+      expect(mockInvoke).toHaveBeenCalledWith('find_similar', { noteId: 'n1', limit: 3 })
     })
   })
 
   // ============================================================================
-  // Graph API Tests
+  // Graph API
   // ============================================================================
 
   describe('Graph API', () => {
-    let graph
-
-    beforeEach(async () => {
-      vi.resetModules()
-      const client = await import('@/api/client')
-      graph = client.graph
+    it('backlinks() invokes get_backlinks', async () => {
+      mockInvoke.mockResolvedValue([])
+      await graph.backlinks('n1')
+      expect(mockInvoke).toHaveBeenCalledWith('get_backlinks', { noteId: 'n1' })
     })
 
-    it('backlinks() calls GET /graph/backlinks/:id', async () => {
-      mockAxiosInstance.get.mockResolvedValue([])
-
-      await graph.backlinks('note-1')
-
-      expect(mockAxiosInstance.get).toHaveBeenCalledWith(
-        '/graph/backlinks/note-1'
-      )
+    it('outgoing() invokes get_outgoing', async () => {
+      mockInvoke.mockResolvedValue([])
+      await graph.outgoing('n1')
+      expect(mockInvoke).toHaveBeenCalledWith('get_outgoing', { noteId: 'n1' })
     })
 
-    it('backlinks() encodes special characters in ID', async () => {
-      mockAxiosInstance.get.mockResolvedValue([])
-
-      await graph.backlinks('special&note')
-
-      expect(mockAxiosInstance.get).toHaveBeenCalledWith(
-        '/graph/backlinks/special%26note'
-      )
+    it('neighbors() invokes get_neighbors', async () => {
+      mockInvoke.mockResolvedValue({ nodes: [], edges: [] })
+      await graph.neighbors('n1', 2)
+      expect(mockInvoke).toHaveBeenCalledWith('get_neighbors', { noteId: 'n1' })
     })
 
-    it('outgoing() calls GET /graph/outgoing/:id', async () => {
-      mockAxiosInstance.get.mockResolvedValue([])
-
-      await graph.outgoing('note-1')
-
-      expect(mockAxiosInstance.get).toHaveBeenCalledWith(
-        '/graph/outgoing/note-1'
-      )
-    })
-
-    it('neighbors() calls GET /graph/neighbors/:id with depth', async () => {
-      mockAxiosInstance.get.mockResolvedValue({ nodes: [], edges: [] })
-
-      await graph.neighbors('note-1', 2)
-
-      expect(mockAxiosInstance.get).toHaveBeenCalledWith(
-        '/graph/neighbors/note-1',
-        { params: { depth: 2 } }
-      )
-    })
-
-    it('neighbors() uses default depth of 1', async () => {
-      mockAxiosInstance.get.mockResolvedValue({ nodes: [], edges: [] })
-
-      await graph.neighbors('note-1')
-
-      expect(mockAxiosInstance.get).toHaveBeenCalledWith(
-        '/graph/neighbors/note-1',
-        { params: { depth: 1 } }
-      )
-    })
-
-    it('unlinkedMentions() calls GET /graph/unlinked-mentions/:id', async () => {
-      mockAxiosInstance.get.mockResolvedValue([])
-
-      await graph.unlinkedMentions('note-1')
-
-      expect(mockAxiosInstance.get).toHaveBeenCalledWith(
-        '/graph/unlinked-mentions/note-1'
-      )
-    })
-
-    it('rebuild() calls POST /graph/rebuild', async () => {
-      mockAxiosInstance.post.mockResolvedValue({ status: 'success' })
-
+    it('rebuild() invokes rebuild_graph', async () => {
+      mockInvoke.mockResolvedValue(null)
       await graph.rebuild()
+      expect(mockInvoke).toHaveBeenCalledWith('rebuild_graph', {})
+    })
 
-      expect(mockAxiosInstance.post).toHaveBeenCalledWith('/graph/rebuild')
+    it('full() invokes get_full_graph', async () => {
+      mockInvoke.mockResolvedValue({ nodes: [], edges: [] })
+      await graph.full()
+      expect(mockInvoke).toHaveBeenCalledWith('get_full_graph', {})
+    })
+
+    it('unlinked() invokes get_unlinked', async () => {
+      mockInvoke.mockResolvedValue([])
+      await graph.unlinked()
+      expect(mockInvoke).toHaveBeenCalledWith('get_unlinked', {})
     })
   })
 
   // ============================================================================
-  // OAuth API Tests
+  // Canvas API
   // ============================================================================
 
-  describe('OAuth API', () => {
-    let oauth
-
-    beforeEach(async () => {
-      vi.resetModules()
-      const client = await import('@/api/client')
-      oauth = client.oauth
+  describe('Canvas API', () => {
+    it('list() invokes list_sessions', async () => {
+      mockInvoke.mockResolvedValue([])
+      await canvas.list()
+      expect(mockInvoke).toHaveBeenCalledWith('list_sessions', {})
     })
 
-    it('getAuthorizationUrl() calls GET /oauth/authorize/:provider', async () => {
-      mockAxiosInstance.get.mockResolvedValue({
-        authorization_url: 'https://github.com/...',
+    it('get() invokes get_session', async () => {
+      mockInvoke.mockResolvedValue({})
+      await canvas.get('s1')
+      expect(mockInvoke).toHaveBeenCalledWith('get_session', { id: 's1' })
+    })
+
+    it('create() invokes create_session', async () => {
+      const data = { name: 'Test' }
+      mockInvoke.mockResolvedValue({ id: 's1', ...data })
+      await canvas.create(data)
+      expect(mockInvoke).toHaveBeenCalledWith('create_session', { session: data })
+    })
+
+    it('delete() invokes delete_session', async () => {
+      mockInvoke.mockResolvedValue(null)
+      await canvas.delete('s1')
+      expect(mockInvoke).toHaveBeenCalledWith('delete_session', { id: 's1' })
+    })
+
+    it('getModels() invokes get_available_models', async () => {
+      mockInvoke.mockResolvedValue([])
+      await canvas.getModels()
+      expect(mockInvoke).toHaveBeenCalledWith('get_available_models', {})
+    })
+
+    it('sendPrompt() invokes send_prompt', async () => {
+      const request = { prompt: 'hello', models: ['gpt-4'] }
+      mockInvoke.mockResolvedValue('tile-1')
+      await canvas.sendPrompt('s1', request)
+      expect(mockInvoke).toHaveBeenCalledWith('send_prompt', { sessionId: 's1', request })
+    })
+
+    it('exportToNote() invokes export_to_note', async () => {
+      mockInvoke.mockResolvedValue({ note_id: 'n1' })
+      await canvas.exportToNote('s1')
+      expect(mockInvoke).toHaveBeenCalledWith('export_to_note', { sessionId: 's1' })
+    })
+  })
+
+  // ============================================================================
+  // Feedback API
+  // ============================================================================
+
+  describe('Feedback API', () => {
+    it('submit() invokes submit_feedback', async () => {
+      const data = { type: 'bug', description: 'broken' }
+      mockInvoke.mockResolvedValue({})
+      await feedback.submit(data)
+      expect(mockInvoke).toHaveBeenCalledWith('submit_feedback', { feedback: data })
+    })
+
+    it('status() invokes feedback_status', async () => {
+      mockInvoke.mockResolvedValue({})
+      await feedback.status()
+      expect(mockInvoke).toHaveBeenCalledWith('feedback_status', {})
+    })
+
+    it('getSystemInfo() invokes get_system_info', async () => {
+      mockInvoke.mockResolvedValue({ platform: 'win32' })
+      await feedback.getSystemInfo('/canvas')
+      expect(mockInvoke).toHaveBeenCalledWith('get_system_info', { currentPage: '/canvas' })
+    })
+  })
+
+  // ============================================================================
+  // Settings API
+  // ============================================================================
+
+  describe('Settings API', () => {
+    it('get() invokes get_settings', async () => {
+      mockInvoke.mockResolvedValue({})
+      await settings.get()
+      expect(mockInvoke).toHaveBeenCalledWith('get_settings', {})
+    })
+
+    it('getStatus() invokes get_settings_status', async () => {
+      mockInvoke.mockResolvedValue({ needs_setup: false })
+      await settings.getStatus()
+      expect(mockInvoke).toHaveBeenCalledWith('get_settings_status', {})
+    })
+
+    it('update() invokes update_settings', async () => {
+      const data = { theme: 'dark' }
+      mockInvoke.mockResolvedValue(data)
+      await settings.update(data)
+      expect(mockInvoke).toHaveBeenCalledWith('update_settings', { update: data })
+    })
+
+    it('pickVaultFolder() invokes pick_vault_folder', async () => {
+      mockInvoke.mockResolvedValue('/path/to/vault')
+      await settings.pickVaultFolder()
+      expect(mockInvoke).toHaveBeenCalledWith('pick_vault_folder')
+    })
+
+    it('validateOpenRouterKey() invokes validate_openrouter_key', async () => {
+      mockInvoke.mockResolvedValue(true)
+      await settings.validateOpenRouterKey('sk-123')
+      expect(mockInvoke).toHaveBeenCalledWith('validate_openrouter_key', { apiKey: 'sk-123' })
+    })
+  })
+
+  // ============================================================================
+  // MCP API
+  // ============================================================================
+
+  describe('MCP API', () => {
+    it('getStatus() invokes get_mcp_status', async () => {
+      mockInvoke.mockResolvedValue({ available: true })
+      await mcp.getStatus()
+      expect(mockInvoke).toHaveBeenCalledWith('get_mcp_status', {})
+    })
+
+    it('getConfigSnippet() invokes get_mcp_config_snippet', async () => {
+      mockInvoke.mockResolvedValue('{}')
+      await mcp.getConfigSnippet()
+      expect(mockInvoke).toHaveBeenCalledWith('get_mcp_config_snippet', {})
+    })
+  })
+
+  // ============================================================================
+  // Memory API
+  // ============================================================================
+
+  describe('Memory API', () => {
+    it('recall() invokes recall_relevant with request', async () => {
+      mockInvoke.mockResolvedValue([])
+      await memory.recall('test query', ['n1'], 3)
+      expect(mockInvoke).toHaveBeenCalledWith('recall_relevant', {
+        request: { query: 'test query', context_note_ids: ['n1'], limit: 3 },
       })
-
-      await oauth.getAuthorizationUrl('github')
-
-      expect(mockAxiosInstance.get).toHaveBeenCalledWith(
-        '/oauth/authorize/github'
-      )
     })
 
-    it('exchangeCode() calls POST /oauth/callback/:provider with code', async () => {
-      mockAxiosInstance.post.mockResolvedValue({ access_token: 'token' })
-
-      await oauth.exchangeCode('github', 'auth-code-123')
-
-      expect(mockAxiosInstance.post).toHaveBeenCalledWith(
-        '/oauth/callback/github',
-        { code: 'auth-code-123' }
-      )
+    it('recall() uses defaults', async () => {
+      mockInvoke.mockResolvedValue([])
+      await memory.recall('query')
+      expect(mockInvoke).toHaveBeenCalledWith('recall_relevant', {
+        request: { query: 'query', context_note_ids: [], limit: 5 },
+      })
     })
 
-    it('getUser() calls GET /oauth/user', async () => {
-      mockAxiosInstance.get.mockResolvedValue({ name: 'Test User' })
-
-      await oauth.getUser()
-
-      expect(mockAxiosInstance.get).toHaveBeenCalledWith('/oauth/user')
+    it('contradictions() invokes find_contradictions', async () => {
+      mockInvoke.mockResolvedValue([])
+      await memory.contradictions('n1')
+      expect(mockInvoke).toHaveBeenCalledWith('find_contradictions', { noteId: 'n1' })
     })
 
-    it('logout() calls POST /oauth/logout', async () => {
-      mockAxiosInstance.post.mockResolvedValue({})
-
-      await oauth.logout()
-
-      expect(mockAxiosInstance.post).toHaveBeenCalledWith('/oauth/logout')
+    it('extract() invokes extract_claims', async () => {
+      const messages = [{ role: 'user', content: 'hello' }]
+      mockInvoke.mockResolvedValue([])
+      await memory.extract(messages)
+      expect(mockInvoke).toHaveBeenCalledWith('extract_claims', { request: { messages } })
     })
   })
 
   // ============================================================================
-  // URL Encoding Tests
+  // Zettelkasten API
   // ============================================================================
 
-  describe('URL Encoding', () => {
-    let notes, search, graph
-
-    beforeEach(async () => {
-      vi.resetModules()
-      const client = await import('@/api/client')
-      notes = client.notes
-      search = client.search
-      graph = client.graph
+  describe('Zettelkasten API', () => {
+    it('discoverLinks() invokes discover_links with defaults', async () => {
+      mockInvoke.mockResolvedValue([])
+      await zettelkasten.discoverLinks('n1')
+      expect(mockInvoke).toHaveBeenCalledWith('discover_links', {
+        noteId: 'n1',
+        mode: 'suggested',
+        maxLinks: 10,
+      })
     })
 
-    it('encodes slashes in note ID', async () => {
-      mockAxiosInstance.get.mockResolvedValue({})
-
-      await notes.get('folder/note')
-
-      expect(mockAxiosInstance.get).toHaveBeenCalledWith(
-        '/notes/folder%2Fnote'
-      )
+    it('applyLinks() invokes apply_links', async () => {
+      mockInvoke.mockResolvedValue({})
+      await zettelkasten.applyLinks('n1', ['l1', 'l2'])
+      expect(mockInvoke).toHaveBeenCalledWith('apply_links', {
+        noteId: 'n1',
+        request: { link_ids: ['l1', 'l2'] },
+      })
     })
 
-    it('encodes question marks in note ID', async () => {
-      mockAxiosInstance.get.mockResolvedValue({})
-
-      await notes.get('what?')
-
-      expect(mockAxiosInstance.get).toHaveBeenCalledWith('/notes/what%3F')
+    it('createLink() invokes create_link', async () => {
+      mockInvoke.mockResolvedValue({})
+      await zettelkasten.createLink('src', 'tgt', 'supports')
+      expect(mockInvoke).toHaveBeenCalledWith('create_link', {
+        sourceId: 'src',
+        targetId: 'tgt',
+        linkType: 'supports',
+      })
     })
 
-    it('encodes hash in note ID', async () => {
-      mockAxiosInstance.get.mockResolvedValue({})
-
-      await notes.get('note#heading')
-
-      expect(mockAxiosInstance.get).toHaveBeenCalledWith(
-        '/notes/note%23heading'
-      )
-    })
-
-    it('encodes ampersand in note ID', async () => {
-      mockAxiosInstance.get.mockResolvedValue({})
-
-      await notes.get('A&B')
-
-      expect(mockAxiosInstance.get).toHaveBeenCalledWith('/notes/A%26B')
-    })
-
-    it('encodes unicode characters in note ID', async () => {
-      mockAxiosInstance.get.mockResolvedValue({})
-
-      await notes.get('日本語')
-
-      // encodeURIComponent encodes each UTF-8 byte
-      expect(mockAxiosInstance.get).toHaveBeenCalledWith(
-        '/notes/%E6%97%A5%E6%9C%AC%E8%AA%9E'
-      )
-    })
-
-    it('encodes emojis in note ID', async () => {
-      mockAxiosInstance.get.mockResolvedValue({})
-
-      await notes.get('note🚀')
-
-      expect(mockAxiosInstance.get).toHaveBeenCalledWith(
-        '/notes/note%F0%9F%9A%80'
-      )
+    it('getLinkTypes() invokes get_link_types', async () => {
+      mockInvoke.mockResolvedValue([])
+      await zettelkasten.getLinkTypes()
+      expect(mockInvoke).toHaveBeenCalledWith('get_link_types', {})
     })
   })
 
   // ============================================================================
-  // Error Handling Tests
+  // Error Handling
   // ============================================================================
 
   describe('Error Handling', () => {
-    let notes
-
-    beforeEach(async () => {
-      vi.resetModules()
-      const client = await import('@/api/client')
-      notes = client.notes
+    it('propagates invoke errors', async () => {
+      mockInvoke.mockRejectedValue(new Error('Tauri error'))
+      await expect(notes.list()).rejects.toThrow('Tauri error')
     })
 
-    it('propagates network errors', async () => {
-      const networkError = new Error('Network Error')
-      mockAxiosInstance.get.mockRejectedValue(networkError)
-
-      await expect(notes.list()).rejects.toThrow('Network Error')
-    })
-
-    it('propagates server errors', async () => {
-      const serverError = {
-        response: { status: 500, data: { message: 'Internal Server Error' } },
-      }
-      mockAxiosInstance.get.mockRejectedValue(serverError)
-
-      await expect(notes.list()).rejects.toEqual(serverError)
-    })
-
-    it('propagates validation errors', async () => {
-      const validationError = {
-        response: { status: 422, data: { detail: 'Title is required' } },
-      }
-      mockAxiosInstance.post.mockRejectedValue(validationError)
-
-      await expect(notes.create({})).rejects.toEqual(validationError)
-    })
-
-    it('propagates 404 errors', async () => {
-      const notFoundError = {
-        response: { status: 404, data: { detail: 'Note not found' } },
-      }
-      mockAxiosInstance.get.mockRejectedValue(notFoundError)
-
-      await expect(notes.get('nonexistent')).rejects.toEqual(notFoundError)
-    })
-  })
-
-  // ============================================================================
-  // Edge Cases
-  // ============================================================================
-
-  describe('Edge Cases', () => {
-    let notes, search
-
-    beforeEach(async () => {
-      vi.resetModules()
-      const client = await import('@/api/client')
-      notes = client.notes
-      search = client.search
-    })
-
-    it('handles empty response data', async () => {
-      mockAxiosInstance.get.mockResolvedValue(null)
-
-      const result = await notes.list()
-
-      expect(result).toBeNull()
-    })
-
-    it('handles empty array response', async () => {
-      mockAxiosInstance.get.mockResolvedValue([])
-
-      const result = await notes.list()
-
-      expect(result).toEqual([])
-    })
-
-    it('handles very long note IDs', async () => {
-      const longId = 'a'.repeat(500)
-      mockAxiosInstance.get.mockResolvedValue({})
-
-      await notes.get(longId)
-
-      expect(mockAxiosInstance.get).toHaveBeenCalledWith(
-        `/notes/${longId}`
-      )
-    })
-
-    it('handles empty query string', async () => {
-      mockAxiosInstance.get.mockResolvedValue([])
-
-      await search.query('')
-
-      expect(mockAxiosInstance.get).toHaveBeenCalledWith('/search', {
-        params: { q: '', limit: 10, semantic: true },
-      })
-    })
-
-    it('handles query with special characters', async () => {
-      mockAxiosInstance.get.mockResolvedValue([])
-
-      await search.query('[[wikilink]] & "quotes"')
-
-      expect(mockAxiosInstance.get).toHaveBeenCalledWith('/search', {
-        params: { q: '[[wikilink]] & "quotes"', limit: 10, semantic: true },
-      })
-    })
-
-    it('returns undefined when delete succeeds', async () => {
-      mockAxiosInstance.delete.mockResolvedValue(undefined)
-
-      const result = await notes.delete('note-1')
-
-      expect(result).toBeUndefined()
+    it('propagates string errors from Rust backend', async () => {
+      mockInvoke.mockRejectedValue('Note not found')
+      await expect(notes.get('nonexistent')).rejects.toBe('Note not found')
     })
   })
 })

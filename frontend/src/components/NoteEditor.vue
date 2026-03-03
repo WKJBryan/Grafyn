@@ -18,6 +18,22 @@
         >
           {{ isDiscovering ? '⏳ Discovering...' : 'Discover Links' }}
         </button>
+        <select
+          v-if="canDistill"
+          v-model="distillMode"
+          class="distill-mode-select"
+          title="Extraction method"
+        >
+          <option value="auto">
+            Auto
+          </option>
+          <option value="rules">
+            Rules
+          </option>
+          <option value="llm">
+            LLM
+          </option>
+        </select>
         <button
           v-if="canDistill"
           class="btn btn-accent"
@@ -145,6 +161,7 @@ const isDirty = ref(false)
 const tagsInput = ref(props.note.tags ? props.note.tags.join(', ') : '')
 const isDistilling = ref(false)
 const distillMessage = ref('')
+const distillMode = ref('auto')
 const showLinkModal = ref(false)
 const isDiscovering = ref(false)
 const linkCandidates = ref([])
@@ -242,27 +259,41 @@ function handleDelete() {
 
 async function handleDistill() {
   if (isDistilling.value) return
-  
+
   isDistilling.value = true
   distillMessage.value = ''
-  
+
   try {
-    const result = await notes.distill(props.note.id, { mode: 'auto' })
-    
+    const result = await notes.distill(props.note.id, {
+      extraction_mode: distillMode.value,
+      hub_policy: 'auto',
+      dedup_action: 'skip',
+    })
+
+    const parts = []
     if (result.created_note_ids?.length > 0) {
-      distillMessage.value = `✓ Created ${result.created_note_ids.length} draft notes`
+      parts.push(`Created ${result.created_note_ids.length} draft notes`)
+    }
+    if (result.skipped_duplicates > 0) {
+      parts.push(`skipped ${result.skipped_duplicates} duplicates`)
+    }
+    if (result.merged_into?.length > 0) {
+      parts.push(`merged into ${result.merged_into.length} existing`)
+    }
+
+    if (parts.length > 0) {
+      distillMessage.value = `✓ ${parts.join(', ')}`
       emit('distill-success', result)
     } else {
       distillMessage.value = result.message || 'No atomic notes found to extract'
     }
-    
-    // Show success briefly
+
     setTimeout(() => {
       distillMessage.value = ''
     }, 3000)
   } catch (error) {
     console.error('Distill failed:', error)
-    distillMessage.value = error.response?.data?.detail || 'Distillation failed'
+    distillMessage.value = error.message || 'Distillation failed'
   } finally {
     isDistilling.value = false
   }
@@ -563,6 +594,17 @@ function handleLinksApplied() {
 
 .tags-input {
   flex: 1;
+}
+
+.distill-mode-select {
+  width: auto;
+  min-width: 80px;
+  padding: 4px 8px;
+  font-size: 0.8rem;
+  background: var(--bg-tertiary);
+  color: var(--text-secondary);
+  border: 1px solid var(--bg-tertiary);
+  border-radius: var(--radius-sm);
 }
 
 .distill-message {

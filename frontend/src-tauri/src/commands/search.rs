@@ -2,7 +2,7 @@ use crate::models::note::SearchResult;
 use crate::AppState;
 use tauri::State;
 
-/// Search notes by query string
+/// Search notes by query string, with priority scoring applied
 #[tauri::command]
 pub async fn search_notes(
     query: String,
@@ -11,10 +11,16 @@ pub async fn search_notes(
 ) -> Result<Vec<SearchResult>, String> {
     let search = state.search_service.read().await;
     let limit = limit.unwrap_or(20);
-    search.search(&query, limit).map_err(|e| e.to_string())
+    let mut results = search.search(&query, limit).map_err(|e| e.to_string())?;
+
+    // Apply priority scoring (recency, status, tag boosts)
+    let priority = state.priority_service.read().await;
+    priority.score_results(&mut results);
+
+    Ok(results)
 }
 
-/// Find notes similar to a given note
+/// Find notes similar to a given note (enhanced with graph-aware retrieval)
 #[tauri::command]
 pub async fn find_similar(
     note_id: String,
@@ -23,7 +29,7 @@ pub async fn find_similar(
 ) -> Result<Vec<SearchResult>, String> {
     let limit = limit.unwrap_or(10);
 
-    // Get the note content
+    // Get the note content for keyword extraction
     let content = {
         let store = state.knowledge_store.read().await;
         store
@@ -32,11 +38,51 @@ pub async fn find_similar(
             .map_err(|e| e.to_string())?
     };
 
-    // Find similar notes
+    // Extract keywords from content
+    let query_words: Vec<&str> = content
+        .split_whitespace()
+        .filter(|w| w.len() > 4)
+        .take(20)
+        .collect();
+
+    if query_words.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let query_str = query_words.join(" ");
+
+    // Use retrieval pipeline with the source note as context
     let search = state.search_service.read().await;
-    search
-        .find_similar(&note_id, &content, limit)
-        .map_err(|e| e.to_string())
+    let graph = state.graph_index.read().await;
+    let priority = state.priority_service.read().await;
+    let retrieval = state.retrieval_service.read().await;
+
+    let results = retrieval.retrieve(
+        &search,
+        &graph,
+        &priority,
+        &query_str,
+        limit + 1,
+        &[note_id.clone()],
+    )?;
+
+    // Convert RetrievalResult → SearchResult, filtering out the source note
+    let search_results: Vec<SearchResult> = results
+        .into_iter()
+        .filter(|r| r.note.id != note_id)
+        .take(limit)
+        .map(|r| SearchResult {
+            note: r.note,
+            score: r.score,
+            snippet: if r.snippet.is_empty() {
+                None
+            } else {
+                Some(r.snippet)
+            },
+        })
+        .collect();
+
+    Ok(search_results)
 }
 
 /// Reindex all notes

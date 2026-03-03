@@ -1,6 +1,6 @@
 {
   "name": "grafyn-frontend",
-  "version": "0.0.7",
+  "version": "0.1.0",
   "type": "module",
   "description": "Grafyn frontend - Vue 3 SPA for knowledge management",
   "scripts": {
@@ -21,7 +21,6 @@
   },
   "dependencies": {
     "@tauri-apps/api": "^1.6.0",
-    "axios": "^1.6.0",
     "d3-drag": "^3.0.0",
     "d3-force": "^3.0.0",
     "d3-selection": "^3.0.0",

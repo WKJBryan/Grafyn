@@ -1,6 +1,6 @@
 [package]
 name = "grafyn"
-version = "0.0.7"
+version = "0.1.0"
 description = "Grafyn - Knowledge Management Desktop App"
 authors = ["Bryan"]
 license = "MIT"
@@ -84,6 +84,9 @@ default = ["tauri-app", "custom-protocol"]
 tauri-app = ["dep:tauri", "dep:tauri-build"]
 custom-protocol = ["tauri-app", "tauri/custom-protocol"]
 mcp = ["dep:rmcp", "dep:schemars", "dep:clap"]
+
+[dev-dependencies]
+tempfile = "3"
 
 [profile.release]
 lto = true

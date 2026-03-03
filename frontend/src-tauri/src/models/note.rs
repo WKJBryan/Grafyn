@@ -35,6 +35,45 @@ impl std::str::FromStr for NoteStatus {
     }
 }
 
+/// Extraction mode for distillation
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ExtractionMode {
+    /// Rules-based: split on H2/H3 headings, parse inline tags
+    Rules,
+    /// LLM: structured JSON extraction via OpenRouter
+    Llm,
+    /// Auto: prefer LLM if configured, fall back to rules
+    #[default]
+    Auto,
+}
+
+/// Hub creation policy during distillation
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum HubCreatePolicy {
+    /// Create hub when a tag appears 3+ times across candidates
+    #[default]
+    Auto,
+    /// Always create hub for every candidate with a suggested hub
+    Always,
+    /// Never create hubs
+    Never,
+}
+
+/// What to do when a candidate's title matches an existing note
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum DeduplicationAction {
+    /// Create new note regardless of duplicates
+    Create,
+    /// Merge content into existing note with matching title
+    Merge,
+    /// Skip candidates that match existing notes (default)
+    #[default]
+    Skip,
+}
+
 /// Full note object with all fields
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Note {
@@ -144,14 +183,12 @@ pub struct SearchResult {
 /// Request for distilling a container note into atomic notes
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DistillRequest {
-    #[serde(default = "default_auto")]
-    pub mode: String,
-    #[serde(default = "default_auto")]
-    pub extraction_method: String,
-}
-
-fn default_auto() -> String {
-    "auto".to_string()
+    #[serde(default)]
+    pub extraction_mode: ExtractionMode,
+    #[serde(default)]
+    pub hub_policy: HubCreatePolicy,
+    #[serde(default)]
+    pub dedup_action: DeduplicationAction,
 }
 
 /// Response from distilling a note
@@ -166,12 +203,12 @@ pub struct DistillResponse {
     pub message: String,
     #[serde(default)]
     pub extraction_method_used: String,
-    #[serde(default = "default_completed")]
+    #[serde(default)]
     pub status: String,
-}
-
-fn default_completed() -> String {
-    "completed".to_string()
+    #[serde(default)]
+    pub skipped_duplicates: usize,
+    #[serde(default)]
+    pub merged_into: Vec<String>,
 }
 
 /// Hub update information from distillation

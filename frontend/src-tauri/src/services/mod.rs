@@ -1,8 +1,11 @@
 pub mod canvas_store;
 pub mod feedback;
 pub mod graph_index;
+pub mod import;
 pub mod knowledge_store;
 pub mod memory;
 pub mod openrouter;
+pub mod priority;
+pub mod retrieval;
 pub mod search;
 pub mod settings;

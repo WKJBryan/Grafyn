@@ -1,18 +1,20 @@
 use crate::models::note::{
-    DistillRequest, DistillResponse, HubUpdate, NoteCreate, NoteStatus, NoteUpdate,
+    DeduplicationAction, DistillRequest, DistillResponse, ExtractionMode, HubCreatePolicy,
+    HubUpdate, NoteCreate, NoteStatus, NoteUpdate,
 };
 use crate::services::openrouter::ChatMessage;
 use crate::AppState;
 use lazy_static::lazy_static;
 use regex::Regex;
+use serde::Deserialize;
 use tauri::State;
 
 lazy_static! {
     /// Inline tag pattern: # followed by letter/digit, then letters/digits/hyphens/underscores
     /// Must not be preceded by ` or # (to skip code and headings)
-    /// Matches Python's INLINE_TAG_PATTERN: allows digit-first tags (#3d) and single-char (#a)
+    /// Uses (?m) multiline + character class instead of lookbehind (unsupported by regex crate)
     static ref INLINE_TAG_RE: Regex =
-        Regex::new(r"(?<![`#])#([a-zA-Z0-9][a-zA-Z0-9_/\-]*)").unwrap();
+        Regex::new(r"(?m)(?:^|[^#`])#([a-zA-Z0-9][a-zA-Z0-9_/\-]*)").unwrap();
     /// Fenced code block removal
     static ref FENCED_CODE_RE: Regex = Regex::new(r"(?s)```.*?```").unwrap();
     /// Inline code removal
@@ -257,26 +259,66 @@ fn extract_candidates_rules(
     candidates
 }
 
-// ── LLM summarization ──────────────────────────────────────────────────────
+// ── LLM structured extraction ─────────────────────────────────────────────
 
-/// Summarize note content using LLM, returning structured markdown with H2 headings
-async fn summarize_with_llm(
+/// LLM response format for structured extraction
+#[derive(Debug, Deserialize)]
+struct LlmExtractionResponse {
+    candidates: Vec<LlmCandidate>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LlmCandidate {
+    title: String,
+    summary: Vec<String>,
+    #[serde(default)]
+    tags: Vec<String>,
+    suggested_hub: Option<String>,
+}
+
+/// Extract JSON from an LLM response, handling ```json wrapping
+fn extract_json_from_response(response: &str) -> String {
+    let trimmed = response.trim();
+    // Handle ```json ... ``` wrapping
+    if let Some(start) = trimmed.find("```json") {
+        let json_start = start + 7;
+        if let Some(end) = trimmed[json_start..].find("```") {
+            return trimmed[json_start..json_start + end].trim().to_string();
+        }
+    }
+    // Handle ``` ... ``` wrapping (without language tag)
+    if trimmed.starts_with("```") {
+        let json_start = trimmed.find('\n').map(|p| p + 1).unwrap_or(3);
+        if let Some(end) = trimmed[json_start..].find("```") {
+            return trimmed[json_start..json_start + end].trim().to_string();
+        }
+    }
+    trimmed.to_string()
+}
+
+/// Extract atomic candidates using structured LLM extraction (JSON response).
+///
+/// Asks the LLM to return a JSON array of candidates with title, summary, tags,
+/// and optional hub suggestion — far more reliable than markdown → H2 parsing.
+async fn extract_candidates_llm(
     content: &str,
+    container_tags: &[String],
     state: &AppState,
-) -> Result<String, String> {
+) -> Result<Vec<AtomicCandidate>, String> {
+    let system = "You extract structured knowledge from notes. \
+        Always respond with valid JSON only, no additional text or markdown formatting.";
+
     let prompt = format!(
-        "Summarize this note into atomic knowledge units. For each distinct concept or insight, create a section with:\n\
-        - A clear descriptive title (not \"Prompt 1\" or generic names)\n\
-        - 3-5 bullet point summary\n\
-        - Key claims or insights\n\
-        - Any open questions\n\
-        \n\
-        Note content:\n\
-        ---\n\
-        {}\n\
-        ---\n\
-        \n\
-        Format your response as markdown with ## headings for each atomic unit.",
+        "Analyze this note and extract distinct atomic knowledge units. \
+        Each unit should be a single focused concept, insight, or claim.\n\n\
+        Note content:\n---\n{}\n---\n\n\
+        Respond with ONLY a JSON object in this exact format:\n\
+        {{\"candidates\": [{{\"title\": \"Clear Descriptive Title\", \
+        \"summary\": [\"Key point 1\", \"Key point 2\"], \
+        \"tags\": [\"tag1\", \"tag2\"], \
+        \"suggested_hub\": \"Hub: Topic\" }}]}}\n\n\
+        Set suggested_hub to null if no hub is appropriate. \
+        Use lowercase hyphenated tags. Extract 1-10 candidates.",
         content
     );
 
@@ -286,16 +328,117 @@ async fn summarize_with_llm(
     }];
 
     let openrouter = state.openrouter.read().await;
-    openrouter
+    let response = openrouter
         .chat(
             "anthropic/claude-3.5-haiku",
             messages,
-            None,
-            Some(0.7),
-            Some(2048),
+            Some(system),
+            Some(0.3),
+            Some(4096),
         )
         .await
-        .map_err(|e| format!("LLM summarization failed: {}", e))
+        .map_err(|e| format!("LLM extraction failed: {}", e))?;
+
+    let json_str = extract_json_from_response(&response);
+    let parsed: LlmExtractionResponse = serde_json::from_str(&json_str).map_err(|e| {
+        format!(
+            "Failed to parse LLM JSON: {} (response: {})",
+            e,
+            &json_str[..json_str.len().min(200)]
+        )
+    })?;
+
+    let inherited = inherited_tags(container_tags);
+
+    Ok(parsed
+        .candidates
+        .into_iter()
+        .map(|c| {
+            let section_tags: Vec<String> = c.tags.iter().map(|t| normalize_tag(t)).collect();
+            let recommended_tags = merge_and_limit_tags(section_tags, &inherited);
+            let suggested_hub =
+                c.suggested_hub.or_else(|| suggest_hub(&c.title, &recommended_tags));
+
+            AtomicCandidate {
+                title: c.title,
+                summary: if c.summary.is_empty() {
+                    vec!["No summary provided".to_string()]
+                } else {
+                    c.summary
+                },
+                recommended_tags,
+                suggested_hub,
+            }
+        })
+        .collect())
+}
+
+// ── Deduplication ─────────────────────────────────────────────────────────
+
+/// Check for existing notes with the same or very similar title.
+/// Returns (id, title) of the matching note if found.
+async fn find_duplicate(title: &str, state: &AppState) -> Option<(String, String)> {
+    let search = state.search_service.read().await;
+    // Strip "Atomic: " prefix for broader matching
+    let query = title.trim_start_matches("Atomic: ");
+    if let Ok(results) = search.search(query, 5) {
+        let candidate_lower = title.to_lowercase();
+        let candidate_core = candidate_lower.trim_start_matches("atomic: ");
+        for result in results {
+            let existing_lower = result.note.title.to_lowercase();
+            let existing_core = existing_lower.trim_start_matches("atomic: ");
+            if existing_core == candidate_core {
+                return Some((result.note.id.clone(), result.note.title.clone()));
+            }
+        }
+    }
+    None
+}
+
+// ── Hub policy ────────────────────────────────────────────────────────────
+
+/// Determine which candidates should get hubs based on the policy.
+/// Returns a Vec parallel to `candidates` — Some(hub_title) or None.
+fn apply_hub_policy(
+    candidates: &[AtomicCandidate],
+    policy: &HubCreatePolicy,
+) -> Vec<Option<String>> {
+    match policy {
+        HubCreatePolicy::Never => vec![None; candidates.len()],
+        HubCreatePolicy::Always => candidates.iter().map(|c| c.suggested_hub.clone()).collect(),
+        HubCreatePolicy::Auto => {
+            // Count tag frequency across all candidates
+            let mut tag_counts: std::collections::HashMap<String, usize> =
+                std::collections::HashMap::new();
+            for candidate in candidates {
+                for tag in &candidate.recommended_tags {
+                    *tag_counts.entry(tag.clone()).or_default() += 1;
+                }
+            }
+
+            // Only create hubs for tags appearing 3+ times
+            let frequent_tags: std::collections::HashSet<String> = tag_counts
+                .iter()
+                .filter(|(_, count)| **count >= 3)
+                .map(|(tag, _)| tag.clone())
+                .collect();
+
+            candidates
+                .iter()
+                .map(|c| {
+                    c.suggested_hub.as_ref().and_then(|hub| {
+                        let has_frequent =
+                            c.recommended_tags.iter().any(|t| frequent_tags.contains(t));
+                        if has_frequent {
+                            Some(hub.clone())
+                        } else {
+                            None
+                        }
+                    })
+                })
+                .collect()
+        }
+    }
 }
 
 // ── Hub management ─────────────────────────────────────────────────────────
@@ -422,7 +565,8 @@ async fn update_hub(
 
 // ── Main distill command ───────────────────────────────────────────────────
 
-/// Distill a container note into atomic draft notes (AUTO mode)
+/// Distill a container note into atomic draft notes with configurable
+/// extraction mode, deduplication, and hub creation policy.
 #[tauri::command]
 pub async fn distill_note(
     id: String,
@@ -441,18 +585,17 @@ pub async fn distill_note(
         or.is_configured()
     };
 
-    let use_llm = match request.extraction_method.as_str() {
-        "llm" => {
+    let use_llm = match request.extraction_mode {
+        ExtractionMode::Llm => {
             if !openrouter_configured {
-                return Err("LLM extraction requested but OpenRouter API key not configured".into());
+                return Err(
+                    "LLM extraction requested but OpenRouter API key not configured".into(),
+                );
             }
             true
         }
-        "rules" => false,
-        _ => {
-            // "auto" — prefer LLM if available
-            openrouter_configured
-        }
+        ExtractionMode::Rules => false,
+        ExtractionMode::Auto => openrouter_configured,
     };
 
     let extraction_method_used = if use_llm { "llm" } else { "rules" };
@@ -460,12 +603,21 @@ pub async fn distill_note(
     // 3. Extract candidates
     let mut llm_fallback_msg: Option<String> = None;
     let candidates = if use_llm {
-        // LLM path: summarize then extract from summary
-        match summarize_with_llm(&note.content, &state).await {
-            Ok(summary) => extract_candidates_rules(&summary, &note.tags),
+        // Structured LLM extraction with JSON response, fallback to rules
+        match extract_candidates_llm(&note.content, &note.tags, &state).await {
+            Ok(c) if !c.is_empty() => c,
+            Ok(_) => {
+                log::info!("LLM returned no candidates, falling back to rules");
+                llm_fallback_msg =
+                    Some("LLM returned no candidates, fell back to rules".to_string());
+                extract_candidates_rules(&note.content, &note.tags)
+            }
             Err(e) => {
-                log::warn!("LLM summarization failed, falling back to rules: {}", e);
-                llm_fallback_msg = Some(format!("LLM summarization failed ({}), fell back to rules-based extraction", e));
+                log::warn!("LLM extraction failed, falling back to rules: {}", e);
+                llm_fallback_msg = Some(format!(
+                    "LLM extraction failed ({}), fell back to rules",
+                    e
+                ));
                 extract_candidates_rules(&note.content, &note.tags)
             }
         }
@@ -481,19 +633,91 @@ pub async fn distill_note(
             message: "No atomic note candidates found in this note".to_string(),
             extraction_method_used: extraction_method_used.to_string(),
             status: "completed".to_string(),
+            skipped_duplicates: 0,
+            merged_into: vec![],
         });
     }
 
-    // 4. Create atomic notes
+    // 4. Apply hub policy — determine which candidates get hubs
+    let hub_assignments = apply_hub_policy(&candidates, &request.hub_policy);
+
+    // 5. Create atomic notes (with deduplication)
     let mut created_ids: Vec<String> = Vec::new();
     let mut hub_updates: Vec<HubUpdate> = Vec::new();
+    let mut skipped_duplicates: usize = 0;
+    let mut merged_into: Vec<String> = Vec::new();
 
-    for candidate in &candidates {
+    for (i, candidate) in candidates.iter().enumerate() {
+        // Check for duplicates
+        if let Some((existing_id, existing_title)) =
+            find_duplicate(&candidate.title, &state).await
+        {
+            match request.dedup_action {
+                DeduplicationAction::Skip => {
+                    log::info!(
+                        "Skipping duplicate: '{}' matches '{}'",
+                        candidate.title,
+                        existing_title
+                    );
+                    skipped_duplicates += 1;
+                    continue;
+                }
+                DeduplicationAction::Merge => {
+                    // Append summary to existing note
+                    let summary_list: String = candidate
+                        .summary
+                        .iter()
+                        .map(|s| format!("- {}", s))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+
+                    let merge_section = format!(
+                        "\n\n## Merged from [[{}]]\n{}\n",
+                        note.title, summary_list
+                    );
+
+                    let existing_note = {
+                        let store = state.knowledge_store.read().await;
+                        store.get_note(&existing_id).ok()
+                    };
+
+                    if let Some(existing) = existing_note {
+                        let update = NoteUpdate {
+                            content: Some(format!("{}{}", existing.content, merge_section)),
+                            ..Default::default()
+                        };
+
+                        let updated = {
+                            let mut store = state.knowledge_store.write().await;
+                            store.update_note(&existing_id, update).ok()
+                        };
+
+                        if let Some(updated_note) = updated {
+                            {
+                                let mut search = state.search_service.write().await;
+                                let _ = search.index_note(&updated_note);
+                                let _ = search.commit();
+                            }
+                            {
+                                let mut graph = state.graph_index.write().await;
+                                graph.update_note(&updated_note);
+                            }
+                        }
+                    }
+
+                    merged_into.push(existing_id);
+                    continue;
+                }
+                DeduplicationAction::Create => {
+                    // Fall through to create new note
+                }
+            }
+        }
+
         let mut tags = candidate.recommended_tags.clone();
         tags.push("draft".to_string());
         let tags = normalize_all_tags(&tags);
 
-        // Build content matching Python's _create_atomic_note template
         let summary_list: String = candidate
             .summary
             .iter()
@@ -547,15 +771,15 @@ pub async fn distill_note(
 
         created_ids.push(created.id.clone());
 
-        // Auto-create/update hub
-        if let Some(ref hub_title) = candidate.suggested_hub {
+        // Create/update hub if policy allows
+        if let Some(ref hub_title) = hub_assignments[i] {
             if let Some(hu) = update_hub(hub_title, &created.id, &state).await {
                 hub_updates.push(hu);
             }
         }
     }
 
-    // 5. Update container note with extracted links
+    // 6. Update container note with extracted links
     let container_updated = if !created_ids.is_empty() {
         let timestamp = chrono::Utc::now().format("%Y-%m-%d %H:%M").to_string();
         let links: String = created_ids
@@ -568,7 +792,6 @@ pub async fn distill_note(
         let section_header = "## Extracted Atomic Notes";
 
         let new_content = if let Some(start) = note.content.find(section_header) {
-            // Find where this section ends (next ## or end of string)
             let after_header = start + section_header.len();
             let end = note.content[after_header..]
                 .find("\n## ")
@@ -612,18 +835,26 @@ pub async fn distill_note(
         false
     };
 
+    // 7. Build response message
     let count = created_ids.len();
-    let message = if let Some(fallback) = llm_fallback_msg {
-        format!(
-            "Auto-created {} draft atomic notes. {}",
-            count, fallback
-        )
-    } else {
-        format!(
-            "Auto-created {} draft atomic notes using {}",
-            count, extraction_method_used
-        )
-    };
+    let mut parts = vec![format!(
+        "Created {} draft atomic notes using {}",
+        count, extraction_method_used
+    )];
+    if skipped_duplicates > 0 {
+        parts.push(format!("skipped {} duplicates", skipped_duplicates));
+    }
+    if !merged_into.is_empty() {
+        parts.push(format!(
+            "merged into {} existing notes",
+            merged_into.len()
+        ));
+    }
+    if let Some(fallback) = llm_fallback_msg {
+        parts.push(fallback);
+    }
+    let message = parts.join(", ");
+
     Ok(DistillResponse {
         created_note_ids: created_ids,
         hub_updates,
@@ -631,6 +862,8 @@ pub async fn distill_note(
         message,
         extraction_method_used: extraction_method_used.to_string(),
         status: "completed".to_string(),
+        skipped_duplicates,
+        merged_into,
     })
 }
 
@@ -689,4 +922,188 @@ pub async fn normalize_tags(
     }
 
     Ok(updated)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::note::HubCreatePolicy;
+
+    #[test]
+    fn test_extract_json_from_response_plain() {
+        let response = r#"{"candidates": [{"title": "Test", "summary": ["a"], "tags": [], "suggested_hub": null}]}"#;
+        let json = extract_json_from_response(response);
+        let parsed: LlmExtractionResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.candidates.len(), 1);
+        assert_eq!(parsed.candidates[0].title, "Test");
+    }
+
+    #[test]
+    fn test_extract_json_from_response_code_block() {
+        let response = "Here is the result:\n```json\n{\"candidates\": [{\"title\": \"Test\", \"summary\": [\"a\"], \"tags\": [], \"suggested_hub\": null}]}\n```";
+        let json = extract_json_from_response(response);
+        let parsed: LlmExtractionResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.candidates.len(), 1);
+    }
+
+    #[test]
+    fn test_extract_json_from_response_bare_code_block() {
+        let response = "```\n{\"candidates\": []}\n```";
+        let json = extract_json_from_response(response);
+        let parsed: LlmExtractionResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.candidates.len(), 0);
+    }
+
+    #[test]
+    fn test_hub_policy_never() {
+        let candidates = vec![
+            AtomicCandidate {
+                title: "Test".into(),
+                summary: vec![],
+                recommended_tags: vec!["rust".into()],
+                suggested_hub: Some("Hub: Rust".into()),
+            },
+        ];
+        let result = apply_hub_policy(&candidates, &HubCreatePolicy::Never);
+        assert_eq!(result, vec![None]);
+    }
+
+    #[test]
+    fn test_hub_policy_always() {
+        let candidates = vec![
+            AtomicCandidate {
+                title: "Test".into(),
+                summary: vec![],
+                recommended_tags: vec!["rust".into()],
+                suggested_hub: Some("Hub: Rust".into()),
+            },
+        ];
+        let result = apply_hub_policy(&candidates, &HubCreatePolicy::Always);
+        assert_eq!(result, vec![Some("Hub: Rust".into())]);
+    }
+
+    #[test]
+    fn test_hub_policy_auto_below_threshold() {
+        // Only 2 candidates share the "rust" tag — below the 3+ threshold
+        let candidates = vec![
+            AtomicCandidate {
+                title: "A".into(),
+                summary: vec![],
+                recommended_tags: vec!["rust".into()],
+                suggested_hub: Some("Hub: Rust".into()),
+            },
+            AtomicCandidate {
+                title: "B".into(),
+                summary: vec![],
+                recommended_tags: vec!["rust".into()],
+                suggested_hub: Some("Hub: Rust".into()),
+            },
+        ];
+        let result = apply_hub_policy(&candidates, &HubCreatePolicy::Auto);
+        assert_eq!(result, vec![None, None]);
+    }
+
+    #[test]
+    fn test_hub_policy_auto_above_threshold() {
+        // 3 candidates share "rust" tag — meets the 3+ threshold
+        let candidates = vec![
+            AtomicCandidate {
+                title: "A".into(),
+                summary: vec![],
+                recommended_tags: vec!["rust".into()],
+                suggested_hub: Some("Hub: Rust".into()),
+            },
+            AtomicCandidate {
+                title: "B".into(),
+                summary: vec![],
+                recommended_tags: vec!["rust".into()],
+                suggested_hub: Some("Hub: Rust".into()),
+            },
+            AtomicCandidate {
+                title: "C".into(),
+                summary: vec![],
+                recommended_tags: vec!["rust".into(), "wasm".into()],
+                suggested_hub: Some("Hub: Rust".into()),
+            },
+        ];
+        let result = apply_hub_policy(&candidates, &HubCreatePolicy::Auto);
+        assert_eq!(
+            result,
+            vec![
+                Some("Hub: Rust".into()),
+                Some("Hub: Rust".into()),
+                Some("Hub: Rust".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_hub_policy_auto_mixed_tags() {
+        // "rust" appears 3 times, "python" only 1 time
+        let candidates = vec![
+            AtomicCandidate {
+                title: "A".into(),
+                summary: vec![],
+                recommended_tags: vec!["rust".into()],
+                suggested_hub: Some("Hub: Rust".into()),
+            },
+            AtomicCandidate {
+                title: "B".into(),
+                summary: vec![],
+                recommended_tags: vec!["rust".into()],
+                suggested_hub: Some("Hub: Rust".into()),
+            },
+            AtomicCandidate {
+                title: "C".into(),
+                summary: vec![],
+                recommended_tags: vec!["rust".into()],
+                suggested_hub: Some("Hub: Rust".into()),
+            },
+            AtomicCandidate {
+                title: "D".into(),
+                summary: vec![],
+                recommended_tags: vec!["python".into()],
+                suggested_hub: Some("Hub: Python".into()),
+            },
+        ];
+        let result = apply_hub_policy(&candidates, &HubCreatePolicy::Auto);
+        // First 3 get hubs (rust is frequent), last one doesn't (python not frequent)
+        assert_eq!(
+            result,
+            vec![
+                Some("Hub: Rust".into()),
+                Some("Hub: Rust".into()),
+                Some("Hub: Rust".into()),
+                None,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_rules_extraction_h2_sections() {
+        let content = "# Container\n\nIntro text\n\n## First Section\n\nThis is a long enough section body with more than fifty characters of content for testing.\n\n- Point one\n- Point two\n\n## Second Section\n\nAnother section that also has enough content to pass the fifty character minimum threshold.\n\n- Detail A\n- Detail B\n";
+        let tags = vec!["test".to_string()];
+        let candidates = extract_candidates_rules(content, &tags);
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].title, "Atomic: First Section");
+        assert_eq!(candidates[1].title, "Atomic: Second Section");
+    }
+
+    #[test]
+    fn test_rules_extraction_skips_meta_sections() {
+        let content = "# Container\n\n## Metadata\n\nThis should be skipped even though it has enough characters to pass the threshold.\n\n## Real Section\n\nThis is a real section with enough content to pass the fifty character minimum threshold.\n";
+        let tags = vec![];
+        let candidates = extract_candidates_rules(content, &tags);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].title, "Atomic: Real Section");
+    }
+
+    #[test]
+    fn test_rules_extraction_skips_short_sections() {
+        let content = "# Container\n\n## Short\n\nToo short.\n\n## Long Enough\n\nThis section has enough content to pass the fifty character minimum threshold for extraction.\n";
+        let tags = vec![];
+        let candidates = extract_candidates_rules(content, &tags);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].title, "Atomic: Long Enough");
+    }
 }
