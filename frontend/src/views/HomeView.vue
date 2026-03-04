@@ -37,13 +37,6 @@
         <div class="header-right">
           <div class="action-buttons">
             <router-link
-              to="/chat"
-              class="btn btn-secondary"
-              title="Chat with Notes"
-            >
-              Chat
-            </router-link>
-            <router-link
               to="/canvas"
               class="btn btn-secondary"
               title="Multi-LLM Canvas"

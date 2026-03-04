@@ -239,8 +239,6 @@ fn main() {
             commands::retrieval::retrieve_relevant,
             commands::retrieval::get_retrieval_config,
             commands::retrieval::update_retrieval_config,
-            // Chat commands
-            commands::chat::chat_send,
         ])
         .run(tauri::generate_context!())
         .unwrap_or_else(|e| {

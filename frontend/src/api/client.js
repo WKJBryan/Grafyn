@@ -156,11 +156,6 @@ export const zettelkasten = {
   getLinkTypes: () => invoke('get_link_types', {}),
 }
 
-// Chat API (chat with notes)
-export const chat = {
-  send: (request) => invoke('chat_send', { request }),
-}
-
 // Retrieval API (temporal + graph-aware)
 export const retrieval = {
   retrieve: (query, limit = 10, contextNoteIds = []) =>

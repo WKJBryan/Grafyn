@@ -21,6 +21,8 @@ pub struct CanvasSession {
     pub tags: Vec<String>,
     #[serde(default = "default_status")]
     pub status: String,
+    #[serde(default)]
+    pub pinned_note_ids: Vec<String>,
 }
 
 fn default_status() -> String {
@@ -41,6 +43,7 @@ impl Default for CanvasSession {
             updated_at: now,
             tags: Vec::new(),
             status: "draft".to_string(),
+            pinned_note_ids: Vec::new(),
         }
     }
 }
@@ -63,6 +66,17 @@ impl Default for CanvasViewport {
     }
 }
 
+/// A note used as context for a tile prompt
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TileContextNote {
+    pub id: String,
+    pub title: String,
+    pub snippet: String,
+    pub score: f32,
+    #[serde(default)]
+    pub pinned: bool,
+}
+
 /// A tile on the canvas containing a prompt and model responses
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PromptTile {
@@ -81,6 +95,8 @@ pub struct PromptTile {
     pub parent_tile_id: Option<String>,
     #[serde(default)]
     pub parent_model_id: Option<String>,
+    #[serde(default)]
+    pub context_notes: Vec<TileContextNote>,
 }
 
 impl Default for PromptTile {
@@ -96,6 +112,7 @@ impl Default for PromptTile {
             context_mode: ContextMode::default(),
             parent_tile_id: None,
             parent_model_id: None,
+            context_notes: Vec::new(),
         }
     }
 }
@@ -126,9 +143,9 @@ impl Default for TilePosition {
 #[serde(rename_all = "snake_case")]
 pub enum ContextMode {
     None,
-    #[default]
     FullHistory,
     Compact,
+    #[default]
     Semantic,
 }
 
@@ -255,6 +272,7 @@ pub struct SessionUpdate {
     pub tags: Option<Vec<String>>,
     pub status: Option<String>,
     pub viewport: Option<CanvasViewport>,
+    pub pinned_note_ids: Option<Vec<String>>,
 }
 
 /// Minimal session metadata for list views
@@ -371,6 +389,11 @@ pub enum CanvasStreamEvent {
         tile_id: String,
         model_id: String,
         error: String,
+    },
+    ContextNotes {
+        session_id: String,
+        tile_id: String,
+        notes: Vec<TileContextNote>,
     },
     SessionSaved {
         session_id: String,
