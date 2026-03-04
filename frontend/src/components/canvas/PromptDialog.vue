@@ -62,6 +62,38 @@
           />
         </div>
 
+        <!-- Context Mode Selector (always visible) -->
+        <div class="form-group context-mode-group">
+          <label for="contextMode">Context Mode</label>
+          <select
+            id="contextMode"
+            v-model="contextMode"
+            class="select-input"
+          >
+            <option value="semantic">
+              Semantic Search (relevant notes)
+            </option>
+            <option value="none">
+              None (no additional context)
+            </option>
+            <option
+              v-if="branchContext"
+              value="full_history"
+            >
+              Full History (all previous turns)
+            </option>
+            <option
+              v-if="branchContext"
+              value="compact"
+            >
+              Compact (summary + recent)
+            </option>
+          </select>
+          <span class="context-mode-hint">
+            {{ contextModeHints[contextMode] }}
+          </span>
+        </div>
+
         <div
           class="advanced-toggle"
           @click="showAdvanced = !showAdvanced"
@@ -101,38 +133,6 @@
             </div>
           </div>
 
-          <!-- Context Mode Selector -->
-          <div class="form-group context-mode-group">
-            <label for="contextMode">Context Mode</label>
-            <select
-              id="contextMode"
-              v-model="contextMode"
-              class="select-input"
-            >
-              <option value="none">
-                None (no additional context)
-              </option>
-              <option value="semantic">
-                Semantic Search (relevant notes & tiles)
-              </option>
-              <option
-                v-if="branchContext"
-                value="full_history"
-              >
-                Full History (all previous turns)
-              </option>
-              <option
-                v-if="branchContext"
-                value="compact"
-              >
-                Compact (summary + recent)
-              </option>
-            </select>
-            <span class="context-mode-hint">
-              {{ contextModeHints[contextMode] }}
-            </span>
-          </div>
-          
           <!-- Context Budget Display -->
           <div
             v-if="selectedModels.length > 0"
@@ -196,7 +196,7 @@ const contextMode = ref('semantic')  // Default to semantic for note lookup
 // Context mode descriptions
 const contextModeHints = {
   none: 'No additional context - just your prompt',
-  semantic: 'Search your notes and previous conversations for relevant context',
+  semantic: 'Retrieves relevant notes (+ pinned notes) as LLM context',
   full_history: 'Include all conversation turns from the parent chain',
   compact: 'Include recent turns + summary of older context to save tokens'
 }

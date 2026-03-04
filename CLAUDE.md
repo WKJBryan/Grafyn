@@ -65,7 +65,7 @@ Grafyn is a **desktop-only** app — a single Tauri binary with a Vue frontend a
 │  │            Rust Backend                   │  │
 │  │  Commands → Services → Local Filesystem   │  │
 │  │  (notes, search, graph, canvas, distill,   │  │
-│  │   settings, feedback, mcp, memory, chat,   │  │
+│  │   settings, feedback, mcp, memory,         │  │
 │  │   import, priority, retrieval, zettelkasten)│  │
 │  └──────────────────────────────────────────┘  │
 │  ~/Documents/Grafyn/                          │
@@ -74,15 +74,14 @@ Grafyn is a **desktop-only** app — a single Tauri binary with a Vue frontend a
 └────────────────────────────────────────────────┘
 ```
 
-### Tauri IPC Commands (66 total across 14 modules)
+### Tauri IPC Commands (65 total across 13 modules)
 
 | Module | Commands | Purpose |
 |--------|----------|---------|
 | `commands/notes.rs` | `list_notes`, `get_note`, `create_note`, `update_note`, `delete_note` | Note CRUD |
 | `commands/search.rs` | `search_notes`, `find_similar`, `reindex` | Full-text search (graph-aware similarity) |
 | `commands/graph.rs` | `get_backlinks`, `get_outgoing`, `get_neighbors`, `get_unlinked`, `get_full_graph`, `rebuild_graph` | Link graph |
-| `commands/canvas.rs` | `list_sessions`, `get_session`, `create_session`, `update_session`, `delete_session`, `get_available_models`, `send_prompt`, `update_tile_position`, `delete_tile`, `delete_response`, `update_viewport`, `update_llm_node_position`, `auto_arrange`, `export_to_note`, `start_debate`, `continue_debate`, `add_models_to_tile`, `regenerate_response` | Multi-LLM canvas (streaming via `canvas-stream` Tauri events) |
-| `commands/chat.rs` | `chat_send` | Chat with notes (streaming via `chat-stream` Tauri events) |
+| `commands/canvas.rs` | `list_sessions`, `get_session`, `create_session`, `update_session`, `delete_session`, `get_available_models`, `send_prompt`, `update_tile_position`, `delete_tile`, `delete_response`, `update_viewport`, `update_llm_node_position`, `auto_arrange`, `export_to_note`, `start_debate`, `continue_debate`, `add_models_to_tile`, `regenerate_response` | Multi-LLM canvas with note context (streaming via `canvas-stream` Tauri events) |
 | `commands/distill.rs` | `distill_note`, `normalize_tags` | LLM + rules-based distillation with dedup and hub creation |
 | `commands/settings.rs` | `get_settings`, `get_settings_status`, `update_settings`, `complete_setup`, `pick_vault_folder`, `validate_openrouter_key`, `get_openrouter_status` | App settings & first-run setup |
 | `commands/feedback.rs` | `submit_feedback`, `get_system_info`, `feedback_status`, `get_pending_feedback`, `retry_pending_feedback`, `clear_pending_feedback` | Feedback with offline queue |
@@ -97,17 +96,16 @@ Grafyn is a **desktop-only** app — a single Tauri binary with a Vue frontend a
 
 ```javascript
 // src/api/client.js — all calls go through Tauri IPC
-import { notes, search, graph, canvas, chat, settings, mcp, memory,
+import { notes, search, graph, canvas, settings, mcp, memory,
          zettelkasten, feedback, priority, retrieval, importApi, isDesktopApp } from '@/api/client'
 
 // Every function calls invoke() directly to the Rust backend
-// Canvas streaming uses canvas-stream Tauri events
-// Chat streaming uses chat-stream Tauri events
+// Canvas streaming uses canvas-stream Tauri events (including ContextNotes for semantic mode)
 ```
 
 **Pinia Stores:** `notes.js`, `canvas.js`, `theme.js`
 
-**Frontend Routes:** `/` (notes), `/canvas`, `/canvas/:id`, `/chat`, `/import`
+**Frontend Routes:** `/` (notes), `/canvas`, `/canvas/:id`, `/import`
 
 ## Key Concepts
 
@@ -163,19 +161,15 @@ Container (evidence) → Atomic Notes (draft) → Hub (topic index)
 
 Discovers potential links using semantic similarity and LLM analysis. Three methods: **Semantic** (cosine similarity > threshold), **LLM** (OpenRouter analyzes content), **Hybrid** (semantic candidates + LLM ranking).
 
-### Multi-LLM Canvas
+### Multi-LLM Canvas (with Note Context)
 
-Compare responses from multiple LLM models simultaneously via OpenRouter. Features: parallel model streaming, infinite canvas with D3.js zoom/pan, model debate mode, session persistence in `data/canvas/`.
+Compare responses from multiple LLM models simultaneously via OpenRouter. Features: parallel model streaming, infinite canvas with D3.js zoom/pan, model debate mode, session persistence in `data/canvas/`, **semantic note context** (retrieves relevant notes as LLM system prompt).
 
-**Streaming architecture:** Commands return immediately, spawn async tasks, stream via `canvas-stream` Tauri events (`TileCreated`, `Chunk`, `Complete`, `Error`, `SessionSaved`, debate variants). Frontend listens via `@tauri-apps/api/event`.
+**Semantic context mode:** When `context_mode == Semantic` (the default), `send_prompt` uses the retrieval pipeline to find relevant notes, fetches their content, and injects it as system prompt context. Pinned notes per session (`pinned_note_ids`) are always included. Context notes are stored on the tile and emitted via `ContextNotes` event for frontend display.
+
+**Streaming architecture:** Commands return immediately, spawn async tasks, stream via `canvas-stream` Tauri events (`TileCreated`, `ContextNotes`, `Chunk`, `Complete`, `Error`, `SessionSaved`, debate variants). Frontend listens via `@tauri-apps/api/event`.
 
 Streaming commands: `send_prompt`, `start_debate`, `continue_debate`, `add_models_to_tile`, `regenerate_response`
-
-### Chat with Notes
-
-Conversational interface over the knowledge base. Uses the retrieval pipeline to find relevant notes, injects their content as system prompt context, then streams the LLM response via OpenRouter.
-
-**Streaming architecture:** Same pattern as canvas — `chat_send` returns a message ID immediately, spawns async task, streams via `chat-stream` Tauri events (`ContextNotes`, `Chunk`, `Complete`, `Error`).
 
 ### Conversation Import
 
@@ -205,7 +199,7 @@ Environment variables for the desktop app:
 
 | Variable | Notes |
 |----------|-------|
-| `OPENROUTER_API_KEY` | Required for Multi-LLM Canvas, Chat with Notes, distillation, link discovery |
+| `OPENROUTER_API_KEY` | Required for Multi-LLM Canvas (including note context), distillation, link discovery |
 | `GITHUB_FEEDBACK_REPO` | Target repo for feedback issues (format: `owner/repo`) |
 | `GITHUB_FEEDBACK_TOKEN` | GitHub PAT with `issues:write` scope |
 | `RUST_LOG` | Logging level (default: `info`) |
@@ -279,6 +273,33 @@ create-release → build (4-job matrix) → publish-release → upload-to-r2 →
 **Required secrets:** `TAURI_PRIVATE_KEY`, `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`, `FEEDBACK_REPO`, `FEEDBACK_TOKEN`
 
 **Required vars:** `CLOUDFLARE_WORKER_URL` (optional, has default)
+
+## CI Pitfalls (Known Issues & Fixes)
+
+### Tauri v1 Requires Ubuntu 22.04
+
+Tauri v1 depends on `libwebkit2gtk-4.0-dev` which **does not exist on Ubuntu 24.04** (`ubuntu-latest`). The `rust-tests` and `lint` CI jobs must use `runs-on: ubuntu-22.04`. Do NOT use `ubuntu-latest` for any job that compiles Tauri Rust code.
+
+- `libwebkit2gtk-4.1-dev` (Ubuntu 24.04) does NOT satisfy Tauri v1's `webkit2gtk-sys` crate — it provides `webkit2gtk-4.1.pc` but Tauri v1 needs `webkit2gtk-4.0.pc`.
+- The `linux-ipc-protocol` Tauri feature is **Tauri v2 only** — do not attempt to use it with Tauri v1.8.
+
+### Rust CI Requires MCP Binary + Stub dist/
+
+`cargo test` compiles the full crate including `tauri::generate_context!()`. Two prerequisites must exist before running tests:
+
+1. **MCP binary** — Tauri's `externalBin` config expects `binaries/grafyn-mcp-{target-triple}` at compile time.
+   ```bash
+   cargo build --bin grafyn-mcp --no-default-features --features mcp
+   cp target/debug/grafyn-mcp "binaries/grafyn-mcp-$(rustc -vV | grep host | awk '{print $2}')"
+   ```
+2. **Stub dist directory** — `tauri::generate_context!()` panics if `distDir` (configured as `../dist`) doesn't exist.
+   ```bash
+   mkdir -p ../dist && echo '<html></html>' > ../dist/index.html
+   ```
+
+### ESLint `_` Prefix Convention
+
+The project's `.eslintrc.cjs` uses `argsIgnorePattern: '^_'` / `varsIgnorePattern: '^_'` / `destructuredArrayIgnorePattern: '^_'` for the `no-unused-vars` rule. Prefix intentionally unused variables with `_` to suppress lint errors.
 
 ## Deployment
 

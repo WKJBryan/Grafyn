@@ -107,6 +107,7 @@ impl CanvasStore {
             updated_at: now,
             tags: create.tags,
             status: "draft".to_string(),
+            pinned_note_ids: Vec::new(),
         };
 
         self.write_session_file(&session)?;
@@ -132,6 +133,9 @@ impl CanvasStore {
         }
         if let Some(viewport) = update.viewport {
             session.viewport = viewport;
+        }
+        if let Some(pinned_note_ids) = update.pinned_note_ids {
+            session.pinned_note_ids = pinned_note_ids;
         }
 
         session.updated_at = Utc::now();

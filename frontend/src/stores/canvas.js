@@ -172,7 +172,7 @@ export const useCanvasStore = defineStore('canvas', () => {
     return unlisten
   }
 
-  async function sendPrompt(prompt, models, systemPrompt = null, temperature = 0.7, maxTokens = 2048, parentTileId = null, parentModelId = null, contextMode = 'full_history') {
+  async function sendPrompt(prompt, models, systemPrompt = null, temperature = 0.7, maxTokens = 2048, parentTileId = null, parentModelId = null, contextMode = 'semantic') {
     if (!currentSession.value) {
       throw new Error('No active session')
     }
@@ -219,6 +219,12 @@ export const useCanvasStore = defineStore('canvas', () => {
         tile_created: (data) => {
           if (currentSession.value && data.tile) {
             currentSession.value.prompt_tiles.push(data.tile)
+          }
+        },
+        context_notes: (data) => {
+          if (currentSession.value) {
+            const tile = currentSession.value.prompt_tiles.find(t => t.id === data.tile_id)
+            if (tile) tile.context_notes = data.notes || []
           }
         },
         chunk: (data) => {
@@ -779,6 +785,18 @@ export const useCanvasStore = defineStore('canvas', () => {
     debateStreamingContent.value = {}
   }
 
+  // Update pinned note IDs for the current session
+  async function updatePinnedNotes(noteIds) {
+    if (!currentSession.value) return
+    const sessionId = currentSession.value.id
+    currentSession.value.pinned_note_ids = noteIds
+    try {
+      await canvasApi.update(sessionId, { pinned_note_ids: noteIds })
+    } catch (err) {
+      console.error('Failed to update pinned notes:', err)
+    }
+  }
+
   // Branching helper - get parent response content for context
   function getParentResponseContent(parentTileId, parentModelId) {
     if (!currentSession.value || !parentTileId) return null
@@ -794,7 +812,7 @@ export const useCanvasStore = defineStore('canvas', () => {
   }
 
   // Branch from a specific model response
-  async function branchFromResponse(parentTileId, parentModelId, newPrompt, models, systemPrompt = null, temperature = 0.7, maxTokens = 2048, contextMode = 'full_history') {
+  async function branchFromResponse(parentTileId, parentModelId, newPrompt, models, systemPrompt = null, temperature = 0.7, maxTokens = 2048, contextMode = 'semantic') {
     return sendPrompt(newPrompt, models, systemPrompt, temperature, maxTokens, parentTileId, parentModelId, contextMode)
   }
 
@@ -838,6 +856,7 @@ export const useCanvasStore = defineStore('canvas', () => {
     getParentResponseContent,
     branchFromResponse,
     addModelToTile,
-    regenerateResponse
+    regenerateResponse,
+    updatePinnedNotes
   }
 })

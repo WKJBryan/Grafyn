@@ -30,6 +30,27 @@
       </div>
     </div>
 
+    <!-- Context Notes Badges -->
+    <div
+      v-if="tile.context_notes && tile.context_notes.length > 0"
+      class="context-notes-bar"
+    >
+      <span class="context-label">Notes:</span>
+      <span
+        v-for="note in tile.context_notes"
+        :key="note.id"
+        class="context-badge"
+        :class="{ pinned: note.pinned }"
+        :title="note.snippet"
+      >
+        <span
+          v-if="note.pinned"
+          class="pin-icon"
+        >&#128204;</span>
+        {{ note.title }}
+      </span>
+    </div>
+
     <div
       class="responses-grid"
       :style="gridStyle"
@@ -152,7 +173,7 @@ const dragStart = ref({ x: 0, y: 0, tileX: 0, tileY: 0 })
 const showBranchInput = ref(false)
 const branchPrompt = ref('')
 const branchInputRef = ref(null)
-const branchContextMode = ref('full_history')
+const branchContextMode = ref('semantic')
 
 // Computed
 const isStreaming = computed(() => {
@@ -431,6 +452,50 @@ onBeforeUnmount(() => {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
+}
+
+/* Context Notes Bar */
+.context-notes-bar {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px var(--spacing-sm);
+  background: rgba(124, 92, 255, 0.05);
+  border-bottom: 1px solid var(--bg-tertiary);
+  flex-wrap: wrap;
+  overflow: hidden;
+  max-height: 52px;
+}
+
+.context-notes-bar .context-label {
+  font-size: 0.6875rem;
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+
+.context-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 1px 6px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-tertiary);
+  color: var(--text-secondary);
+  font-size: 0.6875rem;
+  white-space: nowrap;
+  max-width: 120px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: default;
+}
+
+.context-badge.pinned {
+  background: rgba(124, 92, 255, 0.15);
+  color: var(--accent-primary);
+}
+
+.pin-icon {
+  font-size: 0.625rem;
 }
 
 /* Branch Section */

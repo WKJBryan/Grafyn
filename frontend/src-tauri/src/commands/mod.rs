@@ -1,5 +1,4 @@
 pub mod canvas;
-pub mod chat;
 pub mod distill;
 pub mod feedback;
 pub mod graph;

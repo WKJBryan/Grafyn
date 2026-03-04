@@ -83,6 +83,7 @@
             </button>
           </div>
         </div>
+        <PinnedNotesPanel />
         <button
           class="btn btn-secondary btn-sm"
           :disabled="!session || saving"
@@ -354,6 +355,7 @@ import LLMNode from './LLMNode.vue'
 import DebateNode from './DebateNode.vue'
 import PromptDialog from './PromptDialog.vue'
 import AddModelDialog from './AddModelDialog.vue'
+import PinnedNotesPanel from './PinnedNotesPanel.vue'
 
 const props = defineProps({
   sessionId: {
@@ -853,12 +855,12 @@ async function handlePromptSubmit({ prompt, models, systemPrompt, temperature, m
         systemPrompt,
         temperature,
         maxTokens,
-        contextMode || 'full_history'
+        contextMode || 'semantic'
       )
       branchContext.value = null
     } else {
       // Regular prompt
-      await canvasStore.sendPrompt(prompt, models, systemPrompt, temperature, maxTokens)
+      await canvasStore.sendPrompt(prompt, models, systemPrompt, temperature, maxTokens, null, null, contextMode || 'semantic')
     }
   } catch (err) {
     console.error('Failed to send prompt:', err)
@@ -871,7 +873,7 @@ async function handlePromptSubmit({ prompt, models, systemPrompt, temperature, m
 }
 
 // Handle branch from LLM node
-function handleLLMBranch(tileId, modelId, prompt, contextMode = 'full_history', selectedModels = null) {
+function handleLLMBranch(tileId, modelId, prompt, contextMode = 'semantic', selectedModels = null) {
   // Get parent context
   const parentInfo = canvasStore.getParentResponseContent(tileId, modelId)
   branchContext.value = {

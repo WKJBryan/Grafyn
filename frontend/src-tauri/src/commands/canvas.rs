@@ -1,8 +1,9 @@
 use crate::models::canvas::{
-    AddModelsRequest, AvailableModel, CanvasSession, CanvasStreamEvent,
+    AddModelsRequest, AvailableModel, CanvasSession, CanvasStreamEvent, ContextMode,
     CanvasViewport, Debate, DebateContinueRequest, DebateResponse, DebateRound,
     DebateStartRequest, LLMNodePositionUpdate, ModelResponse, PromptRequest, PromptTile,
-    ResponseStatus, SessionCreate, SessionMeta, SessionUpdate, TilePosition, TilePositionUpdate,
+    ResponseStatus, SessionCreate, SessionMeta, SessionUpdate, TileContextNote, TilePosition,
+    TilePositionUpdate,
 };
 use crate::models::note::{NoteCreate, NoteStatus};
 use crate::services::openrouter::ChatMessage;
@@ -77,6 +78,72 @@ pub async fn send_prompt(
     let tile_id = uuid::Uuid::new_v4().to_string();
     let now = Utc::now();
 
+    // --- Semantic context: retrieve relevant notes when context_mode is Semantic ---
+    let (context_notes, computed_system_prompt) = if request.context_mode == ContextMode::Semantic {
+        // Get pinned note IDs from the session
+        let pinned_ids = {
+            let mut store = state.canvas_store.write().await;
+            store
+                .get_session(&session_id)
+                .map(|s| s.pinned_note_ids.clone())
+                .unwrap_or_default()
+        };
+
+        // Retrieve relevant notes
+        let retrieval_results = {
+            let search = state.search_service.read().await;
+            let graph = state.graph_index.read().await;
+            let priority = state.priority_service.read().await;
+            let retrieval = state.retrieval_service.read().await;
+            retrieval
+                .retrieve(&search, &graph, &priority, &request.prompt, 5, &pinned_ids)
+                .unwrap_or_default()
+        };
+
+        // Fetch full note content and build context
+        let note_contexts: Vec<(String, String, String)> = {
+            let store = state.knowledge_store.read().await;
+            retrieval_results
+                .iter()
+                .filter_map(|r| {
+                    store.get_note(&r.note.id).ok().map(|note| {
+                        let truncated = if note.content.len() > 1500 {
+                            format!("{}...", &note.content[..1500])
+                        } else {
+                            note.content.clone()
+                        };
+                        (note.id.clone(), note.title.clone(), truncated)
+                    })
+                })
+                .collect()
+        };
+
+        // Build tile context notes for the frontend
+        let tile_context: Vec<TileContextNote> = retrieval_results
+            .iter()
+            .map(|r| TileContextNote {
+                id: r.note.id.clone(),
+                title: r.note.title.clone(),
+                snippet: r.snippet.clone(),
+                score: r.score,
+                pinned: pinned_ids.contains(&r.note.id),
+            })
+            .collect();
+
+        // Build note context prompt, merge with user's system_prompt if provided
+        let note_prompt = build_note_context_prompt(&note_contexts);
+        let merged = match &request.system_prompt {
+            Some(user_sp) if !user_sp.is_empty() => {
+                format!("{}\n\n{}", note_prompt, user_sp)
+            }
+            _ => note_prompt,
+        };
+
+        (tile_context, Some(merged))
+    } else {
+        (Vec::new(), request.system_prompt.clone())
+    };
+
     // Compute LLM node positions (offset from prompt tile)
     let prompt_pos = request.position.clone().unwrap_or_default();
     let llm_start_x = prompt_pos.x + prompt_pos.width + 80.0;
@@ -107,7 +174,7 @@ pub async fn send_prompt(
         );
     }
 
-    // Create the tile
+    // Create the tile (with context notes attached)
     let tile = PromptTile {
         id: tile_id.clone(),
         prompt: request.prompt.clone(),
@@ -119,6 +186,7 @@ pub async fn send_prompt(
         context_mode: request.context_mode,
         parent_tile_id: request.parent_tile_id,
         parent_model_id: request.parent_model_id,
+        context_notes: context_notes.clone(),
     };
 
     // Save tile to session
@@ -136,12 +204,24 @@ pub async fn send_prompt(
         },
     );
 
+    // Emit ContextNotes event (so frontend can display which notes were used)
+    if !context_notes.is_empty() {
+        let _ = window.emit(
+            "canvas-stream",
+            CanvasStreamEvent::ContextNotes {
+                session_id: session_id.clone(),
+                tile_id: tile_id.clone(),
+                notes: context_notes,
+            },
+        );
+    }
+
     // Clone what we need for the spawned task
     let openrouter_arc = state.openrouter.clone();
     let canvas_store_arc = state.canvas_store.clone();
     let models = request.models.clone();
     let prompt = request.prompt.clone();
-    let system_prompt = request.system_prompt.clone();
+    let system_prompt = computed_system_prompt;
     let temperature = request.temperature;
     let max_tokens = request.max_tokens;
     let tile_id_clone = tile_id.clone();
@@ -1293,4 +1373,53 @@ pub async fn regenerate_response(
     });
 
     Ok(())
+}
+
+/// Build a system prompt that includes retrieved note context.
+/// Used by send_prompt when context_mode is Semantic.
+fn build_note_context_prompt(notes: &[(String, String, String)]) -> String {
+    let mut prompt = String::from(
+        "You are a helpful knowledge assistant for the user's personal note-taking system (Grafyn). \
+         Answer questions using the context from the user's notes below. \
+         Reference specific notes by title when citing information. \
+         If the notes don't contain relevant information, say so honestly.\n\n",
+    );
+
+    if notes.is_empty() {
+        prompt.push_str("No relevant notes were found for this query.\n");
+    } else {
+        prompt.push_str("## Relevant Notes\n\n");
+        for (id, title, content) in notes {
+            prompt.push_str(&format!("### {} (id: {})\n{}\n\n", title, id, content));
+        }
+    }
+
+    prompt
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_build_note_context_prompt_with_notes() {
+        let notes = vec![
+            ("id1".into(), "Note A".into(), "Content of A".into()),
+            ("id2".into(), "Note B".into(), "Content of B".into()),
+        ];
+        let prompt = build_note_context_prompt(&notes);
+
+        assert!(prompt.contains("Note A"));
+        assert!(prompt.contains("Content of A"));
+        assert!(prompt.contains("Note B"));
+        assert!(prompt.contains("id: id1"));
+    }
+
+    #[test]
+    fn test_build_note_context_prompt_empty() {
+        let notes: Vec<(String, String, String)> = vec![];
+        let prompt = build_note_context_prompt(&notes);
+
+        assert!(prompt.contains("No relevant notes were found"));
+    }
 }
