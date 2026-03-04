@@ -428,7 +428,7 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           VERSION: ${{ steps.version.outputs.version }}
         run: |
-          npm i -g wrangler
+          npm i -g wrangler@3
 
           upload_with_retry() {
             local file="$1"
@@ -444,7 +444,7 @@ jobs:
               if [ -n "$content_type" ]; then
                 ct_flag="--content-type $content_type"
               fi
-              if wrangler r2 object put "$key" --file "$file" $ct_flag 2>&1; then
+              if wrangler r2 object put "$key" --file "$file" --remote $ct_flag 2>&1; then
                 echo "  Upload complete."
                 return 0
               fi
@@ -472,6 +472,25 @@ jobs:
             fi
           done
           echo "Upload complete!"
+
+      - name: Verify R2 upload
+        env:
+          WORKER_URL: ${{ vars.CLOUDFLARE_WORKER_URL || 'https://grafyn-updater.grafyn-updater.workers.dev' }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          EXPECTED_VERSION="${VERSION#v}"
+
+          # Curl the actual Worker endpoint — the same URL Tauri's updater hits.
+          # This catches account-ID mismatches that wrangler read-back would miss
+          # (since wrangler would read from the same wrong bucket it uploaded to).
+          sleep 5  # allow R2 propagation
+          UPLOADED_VERSION=$(curl -sf "${WORKER_URL}/latest.json" | jq -r '.version')
+
+          if [ "$UPLOADED_VERSION" != "$EXPECTED_VERSION" ]; then
+            echo "::error::R2 latest.json version mismatch! Expected $EXPECTED_VERSION but Worker serves $UPLOADED_VERSION. The CLOUDFLARE_ACCOUNT_ID secret likely points to the wrong account."
+            exit 1
+          fi
+          echo "R2 verified: Worker serves latest.json version = $UPLOADED_VERSION"
 
   # ============================================================================
   # Summary
