@@ -3,7 +3,10 @@
     ref="container"
     class="canvas-container"
   >
-    <div class="canvas-toolbar">
+    <div
+      class="canvas-toolbar"
+      data-guide="canvas-toolbar"
+    >
       <div class="toolbar-left">
         <span
           v-if="session"
@@ -83,9 +86,10 @@
             </button>
           </div>
         </div>
-        <PinnedNotesPanel />
+        <PinnedNotesPanel data-guide="pinned-notes-btn" />
         <button
           class="btn btn-secondary btn-sm"
+          data-guide="canvas-save-btn"
           :disabled="!session || saving"
           title="Save as Note"
           @click="handleSaveAsNote"

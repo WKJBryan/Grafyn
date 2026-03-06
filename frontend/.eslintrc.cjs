@@ -16,6 +16,9 @@ module.exports = {
   plugins: [
     'vue',
   ],
+  globals: {
+    __APP_VERSION__: 'readonly',
+  },
   rules: {
     'vue/multi-word-component-names': 'off',
     'no-console': process.env.NODE_ENV === 'production' ? 'warn' : 'off',

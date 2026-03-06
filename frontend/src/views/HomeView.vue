@@ -32,7 +32,10 @@
           </div>
         </div>
         <div class="header-center">
-          <SearchBar @select="handleSearchSelect" />
+          <SearchBar
+            data-guide="search-bar"
+            @select="handleSearchSelect"
+          />
         </div>
         <div class="header-right">
           <div class="action-buttons">
@@ -46,12 +49,22 @@
             <button
               class="btn btn-ghost"
               title="Settings"
+              data-guide="settings-btn"
               @click="showSettingsModal = true"
             >
               ⚙️
             </button>
             <button
+              class="btn btn-ghost"
+              title="Guide"
+              data-guide="help-btn"
+              @click="guide.togglePanel()"
+            >
+              ?
+            </button>
+            <button
               class="btn btn-primary"
+              data-guide="new-note-btn"
               @click="handleNewNote"
             >
               + New Note
@@ -63,7 +76,10 @@
       <!-- Main Content -->
       <div class="app-main">
         <!-- Left Sidebar: Navigation & Tags -->
-        <aside class="sidebar-left">
+        <aside
+          class="sidebar-left"
+          data-guide="sidebar-left"
+        >
           <TreeNav 
             :notes="filteredNotes" 
             :selected-id="selectedNoteId"
@@ -94,7 +110,10 @@
               </button>
             </div>
           </div>
-          <div class="full-graph-container">
+          <div
+            class="full-graph-container"
+            data-guide="graph-view"
+          >
             <div class="graph-header">
               <h2>Knowledge Graph</h2>
             </div>
@@ -262,7 +281,9 @@ import FeedbackModal from '../components/FeedbackModal.vue'
 import SettingsModal from '../components/SettingsModal.vue'
 import ConfirmDialog from '../components/ConfirmDialog.vue'
 import { useToast } from '../composables/useToast'
+import { useGuide } from '../composables/useGuide'
 
+const guide = useGuide()
 const notes = ref([])
 const selectedNoteId = ref(null)
 const selectedNote = ref(null)

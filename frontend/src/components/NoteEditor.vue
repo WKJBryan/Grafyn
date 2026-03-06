@@ -14,6 +14,7 @@
         <button
           v-if="note.id"
           class="btn btn-secondary"
+          data-guide="discover-links-btn"
           :disabled="isDiscovering"
           title="Discover potential links to other notes"
           @click="handleDiscoverLinks"
@@ -36,6 +37,7 @@
         <button
           v-if="canDistill"
           class="btn btn-accent"
+          data-guide="distill-btn"
           :disabled="isDistilling"
           title="Extract atomic notes from this container"
           @click="handleDistill"
