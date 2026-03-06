@@ -102,8 +102,8 @@
             <option value="compact">
               Compact
             </option>
-            <option value="semantic">
-              Semantic
+            <option value="knowledge_search">
+              Knowledge Search
             </option>
           </select>
         </div>
@@ -173,7 +173,7 @@ const dragStart = ref({ x: 0, y: 0, tileX: 0, tileY: 0 })
 const showBranchInput = ref(false)
 const branchPrompt = ref('')
 const branchInputRef = ref(null)
-const branchContextMode = ref('semantic')
+const branchContextMode = ref('knowledge_search')
 
 // Computed
 const isStreaming = computed(() => {

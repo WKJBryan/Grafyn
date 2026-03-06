@@ -9,3 +9,6 @@ pub mod priority;
 pub mod retrieval;
 pub mod search;
 pub mod settings;
+pub mod similarity;
+pub mod texttiling;
+pub mod yake;

@@ -98,6 +98,14 @@ impl SettingsService {
             self.settings.mcp_enabled = mcp_enabled;
         }
 
+        if let Some(llm_model) = update.llm_model {
+            self.settings.llm_model = if llm_model.is_empty() {
+                crate::models::settings::default_llm_model()
+            } else {
+                llm_model
+            };
+        }
+
         // Persist to disk
         self.save()?;
 

@@ -855,12 +855,12 @@ async function handlePromptSubmit({ prompt, models, systemPrompt, temperature, m
         systemPrompt,
         temperature,
         maxTokens,
-        contextMode || 'semantic'
+        contextMode || 'knowledge_search'
       )
       branchContext.value = null
     } else {
       // Regular prompt
-      await canvasStore.sendPrompt(prompt, models, systemPrompt, temperature, maxTokens, null, null, contextMode || 'semantic')
+      await canvasStore.sendPrompt(prompt, models, systemPrompt, temperature, maxTokens, null, null, contextMode || 'knowledge_search')
     }
   } catch (err) {
     console.error('Failed to send prompt:', err)
@@ -873,7 +873,7 @@ async function handlePromptSubmit({ prompt, models, systemPrompt, temperature, m
 }
 
 // Handle branch from LLM node
-function handleLLMBranch(tileId, modelId, prompt, contextMode = 'semantic', selectedModels = null) {
+function handleLLMBranch(tileId, modelId, prompt, contextMode = 'knowledge_search', selectedModels = null) {
   // Get parent context
   const parentInfo = canvasStore.getParentResponseContent(tileId, modelId)
   branchContext.value = {

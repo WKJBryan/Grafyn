@@ -3,6 +3,8 @@ use crate::models::note::{
     HubUpdate, NoteCreate, NoteStatus, NoteUpdate,
 };
 use crate::services::openrouter::ChatMessage;
+use crate::services::texttiling::{self, TextTilingConfig};
+use crate::services::yake;
 use crate::AppState;
 use lazy_static::lazy_static;
 use regex::Regex;
@@ -208,7 +210,9 @@ fn extract_candidates_rules(
                 }
 
                 let summary = extract_summary_bullets(&h3_body);
-                let section_tags = parse_inline_tags(&h3_body);
+                let mut section_tags = parse_inline_tags(&h3_body);
+                section_tags.extend(yake::extract_tags(&h3_body, 3));
+                let section_tags = section_tags;
                 let recommended_tags = merge_and_limit_tags(section_tags, &inherited);
                 let suggested_hub = suggest_hub(&h3_title, &recommended_tags);
 
@@ -234,7 +238,9 @@ fn extract_candidates_rules(
 
         // Normal H2 section — extract as single candidate
         let summary = extract_summary_bullets(&body);
-        let section_tags = parse_inline_tags(&body);
+        let mut section_tags = parse_inline_tags(&body);
+        section_tags.extend(yake::extract_tags(&body, 3));
+        let section_tags = section_tags;
         let recommended_tags = merge_and_limit_tags(section_tags, &inherited);
         let suggested_hub = suggest_hub(&title, &recommended_tags);
 
@@ -276,6 +282,51 @@ struct LlmCandidate {
     suggested_hub: Option<String>,
 }
 
+/// LLM V2 response format with confidence scoring and recursive splitting
+#[derive(Debug, Deserialize)]
+struct LlmExtractionResponseV2 {
+    candidates: Vec<LlmCandidateV2>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LlmCandidateV2 {
+    title: String,
+    summary: Vec<String>,
+    #[serde(default)]
+    tags: Vec<String>,
+    suggested_hub: Option<String>,
+    #[serde(default)]
+    keyphrases: Vec<String>,
+    #[serde(default = "default_confidence")]
+    confidence: f64,
+    #[serde(default)]
+    sub_candidates: Option<Vec<LlmCandidateV2>>,
+}
+
+fn default_confidence() -> f64 {
+    1.0
+}
+
+/// Recursively flatten sub_candidates where confidence < 0.7.
+fn flatten_candidates(candidates: Vec<LlmCandidateV2>) -> Vec<LlmCandidateV2> {
+    let mut flat = Vec::new();
+    for c in candidates {
+        if c.confidence < 0.7 {
+            if let Some(subs) = c.sub_candidates {
+                if !subs.is_empty() {
+                    flat.extend(flatten_candidates(subs));
+                    continue;
+                }
+            }
+        }
+        flat.push(LlmCandidateV2 {
+            sub_candidates: None,
+            ..c
+        });
+    }
+    flat
+}
+
 /// Extract JSON from an LLM response, handling ```json wrapping
 fn extract_json_from_response(response: &str) -> String {
     let trimmed = response.trim();
@@ -298,8 +349,9 @@ fn extract_json_from_response(response: &str) -> String {
 
 /// Extract atomic candidates using structured LLM extraction (JSON response).
 ///
-/// Asks the LLM to return a JSON array of candidates with title, summary, tags,
-/// and optional hub suggestion — far more reliable than markdown → H2 parsing.
+/// Uses V2 prompt format requesting confidence scoring, keyphrases, and recursive
+/// sub_candidates for low-coherence chunks. Falls back to V1 format parsing if
+/// the model doesn't handle V2 well.
 async fn extract_candidates_llm(
     content: &str,
     container_tags: &[String],
@@ -315,10 +367,19 @@ async fn extract_candidates_llm(
         Respond with ONLY a JSON object in this exact format:\n\
         {{\"candidates\": [{{\"title\": \"Clear Descriptive Title\", \
         \"summary\": [\"Key point 1\", \"Key point 2\"], \
-        \"tags\": [\"tag1\", \"tag2\"], \
-        \"suggested_hub\": \"Hub: Topic\" }}]}}\n\n\
-        Set suggested_hub to null if no hub is appropriate. \
-        Use lowercase hyphenated tags. Extract 1-10 candidates.",
+        \"tags\": [\"lowercase-hyphenated-tag\"], \
+        \"suggested_hub\": \"Hub: Topic\", \
+        \"keyphrases\": [\"key phrase 1\", \"key phrase 2\"], \
+        \"confidence\": 0.85, \
+        \"sub_candidates\": null }}]}}\n\n\
+        Rules:\n\
+        - Set suggested_hub to null if no hub is appropriate\n\
+        - Use lowercase hyphenated tags\n\
+        - Extract 3-5 keyphrases per chunk (significant terms from the content)\n\
+        - Rate confidence 0-1 for how coherent/focused each chunk is\n\
+        - If a chunk covers multiple sub-topics (confidence < 0.7), split it \
+        into sub_candidates with the same format\n\
+        - Extract 1-10 candidates",
         content
     );
 
@@ -327,10 +388,15 @@ async fn extract_candidates_llm(
         content: prompt,
     }];
 
+    let model = {
+        let settings = state.settings_service.read().await;
+        settings.get().llm_model.clone()
+    };
+
     let openrouter = state.openrouter.read().await;
     let response = openrouter
         .chat(
-            "anthropic/claude-3.5-haiku",
+            &model,
             messages,
             Some(system),
             Some(0.3),
@@ -340,6 +406,41 @@ async fn extract_candidates_llm(
         .map_err(|e| format!("LLM extraction failed: {}", e))?;
 
     let json_str = extract_json_from_response(&response);
+    let inherited = inherited_tags(container_tags);
+
+    // Try V2 format first, fall back to V1
+    if let Ok(parsed_v2) = serde_json::from_str::<LlmExtractionResponseV2>(&json_str) {
+        let flattened = flatten_candidates(parsed_v2.candidates);
+        return Ok(flattened
+            .into_iter()
+            .map(|c| {
+                let mut section_tags: Vec<String> =
+                    c.tags.iter().map(|t| normalize_tag(t)).collect();
+                // Merge 1-2 word keyphrases as additional tag candidates
+                for kp in &c.keyphrases {
+                    if kp.split_whitespace().count() <= 2 {
+                        section_tags.push(normalize_tag(kp));
+                    }
+                }
+                let recommended_tags = merge_and_limit_tags(section_tags, &inherited);
+                let suggested_hub =
+                    c.suggested_hub.or_else(|| suggest_hub(&c.title, &recommended_tags));
+
+                AtomicCandidate {
+                    title: c.title,
+                    summary: if c.summary.is_empty() {
+                        vec!["No summary provided".to_string()]
+                    } else {
+                        c.summary
+                    },
+                    recommended_tags,
+                    suggested_hub,
+                }
+            })
+            .collect());
+    }
+
+    // V1 fallback
     let parsed: LlmExtractionResponse = serde_json::from_str(&json_str).map_err(|e| {
         format!(
             "Failed to parse LLM JSON: {} (response: {})",
@@ -347,8 +448,6 @@ async fn extract_candidates_llm(
             &json_str[..json_str.len().min(200)]
         )
     })?;
-
-    let inherited = inherited_tags(container_tags);
 
     Ok(parsed
         .candidates
@@ -371,6 +470,63 @@ async fn extract_candidates_llm(
             }
         })
         .collect())
+}
+
+// ── TextTile extraction ──────────────────────────────────────────────────
+
+/// Extract atomic candidates using TextTiling segmentation + YAKE keyphrases.
+///
+/// Splits the note content at detected topic boundaries, then uses YAKE to
+/// generate titles and tags for each segment.
+fn extract_candidates_texttile(
+    content: &str,
+    container_tags: &[String],
+) -> Vec<AtomicCandidate> {
+    let config = TextTilingConfig::default();
+    let segments = texttiling::segment(content, &config);
+    let inherited = inherited_tags(container_tags);
+
+    segments
+        .into_iter()
+        .filter(|seg| seg.content.split_whitespace().count() >= 30)
+        .map(|seg| {
+            let title = format!("Atomic: {}", yake::generate_title(&seg.content));
+            let yake_tags = yake::extract_tags(&seg.content, 3);
+            let inline_tags = parse_inline_tags(&seg.content);
+            let section_tags: Vec<String> = yake_tags.into_iter().chain(inline_tags).collect();
+            let recommended_tags = merge_and_limit_tags(section_tags, &inherited);
+            let suggested_hub = suggest_hub(&title, &recommended_tags);
+
+            let summary = extract_summary_bullets(&seg.content);
+            let summary = if summary.is_empty() {
+                let truncated: String = seg.content.chars().take(200).collect();
+                vec![if seg.content.len() > 200 {
+                    format!("{}...", truncated)
+                } else {
+                    truncated
+                }]
+            } else {
+                summary
+            };
+
+            AtomicCandidate {
+                title,
+                summary,
+                recommended_tags,
+                suggested_hub,
+            }
+        })
+        .collect()
+}
+
+/// Algorithm extraction: heading heuristic (≥2 H2 → rules splitting, else TextTiling).
+fn extract_candidates_algorithm(content: &str, tags: &[String]) -> Vec<AtomicCandidate> {
+    let h2_count = content.matches("\n## ").count();
+    if h2_count >= 2 {
+        extract_candidates_rules(content, tags)
+    } else {
+        extract_candidates_texttile(content, tags)
+    }
 }
 
 // ── Deduplication ─────────────────────────────────────────────────────────
@@ -579,14 +735,13 @@ pub async fn distill_note(
         store.get_note(&id).map_err(|e| e.to_string())?
     };
 
-    // 2. Determine extraction method
-    let openrouter_configured = {
-        let or = state.openrouter.read().await;
-        or.is_configured()
-    };
-
+    // 2. Determine extraction strategy
     let use_llm = match request.extraction_mode {
         ExtractionMode::Llm => {
+            let openrouter_configured = {
+                let or = state.openrouter.read().await;
+                or.is_configured()
+            };
             if !openrouter_configured {
                 return Err(
                     "LLM extraction requested but OpenRouter API key not configured".into(),
@@ -594,35 +749,40 @@ pub async fn distill_note(
             }
             true
         }
-        ExtractionMode::Rules => false,
-        ExtractionMode::Auto => openrouter_configured,
+        ExtractionMode::Algorithm => false,
     };
 
-    let extraction_method_used = if use_llm { "llm" } else { "rules" };
+    let mut extraction_method_used = if use_llm {
+        "llm".to_string()
+    } else {
+        "algorithm".to_string()
+    };
 
     // 3. Extract candidates
     let mut llm_fallback_msg: Option<String> = None;
     let candidates = if use_llm {
-        // Structured LLM extraction with JSON response, fallback to rules
+        // Structured LLM extraction with V2 JSON response, fallback to Algorithm
         match extract_candidates_llm(&note.content, &note.tags, &state).await {
             Ok(c) if !c.is_empty() => c,
             Ok(_) => {
-                log::info!("LLM returned no candidates, falling back to rules");
+                log::info!("LLM returned no candidates, falling back to algorithm");
                 llm_fallback_msg =
-                    Some("LLM returned no candidates, fell back to rules".to_string());
-                extract_candidates_rules(&note.content, &note.tags)
+                    Some("LLM returned no candidates, fell back to algorithm".to_string());
+                extraction_method_used = "algorithm".to_string();
+                extract_candidates_algorithm(&note.content, &note.tags)
             }
             Err(e) => {
-                log::warn!("LLM extraction failed, falling back to rules: {}", e);
+                log::warn!("LLM extraction failed, falling back to algorithm: {}", e);
                 llm_fallback_msg = Some(format!(
-                    "LLM extraction failed ({}), fell back to rules",
+                    "LLM extraction failed ({}), fell back to algorithm",
                     e
                 ));
-                extract_candidates_rules(&note.content, &note.tags)
+                extraction_method_used = "algorithm".to_string();
+                extract_candidates_algorithm(&note.content, &note.tags)
             }
         }
     } else {
-        extract_candidates_rules(&note.content, &note.tags)
+        extract_candidates_algorithm(&note.content, &note.tags)
     };
 
     if candidates.is_empty() {

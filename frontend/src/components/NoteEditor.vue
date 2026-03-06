@@ -1,13 +1,15 @@
 <template>
   <div class="note-editor">
     <div class="editor-header">
-      <input
-        v-model="localNote.title"
-        type="text"
-        class="title-input"
-        placeholder="Note title..."
-        @input="handleDirty"
-      >
+      <div class="header-top">
+        <input
+          v-model="localNote.title"
+          type="text"
+          class="title-input"
+          placeholder="Note title..."
+          @input="handleDirty"
+        >
+      </div>
       <div class="editor-actions">
         <button
           v-if="note.id"
@@ -24,11 +26,8 @@
           class="distill-mode-select"
           title="Extraction method"
         >
-          <option value="auto">
-            Auto
-          </option>
-          <option value="rules">
-            Rules
+          <option value="algorithm">
+            Algorithm
           </option>
           <option value="llm">
             LLM
@@ -161,7 +160,7 @@ const isDirty = ref(false)
 const tagsInput = ref(props.note.tags ? props.note.tags.join(', ') : '')
 const isDistilling = ref(false)
 const distillMessage = ref('')
-const distillMode = ref('auto')
+const distillMode = ref('algorithm')
 const showLinkModal = ref(false)
 const isDiscovering = ref(false)
 const linkCandidates = ref([])
@@ -337,15 +336,22 @@ function handleLinksApplied() {
 
 .editor-header {
   display: flex;
-  align-items: center;
-  justify-content: space-between;
+  flex-direction: column;
   padding: var(--spacing-md);
   border-bottom: 1px solid var(--bg-tertiary);
   gap: var(--spacing-sm);
 }
 
+.header-top {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  gap: var(--spacing-sm);
+}
+
 .title-input {
   flex: 1;
+  min-width: 150px;
   background: transparent;
   border: none;
   color: var(--text-primary);
@@ -364,8 +370,10 @@ function handleLinksApplied() {
 
 .editor-actions {
   display: flex;
+  flex-wrap: wrap;
   gap: var(--spacing-sm);
-  flex-shrink: 0;
+  width: 100%;
+  justify-content: flex-end;
 }
 
 .editor-tabs {
@@ -598,7 +606,7 @@ function handleLinksApplied() {
 
 .distill-mode-select {
   width: auto;
-  min-width: 80px;
+  min-width: 100px;
   padding: 4px 8px;
   font-size: 0.8rem;
   background: var(--bg-tertiary);

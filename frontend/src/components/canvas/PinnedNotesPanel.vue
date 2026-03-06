@@ -93,7 +93,7 @@
         v-else-if="searchResults.length === 0"
         class="empty-state"
       >
-        Pin notes to always include them as context in semantic mode.
+        Pin notes to always include them as context in Knowledge Search mode.
       </div>
     </div>
   </div>

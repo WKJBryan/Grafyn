@@ -121,7 +121,26 @@
       "Bash(npx tauri build:*)",
       "WebFetch(domain:docs.rs)",
       "WebFetch(domain:www.shuttle.dev)",
-      "Bash(cargo test:*)"
+      "Bash(cargo test:*)",
+      "Bash(git check-ignore:*)",
+      "Bash(npx eslint:*)",
+      "Bash(del \"C:\\\\Users\\\\bryan\\\\Seedream\\\\frontend\\\\src-tauri\\\\binaries\\\\grafyn-backend-x86_64-pc-windows-msvc.exe\")",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(tail:*)",
+      "Bash(cd /c/Users/bryan/Seedream && gh repo view WKJBryan/Grafyn --json name,owner,url,isPrivate 2>&1)",
+      "Bash(cd /c/Users/bryan/Seedream && gh variable list --repo WKJBryan/Grafyn 2>&1)",
+      "Bash(echo OLD REPO NOT ACCESSIBLE:*)",
+      "Bash(cd:*)",
+      "Bash(cd /c/Users/bryan/Seedream && gh workflow run \"Test Suite\" --repo WKJBryan/Grafyn --ref main 2>&1)",
+      "Bash(cd /c/Users/bryan/Seedream && gh run rerun 22279277813 --repo WKJBryan/Grafyn 2>&1)",
+      "Bash(cd /c/Users/bryan/Seedream/frontend && npm run test:run -- --reporter verbose src/__tests__/unit/components/SearchBar.spec.js 2>&1)",
+      "Bash(cd /c/Users/bryan/Seedream/frontend && npm run test:run 2>&1)",
+      "Bash(cd /c/Users/bryan/Seedream/frontend && npm run test:run -- --reporter verbose src/__tests__/unit/components/NoteEditor.spec.js 2>&1)",
+      "Bash(cd /c/Users/bryan/Seedream/frontend && npm run test:run -- --reporter verbose 2>&1)",
+      "Bash(cd /c/Users/bryan/Seedream && gh variable list 2>&1)",
+      "WebFetch(domain:developers.cloudflare.com)",
+      "WebFetch(domain:grafyn-updater.grafyn-updater.workers.dev)",
+      "Bash(head:*)"
     ]
   },
   "outputStyle": "Explanatory"

@@ -1,0 +1,39 @@
+{
+  "version": "0.0.6",
+  "notes": "",
+  "pub_date": "2026-02-25T08:52:15.513Z",
+  "platforms": {
+    "darwin-aarch64": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSRkhKT1J2c3liYTJBSXZ2T2Z0K1lFQlJ0bXpsVFJTODlpK0dPem9PSC9NWVJhcHFZSzVqT21zK1JPOVJ2WU9CQkZaNThSWFBvRHNGZ25zSkV5Q3dKeFlBbHNSRUFtbXdBPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzcyMDA4MzQ5CWZpbGU6R3JhZnluLmFwcC50YXIuZ3oKMDJNcUtmaWswdVVSanRrdDF4ZDJiRUIwOW5mbitqbXlpYkFPZDZOL2FSRzRidXczZGJBK3RmbHhMVk9CSTlxa0hvVXVuN0ZYaHBzZ21ObXFtSHpWQmc9PQo=",
+      "url": "https://grafyn-updater.grafyn-updater.workers.dev/download/v0.0.6/Grafyn_aarch64.app.tar.gz"
+    },
+    "darwin-aarch64-app": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSRkhKT1J2c3liYTJBSXZ2T2Z0K1lFQlJ0bXpsVFJTODlpK0dPem9PSC9NWVJhcHFZSzVqT21zK1JPOVJ2WU9CQkZaNThSWFBvRHNGZ25zSkV5Q3dKeFlBbHNSRUFtbXdBPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzcyMDA4MzQ5CWZpbGU6R3JhZnluLmFwcC50YXIuZ3oKMDJNcUtmaWswdVVSanRrdDF4ZDJiRUIwOW5mbitqbXlpYkFPZDZOL2FSRzRidXczZGJBK3RmbHhMVk9CSTlxa0hvVXVuN0ZYaHBzZ21ObXFtSHpWQmc9PQo=",
+      "url": "https://grafyn-updater.grafyn-updater.workers.dev/download/v0.0.6/Grafyn_aarch64.app.tar.gz"
+    },
+    "linux-x86_64": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSRkhKT1J2c3liYXpkcDh4bUgwdTYvSXNLRHYrYkRyVlMvNHFXcmVhZTc2NUFNOFJkNVM1MlFCaUs2SjNabHo0eHJ1RGVYb285Z1prS1RDdW9iSmN4dmpOQUpmUUxjRlFrPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzcyMDA4OTc5CWZpbGU6Z3JhZnluXzAuMC42X2FtZDY0LkFwcEltYWdlLnRhci5negpTKy8xTkltY3grQjhTNFh2ZTlsWG45NC81Qm44ODNuby9NYVlSamJodG5PblNjSXlvcno0Q3hETnQxdTZTY1dJSlFxQ0tWVStDTS92Q3hUMWIzelFDZz09Cg==",
+      "url": "https://grafyn-updater.grafyn-updater.workers.dev/download/v0.0.6/grafyn_0.0.6_amd64.AppImage.tar.gz"
+    },
+    "linux-x86_64-appimage": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSRkhKT1J2c3liYXpkcDh4bUgwdTYvSXNLRHYrYkRyVlMvNHFXcmVhZTc2NUFNOFJkNVM1MlFCaUs2SjNabHo0eHJ1RGVYb285Z1prS1RDdW9iSmN4dmpOQUpmUUxjRlFrPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzcyMDA4OTc5CWZpbGU6Z3JhZnluXzAuMC42X2FtZDY0LkFwcEltYWdlLnRhci5negpTKy8xTkltY3grQjhTNFh2ZTlsWG45NC81Qm44ODNuby9NYVlSamJodG5PblNjSXlvcno0Q3hETnQxdTZTY1dJSlFxQ0tWVStDTS92Q3hUMWIzelFDZz09Cg==",
+      "url": "https://grafyn-updater.grafyn-updater.workers.dev/download/v0.0.6/grafyn_0.0.6_amd64.AppImage.tar.gz"
+    },
+    "windows-x86_64": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSRkhKT1J2c3liYTFuY2VPeTlNaHJoOHlISGFXekRQUFZOS0hiN1QvcFgzbnArWTlsTit6VGtYbFA0bHlGSkY4RWdiQmo1ZDhrZ1dyQnEvT1I1ZzM2dFliRnE5MzdQb3cwPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzcyMDA5NTEzCWZpbGU6R3JhZnluXzAuMC42X3g2NC1zZXR1cC5uc2lzLnppcAplRkxaUzJlaTlQaG1HN3lncUM5aDBQRzRtTFlxUzZOTWRmQktZY2JpcEZjcERyY0p3REJXOTJ0YjNLZ0svR3BUamRPYUJicTlxR1hhS1ZaTkx1VDNDUT09Cg==",
+      "url": "https://grafyn-updater.grafyn-updater.workers.dev/download/v0.0.6/Grafyn_0.0.6_x64-setup.nsis.zip"
+    },
+    "windows-x86_64-nsis": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSRkhKT1J2c3liYTFuY2VPeTlNaHJoOHlISGFXekRQUFZOS0hiN1QvcFgzbnArWTlsTit6VGtYbFA0bHlGSkY4RWdiQmo1ZDhrZ1dyQnEvT1I1ZzM2dFliRnE5MzdQb3cwPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzcyMDA5NTEzCWZpbGU6R3JhZnluXzAuMC42X3g2NC1zZXR1cC5uc2lzLnppcAplRkxaUzJlaTlQaG1HN3lncUM5aDBQRzRtTFlxUzZOTWRmQktZY2JpcEZjcERyY0p3REJXOTJ0YjNLZ0svR3BUamRPYUJicTlxR1hhS1ZaTkx1VDNDUT09Cg==",
+      "url": "https://grafyn-updater.grafyn-updater.workers.dev/download/v0.0.6/Grafyn_0.0.6_x64-setup.nsis.zip"
+    },
+    "windows-aarch64": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSRkhKT1J2c3liYXpxKzdWaHNYMVYyZi9mQXNVMTF2VG5hUEUvcWhrZjByWkpZZENpcWxOQmlhVTlDUGVCVUM1WEhFUzNQRElab05hWGZDWUpUMlpTdW9uSDB4WStjWkFFPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzcyMDA5NTI5CWZpbGU6R3JhZnluXzAuMC42X2FybTY0LXNldHVwLm5zaXMuemlwCnFPZVpCWWxyQzJITDNCdkxHUzVuZkFpWEtvZmZVVmFhQ1lYYTBJdVhLTGJuVy8wdmJNbzZqOXdXa2kreFcxV2Mzallnd1hVN1FYL3B4NmUyWUFzRkN3PT0K",
+      "url": "https://grafyn-updater.grafyn-updater.workers.dev/download/v0.0.6/Grafyn_0.0.6_arm64-setup.nsis.zip"
+    },
+    "windows-aarch64-nsis": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSRkhKT1J2c3liYXpxKzdWaHNYMVYyZi9mQXNVMTF2VG5hUEUvcWhrZjByWkpZZENpcWxOQmlhVTlDUGVCVUM1WEhFUzNQRElab05hWGZDWUpUMlpTdW9uSDB4WStjWkFFPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzcyMDA5NTI5CWZpbGU6R3JhZnluXzAuMC42X2FybTY0LXNldHVwLm5zaXMuemlwCnFPZVpCWWxyQzJITDNCdkxHUzVuZkFpWEtvZmZVVmFhQ1lYYTBJdVhLTGJuVy8wdmJNbzZqOXdXa2kreFcxV2Mzallnd1hVN1FYL3B4NmUyWUFzRkN3PT0K",
+      "url": "https://grafyn-updater.grafyn-updater.workers.dev/download/v0.0.6/Grafyn_0.0.6_arm64-setup.nsis.zip"
+    }
+  }
+}
