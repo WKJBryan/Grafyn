@@ -1,0 +1,39 @@
+changelog:
+  exclude:
+    labels:
+      - skip-changelog
+      - duplicate
+      - invalid
+      - question
+      - wontfix
+    authors:
+      - dependabot
+      - github-actions
+  categories:
+    - title: Breaking Changes
+      labels:
+        - breaking-change
+        - semver-major
+    - title: Added
+      labels:
+        - feature
+        - enhancement
+        - semver-minor
+    - title: Fixed
+      labels:
+        - bug
+        - fix
+        - hotfix
+    - title: Debugged
+      labels:
+        - debug
+    - title: Changed
+      labels:
+        - refactor
+        - maintenance
+        - docs
+        - performance
+        - dependencies
+    - title: Other
+      labels:
+        - "*"

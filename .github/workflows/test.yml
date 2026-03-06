@@ -1,14 +1,15 @@
 name: Test Suite
 
 on:
-  push:
-    branches: [main]
   pull_request:
     branches: [main]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
+
+env:
+  RUST_CACHE_VERSION: v1
 
 jobs:
   # ============================================================================
@@ -26,6 +27,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: frontend/src-tauri
+          key: ${{ runner.os }}-ubuntu2204-stable-${{ hashFiles('frontend/src-tauri/Cargo.lock', '.github/workflows/test.yml') }}-${{ env.RUST_CACHE_VERSION }}
 
       - name: Install system dependencies
         run: |
@@ -80,6 +82,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: frontend/src-tauri
+          key: ${{ runner.os }}-ubuntu2204-clippy-${{ hashFiles('frontend/src-tauri/Cargo.lock', '.github/workflows/test.yml') }}-${{ env.RUST_CACHE_VERSION }}
 
       - name: Set up Node.js
         uses: actions/setup-node@v4

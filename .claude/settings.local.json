@@ -140,7 +140,8 @@
       "Bash(cd /c/Users/bryan/Seedream && gh variable list 2>&1)",
       "WebFetch(domain:developers.cloudflare.com)",
       "WebFetch(domain:grafyn-updater.grafyn-updater.workers.dev)",
-      "Bash(head:*)"
+      "Bash(head:*)",
+      "Bash(npx vitest:*)"
     ]
   },
   "outputStyle": "Explanatory"

@@ -13,7 +13,15 @@
             {{ themeIcon }}
           </button>
           <button
+            class="btn btn-ghost btn-sm"
+            title="Guide"
+            @click="guide.togglePanel()"
+          >
+            ?
+          </button>
+          <button
             class="btn btn-primary btn-sm"
+            data-guide="canvas-new-btn"
             @click="createNewSession"
           >
             + New
@@ -178,6 +186,7 @@ import { isDesktopApp } from '@/api/client'
 import CanvasContainer from '@/components/canvas/CanvasContainer.vue'
 import SettingsModal from '@/components/SettingsModal.vue'
 import ConfirmDialog from '@/components/ConfirmDialog.vue'
+import { useGuide } from '@/composables/useGuide'
 
 const route = useRoute()
 const router = useRouter()
@@ -192,6 +201,7 @@ const showSettingsModal = ref(false)
 const showDeleteConfirm = ref(false)
 const pendingDeleteSessionId = ref(null)
 const _isDesktop = isDesktopApp()
+const guide = useGuide()
 
 // Computed property to get the current theme icon
 const themeIcon = computed(() => {

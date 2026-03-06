@@ -14,6 +14,7 @@
     >
       <button
         class="btn btn-primary file-btn"
+        data-guide="import-file-btn"
         :disabled="loading"
         @click="handlePickFile"
       >
