@@ -25,10 +25,18 @@ pub struct UserSettings {
     /// Whether MCP sidecar is enabled
     #[serde(default)]
     pub mcp_enabled: bool,
+
+    /// LLM model for distillation & link discovery (OpenRouter model ID)
+    #[serde(default = "default_llm_model")]
+    pub llm_model: String,
 }
 
 fn default_theme() -> String {
     "system".to_string()
+}
+
+pub fn default_llm_model() -> String {
+    "anthropic/claude-3.5-haiku".to_string()
 }
 
 impl Default for UserSettings {
@@ -39,6 +47,7 @@ impl Default for UserSettings {
             setup_completed: false,
             theme: default_theme(),
             mcp_enabled: false,
+            llm_model: default_llm_model(),
         }
     }
 }
@@ -87,6 +96,7 @@ pub struct SettingsUpdate {
     pub setup_completed: Option<bool>,
     pub theme: Option<String>,
     pub mcp_enabled: Option<bool>,
+    pub llm_model: Option<String>,
 }
 
 /// Response for settings status check
@@ -98,6 +108,7 @@ pub struct SettingsStatus {
     pub vault_path: Option<String>,
     pub theme: String,
     pub mcp_enabled: bool,
+    pub llm_model: String,
 }
 
 impl From<&UserSettings> for SettingsStatus {
@@ -109,6 +120,7 @@ impl From<&UserSettings> for SettingsStatus {
             vault_path: settings.vault_path.clone(),
             theme: settings.theme.clone(),
             mcp_enabled: settings.mcp_enabled,
+            llm_model: settings.llm_model.clone(),
         }
     }
 }

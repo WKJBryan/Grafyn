@@ -143,6 +143,60 @@
           </p>
         </div>
 
+        <!-- LLM Model Section (non-setup only, requires API key) -->
+        <div
+          v-if="!isSetup && openrouterKey"
+          class="setting-section"
+        >
+          <label class="setting-label">
+            <span class="label-icon">🧠</span>
+            LLM Model
+          </label>
+          <p class="setting-description">
+            Model used for note distillation and link discovery. Faster models are cheaper but may produce lower quality results.
+          </p>
+          <div
+            class="model-combobox"
+            role="combobox"
+            :aria-expanded="showModelDropdown"
+          >
+            <input
+              v-model="modelSearchQuery"
+              type="text"
+              class="model-search-input"
+              placeholder="Search models..."
+              :disabled="modelsLoading"
+              @focus="showModelDropdown = true"
+              @input="highlightedModelIndex = 0"
+              @keydown.down.prevent="highlightedModelIndex = Math.min(highlightedModelIndex + 1, filteredModels.length - 1)"
+              @keydown.up.prevent="highlightedModelIndex = Math.max(highlightedModelIndex - 1, 0)"
+              @keydown.enter.prevent="selectHighlightedModel"
+              @keydown.escape="showModelDropdown = false"
+            >
+            <ul
+              v-if="showModelDropdown && filteredModels.length > 0"
+              class="model-dropdown"
+            >
+              <li
+                v-for="(model, index) in filteredModels"
+                :key="model.id"
+                class="model-option"
+                :class="{ highlighted: index === highlightedModelIndex }"
+                @mousedown.prevent="selectModel(model)"
+                @mouseenter="highlightedModelIndex = index"
+              >
+                {{ model.name }} <span class="model-provider">({{ model.provider }})</span>
+              </li>
+            </ul>
+            <div
+              v-if="showModelDropdown && !modelsLoading && filteredModels.length === 0"
+              class="model-dropdown model-no-results"
+            >
+              No models found
+            </div>
+          </div>
+        </div>
+
         <!-- Theme Section (non-setup only) -->
         <div
           v-if="!isSetup"
@@ -296,9 +350,9 @@
 </template>
 
 <script setup>
-import { ref, watch, onMounted } from 'vue'
+import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
 import { useRouter } from 'vue-router'
-import { settings as settingsApi, mcp as mcpApi, isDesktopApp } from '@/api/client'
+import { settings as settingsApi, mcp as mcpApi, canvas as canvasApi, isDesktopApp } from '@/api/client'
 import { useToast } from '@/composables/useToast'
 import { useThemeStore } from '@/stores/theme'
 
@@ -329,7 +383,53 @@ const isDesktop = isDesktopApp()
 const vaultPath = ref('')
 const openrouterKey = ref('')
 const theme = ref('system')
+const llmModel = ref('anthropic/claude-3.5-haiku')
 const keyValidationState = ref(null) // 'validating' | 'valid' | 'invalid' | null
+
+// LLM model state
+const availableModels = ref([])
+const modelsLoading = ref(false)
+const modelSearchQuery = ref('')
+const showModelDropdown = ref(false)
+const highlightedModelIndex = ref(0)
+
+const filteredModels = computed(() => {
+  if (!availableModels.value.length) return []
+  const q = modelSearchQuery.value.toLowerCase().trim()
+  if (!q) return availableModels.value.slice(0, 50)
+  return availableModels.value.filter(m =>
+    m.name.toLowerCase().includes(q) ||
+    m.id.toLowerCase().includes(q) ||
+    m.provider.toLowerCase().includes(q)
+  ).slice(0, 30)
+})
+
+function selectModel(model) {
+  llmModel.value = model.id
+  modelSearchQuery.value = `${model.name} (${model.provider})`
+  showModelDropdown.value = false
+}
+
+function selectHighlightedModel() {
+  if (filteredModels.value.length > 0 && highlightedModelIndex.value < filteredModels.value.length) {
+    selectModel(filteredModels.value[highlightedModelIndex.value])
+  }
+}
+
+// Close dropdown on outside click
+function handleClickOutside(e) {
+  const combobox = document.querySelector('.model-combobox')
+  if (combobox && !combobox.contains(e.target)) {
+    showModelDropdown.value = false
+  }
+}
+
+onMounted(() => {
+  document.addEventListener('mousedown', handleClickOutside)
+})
+onUnmounted(() => {
+  document.removeEventListener('mousedown', handleClickOutside)
+})
 
 // MCP state
 const mcpAvailable = ref(false)
@@ -394,12 +494,35 @@ const loadCurrentSettings = async () => {
       vaultPath.value = currentSettings.vault_path || ''
       openrouterKey.value = currentSettings.openrouter_api_key || ''
       theme.value = currentSettings.theme || 'system'
+      llmModel.value = currentSettings.llm_model || 'anthropic/claude-3.5-haiku'
     }
 
     // Load MCP status (binary availability + config snippet)
     await loadMcpStatus()
+
+    // Load available models if API key is configured
+    if (openrouterKey.value) {
+      await loadAvailableModels()
+      // Set display text for current model
+      const current = availableModels.value.find(m => m.id === llmModel.value)
+      modelSearchQuery.value = current ? `${current.name} (${current.provider})` : llmModel.value
+    }
   } catch (e) {
     console.error('Failed to load settings:', e)
+  }
+}
+
+// Load available LLM models from OpenRouter
+const loadAvailableModels = async () => {
+  modelsLoading.value = true
+  try {
+    const models = await canvasApi.getModels()
+    availableModels.value = models || []
+  } catch (e) {
+    console.error('Failed to load models:', e)
+    availableModels.value = []
+  } finally {
+    modelsLoading.value = false
   }
 }
 
@@ -453,6 +576,7 @@ const saveSettings = async () => {
       vault_path: vaultPath.value || null,
       openrouter_api_key: openrouterKey.value || null,
       theme: theme.value,
+      llm_model: llmModel.value || null,
     }
 
     if (props.isSetup) {
@@ -731,6 +855,69 @@ onMounted(() => {
 
 .theme-option input {
   display: none;
+}
+
+.model-combobox {
+  position: relative;
+}
+
+.model-search-input {
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid var(--border-color, #e0e0e0);
+  border-radius: 8px;
+  font-size: 0.9rem;
+  background: var(--bg-primary, #fff);
+  color: var(--text-primary, #1a1a1a);
+  box-sizing: border-box;
+}
+
+.model-search-input:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.model-dropdown {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  right: 0;
+  max-height: 200px;
+  overflow-y: auto;
+  background: var(--bg-primary, #fff);
+  border: 1px solid var(--border-color, #e0e0e0);
+  border-top: none;
+  border-radius: 0 0 8px 8px;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  z-index: 10;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+}
+
+.model-option {
+  padding: 8px 12px;
+  cursor: pointer;
+  font-size: 0.85rem;
+  color: var(--text-primary, #1a1a1a);
+}
+
+.model-option:hover,
+.model-option.highlighted {
+  background: var(--accent-color, #7c3aed);
+  color: white;
+}
+
+.model-option .model-provider {
+  opacity: 0.7;
+  font-size: 0.8rem;
+}
+
+.model-no-results {
+  padding: 10px 12px;
+  font-size: 0.85rem;
+  color: var(--text-secondary, #666);
+  text-align: center;
 }
 
 .modal-footer {

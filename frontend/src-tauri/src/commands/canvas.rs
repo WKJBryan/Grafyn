@@ -78,8 +78,9 @@ pub async fn send_prompt(
     let tile_id = uuid::Uuid::new_v4().to_string();
     let now = Utc::now();
 
-    // --- Semantic context: retrieve relevant notes when context_mode is Semantic ---
-    let (context_notes, computed_system_prompt) = if request.context_mode == ContextMode::Semantic {
+    // --- Knowledge search context: retrieve relevant notes ---
+    let use_knowledge_search = matches!(request.context_mode, ContextMode::KnowledgeSearch | ContextMode::Semantic);
+    let (context_notes, computed_system_prompt) = if use_knowledge_search {
         // Get pinned note IDs from the session
         let pinned_ids = {
             let mut store = state.canvas_store.write().await;

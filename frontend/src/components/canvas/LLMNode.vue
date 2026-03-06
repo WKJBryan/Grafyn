@@ -257,8 +257,8 @@
           <option value="compact">
             Compact
           </option>
-          <option value="semantic">
-            Semantic
+          <option value="knowledge_search">
+            Knowledge Search
           </option>
         </select>
       </div>

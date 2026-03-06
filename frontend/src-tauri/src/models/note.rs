@@ -39,13 +39,11 @@ impl std::str::FromStr for NoteStatus {
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ExtractionMode {
-    /// Rules-based: split on H2/H3 headings, parse inline tags
-    Rules,
-    /// LLM: structured JSON extraction via OpenRouter
-    Llm,
-    /// Auto: prefer LLM if configured, fall back to rules
+    /// Algorithm: heading heuristic (≥2 H2 → rules splitting, else TextTiling) + YAKE
     #[default]
-    Auto,
+    Algorithm,
+    /// LLM: structured JSON extraction via OpenRouter (falls back to Algorithm)
+    Llm,
 }
 
 /// Hub creation policy during distillation

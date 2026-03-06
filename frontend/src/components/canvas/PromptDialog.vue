@@ -70,8 +70,8 @@
             v-model="contextMode"
             class="select-input"
           >
-            <option value="semantic">
-              Semantic Search (relevant notes)
+            <option value="knowledge_search">
+              Knowledge Search (relevant notes)
             </option>
             <option value="none">
               None (no additional context)
@@ -191,12 +191,12 @@ const selectedModels = ref([])
 const temperature = ref(0.7)
 const maxTokens = ref(2048)
 const showAdvanced = ref(false)
-const contextMode = ref('semantic')  // Default to semantic for note lookup
+const contextMode = ref('knowledge_search')  // Default to knowledge search for note lookup
 
 // Context mode descriptions
 const contextModeHints = {
   none: 'No additional context - just your prompt',
-  semantic: 'Retrieves relevant notes (+ pinned notes) as LLM context',
+  knowledge_search: 'Retrieves relevant notes (+ pinned notes) as LLM context',
   full_history: 'Include all conversation turns from the parent chain',
   compact: 'Include recent turns + summary of older context to save tokens'
 }
@@ -222,7 +222,7 @@ const estimatedTokens = computed(() => {
   // Estimate context tokens based on mode
   const contextMultiplier = {
     none: 1.0,          // No additional context
-    semantic: 1.3,      // Semantic search results
+    knowledge_search: 1.3,  // Knowledge search results
     full_history: 1.5,  // Include conversation history
     compact: 1.2        // Compact summary
   }

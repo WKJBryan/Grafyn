@@ -150,7 +150,7 @@ Distillation splits large "container" notes into focused "atomic" notes:
 Container (evidence) → Atomic Notes (draft) → Hub (topic index)
 ```
 
-- **Extraction modes:** `rules` (H2/H3 splitting), `llm` (structured JSON via OpenRouter), `auto` (LLM with rules fallback)
+- **Extraction modes:** `rules` (H2/H3 splitting), `llm` (structured JSON via OpenRouter, model configurable via settings), `auto` (LLM with rules fallback)
 - **Hub creation policy:** `auto` (tag frequency ≥3), `always`, `never`
 - **Deduplication:** `skip` (default — skips matching titles), `merge`, `create`
 - Tag normalization: `#Tag` → `tag` (lowercase, strip #, spaces→hyphens)
@@ -187,7 +187,9 @@ Submit bug reports, feature requests, and general feedback. Creates GitHub Issue
 
 ### Settings System
 
-First-run setup wizard and persistent settings. Manages vault path, OpenRouter API key, MCP configuration, and theme preferences. Settings stored as JSON in app data directory. Frontend: `SettingsModal.vue`.
+First-run setup wizard and persistent settings. Manages vault path, OpenRouter API key, MCP configuration, theme preferences, and LLM model selection. Settings stored as JSON in app data directory. Frontend: `SettingsModal.vue`.
+
+- **`llm_model`** — configurable LLM model for distillation and link discovery (default: `anthropic/claude-3.5-haiku`), selectable via Settings dropdown when API key is configured
 
 **Runtime sync pattern:** When settings change via `update_settings`, dependent services are updated in-place — no restart required. The pattern (in `commands/settings.rs`): capture changed fields before moving the update, apply settings, then sync each affected service:
 - **OpenRouter API key** → `openrouter.set_api_key()`

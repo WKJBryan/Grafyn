@@ -138,7 +138,7 @@ impl Default for TilePosition {
 }
 
 /// Context mode for branching conversations.
-/// Values match what the frontend sends: none, full_history, compact, semantic.
+/// Values match what the frontend sends: none, full_history, compact, knowledge_search.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ContextMode {
@@ -146,6 +146,9 @@ pub enum ContextMode {
     FullHistory,
     Compact,
     #[default]
+    KnowledgeSearch,
+    /// Legacy alias for KnowledgeSearch — accept "semantic" from old saved sessions
+    #[serde(rename = "semantic")]
     Semantic,
 }
 

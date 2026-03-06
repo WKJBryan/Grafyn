@@ -3,6 +3,7 @@ use crate::models::note::{
     NoteUpdate, ZettelLinkCandidate,
 };
 use crate::services::openrouter::ChatMessage;
+use crate::services::yake::{self, YakeConfig, STOPWORDS};
 use crate::AppState;
 use lazy_static::lazy_static;
 use regex::Regex;
@@ -24,16 +25,6 @@ lazy_static! {
     /// Inline code removal
     static ref INLINE_CODE_RE: Regex = Regex::new(r"`[^`]+`").unwrap();
 }
-
-/// Stopwords to exclude from key term extraction
-const STOPWORDS: &[&str] = &[
-    "this", "that", "with", "from", "have", "been", "will", "would", "should", "could", "might",
-    "their", "there", "these", "those", "they", "them", "then", "than", "what", "when", "where",
-    "which", "while", "about", "after", "before", "between", "into", "through", "during", "each",
-    "some", "other", "more", "most", "also", "only", "very", "just", "like", "such", "well",
-    "here", "even", "back", "over", "much", "many", "make", "made", "does", "done", "take",
-    "note", "notes",
-];
 
 // ── Link type definitions ────────────────────────────────────────────────
 
@@ -70,7 +61,10 @@ fn reverse_link_type(link_type: &str) -> &'static str {
 
 // ── Key term extraction ──────────────────────────────────────────────────
 
-/// Extract key terms from markdown content (proper nouns, acronyms, long words)
+/// Extract key terms from markdown content using YAKE keyphrases + regex patterns.
+///
+/// YAKE provides statistically significant multi-word keyphrases. Regex patterns
+/// supplement with proper nouns and acronyms that YAKE may miss.
 fn extract_key_terms(content: &str) -> HashSet<String> {
     let stopwords: HashSet<&str> = STOPWORDS.iter().copied().collect();
 
@@ -81,7 +75,17 @@ fn extract_key_terms(content: &str) -> HashSet<String> {
 
     let mut terms = HashSet::new();
 
-    // Proper nouns (lowercased)
+    // Primary: YAKE keyphrases (lowercased, up to bigrams for overlap matching)
+    let config = YakeConfig {
+        max_ngram_size: 2,
+        top_k: 15,
+        ..YakeConfig::default()
+    };
+    for kp in yake::extract_keyphrases(&clean, &config) {
+        terms.insert(kp.text.to_lowercase());
+    }
+
+    // Supplementary: proper nouns (lowercased)
     for m in PROPER_NOUN_RE.find_iter(&clean) {
         let t = m.as_str().to_lowercase();
         if t.len() >= 3 && !stopwords.contains(t.as_str()) {
@@ -89,18 +93,10 @@ fn extract_key_terms(content: &str) -> HashSet<String> {
         }
     }
 
-    // Acronyms (lowercased)
+    // Supplementary: acronyms (lowercased)
     for m in ACRONYM_RE.find_iter(&clean) {
         let t = m.as_str().to_lowercase();
         if t.len() >= 2 {
-            terms.insert(t);
-        }
-    }
-
-    // Long words
-    for m in LONG_WORD_RE.find_iter(&clean) {
-        let t = m.as_str().to_lowercase();
-        if t.len() >= 4 && !stopwords.contains(t.as_str()) {
             terms.insert(t);
         }
     }
@@ -300,15 +296,15 @@ async fn find_keyword_links(
         let term_overlap = note_terms.intersection(&other_terms).count();
         let tag_overlap = note_tags.intersection(&other_tags).count();
 
-        // Require meaningful overlap
+        // Require meaningful overlap (YAKE keyphrases are higher-quality terms)
         if term_overlap >= 2 || (tag_overlap >= 1 && term_overlap >= 1) {
-            let confidence = ((term_overlap as f64 * 0.15) + (tag_overlap as f64 * 0.25)).min(0.9);
+            let confidence = ((term_overlap as f64 * 0.12) + (tag_overlap as f64 * 0.25)).min(0.9);
             candidates.push(ZettelLinkCandidate {
                 target_id: meta.id.clone(),
                 target_title: meta.title.clone(),
                 link_type: "related".to_string(),
                 confidence: (confidence * 100.0).round() / 100.0,
-                reason: format!("Shared {} terms, {} tags", term_overlap, tag_overlap),
+                reason: format!("Shared {} keyphrases, {} tags", term_overlap, tag_overlap),
             });
         }
     }
@@ -392,10 +388,15 @@ async fn find_llm_links(
         content: prompt,
     }];
 
+    let model = {
+        let settings = state.settings_service.read().await;
+        settings.get().llm_model.clone()
+    };
+
     let response = {
         let or = state.openrouter.read().await;
         match or
-            .chat("anthropic/claude-3.5-haiku", messages, None, Some(0.2), Some(800))
+            .chat(&model, messages, None, Some(0.2), Some(800))
             .await
         {
             Ok(r) => r,
