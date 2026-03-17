@@ -1,6 +1,6 @@
 [package]
 name = "grafyn"
-version = "0.1.1"
+version = "0.1.2"
 description = "Grafyn - Knowledge Management Desktop App"
 authors = ["Bryan"]
 license = "MIT"
@@ -27,8 +27,6 @@ tauri = { version = "1.8", optional = true, features = [
     "dialog-all",
     "fs-all",
     "path-all",
-    "process-all",
-    "protocol-all",
     "updater",
     "window-all"
 ] }
@@ -73,6 +71,7 @@ env_logger = "0.11"
 
 # System paths
 dirs = "5.0"
+keyring = "2.3"
 
 # MCP server (optional — only needed for the grafyn-mcp binary)
 rmcp = { version = "0.15", features = ["server", "transport-io"], optional = true }

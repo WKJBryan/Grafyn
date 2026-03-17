@@ -1,7 +1,7 @@
 <template>
   <div
     class="llm-node"
-    :class="{ dragging: isDragging, streaming: isStreaming, selected, error: hasError }"
+    :class="{ dragging: isDragging, resizing: isResizing, streaming: isStreaming, selected, error: hasError }"
     :style="nodeStyle"
     @mousedown="handleMouseDown"
   >
@@ -183,7 +183,7 @@
           class="branch-model-tags"
         >
           <span 
-            v-for="mId in branchModels.slice(0, 3)" 
+            v-for="mId in branchModels" 
             :key="mId" 
             class="branch-model-tag"
           >
@@ -192,12 +192,6 @@
               class="tag-remove-btn"
               @click.stop="removeModel(mId)"
             >×</button>
-          </span>
-          <span
-            v-if="branchModels.length > 3"
-            class="more-models"
-          >
-            +{{ branchModels.length - 3 }} more
           </span>
         </div>
         
@@ -278,12 +272,20 @@
         </button>
       </div>
     </div>
+
+    <div
+      class="resize-handle"
+      @mousedown.stop="startResize"
+    />
   </div>
 </template>
 
 <script setup>
 import { ref, computed, onBeforeUnmount, watch, nextTick } from 'vue'
 import { marked } from 'marked'
+
+const MIN_WIDTH = 280
+const MIN_HEIGHT = 200
 
 const props = defineProps({
   tileId: {
@@ -321,6 +323,7 @@ const followupInputRef = ref(null)
 
 // Dragging state
 const isDragging = ref(false)
+const isResizing = ref(false)
 const dragStart = ref({ x: 0, y: 0, nodeX: 0, nodeY: 0 })
 
 // Follow-up state
@@ -360,11 +363,7 @@ const headerStyle = computed(() => ({
 const renderedContent = computed(() => {
   if (!props.response.content || props.isStreaming) return ''
   marked.setOptions({ breaks: true, gfm: true })
-  // Truncate for display if very long
-  const content = props.response.content.length > 3000
-    ? props.response.content.slice(0, 3000) + '\n\n*[Content truncated...]*'
-    : props.response.content
-  return marked(content)
+  return marked(props.response.content)
 })
 
 // Watch for branch input focus
@@ -412,6 +411,7 @@ function handleMouseDown(e) {
       e.target.closest('.branch-overlay') ||
       e.target.closest('.followup-overlay') ||
       e.target.closest('.node-content') ||
+      e.target.closest('.resize-handle') ||
       e.target.closest('button')) {
     return
   }
@@ -456,6 +456,38 @@ function stopDrag() {
   document.removeEventListener('mousemove', onDrag)
   document.removeEventListener('mouseup', stopDrag)
   document.body.classList.remove('tile-dragging')
+}
+
+function startResize(e) {
+  isResizing.value = true
+  const startX = e.clientX
+  const startY = e.clientY
+  const startWidth = props.response.position.width || MIN_WIDTH
+  const startHeight = props.response.position.height || MIN_HEIGHT
+
+  e.preventDefault()
+  e.stopPropagation()
+
+  function onResize(moveEvent) {
+    const newWidth = Math.max(MIN_WIDTH, startWidth + (moveEvent.clientX - startX))
+    const newHeight = Math.max(MIN_HEIGHT, startHeight + (moveEvent.clientY - startY))
+
+    emit('drag', props.tileId, props.modelId, {
+      x: props.response.position.x,
+      y: props.response.position.y,
+      width: newWidth,
+      height: newHeight
+    })
+  }
+
+  function stopResize() {
+    isResizing.value = false
+    document.removeEventListener('mousemove', onResize)
+    document.removeEventListener('mouseup', stopResize)
+  }
+
+  document.addEventListener('mousemove', onResize)
+  document.addEventListener('mouseup', stopResize)
 }
 
 function toggleBranch() {
@@ -538,6 +570,10 @@ onBeforeUnmount(() => {
   box-shadow: 0 12px 36px rgba(0, 0, 0, 0.4);
   z-index: 1000;
   transform: scale(1.02);
+}
+
+.llm-node.resizing {
+  user-select: none;
 }
 
 .llm-node.streaming {
@@ -904,7 +940,7 @@ onBeforeUnmount(() => {
   position: absolute;
   bottom: 100%;
   left: 0;
-  right: 0;
+  width: max(100%, 340px);
   background: var(--bg-secondary);
   border: 1px solid var(--accent-primary);
   border-radius: var(--radius-md);
@@ -1056,12 +1092,6 @@ onBeforeUnmount(() => {
   color: var(--accent-primary);
 }
 
-.more-models {
-  font-size: 0.6875rem;
-  color: var(--text-muted);
-  padding: 2px 6px;
-}
-
 .model-picker-dropdown {
   position: absolute;
   top: 100%;
@@ -1156,6 +1186,22 @@ onBeforeUnmount(() => {
   background: var(--accent-primary);
   border-color: var(--accent-primary);
   color: white;
+}
+
+.resize-handle {
+  position: absolute;
+  right: 6px;
+  bottom: 6px;
+  width: 14px;
+  height: 14px;
+  border-right: 2px solid color-mix(in srgb, var(--node-color, #7c5cff) 75%, white);
+  border-bottom: 2px solid color-mix(in srgb, var(--node-color, #7c5cff) 75%, white);
+  opacity: 0.7;
+  cursor: se-resize;
+}
+
+.resize-handle:hover {
+  opacity: 1;
 }
 
 .picker-btn-done:hover {

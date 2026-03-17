@@ -44,15 +44,15 @@
     />
     
     <div
-      v-if="loading"
+      v-if="loading || waitingForBoot"
       class="loading-overlay"
     >
       <div class="spinner" />
-      <p>Loading graph...</p>
+      <p>{{ waitingForBoot ? 'Preparing graph...' : 'Loading graph...' }}</p>
     </div>
 
     <div
-      v-if="!loading && stats && stats.nodes === 0"
+      v-if="!loading && !waitingForBoot && stats && stats.nodes === 0"
       class="graph-empty-state"
     >
       <p>Your knowledge graph is empty.</p>
@@ -64,7 +64,7 @@
 </template>
 
 <script setup>
-import { ref, onMounted, onBeforeUnmount, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { select } from 'd3-selection'
 import { zoom as d3Zoom, zoomIdentity } from 'd3-zoom'
 import { forceSimulation, forceLink, forceManyBody, forceCenter, forceCollide, forceX, forceY } from 'd3-force'
@@ -72,6 +72,7 @@ import { drag as d3Drag } from 'd3-drag'
 import 'd3-transition'
 import { graph as graphApi } from '../api/client'
 import GraphSettings from './GraphSettings.vue'
+import { useBootStore } from '@/stores/boot'
 
 const props = defineProps({
   width: {
@@ -98,6 +99,9 @@ const container = ref(null)
 const canvas = ref(null)
 const loading = ref(false)
 const stats = ref(null)
+const boot = useBootStore()
+const graphReady = computed(() => boot.ready || boot.failed)
+const waitingForBoot = computed(() => !graphReady.value)
 
 // D3 variables
 let simulation = null
@@ -139,7 +143,9 @@ const currentForces = ref({
 
 onMounted(() => {
   // Initial load
-  loadGraph()
+  if (graphReady.value) {
+    loadGraph()
+  }
   
   // Resize observer
   const resizeObserver = new ResizeObserver(entries => {
@@ -164,7 +170,13 @@ onMounted(() => {
 
 // Re-fetch graph when parent signals data changed
 watch(() => props.refreshKey, (newVal, oldVal) => {
-  if (newVal !== oldVal) loadGraph()
+  if (newVal !== oldVal && graphReady.value) loadGraph()
+})
+
+watch(graphReady, (isReady, wasReady) => {
+  if (isReady && !wasReady) {
+    loadGraph()
+  }
 })
 
 async function loadGraph() {

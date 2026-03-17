@@ -186,8 +186,8 @@ async function handleApply() {
 
   applying.value = true
   try {
-    const linkIds = Array.from(selected.value)
-    const result = await zettelkasten.applyLinks(props.noteId, linkIds)
+    const selectedCandidates = props.candidates.filter(candidate => selected.value.has(candidate.target_id))
+    const result = await zettelkasten.applyLinks(props.noteId, selectedCandidates)
     toast.success(`Created ${result.links_created} link${result.links_created !== 1 ? 's' : ''}`)
     emit('applied', result)
   } catch (e) {

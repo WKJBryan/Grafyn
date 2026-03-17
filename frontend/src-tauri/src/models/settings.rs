@@ -11,7 +11,7 @@ pub struct UserSettings {
 
     /// OpenRouter API key for LLM features (Canvas)
     /// Users need their own key as it has usage costs
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub openrouter_api_key: Option<String>,
 
     /// Whether the user has completed initial setup
@@ -29,6 +29,10 @@ pub struct UserSettings {
     /// LLM model for distillation & link discovery (OpenRouter model ID)
     #[serde(default = "default_llm_model")]
     pub llm_model: String,
+
+    /// Whether smart web search auto-detection is enabled in canvas
+    #[serde(default = "default_smart_web_search")]
+    pub smart_web_search: bool,
 }
 
 fn default_theme() -> String {
@@ -37,6 +41,10 @@ fn default_theme() -> String {
 
 pub fn default_llm_model() -> String {
     "anthropic/claude-3.5-haiku".to_string()
+}
+
+fn default_smart_web_search() -> bool {
+    true
 }
 
 impl Default for UserSettings {
@@ -48,6 +56,7 @@ impl Default for UserSettings {
             theme: default_theme(),
             mcp_enabled: false,
             llm_model: default_llm_model(),
+            smart_web_search: true,
         }
     }
 }
@@ -97,6 +106,7 @@ pub struct SettingsUpdate {
     pub theme: Option<String>,
     pub mcp_enabled: Option<bool>,
     pub llm_model: Option<String>,
+    pub smart_web_search: Option<bool>,
 }
 
 /// Response for settings status check
@@ -109,6 +119,7 @@ pub struct SettingsStatus {
     pub theme: String,
     pub mcp_enabled: bool,
     pub llm_model: String,
+    pub smart_web_search: bool,
 }
 
 impl From<&UserSettings> for SettingsStatus {
@@ -121,6 +132,7 @@ impl From<&UserSettings> for SettingsStatus {
             theme: settings.theme.clone(),
             mcp_enabled: settings.mcp_enabled,
             llm_model: settings.llm_model.clone(),
+            smart_web_search: settings.smart_web_search,
         }
     }
 }

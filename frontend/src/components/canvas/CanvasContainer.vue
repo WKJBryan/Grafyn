@@ -260,6 +260,7 @@
       v-if="showPromptDialog"
       :models="availableModels"
       :branch-context="branchContext"
+      :smart-web-search="smartWebSearch"
       @submit="handlePromptSubmit"
       @cancel="closeBranchDialog"
     />
@@ -392,6 +393,7 @@ const arranging = ref(false)  // Loading state during arrangement
 const arrangeDropdown = ref(null)  // Ref for dropdown element
 const showApiKeyRequired = ref(false)  // Show API key required dialog
 const hasApiKey = ref(true)  // Assume true initially, check on mount
+const smartWebSearch = ref(true)  // Smart web search auto-detection (loaded from settings)
 
 // D3 zoom
 let zoom = null
@@ -624,6 +626,10 @@ onMounted(async () => {
     try {
       const status = await settingsApi.getOpenRouterStatus()
       hasApiKey.value = status?.is_configured || false
+
+      // Load smart web search setting
+      const settingsData = await settingsApi.getStatus()
+      smartWebSearch.value = settingsData?.smart_web_search ?? true
     } catch (e) {
       console.error('Failed to check OpenRouter status:', e)
       hasApiKey.value = false
@@ -845,7 +851,7 @@ function openSettingsForApiKey() {
   emit('open-settings')
 }
 
-async function handlePromptSubmit({ prompt, models, systemPrompt, temperature, maxTokens, contextMode }) {
+async function handlePromptSubmit({ prompt, models, systemPrompt, temperature, maxTokens, contextMode, webSearch }) {
   showPromptDialog.value = false
 
   try {
@@ -859,12 +865,13 @@ async function handlePromptSubmit({ prompt, models, systemPrompt, temperature, m
         systemPrompt,
         temperature,
         maxTokens,
-        contextMode || 'knowledge_search'
+        contextMode || 'knowledge_search',
+        webSearch || false
       )
       branchContext.value = null
     } else {
       // Regular prompt
-      await canvasStore.sendPrompt(prompt, models, systemPrompt, temperature, maxTokens, null, null, contextMode || 'knowledge_search')
+      await canvasStore.sendPrompt(prompt, models, systemPrompt, temperature, maxTokens, null, null, contextMode || 'knowledge_search', webSearch || false)
     }
   } catch (err) {
     console.error('Failed to send prompt:', err)
@@ -896,7 +903,8 @@ function handleLLMBranch(tileId, modelId, prompt, contextMode = 'knowledge_searc
       systemPrompt: null,
       temperature: 0.7,
       maxTokens: 2048,
-      contextMode
+      contextMode,
+      webSearch: false
     })
   } else {
     showPromptDialog.value = true

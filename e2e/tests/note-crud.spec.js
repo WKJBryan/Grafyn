@@ -13,7 +13,6 @@ import {
   createNoteViaAPI,
   selectNote,
   closeEditorOverlay,
-  completeTopicSelector,
   clearAllNotes,
 } from './fixtures/test-helpers.js'
 
@@ -103,9 +102,7 @@ test.describe('Note CRUD Operations', () => {
       await page.fill('.editor-panel-overlay .editor-textarea', 'Content')
       await page.click('.editor-panel-overlay button:has-text("Save")')
 
-      await page.waitForResponse(resp =>
-        resp.url().includes('/api/notes') && resp.status() === 200
-      )
+      await expect(page.locator('.editor-panel-overlay button:has-text("Save")')).toBeDisabled()
     })
 
     test('should cancel TopicSelector without creating', async ({ page }) => {
@@ -122,13 +119,11 @@ test.describe('Note CRUD Operations', () => {
   })
 
   test.describe('Read Note', () => {
-    test('should display note content when selected from TreeNav', async ({ page, request }) => {
+    test('should display note content when selected from TreeNav', async ({ page }) => {
       const title = generateNoteTitle()
       const content = 'Readable content here'
-      const baseURL = 'http://localhost:8080'
 
-      // Create via API for speed
-      await createNoteViaAPI(request, baseURL, { title, content })
+      await createNoteViaAPI(page, { title, content })
       await page.reload()
       await waitForAppReady(page)
 
@@ -144,9 +139,8 @@ test.describe('Note CRUD Operations', () => {
       await expect(page.locator('.full-graph-container')).toBeVisible()
     })
 
-    test('should show empty state banner when no notes exist', async ({ page, request }) => {
-      const baseURL = 'http://localhost:8080'
-      await clearAllNotes(request, baseURL)
+    test('should show empty state banner when no notes exist', async ({ page }) => {
+      await clearAllNotes(page)
       await page.reload()
       await waitForAppReady(page)
 
@@ -156,12 +150,11 @@ test.describe('Note CRUD Operations', () => {
   })
 
   test.describe('Update Note', () => {
-    test('should update note title', async ({ page, request }) => {
-      const baseURL = 'http://localhost:8080'
+    test('should update note title', async ({ page }) => {
       const originalTitle = generateNoteTitle()
       const updatedTitle = `Updated ${originalTitle}`
 
-      await createNoteViaAPI(request, baseURL, { title: originalTitle, content: 'Original content' })
+      await createNoteViaAPI(page, { title: originalTitle, content: 'Original content' })
       await page.reload()
       await waitForAppReady(page)
 
@@ -170,20 +163,17 @@ test.describe('Note CRUD Operations', () => {
       await page.fill('.editor-panel-overlay .title-input', updatedTitle)
       await page.click('.editor-panel-overlay button:has-text("Save")')
 
-      await page.waitForResponse(resp =>
-        resp.url().includes('/api/notes') && resp.status() === 200
-      )
+      await expect(page.locator('.editor-panel-overlay button:has-text("Save")')).toBeDisabled()
 
       // Verify update in TreeNav
       await expect(page.locator('.tree-nav')).toContainText(updatedTitle)
     })
 
-    test('should update note content', async ({ page, request }) => {
-      const baseURL = 'http://localhost:8080'
+    test('should update note content', async ({ page }) => {
       const title = generateNoteTitle()
       const updatedContent = 'Updated content with changes'
 
-      await createNoteViaAPI(request, baseURL, { title, content: 'Original content' })
+      await createNoteViaAPI(page, { title, content: 'Original content' })
       await page.reload()
       await waitForAppReady(page)
 
@@ -192,9 +182,7 @@ test.describe('Note CRUD Operations', () => {
       await page.fill('.editor-panel-overlay .editor-textarea', updatedContent)
       await page.click('.editor-panel-overlay button:has-text("Save")')
 
-      await page.waitForResponse(resp =>
-        resp.url().includes('/api/notes') && resp.status() === 200
-      )
+      await expect(page.locator('.editor-panel-overlay button:has-text("Save")')).toBeDisabled()
 
       // Close and reopen to verify persistence
       await closeEditorOverlay(page)
@@ -202,11 +190,10 @@ test.describe('Note CRUD Operations', () => {
       await expect(page.locator('.editor-panel-overlay .editor-textarea')).toHaveValue(updatedContent)
     })
 
-    test('should show Save button disabled when no changes', async ({ page, request }) => {
-      const baseURL = 'http://localhost:8080'
+    test('should show Save button disabled when no changes', async ({ page }) => {
       const title = generateNoteTitle()
 
-      await createNoteViaAPI(request, baseURL, { title, content: 'Content' })
+      await createNoteViaAPI(page, { title, content: 'Content' })
       await page.reload()
       await waitForAppReady(page)
 
@@ -218,11 +205,10 @@ test.describe('Note CRUD Operations', () => {
   })
 
   test.describe('Delete Note', () => {
-    test('should delete note via ConfirmDialog', async ({ page, request }) => {
-      const baseURL = 'http://localhost:8080'
+    test('should delete note via ConfirmDialog', async ({ page }) => {
       const title = generateNoteTitle()
 
-      await createNoteViaAPI(request, baseURL, { title, content: 'Content to delete' })
+      await createNoteViaAPI(page, { title, content: 'Content to delete' })
       await page.reload()
       await waitForAppReady(page)
 
@@ -240,19 +226,16 @@ test.describe('Note CRUD Operations', () => {
       // Confirm deletion
       await page.click('.confirm-dialog .btn-danger')
 
-      await page.waitForResponse(resp =>
-        resp.url().includes('/api/notes') && resp.request().method() === 'DELETE'
-      )
+      await page.waitForSelector('.confirm-dialog', { state: 'hidden' })
 
       // Note should be removed from TreeNav
       await expect(page.locator('.tree-nav')).not.toContainText(title)
     })
 
-    test('should cancel delete via ConfirmDialog', async ({ page, request }) => {
-      const baseURL = 'http://localhost:8080'
+    test('should cancel delete via ConfirmDialog', async ({ page }) => {
       const title = generateNoteTitle()
 
-      await createNoteViaAPI(request, baseURL, { title, content: 'Content to keep' })
+      await createNoteViaAPI(page, { title, content: 'Content to keep' })
       await page.reload()
       await waitForAppReady(page)
 
@@ -268,11 +251,10 @@ test.describe('Note CRUD Operations', () => {
       await expect(page.locator('.tree-nav')).toContainText(title)
     })
 
-    test('should close editor overlay after delete', async ({ page, request }) => {
-      const baseURL = 'http://localhost:8080'
+    test('should close editor overlay after delete', async ({ page }) => {
       const title = generateNoteTitle()
 
-      await createNoteViaAPI(request, baseURL, { title, content: 'Content' })
+      await createNoteViaAPI(page, { title, content: 'Content' })
       await page.reload()
       await waitForAppReady(page)
 
@@ -280,9 +262,7 @@ test.describe('Note CRUD Operations', () => {
       await page.click('.editor-panel-overlay button:has-text("Delete")')
       await page.click('.confirm-dialog .btn-danger')
 
-      await page.waitForResponse(resp =>
-        resp.url().includes('/api/notes') && resp.request().method() === 'DELETE'
-      )
+      await page.waitForSelector('.confirm-dialog', { state: 'hidden' })
 
       // Editor overlay should close
       await expect(page.locator('.editor-panel-overlay')).not.toBeVisible()

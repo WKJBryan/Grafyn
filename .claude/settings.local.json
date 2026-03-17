@@ -141,7 +141,12 @@
       "WebFetch(domain:developers.cloudflare.com)",
       "WebFetch(domain:grafyn-updater.grafyn-updater.workers.dev)",
       "Bash(head:*)",
-      "Bash(npx vitest:*)"
+      "Bash(npx vitest:*)",
+      "Bash(npm run:*)",
+      "WebFetch(domain:openrouter.ai)",
+      "WebFetch(domain:tavily.com)",
+      "WebFetch(domain:docs.perplexity.ai)",
+      "WebFetch(domain:docs.tavily.com)"
     ]
   },
   "outputStyle": "Explanatory"

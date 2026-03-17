@@ -23,6 +23,7 @@ vi.mock('@tauri-apps/api/tauri', () => ({
 }))
 
 import {
+  boot,
   notes,
   search,
   graph,
@@ -43,6 +44,14 @@ describe('API Client (Tauri)', () => {
   describe('isDesktopApp', () => {
     it('always returns true', () => {
       expect(isDesktopApp()).toBe(true)
+    })
+  })
+
+  describe('Boot API', () => {
+    it('status() invokes get_boot_status', async () => {
+      mockInvoke.mockResolvedValue({ ready: false })
+      await boot.status()
+      expect(mockInvoke).toHaveBeenCalledWith('get_boot_status', {})
     })
   })
 
@@ -356,12 +365,39 @@ describe('API Client (Tauri)', () => {
       })
     })
 
+    it('discoverLinks() passes explicit algorithm mode', async () => {
+      mockInvoke.mockResolvedValue([])
+      await zettelkasten.discoverLinks('n1', 'algorithm', 5)
+      expect(mockInvoke).toHaveBeenCalledWith('discover_links', {
+        noteId: 'n1',
+        mode: 'algorithm',
+        maxLinks: 5,
+      })
+    })
+
+    it('discoverLinks() passes explicit llm mode', async () => {
+      mockInvoke.mockResolvedValue([])
+      await zettelkasten.discoverLinks('n1', 'llm', 7)
+      expect(mockInvoke).toHaveBeenCalledWith('discover_links', {
+        noteId: 'n1',
+        mode: 'llm',
+        maxLinks: 7,
+      })
+    })
+
     it('applyLinks() invokes apply_links', async () => {
       mockInvoke.mockResolvedValue({})
-      await zettelkasten.applyLinks('n1', ['l1', 'l2'])
+      const candidates = [
+        { target_id: 'l1', target_title: 'Note 1', link_type: 'related', confidence: 0.8, reason: 'A' },
+        { target_id: 'l2', target_title: 'Note 2', link_type: 'supports', confidence: 0.7, reason: 'B' },
+      ]
+      await zettelkasten.applyLinks('n1', candidates)
       expect(mockInvoke).toHaveBeenCalledWith('apply_links', {
         noteId: 'n1',
-        request: { link_ids: ['l1', 'l2'] },
+        request: {
+          link_ids: ['l1', 'l2'],
+          candidates,
+        },
       })
     })
 

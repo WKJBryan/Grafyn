@@ -252,13 +252,14 @@ function removeModel(modelId) {
 .selected-tags {
   display: flex;
   flex-wrap: wrap;
+  align-items: flex-start;
   gap: 8px;
   padding: var(--spacing-sm);
   background: var(--bg-tertiary);
   border-radius: var(--radius-sm);
   min-height: 40px;
-  max-height: 80px;
-  overflow-y: auto;
+  max-height: none;
+  overflow: visible;
 }
 
 .model-tag {

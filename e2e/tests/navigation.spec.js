@@ -8,13 +8,12 @@
 import { test, expect } from '@playwright/test'
 import {
   waitForAppReady,
+  createNote,
   createNoteViaAPI,
   selectNote,
   clearAllNotes,
   closeEditorOverlay,
 } from './fixtures/test-helpers.js'
-
-const BASE_URL = 'http://localhost:8080'
 
 test.describe('Navigation and Layout', () => {
   test.describe('Main Layout', () => {
@@ -71,19 +70,18 @@ test.describe('Navigation and Layout', () => {
   })
 
   test.describe('TreeNav Navigation', () => {
-    test.beforeEach(async ({ page, request }) => {
+    test.beforeEach(async ({ page }) => {
       await page.goto('/')
       await waitForAppReady(page)
 
-      // Create test notes via API for speed
+      // Seed test notes through the UI (web backend mode is removed).
       for (let i = 1; i <= 3; i++) {
-        await createNoteViaAPI(request, BASE_URL, {
+        await createNote(page, {
           title: `Nav Test Note ${i}`,
           content: `Content for note ${i}`,
         })
+        await closeEditorOverlay(page)
       }
-      await page.reload()
-      await waitForAppReady(page)
     })
 
     test('should select note on click in TreeNav', async ({ page }) => {
@@ -120,22 +118,21 @@ test.describe('Navigation and Layout', () => {
   })
 
   test.describe('Backlinks Panel', () => {
-    test.beforeEach(async ({ page, request }) => {
+    test.beforeEach(async ({ page }) => {
       await page.goto('/')
       await waitForAppReady(page)
 
-      // Create notes with wikilinks via API
-      await createNoteViaAPI(request, BASE_URL, {
+      // Create notes with wikilinks through the UI.
+      await createNote(page, {
         title: 'Target Note',
         content: 'This is the target note content',
       })
-      await createNoteViaAPI(request, BASE_URL, {
+      await closeEditorOverlay(page)
+      await createNote(page, {
         title: 'Linking Note',
         content: 'This links to [[Target Note]]',
       })
-
-      await page.reload()
-      await waitForAppReady(page)
+      await closeEditorOverlay(page)
     })
 
     test('should show backlinks section in right sidebar', async ({ page }) => {
@@ -150,8 +147,8 @@ test.describe('Navigation and Layout', () => {
   })
 
   test.describe('Empty States', () => {
-    test('should show empty state banner when no notes exist', async ({ page, request }) => {
-      await clearAllNotes(request, BASE_URL)
+    test('should show empty state banner when no notes exist', async ({ page }) => {
+      await clearAllNotes(page)
       await page.goto('/')
       await waitForAppReady(page)
 
@@ -159,8 +156,8 @@ test.describe('Navigation and Layout', () => {
       await expect(page.locator('.empty-state-banner')).toContainText('Welcome to Grafyn')
     })
 
-    test('should show Create Your First Note button in empty state', async ({ page, request }) => {
-      await clearAllNotes(request, BASE_URL)
+    test('should show Create Your First Note button in empty state', async ({ page }) => {
+      await clearAllNotes(page)
       await page.goto('/')
       await waitForAppReady(page)
 
@@ -210,10 +207,10 @@ test.describe('Navigation and Layout', () => {
   })
 
   test.describe('Page Refresh', () => {
-    test('should persist notes after refresh', async ({ page, request }) => {
+    test('should persist notes after refresh', async ({ page }) => {
       const title = `Persist Test ${Date.now()}`
 
-      await createNoteViaAPI(request, BASE_URL, { title, content: 'Persisted content' })
+      await createNoteViaAPI(page, { title, content: 'Persisted content' })
       await page.goto('/')
       await waitForAppReady(page)
 

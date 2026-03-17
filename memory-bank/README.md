@@ -4,6 +4,8 @@
 > **Last Updated:** 2025-12-31
 > **Status:** Active
 
+> **Important:** Large parts of the Memory Bank predate the Tauri desktop rewrite and are now historical rather than source-of-truth. For current setup, runtime, and testing instructions, use [HOW_TO_RUN.md](../HOW_TO_RUN.md), [frontend/README.md](../frontend/README.md), and [frontend/TESTING.md](../frontend/TESTING.md) first.
+
 ## Overview
 
 The Memory Bank complements the technical documentation in the [`docs/`](../docs/) directory by capturing:
@@ -34,8 +36,8 @@ memory-bank/
 
 ### For New Developers
 - [Project History](./01-project-context/history.md) - Understand the project's origins
-- [Setup Guide](./05-configuration/setup-guide.md) - Get started quickly
-- [Development Workflow](./07-workflows/development-workflow.md) - Daily development process
+- [Setup Guide](./05-configuration/setup-guide.md) - Current desktop-first setup notes
+- [Development Workflow](./07-workflows/development-workflow.md) - Historical workflow reference
 
 ### For Architecture Understanding
 - [ADR Index](./02-architecture-decisions/README.md) - All architecture decisions
@@ -44,7 +46,7 @@ memory-bank/
 
 ### For Development
 - [Coding Standards](./03-development-patterns/coding-standards.md) - Style guides
-- [Backend Patterns](./03-development-patterns/backend-patterns.md) - Python/FastAPI patterns
+- [Backend Patterns](./03-development-patterns/backend-patterns.md) - Historical Python/FastAPI patterns
 - [Frontend Patterns](./03-development-patterns/frontend-patterns.md) - Vue 3 patterns
 
 ### For Troubleshooting
@@ -52,7 +54,7 @@ memory-bank/
 - [Troubleshooting Guide](./05-configuration/troubleshooting.md) - Setup issues
 
 ### For Quick Reference
-- [API Endpoints](./06-quick-reference/api-endpoints.md) - Concise API reference
+- [API Endpoints](./06-quick-reference/api-endpoints.md) - Current Tauri IPC reference
 - [Data Models](./06-quick-reference/data-models.md) - Data model cheat sheet
 - [Services](./06-quick-reference/services.md) - Service layer reference
 

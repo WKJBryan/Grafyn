@@ -95,6 +95,14 @@
         </div>
 
         <div
+          v-if="smartWebSearch && detectionResult.shouldSearch"
+          class="web-search-hint"
+        >
+          <span class="hint-icon">🔍</span>
+          <span class="hint-text">Web search: {{ detectionResult.reason }}</span>
+        </div>
+
+        <div
           class="advanced-toggle"
           @click="showAdvanced = !showAdvanced"
         >
@@ -169,6 +177,7 @@
 import { ref, computed } from 'vue'
 import ModelSelector from './ModelSelector.vue'
 import ContextBudgetDisplay from './ContextBudgetDisplay.vue'
+import { detectWebSearch } from '@/composables/useWebSearchDetection'
 
 const props = defineProps({
   models: {
@@ -178,6 +187,10 @@ const props = defineProps({
   branchContext: {
     type: Object,
     default: null
+  },
+  smartWebSearch: {
+    type: Boolean,
+    default: true
   }
 })
 
@@ -192,6 +205,13 @@ const temperature = ref(0.7)
 const maxTokens = ref(2048)
 const showAdvanced = ref(false)
 const contextMode = ref('knowledge_search')  // Default to knowledge search for note lookup
+
+// Smart web search auto-detection
+const detectionResult = computed(() => {
+  if (!props.smartWebSearch) return { shouldSearch: false, reason: null }
+  return detectWebSearch(prompt.value)
+})
+const resolvedWebSearch = computed(() => detectionResult.value.shouldSearch)
 
 // Context mode descriptions
 const contextModeHints = {
@@ -253,7 +273,8 @@ function handleSubmit() {
     systemPrompt: showSystemPrompt.value ? systemPrompt.value.trim() : null,
     temperature: temperature.value,
     maxTokens: maxTokens.value,
-    contextMode: contextMode.value
+    contextMode: contextMode.value,
+    webSearch: resolvedWebSearch.value
   })
 }
 </script>
@@ -484,5 +505,26 @@ function handleSubmit() {
   margin-top: var(--spacing-xs);
   font-size: 0.75rem;
   color: var(--text-muted);
+}
+
+.web-search-hint {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-sm);
+  padding: var(--spacing-xs) var(--spacing-sm);
+  background: color-mix(in srgb, var(--accent-cyan, #06b6d4) 10%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent-cyan, #06b6d4) 25%, transparent);
+  border-radius: var(--radius-sm);
+  font-size: 0.8125rem;
+  color: var(--accent-cyan, #06b6d4);
+}
+
+.hint-icon {
+  font-size: 0.875rem;
+  flex-shrink: 0;
+}
+
+.hint-text {
+  flex: 1;
 }
 </style>

@@ -149,4 +149,50 @@ describe('useGuide', () => {
     guide.showTip('nonexistent-step')
     expect(guide.activeTip.value).toBeNull()
   })
+
+  it('showNextTip only picks tips for the current route', () => {
+    const guide = useGuide()
+    guide.state.tipQueue = [
+      { id: 'a', route: '/', anchor: '[data-guide="x"]' },
+      { id: 'b', route: '/canvas', anchor: '[data-guide="y"]' },
+    ]
+    guide.setCurrentRoute('/')
+    guide.showNextTip()
+    expect(guide.activeTip.value.id).toBe('a')
+
+    // Complete home tip — should NOT advance to canvas tip
+    guide.completeTip('a')
+    expect(guide.activeTip.value).toBeNull()
+  })
+
+  it('showNextTip picks canvas tip when on canvas route', () => {
+    const guide = useGuide()
+    guide.state.tipQueue = [
+      { id: 'b', route: '/canvas', anchor: '[data-guide="y"]' },
+      { id: 'c', route: '/import', anchor: '[data-guide="z"]' },
+    ]
+    guide.setCurrentRoute('/canvas')
+    guide.showNextTip()
+    expect(guide.activeTip.value.id).toBe('b')
+  })
+
+  it('setCurrentRoute updates internal route state', () => {
+    const guide = useGuide()
+    expect(guide.state.currentRoute).toBe('/')
+    guide.setCurrentRoute('/canvas')
+    expect(guide.state.currentRoute).toBe('/canvas')
+  })
+
+  it('skipTip clears activeTip without marking completed', () => {
+    const guide = useGuide()
+    const tip = { id: 'skip-me', route: '/canvas', anchor: '[data-guide="x"]' }
+    guide.state.tipQueue = [tip]
+    guide.state.activeTip = tip
+    guide.skipTip()
+    expect(guide.activeTip.value).toBeNull()
+    // Tip should NOT be marked completed
+    expect(guide.isStepCompleted('skip-me')).toBe(false)
+    // Tip should still be in the queue for later
+    expect(guide.state.tipQueue.length).toBe(1)
+  })
 })

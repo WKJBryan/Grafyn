@@ -97,6 +97,8 @@ pub struct PromptTile {
     pub parent_model_id: Option<String>,
     #[serde(default)]
     pub context_notes: Vec<TileContextNote>,
+    #[serde(default)]
+    pub web_search: bool,
 }
 
 impl Default for PromptTile {
@@ -113,6 +115,7 @@ impl Default for PromptTile {
             parent_tile_id: None,
             parent_model_id: None,
             context_notes: Vec::new(),
+            web_search: false,
         }
     }
 }
@@ -325,6 +328,8 @@ pub struct PromptRequest {
     pub temperature: f64,
     #[serde(default = "default_max_tokens")]
     pub max_tokens: u32,
+    #[serde(default)]
+    pub web_search: bool,
 }
 
 fn default_temperature() -> f64 {

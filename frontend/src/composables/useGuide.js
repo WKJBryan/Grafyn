@@ -42,6 +42,7 @@ const state = reactive({
   panelCategory: null,
   activeTip: null,
   tipQueue: [],
+  currentRoute: '/',
 })
 
 function checkNewFeatures() {
@@ -66,12 +67,21 @@ function getTipsForRoute(path) {
   })
 }
 
+function setCurrentRoute(path) {
+  state.currentRoute = path
+}
+
 function showNextTip() {
   if (state.dismissed || state.tipQueue.length === 0) {
     state.activeTip = null
     return
   }
-  state.activeTip = state.tipQueue[0]
+  const routeTips = getTipsForRoute(state.currentRoute)
+  state.activeTip = routeTips.length > 0 ? routeTips[0] : null
+}
+
+function skipTip() {
+  state.activeTip = null
 }
 
 function showTipForRoute(path) {
@@ -147,9 +157,11 @@ export function useGuide() {
     activeTip: computed(() => state.activeTip),
     checkNewFeatures,
     getTipsForRoute,
+    setCurrentRoute,
     showNextTip,
     showTipForRoute,
     completeTip,
+    skipTip,
     dismissAllTips,
     togglePanel,
     openPanel,

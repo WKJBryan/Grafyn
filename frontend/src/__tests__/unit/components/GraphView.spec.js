@@ -1,8 +1,10 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { mount, flushPromises } from '@vue/test-utils'
+import { createPinia, setActivePinia } from 'pinia'
 import GraphView from '@/components/GraphView.vue'
 import * as apiClient from '@/api/client'
 import { forceSimulation } from 'd3-force'
+import { useBootStore } from '@/stores/boot'
 // Mock GraphSettings child component
 vi.mock('@/components/GraphSettings.vue', () => ({
   default: {
@@ -101,6 +103,14 @@ describe('GraphView', () => {
 
   beforeEach(() => {
     vi.clearAllMocks()
+    setActivePinia(createPinia())
+    const bootStore = useBootStore()
+    bootStore.setStatus({
+      phase: 'ready',
+      message: 'Grafyn is ready',
+      ready: true,
+      error: null,
+    })
     vi.spyOn(apiClient.graph, 'full').mockResolvedValue(mockGraphData)
 
     // Mock ResizeObserver
@@ -131,6 +141,32 @@ describe('GraphView', () => {
     // Stats rendered
     expect(wrapper.find('.toolbar-stats').text()).toContain('2 Notes')
     expect(wrapper.find('.toolbar-stats').text()).toContain('1 Links')
+  })
+
+  it('waits for boot readiness before loading graph data', async () => {
+    const bootStore = useBootStore()
+    bootStore.setStatus({
+      phase: 'building_indices',
+      message: 'Building graph and search index',
+      ready: false,
+      error: null,
+    })
+
+    wrapper = mount(GraphView)
+    await flushPromises()
+
+    expect(apiClient.graph.full).not.toHaveBeenCalled()
+    expect(wrapper.find('.loading-overlay').text()).toContain('Preparing graph...')
+
+    bootStore.setStatus({
+      phase: 'ready',
+      message: 'Grafyn is ready',
+      ready: true,
+      error: null,
+    })
+    await flushPromises()
+
+    expect(apiClient.graph.full).toHaveBeenCalledTimes(1)
   })
 
   it('initializes D3 simulation', async () => {

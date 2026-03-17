@@ -20,7 +20,7 @@ pub struct FeedbackService {
 }
 
 impl FeedbackService {
-    /// Create a new feedback service with environment variables (for development)
+    /// Create a new feedback service using runtime environment variables.
     pub fn new(store_path: PathBuf) -> Self {
         // Create the pending feedback directory
         std::fs::create_dir_all(&store_path).ok();
@@ -28,20 +28,6 @@ impl FeedbackService {
         // Load configuration from environment
         let repo = std::env::var("GITHUB_FEEDBACK_REPO").unwrap_or_default();
         let token = std::env::var("GITHUB_FEEDBACK_TOKEN").unwrap_or_default();
-
-        Self {
-            client: Client::new(),
-            store_path,
-            repo,
-            token,
-        }
-    }
-
-    /// Create a new feedback service with explicit credentials (for production)
-    /// Use this to embed credentials at compile time
-    pub fn new_with_credentials(store_path: PathBuf, repo: String, token: String) -> Self {
-        // Create the pending feedback directory
-        std::fs::create_dir_all(&store_path).ok();
 
         Self {
             client: Client::new(),
@@ -64,7 +50,7 @@ impl FeedbackService {
             return FeedbackStatus {
                 configured: false,
                 pending_count: pending.len(),
-                message: "Feedback service not configured. Set GITHUB_FEEDBACK_REPO and GITHUB_FEEDBACK_TOKEN environment variables.".to_string(),
+                message: "Feedback submission is unavailable. Runtime env vars GITHUB_FEEDBACK_REPO and GITHUB_FEEDBACK_TOKEN are not configured.".to_string(),
             };
         }
 
@@ -108,7 +94,7 @@ impl FeedbackService {
         // Check configuration
         if !self.is_configured() {
             return Ok(FeedbackResponse::error(
-                "Feedback service not configured. Please set GITHUB_FEEDBACK_REPO and GITHUB_FEEDBACK_TOKEN.",
+                "Feedback submission is unavailable. Missing runtime GITHUB_FEEDBACK_REPO and GITHUB_FEEDBACK_TOKEN configuration.",
             ));
         }
 

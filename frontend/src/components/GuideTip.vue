@@ -1,7 +1,7 @@
 <template>
   <Teleport to="body">
     <div
-      v-if="guide.activeTip.value"
+      v-if="guide.activeTip.value && tipPosition"
       class="guide-tip-backdrop"
       @click="handleBackdropClick"
     />
@@ -86,6 +86,7 @@ function positionTip(tip) {
   const el = document.querySelector(tip.anchor)
   if (!el) {
     tipPosition.value = null
+    guide.skipTip()
     return
   }
 

@@ -25,7 +25,7 @@
           v-if="canDistill"
           v-model="distillMode"
           class="distill-mode-select"
-          title="Extraction method"
+          title="Method for distill and link discovery"
         >
           <option value="algorithm">
             Algorithm
@@ -309,7 +309,7 @@ async function handleDiscoverLinks() {
   showLinkModal.value = true
 
   try {
-    const result = await zettelkasten.discoverLinks(props.note.id, 'suggested')
+    const result = await zettelkasten.discoverLinks(props.note.id, distillMode.value)
     linkCandidates.value = result.links || []
   } catch (e) {
     console.error('Link discovery failed:', e)

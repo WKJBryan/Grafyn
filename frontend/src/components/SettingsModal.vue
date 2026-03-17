@@ -41,7 +41,7 @@
           />
           <div
             class="step"
-            :class="{ active: vaultPath, done: vaultPath && (openrouterKey || keyValidationState === 'valid') }"
+            :class="{ active: vaultPath, done: vaultPath && (openrouterKey || hasStoredOpenRouterKey || keyValidationState === 'valid') }"
           >
             <span class="step-number">2</span>
             <span class="step-label">API Key (Optional)</span>
@@ -119,6 +119,7 @@
               :type="showApiKey ? 'text' : 'password'"
               class="key-input"
               placeholder="sk-or-v1-..."
+              @input="handleApiKeyInput"
               @blur="validateKey"
             >
             <button
@@ -141,11 +142,17 @@
           <p class="setting-hint">
             💡 You can skip this for now and add it later when using Canvas
           </p>
+          <p
+            v-if="hasStoredOpenRouterKey && !openrouterKey"
+            class="setting-hint"
+          >
+            🔐 An API key is already stored securely. Enter a new key to replace it, or leave this blank to keep it.
+          </p>
         </div>
 
         <!-- LLM Model Section (non-setup only, requires API key) -->
         <div
-          v-if="!isSetup && openrouterKey"
+          v-if="!isSetup && (openrouterKey || hasStoredOpenRouterKey)"
           class="setting-section"
         >
           <label class="setting-label">
@@ -241,6 +248,27 @@
               <span>Dark</span>
             </label>
           </div>
+        </div>
+
+        <!-- Smart Web Search Section (non-setup only, requires API key) -->
+        <div
+          v-if="!isSetup && (openrouterKey || hasStoredOpenRouterKey)"
+          class="setting-section"
+        >
+          <label class="setting-label">
+            <span class="label-icon">🔍</span>
+            Smart Web Search
+          </label>
+          <p class="setting-description">
+            Automatically search the web when canvas prompts need current information (~$0.02/query per model).
+          </p>
+          <label class="checkbox-label">
+            <input
+              v-model="smartWebSearch"
+              type="checkbox"
+            >
+            <span>{{ smartWebSearch ? 'Enabled' : 'Disabled' }}</span>
+          </label>
         </div>
 
         <!-- MCP Integration Section (desktop only, non-setup only) -->
@@ -382,8 +410,11 @@ const isDesktop = isDesktopApp()
 // Form state
 const vaultPath = ref('')
 const openrouterKey = ref('')
+const hasStoredOpenRouterKey = ref(false)
+const openrouterKeyDirty = ref(false)
 const theme = ref('system')
 const llmModel = ref('anthropic/claude-3.5-haiku')
+const smartWebSearch = ref(true)
 const keyValidationState = ref(null) // 'validating' | 'valid' | 'invalid' | null
 
 // LLM model state
@@ -492,16 +523,20 @@ const loadCurrentSettings = async () => {
     const currentSettings = await settingsApi.get()
     if (currentSettings) {
       vaultPath.value = currentSettings.vault_path || ''
-      openrouterKey.value = currentSettings.openrouter_api_key || ''
+      openrouterKey.value = ''
+      openrouterKeyDirty.value = false
       theme.value = currentSettings.theme || 'system'
       llmModel.value = currentSettings.llm_model || 'anthropic/claude-3.5-haiku'
+      smartWebSearch.value = currentSettings.smart_web_search ?? true
     }
+    const status = await settingsApi.getOpenRouterStatus()
+    hasStoredOpenRouterKey.value = Boolean(status?.has_key)
 
     // Load MCP status (binary availability + config snippet)
     await loadMcpStatus()
 
     // Load available models if API key is configured
-    if (openrouterKey.value) {
+    if (openrouterKey.value || hasStoredOpenRouterKey.value) {
       await loadAvailableModels()
       // Set display text for current model
       const current = availableModels.value.find(m => m.id === llmModel.value)
@@ -510,6 +545,12 @@ const loadCurrentSettings = async () => {
   } catch (e) {
     console.error('Failed to load settings:', e)
   }
+}
+
+const handleApiKeyInput = () => {
+  openrouterKeyDirty.value = true
+  hasStoredOpenRouterKey.value = false
+  keyValidationState.value = null
 }
 
 // Load available LLM models from OpenRouter
@@ -574,9 +615,13 @@ const saveSettings = async () => {
   try {
     const update = {
       vault_path: vaultPath.value || null,
-      openrouter_api_key: openrouterKey.value || null,
       theme: theme.value,
       llm_model: llmModel.value || null,
+      smart_web_search: smartWebSearch.value,
+    }
+    if (openrouterKeyDirty.value) {
+      // Empty string means explicit clear. Missing field means keep existing key.
+      update.openrouter_api_key = openrouterKey.value || ''
     }
 
     if (props.isSetup) {
@@ -960,6 +1005,22 @@ onMounted(() => {
 .save-btn:disabled {
   opacity: 0.5;
   cursor: not-allowed;
+}
+
+/* Smart Web Search toggle */
+.checkbox-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  font-size: 0.9rem;
+  color: var(--text-primary, #1a1a1a);
+}
+
+.checkbox-label input[type="checkbox"] {
+  width: 16px;
+  height: 16px;
+  accent-color: var(--accent-color, #7c3aed);
 }
 
 /* MCP Section */
