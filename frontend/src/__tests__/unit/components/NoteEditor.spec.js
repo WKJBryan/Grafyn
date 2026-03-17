@@ -18,6 +18,15 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { mount } from '@vue/test-utils'
 import NoteEditor from '@/components/NoteEditor.vue'
 
+const mockNotesApi = vi.hoisted(() => ({
+  distill: vi.fn(),
+}))
+
+const mockZettelkastenApi = vi.hoisted(() => ({
+  discoverLinks: vi.fn(),
+  applyLinks: vi.fn(),
+}))
+
 const mockToast = vi.hoisted(() => ({
   toasts: { value: [] },
   success: vi.fn(),
@@ -29,6 +38,11 @@ const mockToast = vi.hoisted(() => ({
 
 vi.mock('@/composables/useToast', () => ({
   useToast: () => mockToast,
+}))
+
+vi.mock('@/api/client', () => ({
+  notes: mockNotesApi,
+  zettelkasten: mockZettelkastenApi,
 }))
 
 describe('NoteEditor', () => {
@@ -655,6 +669,52 @@ describe('NoteEditor', () => {
       })
 
       expect(wrapper.find('.tags-input').element.value).toBe('new, tags')
+    })
+  })
+
+  describe('Discover Links', () => {
+    it('uses the shared selector algorithm mode for discover links', async () => {
+      mockZettelkastenApi.discoverLinks.mockResolvedValue({ links: [] })
+
+      wrapper = mount(NoteEditor, {
+        props: {
+          note: { ...mockNote, status: 'evidence' },
+        },
+      })
+
+      await wrapper.find('.distill-mode-select').setValue('algorithm')
+
+      const discoverButton = wrapper.findAll('button').find((btn) =>
+        btn.text().includes('Discover Links')
+      )
+      await discoverButton.trigger('click')
+
+      expect(mockZettelkastenApi.discoverLinks).toHaveBeenCalledWith(
+        'test-note-1',
+        'algorithm'
+      )
+    })
+
+    it('uses the shared selector llm mode for discover links', async () => {
+      mockZettelkastenApi.discoverLinks.mockResolvedValue({ links: [] })
+
+      wrapper = mount(NoteEditor, {
+        props: {
+          note: { ...mockNote, status: 'evidence' },
+        },
+      })
+
+      await wrapper.find('.distill-mode-select').setValue('llm')
+
+      const discoverButton = wrapper.findAll('button').find((btn) =>
+        btn.text().includes('Discover Links')
+      )
+      await discoverButton.trigger('click')
+
+      expect(mockZettelkastenApi.discoverLinks).toHaveBeenCalledWith(
+        'test-note-1',
+        'llm'
+      )
     })
   })
 })

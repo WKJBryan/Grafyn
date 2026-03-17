@@ -353,8 +353,6 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
           TAURI_KEY_PASSWORD: ''
-          GITHUB_FEEDBACK_REPO: ${{ secrets.FEEDBACK_REPO }}
-          GITHUB_FEEDBACK_TOKEN: ${{ secrets.FEEDBACK_TOKEN }}
         with:
           projectPath: frontend
           tauriScript: npx tauri

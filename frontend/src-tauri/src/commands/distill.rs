@@ -401,6 +401,7 @@ async fn extract_candidates_llm(
             Some(system),
             Some(0.3),
             Some(4096),
+            false,
         )
         .await
         .map_err(|e| format!("LLM extraction failed: {}", e))?;

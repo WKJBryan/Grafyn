@@ -172,7 +172,7 @@ export const useCanvasStore = defineStore('canvas', () => {
     return unlisten
   }
 
-  async function sendPrompt(prompt, models, systemPrompt = null, temperature = 0.7, maxTokens = 2048, parentTileId = null, parentModelId = null, contextMode = 'knowledge_search') {
+  async function sendPrompt(prompt, models, systemPrompt = null, temperature = 0.7, maxTokens = 2048, parentTileId = null, parentModelId = null, contextMode = 'knowledge_search', webSearch = false) {
     if (!currentSession.value) {
       throw new Error('No active session')
     }
@@ -211,7 +211,8 @@ export const useCanvasStore = defineStore('canvas', () => {
         parent_tile_id: parentTileId,
         parent_model_id: parentModelId,
         context_mode: contextMode,
-        position
+        position,
+        web_search: webSearch
       }
 
       // Set up event listener BEFORE calling invoke
@@ -812,8 +813,8 @@ export const useCanvasStore = defineStore('canvas', () => {
   }
 
   // Branch from a specific model response
-  async function branchFromResponse(parentTileId, parentModelId, newPrompt, models, systemPrompt = null, temperature = 0.7, maxTokens = 2048, contextMode = 'knowledge_search') {
-    return sendPrompt(newPrompt, models, systemPrompt, temperature, maxTokens, parentTileId, parentModelId, contextMode)
+  async function branchFromResponse(parentTileId, parentModelId, newPrompt, models, systemPrompt = null, temperature = 0.7, maxTokens = 2048, contextMode = 'knowledge_search', webSearch = false) {
+    return sendPrompt(newPrompt, models, systemPrompt, temperature, maxTokens, parentTileId, parentModelId, contextMode, webSearch)
   }
 
   return {

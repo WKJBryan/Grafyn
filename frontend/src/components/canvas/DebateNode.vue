@@ -1,7 +1,7 @@
 <template>
   <div
     class="debate-node"
-    :class="{ dragging: isDragging, active: isActive, expanded: isExpanded }"
+    :class="{ dragging: isDragging, resizing: isResizing, active: isActive, expanded: isExpanded }"
     :style="nodeStyle"
     @mousedown="handleMouseDown"
   >
@@ -82,6 +82,11 @@
     
     <!-- Connection points for source tiles (left side) -->
     <div class="connection-point in" />
+
+    <div
+      class="resize-handle"
+      @mousedown.stop="startResize"
+    />
     
     <!-- Expanded view overlay -->
     <div
@@ -160,6 +165,9 @@
 import { ref, computed, onBeforeUnmount } from 'vue'
 import { marked } from 'marked'
 
+const MIN_WIDTH = 280
+const MIN_HEIGHT = 200
+
 const props = defineProps({
   debate: {
     type: Object,
@@ -179,6 +187,7 @@ const emit = defineEmits(['drag', 'delete', 'expand', 'collapse', 'continue'])
 
 // Dragging state
 const isDragging = ref(false)
+const isResizing = ref(false)
 const dragStart = ref({ x: 0, y: 0, nodeX: 0, nodeY: 0 })
 
 // Computed
@@ -295,6 +304,7 @@ function handleMouseDown(e) {
   if (e.target.closest('.node-actions') || 
       e.target.closest('.node-footer') ||
       e.target.closest('.expanded-overlay') ||
+      e.target.closest('.resize-handle') ||
       e.target.closest('button')) {
     return
   }
@@ -341,6 +351,38 @@ function stopDrag() {
   document.body.classList.remove('tile-dragging')
 }
 
+function startResize(e) {
+  isResizing.value = true
+  const startX = e.clientX
+  const startY = e.clientY
+  const startWidth = props.debate.position.width || MIN_WIDTH
+  const startHeight = props.debate.position.height || MIN_HEIGHT
+
+  e.preventDefault()
+  e.stopPropagation()
+
+  function onResize(moveEvent) {
+    const newWidth = Math.max(MIN_WIDTH, startWidth + (moveEvent.clientX - startX))
+    const newHeight = Math.max(MIN_HEIGHT, startHeight + (moveEvent.clientY - startY))
+
+    emit('drag', props.debate.id, {
+      x: props.debate.position.x,
+      y: props.debate.position.y,
+      width: newWidth,
+      height: newHeight
+    })
+  }
+
+  function stopResize() {
+    isResizing.value = false
+    document.removeEventListener('mousemove', onResize)
+    document.removeEventListener('mouseup', stopResize)
+  }
+
+  document.addEventListener('mousemove', onResize)
+  document.addEventListener('mouseup', stopResize)
+}
+
 // Cleanup on unmount
 onBeforeUnmount(() => {
   document.removeEventListener('mousemove', onDrag)
@@ -382,6 +424,10 @@ onBeforeUnmount(() => {
   box-shadow: 0 12px 32px color-mix(in srgb, var(--accent-cyan) 40%, transparent);
   z-index: 1000;
   transform: scale(1.02);
+}
+
+.debate-node.resizing {
+  user-select: none;
 }
 
 .node-header {
@@ -585,6 +631,22 @@ onBeforeUnmount(() => {
   left: -6px;
   top: 50%;
   transform: translateY(-50%);
+}
+
+.resize-handle {
+  position: absolute;
+  right: 6px;
+  bottom: 6px;
+  width: 14px;
+  height: 14px;
+  border-right: 2px solid color-mix(in srgb, var(--accent-cyan) 75%, white);
+  border-bottom: 2px solid color-mix(in srgb, var(--accent-cyan) 75%, white);
+  opacity: 0.7;
+  cursor: se-resize;
+}
+
+.resize-handle:hover {
+  opacity: 1;
 }
 
 /* Expanded overlay */

@@ -5,6 +5,7 @@ mod commands;
 mod models;
 mod services;
 
+use models::boot::BootStatus;
 use services::{
     canvas_store::CanvasStore,
     feedback::FeedbackService,
@@ -22,6 +23,7 @@ use tauri::Manager;
 use tokio::sync::RwLock;
 
 /// Application state holding all services
+#[derive(Clone)]
 pub struct AppState {
     pub knowledge_store: Arc<RwLock<KnowledgeStore>>,
     pub graph_index: Arc<RwLock<GraphIndex>>,
@@ -34,6 +36,7 @@ pub struct AppState {
     pub retrieval_service: Arc<RwLock<RetrievalService>>,
     /// MemoryService is stateless — no lock needed, just Arc for shared ownership
     pub memory_service: Arc<MemoryService>,
+    pub boot_state: Arc<RwLock<BootStatus>>,
 }
 
 fn main() {
@@ -100,47 +103,10 @@ fn main() {
             // Initialize retrieval service
             let retrieval_service = RetrievalService::new(data_path.clone());
 
-            // Initialize feedback service with compile-time credentials
-            // These are embedded during build so users don't need to configure anything
-            let feedback_service = FeedbackService::new_with_credentials(
-                data_path.join("feedback"),
-                get_feedback_repo(),
-                get_feedback_token(),
-            );
-
-            // Build initial indices — parallelize note loading across threads
-            let note_metas = knowledge_store.list_notes().unwrap_or_default();
-            let note_ids: Vec<String> = note_metas.iter().map(|m| m.id.clone()).collect();
-
-            let full_notes: Vec<_> = {
-                let ks = &knowledge_store;
-                let notes = std::sync::Mutex::new(Vec::with_capacity(note_ids.len()));
-                let num_threads = std::thread::available_parallelism()
-                    .map(|n| n.get())
-                    .unwrap_or(4)
-                    .min(note_ids.len().max(1));
-                let chunk_size = note_ids.len().div_ceil(num_threads).max(1);
-
-                std::thread::scope(|s| {
-                    for chunk in note_ids.chunks(chunk_size) {
-                        let notes = &notes;
-                        s.spawn(move || {
-                            let mut batch = Vec::new();
-                            for id in chunk {
-                                if let Ok(note) = ks.get_note(id) {
-                                    batch.push(note);
-                                }
-                            }
-                            notes.lock().unwrap().extend(batch);
-                        });
-                    }
-                });
-
-                notes.into_inner().unwrap()
-            };
-
-            let mut graph_index = graph_index;
-            graph_index.build_from_notes(&full_notes);
+            // Initialize feedback service using runtime environment only.
+            // Release builds must not embed repository credentials.
+            let feedback_service = FeedbackService::new(data_path.join("feedback"));
+            let boot_state = Arc::new(RwLock::new(BootStatus::default()));
 
             // Create app state (MemoryService is stateless — no RwLock needed)
             let state = AppState {
@@ -154,13 +120,28 @@ fn main() {
                 priority_service: Arc::new(RwLock::new(priority_service)),
                 retrieval_service: Arc::new(RwLock::new(retrieval_service)),
                 memory_service: Arc::new(MemoryService::new()),
+                boot_state,
             };
 
             app.manage(state);
 
+            let app_handle = app.handle();
+            let state = app.state::<AppState>().inner().clone();
+            tauri::async_runtime::spawn(async move {
+                if let Err(error) = warm_start_services(app_handle.clone(), state.clone()).await {
+                    publish_boot_status(
+                        &app_handle,
+                        &state,
+                        BootStatus::failed("failed", "Startup failed", error),
+                    )
+                    .await;
+                }
+            });
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            commands::boot::get_boot_status,
             // Note commands
             commands::notes::list_notes,
             commands::notes::get_note,
@@ -247,24 +228,64 @@ fn main() {
         });
 }
 
-/// Get feedback repository from compile-time env or runtime env
-/// Priority: compile-time > runtime env
-fn get_feedback_repo() -> String {
-    // First try compile-time env (embedded in binary during build)
-    option_env!("GITHUB_FEEDBACK_REPO")
-        .map(|s| s.to_string())
-        // Fall back to runtime env (for development)
-        .or_else(|| std::env::var("GITHUB_FEEDBACK_REPO").ok())
-        .unwrap_or_default()
+async fn warm_start_services(app_handle: tauri::AppHandle, state: AppState) -> Result<(), String> {
+    publish_boot_status(
+        &app_handle,
+        &state,
+        BootStatus::new("opening_store", "Loading notes from your vault"),
+    )
+    .await;
+
+    let full_notes = {
+        let store = state.knowledge_store.read().await;
+        let note_metas = store.list_notes().map_err(|e| e.to_string())?;
+        let note_ids: Vec<String> = note_metas.iter().map(|m| m.id.clone()).collect();
+        let mut notes = Vec::with_capacity(note_ids.len());
+
+        for id in note_ids {
+            if let Ok(note) = store.get_note(&id) {
+                notes.push(note);
+            }
+        }
+
+        notes
+    };
+
+    publish_boot_status(
+        &app_handle,
+        &state,
+        BootStatus::new("building_indices", "Building graph and search index"),
+    )
+    .await;
+
+    {
+        let mut graph = state.graph_index.write().await;
+        graph.build_from_notes(&full_notes);
+    }
+
+    {
+        let mut search = state.search_service.write().await;
+        search.reindex_all(&full_notes).map_err(|e| e.to_string())?;
+    }
+
+    publish_boot_status(
+        &app_handle,
+        &state,
+        BootStatus::ready("Grafyn is ready"),
+    )
+    .await;
+
+    Ok(())
 }
 
-/// Get feedback token from compile-time env or runtime env
-/// Priority: compile-time > runtime env
-fn get_feedback_token() -> String {
-    // First try compile-time env (embedded in binary during build)
-    option_env!("GITHUB_FEEDBACK_TOKEN")
-        .map(|s| s.to_string())
-        // Fall back to runtime env (for development)
-        .or_else(|| std::env::var("GITHUB_FEEDBACK_TOKEN").ok())
-        .unwrap_or_default()
+async fn publish_boot_status(app_handle: &tauri::AppHandle, state: &AppState, status: BootStatus) {
+    {
+        let mut boot_state = state.boot_state.write().await;
+        *boot_state = status.clone();
+    }
+
+    if let Some(window) = app_handle.get_window("main") {
+        let _ = window.emit("boot-status", status);
+    }
 }
+

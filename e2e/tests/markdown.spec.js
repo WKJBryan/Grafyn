@@ -13,8 +13,6 @@ import {
   selectNote,
 } from './fixtures/test-helpers.js'
 
-const BASE_URL = 'http://localhost:8080'
-
 test.describe('Markdown Editor', () => {
   test.beforeEach(async ({ page }) => {
     await page.goto('/')
@@ -35,11 +33,11 @@ test.describe('Markdown Editor', () => {
       await expect(page.locator('.editor-panel-overlay .editor-textarea')).toHaveValue(content)
     })
 
-    test('should preserve markdown formatting after save and reload', async ({ page, request }) => {
+    test('should preserve markdown formatting after save and reload', async ({ page }) => {
       const title = `Format Test ${Date.now()}`
       const content = '## Subheading\n\n- List item 1\n- List item 2\n\n**Bold text**'
 
-      await createNoteViaAPI(request, BASE_URL, { title, content })
+      await createNoteViaAPI(page, { title, content })
       await page.reload()
       await waitForAppReady(page)
 
@@ -120,12 +118,12 @@ test.describe('Markdown Editor', () => {
       await expect(preview.locator('.wikilink, a:has-text("custom display")')).toBeVisible()
     })
 
-    test('should navigate on wikilink click', async ({ page, request }) => {
+    test('should navigate on wikilink click', async ({ page }) => {
       // Create target note
-      await createNoteViaAPI(request, BASE_URL, { title: 'Link Target', content: 'This is the target' })
+      await createNoteViaAPI(page, { title: 'Link Target', content: 'This is the target' })
 
       // Create note with wikilink
-      await createNoteViaAPI(request, BASE_URL, { title: 'Link Source', content: 'Go to [[Link Target]]' })
+      await createNoteViaAPI(page, { title: 'Link Source', content: 'Go to [[Link Target]]' })
 
       await page.reload()
       await waitForAppReady(page)
@@ -171,11 +169,11 @@ test.describe('Markdown Editor', () => {
   })
 
   test.describe('Special Characters', () => {
-    test('should handle unicode characters', async ({ page, request }) => {
+    test('should handle unicode characters', async ({ page }) => {
       const title = 'Unicode Test'
       const content = '日本語テキスト and 中文文本'
 
-      await createNoteViaAPI(request, BASE_URL, { title, content })
+      await createNoteViaAPI(page, { title, content })
       await page.reload()
       await waitForAppReady(page)
 

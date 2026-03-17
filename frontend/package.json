@@ -1,6 +1,6 @@
 {
   "name": "grafyn-frontend",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "type": "module",
   "description": "Grafyn frontend - Vue 3 SPA for knowledge management",
   "scripts": {

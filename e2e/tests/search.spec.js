@@ -2,20 +2,18 @@
  * E2E Tests: Search Functionality
  *
  * Tests semantic search and navigation.
- * Updated for graph-first UI: uses API-based note creation and editor overlay selectors.
+ * Updated for graph-first UI: uses UI-based test note setup and editor overlay selectors.
  */
 
 import { test, expect } from '@playwright/test'
-import { waitForAppReady, createNoteViaAPI, clearAllNotes } from './fixtures/test-helpers.js'
-
-const BASE_URL = 'http://localhost:8080'
+import { waitForAppReady, createNoteViaAPI } from './fixtures/test-helpers.js'
 
 test.describe('Search Functionality', () => {
-  test.beforeEach(async ({ page, request }) => {
+  test.beforeEach(async ({ page }) => {
     await page.goto('/')
     await waitForAppReady(page)
 
-    // Create test notes via API for speed
+    // Create test notes through the UI setup helper.
     const testNotes = [
       { title: 'Machine Learning Basics', content: 'Neural networks and deep learning concepts' },
       { title: 'Python Programming', content: 'Python is a great language for machine learning' },
@@ -23,10 +21,10 @@ test.describe('Search Functionality', () => {
     ]
 
     for (const note of testNotes) {
-      await createNoteViaAPI(request, BASE_URL, note)
+      await createNoteViaAPI(page, note)
     }
 
-    // Reload to pick up API-created notes
+    // Reload to ensure search index/view state is fresh.
     await page.reload()
     await waitForAppReady(page)
   })

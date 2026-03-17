@@ -1,129 +1,52 @@
-# Grafyn — How to Run Everything
+# Grafyn — Run & Test (Desktop-Only)
 
-## 1. Desktop App (Tauri) — Recommended for Production Use
+The product ships as a Tauri desktop app: Vue 3 + Vite in a WebView with a Rust backend. Web mode and the old Python backend are removed.
 
-The full desktop experience: single binary, Rust backend, Vue frontend in a WebView.
+## Prerequisites
+- Rust toolchain (`rustup`)
+- Node.js 18+ and npm
+- Tauri v1 prerequisites for your OS (see tauri.app)
 
+## Develop the Desktop App
 ```bash
 cd frontend
-npm run tauri:dev           # Dev mode with hot reload
-npm run tauri:build         # Production build → src-tauri/target/release/bundle/
+npm install          # first time
+npm run tauri:dev    # Tauri + Vite with hot reload
 ```
 
-**Prerequisites:** Rust (rustup), Node.js, [Tauri v1 prerequisites](https://v1.tauri.app/v1/guides/getting-started/prerequisites)
-
-**Environment:** `set OPENROUTER_API_KEY=your-key` for the Multi-LLM Canvas feature
-
-**Data location:** `~/Documents/Grafyn/` (vault/ for notes, data/ for indexes)
-
----
-
-## 2. Web Dev Mode (Python Backend + Vue Frontend)
-
-Two separate processes — good for backend development and debugging.
-
-### Terminal 1 — Python Backend (port 8080)
-```bash
-cd backend
-pip install -r requirements.txt       # First time only
-uvicorn app.main:app --reload --host 0.0.0.0 --port 8080
-```
-
-Or with Docker:
-```bash
-cd backend
-docker-compose up
-```
-
-### Terminal 2 — Vue Frontend (port 5173)
+## Build the Desktop App
 ```bash
 cd frontend
-npm install                            # First time only
-npm run dev                            # Dev server on http://localhost:5173
+npm run tauri:build  # bundles to src-tauri/target/release/bundle/
 ```
 
-The frontend auto-detects Tauri vs web: in web mode it uses Axios HTTP to `:8080`, in Tauri it uses IPC invoke().
-
-**Environment file:**
-```bash
-cp backend/.env.example .env
-# Edit .env — set OPENROUTER_API_KEY, GITHUB_FEEDBACK_TOKEN, etc.
-```
-
----
-
-## 3. Backend Tests (pytest)
-
-```bash
-cd backend
-pip install -r requirements-dev.txt    # First time only
-
-pytest                                 # All 795+ tests
-pytest --cov=app --cov-report=html     # With coverage report
-pytest -m unit                         # Unit tests only (~600)
-pytest -m integration                  # Integration tests only (~200)
-pytest -m security                     # Security tests
-pytest tests/integration/test_graph_api.py  # Single file
-pytest -k "TestGetNeighbors"           # Single test class
-```
-
----
-
-## 4. Frontend Only (Lint / Format / Build)
-
+## Frontend-Only Tasks (no backend)
 ```bash
 cd frontend
-npm run dev              # Dev server on :5173
-npm run build            # Production build (outputs to dist/)
-npm run lint             # ESLint
-npm run format           # Prettier
+npm run lint
+npm run test:run     # Vitest unit suite
+npm run build        # Vite production build (used by Tauri)
 ```
 
----
-
-## 5. MCP Sidecar (Desktop + Claude/ChatGPT Integration)
-
-Bundles a Python backend as a sidecar for MCP protocol support.
-
-### Build the sidecar binary
+## Rust Backend Tests
 ```bash
-cd backend
-pip install pyinstaller
-python build-exe.py      # Bundles to frontend/src-tauri/binaries/
+cd frontend/src-tauri
+cargo test
 ```
 
-### Enable at runtime
+## Playwright E2E (against the Vite UI, no backend)
 ```bash
-set MCP_ENABLED=1        # Windows
-export MCP_ENABLED=1     # macOS/Linux
+cd e2e
+npm install
+npm run install-browsers
+npm test             # or npm run test:ui for the UI runner
 ```
 
-### Connect Claude Desktop
-Add to `claude_desktop_config.json`:
-```json
-{ "mcpServers": { "grafyn-local": { "url": "http://localhost:8765/sse" } } }
-```
+## Environment Notes
+- `OPENROUTER_API_KEY` (optional) enables the multi-LLM canvas.
+- App data lives under `~/Documents/Grafyn/` by default (vault, data, cache).
 
----
-
-## 6. Key Environment Variables
-
-| Variable | Required For | Default |
-|----------|-------------|---------|
-| `OPENROUTER_API_KEY` | Multi-LLM Canvas | `""` (canvas disabled) |
-| `GITHUB_FEEDBACK_REPO` | Feedback system | `""` |
-| `GITHUB_FEEDBACK_TOKEN` | Feedback system | `""` |
-| `TOKEN_ENCRYPTION_KEY` | OAuth tokens | — (generate with Fernet) |
-| `ENVIRONMENT` | CORS policy | `development` |
-| `MCP_ENABLED` | MCP sidecar | `0` (disabled) |
-| `RUST_LOG` | Tauri logging | `info` |
-
----
-
-## Quick Start (Most Common Workflow)
-
-For day-to-day development, you likely want **one of**:
-
-- **Frontend + Backend changes:** Run Web Dev Mode (#2) — two terminals
-- **Desktop app testing:** Run Tauri Dev (#1) — single command
-- **After code changes:** Run tests (#3) — `pytest --tb=short -q`
+## Quick Start
+1) Install deps: `npm install` in `frontend` and `e2e`, `rustup` for Tauri.
+2) Run live app: `npm run tauri:dev`.
+3) Before shipping: `npm run lint && npm run test:run && cargo test && npm run tauri:build`.

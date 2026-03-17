@@ -254,7 +254,10 @@ pub struct DiscoverLinksResponse {
 /// Request to apply discovered links
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApplyLinksRequest {
+    #[serde(default)]
     pub link_ids: Vec<String>,
+    #[serde(default)]
+    pub candidates: Vec<ZettelLinkCandidate>,
 }
 
 /// Response from applying discovered links

@@ -5,9 +5,6 @@ import { readFileSync } from 'node:fs'
 
 const pkg = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf-8'))
 
-// Tauri CLI sets TAURI_PLATFORM before running beforeDevCommand
-const isTauri = !!process.env.TAURI_PLATFORM
-
 // https://vitejs.dev/config/
 export default defineConfig({
   plugins: [vue()],
@@ -25,17 +22,6 @@ export default defineConfig({
     port: 5173,
     // Tauri expects a fixed port
     strictPort: true,
-    // Proxy to Python backend only in web mode; Tauri uses IPC invoke() instead
-    proxy: isTauri ? undefined : {
-      '/api': {
-        target: 'http://localhost:8080',
-        changeOrigin: true,
-      },
-      '/mcp': {
-        target: 'http://localhost:8080',
-        changeOrigin: true,
-      },
-    },
   },
   // Env variables starting with TAURI_ are exposed to Tauri's API
   envPrefix: ['VITE_', 'TAURI_'],

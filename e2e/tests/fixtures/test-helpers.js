@@ -4,8 +4,7 @@
  * Updated for graph-first UI with overlay editor panels, TopicSelector modal,
  * TreeNav navigation, and ConfirmDialog.
  */
-
-const API_BASE = 'http://localhost:8080/api'
+import { expect } from '@playwright/test'
 
 /**
  * Generate a unique note title for testing
@@ -139,19 +138,19 @@ export async function createNote(page, { title, content, status = 'draft', tags 
   }
 
   // Save
-  await page.click('.editor-panel-overlay button:has-text("Save")')
+  const saveButton = page.locator('.editor-panel-overlay button:has-text("Save")')
+  await saveButton.click()
 
-  // Wait for save response
-  await page.waitForResponse(resp =>
-    resp.url().includes('/api/notes') && resp.status() === 200
-  )
+  // Save completion is reflected in UI by Save becoming disabled.
+  await expect(saveButton).toBeDisabled({ timeout: 10000 })
+  await expect(page.locator('.tree-nav')).toContainText(title, { timeout: 10000 })
 }
 
 /**
- * Create a note via API (faster, for test setup — skips UI).
+ * Create a note for test setup.
+ * Kept with legacy name for compatibility with existing specs.
  *
- * @param {import('@playwright/test').APIRequestContext} request
- * @param {string} baseURL
+ * @param {import('@playwright/test').Page} page
  * @param {Object} data
  * @param {string} data.title
  * @param {string} data.content
@@ -159,11 +158,10 @@ export async function createNote(page, { title, content, status = 'draft', tags 
  * @param {string[]} [data.tags=[]]
  * @returns {Promise<Object>} Created note
  */
-export async function createNoteViaAPI(request, baseURL, { title, content, status = 'draft', tags = [] }) {
-  const response = await request.post(`${baseURL}/api/notes`, {
-    data: { title, content, status, tags },
-  })
-  return response.json()
+export async function createNoteViaAPI(page, { title, content, status = 'draft', tags = [] }) {
+  await createNote(page, { title, content, status, tags })
+  await closeEditorOverlay(page)
+  return { title, content, status, tags }
 }
 
 /**
@@ -195,10 +193,8 @@ export async function deleteNote(page) {
   // Click the confirm "Delete" button in the dialog
   await page.click('.confirm-dialog .btn-danger')
 
-  // Wait for delete response
-  await page.waitForResponse(resp =>
-    resp.url().includes('/api/notes') && resp.request().method() === 'DELETE'
-  )
+  await page.waitForSelector('.confirm-dialog', { state: 'hidden' })
+  await page.waitForSelector('.editor-panel-overlay', { state: 'hidden' })
 }
 
 /**
@@ -256,13 +252,26 @@ export async function mockApiResponses(page, responses = {}) {
 }
 
 /**
- * Clear all notes via API
+ * Clear all notes through the UI.
  */
-export async function clearAllNotes(request, baseURL) {
-  const response = await request.get(`${baseURL}/api/notes`)
-  const notes = await response.json()
+export async function clearAllNotes(page) {
+  const navItems = page.locator('.tree-nav .nav-item')
+  let safetyCounter = 0
 
-  for (const note of notes) {
-    await request.delete(`${baseURL}/api/notes/${encodeURIComponent(note.id)}`)
+  while ((await navItems.count()) > 0 && safetyCounter < 100) {
+    const firstItem = navItems.first()
+    const noteTitle = (await firstItem.textContent())?.trim() || ''
+
+    await firstItem.click()
+    await page.waitForSelector('.editor-panel-overlay', { state: 'visible' })
+    await page.click('.editor-panel-overlay button:has-text("Delete")')
+    await confirmDelete(page)
+    await page.waitForSelector('.editor-panel-overlay', { state: 'hidden' })
+
+    if (noteTitle) {
+      await expect(page.locator('.tree-nav')).not.toContainText(noteTitle)
+    }
+
+    safetyCounter += 1
   }
 }

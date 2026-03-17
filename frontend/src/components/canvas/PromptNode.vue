@@ -1,7 +1,7 @@
 <template>
   <div
     class="prompt-node"
-    :class="{ dragging: isDragging, selected }"
+    :class="{ dragging: isDragging, resizing: isResizing, selected }"
     :style="nodeStyle"
     @mousedown="handleMouseDown"
   >
@@ -30,6 +30,11 @@
     
     <div class="node-footer">
       <span class="model-count">→ {{ modelCount }} model{{ modelCount !== 1 ? 's' : '' }}</span>
+      <span
+        v-if="tile.web_search"
+        class="web-search-badge"
+        title="Web search enabled"
+      >Web</span>
       <span class="timestamp">{{ formatTime(tile.created_at) }}</span>
     </div>
     
@@ -53,11 +58,19 @@
     >
       ⑂
     </div>
+
+    <div
+      class="resize-handle"
+      @mousedown.stop="startResize"
+    />
   </div>
 </template>
 
 <script setup>
 import { ref, computed, onBeforeUnmount } from 'vue'
+
+const MIN_WIDTH = 200
+const MIN_HEIGHT = 120
 
 const props = defineProps({
   tile: {
@@ -74,6 +87,7 @@ const emit = defineEmits(['drag', 'delete', 'show-add-model-dialog'])
 
 // Dragging state
 const isDragging = ref(false)
+const isResizing = ref(false)
 const dragStart = ref({ x: 0, y: 0, nodeX: 0, nodeY: 0 })
 
 // Computed
@@ -104,7 +118,12 @@ function formatTime(dateStr) {
 
 function handleMouseDown(e) {
   // Ignore clicks on interactive elements
-  if (e.target.closest('.node-actions') || e.target.closest('.delete-btn') || e.target.closest('.add-model-btn')) {
+  if (
+    e.target.closest('.node-actions') ||
+    e.target.closest('.delete-btn') ||
+    e.target.closest('.add-model-btn') ||
+    e.target.closest('.resize-handle')
+  ) {
     return
   }
   if (e.button !== 0) return
@@ -150,6 +169,38 @@ function stopDrag() {
   document.body.classList.remove('tile-dragging')
 }
 
+function startResize(e) {
+  isResizing.value = true
+  const startX = e.clientX
+  const startY = e.clientY
+  const startWidth = props.tile.position.width || MIN_WIDTH
+  const startHeight = props.tile.position.height || MIN_HEIGHT
+
+  e.preventDefault()
+  e.stopPropagation()
+
+  function onResize(moveEvent) {
+    const newWidth = Math.max(MIN_WIDTH, startWidth + (moveEvent.clientX - startX))
+    const newHeight = Math.max(MIN_HEIGHT, startHeight + (moveEvent.clientY - startY))
+
+    emit('drag', props.tile.id, {
+      x: props.tile.position.x,
+      y: props.tile.position.y,
+      width: newWidth,
+      height: newHeight
+    })
+  }
+
+  function stopResize() {
+    isResizing.value = false
+    document.removeEventListener('mousemove', onResize)
+    document.removeEventListener('mouseup', stopResize)
+  }
+
+  document.addEventListener('mousemove', onResize)
+  document.addEventListener('mouseup', stopResize)
+}
+
 // Cleanup on unmount
 onBeforeUnmount(() => {
   document.removeEventListener('mousemove', onDrag)
@@ -187,6 +238,10 @@ onBeforeUnmount(() => {
   box-shadow: 0 12px 32px color-mix(in srgb, var(--accent-primary) 40%, transparent);
   z-index: 1000;
   transform: scale(1.02);
+}
+
+.prompt-node.resizing {
+  user-select: none;
 }
 
 .node-header {
@@ -267,6 +322,17 @@ onBeforeUnmount(() => {
   color: var(--accent-primary);
 }
 
+.web-search-badge {
+  font-size: 0.625rem;
+  font-weight: 600;
+  color: var(--accent-cyan);
+  background: color-mix(in srgb, var(--accent-cyan) 15%, transparent);
+  padding: 1px 5px;
+  border-radius: var(--radius-sm);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
 /* Connection point - visual indicator on right side */
 .connection-point {
   position: absolute;
@@ -333,5 +399,21 @@ onBeforeUnmount(() => {
   background: var(--accent-green);
   color: white;
   transform: scale(1.1);
+}
+
+.resize-handle {
+  position: absolute;
+  right: 6px;
+  bottom: 6px;
+  width: 14px;
+  height: 14px;
+  border-right: 2px solid color-mix(in srgb, var(--accent-primary) 75%, white);
+  border-bottom: 2px solid color-mix(in srgb, var(--accent-primary) 75%, white);
+  opacity: 0.7;
+  cursor: se-resize;
+}
+
+.resize-handle:hover {
+  opacity: 1;
 }
 </style>

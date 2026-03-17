@@ -1,6 +1,6 @@
 use crate::models::note::{
-    ApplyLinksRequest, ApplyLinksResponse, CreateLinkResponse, DiscoverLinksResponse, NoteStatus,
-    NoteUpdate, ZettelLinkCandidate,
+    ApplyLinksRequest, ApplyLinksResponse, CreateLinkResponse, DiscoverLinksResponse, NoteUpdate,
+    ZettelLinkCandidate,
 };
 use crate::services::openrouter::ChatMessage;
 use crate::services::yake::{self, YakeConfig, STOPWORDS};
@@ -233,7 +233,7 @@ async fn find_search_links(
     results
         .into_iter()
         .filter(|r| {
-            r.note.id != note_id && r.note.status != NoteStatus::Evidence && r.score > 0.0
+            r.note.id != note_id && r.score > 0.0
         })
         .take(max_links)
         .map(|r| {
@@ -277,7 +277,7 @@ async fn find_keyword_links(
     let mut candidates = Vec::new();
 
     for meta in &all_notes {
-        if meta.id == note_id || meta.status == NoteStatus::Evidence {
+        if meta.id == note_id {
             continue;
         }
 
@@ -331,14 +331,14 @@ async fn find_llm_links(
         return Vec::new();
     }
 
-    // Get context notes (up to 15, excluding self and evidence notes)
+    // Get context notes (up to 15, excluding self)
     let context_notes: Vec<(String, String)> = {
         let store = state.knowledge_store.read().await;
         store
             .list_notes()
             .unwrap_or_default()
             .into_iter()
-            .filter(|m| m.id != note_id && m.status != NoteStatus::Evidence)
+            .filter(|m| m.id != note_id)
             .take(15)
             .map(|m| (m.id.clone(), m.title.clone()))
             .collect()
@@ -396,7 +396,7 @@ async fn find_llm_links(
     let response = {
         let or = state.openrouter.read().await;
         match or
-            .chat(&model, messages, None, Some(0.2), Some(800))
+            .chat(&model, messages, None, Some(0.2), Some(800), false)
             .await
         {
             Ok(r) => r,
@@ -512,6 +512,28 @@ fn deduplicate_links(links: Vec<ZettelLinkCandidate>) -> Vec<ZettelLinkCandidate
     seen.into_values().collect()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiscoverMode {
+    Manual,
+    Algorithm,
+    Llm,
+}
+
+impl DiscoverMode {
+    fn parse(mode: Option<&str>) -> Self {
+        match mode.unwrap_or("suggested").to_ascii_lowercase().as_str() {
+            "manual" => Self::Manual,
+            "algorithm" => Self::Algorithm,
+            "llm" | "suggested" => Self::Llm,
+            _ => Self::Llm,
+        }
+    }
+
+    fn include_llm(self) -> bool {
+        matches!(self, Self::Llm)
+    }
+}
+
 // ── Tauri commands ───────────────────────────────────────────────────────
 
 /// Discover potential links for a note using multiple strategies
@@ -522,10 +544,10 @@ pub async fn discover_links(
     mode: Option<String>,
     #[allow(non_snake_case)] maxLinks: Option<usize>,
 ) -> Result<DiscoverLinksResponse, String> {
-    let mode = mode.unwrap_or_else(|| "suggested".to_string());
+    let discover_mode = DiscoverMode::parse(mode.as_deref());
     let max_links = maxLinks.unwrap_or(10);
 
-    if mode == "manual" {
+    if discover_mode == DiscoverMode::Manual {
         return Ok(DiscoverLinksResponse {
             note_id: noteId,
             links: Vec::new(),
@@ -542,7 +564,11 @@ pub async fn discover_links(
     // Run all three strategies
     let search_links = find_search_links(&state, &noteId, &title, &content, max_links).await;
     let keyword_links = find_keyword_links(&state, &noteId, &content, &tags).await;
-    let llm_links = find_llm_links(&state, &noteId, &title, &content, max_links).await;
+    let llm_links = if discover_mode.include_llm() {
+        find_llm_links(&state, &noteId, &title, &content, max_links).await
+    } else {
+        Vec::new()
+    };
 
     // Merge, deduplicate, sort by confidence
     let mut all_links = Vec::new();
@@ -564,6 +590,32 @@ pub async fn discover_links(
     })
 }
 
+#[cfg(test)]
+mod tests {
+    use super::DiscoverMode;
+
+    #[test]
+    fn parses_discover_modes() {
+        assert_eq!(DiscoverMode::parse(None), DiscoverMode::Llm);
+        assert_eq!(DiscoverMode::parse(Some("suggested")), DiscoverMode::Llm);
+        assert_eq!(DiscoverMode::parse(Some("llm")), DiscoverMode::Llm);
+        assert_eq!(DiscoverMode::parse(Some("algorithm")), DiscoverMode::Algorithm);
+        assert_eq!(DiscoverMode::parse(Some("manual")), DiscoverMode::Manual);
+    }
+
+    #[test]
+    fn unknown_modes_default_to_llm() {
+        assert_eq!(DiscoverMode::parse(Some("unexpected")), DiscoverMode::Llm);
+    }
+
+    #[test]
+    fn include_llm_only_for_llm_mode() {
+        assert!(DiscoverMode::Llm.include_llm());
+        assert!(!DiscoverMode::Algorithm.include_llm());
+        assert!(!DiscoverMode::Manual.include_llm());
+    }
+}
+
 /// Apply discovered links to a note (creates bidirectional wikilinks)
 #[tauri::command]
 pub async fn apply_links(
@@ -571,43 +623,55 @@ pub async fn apply_links(
     #[allow(non_snake_case)] noteId: String,
     request: ApplyLinksRequest,
 ) -> Result<ApplyLinksResponse, String> {
-    // First discover links to get the full candidate list
-    let candidates = {
-        let store = state.knowledge_store.read().await;
-        let note = store.get_note(&noteId).map_err(|e| e.to_string())?;
+    let requested_candidates = if !request.candidates.is_empty() {
+        deduplicate_links(request.candidates.clone())
+    } else {
+        // Backward-compatibility path for older callers that only send IDs.
+        let candidates = {
+            let store = state.knowledge_store.read().await;
+            let note = store.get_note(&noteId).map_err(|e| e.to_string())?;
 
-        // Re-discover to get candidate details (the frontend only sends target IDs)
-        let (title, content, tags) = (note.title.clone(), note.content.clone(), note.tags.clone());
-        drop(store); // release lock before async calls
+            let (title, content, tags) = (note.title.clone(), note.content.clone(), note.tags.clone());
+            drop(store);
 
-        let search_links = find_search_links(&state, &noteId, &title, &content, 20).await;
-        let keyword_links = find_keyword_links(&state, &noteId, &content, &tags).await;
-        let llm_links = find_llm_links(&state, &noteId, &title, &content, 20).await;
+            let search_links = find_search_links(&state, &noteId, &title, &content, 20).await;
+            let keyword_links = find_keyword_links(&state, &noteId, &content, &tags).await;
+            let llm_links = find_llm_links(&state, &noteId, &title, &content, 20).await;
 
-        let mut all = Vec::new();
-        all.extend(search_links);
-        all.extend(keyword_links);
-        all.extend(llm_links);
-        deduplicate_links(all)
+            let mut all = Vec::new();
+            all.extend(search_links);
+            all.extend(keyword_links);
+            all.extend(llm_links);
+            deduplicate_links(all)
+        };
+
+        let requested: HashSet<String> = request.link_ids.iter().cloned().collect();
+        candidates
+            .into_iter()
+            .filter(|c| requested.contains(&c.target_id))
+            .collect()
     };
-
-    // Build lookup of requested target IDs
-    let requested: HashSet<String> = request.link_ids.iter().cloned().collect();
-    let to_apply: Vec<&ZettelLinkCandidate> = candidates
-        .iter()
-        .filter(|c| requested.contains(&c.target_id))
-        .collect();
+    let links_attempted = requested_candidates.len();
 
     let mut links_created = 0;
 
-    for candidate in &to_apply {
+    for candidate in &requested_candidates {
+        let (target_title, target_content) = {
+            let store = state.knowledge_store.read().await;
+            let target = match store.get_note(&candidate.target_id) {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            (target.title.clone(), target.content.clone())
+        };
+
         // Add forward link (source → target)
         let source_updated = {
             let store = state.knowledge_store.read().await;
             let source = store.get_note(&noteId).map_err(|e| e.to_string())?;
 
             if let Some(new_content) =
-                add_wikilink_to_content(&source.content, &candidate.target_title, &candidate.link_type)
+                add_wikilink_to_content(&source.content, &target_title, &candidate.link_type)
             {
                 drop(store);
                 let mut store = state.knowledge_store.write().await;
@@ -637,16 +701,7 @@ pub async fn apply_links(
         };
 
         {
-            let store = state.knowledge_store.read().await;
-            let target = match store.get_note(&candidate.target_id) {
-                Ok(t) => t,
-                Err(_) => continue,
-            };
-
-            if let Some(new_content) =
-                add_wikilink_to_content(&target.content, &source_title, reverse_type)
-            {
-                drop(store);
+            if let Some(new_content) = add_wikilink_to_content(&target_content, &source_title, reverse_type) {
                 let mut store = state.knowledge_store.write().await;
                 let _ = store.update_note(
                     &candidate.target_id,
@@ -693,7 +748,7 @@ pub async fn apply_links(
     Ok(ApplyLinksResponse {
         note_id: noteId,
         links_created,
-        links_attempted: request.link_ids.len(),
+        links_attempted,
     })
 }
 

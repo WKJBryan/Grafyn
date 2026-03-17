@@ -97,6 +97,7 @@ impl OpenRouterService {
         system_prompt: Option<&str>,
         temperature: Option<f64>,
         max_tokens: Option<u32>,
+        web_search: bool,
     ) -> Result<String> {
         if !self.is_configured() {
             return Err(anyhow::anyhow!("OpenRouter API key not configured"));
@@ -113,12 +114,22 @@ impl OpenRouterService {
 
         all_messages.extend(messages);
 
+        let plugins = if web_search {
+            Some(vec![WebPlugin {
+                id: "web".to_string(),
+                max_results: Some(5),
+            }])
+        } else {
+            None
+        };
+
         let request = ChatRequest {
             model: model.to_string(),
             messages: all_messages,
             stream: Some(false),
             temperature,
             max_tokens,
+            plugins,
         };
 
         let response = self
@@ -158,6 +169,7 @@ impl OpenRouterService {
         system_prompt: Option<&str>,
         temperature: Option<f64>,
         max_tokens: Option<u32>,
+        web_search: bool,
     ) -> Result<impl futures::Stream<Item = Result<String>>> {
         if !self.is_configured() {
             return Err(anyhow::anyhow!("OpenRouter API key not configured"));
@@ -174,12 +186,22 @@ impl OpenRouterService {
 
         all_messages.extend(messages);
 
+        let plugins = if web_search {
+            Some(vec![WebPlugin {
+                id: "web".to_string(),
+                max_results: Some(5),
+            }])
+        } else {
+            None
+        };
+
         let request = ChatRequest {
             model: model.to_string(),
             messages: all_messages,
             stream: Some(true),
             temperature,
             max_tokens,
+            plugins,
         };
 
         let response = self
@@ -342,6 +364,13 @@ fn get_default_models() -> Vec<AvailableModel> {
 // API request/response types
 
 #[derive(Debug, Serialize)]
+struct WebPlugin {
+    id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_results: Option<u32>,
+}
+
+#[derive(Debug, Serialize)]
 struct ChatRequest {
     model: String,
     messages: Vec<ChatMessage>,
@@ -351,6 +380,8 @@ struct ChatRequest {
     temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    plugins: Option<Vec<WebPlugin>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -8,7 +8,7 @@ use tauri::State;
 #[tauri::command]
 pub async fn get_settings(state: State<'_, AppState>) -> Result<UserSettings, String> {
     let settings = state.settings_service.read().await;
-    Ok(settings.get().clone())
+    Ok(redact_sensitive_settings(settings.get()))
 }
 
 /// Get settings status (for checking if setup is needed)
@@ -82,7 +82,7 @@ pub async fn update_settings(
         log::info!("Services rebuilt for new vault path");
     }
 
-    Ok(result)
+    Ok(redact_sensitive_settings(&result))
 }
 
 /// Complete initial setup
@@ -154,4 +154,10 @@ pub async fn get_openrouter_status(state: State<'_, AppState>) -> Result<OpenRou
 pub struct OpenRouterStatus {
     pub has_key: bool,
     pub is_configured: bool,
+}
+
+fn redact_sensitive_settings(settings: &UserSettings) -> UserSettings {
+    let mut redacted = settings.clone();
+    redacted.openrouter_api_key = None;
+    redacted
 }

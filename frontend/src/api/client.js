@@ -1,5 +1,10 @@
 import { invoke } from '@tauri-apps/api/tauri'
 
+// App boot API
+export const boot = {
+  status: () => invoke('get_boot_status', {}),
+}
+
 // Notes API
 export const notes = {
   list: () => invoke('list_notes', {}),
@@ -147,8 +152,14 @@ export const zettelkasten = {
   discoverLinks: (noteId, mode = 'suggested', maxLinks = 10) =>
     invoke('discover_links', { noteId, mode, maxLinks }),
 
-  applyLinks: (noteId, linkIds) =>
-    invoke('apply_links', { noteId, request: { link_ids: linkIds } }),
+  applyLinks: (noteId, candidates) =>
+    invoke('apply_links', {
+      noteId,
+      request: {
+        link_ids: candidates.map(candidate => candidate.target_id),
+        candidates,
+      },
+    }),
 
   createLink: (sourceId, targetId, linkType = 'related') =>
     invoke('create_link', { sourceId, targetId, linkType }),

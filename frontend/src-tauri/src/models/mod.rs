@@ -1,3 +1,4 @@
+pub mod boot;
 pub mod canvas;
 pub mod feedback;
 pub mod import;

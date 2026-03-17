@@ -4,6 +4,9 @@ use crate::models::settings::{SettingsStatus, SettingsUpdate, UserSettings};
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 
+const KEYRING_SERVICE: &str = "com.grafyn.app";
+const OPENROUTER_KEY_ACCOUNT: &str = "openrouter_api_key";
+
 /// Service for managing user settings
 #[derive(Debug, Clone)]
 pub struct SettingsService {
@@ -41,7 +44,7 @@ impl SettingsService {
         }
         let config_path = config_dir.join("settings.json");
 
-        let settings = if config_path.exists() {
+        let mut settings: UserSettings = if config_path.exists() {
             let content = std::fs::read_to_string(&config_path)
                 .context("Failed to read settings file")?;
             serde_json::from_str(&content).unwrap_or_default()
@@ -49,10 +52,33 @@ impl SettingsService {
             UserSettings::default()
         };
 
-        Ok(Self {
+        let mut migrated_legacy_plaintext_key = false;
+
+        // Prefer OS keychain storage for API keys.
+        if let Some(stored_key) = load_openrouter_api_key() {
+            settings.openrouter_api_key = Some(stored_key);
+        } else if let Some(legacy_key) = settings.openrouter_api_key.clone() {
+            if !legacy_key.is_empty() {
+                if let Err(error) = store_openrouter_api_key(&legacy_key) {
+                    log::warn!("Failed to migrate OpenRouter key to OS keychain: {}", error);
+                }
+                migrated_legacy_plaintext_key = true;
+            }
+        }
+
+        let service = Self {
             config_path,
             settings,
-        })
+        };
+
+        // Re-save after migration so settings.json no longer contains plaintext API keys.
+        if migrated_legacy_plaintext_key {
+            if let Err(error) = service.save() {
+                log::warn!("Failed to persist settings cleanup after key migration: {}", error);
+            }
+        }
+
+        Ok(service)
     }
 
     /// Get current settings
@@ -80,8 +106,14 @@ impl SettingsService {
 
         if let Some(api_key) = update.openrouter_api_key {
             self.settings.openrouter_api_key = if api_key.is_empty() {
+                if let Err(error) = clear_openrouter_api_key() {
+                    log::warn!("Failed to clear OpenRouter API key from OS keychain: {}", error);
+                }
                 None
             } else {
+                if let Err(error) = store_openrouter_api_key(&api_key) {
+                    log::warn!("Failed to store OpenRouter API key in OS keychain: {}", error);
+                }
                 Some(api_key)
             };
         }
@@ -104,6 +136,10 @@ impl SettingsService {
             } else {
                 llm_model
             };
+        }
+
+        if let Some(smart_web_search) = update.smart_web_search {
+            self.settings.smart_web_search = smart_web_search;
         }
 
         // Persist to disk
@@ -155,15 +191,54 @@ impl SettingsService {
 
     /// Clear the OpenRouter API key
     pub fn clear_openrouter_key(&mut self) -> Result<()> {
+        if let Err(error) = clear_openrouter_api_key() {
+            log::warn!("Failed to clear OpenRouter API key from OS keychain: {}", error);
+        }
         self.settings.openrouter_api_key = None;
         self.save()
     }
 }
 
+fn keyring_entry() -> Result<keyring::Entry> {
+    keyring::Entry::new(KEYRING_SERVICE, OPENROUTER_KEY_ACCOUNT)
+        .context("Failed to initialize OS keychain entry")
+}
+
+fn load_openrouter_api_key() -> Option<String> {
+    let entry = match keyring_entry() {
+        Ok(entry) => entry,
+        Err(error) => {
+            log::debug!("OpenRouter keychain unavailable: {}", error);
+            return None;
+        }
+    };
+    match entry.get_password() {
+        Ok(password) if !password.is_empty() => Some(password),
+        Ok(_) => None,
+        Err(error) => {
+            log::debug!("OpenRouter key not available in OS keychain: {}", error);
+            None
+        }
+    }
+}
+
+fn store_openrouter_api_key(api_key: &str) -> Result<()> {
+    let entry = keyring_entry()?;
+    entry
+        .set_password(api_key)
+        .context("Failed to store OpenRouter API key in OS keychain")
+}
+
+fn clear_openrouter_api_key() -> Result<()> {
+    let entry = keyring_entry()?;
+    entry
+        .delete_password()
+        .context("Failed to delete OpenRouter API key from OS keychain")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
 
     #[test]
     fn test_default_settings() {

@@ -3,9 +3,9 @@ import { defineConfig, devices } from '@playwright/test'
 /**
  * Playwright configuration for Grafyn E2E tests
  *
- * Note: E2E tests run against the built Tauri app or the Vite dev server.
- * The Python backend has been removed — all API calls go through Tauri IPC.
- * These tests validate the frontend UI flows against the Vite dev server.
+ * Note: E2E tests run against the frontend served by Vite.
+ * Web-backend mode has been removed; tests should not assume localhost:8080 APIs.
+ * Desktop/Tauri integration is validated in dedicated desktop checks, not here.
  *
  * @see https://playwright.dev/docs/test-configuration
  */
