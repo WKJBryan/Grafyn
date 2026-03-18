@@ -103,7 +103,7 @@ import { notes, search, graph, canvas, settings, mcp, memory,
 // Canvas streaming uses canvas-stream Tauri events (including ContextNotes for semantic mode)
 ```
 
-**Pinia Stores:** `notes.js`, `canvas.js`, `theme.js`
+**Pinia Stores:** `notes.js`, `canvas.js`, `theme.js`, `boot.js`
 
 **Frontend Routes:** `/` (notes), `/canvas`, `/canvas/:id`, `/import`
 
@@ -171,6 +171,10 @@ Compare responses from multiple LLM models simultaneously via OpenRouter. Featur
 
 Streaming commands: `send_prompt`, `start_debate`, `continue_debate`, `add_models_to_tile`, `regenerate_response`
 
+**Web search:** When `web_search: true`, OpenRouter's `plugins: [{"id": "web", "max_results": 5}]` is added to the API request (~$0.02/query per model). The `web_search` flag is threaded through the full stack and persisted on `PromptTile` for regenerate/add-model replay.
+
+**Smart web search auto-detection:** Controlled by `UserSettings.smart_web_search` (default: `true`). When enabled, `useWebSearchDetection.js` analyzes prompt text with 5 heuristic rules (temporal markers, explicit search intent, news patterns, freshness queries, comparisons) and suppression rules (code blocks, wikilinks, short prompts). Detection result is shown as a hint in `PromptDialog.vue`. Disable via Settings toggle.
+
 ### Conversation Import
 
 Import conversations from ChatGPT, Claude, Grok, or Gemini as evidence notes. Four format parsers with auto-detection via platform-specific JSON keys. Each parser implements `can_parse()` + `parse()`. Imported conversations become evidence-status container notes with provenance metadata (`source`, `source_id`, `created_via`).
@@ -190,6 +194,7 @@ Submit bug reports, feature requests, and general feedback. Creates GitHub Issue
 First-run setup wizard and persistent settings. Manages vault path, OpenRouter API key, MCP configuration, theme preferences, and LLM model selection. Settings stored as JSON in app data directory. Frontend: `SettingsModal.vue`.
 
 - **`llm_model`** — configurable LLM model for distillation and link discovery (default: `anthropic/claude-3.5-haiku`), selectable via Settings dropdown when API key is configured
+- **`smart_web_search`** — enables automatic web search detection in canvas prompts (default: `true`). Uses `#[serde(default = "default_smart_web_search")]` for backward-compatible `true` default.
 
 **Runtime sync pattern:** When settings change via `update_settings`, dependent services are updated in-place — no restart required. The pattern (in `commands/settings.rs`): capture changed fields before moving the update, apply settings, then sync each affected service:
 - **OpenRouter API key** → `openrouter.set_api_key()`
@@ -298,6 +303,14 @@ Tauri v1 depends on `libwebkit2gtk-4.0-dev` which **does not exist on Ubuntu 24.
    ```bash
    mkdir -p ../dist && echo '<html></html>' > ../dist/index.html
    ```
+
+### Cargo.lock Must Be Committed
+
+`Cargo.lock` is committed (not gitignored) to ensure reproducible CI builds. Without it, CI resolves fresh dependency versions that may break — e.g., `webkit2gtk` updates that are incompatible with `wry` 0.24.x.
+
+### Tauri Features Must Include `process-all` and `protocol-all`
+
+Removing `process-all` or `protocol-all` from the Tauri features in `Cargo.toml` changes the `wry`/`webkit2gtk` feature graph and breaks the Linux build. The `wry` crate's webkitgtk code depends on `SettingsExt` trait methods that are only in scope when these features are enabled.
 
 ### ESLint `_` Prefix Convention
 
