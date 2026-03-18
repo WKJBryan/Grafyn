@@ -497,7 +497,7 @@ jobs:
               if [ -n "$content_type" ]; then
                 ct_flag="--content-type $content_type"
               fi
-              if wrangler r2 object put "$key" --file "$file" --remote $ct_flag 2>&1; then
+              if wrangler r2 object put "$key" --file "$file" $ct_flag 2>&1; then
                 echo "  Upload complete."
                 return 0
               fi
