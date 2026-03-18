@@ -99,6 +99,8 @@ pub struct PromptTile {
     pub context_notes: Vec<TileContextNote>,
     #[serde(default)]
     pub web_search: bool,
+    #[serde(default = "default_web_search_max_results")]
+    pub web_search_max_results: u32,
 }
 
 impl Default for PromptTile {
@@ -116,6 +118,7 @@ impl Default for PromptTile {
             parent_model_id: None,
             context_notes: Vec::new(),
             web_search: false,
+            web_search_max_results: default_web_search_max_results(),
         }
     }
 }
@@ -326,18 +329,20 @@ pub struct PromptRequest {
     pub parent_model_id: Option<String>,
     #[serde(default = "default_temperature")]
     pub temperature: f64,
-    #[serde(default = "default_max_tokens")]
-    pub max_tokens: u32,
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
     #[serde(default)]
     pub web_search: bool,
+    #[serde(default = "default_web_search_max_results")]
+    pub web_search_max_results: u32,
 }
 
 fn default_temperature() -> f64 {
     0.7
 }
 
-fn default_max_tokens() -> u32 {
-    2048
+fn default_web_search_max_results() -> u32 {
+    5
 }
 
 /// Available LLM model information
@@ -352,6 +357,44 @@ pub struct AvailableModel {
     pub context_length: Option<u32>,
     #[serde(default)]
     pub pricing: Option<ModelPricing>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn prompt_request_defaults_web_search_max_results_when_omitted() {
+        let request: PromptRequest = serde_json::from_value(json!({
+            "prompt": "hello",
+            "models": ["openai/gpt-4"]
+        }))
+        .unwrap();
+
+        assert_eq!(request.web_search_max_results, 5);
+        assert_eq!(request.max_tokens, None);
+    }
+
+    #[test]
+    fn prompt_tile_defaults_web_search_max_results_when_omitted() {
+        let tile: PromptTile = serde_json::from_value(json!({
+            "id": "tile-1",
+            "prompt": "hello",
+            "models": ["openai/gpt-4"],
+            "responses": {},
+            "position": {
+                "x": 0.0,
+                "y": 0.0,
+                "width": 400.0,
+                "height": 300.0
+            },
+            "created_at": "2026-03-17T00:00:00Z"
+        }))
+        .unwrap();
+
+        assert_eq!(tile.web_search_max_results, 5);
+    }
 }
 
 /// Model pricing information

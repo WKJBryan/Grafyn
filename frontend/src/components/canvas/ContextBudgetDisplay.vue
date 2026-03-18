@@ -78,7 +78,7 @@ const isError = computed(() => {
   padding: var(--spacing-sm);
   background: var(--bg-tertiary);
   border-radius: var(--radius-sm);
-  border: 1px solid var(--bg-tertiary);
+  border: 1px solid var(--border-subtle);
   transition: border-color 0.2s;
 }
 

@@ -222,7 +222,7 @@ describe('API Client (Tauri)', () => {
     })
 
     it('sendPrompt() invokes send_prompt', async () => {
-      const request = { prompt: 'hello', models: ['gpt-4'] }
+      const request = { prompt: 'hello', models: ['gpt-4'], web_search_max_results: 8 }
       mockInvoke.mockResolvedValue('tile-1')
       await canvas.sendPrompt('s1', request)
       expect(mockInvoke).toHaveBeenCalledWith('send_prompt', { sessionId: 's1', request })

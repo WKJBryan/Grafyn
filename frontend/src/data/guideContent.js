@@ -116,8 +116,8 @@ export const guideCategories = [
       {
         id: 'canvas-prompt',
         title: 'Send a Prompt',
-        content: 'Type a prompt and select one or more models. Responses stream in real-time onto the infinite canvas.',
-        anchor: '[data-guide="canvas-toolbar"]',
+        content: 'Start with + New Prompt, then type your prompt and choose one or more models. Responses stream onto the canvas in real time.',
+        anchor: '[data-guide="canvas-prompt-btn"]',
         sinceVersion: '0.1.0',
       },
       {

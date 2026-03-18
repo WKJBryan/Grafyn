@@ -17,7 +17,7 @@ describe('ModelSelector', () => {
     wrapper?.unmount()
   })
 
-  it('renders all selected model chips when more than three models are selected', () => {
+  it('renders all selected model chips in the wrapping selection area when more than three models are selected', () => {
     wrapper = mount(ModelSelector, {
       props: {
         models,
@@ -31,5 +31,22 @@ describe('ModelSelector', () => {
     expect(wrapper.find('.selected-tags').text()).toContain('GPT-4o')
     expect(wrapper.find('.selected-tags').text()).toContain('Claude 3.5 Sonnet')
     expect(wrapper.find('.selected-tags').text()).toContain('Gemini 1.5 Pro')
+    expect(wrapper.find('.selected-tags').text()).toContain('Llama 3.1 70B Instruct')
+    expect(tags[0].attributes('title')).toBeTruthy()
+  })
+
+  it('removes a selected model when the chip close button is clicked', async () => {
+    wrapper = mount(ModelSelector, {
+      props: {
+        models,
+        modelValue: ['openai/gpt-4o', 'anthropic/claude-3.5-sonnet']
+      }
+    })
+
+    await wrapper.find('.tag-remove').trigger('click')
+
+    expect(wrapper.emitted('update:modelValue')).toEqual([
+      [['anthropic/claude-3.5-sonnet']]
+    ])
   })
 })

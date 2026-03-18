@@ -12,17 +12,35 @@
       <span class="model-badge">{{ modelName }}</span>
       <div class="header-right">
         <span
+          v-if="webSearch"
+          class="web-search-badge"
+          title="Live web search used for this prompt"
+        >
+          <GIcon
+            name="globe"
+            :size="12"
+          />
+          <span>Web</span>
+        </span>
+        <GIcon
           v-if="isStreaming"
+          name="loader"
+          :size="14"
           class="streaming-indicator"
-        >●</span>
-        <span
+          icon-class="spinning"
+        />
+        <GIcon
           v-else-if="hasError"
+          name="alert-circle"
+          :size="14"
           class="error-indicator"
-        >!</span>
-        <span
+        />
+        <GIcon
           v-else-if="isCompleted"
+          name="check-circle"
+          :size="14"
           class="complete-indicator"
-        >✓</span>
+        />
       </div>
     </div>
     
@@ -46,7 +64,11 @@
         v-else-if="hasError"
         class="error-message"
       >
-        <span class="error-icon">⚠️</span>
+        <GIcon
+          name="alert-triangle"
+          :size="16"
+          class="error-icon"
+        />
         <span>{{ response.error_message || 'Error occurred' }}</span>
       </div>
       <div
@@ -68,7 +90,18 @@
         title="Branch from this response"
         @click.stop="toggleBranch"
       >
-        ⑂ Branch
+        <GIcon
+          name="git-branch"
+          :size="14"
+        /> Branch
+      </button>
+      <button
+        v-if="isCompleted"
+        class="think-harder-btn"
+        title="Ask this model to think harder"
+        @click.stop="toggleThinkHarder"
+      >
+        Think Harder
       </button>
       <button 
         class="regenerate-btn" 
@@ -76,7 +109,10 @@
         title="Regenerate response"
         @click.stop="$emit('regenerate', { tileId, modelId })"
       >
-        ↻
+        <GIcon
+          name="refresh-cw"
+          :size="14"
+        />
       </button>
       <button 
         class="select-btn"
@@ -84,14 +120,25 @@
         title="Select for debate"
         @click.stop="$emit('select', { tileId, modelId })"
       >
-        {{ selected ? '✓' : '○' }}
+        <GIcon
+          v-if="selected"
+          name="check"
+          :size="14"
+        /><GIcon
+          v-else
+          name="circle"
+          :size="14"
+        />
       </button>
       <button
         class="delete-btn"
         title="Remove this response"
         @click.stop="$emit('delete', { tileId, modelId })"
       >
-        ×
+        <GIcon
+          name="x"
+          :size="14"
+        />
       </button>
     </div>
     
@@ -113,7 +160,10 @@
       title="Quick follow-up with this model"
       @click.stop="toggleFollowup"
     >
-      +
+      <GIcon
+        name="plus"
+        :size="16"
+      />
     </button>
 
     <!-- Follow-up input overlay -->
@@ -191,7 +241,10 @@
             <button
               class="tag-remove-btn"
               @click.stop="removeModel(mId)"
-            >×</button>
+            ><GIcon
+              name="x"
+              :size="10"
+            /></button>
           </span>
         </div>
         
@@ -274,6 +327,44 @@
     </div>
 
     <div
+      v-if="showThinkHarder"
+      class="think-harder-overlay"
+      @click.stop
+    >
+      <div class="think-harder-header">
+        <span class="think-harder-title">Think Harder</span>
+        <span class="think-harder-model">{{ modelName }}</span>
+      </div>
+      <p class="think-harder-copy">
+        This creates a deeper second-pass branch and asks the model to verify more information before answering.
+      </p>
+      <label class="think-harder-checkbox">
+        <input
+          v-model="thinkHarderWebSearch"
+          type="checkbox"
+        >
+        <span>Web search more sources</span>
+      </label>
+      <p class="think-harder-hint">
+        Enabled by default. This pass searches more results than a normal web-search prompt when supported.
+      </p>
+      <div class="think-harder-actions">
+        <button
+          class="think-harder-cancel"
+          @click.stop="showThinkHarder = false"
+        >
+          Cancel
+        </button>
+        <button
+          class="think-harder-submit"
+          @click.stop="submitThinkHarder"
+        >
+          Think Harder
+        </button>
+      </div>
+    </div>
+
+    <div
       class="resize-handle"
       @mousedown.stop="startResize"
     />
@@ -283,6 +374,7 @@
 <script setup>
 import { ref, computed, onBeforeUnmount, watch, nextTick } from 'vue'
 import { marked } from 'marked'
+import GIcon from '@/components/ui/GIcon.vue'
 
 const MIN_WIDTH = 280
 const MIN_HEIGHT = 200
@@ -300,6 +392,10 @@ const props = defineProps({
     type: Object,
     required: true
   },
+  webSearch: {
+    type: Boolean,
+    default: false
+  },
   isStreaming: {
     type: Boolean,
     default: false
@@ -314,7 +410,7 @@ const props = defineProps({
   }
 })
 
-const emit = defineEmits(['drag', 'branch', 'select', 'delete', 'regenerate', 'follow-up'])
+const emit = defineEmits(['drag', 'branch', 'select', 'delete', 'regenerate', 'follow-up', 'think-harder'])
 
 // Refs
 const contentRef = ref(null)
@@ -329,6 +425,8 @@ const dragStart = ref({ x: 0, y: 0, nodeX: 0, nodeY: 0 })
 // Follow-up state
 const showFollowup = ref(false)
 const followupPrompt = ref('')
+const showThinkHarder = ref(false)
+const thinkHarderWebSearch = ref(true)
 
 // Branch state
 const showBranch = ref(false)
@@ -410,6 +508,7 @@ function handleMouseDown(e) {
   if (e.target.closest('.node-footer') ||
       e.target.closest('.branch-overlay') ||
       e.target.closest('.followup-overlay') ||
+      e.target.closest('.think-harder-overlay') ||
       e.target.closest('.node-content') ||
       e.target.closest('.resize-handle') ||
       e.target.closest('button')) {
@@ -491,6 +590,7 @@ function startResize(e) {
 }
 
 function toggleBranch() {
+  showThinkHarder.value = false
   showBranch.value = !showBranch.value
   if (!showBranch.value) {
     branchPrompt.value = ''
@@ -509,10 +609,29 @@ function submitBranch() {
 
 // Follow-up methods
 function toggleFollowup() {
+  showThinkHarder.value = false
   showFollowup.value = !showFollowup.value
   if (!showFollowup.value) {
     followupPrompt.value = ''
   }
+}
+
+function toggleThinkHarder() {
+  showBranch.value = false
+  showFollowup.value = false
+  showThinkHarder.value = !showThinkHarder.value
+  if (showThinkHarder.value) {
+    thinkHarderWebSearch.value = true
+  }
+}
+
+function submitThinkHarder() {
+  emit('think-harder', {
+    tileId: props.tileId,
+    modelId: props.modelId,
+    webSearch: thinkHarderWebSearch.value
+  })
+  showThinkHarder.value = false
 }
 
 function submitFollowup() {
@@ -549,7 +668,7 @@ onBeforeUnmount(() => {
   background: var(--bg-secondary);
   border: 2px solid var(--node-color, #7c5cff);
   border-radius: var(--radius-md);
-  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.2);
+  box-shadow: var(--shadow-md);
   display: flex;
   flex-direction: column;
   overflow: visible;
@@ -558,7 +677,7 @@ onBeforeUnmount(() => {
 }
 
 .llm-node:hover {
-  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.3);
+  box-shadow: var(--shadow-lg);
 }
 
 .llm-node.selected {
@@ -617,6 +736,27 @@ onBeforeUnmount(() => {
   display: flex;
   align-items: center;
   gap: 4px;
+}
+
+.web-search-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 6px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--accent-cyan) 35%, transparent);
+  background: color-mix(in srgb, var(--accent-cyan) 14%, transparent);
+  color: var(--accent-cyan);
+  font-size: 0.625rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  line-height: 1;
+  text-transform: uppercase;
+}
+
+.web-search-icon {
+  font-size: 0.6875rem;
+  line-height: 1;
 }
 
 .streaming-indicator {
@@ -699,7 +839,7 @@ onBeforeUnmount(() => {
 .pending-spinner {
   width: 16px;
   height: 16px;
-  border: 2px solid var(--bg-tertiary);
+  border: 2px solid var(--border-subtle);
   border-top-color: var(--accent-primary);
   border-radius: 50%;
   animation: spin 1s linear infinite;
@@ -717,13 +857,13 @@ onBeforeUnmount(() => {
   display: flex;
   gap: 4px;
   padding: var(--spacing-xs) var(--spacing-sm);
-  background: rgba(0, 0, 0, 0.1);
-  border-top: 1px solid var(--bg-tertiary);
+  border-top: 1px solid var(--border-subtle);
+  background: transparent;
 }
 
-.branch-btn, .select-btn, .delete-btn {
+.branch-btn, .think-harder-btn, .select-btn, .delete-btn {
   padding: 4px 8px;
-  border: 1px solid var(--bg-tertiary);
+  border: 1px solid var(--border-subtle);
   border-radius: var(--radius-sm);
   background: transparent;
   color: var(--text-muted);
@@ -745,6 +885,16 @@ onBeforeUnmount(() => {
 .branch-btn:disabled {
   opacity: 0.4;
   cursor: not-allowed;
+}
+
+.think-harder-btn {
+  white-space: nowrap;
+}
+
+.think-harder-btn:hover {
+  border-color: var(--accent-cyan);
+  color: var(--accent-cyan);
+  background: color-mix(in srgb, var(--accent-cyan) 10%, transparent);
 }
 
 .select-btn {
@@ -805,7 +955,7 @@ onBeforeUnmount(() => {
 /* Regenerate button */
 .regenerate-btn {
   padding: 4px 8px;
-  border: 1px solid var(--bg-tertiary);
+  border: 1px solid var(--border-subtle);
   border-radius: var(--radius-sm);
   background: transparent;
   color: var(--text-muted);
@@ -870,11 +1020,12 @@ onBeforeUnmount(() => {
   left: 0;
   right: 0;
   background: var(--bg-secondary);
-  border: 1px solid var(--accent-blue);
+  border: 1px solid var(--border-default);
   border-radius: var(--radius-md);
   padding: var(--spacing-sm);
   margin-bottom: var(--spacing-xs);
-  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.3);
+  backdrop-filter: blur(12px);
+  box-shadow: var(--shadow-lg);
   z-index: 10;
 }
 
@@ -882,7 +1033,7 @@ onBeforeUnmount(() => {
   width: 100%;
   padding: var(--spacing-sm);
   background: var(--bg-tertiary);
-  border: 1px solid var(--bg-tertiary);
+  border: 1px solid var(--border-subtle);
   border-radius: var(--radius-sm);
   color: var(--text-primary);
   font-size: 0.8125rem;
@@ -912,7 +1063,7 @@ onBeforeUnmount(() => {
 
 .followup-cancel {
   background: transparent;
-  border: 1px solid var(--bg-tertiary);
+  border: 1px solid var(--border-subtle);
   color: var(--text-muted);
 }
 
@@ -935,6 +1086,106 @@ onBeforeUnmount(() => {
   cursor: not-allowed;
 }
 
+.think-harder-overlay {
+  position: absolute;
+  right: -8px;
+  bottom: calc(100% + 12px);
+  width: 280px;
+  padding: var(--spacing-md);
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  backdrop-filter: blur(12px);
+  box-shadow: var(--shadow-lg);
+  z-index: 50;
+}
+
+.think-harder-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--spacing-sm);
+  margin-bottom: var(--spacing-xs);
+}
+
+.think-harder-title {
+  font-size: 0.8125rem;
+  font-weight: 700;
+  color: var(--text-primary);
+}
+
+.think-harder-model {
+  max-width: 120px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.75rem;
+  color: var(--accent-cyan);
+}
+
+.think-harder-copy,
+.think-harder-hint {
+  margin: 0;
+  font-size: 0.75rem;
+  line-height: 1.5;
+  color: var(--text-secondary);
+}
+
+.think-harder-copy {
+  margin-bottom: var(--spacing-sm);
+}
+
+.think-harder-checkbox {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-sm);
+  margin-bottom: var(--spacing-xs);
+  font-size: 0.8125rem;
+  color: var(--text-primary);
+  cursor: pointer;
+}
+
+.think-harder-checkbox input[type="checkbox"] {
+  margin: 0;
+  accent-color: var(--accent-cyan);
+}
+
+.think-harder-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--spacing-sm);
+  margin-top: var(--spacing-md);
+}
+
+.think-harder-cancel,
+.think-harder-submit {
+  padding: 4px 12px;
+  border-radius: var(--radius-sm);
+  font-size: 0.75rem;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.think-harder-cancel {
+  background: transparent;
+  border: 1px solid var(--border-subtle);
+  color: var(--text-muted);
+}
+
+.think-harder-cancel:hover {
+  border-color: var(--text-muted);
+}
+
+.think-harder-submit {
+  background: color-mix(in srgb, var(--accent-cyan) 20%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent-cyan) 35%, transparent);
+  color: var(--accent-cyan);
+}
+
+.think-harder-submit:hover {
+  background: color-mix(in srgb, var(--accent-cyan) 28%, transparent);
+}
+
 /* Branch overlay */
 .branch-overlay {
   position: absolute;
@@ -942,11 +1193,12 @@ onBeforeUnmount(() => {
   left: 0;
   width: max(100%, 340px);
   background: var(--bg-secondary);
-  border: 1px solid var(--accent-primary);
+  border: 1px solid var(--border-default);
   border-radius: var(--radius-md);
   padding: var(--spacing-sm);
   margin-bottom: var(--spacing-xs);
-  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.3);
+  backdrop-filter: blur(12px);
+  box-shadow: var(--shadow-lg);
   z-index: 10;
 }
 
@@ -954,7 +1206,7 @@ onBeforeUnmount(() => {
   width: 100%;
   padding: var(--spacing-sm);
   background: var(--bg-tertiary);
-  border: 1px solid var(--bg-tertiary);
+  border: 1px solid var(--border-subtle);
   border-radius: var(--radius-sm);
   color: var(--text-primary);
   font-size: 0.8125rem;
@@ -975,7 +1227,7 @@ onBeforeUnmount(() => {
   width: 100%;
   padding: 4px 8px;
   background: var(--bg-tertiary);
-  border: 1px solid var(--bg-tertiary);
+  border: 1px solid var(--border-subtle);
   border-radius: var(--radius-sm);
   color: var(--text-primary);
   font-size: 0.75rem;
@@ -997,7 +1249,7 @@ onBeforeUnmount(() => {
 
 .branch-cancel {
   background: transparent;
-  border: 1px solid var(--bg-tertiary);
+  border: 1px solid var(--border-subtle);
   color: var(--text-muted);
 }
 
@@ -1041,7 +1293,7 @@ onBeforeUnmount(() => {
 .models-toggle {
   padding: 2px 8px;
   background: var(--bg-tertiary);
-  border: 1px solid var(--bg-tertiary);
+  border: 1px solid var(--border-subtle);
   border-radius: var(--radius-sm);
   color: var(--text-secondary);
   font-size: 0.75rem;
@@ -1112,7 +1364,7 @@ onBeforeUnmount(() => {
   padding: 8px;
   background: var(--bg-tertiary);
   border: none;
-  border-bottom: 1px solid var(--bg-tertiary);
+  border-bottom: 1px solid var(--border-subtle);
   color: var(--text-primary);
   font-size: 0.75rem;
 }
@@ -1165,7 +1417,7 @@ onBeforeUnmount(() => {
   justify-content: flex-end;
   gap: 4px;
   padding: 6px 8px;
-  border-top: 1px solid var(--bg-tertiary);
+  border-top: 1px solid var(--border-subtle);
 }
 
 .picker-btn {
@@ -1174,7 +1426,7 @@ onBeforeUnmount(() => {
   font-size: 0.6875rem;
   cursor: pointer;
   background: transparent;
-  border: 1px solid var(--bg-tertiary);
+  border: 1px solid var(--border-subtle);
   color: var(--text-muted);
 }
 

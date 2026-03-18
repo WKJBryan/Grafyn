@@ -396,7 +396,7 @@ async fn find_llm_links(
     let response = {
         let or = state.openrouter.read().await;
         match or
-            .chat(&model, messages, None, Some(0.2), Some(800), false)
+            .chat(&model, messages, None, Some(0.2), Some(800), false, 5)
             .await
         {
             Ok(r) => r,

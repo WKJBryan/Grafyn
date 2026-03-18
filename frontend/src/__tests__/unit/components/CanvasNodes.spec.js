@@ -119,6 +119,28 @@ describe('Canvas Nodes', () => {
     expect(position).toEqual({ x: 15, y: 25, width: 260, height: 160 })
   })
 
+  it('emits show-add-model-dialog when the prompt tile add-model button is clicked', async () => {
+    const wrapper = mountAttached(PromptNode, {
+      props: {
+        tile: {
+          id: 'prompt-1',
+          prompt: 'Prompt',
+          responses: {
+            'openai/gpt-4': { status: 'completed' }
+          },
+          created_at: new Date().toISOString(),
+          position: { x: 15, y: 25, width: 200, height: 120 }
+        }
+      }
+    })
+
+    await wrapper.find('.add-model-btn').trigger('pointerdown')
+    await wrapper.find('.add-model-btn').trigger('mousedown')
+    await wrapper.find('.add-model-btn').trigger('click')
+
+    expect(wrapper.emitted('show-add-model-dialog')).toEqual([[{ tileId: 'prompt-1' }]])
+  })
+
   it('enforces minimum size when resizing prompt nodes', () => {
     const wrapper = mountAttached(PromptNode, {
       props: {
@@ -229,5 +251,162 @@ describe('Canvas Nodes', () => {
     expect(wrapper.find('.branch-model-tags').text()).toContain('Claude 3.5 Sonnet')
     expect(wrapper.find('.branch-model-tags').text()).toContain('Gemini 1.5 Pro')
     expect(wrapper.find('.more-models').exists()).toBe(false)
+  })
+
+  it('shows Think Harder only for completed responses', () => {
+    const completedWrapper = mountAttached(LLMNode, {
+      props: {
+        tileId: 'tile-1',
+        modelId: 'openai/gpt-4',
+        response: {
+          status: 'completed',
+          content: 'Response',
+          model_name: 'GPT-4',
+          color: '#7c5cff',
+          position: { x: 0, y: 0, width: 280, height: 200 }
+        },
+        isStreaming: false,
+        availableModels: []
+      }
+    })
+    const streamingWrapper = mountAttached(LLMNode, {
+      props: {
+        tileId: 'tile-2',
+        modelId: 'openai/gpt-4',
+        response: {
+          status: 'streaming',
+          content: 'Partial',
+          model_name: 'GPT-4',
+          color: '#7c5cff',
+          position: { x: 0, y: 0, width: 280, height: 200 }
+        },
+        isStreaming: true,
+        availableModels: []
+      }
+    })
+    const errorWrapper = mountAttached(LLMNode, {
+      props: {
+        tileId: 'tile-3',
+        modelId: 'openai/gpt-4',
+        response: {
+          status: 'error',
+          content: '',
+          model_name: 'GPT-4',
+          error_message: 'Oops',
+          color: '#7c5cff',
+          position: { x: 0, y: 0, width: 280, height: 200 }
+        },
+        isStreaming: false,
+        availableModels: []
+      }
+    })
+
+    expect(completedWrapper.find('.think-harder-btn').exists()).toBe(true)
+    expect(streamingWrapper.find('.think-harder-btn').exists()).toBe(false)
+    expect(errorWrapper.find('.think-harder-btn').exists()).toBe(false)
+  })
+
+  it('shows a web-search badge on response nodes when live web search was used', () => {
+    const wrapper = mountAttached(LLMNode, {
+      props: {
+        tileId: 'tile-1',
+        modelId: 'openai/gpt-4',
+        webSearch: true,
+        response: {
+          status: 'completed',
+          content: 'Response',
+          model_name: 'GPT-4',
+          color: '#7c5cff',
+          position: { x: 0, y: 0, width: 280, height: 200 }
+        },
+        isStreaming: false,
+        availableModels: []
+      }
+    })
+
+    const badge = wrapper.find('.header-right .web-search-badge')
+    expect(badge.exists()).toBe(true)
+    expect(badge.text()).toContain('Web')
+    expect(badge.attributes('title')).toBe('Live web search used for this prompt')
+    expect(wrapper.find('.complete-indicator').exists()).toBe(true)
+  })
+
+  it('does not show a web-search badge for note-only response nodes', () => {
+    const wrapper = mountAttached(LLMNode, {
+      props: {
+        tileId: 'tile-1',
+        modelId: 'openai/gpt-4',
+        webSearch: false,
+        response: {
+          status: 'completed',
+          content: 'Response',
+          model_name: 'GPT-4',
+          color: '#7c5cff',
+          position: { x: 0, y: 0, width: 280, height: 200 }
+        },
+        isStreaming: false,
+        availableModels: []
+      }
+    })
+
+    expect(wrapper.find('.header-right .web-search-badge').exists()).toBe(false)
+  })
+
+  it('opens Think Harder with web search enabled and fixed model display', async () => {
+    const wrapper = mountAttached(LLMNode, {
+      props: {
+        tileId: 'tile-1',
+        modelId: 'openai/gpt-4',
+        response: {
+          status: 'completed',
+          content: 'Response',
+          model_name: 'GPT-4',
+          color: '#7c5cff',
+          position: { x: 0, y: 0, width: 280, height: 200 }
+        },
+        availableModels: [
+          { id: 'openai/gpt-4', name: 'OpenAI: GPT-4' },
+          { id: 'anthropic/claude-3.5-sonnet', name: 'Anthropic: Claude 3.5 Sonnet' }
+        ]
+      }
+    })
+
+    await wrapper.find('.think-harder-btn').trigger('click')
+    await nextTick()
+
+    expect(wrapper.find('.think-harder-overlay').exists()).toBe(true)
+    expect(wrapper.find('.think-harder-model').text()).toBe('GPT-4')
+    expect(wrapper.find('.think-harder-checkbox input').element.checked).toBe(true)
+    expect(wrapper.find('.models-toggle').exists()).toBe(false)
+  })
+
+  it('emits think-harder payload with the selected web search setting', async () => {
+    const wrapper = mountAttached(LLMNode, {
+      props: {
+        tileId: 'tile-1',
+        modelId: 'openai/gpt-4',
+        response: {
+          status: 'completed',
+          content: 'Response',
+          model_name: 'GPT-4',
+          color: '#7c5cff',
+          position: { x: 0, y: 0, width: 280, height: 200 }
+        },
+        availableModels: []
+      }
+    })
+
+    await wrapper.find('.think-harder-btn').trigger('click')
+    await nextTick()
+    await wrapper.find('.think-harder-checkbox input').setValue(false)
+    await wrapper.find('.think-harder-submit').trigger('click')
+
+    expect(wrapper.emitted('think-harder')).toEqual([[
+      {
+        tileId: 'tile-1',
+        modelId: 'openai/gpt-4',
+        webSearch: false
+      }
+    ]])
   })
 })

@@ -10,7 +10,11 @@
       @mousedown="handleMouseDown"
     >
       <div class="debate-info">
-        <span class="debate-icon">&#9876;</span>
+        <GIcon
+          name="swords"
+          :size="16"
+          class="debate-icon"
+        />
         <span class="debate-title">Debate</span>
         <span class="debate-mode">{{ debate.debate_mode }}</span>
       </div>
@@ -26,7 +30,10 @@
           title="Delete debate"
           @click.stop="$emit('delete', debate.id)"
         >
-          &#10005;
+          <GIcon
+            name="x"
+            :size="12"
+          />
         </button>
       </div>
     </div>
@@ -71,7 +78,11 @@
         class="expand-btn"
         @click.stop="isExpanded = true"
       >
-        <span class="expand-icon">&#9660;</span>
+        <GIcon
+          name="chevron-down"
+          :size="12"
+          class="expand-icon"
+        />
         View Full Debate
       </button>
     </div>
@@ -85,7 +96,11 @@
         class="collapse-btn"
         @click.stop="isExpanded = false"
       >
-        <span class="collapse-icon">&#9650;</span>
+        <GIcon
+          name="chevron-up"
+          :size="12"
+          class="collapse-icon"
+        />
         Collapse
       </button>
       
@@ -142,6 +157,7 @@
 <script setup>
 import { ref, computed, onBeforeUnmount } from 'vue'
 import { marked } from 'marked'
+import GIcon from '@/components/ui/GIcon.vue'
 import DebateControls from './DebateControls.vue'
 
 const props = defineProps({
@@ -327,11 +343,16 @@ onBeforeUnmount(() => {
   background: var(--bg-secondary);
   border: 2px solid var(--accent-blue);
   border-radius: var(--radius-md);
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
+  box-shadow: var(--shadow-sm);
   display: flex;
   flex-direction: column;
   overflow: hidden;
   user-select: none;
+  transition: box-shadow 0.15s;
+}
+
+.debate-tile:hover {
+  box-shadow: var(--shadow-md);
 }
 
 .debate-tile.dragging {
@@ -350,7 +371,7 @@ onBeforeUnmount(() => {
   justify-content: space-between;
   padding: var(--spacing-sm) var(--spacing-md);
   background: var(--bg-primary);
-  border-bottom: 1px solid var(--bg-tertiary);
+  border-bottom: 1px solid var(--border-subtle);
   cursor: grab;
 }
 
@@ -365,7 +386,7 @@ onBeforeUnmount(() => {
 }
 
 .debate-icon {
-  font-size: 1.25rem;
+  flex-shrink: 0;
 }
 
 .debate-title {
@@ -407,7 +428,7 @@ onBeforeUnmount(() => {
 .delete-btn {
   width: 24px;
   height: 24px;
-  border: 1px solid var(--bg-tertiary);
+  border: 1px solid var(--border-subtle);
   border-radius: var(--radius-sm);
   background: transparent;
   color: var(--text-muted);
@@ -431,7 +452,7 @@ onBeforeUnmount(() => {
   flex-wrap: wrap;
   gap: var(--spacing-xs);
   padding: var(--spacing-sm) var(--spacing-md);
-  border-bottom: 1px solid var(--bg-tertiary);
+  border-bottom: 1px solid var(--border-subtle);
 }
 
 .model-badge {
@@ -680,7 +701,7 @@ onBeforeUnmount(() => {
   gap: var(--spacing-xs);
   padding: var(--spacing-sm);
   background: var(--bg-tertiary);
-  border: 1px solid var(--bg-tertiary);
+  border: 1px solid var(--border-subtle);
   border-radius: var(--radius-sm);
   color: var(--text-secondary);
   font-size: 0.8125rem;
@@ -698,7 +719,7 @@ onBeforeUnmount(() => {
 
 .expand-icon,
 .collapse-icon {
-  font-size: 0.625rem;
+  flex-shrink: 0;
 }
 
 .collapse-btn {

@@ -7,7 +7,11 @@
   >
     <div class="tile-header">
       <div class="prompt-preview">
-        <span class="prompt-icon">?</span>
+        <GIcon
+          name="message-square"
+          :size="14"
+          class="prompt-icon"
+        />
         <span class="prompt-text">{{ truncatedPrompt }}</span>
       </div>
       <div class="tile-actions">
@@ -17,15 +21,26 @@
           title="Select for debate"
           @click.stop="$emit('select', tile.id)"
         >
-          <span v-if="selected">&#10003;</span>
-          <span v-else>&#9675;</span>
+          <GIcon
+            v-if="selected"
+            name="check"
+            :size="14"
+          />
+          <GIcon
+            v-else
+            name="circle"
+            :size="14"
+          />
         </button>
         <button
           class="delete-btn"
           title="Delete tile"
           @click.stop="$emit('delete', tile.id)"
         >
-          &#10005;
+          <GIcon
+            name="x"
+            :size="12"
+          />
         </button>
       </div>
     </div>
@@ -43,10 +58,12 @@
         :class="{ pinned: note.pinned }"
         :title="note.snippet"
       >
-        <span
+        <GIcon
           v-if="note.pinned"
+          name="pin"
+          :size="10"
           class="pin-icon"
-        >&#128204;</span>
+        />
         {{ note.title }}
       </span>
     </div>
@@ -73,7 +90,11 @@
         class="branch-trigger"
         @click.stop="showBranchInput = true"
       >
-        <span class="branch-icon">⑂</span>
+        <GIcon
+          name="git-branch"
+          :size="14"
+          class="branch-icon"
+        />
         <span>Branch from here...</span>
       </div>
       <div
@@ -145,6 +166,7 @@
 
 <script setup>
 import { ref, computed, onBeforeUnmount, nextTick } from 'vue'
+import GIcon from '@/components/ui/GIcon.vue'
 import ModelResponseCard from './ModelResponseCard.vue'
 
 const props = defineProps({
@@ -322,9 +344,9 @@ onBeforeUnmount(() => {
 .prompt-tile {
   position: absolute;
   background: var(--bg-secondary);
-  border: 1px solid var(--bg-tertiary);
+  border: 1px solid var(--border-subtle);
   border-radius: var(--radius-md);
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
+  box-shadow: var(--shadow-sm);
   display: flex;
   flex-direction: column;
   overflow: hidden;
@@ -340,6 +362,7 @@ onBeforeUnmount(() => {
 
 .prompt-tile:hover {
   border-color: var(--accent-primary);
+  box-shadow: var(--shadow-md);
 }
 
 .prompt-tile.selected {
@@ -357,7 +380,7 @@ onBeforeUnmount(() => {
   justify-content: space-between;
   padding: var(--spacing-sm) var(--spacing-md);
   background: var(--bg-primary);
-  border-bottom: 1px solid var(--bg-tertiary);
+  border-bottom: 1px solid var(--border-subtle);
   cursor: grab;
 }
 
@@ -402,7 +425,7 @@ onBeforeUnmount(() => {
 .select-btn {
   width: 28px;
   height: 28px;
-  border: 1px solid var(--bg-tertiary);
+  border: 1px solid var(--border-subtle);
   border-radius: var(--radius-sm);
   background: transparent;
   color: var(--text-muted);
@@ -427,7 +450,7 @@ onBeforeUnmount(() => {
 .delete-btn {
   width: 28px;
   height: 28px;
-  border: 1px solid var(--bg-tertiary);
+  border: 1px solid var(--border-subtle);
   border-radius: var(--radius-sm);
   background: transparent;
   color: var(--text-muted);
@@ -461,7 +484,7 @@ onBeforeUnmount(() => {
   gap: 4px;
   padding: 4px var(--spacing-sm);
   background: rgba(124, 92, 255, 0.05);
-  border-bottom: 1px solid var(--bg-tertiary);
+  border-bottom: 1px solid var(--border-subtle);
   flex-wrap: wrap;
   overflow: hidden;
   max-height: 52px;
@@ -501,7 +524,7 @@ onBeforeUnmount(() => {
 /* Branch Section */
 .branch-section {
   padding: var(--spacing-sm);
-  border-top: 1px solid var(--bg-tertiary);
+  border-top: 1px solid var(--border-subtle);
   background: var(--bg-primary);
 }
 
@@ -510,7 +533,7 @@ onBeforeUnmount(() => {
   align-items: center;
   gap: var(--spacing-sm);
   padding: var(--spacing-sm);
-  border: 1px dashed var(--bg-tertiary);
+  border: 1px dashed var(--border-subtle);
   border-radius: var(--radius-sm);
   color: var(--text-muted);
   cursor: pointer;
@@ -525,7 +548,7 @@ onBeforeUnmount(() => {
 }
 
 .branch-icon {
-  font-size: 1rem;
+  flex-shrink: 0;
 }
 
 .branch-input-container {
@@ -538,7 +561,7 @@ onBeforeUnmount(() => {
   width: 100%;
   padding: var(--spacing-sm);
   background: var(--bg-tertiary);
-  border: 1px solid var(--bg-tertiary);
+  border: 1px solid var(--border-subtle);
   border-radius: var(--radius-sm);
   color: var(--text-primary);
   font-size: 0.8125rem;
@@ -567,7 +590,7 @@ onBeforeUnmount(() => {
   flex: 1;
   padding: 4px 8px;
   background: var(--bg-tertiary);
-  border: 1px solid var(--bg-tertiary);
+  border: 1px solid var(--border-subtle);
   border-radius: var(--radius-sm);
   color: var(--text-primary);
   font-size: 0.75rem;
@@ -596,7 +619,7 @@ onBeforeUnmount(() => {
 
 .branch-cancel {
   background: transparent;
-  border: 1px solid var(--bg-tertiary);
+  border: 1px solid var(--border-subtle);
   color: var(--text-muted);
 }
 
@@ -624,7 +647,7 @@ onBeforeUnmount(() => {
   justify-content: space-between;
   padding: var(--spacing-xs) var(--spacing-md);
   background: var(--bg-primary);
-  border-top: 1px solid var(--bg-tertiary);
+  border-top: 1px solid var(--border-subtle);
   font-size: 0.75rem;
   color: var(--text-muted);
 }

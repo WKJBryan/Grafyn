@@ -2,6 +2,17 @@ import { defineStore } from 'pinia'
 import { ref, shallowRef, computed, triggerRef } from 'vue'
 import { canvas as canvasApi } from '@/api/client'
 
+export const DEFAULT_WEB_SEARCH_MAX_RESULTS = 5
+export const THINK_HARDER_WEB_SEARCH_MAX_RESULTS = 8
+export const THINK_HARDER_PROMPT = 'Think harder and improve your previous answer.'
+export const THINK_HARDER_SYSTEM_PROMPT = [
+  'You are revisiting your immediately previous answer.',
+  'Think more carefully before responding.',
+  'Verify factual claims when possible, correct any mistakes, consider edge cases, and improve clarity.',
+  'If web results are available, use them to increase accuracy.',
+  'Return the improved answer directly and call out any remaining uncertainty briefly.'
+].join(' ')
+
 export const useCanvasStore = defineStore('canvas', () => {
   // State
   const sessions = ref([])
@@ -172,7 +183,18 @@ export const useCanvasStore = defineStore('canvas', () => {
     return unlisten
   }
 
-  async function sendPrompt(prompt, models, systemPrompt = null, temperature = 0.7, maxTokens = 2048, parentTileId = null, parentModelId = null, contextMode = 'knowledge_search', webSearch = false) {
+  async function sendPrompt(
+    prompt,
+    models,
+    systemPrompt = null,
+    temperature = 0.7,
+    maxTokens = null,
+    parentTileId = null,
+    parentModelId = null,
+    contextMode = 'knowledge_search',
+    webSearch = false,
+    webSearchMaxResults = DEFAULT_WEB_SEARCH_MAX_RESULTS
+  ) {
     if (!currentSession.value) {
       throw new Error('No active session')
     }
@@ -207,12 +229,15 @@ export const useCanvasStore = defineStore('canvas', () => {
         models,
         system_prompt: systemPrompt,
         temperature,
-        max_tokens: maxTokens,
         parent_tile_id: parentTileId,
         parent_model_id: parentModelId,
         context_mode: contextMode,
         position,
-        web_search: webSearch
+        web_search: webSearch,
+        web_search_max_results: webSearchMaxResults
+      }
+      if (maxTokens != null) {
+        request.max_tokens = maxTokens
       }
 
       // Set up event listener BEFORE calling invoke
@@ -237,7 +262,7 @@ export const useCanvasStore = defineStore('canvas', () => {
           removeStreaming(data.model_id)
         },
         error: (data) => {
-          updateTileResponseLocal(data.tile_id, data.model_id, data.error, 'error')
+          updateTileResponseLocal(data.tile_id, data.model_id, '', 'error', data.error)
           removeStreaming(data.model_id)
         },
         session_saved: async () => {
@@ -278,13 +303,16 @@ export const useCanvasStore = defineStore('canvas', () => {
     })
   }
 
-  function updateTileResponseLocal(tileId, modelId, content, status) {
+  function updateTileResponseLocal(tileId, modelId, content, status, errorMessage = null) {
     if (!currentSession.value) return
 
     const tile = currentSession.value.prompt_tiles.find(t => t.id === tileId)
     if (tile && tile.responses[modelId]) {
       tile.responses[modelId].content = content
       tile.responses[modelId].status = status
+      tile.responses[modelId].error_message = status === 'error'
+        ? (errorMessage || content || 'Error occurred')
+        : null
     }
   }
 
@@ -683,7 +711,7 @@ export const useCanvasStore = defineStore('canvas', () => {
           removeStreaming(data.model_id)
         },
         error: (data) => {
-          updateTileResponseLocal(tileId, data.model_id, data.error, 'error')
+          updateTileResponseLocal(tileId, data.model_id, '', 'error', data.error)
           removeStreaming(data.model_id)
         },
         session_saved: async () => {
@@ -744,7 +772,7 @@ export const useCanvasStore = defineStore('canvas', () => {
         },
         error: (data) => {
           if (data.model_id === modelId) {
-            updateTileResponseLocal(tileId, modelId, data.error, 'error')
+            updateTileResponseLocal(tileId, modelId, '', 'error', data.error)
             removeStreaming(modelId)
           }
         },
@@ -813,8 +841,50 @@ export const useCanvasStore = defineStore('canvas', () => {
   }
 
   // Branch from a specific model response
-  async function branchFromResponse(parentTileId, parentModelId, newPrompt, models, systemPrompt = null, temperature = 0.7, maxTokens = 2048, contextMode = 'knowledge_search', webSearch = false) {
-    return sendPrompt(newPrompt, models, systemPrompt, temperature, maxTokens, parentTileId, parentModelId, contextMode, webSearch)
+  async function branchFromResponse(
+    parentTileId,
+    parentModelId,
+    newPrompt,
+    models,
+    systemPrompt = null,
+    temperature = 0.7,
+    maxTokens = null,
+    contextMode = 'knowledge_search',
+    webSearch = false,
+    webSearchMaxResults = DEFAULT_WEB_SEARCH_MAX_RESULTS
+  ) {
+    return sendPrompt(
+      newPrompt,
+      models,
+      systemPrompt,
+      temperature,
+      maxTokens,
+      parentTileId,
+      parentModelId,
+      contextMode,
+      webSearch,
+      webSearchMaxResults
+    )
+  }
+
+  async function thinkHarderFromResponse(parentTileId, parentModelId, options = {}) {
+    const webSearch = options.webSearch ?? true
+    const webSearchMaxResults = webSearch
+      ? THINK_HARDER_WEB_SEARCH_MAX_RESULTS
+      : DEFAULT_WEB_SEARCH_MAX_RESULTS
+
+    return branchFromResponse(
+      parentTileId,
+      parentModelId,
+      THINK_HARDER_PROMPT,
+      [parentModelId],
+      THINK_HARDER_SYSTEM_PROMPT,
+      0.3,
+      4096,
+      'full_history',
+      webSearch,
+      webSearchMaxResults
+    )
   }
 
   return {
@@ -856,6 +926,7 @@ export const useCanvasStore = defineStore('canvas', () => {
     reset,
     getParentResponseContent,
     branchFromResponse,
+    thinkHarderFromResponse,
     addModelToTile,
     regenerateResponse,
     updatePinnedNotes

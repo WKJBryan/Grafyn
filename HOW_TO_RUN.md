@@ -29,6 +29,24 @@ npm run test:run     # Vitest unit suite
 npm run build        # Vite production build (used by Tauri)
 ```
 
+## What "Desktop App" vs "Frontend-Only" Means
+
+| Mode | What you have | What you do not have | Best for |
+| --- | --- | --- | --- |
+| Desktop app | Full Tauri app: Vue frontend plus Rust-powered desktop capabilities | No cloud/server features unless we build them separately | Real app behavior, local files, native menus, packaging, offline workflows |
+| Frontend-only task | UI work in the Vue/Vite layer | No Rust/Tauri behavior at runtime, no native desktop APIs | Layouts, components, state flows, unit tests, visual polish |
+| No backend | No server-side service or hosted database | No sync service, no server-owned auth/session logic, no safe place for private server keys | Local-first features and UI work that does not need cloud coordination |
+
+### Practical impact
+- Frontend-only work can build screens, forms, interactions, and local state, but it cannot verify native desktop features such as file dialogs, system tray behavior, window management, or other OS integrations.
+- Desktop app work can use Tauri's native bridge, so we can open and save local files, integrate with the operating system, bundle the app, and test the real installed-app behavior.
+- "No backend" does not mean "nothing works." It means features that depend on a shared server are missing, such as multi-device sync, server-managed accounts, background jobs, webhooks, and securely storing private API secrets on our own infrastructure.
+
+### Rule of thumb
+- Choose desktop app development when the feature needs local machine access or must behave like a packaged native app.
+- Choose frontend-only tasks when the work is limited to UI behavior, styling, component logic, or tests that can run without the native layer.
+- Add a backend only when the feature needs shared online data, centralized auth, cloud automation, or secure server-side key handling.
+
 ## Rust Backend Tests
 ```bash
 cd frontend/src-tauri

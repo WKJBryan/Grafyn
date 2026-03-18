@@ -63,6 +63,21 @@
   /* Transitions */
   --transition-fast: 150ms ease;
   --transition-normal: 250ms ease;
+
+  /* Borders — structured border hierarchy */
+  --border-subtle: rgba(255, 255, 255, 0.06);
+  --border-default: rgba(255, 255, 255, 0.10);
+  --border-strong: rgba(255, 255, 255, 0.16);
+
+  /* Shadows — elevation scale */
+  --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.2);
+  --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.25);
+  --shadow-lg: 0 8px 24px rgba(0, 0, 0, 0.35);
+  --shadow-xl: 0 16px 48px rgba(0, 0, 0, 0.45);
+  --shadow-glow: 0 0 20px rgba(108, 113, 196, 0.15);
+
+  /* Elevated surface for floating UI */
+  --bg-elevated: #0d4a5c;
 }
 
 /* Light Theme - Solarized Light */
@@ -127,6 +142,21 @@
   /* Transitions */
   --transition-fast: 150ms ease;
   --transition-normal: 250ms ease;
+
+  /* Borders — structured border hierarchy */
+  --border-subtle: rgba(0, 0, 0, 0.04);
+  --border-default: rgba(0, 0, 0, 0.08);
+  --border-strong: rgba(0, 0, 0, 0.14);
+
+  /* Shadows — elevation scale */
+  --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.06);
+  --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.08);
+  --shadow-lg: 0 8px 24px rgba(0, 0, 0, 0.12);
+  --shadow-xl: 0 16px 48px rgba(0, 0, 0, 0.16);
+  --shadow-glow: 0 0 20px rgba(108, 113, 196, 0.08);
+
+  /* Elevated surface for floating UI */
+  --bg-elevated: #d3cbb8;
 }
 
 * {
@@ -218,6 +248,7 @@ pre code {
   cursor: pointer;
   transition: all var(--transition-fast);
   text-decoration: none;
+  white-space: nowrap;
 }
 
 .btn:disabled {
@@ -231,7 +262,7 @@ pre code {
 }
 
 .btn-primary:hover:not(:disabled) {
-  background: #6b4ee6;
+  background: #5a5fad;
 }
 
 .btn-secondary {
@@ -261,6 +292,16 @@ pre code {
 .btn-accent:hover:not(:disabled) {
   background: linear-gradient(135deg, var(--accent-magenta), var(--accent-cyan));
   transform: scale(1.02);
+}
+
+.btn-sm {
+  padding: 4px 8px;
+  font-size: 0.75rem;
+}
+
+.btn-lg {
+  padding: var(--spacing-sm) var(--spacing-lg);
+  font-size: 1rem;
 }
 
 /* Inputs */
@@ -329,8 +370,10 @@ textarea::placeholder {
 /* Cards */
 .card {
   background: var(--bg-secondary);
+  border: 1px solid var(--border-subtle);
   border-radius: var(--radius-md);
   padding: var(--spacing-md);
+  box-shadow: var(--shadow-sm);
 }
 
 .card-hover {
@@ -356,10 +399,6 @@ textarea::placeholder {
 }
 
 /* Scrollbar */
-::-webkit-scrollbar {
-  width: 8px;
-  height: 8px;
-}
 
 ::-webkit-scrollbar-track {
   background: var(--bg-secondary);
@@ -409,6 +448,27 @@ textarea::placeholder {
 
 .hidden {
   display: none;
+}
+
+/* Icon Utilities */
+.g-icon {
+  flex-shrink: 0;
+}
+
+.g-icon.spinning {
+  animation: g-icon-spin 1s linear infinite;
+}
+
+@keyframes g-icon-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* Scrollbar refinements */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
 }
 
 /* Tile Dragging State */
