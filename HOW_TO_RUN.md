@@ -17,8 +17,9 @@ npm run tauri:dev    # Tauri + Vite with hot reload
 ## Build the Desktop App
 ```bash
 cd frontend
-npm run tauri:build  # bundles to src-tauri/target/release/bundle/
+npm run tauri:build  # builds the bundled MCP sidecar, then packages installers under src-tauri/target/release/bundle/
 ```
+If `TAURI_PRIVATE_KEY` is unset, the local build skips the signed updater bundle automatically and still produces normal installer artifacts.
 
 ## Frontend-Only Tasks (no backend)
 ```bash
@@ -50,3 +51,4 @@ npm test             # or npm run test:ui for the UI runner
 1) Install deps: `npm install` in `frontend` and `e2e`, `rustup` for Tauri.
 2) Run live app: `npm run tauri:dev`.
 3) Before shipping: `npm run lint && npm run test:run && cargo test && npm run tauri:build`.
+   `npm run tauri:build` now prepares the `grafyn-mcp` bundled sidecar automatically.

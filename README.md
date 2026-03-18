@@ -69,9 +69,10 @@ node scripts/generate-icons.cjs
 # Development mode with hot reload
 npm run tauri:dev
 
-# Production build
+# Production build (auto-builds the bundled grafyn-mcp sidecar first)
 npm run tauri:build
 ```
+If `TAURI_PRIVATE_KEY` is not set, local builds automatically skip the signed updater bundle and still produce normal installer artifacts. Release CI still signs updater bundles because it provides the key.
 
 **Build output:**
 - Windows: `src-tauri/target/release/bundle/nsis/Grafyn_0.1.1_x64-setup.exe`
@@ -236,7 +237,7 @@ Desktop app — all data stored locally on disk. No server-side authentication n
 3. **Publish release** — draft → published after all builds complete
 4. **Upload to R2** — assets mirrored to Cloudflare R2 for auto-update distribution
 
-Manual builds can be triggered via `workflow_dispatch` without creating a release.
+Manual builds can be triggered via `workflow_dispatch` without creating a release. The workflow and local `npm run tauri:build` now use the same sidecar-prep path so the bundled `grafyn-mcp` binary is generated consistently before packaging.
 
 ## Contributing
 
