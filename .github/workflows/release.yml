@@ -332,17 +332,8 @@ jobs:
       # Build MCP Binary (native Rust, no Tauri)
       # ========================================
       - name: Build MCP binary
-        working-directory: frontend/src-tauri
-        shell: bash
-        run: |
-          EXT=""
-          if [[ "${{ matrix.os_name }}" == "windows" ]]; then
-            EXT=".exe"
-          fi
-          cargo build --release --bin grafyn-mcp --no-default-features --features mcp --target ${{ matrix.target }}
-          mkdir -p binaries
-          cp "target/${{ matrix.target }}/release/grafyn-mcp${EXT}" "binaries/grafyn-mcp-${{ matrix.target }}${EXT}"
-          echo "Built grafyn-mcp for ${{ matrix.target }}"
+        working-directory: frontend
+        run: node scripts/prepare-sidecar.cjs --release --target ${{ matrix.target }}
 
       # ========================================
       # Build Tauri App & Upload to Release

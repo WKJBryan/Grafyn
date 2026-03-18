@@ -36,13 +36,11 @@ jobs:
 
       - name: Prepare build artifacts for Tauri
         run: |
-          cd frontend/src-tauri
           # Tauri's generate_context!() requires distDir to exist at compile time
-          mkdir -p ../dist && echo '<html></html>' > ../dist/index.html
+          mkdir -p frontend/dist && echo '<html></html>' > frontend/dist/index.html
+          cd frontend
           # Tauri's build script requires the MCP external binary
-          cargo build --bin grafyn-mcp --no-default-features --features mcp
-          mkdir -p binaries
-          cp target/debug/grafyn-mcp "binaries/grafyn-mcp-$(rustc -vV | grep host | awk '{print $2}')"
+          node scripts/prepare-sidecar.cjs
 
       - name: Run Rust tests
         run: cd frontend/src-tauri && cargo test
