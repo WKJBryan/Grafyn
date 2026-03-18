@@ -264,7 +264,7 @@ jobs:
       # Setup Rust
       # ========================================
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.93.1
         with:
           targets: ${{ matrix.target }}
 
@@ -333,7 +333,7 @@ jobs:
       # ========================================
       - name: Build MCP binary
         working-directory: frontend
-        run: node scripts/prepare-sidecar.cjs --release --target ${{ matrix.target }}
+        run: node scripts/prepare-sidecar.cjs --release --locked --target ${{ matrix.target }}
 
       # ========================================
       # Build Tauri App & Upload to Release
@@ -347,7 +347,7 @@ jobs:
         with:
           projectPath: frontend
           tauriScript: npx tauri
-          args: --target ${{ matrix.target }}
+          args: --target ${{ matrix.target }} -- --locked
           releaseId: ${{ needs.create-release.outputs.release_id }}
           releaseBody: ${{ needs.create-release.outputs.release_notes }}
           updaterJsonPreferNsis: true

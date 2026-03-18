@@ -46,6 +46,7 @@ function capture(command, args) {
 function parseArgs(argv) {
   const parsed = {
     release: false,
+    locked: false,
     target: process.env.CARGO_BUILD_TARGET || process.env.npm_config_target || '',
   }
 
@@ -54,6 +55,11 @@ function parseArgs(argv) {
 
     if (value === '--release') {
       parsed.release = true
+      continue
+    }
+
+    if (value === '--locked') {
+      parsed.locked = true
       continue
     }
 
@@ -68,7 +74,7 @@ function parseArgs(argv) {
     }
 
     if (value === '--help' || value === '-h') {
-      console.log('Usage: node scripts/prepare-sidecar.cjs [--release] [--target <triple>]')
+      console.log('Usage: node scripts/prepare-sidecar.cjs [--release] [--locked] [--target <triple>]')
       process.exit(0)
     }
 
@@ -111,6 +117,9 @@ function main() {
   const extension = isWindowsTarget ? '.exe' : ''
 
   const cargoArgs = ['build', '--bin', 'grafyn-mcp', '--no-default-features', '--features', 'mcp']
+  if (options.locked) {
+    cargoArgs.push('--locked')
+  }
   if (options.release) {
     cargoArgs.push('--release')
   }
