@@ -14,13 +14,17 @@
         v-for="modelId in selectedModels"
         :key="modelId"
         class="model-tag"
+        :title="getModelDisplayName(modelId)"
       >
         <span class="tag-name">{{ getModelDisplayName(modelId) }}</span>
         <button
           class="tag-remove"
           title="Remove"
           @click.stop="removeModel(modelId)"
-        >&times;</button>
+        ><GIcon
+          name="x"
+          :size="10"
+        /></button>
       </span>
     </div>
 
@@ -66,7 +70,12 @@
         >
           <span class="provider-name">{{ provider }}</span>
           <span class="group-count">({{ models.length }})</span>
-          <span class="expand-icon">{{ expandedGroups.has(provider.toLowerCase()) ? '-' : '+' }}</span>
+          <GIcon
+            name="chevron-down"
+            :size="14"
+            class="expand-icon"
+            :style="{ transform: expandedGroups.has(provider.toLowerCase()) ? 'rotate(180deg)' : 'rotate(0)', transition: 'transform 150ms ease' }"
+          />
         </div>
 
         <div
@@ -109,6 +118,7 @@
 
 <script setup>
 import { ref, computed } from 'vue'
+import GIcon from '@/components/ui/GIcon.vue'
 
 const props = defineProps({
   models: {
@@ -224,7 +234,7 @@ function removeModel(modelId) {
 .model-selector {
   display: flex;
   flex-direction: column;
-  gap: var(--spacing-sm);
+  gap: var(--spacing-xs);
   max-height: 350px;
   min-height: 200px;
 }
@@ -233,6 +243,7 @@ function removeModel(modelId) {
   display: flex;
   justify-content: space-between;
   align-items: center;
+  flex-shrink: 0;
 }
 
 .selector-header h4 {
@@ -242,10 +253,10 @@ function removeModel(modelId) {
 }
 
 .selected-count {
-  font-size: 0.75rem;
+  font-size: 0.6875rem;
   color: var(--accent-primary);
   background: rgba(124, 92, 255, 0.15);
-  padding: 2px 8px;
+  padding: 2px 6px;
   border-radius: var(--radius-sm);
 }
 
@@ -253,29 +264,29 @@ function removeModel(modelId) {
   display: flex;
   flex-wrap: wrap;
   align-items: flex-start;
-  gap: 8px;
-  padding: var(--spacing-sm);
+  gap: 6px;
+  padding: 6px;
   background: var(--bg-tertiary);
   border-radius: var(--radius-sm);
-  min-height: 40px;
-  max-height: none;
-  overflow: visible;
+  min-height: 34px;
+  flex-shrink: 0;
 }
 
 .model-tag {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
-  padding: 4px 8px;
+  gap: 4px;
+  padding: 3px 7px;
   background: rgba(124, 92, 255, 0.15);
-  border: 1px solid rgba(124, 92, 255, 0.3);
+  border: 1px solid var(--border-default);
   border-radius: var(--radius-sm);
-  font-size: 0.875rem;
+  font-size: 0.75rem;
+  line-height: 1.1;
   color: var(--text-primary);
 }
 
 .tag-name {
-  max-width: 150px;
+  max-width: 112px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -304,13 +315,14 @@ function removeModel(modelId) {
 
 .search-box {
   position: relative;
+  flex-shrink: 0;
 }
 
 .search-input {
   width: 100%;
-  padding: var(--spacing-sm);
+  padding: 8px 10px;
   background: var(--bg-tertiary);
-  border: 1px solid var(--bg-tertiary);
+  border: 1px solid var(--border-subtle);
   border-radius: var(--radius-sm);
   color: var(--text-primary);
   font-size: 0.875rem;
@@ -324,6 +336,7 @@ function removeModel(modelId) {
 .quick-actions {
   display: flex;
   gap: var(--spacing-xs);
+  flex-shrink: 0;
 }
 
 .model-groups {
@@ -334,7 +347,7 @@ function removeModel(modelId) {
 }
 
 .model-group {
-  background: var(--bg-tertiary);
+  background: color-mix(in srgb, var(--bg-tertiary) 85%, transparent);
   border-radius: var(--radius-sm);
   overflow: visible;
   margin-bottom: var(--spacing-xs);
@@ -343,13 +356,14 @@ function removeModel(modelId) {
 .group-header {
   display: flex;
   align-items: center;
-  padding: var(--spacing-sm);
+  padding: 8px 10px;
   cursor: pointer;
   background: var(--bg-hover);
 }
 
 .group-header:hover {
   background: var(--bg-tertiary);
+  border-radius: var(--radius-sm);
 }
 
 .provider-name {
@@ -371,21 +385,23 @@ function removeModel(modelId) {
   font-weight: 600;
   width: 16px;
   text-align: center;
+  transition: transform var(--transition-fast);
+  display: inline-flex;
 }
 
 .group-models {
-  padding: var(--spacing-xs);
+  padding: 4px;
 }
 
 .model-option {
   display: flex;
   align-items: center;
   gap: var(--spacing-sm);
-  padding: var(--spacing-xs) var(--spacing-sm);
+  padding: 5px 8px;
   border-radius: var(--radius-sm);
   cursor: pointer;
   transition: background 0.15s;
-  min-height: 32px;
+  min-height: 28px;
 }
 
 .model-option:hover {
@@ -398,8 +414,8 @@ function removeModel(modelId) {
 
 .model-checkbox {
   accent-color: var(--accent-primary);
-  width: 16px;
-  height: 16px;
+  width: 14px;
+  height: 14px;
   flex-shrink: 0;
   flex-grow: 0;
 }
@@ -407,14 +423,15 @@ function removeModel(modelId) {
 .model-info {
   flex: 1;
   min-width: 0;
-  display: flex;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
   align-items: center;
-  gap: var(--spacing-sm);
+  gap: 8px;
 }
 
 .model-name {
   flex: 1;
-  font-size: 0.8125rem;
+  font-size: 0.775rem;
   color: var(--text-primary);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -425,13 +442,13 @@ function removeModel(modelId) {
   display: flex;
   align-items: center;
   gap: 2px;
-  font-size: 0.6875rem;
+  font-size: 0.625rem;
   color: var(--text-muted);
   flex-shrink: 0;
 }
 
 .pricing-item {
-  min-width: 32px;
+  min-width: 28px;
   text-align: right;
 }
 
@@ -440,22 +457,22 @@ function removeModel(modelId) {
 }
 
 .model-ctx {
-  font-size: 0.6875rem;
+  font-size: 0.625rem;
   color: var(--text-muted);
-  min-width: 35px;
+  min-width: 32px;
   text-align: right;
   flex-shrink: 0;
 }
 
 .btn-sm {
-  padding: 4px 8px;
-  font-size: 0.75rem;
+  padding: 3px 8px;
+  font-size: 0.6875rem;
 }
 
 .btn-ghost {
   background: transparent;
   color: var(--text-secondary);
-  border: 1px solid var(--bg-tertiary);
+  border: 1px solid var(--border-subtle);
 }
 
 .btn-ghost:hover {

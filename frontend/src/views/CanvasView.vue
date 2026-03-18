@@ -7,17 +7,25 @@
         <div class="header-actions">
           <button
             class="btn btn-ghost btn-sm"
+            title="Settings"
+            data-guide="canvas-settings-btn"
+            @click="showSettingsModal = true"
+          >
+            <GIcon name="settings" />
+          </button>
+          <button
+            class="btn btn-ghost btn-sm"
             title="Toggle Theme"
             @click="handleThemeToggle"
           >
-            {{ themeIcon }}
+            <GIcon :name="themeStore.theme === 'dark' ? 'moon' : 'sun'" />
           </button>
           <button
             class="btn btn-ghost btn-sm"
             title="Guide"
             @click="guide.togglePanel()"
           >
-            ?
+            <GIcon name="help-circle" />
           </button>
           <button
             class="btn btn-primary btn-sm"
@@ -48,7 +56,10 @@
             title="Delete session"
             @click.stop="deleteSession(session.id)"
           >
-            &#10005;
+            <GIcon
+              name="x"
+              :size="12"
+            />
           </button>
         </div>
 
@@ -98,7 +109,6 @@
         v-else
         :session-id="currentSessionId"
         @session-loaded="onSessionLoaded"
-        @open-settings="showSettingsModal = true"
       />
     </main>
 
@@ -115,7 +125,10 @@
             class="close-btn"
             @click="showCreateDialog = false"
           >
-            &#10005;
+            <GIcon
+              name="x"
+              :size="12"
+            />
           </button>
         </div>
         <div class="dialog-body">
@@ -186,6 +199,7 @@ import { isDesktopApp } from '@/api/client'
 import CanvasContainer from '@/components/canvas/CanvasContainer.vue'
 import SettingsModal from '@/components/SettingsModal.vue'
 import ConfirmDialog from '@/components/ConfirmDialog.vue'
+import GIcon from '@/components/ui/GIcon.vue'
 import { useGuide } from '@/composables/useGuide'
 
 const route = useRoute()
@@ -202,11 +216,6 @@ const showDeleteConfirm = ref(false)
 const pendingDeleteSessionId = ref(null)
 const _isDesktop = isDesktopApp()
 const guide = useGuide()
-
-// Computed property to get the current theme icon
-const themeIcon = computed(() => {
-  return themeStore.theme === 'dark' ? '🌙' : '☀️'
-})
 
 // Function to toggle theme
 function handleThemeToggle() {
@@ -303,10 +312,11 @@ function formatDate(dateStr) {
 .canvas-sidebar {
   width: 280px;
   background: var(--bg-secondary);
-  border-right: 1px solid var(--bg-tertiary);
+  border-right: 1px solid var(--border-default);
   display: flex;
   flex-direction: column;
   flex-shrink: 0;
+  box-shadow: var(--shadow-lg);
 }
 
 .sidebar-header {
@@ -314,7 +324,7 @@ function formatDate(dateStr) {
   align-items: center;
   justify-content: space-between;
   padding: var(--spacing-md);
-  border-bottom: 1px solid var(--bg-tertiary);
+  border-bottom: 1px solid var(--border-subtle);
 }
 
 .sidebar-header h2 {
@@ -341,18 +351,21 @@ function formatDate(dateStr) {
   justify-content: space-between;
   padding: var(--spacing-sm) var(--spacing-md);
   margin-bottom: var(--spacing-xs);
-  background: var(--bg-tertiary);
+  background: transparent;
+  border: 1px solid transparent;
   border-radius: var(--radius-sm);
   cursor: pointer;
-  transition: all 0.15s;
+  transition: all var(--transition-fast);
 }
 
 .session-item:hover {
-  background: var(--bg-hover);
+  background: var(--bg-tertiary);
+  border-color: var(--border-subtle);
 }
 
 .session-item.active {
-  background: rgba(124, 92, 255, 0.2);
+  background: color-mix(in srgb, var(--accent-primary) 12%, transparent);
+  border-color: var(--accent-primary);
   border-left: 3px solid var(--accent-primary);
 }
 
@@ -410,7 +423,7 @@ function formatDate(dateStr) {
 
 .sidebar-footer {
   padding: var(--spacing-md);
-  border-top: 1px solid var(--bg-tertiary);
+  border-top: 1px solid var(--border-subtle);
 }
 
 .back-link {
@@ -474,15 +487,16 @@ function formatDate(dateStr) {
   align-items: center;
   justify-content: center;
   z-index: 1000;
+  backdrop-filter: blur(8px);
 }
 
 .create-dialog {
   background: var(--bg-secondary);
-  border: 1px solid var(--bg-tertiary);
+  border: 1px solid var(--border-default);
   border-radius: var(--radius-lg);
   width: 100%;
   max-width: 400px;
-  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+  box-shadow: var(--shadow-xl);
 }
 
 .dialog-header {
@@ -490,7 +504,7 @@ function formatDate(dateStr) {
   align-items: center;
   justify-content: space-between;
   padding: var(--spacing-md) var(--spacing-lg);
-  border-bottom: 1px solid var(--bg-tertiary);
+  border-bottom: 1px solid var(--border-subtle);
 }
 
 .dialog-header h3 {
@@ -554,7 +568,7 @@ function formatDate(dateStr) {
   justify-content: flex-end;
   gap: var(--spacing-sm);
   padding: var(--spacing-md) var(--spacing-lg);
-  border-top: 1px solid var(--bg-tertiary);
+  border-top: 1px solid var(--border-subtle);
 }
 
 .btn-sm {

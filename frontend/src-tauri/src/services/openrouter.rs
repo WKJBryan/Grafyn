@@ -98,6 +98,7 @@ impl OpenRouterService {
         temperature: Option<f64>,
         max_tokens: Option<u32>,
         web_search: bool,
+        web_search_max_results: u32,
     ) -> Result<String> {
         if !self.is_configured() {
             return Err(anyhow::anyhow!("OpenRouter API key not configured"));
@@ -114,14 +115,7 @@ impl OpenRouterService {
 
         all_messages.extend(messages);
 
-        let plugins = if web_search {
-            Some(vec![WebPlugin {
-                id: "web".to_string(),
-                max_results: Some(5),
-            }])
-        } else {
-            None
-        };
+        let plugins = build_web_plugins(web_search, web_search_max_results);
 
         let request = ChatRequest {
             model: model.to_string(),
@@ -170,6 +164,7 @@ impl OpenRouterService {
         temperature: Option<f64>,
         max_tokens: Option<u32>,
         web_search: bool,
+        web_search_max_results: u32,
     ) -> Result<impl futures::Stream<Item = Result<String>>> {
         if !self.is_configured() {
             return Err(anyhow::anyhow!("OpenRouter API key not configured"));
@@ -186,14 +181,7 @@ impl OpenRouterService {
 
         all_messages.extend(messages);
 
-        let plugins = if web_search {
-            Some(vec![WebPlugin {
-                id: "web".to_string(),
-                max_results: Some(5),
-            }])
-        } else {
-            None
-        };
+        let plugins = build_web_plugins(web_search, web_search_max_results);
 
         let request = ChatRequest {
             model: model.to_string(),
@@ -266,6 +254,17 @@ impl OpenRouterService {
 
         Ok(stream)
     }
+}
+
+fn build_web_plugins(web_search: bool, web_search_max_results: u32) -> Option<Vec<WebPlugin>> {
+    if !web_search {
+        return None;
+    }
+
+    Some(vec![WebPlugin {
+        id: "web".to_string(),
+        max_results: Some(web_search_max_results),
+    }])
 }
 
 /// Parse SSE chunk to extract content

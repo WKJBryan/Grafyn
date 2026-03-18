@@ -6,7 +6,11 @@
     @mousedown="handleMouseDown"
   >
     <div class="node-header">
-      <span class="node-icon">⚔</span>
+      <GIcon
+        name="swords"
+        :size="16"
+        class="node-icon"
+      />
       <span class="node-type">Debate</span>
       <span class="mode-badge">{{ debate.debate_mode }}</span>
       <div class="node-actions">
@@ -15,11 +19,14 @@
           title="Delete debate"
           @click.stop="$emit('delete', debate.id)"
         >
-          ×
+          <GIcon
+            name="x"
+            :size="12"
+          />
         </button>
       </div>
     </div>
-    
+
     <div class="node-content">
       <div class="stats">
         <span
@@ -69,7 +76,17 @@
         :disabled="!hasRounds && !isDebateStreaming"
         @click.stop="toggleExpand"
       >
-        {{ isExpanded ? '▲ Hide Fight' : '⚔ See Fight' }}
+        <template v-if="isExpanded">
+          <GIcon
+            name="chevron-up"
+            :size="14"
+          /> Hide
+        </template><template v-else>
+          <GIcon
+            name="swords"
+            :size="14"
+          /> See Fight
+        </template>
       </button>
       <button 
         v-if="debate.status !== 'completed'"
@@ -101,7 +118,10 @@
           class="close-btn"
           @click.stop="toggleExpand"
         >
-          ×
+          <GIcon
+            name="x"
+            :size="14"
+          />
         </button>
       </div>
       <div class="rounds-container">
@@ -164,6 +184,7 @@
 <script setup>
 import { ref, computed, onBeforeUnmount } from 'vue'
 import { marked } from 'marked'
+import GIcon from '@/components/ui/GIcon.vue'
 
 const MIN_WIDTH = 280
 const MIN_HEIGHT = 200
@@ -397,7 +418,7 @@ onBeforeUnmount(() => {
   background: linear-gradient(135deg, var(--bg-secondary) 0%, var(--bg-tertiary) 100%);
   border: 2px solid var(--accent-cyan);
   border-radius: var(--radius-md);
-  box-shadow: 0 4px 16px color-mix(in srgb, var(--accent-cyan) 20%, transparent);
+  box-shadow: var(--shadow-md);
   display: flex;
   flex-direction: column;
   overflow: visible;  /* Changed from hidden to allow expanded overlay to show */
@@ -411,7 +432,7 @@ onBeforeUnmount(() => {
 }
 
 .debate-node:hover {
-  box-shadow: 0 6px 20px color-mix(in srgb, var(--accent-cyan) 35%, transparent);
+  box-shadow: var(--shadow-lg);
 }
 
 .debate-node.active {
@@ -529,7 +550,7 @@ onBeforeUnmount(() => {
 .conclusion-preview {
   padding: var(--spacing-sm);
   background: color-mix(in srgb, var(--accent-cyan) 5%, transparent);
-  border-top: 1px solid var(--bg-tertiary);
+  border-top: 1px solid var(--border-subtle);
   max-height: 150px;
   overflow-y: auto;
 }
@@ -585,14 +606,14 @@ onBeforeUnmount(() => {
   display: flex;
   gap: 4px;
   padding: var(--spacing-xs) var(--spacing-sm);
-  background: rgba(0, 0, 0, 0.1);
-  border-top: 1px solid color-mix(in srgb, var(--accent-cyan) 20%, transparent);
+  border-top: 1px solid var(--border-subtle);
+  background: transparent;
 }
 
 .expand-btn, .continue-btn {
   flex: 1;
   padding: 4px 8px;
-  border: 1px solid var(--bg-tertiary);
+  border: 1px solid var(--border-subtle);
   border-radius: var(--radius-sm);
   background: transparent;
   color: var(--text-muted);
@@ -671,7 +692,7 @@ onBeforeUnmount(() => {
   justify-content: space-between;
   align-items: center;
   padding: var(--spacing-sm);
-  border-bottom: 1px solid var(--bg-tertiary);
+  border-bottom: 1px solid var(--border-subtle);
 }
 
 .expanded-header h4 {
@@ -835,7 +856,7 @@ onBeforeUnmount(() => {
   border-radius: var(--radius-sm);
   text-transform: uppercase;
   letter-spacing: 0.5px;
-  animation: pulse-live 1.5s ease-in-out infinite;
+  animation: pulse-live 2s ease-in-out infinite;
 }
 
 .live-badge-sm {
@@ -846,7 +867,7 @@ onBeforeUnmount(() => {
 
 @keyframes pulse-live {
   0%, 100% { opacity: 1; }
-  50% { opacity: 0.5; }
+  50% { opacity: 0.6; }
 }
 
 /* Streaming round card */

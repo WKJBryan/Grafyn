@@ -10,7 +10,10 @@
           class="close-btn"
           @click="$emit('cancel')"
         >
-          &#10005;
+          <GIcon
+            name="x"
+            :size="14"
+          />
         </button>
       </div>
 
@@ -19,7 +22,11 @@
         v-if="branchContext"
         class="branch-context"
       >
-        <span class="branch-icon">⑂</span>
+        <GIcon
+          name="git-branch"
+          :size="16"
+          class="branch-icon"
+        />
         <span class="branch-text">
           Branching from <strong>{{ branchContext.parentContent?.model?.split('/').pop() || 'response' }}</strong>
         </span>
@@ -71,7 +78,7 @@
             class="select-input"
           >
             <option value="knowledge_search">
-              Knowledge Search (relevant notes)
+              Vault Notes (relevant notes)
             </option>
             <option value="none">
               None (no additional context)
@@ -95,11 +102,15 @@
         </div>
 
         <div
-          v-if="smartWebSearch && detectionResult.shouldSearch"
           class="web-search-hint"
+          :class="{ disabled: !resolvedWebSearch }"
         >
-          <span class="hint-icon">🔍</span>
-          <span class="hint-text">Web search: {{ detectionResult.reason }}</span>
+          <GIcon
+            name="globe"
+            :size="14"
+            class="hint-icon"
+          />
+          <span class="hint-text">{{ webSearchHint }}</span>
         </div>
 
         <div
@@ -107,38 +118,29 @@
           @click="showAdvanced = !showAdvanced"
         >
           <span>Advanced Options</span>
-          <span class="toggle-icon">{{ showAdvanced ? '-' : '+' }}</span>
+          <GIcon
+            name="chevron-down"
+            :size="14"
+            class="toggle-icon"
+            :style="{ transform: showAdvanced ? 'rotate(180deg)' : 'rotate(0)' }"
+          />
         </div>
 
         <div
           v-if="showAdvanced"
           class="advanced-options"
         >
-          <div class="form-row">
-            <div class="form-group">
-              <label for="temperature">Temperature: {{ temperature }}</label>
-              <input
-                id="temperature"
-                v-model.number="temperature"
-                type="range"
-                min="0"
-                max="2"
-                step="0.1"
-                class="slider"
-              >
-            </div>
-            <div class="form-group">
-              <label for="maxTokens">Max Tokens</label>
-              <input
-                id="maxTokens"
-                v-model.number="maxTokens"
-                type="number"
-                min="100"
-                max="32000"
-                step="100"
-                class="number-input"
-              >
-            </div>
+          <div class="form-group">
+            <label for="temperature">Temperature: {{ temperature }}</label>
+            <input
+              id="temperature"
+              v-model.number="temperature"
+              type="range"
+              min="0"
+              max="2"
+              step="0.1"
+              class="slider"
+            >
           </div>
 
           <!-- Context Budget Display -->
@@ -177,7 +179,7 @@
 import { ref, computed } from 'vue'
 import ModelSelector from './ModelSelector.vue'
 import ContextBudgetDisplay from './ContextBudgetDisplay.vue'
-import { detectWebSearch } from '@/composables/useWebSearchDetection'
+import GIcon from '@/components/ui/GIcon.vue'
 
 const props = defineProps({
   models: {
@@ -191,6 +193,10 @@ const props = defineProps({
   smartWebSearch: {
     type: Boolean,
     default: true
+  },
+  openRouterConfigured: {
+    type: Boolean,
+    default: true
   }
 })
 
@@ -202,21 +208,26 @@ const systemPrompt = ref('')
 const showSystemPrompt = ref(false)
 const selectedModels = ref([])
 const temperature = ref(0.7)
-const maxTokens = ref(2048)
 const showAdvanced = ref(false)
 const contextMode = ref('knowledge_search')  // Default to knowledge search for note lookup
 
-// Smart web search auto-detection
-const detectionResult = computed(() => {
-  if (!props.smartWebSearch) return { shouldSearch: false, reason: null }
-  return detectWebSearch(prompt.value)
+const resolvedWebSearch = computed(() => props.openRouterConfigured && props.smartWebSearch)
+const webSearchHint = computed(() => {
+  if (resolvedWebSearch.value) {
+    return 'Live web search is on for this prompt by default.'
+  }
+
+  if (!props.openRouterConfigured) {
+    return 'Live web search is off because OpenRouter is not configured.'
+  }
+
+  return 'Live web search is off for this prompt. Enable Canvas Web Search in Settings to use live sources.'
 })
-const resolvedWebSearch = computed(() => detectionResult.value.shouldSearch)
 
 // Context mode descriptions
 const contextModeHints = {
   none: 'No additional context - just your prompt',
-  knowledge_search: 'Retrieves relevant notes (+ pinned notes) as LLM context',
+  knowledge_search: 'Retrieves relevant notes (+ pinned notes) from your vault as LLM context. This does not search the live web.',
   full_history: 'Include all conversation turns from the parent chain',
   compact: 'Include recent turns + summary of older context to save tokens'
 }
@@ -272,7 +283,6 @@ function handleSubmit() {
     models: selectedModels.value,
     systemPrompt: showSystemPrompt.value ? systemPrompt.value.trim() : null,
     temperature: temperature.value,
-    maxTokens: maxTokens.value,
     contextMode: contextMode.value,
     webSearch: resolvedWebSearch.value
   })
@@ -284,6 +294,7 @@ function handleSubmit() {
   position: fixed;
   inset: 0;
   background: rgba(0, 0, 0, 0.7);
+  backdrop-filter: blur(8px);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -293,14 +304,14 @@ function handleSubmit() {
 
 .dialog-content {
   background: var(--bg-secondary);
-  border: 1px solid var(--bg-tertiary);
+  border: 1px solid var(--border-default);
   border-radius: var(--radius-lg);
   width: 100%;
   max-width: 600px;
   max-height: 90vh;
   display: flex;
   flex-direction: column;
-  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+  box-shadow: var(--shadow-xl);
 }
 
 .dialog-header {
@@ -308,7 +319,7 @@ function handleSubmit() {
   align-items: center;
   justify-content: space-between;
   padding: var(--spacing-md) var(--spacing-lg);
-  border-bottom: 1px solid var(--bg-tertiary);
+  border-bottom: 1px solid var(--border-subtle);
 }
 
 .dialog-header h3 {
@@ -402,7 +413,7 @@ function handleSubmit() {
   width: 100%;
   padding: var(--spacing-sm);
   background: var(--bg-tertiary);
-  border: 1px solid var(--bg-tertiary);
+  border: 1px solid var(--border-subtle);
   border-radius: var(--radius-sm);
   color: var(--text-primary);
   font-size: 0.875rem;
@@ -414,6 +425,7 @@ function handleSubmit() {
 .system-input:focus {
   border-color: var(--accent-primary);
   outline: none;
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent-primary) 30%, transparent);
 }
 
 .prompt-input {
@@ -438,6 +450,8 @@ function handleSubmit() {
 
 .toggle-icon {
   font-weight: 600;
+  transition: transform var(--transition-fast);
+  display: inline-flex;
 }
 
 .advanced-options {
@@ -446,30 +460,9 @@ function handleSubmit() {
   border-radius: var(--radius-sm);
 }
 
-.form-row {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: var(--spacing-md);
-}
-
 .slider {
   width: 100%;
   accent-color: var(--accent-primary);
-}
-
-.number-input {
-  width: 100%;
-  padding: var(--spacing-sm);
-  background: var(--bg-secondary);
-  border: 1px solid var(--bg-tertiary);
-  border-radius: var(--radius-sm);
-  color: var(--text-primary);
-  font-size: 0.875rem;
-}
-
-.number-input:focus {
-  border-color: var(--accent-primary);
-  outline: none;
 }
 
 .dialog-footer {
@@ -477,7 +470,7 @@ function handleSubmit() {
   justify-content: flex-end;
   gap: var(--spacing-sm);
   padding: var(--spacing-md) var(--spacing-lg);
-  border-top: 1px solid var(--bg-tertiary);
+  border-top: 1px solid var(--border-subtle);
 }
 
 .context-mode-group {
@@ -488,7 +481,7 @@ function handleSubmit() {
   width: 100%;
   padding: var(--spacing-sm);
   background: var(--bg-secondary);
-  border: 1px solid var(--bg-tertiary);
+  border: 1px solid var(--border-subtle);
   border-radius: var(--radius-sm);
   color: var(--text-primary);
   font-size: 0.875rem;
@@ -517,6 +510,12 @@ function handleSubmit() {
   border-radius: var(--radius-sm);
   font-size: 0.8125rem;
   color: var(--accent-cyan, #06b6d4);
+}
+
+.web-search-hint.disabled {
+  color: var(--text-secondary);
+  background: color-mix(in srgb, var(--bg-tertiary) 72%, transparent);
+  border-color: color-mix(in srgb, var(--bg-tertiary) 82%, transparent);
 }
 
 .hint-icon {

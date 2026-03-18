@@ -10,7 +10,10 @@
           class="close-btn"
           @click="$emit('cancel')"
         >
-          &times;
+          <GIcon
+            name="x"
+            :size="14"
+          />
         </button>
       </div>
 
@@ -43,6 +46,7 @@
 <script setup>
 import { ref, computed, onMounted, onBeforeUnmount } from 'vue'
 import ModelSelector from './ModelSelector.vue'
+import GIcon from '@/components/ui/GIcon.vue'
 
 const props = defineProps({
   models: {
@@ -90,6 +94,7 @@ onBeforeUnmount(() => {
   position: fixed;
   inset: 0;
   background: rgba(0, 0, 0, 0.6);
+  backdrop-filter: blur(8px);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -104,9 +109,9 @@ onBeforeUnmount(() => {
 
 .dialog-content {
   background: var(--bg-secondary);
-  border: 1px solid var(--bg-tertiary);
+  border: 1px solid var(--border-default);
   border-radius: var(--radius-lg);
-  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+  box-shadow: var(--shadow-xl);
   width: 90%;
   max-width: 500px;
   max-height: 80vh;
@@ -131,7 +136,7 @@ onBeforeUnmount(() => {
   align-items: center;
   justify-content: space-between;
   padding: var(--spacing-md);
-  border-bottom: 1px solid var(--bg-tertiary);
+  border-bottom: 1px solid var(--border-subtle);
 }
 
 .dialog-header h3 {
@@ -169,7 +174,7 @@ onBeforeUnmount(() => {
   justify-content: flex-end;
   gap: var(--spacing-sm);
   padding: var(--spacing-md);
-  border-top: 1px solid var(--bg-tertiary);
+  border-top: 1px solid var(--border-subtle);
 }
 
 .btn {

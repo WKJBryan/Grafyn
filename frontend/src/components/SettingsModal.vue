@@ -115,20 +115,16 @@
           </p>
           <div class="api-key-input">
             <input
-              v-model="openrouterKey"
-              :type="showApiKey ? 'text' : 'password'"
+              :value="apiKeyFieldValue"
+              type="password"
               class="key-input"
-              placeholder="sk-or-v1-..."
+              :placeholder="showStoredKeyMask ? '' : 'sk-or-v1-...'"
+              @focus="handleApiKeyFocus"
               @input="handleApiKeyInput"
-              @blur="validateKey"
+              @blur="handleApiKeyBlur"
+              @copy.prevent
+              @cut.prevent
             >
-            <button
-              class="toggle-visibility"
-              type="button"
-              @click="showApiKey = !showApiKey"
-            >
-              {{ showApiKey ? '🙈' : '👁️' }}
-            </button>
           </div>
           <div
             v-if="keyValidationState"
@@ -139,11 +135,8 @@
             <span v-else-if="keyValidationState === 'valid'">✅ API key is valid</span>
             <span v-else-if="keyValidationState === 'invalid'">❌ Invalid API key</span>
           </div>
-          <p class="setting-hint">
-            💡 You can skip this for now and add it later when using Canvas
-          </p>
           <p
-            v-if="hasStoredOpenRouterKey && !openrouterKey"
+            v-if="showStoredKeyMask"
             class="setting-hint"
           >
             🔐 An API key is already stored securely. Enter a new key to replace it, or leave this blank to keep it.
@@ -250,24 +243,24 @@
           </div>
         </div>
 
-        <!-- Smart Web Search Section (non-setup only, requires API key) -->
+        <!-- Canvas Web Search Section (non-setup only, requires API key) -->
         <div
           v-if="!isSetup && (openrouterKey || hasStoredOpenRouterKey)"
           class="setting-section"
         >
           <label class="setting-label">
             <span class="label-icon">🔍</span>
-            Smart Web Search
+            Canvas Web Search
           </label>
           <p class="setting-description">
-            Automatically search the web when canvas prompts need current information (~$0.02/query per model).
+            Turn live web search on by default for normal Canvas prompts (~$0.02/query per model). Disable this if you want Canvas to rely only on your prompt and selected context.
           </p>
           <label class="checkbox-label">
             <input
               v-model="smartWebSearch"
               type="checkbox"
             >
-            <span>{{ smartWebSearch ? 'Enabled' : 'Disabled' }}</span>
+            <span>{{ smartWebSearch ? 'On by default' : 'Off by default' }}</span>
           </label>
         </div>
 
@@ -400,18 +393,19 @@ const emit = defineEmits(['update:modelValue', 'saved', 'setup-complete', 'open-
 const isOpen = ref(props.modelValue)
 const isLoading = ref(false)
 const isSaving = ref(false)
-const showApiKey = ref(false)
 
 const router = useRouter()
 const toast = useToast()
 const themeStore = useThemeStore()
 const isDesktop = isDesktopApp()
+const STORED_KEY_MASK = 'sk-or-v1-stored-key'
 
 // Form state
 const vaultPath = ref('')
 const openrouterKey = ref('')
 const hasStoredOpenRouterKey = ref(false)
 const openrouterKeyDirty = ref(false)
+const editingOpenRouterKey = ref(false)
 const theme = ref('system')
 const llmModel = ref('anthropic/claude-3.5-haiku')
 const smartWebSearch = ref(true)
@@ -434,6 +428,17 @@ const filteredModels = computed(() => {
     m.provider.toLowerCase().includes(q)
   ).slice(0, 30)
 })
+
+const showStoredKeyMask = computed(() =>
+  hasStoredOpenRouterKey.value &&
+  !openrouterKey.value &&
+  !openrouterKeyDirty.value &&
+  !editingOpenRouterKey.value
+)
+
+const apiKeyFieldValue = computed(() => (
+  showStoredKeyMask.value ? STORED_KEY_MASK : openrouterKey.value
+))
 
 function selectModel(model) {
   llmModel.value = model.id
@@ -525,6 +530,7 @@ const loadCurrentSettings = async () => {
       vaultPath.value = currentSettings.vault_path || ''
       openrouterKey.value = ''
       openrouterKeyDirty.value = false
+      editingOpenRouterKey.value = false
       theme.value = currentSettings.theme || 'system'
       llmModel.value = currentSettings.llm_model || 'anthropic/claude-3.5-haiku'
       smartWebSearch.value = currentSettings.smart_web_search ?? true
@@ -547,10 +553,28 @@ const loadCurrentSettings = async () => {
   }
 }
 
-const handleApiKeyInput = () => {
+const handleApiKeyInput = (event) => {
+  openrouterKey.value = event.target.value
+  editingOpenRouterKey.value = true
   openrouterKeyDirty.value = true
   hasStoredOpenRouterKey.value = false
   keyValidationState.value = null
+}
+
+const handleApiKeyFocus = () => {
+  if (showStoredKeyMask.value) {
+    editingOpenRouterKey.value = true
+  }
+}
+
+const handleApiKeyBlur = async (event) => {
+  if (editingOpenRouterKey.value && !event.target.value) {
+    editingOpenRouterKey.value = false
+    openrouterKeyDirty.value = false
+  }
+
+  openrouterKey.value = event.target.value
+  await validateKey()
 }
 
 // Load available LLM models from OpenRouter
@@ -817,8 +841,7 @@ onMounted(() => {
 }
 
 .api-key-input {
-  display: flex;
-  gap: 8px;
+  display: block;
 }
 
 .key-input {
@@ -830,15 +853,6 @@ onMounted(() => {
   font-family: monospace;
   background: var(--bg-primary, #fff);
   color: var(--text-primary, #1a1a1a);
-}
-
-.toggle-visibility {
-  padding: 10px 12px;
-  background: var(--bg-secondary, #f5f5f5);
-  border: 1px solid var(--border-color, #e0e0e0);
-  border-radius: 8px;
-  cursor: pointer;
-  font-size: 1rem;
 }
 
 .validation-status {
@@ -1007,7 +1021,7 @@ onMounted(() => {
   cursor: not-allowed;
 }
 
-/* Smart Web Search toggle */
+/* Canvas Web Search toggle */
 .checkbox-label {
   display: inline-flex;
   align-items: center;

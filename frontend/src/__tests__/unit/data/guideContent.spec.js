@@ -73,4 +73,11 @@ describe('guideContent', () => {
       expect(cat.steps.length).toBeGreaterThan(0)
     }
   })
+
+  it('anchors the canvas prompt tip to the new prompt button', () => {
+    const promptStep = allSteps.find(step => step.id === 'canvas-prompt')
+    expect(promptStep).toBeDefined()
+    expect(promptStep.anchor).toBe('[data-guide="canvas-prompt-btn"]')
+    expect(promptStep.content).toContain('+ New Prompt')
+  })
 })

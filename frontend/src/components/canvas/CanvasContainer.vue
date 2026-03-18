@@ -41,8 +41,16 @@
             title="Auto-arrange nodes"
             @click="toggleArrangeMenu"
           >
-            <span class="icon">⊞</span> Arrange
-            <span class="dropdown-arrow">▼</span>
+            <GIcon
+              name="layout-grid"
+              :size="14"
+              class="icon"
+            /> Arrange
+            <GIcon
+              name="chevron-down"
+              :size="12"
+              class="dropdown-arrow"
+            />
           </button>
           <div
             v-if="showArrangeMenu"
@@ -56,7 +64,11 @@
               :class="{ active: layoutAlgorithm === 'hierarchical' }"
               @click="handleAutoArrange('hierarchical')"
             >
-              <span class="layout-icon">🌳</span>
+              <GIcon
+                name="tree-pine"
+                :size="18"
+                class="layout-icon"
+              />
               <div class="layout-info">
                 <span class="layout-name">Hierarchical</span>
                 <span class="layout-desc">Tree layout from left to right</span>
@@ -67,7 +79,11 @@
               :class="{ active: layoutAlgorithm === 'force-directed' }"
               @click="handleAutoArrange('force-directed')"
             >
-              <span class="layout-icon">🔮</span>
+              <GIcon
+                name="orbit"
+                :size="18"
+                class="layout-icon"
+              />
               <div class="layout-info">
                 <span class="layout-name">Force-Directed</span>
                 <span class="layout-desc">Physics-based node positioning</span>
@@ -78,7 +94,11 @@
               :class="{ active: layoutAlgorithm === 'circular' }"
               @click="handleAutoArrange('circular')"
             >
-              <span class="layout-icon">⭕</span>
+              <GIcon
+                name="circle"
+                :size="18"
+                class="layout-icon"
+              />
               <div class="layout-info">
                 <span class="layout-name">Circular</span>
                 <span class="layout-desc">Nodes arranged in a circle</span>
@@ -102,21 +122,33 @@
           title="Reset View"
           @click="resetZoom"
         >
-          <span class="icon">&#8693;</span>
+          <GIcon
+            name="maximize-2"
+            :size="14"
+            class="icon"
+          />
         </button>
         <button
           class="btn btn-secondary btn-sm"
           title="Zoom In"
           @click="zoomIn"
         >
-          <span class="icon">+</span>
+          <GIcon
+            name="zoom-in"
+            :size="14"
+            class="icon"
+          />
         </button>
         <button
           class="btn btn-secondary btn-sm"
           title="Zoom Out"
           @click="zoomOut"
         >
-          <span class="icon">-</span>
+          <GIcon
+            name="zoom-out"
+            :size="14"
+            class="icon"
+          />
         </button>
         <span class="zoom-level">{{ Math.round(viewport.zoom * 100) }}%</span>
       </div>
@@ -174,6 +206,7 @@
           :tile-id="node.tileId"
           :model-id="node.modelId"
           :response="node.response"
+          :web-search="node.webSearch"
           :is-streaming="streamingModels.has(node.modelId)"
           :selected="selectedNodes.includes(`llm:${node.tileId}:${node.modelId}`)"
           :available-models="availableModels"
@@ -183,6 +216,7 @@
           @delete="handleDeleteLLMNode"
           @regenerate="handleRegenerate"
           @follow-up="handleFollowUp"
+          @think-harder="handleThinkHarder"
         />
 
         <!-- Debate Nodes -->
@@ -235,6 +269,7 @@
       <button
         class="btn btn-primary"
         :disabled="!session"
+        data-guide="canvas-prompt-btn"
         @click="handleNewPromptClick"
       >
         + New Prompt
@@ -261,6 +296,7 @@
       :models="availableModels"
       :branch-context="branchContext"
       :smart-web-search="smartWebSearch"
+      :open-router-configured="hasApiKey"
       @submit="handlePromptSubmit"
       @cancel="closeBranchDialog"
     />
@@ -300,19 +336,16 @@
               rel="noopener"
             >Get your API key →</a>
           </p>
+          <p class="hint">
+            If the Settings input looks blank, check whether a key is already stored securely before assuming Canvas has no key configured.
+          </p>
         </div>
         <div class="dialog-footer">
           <button
-            class="btn btn-secondary"
+            class="btn btn-primary"
             @click="showApiKeyRequired = false"
           >
-            Cancel
-          </button>
-          <button
-            class="btn btn-primary"
-            @click="openSettingsForApiKey"
-          >
-            Open Settings
+            Close
           </button>
         </div>
       </div>
@@ -361,6 +394,7 @@ import DebateNode from './DebateNode.vue'
 import PromptDialog from './PromptDialog.vue'
 import AddModelDialog from './AddModelDialog.vue'
 import PinnedNotesPanel from './PinnedNotesPanel.vue'
+import GIcon from '@/components/ui/GIcon.vue'
 
 const props = defineProps({
   sessionId: {
@@ -369,7 +403,7 @@ const props = defineProps({
   }
 })
 
-const emit = defineEmits(['session-loaded', 'open-settings'])
+const emit = defineEmits(['session-loaded'])
 
 const canvasStore = useCanvasStore()
 
@@ -414,7 +448,8 @@ const llmNodes = computed(() => {
       nodes.push({
         tileId: tile.id,
         modelId,
-        response
+        response,
+        webSearch: Boolean(tile.web_search)
       })
     }
   }
@@ -624,12 +659,7 @@ onMounted(async () => {
   // Check if OpenRouter API key is configured (desktop only)
   if (isDesktopApp()) {
     try {
-      const status = await settingsApi.getOpenRouterStatus()
-      hasApiKey.value = status?.is_configured || false
-
-      // Load smart web search setting
-      const settingsData = await settingsApi.getStatus()
-      smartWebSearch.value = settingsData?.smart_web_search ?? true
+      await refreshOpenRouterStatus()
     } catch (e) {
       console.error('Failed to check OpenRouter status:', e)
       hasApiKey.value = false
@@ -775,6 +805,19 @@ function handleFollowUp({ tileId, modelId, prompt }) {
   handleLLMBranch(tileId, modelId, prompt, 'full_history', [modelId])
 }
 
+async function handleThinkHarder({ tileId, modelId, webSearch }) {
+  try {
+    await canvasStore.thinkHarderFromResponse(tileId, modelId, { webSearch })
+  } catch (err) {
+    console.error('Failed to run think harder:', err)
+    saveMessage.value = {
+      type: 'error',
+      text: err.message || 'Failed to run think harder'
+    }
+    setTimeout(() => { saveMessage.value = null }, 5000)
+  }
+}
+
 // Handle add model dialog submit
 async function handleAddModelDialogSubmit(newModelIds) {
   if (!addModelContext.value || newModelIds.length === 0) return
@@ -824,6 +867,16 @@ function clearSelection() {
   selectedNodes.value = []
 }
 
+async function refreshOpenRouterStatus() {
+  const [status, settingsData] = await Promise.all([
+    settingsApi.getOpenRouterStatus(),
+    settingsApi.getStatus()
+  ])
+  hasApiKey.value = status?.is_configured || false
+  smartWebSearch.value = settingsData?.smart_web_search ?? true
+  return hasApiKey.value
+}
+
 // Debate expand/collapse
 function expandDebate(debateId) {
   if (!expandedDebates.value.includes(debateId)) {
@@ -836,22 +889,36 @@ function collapseDebate(debateId) {
 }
 
 // Handle "+ New Prompt" click - check API key first
-function handleNewPromptClick() {
-  if (!hasApiKey.value && isDesktopApp()) {
-    showApiKeyRequired.value = true
-    return
+async function handleNewPromptClick() {
+  if (isDesktopApp()) {
+    try {
+      if (!(await refreshOpenRouterStatus())) {
+        showApiKeyRequired.value = true
+        return
+      }
+    } catch (err) {
+      console.error('Failed to refresh OpenRouter status:', err)
+      showApiKeyRequired.value = true
+      return
+    }
   }
   showPromptDialog.value = true
 }
 
-// Open settings to configure API key
-function openSettingsForApiKey() {
-  showApiKeyRequired.value = false
-  // Emit event to parent to open settings
-  emit('open-settings')
-}
+async function handlePromptSubmit({ prompt, models, systemPrompt, temperature, maxTokens = null, contextMode, webSearch }) {
+  if (isDesktopApp()) {
+    try {
+      if (!(await refreshOpenRouterStatus())) {
+        showApiKeyRequired.value = true
+        return
+      }
+    } catch (err) {
+      console.error('Failed to refresh OpenRouter status before submit:', err)
+      showApiKeyRequired.value = true
+      return
+    }
+  }
 
-async function handlePromptSubmit({ prompt, models, systemPrompt, temperature, maxTokens, contextMode, webSearch }) {
   showPromptDialog.value = false
 
   try {
@@ -902,7 +969,7 @@ function handleLLMBranch(tileId, modelId, prompt, contextMode = 'knowledge_searc
       models,
       systemPrompt: null,
       temperature: 0.7,
-      maxTokens: 2048,
+      maxTokens: null,
       contextMode,
       webSearch: false
     })
@@ -1260,7 +1327,7 @@ async function handleAutoArrange(algorithm = 'hierarchical') {
   align-items: center;
   justify-content: space-between;
   padding: var(--spacing-xs) var(--spacing-md);
-  border-bottom: 1px solid var(--bg-tertiary);
+  border-bottom: 1px solid var(--border-subtle);
   background: var(--bg-secondary);
   z-index: 20;
   flex-shrink: 0;
@@ -1327,9 +1394,10 @@ async function handleAutoArrange(algorithm = 'hierarchical') {
   right: 0;
   min-width: 280px;
   background: var(--bg-secondary);
-  border: 1px solid var(--bg-tertiary);
+  border: 1px solid var(--border-default);
   border-radius: var(--radius-md);
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+  box-shadow: var(--shadow-lg);
+  backdrop-filter: blur(12px);
   z-index: 100;
   overflow: hidden;
 }
@@ -1341,7 +1409,7 @@ async function handleAutoArrange(algorithm = 'hierarchical') {
   color: var(--text-muted);
   text-transform: uppercase;
   letter-spacing: 0.5px;
-  border-bottom: 1px solid var(--bg-tertiary);
+  border-bottom: 1px solid var(--border-subtle);
 }
 
 .dropdown-item {
@@ -1358,6 +1426,7 @@ async function handleAutoArrange(algorithm = 'hierarchical') {
 
 .dropdown-item:hover {
   background: var(--bg-tertiary);
+  border-radius: var(--radius-sm);
 }
 
 .dropdown-item.active {
@@ -1491,7 +1560,7 @@ async function handleAutoArrange(algorithm = 'hierarchical') {
   width: 150px;
   height: 100px;
   background: var(--bg-secondary);
-  border: 1px solid var(--bg-tertiary);
+  border: 1px solid var(--border-subtle);
   border-radius: var(--radius-sm);
   overflow: hidden;
   z-index: 50;
@@ -1549,10 +1618,12 @@ async function handleAutoArrange(algorithm = 'hierarchical') {
   left: 50%;
   transform: translateX(-50%);
   display: flex;
+  align-items: center;
+  flex-wrap: wrap;
   gap: var(--spacing-sm);
   padding: var(--spacing-sm);
   background: var(--bg-secondary);
-  border: 1px solid var(--bg-tertiary);
+  border: 1px solid var(--border-default);
   border-radius: var(--radius-lg);
   box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
   z-index: 10;
@@ -1645,7 +1716,7 @@ async function handleAutoArrange(algorithm = 'hierarchical') {
 /* API Key Required Dialog */
 .api-key-dialog {
   background: var(--bg-secondary);
-  border: 1px solid var(--bg-tertiary);
+  border: 1px solid var(--border-default);
   border-radius: var(--radius-lg);
   width: 90%;
   max-width: 450px;
@@ -1657,7 +1728,7 @@ async function handleAutoArrange(algorithm = 'hierarchical') {
   align-items: center;
   justify-content: space-between;
   padding: var(--spacing-md) var(--spacing-lg);
-  border-bottom: 1px solid var(--bg-tertiary);
+  border-bottom: 1px solid var(--border-subtle);
 }
 
 .api-key-dialog .dialog-header h3 {
@@ -1699,6 +1770,6 @@ async function handleAutoArrange(algorithm = 'hierarchical') {
   justify-content: flex-end;
   gap: var(--spacing-sm);
   padding: var(--spacing-md) var(--spacing-lg);
-  border-top: 1px solid var(--bg-tertiary);
+  border-top: 1px solid var(--border-subtle);
 }
 </style>

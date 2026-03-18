@@ -13,18 +13,24 @@
           v-if="isStreaming"
           class="streaming-dot"
         />
-        <span
+        <GIcon
           v-else-if="response.status === 'completed'"
+          name="check"
+          :size="14"
           class="status-complete"
-        >&#10003;</span>
-        <span
+        />
+        <GIcon
           v-else-if="response.status === 'error'"
+          name="x"
+          :size="14"
           class="status-error"
-        >&#10005;</span>
-        <span
+        />
+        <GIcon
           v-else
+          name="loader"
+          :size="14"
           class="status-pending"
-        >&#8230;</span>
+        />
       </span>
     </div>
 
@@ -45,7 +51,11 @@
         v-else-if="response.status === 'error'"
         class="error-state"
       >
-        <span class="error-icon">!</span>
+        <GIcon
+          name="alert-circle"
+          :size="18"
+          class="error-icon"
+        />
         <span class="error-message">{{ response.error_message || 'An error occurred' }}</span>
       </div>
       <div
@@ -67,6 +77,7 @@
 <script setup>
 import { computed, ref, watch, nextTick } from 'vue'
 import { marked } from 'marked'
+import GIcon from '@/components/ui/GIcon.vue'
 
 const props = defineProps({
   response: {
@@ -118,6 +129,7 @@ watch(() => props.response.content, () => {
   overflow: hidden;
   min-height: 120px;
   max-height: 300px;
+  box-shadow: var(--shadow-sm);
 }
 
 .model-response-card.streaming {
@@ -138,7 +150,7 @@ watch(() => props.response.content, () => {
   justify-content: space-between;
   padding: var(--spacing-xs) var(--spacing-sm);
   background: var(--bg-hover);
-  border-bottom: 1px solid var(--bg-tertiary);
+  border-bottom: 1px solid var(--border-subtle);
 }
 
 .header-actions {
@@ -198,17 +210,14 @@ watch(() => props.response.content, () => {
 
 .status-complete {
   color: var(--accent-green);
-  font-size: 0.875rem;
 }
 
 .status-error {
   color: var(--accent-red);
-  font-size: 0.875rem;
 }
 
 .status-pending {
   color: var(--text-muted);
-  font-size: 0.75rem;
 }
 
 .response-content {
@@ -263,14 +272,7 @@ watch(() => props.response.content, () => {
 }
 
 .error-icon {
-  width: 32px;
-  height: 32px;
-  background: rgba(248, 113, 113, 0.2);
-  border-radius: 50%;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-weight: 700;
+  color: var(--accent-red);
 }
 
 .error-message {
@@ -355,7 +357,7 @@ watch(() => props.response.content, () => {
 .response-footer {
   padding: var(--spacing-xs) var(--spacing-sm);
   background: var(--bg-hover);
-  border-top: 1px solid var(--bg-tertiary);
+  border-top: 1px solid var(--border-subtle);
 }
 
 .tokens {

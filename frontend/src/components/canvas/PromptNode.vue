@@ -6,7 +6,11 @@
     @mousedown="handleMouseDown"
   >
     <div class="node-header">
-      <span class="node-icon">💬</span>
+      <GIcon
+        name="message-square"
+        :size="14"
+        class="node-icon"
+      />
       <span class="node-type">Prompt</span>
       <div class="node-actions">
         <button
@@ -14,11 +18,14 @@
           title="Delete prompt"
           @click.stop="$emit('delete', tile.id)"
         >
-          ×
+          <GIcon
+            name="x"
+            :size="12"
+          />
         </button>
       </div>
     </div>
-    
+
     <div class="node-content">
       <p
         class="prompt-text"
@@ -33,8 +40,14 @@
       <span
         v-if="tile.web_search"
         class="web-search-badge"
-        title="Web search enabled"
-      >Web</span>
+        title="Live web search used for this prompt"
+      >
+        <GIcon
+          name="globe"
+          :size="12"
+        />
+        <span>Web</span>
+      </span>
       <span class="timestamp">{{ formatTime(tile.created_at) }}</span>
     </div>
     
@@ -44,11 +57,17 @@
     <!-- Add Model button (+) on right edge -->
     <button
       v-if="hasCompletedResponse"
+      type="button"
       class="add-model-btn"
       title="Add more models"
+      @pointerdown.stop.prevent
+      @mousedown.stop.prevent
       @click.stop="$emit('show-add-model-dialog', { tileId: tile.id })"
     >
-      +
+      <GIcon
+        name="plus"
+        :size="14"
+      />
     </button>
 
     <!-- Branch indicator if this is a child prompt -->
@@ -56,7 +75,10 @@
       v-if="tile.parent_tile_id"
       class="branch-indicator"
     >
-      ⑂
+      <GIcon
+        name="git-branch"
+        :size="14"
+      />
     </div>
 
     <div
@@ -68,6 +90,7 @@
 
 <script setup>
 import { ref, computed, onBeforeUnmount } from 'vue'
+import GIcon from '@/components/ui/GIcon.vue'
 
 const MIN_WIDTH = 200
 const MIN_HEIGHT = 120
@@ -213,9 +236,9 @@ onBeforeUnmount(() => {
 .prompt-node {
   position: absolute;
   background: linear-gradient(135deg, var(--bg-secondary) 0%, var(--bg-tertiary) 100%);
-  border: 2px solid var(--accent-primary);
+  border: 1px solid var(--border-default);
   border-radius: var(--radius-md);
-  box-shadow: 0 4px 16px color-mix(in srgb, var(--accent-primary) 20%, transparent);
+  box-shadow: var(--shadow-md);
   display: flex;
   flex-direction: column;
   overflow: visible;
@@ -225,7 +248,12 @@ onBeforeUnmount(() => {
 }
 
 .prompt-node:hover {
-  box-shadow: 0 6px 20px color-mix(in srgb, var(--accent-primary) 35%, transparent);
+  box-shadow: var(--shadow-lg);
+  z-index: 6;
+}
+
+.prompt-node:focus-within {
+  z-index: 6;
 }
 
 .prompt-node.selected {
@@ -312,7 +340,8 @@ onBeforeUnmount(() => {
   justify-content: space-between;
   align-items: center;
   padding: var(--spacing-xs) var(--spacing-sm);
-  background: rgba(0, 0, 0, 0.1);
+  border-top: 1px solid var(--border-subtle);
+  background: transparent;
   font-size: 0.6875rem;
   color: var(--text-muted);
 }
@@ -323,14 +352,24 @@ onBeforeUnmount(() => {
 }
 
 .web-search-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
   font-size: 0.625rem;
-  font-weight: 600;
+  font-weight: 700;
   color: var(--accent-cyan);
-  background: color-mix(in srgb, var(--accent-cyan) 15%, transparent);
-  padding: 1px 5px;
-  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--accent-cyan) 14%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent-cyan) 35%, transparent);
+  padding: 2px 6px;
+  border-radius: 999px;
   text-transform: uppercase;
-  letter-spacing: 0.5px;
+  letter-spacing: 0.04em;
+  line-height: 1;
+}
+
+.web-search-icon {
+  font-size: 0.6875rem;
+  line-height: 1;
 }
 
 /* Connection point - visual indicator on right side */
@@ -388,6 +427,7 @@ onBeforeUnmount(() => {
   opacity: 0;
   transform: scale(0.8);
   z-index: 5;
+  pointer-events: auto;
 }
 
 .prompt-node:hover .add-model-btn {

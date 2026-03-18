@@ -101,7 +101,7 @@ function handleAutoRound() {
 .debate-controls {
   padding: var(--spacing-sm) var(--spacing-md);
   background: var(--bg-primary);
-  border-top: 1px solid var(--bg-tertiary);
+  border-top: 1px solid var(--border-subtle);
   display: flex;
   flex-direction: column;
   gap: var(--spacing-sm);
@@ -145,7 +145,7 @@ function handleAutoRound() {
   flex: 1;
   padding: var(--spacing-xs);
   background: var(--bg-tertiary);
-  border: 1px solid var(--bg-tertiary);
+  border: 1px solid var(--border-subtle);
   border-radius: var(--radius-sm);
   color: var(--text-primary);
   font-size: 0.8125rem;
@@ -172,7 +172,7 @@ function handleAutoRound() {
 .btn-ghost {
   background: transparent;
   color: var(--text-muted);
-  border: 1px solid var(--bg-tertiary);
+  border: 1px solid var(--border-subtle);
 }
 
 .btn-ghost:hover {

@@ -7,7 +7,10 @@
       title="Pin notes for context"
       @click="showPanel = !showPanel"
     >
-      <span class="icon">&#128204;</span>
+      <GIcon
+        name="pin"
+        :size="14"
+      />
       Notes
       <span
         v-if="pinnedCount > 0"
@@ -25,7 +28,10 @@
           class="close-btn"
           @click="showPanel = false"
         >
-          &#10005;
+          <GIcon
+            name="x"
+            :size="14"
+          />
         </button>
       </div>
 
@@ -84,7 +90,10 @@
             title="Unpin"
             @click="unpinNote(note.id)"
           >
-            &#10005;
+            <GIcon
+              name="x"
+              :size="10"
+            />
           </button>
         </div>
       </div>
@@ -101,6 +110,7 @@
 
 <script setup>
 import { ref, computed, watch } from 'vue'
+import GIcon from '@/components/ui/GIcon.vue'
 import { search as searchApi } from '@/api/client'
 import { useCanvasStore } from '@/stores/canvas'
 
@@ -200,9 +210,9 @@ async function unpinNote(noteId) {
   margin-top: 4px;
   width: 280px;
   background: var(--bg-secondary);
-  border: 1px solid var(--bg-tertiary);
+  border: 1px solid var(--border-default);
   border-radius: var(--radius-md);
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.3);
+  box-shadow: var(--shadow-lg);
   z-index: 100;
   max-height: 400px;
   display: flex;
@@ -214,7 +224,7 @@ async function unpinNote(noteId) {
   align-items: center;
   justify-content: space-between;
   padding: var(--spacing-sm) var(--spacing-md);
-  border-bottom: 1px solid var(--bg-tertiary);
+  border-bottom: 1px solid var(--border-subtle);
 }
 
 .panel-header h4 {
@@ -247,7 +257,7 @@ async function unpinNote(noteId) {
   width: 100%;
   padding: 6px 8px;
   background: var(--bg-tertiary);
-  border: 1px solid var(--bg-tertiary);
+  border: 1px solid var(--border-subtle);
   border-radius: var(--radius-sm);
   color: var(--text-primary);
   font-size: 0.8125rem;
@@ -261,7 +271,7 @@ async function unpinNote(noteId) {
 .search-results {
   max-height: 160px;
   overflow-y: auto;
-  border-bottom: 1px solid var(--bg-tertiary);
+  border-bottom: 1px solid var(--border-subtle);
 }
 
 .search-result-item {

@@ -5,27 +5,13 @@
       <header class="app-header">
         <div class="header-left">
           <div class="logo-wrapper">
-            <svg
+            <img
+              :src="grafynLogo"
+              alt="Grafyn"
               class="logo-icon"
               width="24"
               height="24"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
             >
-              <circle
-                cx="12"
-                cy="12"
-                r="10"
-              />
-              <line
-                x1="2"
-                y1="12"
-                x2="22"
-                y2="12"
-              />
-              <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z" />
-            </svg>
             <h1 class="logo">
               Grafyn
             </h1>
@@ -282,6 +268,7 @@ import SettingsModal from '../components/SettingsModal.vue'
 import ConfirmDialog from '../components/ConfirmDialog.vue'
 import { useToast } from '../composables/useToast'
 import { useGuide } from '../composables/useGuide'
+import grafynLogo from '../assets/grafyn-logo.png'
 
 const guide = useGuide()
 const notes = ref([])

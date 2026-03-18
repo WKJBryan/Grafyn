@@ -144,6 +144,7 @@ pub async fn send_prompt(
         parent_model_id: request.parent_model_id,
         context_notes: resolved_context.context_notes.clone(),
         web_search: request.web_search,
+        web_search_max_results: request.web_search_max_results,
     };
 
     // Save tile to session
@@ -182,6 +183,7 @@ pub async fn send_prompt(
     let temperature = request.temperature;
     let max_tokens = request.max_tokens;
     let web_search = request.web_search;
+    let web_search_max_results = request.web_search_max_results;
     let tile_id_clone = tile_id.clone();
     let session_id_clone = session_id.clone();
 
@@ -206,8 +208,9 @@ pub async fn send_prompt(
                         messages,
                         system_prompt.as_deref(),
                         Some(temperature),
-                        Some(max_tokens),
+                        max_tokens,
                         web_search,
+                        web_search_max_results,
                     )
                     .await;
                 drop(openrouter);
@@ -609,7 +612,7 @@ pub async fn start_debate(
                 join_set.spawn(async move {
                     let openrouter = openrouter_arc.read().await;
                     let stream_result = openrouter
-                        .chat_stream(&model_id, messages, None, Some(0.7), Some(1024), false)
+                        .chat_stream(&model_id, messages, None, Some(0.7), Some(1024), false, 5)
                         .await;
                     drop(openrouter);
 
@@ -836,7 +839,7 @@ pub async fn continue_debate(
             join_set.spawn(async move {
                 let openrouter = openrouter_arc.read().await;
                 let stream_result = openrouter
-                    .chat_stream(&model_id, messages, None, Some(0.7), Some(1024), false)
+                    .chat_stream(&model_id, messages, None, Some(0.7), Some(1024), false, 5)
                     .await;
                 drop(openrouter);
 
@@ -1010,7 +1013,7 @@ pub async fn add_models_to_tile(
         .ok_or_else(|| "Tile not found".to_string())?
         .clone();
     let model_ids = request.model_ids.clone();
-    let prompt_request = prompt_request_from_tile(&tile, model_ids.clone(), 0.7, 2048);
+    let prompt_request = prompt_request_from_tile(&tile, model_ids.clone(), 0.7, None);
     let resolved_context = resolve_prompt_context(state.inner(), &session, &prompt_request).await?;
 
     let now = Utc::now();
@@ -1060,6 +1063,7 @@ pub async fn add_models_to_tile(
     let messages = resolved_context.messages.clone();
     let system_prompt = resolved_context.system_prompt.clone();
     let web_search = prompt_request.web_search;
+    let web_search_max_results = prompt_request.web_search_max_results;
 
     tauri::async_runtime::spawn(async move {
         // Stream all new models concurrently using JoinSet
@@ -1076,7 +1080,15 @@ pub async fn add_models_to_tile(
             join_set.spawn(async move {
                 let openrouter = openrouter_arc.read().await;
                 let stream_result = openrouter
-                    .chat_stream(&model_id, messages, system_prompt.as_deref(), Some(0.7), Some(2048), web_search)
+                    .chat_stream(
+                        &model_id,
+                        messages,
+                        system_prompt.as_deref(),
+                        Some(0.7),
+                        None,
+                        web_search,
+                        web_search_max_results,
+                    )
                     .await;
                 drop(openrouter);
 
@@ -1215,7 +1227,7 @@ pub async fn regenerate_response(
         return Err("Response not found".to_string());
     }
 
-    let request = prompt_request_from_tile(tile, vec![model_id.clone()], 0.7, 2048);
+    let request = prompt_request_from_tile(tile, vec![model_id.clone()], 0.7, None);
     let resolved_context = resolve_prompt_context(state.inner(), &session, &request).await?;
 
     // Reset response to streaming
@@ -1232,11 +1244,20 @@ pub async fn regenerate_response(
     let messages = resolved_context.messages.clone();
     let system_prompt = resolved_context.system_prompt.clone();
     let web_search = request.web_search;
+    let web_search_max_results = request.web_search_max_results;
 
     tauri::async_runtime::spawn(async move {
         let openrouter = openrouter_arc.read().await;
         let stream_result = openrouter
-            .chat_stream(&model_id, messages, system_prompt.as_deref(), Some(0.7), Some(2048), web_search)
+            .chat_stream(
+                &model_id,
+                messages,
+                system_prompt.as_deref(),
+                Some(0.7),
+                None,
+                web_search,
+                web_search_max_results,
+            )
             .await;
         drop(openrouter);
 
@@ -1329,7 +1350,7 @@ fn prompt_request_from_tile(
     tile: &PromptTile,
     models: Vec<String>,
     temperature: f64,
-    max_tokens: u32,
+    max_tokens: Option<u32>,
 ) -> PromptRequest {
     PromptRequest {
         prompt: tile.prompt.clone(),
@@ -1342,6 +1363,7 @@ fn prompt_request_from_tile(
         temperature,
         max_tokens,
         web_search: tile.web_search,
+        web_search_max_results: tile.web_search_max_results,
     }
 }
 
@@ -1651,6 +1673,7 @@ mod tests {
             parent_model_id: parent_model_id.map(str::to_string),
             context_notes: Vec::new(),
             web_search: false,
+            web_search_max_results: 5,
         }
     }
 
@@ -1680,8 +1703,9 @@ mod tests {
             parent_tile_id: Some(parent_tile_id.to_string()),
             parent_model_id: Some(parent_model_id.to_string()),
             temperature: 0.7,
-            max_tokens: 2048,
+            max_tokens: None,
             web_search: false,
+            web_search_max_results: 5,
         }
     }
 
@@ -1775,5 +1799,21 @@ mod tests {
         let err = build_selected_parent_chain(&session, &request).unwrap_err();
 
         assert!(err.contains("Parent response not found"));
+    }
+
+    #[test]
+    fn test_prompt_request_from_tile_preserves_web_search_settings() {
+        let tile = PromptTile {
+            web_search: true,
+            web_search_max_results: 8,
+            ..build_tile("tile-1", "Prompt", "openai/gpt-4", "Response", None, None)
+        };
+
+        let request = prompt_request_from_tile(&tile, vec!["openai/gpt-4".to_string()], 0.3, Some(4096));
+
+        assert!(request.web_search);
+        assert_eq!(request.web_search_max_results, 8);
+        assert_eq!(request.temperature, 0.3);
+        assert_eq!(request.max_tokens, Some(4096));
     }
 }
