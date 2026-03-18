@@ -13,9 +13,10 @@
     "test:ui": "vitest --ui",
     "test:run": "vitest run",
     "test:coverage": "vitest run --coverage",
+    "prepare:sidecar": "node scripts/prepare-sidecar.cjs",
     "tauri": "tauri",
-    "tauri:dev": "tauri dev",
-    "tauri:build": "tauri build",
+    "tauri:dev": "node scripts/run-tauri.cjs dev",
+    "tauri:build": "node scripts/run-tauri.cjs build",
     "version:bump": "node scripts/bump-version.cjs",
     "generate-icons": "node scripts/generate-icons.cjs && npx tauri icon src-tauri/icons/app-icon.png"
   },
