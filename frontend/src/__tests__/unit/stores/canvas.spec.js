@@ -78,7 +78,7 @@ describe('Canvas Store', () => {
       return unlistenMock
     })
 
-    const sendPromptSpy = vi.spyOn(apiClient.canvas, 'sendPrompt').mockImplementation(async (_sessionId, request) => {
+    const sendPromptSpy = vi.spyOn(apiClient.canvas, 'sendPrompt').mockImplementation(async (_sessionId, _request) => {
       streamHandler({
         payload: {
           session_id: 'session-1',

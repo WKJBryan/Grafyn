@@ -1,0 +1,138 @@
+name: Release Smoke
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  RUST_CACHE_VERSION: v1
+
+jobs:
+  release-smoke:
+    name: Release Smoke (${{ matrix.os_name }} ${{ matrix.arch }})
+    runs-on: ${{ matrix.platform }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-latest
+            target: x86_64-pc-windows-msvc
+            arch: x64
+            os_name: windows
+          - platform: windows-latest
+            target: aarch64-pc-windows-msvc
+            arch: arm64
+            os_name: windows
+          - platform: macos-latest
+            target: aarch64-apple-darwin
+            arch: arm64
+            os_name: macos
+          - platform: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            arch: x64
+            os_name: linux
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@1.93.1
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: 'frontend/src-tauri -> target'
+          key: ${{ runner.os }}-${{ matrix.target }}-${{ hashFiles('frontend/src-tauri/Cargo.lock', '.github/workflows/release-smoke.yml', '.github/workflows/release.yml') }}-${{ env.RUST_CACHE_VERSION }}
+
+      - name: Install Linux dependencies
+        if: matrix.os_name == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-3-dev \
+            libwebkit2gtk-4.0-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Normalize Cargo.lock
+        run: |
+          cd frontend/src-tauri
+          cargo generate-lockfile
+          cd ../..
+          git diff --exit-code -- frontend/src-tauri/Cargo.lock
+
+      - name: Validate and regenerate icons
+        working-directory: frontend
+        shell: bash
+        run: |
+          if node -e "
+            const fs = require('fs');
+            const ico = 'src-tauri/icons/icon.ico';
+            if (!fs.existsSync(ico)) process.exit(1);
+            const magic = fs.readFileSync(ico).slice(0, 4).toString('hex');
+            console.log('icon.ico magic: ' + magic);
+            if (magic !== '00000100') process.exit(1);
+          "; then
+            echo "Icons are valid"
+          else
+            echo "Regenerating icons..."
+            node scripts/generate-icons.cjs
+            npx tauri icon src-tauri/icons/app-icon.png
+          fi
+
+      - name: Build MCP binary
+        working-directory: frontend
+        run: node scripts/prepare-sidecar.cjs --release --locked --target ${{ matrix.target }}
+
+      - name: Prepare Tauri smoke args
+        id: tauri_args
+        shell: bash
+        env:
+          TAURI_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
+        run: |
+          args="--target ${{ matrix.target }} -- --locked"
+
+          if [ -z "${TAURI_PRIVATE_KEY}" ]; then
+            config_path="$RUNNER_TEMP/tauri-smoke-config.json"
+            printf '%s' '{"tauri":{"updater":{"active":false}}}' > "$config_path"
+            args="$args --config $config_path"
+            echo "TAURI_PRIVATE_KEY is unavailable; updater signing is disabled for this smoke build."
+          fi
+
+          echo "args=$args" >> "$GITHUB_OUTPUT"
+
+      - name: Build Tauri app
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
+          TAURI_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
+        with:
+          projectPath: frontend
+          tauriScript: npx tauri
+          args: ${{ steps.tauri_args.outputs.args }}
+          uploadUpdaterJson: false
