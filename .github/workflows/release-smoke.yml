@@ -5,6 +5,11 @@ on:
     branches: [main]
   push:
     branches: [main]
+    paths-ignore:
+      - 'frontend/package.json'
+      - 'frontend/src-tauri/Cargo.toml'
+      - 'frontend/src-tauri/Cargo.lock'
+      - 'frontend/src-tauri/tauri.conf.json'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
