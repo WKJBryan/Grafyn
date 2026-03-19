@@ -41,7 +41,7 @@ tokio = { version = "1.0", features = ["rt-multi-thread", "sync", "macros", "fs"
 # File handling
 gray_matter = "0.2"
 walkdir = "2.4"
-notify = "6.1"
+notify = "8.2"
 serde_yaml = "0.9"
 
 # Search
