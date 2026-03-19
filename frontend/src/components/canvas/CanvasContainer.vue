@@ -1660,10 +1660,6 @@ async function handleAutoArrange(algorithm = 'hierarchical') {
   to { transform: rotate(360deg); }
 }
 
-.btn-sm {
-  padding: 4px 8px;
-  font-size: 0.75rem;
-}
 
 .btn-ghost {
   background: transparent;
