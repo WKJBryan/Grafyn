@@ -76,7 +76,7 @@ dirs = "5.0"
 keyring = "2.3"
 
 # MCP server (optional — only needed for the grafyn-mcp binary)
-rmcp = { version = "0.15", features = ["server", "transport-io"], optional = true }
+rmcp = { version = "1.2", features = ["server", "transport-io"], optional = true }
 schemars = { version = "1", optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
 
