@@ -14,6 +14,7 @@ data/lancedb/
 data/import/
 data/canvas/
 data/tokens.json
+data/.encryption_key
 import files/
 
 # ── Python ──
@@ -52,3 +53,5 @@ error_output.txt
 # ── Cloudflare Worker ──
 .cloudflare/node_modules/
 .cloudflare/.wrangler/
+.cloudflare/latest.json
+.wrangler/
