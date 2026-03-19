@@ -4,12 +4,6 @@ on:
   push:
     tags:
       - 'v*'
-  workflow_dispatch:
-    inputs:
-      version:
-        description: 'Version tag (e.g., v1.0.0)'
-        required: false
-        default: 'dev'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -21,26 +15,55 @@ env:
   RUST_CACHE_VERSION: v1
 
 jobs:
-  # ============================================================================
-  # Create Release - Single job to avoid duplicate drafts from matrix race
-  # ============================================================================
-  create-release:
-    if: startsWith(github.ref, 'refs/tags/v')
+  prepare-release:
     runs-on: ubuntu-latest
-    outputs:
-      release_id: ${{ steps.create.outputs.result }}
-      release_notes: ${{ steps.notes.outputs.notes }}
     permissions:
       contents: write
+    environment: release
+    outputs:
+      created_new: ${{ steps.ensure_release.outputs.created_new }}
+      release_id: ${{ steps.ensure_release.outputs.release_id }}
+      release_notes: ${{ steps.notes.outputs.notes }}
+      tag_name: ${{ github.ref_name }}
+      version: ${{ steps.version.outputs.version }}
 
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Get version from tag
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@1.93.1
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: frontend/src-tauri
+          key: ${{ runner.os }}-release-prepare-1.93.1-${{ hashFiles('frontend/src-tauri/Cargo.lock', '.github/workflows/release.yml') }}-${{ env.RUST_CACHE_VERSION }}
+
+      - name: Validate release manifests
+        working-directory: frontend
+        run: npm run release:verify
+
+      - name: Read version from manifests
         id: version
-        run: echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+        working-directory: frontend
+        shell: bash
+        run: echo "version=$(node -p \"require('./package.json').version\")" >> "$GITHUB_OUTPUT"
+
+      - name: Verify tag matches manifests
+        shell: bash
+        run: |
+          expected_tag="v${{ steps.version.outputs.version }}"
+          if [ "${GITHUB_REF_NAME}" != "$expected_tag" ]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match manifest version ${expected_tag}"
+            exit 1
+          fi
 
       - name: Generate release notes
         id: notes
@@ -51,7 +74,6 @@ jobs:
           script: |
             const tag = `v${process.env.VERSION}`;
 
-            // Find the previous tag for the changelog range
             let previousTag = '';
             try {
               const { data: tags } = await github.rest.repos.listTags({
@@ -63,14 +85,12 @@ jobs:
               if (currentIdx >= 0 && currentIdx + 1 < tags.length) {
                 previousTag = tags[currentIdx + 1].name;
               } else if (tags.length > 1) {
-                // Tag not yet in list (just pushed), use second tag as previous
                 previousTag = tags[0].name === tag ? tags[1]?.name : tags[0].name;
               }
-            } catch (e) {
-              core.info(`Could not find previous tag: ${e.message}`);
+            } catch (error) {
+              core.info(`Could not determine previous tag: ${error.message}`);
             }
 
-            // Generate changelog using GitHub's release notes API
             let changelog = '';
             try {
               const params = {
@@ -78,31 +98,27 @@ jobs:
                 repo: context.repo.repo,
                 tag_name: tag,
               };
-              if (previousTag) params.previous_tag_name = previousTag;
+              if (previousTag) {
+                params.previous_tag_name = previousTag;
+              }
 
               const { data } = await github.rest.repos.generateReleaseNotes(params);
               changelog = data.body;
-            } catch (e) {
-              core.warning(`Could not generate release notes: ${e.message}`);
+            } catch (error) {
+              core.warning(`Could not generate release notes: ${error.message}`);
               changelog = `Release ${tag}`;
             }
 
-            // Produce a plain-text summary for the updater dialog while preserving
-            // category headings from GitHub's generated markdown.
             const lines = changelog.split('\n').map(line => line.trimRight());
             const sections = [];
             let currentHeading = '';
             let currentItems = [];
-
-            const ignoredHeadings = new Set([
-              "what's changed",
-              'new contributors',
-            ]);
+            const ignoredHeadings = new Set(["what's changed", 'new contributors']);
 
             const cleanItem = (line) => line
               .replace(/^\* /, '- ')
-              .replace(/ by @[\w-]+ in .+$/, '') // strip "by @user in URL"
-              .replace(/\*\*/g, '')               // strip bold markers
+              .replace(/ by @[\w-]+ in .+$/, '')
+              .replace(/\*\*/g, '')
               .trim();
 
             const flushSection = () => {
@@ -115,7 +131,6 @@ jobs:
                 heading: currentHeading,
                 items: [...currentItems],
               });
-
               currentHeading = '';
               currentItems = [];
             };
@@ -140,11 +155,15 @@ jobs:
             const maxItems = 15;
 
             for (const section of sections) {
-              if (totalItems >= maxItems) break;
+              if (totalItems >= maxItems) {
+                break;
+              }
 
               const remaining = maxItems - totalItems;
               const items = section.items.slice(0, remaining);
-              if (items.length === 0) continue;
+              if (items.length === 0) {
+                continue;
+              }
 
               cappedSections.push({
                 heading: section.heading,
@@ -156,12 +175,12 @@ jobs:
             const updaterNotes = cappedSections.length > 0
               ? cappedSections
                   .map(section => {
-                    const lines = [];
+                    const output = [];
                     if (section.heading) {
-                      lines.push(`${section.heading}:`);
+                      output.push(`${section.heading}:`);
                     }
-                    lines.push(...section.items);
-                    return lines.join('\n');
+                    output.push(...section.items);
+                    return output.join('\n');
                   })
                   .join('\n\n')
               : `Release ${tag}`;
@@ -169,15 +188,21 @@ jobs:
             core.setOutput('notes', updaterNotes);
             core.setOutput('changelog', changelog);
 
-      - name: Create draft release
-        id: create
+      - name: Ensure reusable draft release
+        id: ensure_release
         uses: actions/github-script@v7
         env:
-          VERSION: ${{ steps.version.outputs.version }}
           CHANGELOG: ${{ steps.notes.outputs.changelog }}
+          TAG_NAME: ${{ github.ref_name }}
+          VERSION: ${{ steps.version.outputs.version }}
         with:
           script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const tag = process.env.TAG_NAME;
+            const version = process.env.VERSION;
             const changelog = process.env.CHANGELOG || '';
+
             const body = [
               changelog,
               '',
@@ -190,39 +215,92 @@ jobs:
               '| **Windows (64-bit)** | `Grafyn_*_x64-setup.exe` | Most Windows PCs |',
               '| **Windows (ARM)** | `Grafyn_*_arm64-setup.exe` | Surface Pro X, Snapdragon laptops |',
               '| **macOS** | `Grafyn_*_aarch64.dmg` | M1/M2/M3/M4 Macs (also runs on Intel via Rosetta 2) |',
-              '| **Linux (Debian/Ubuntu)** | `Grafyn_*_amd64.deb` | `sudo dpkg -i` to install |',
-              '| **Linux (Universal)** | `Grafyn_*_amd64.AppImage` | `chmod +x` and run — works on any distro |',
+              '| **Linux (Debian/Ubuntu)** | `grafyn_*_amd64.deb` | `sudo dpkg -i` to install |',
+              '| **Linux (Universal)** | `grafyn_*_amd64.AppImage` | `chmod +x` and run — works on any distro |',
               '',
               '> **Already installed?** Grafyn will prompt you to update automatically.',
               '>',
-              '> Files ending in `.sig`, `.zip`, or `latest.json` are for auto-update — you don\'t need to download those.',
+              '> Files ending in `.sig`, `.zip`, or `latest.json` are for auto-update — you do not need to download those.',
             ].join('\n');
 
-            const { data } = await github.rest.repos.createRelease({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              tag_name: `v${process.env.VERSION}`,
-              name: `Grafyn v${process.env.VERSION}`,
+            const releases = await github.paginate(github.rest.repos.listReleases, {
+              owner,
+              repo,
+              per_page: 100,
+            });
+
+            const matching = releases.filter(release => release.tag_name === tag);
+
+            if (matching.length > 1) {
+              core.setFailed(
+                `Found ${matching.length} releases for ${tag}. Clean up duplicate drafts before retrying.`,
+              );
+              return;
+            }
+
+            if (matching.length === 1) {
+              const release = matching[0];
+              if (!release.draft) {
+                core.setFailed(
+                  `A published release already exists for ${tag}. Cut a new version instead of reusing this tag.`,
+                );
+                return;
+              }
+
+              const assets = await github.paginate(github.rest.repos.listReleaseAssets, {
+                owner,
+                repo,
+                release_id: release.id,
+                per_page: 100,
+              });
+
+              for (const asset of assets) {
+                await github.rest.repos.deleteReleaseAsset({
+                  owner,
+                  repo,
+                  asset_id: asset.id,
+                });
+              }
+
+              const { data: updated } = await github.rest.repos.updateRelease({
+                owner,
+                repo,
+                release_id: release.id,
+                tag_name: tag,
+                name: `Grafyn v${version}`,
+                body,
+                draft: true,
+                prerelease: false,
+              });
+
+              core.setOutput('created_new', 'false');
+              core.setOutput('release_id', String(updated.id));
+              return;
+            }
+
+            const { data: created } = await github.rest.repos.createRelease({
+              owner,
+              repo,
+              tag_name: tag,
+              name: `Grafyn v${version}`,
               body,
               draft: true,
               prerelease: false,
             });
-            return data.id;
 
-  # ============================================================================
-  # Build Matrix - All Platforms & Architectures
-  # ============================================================================
+            core.setOutput('created_new', 'true');
+            core.setOutput('release_id', String(created.id));
+
   build:
-    needs: create-release
-    if: always() && (needs.create-release.result == 'success' || !startsWith(github.ref, 'refs/tags/v'))
+    needs: prepare-release
+    runs-on: ${{ matrix.platform }}
     permissions:
       contents: write
-
+    environment: release
     strategy:
       fail-fast: false
       matrix:
         include:
-          # Windows
           - platform: windows-latest
             target: x86_64-pc-windows-msvc
             arch: x64
@@ -231,28 +309,18 @@ jobs:
             target: aarch64-pc-windows-msvc
             arch: arm64
             os_name: windows
-
-          # macOS (ARM only — Rosetta 2 handles x64 on Apple Silicon)
           - platform: macos-latest
             target: aarch64-apple-darwin
             arch: arm64
             os_name: macos
-
-          # Linux
           - platform: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             arch: x64
             os_name: linux
 
-    runs-on: ${{ matrix.platform }}
-
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      # ========================================
-      # Setup Node.js
-      # ========================================
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
@@ -260,9 +328,6 @@ jobs:
           cache: 'npm'
           cache-dependency-path: frontend/package-lock.json
 
-      # ========================================
-      # Setup Rust
-      # ========================================
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@1.93.1
         with:
@@ -274,9 +339,6 @@ jobs:
           workspaces: 'frontend/src-tauri -> target'
           key: ${{ runner.os }}-${{ matrix.target }}-${{ hashFiles('frontend/src-tauri/Cargo.lock', '.github/workflows/release.yml') }}-${{ env.RUST_CACHE_VERSION }}
 
-      # ========================================
-      # Install Linux Dependencies
-      # ========================================
       - name: Install Linux dependencies
         if: matrix.os_name == 'linux'
         run: |
@@ -288,31 +350,21 @@ jobs:
             librsvg2-dev \
             patchelf
 
-      # ========================================
-      # Install macOS Dependencies (for cross-compile)
-      # ========================================
-      - name: Install macOS cross-compile tools
-        if: matrix.os_name == 'macos' && matrix.arch == 'arm64'
-        run: |
-          # ARM64 builds on Intel Mac need no extra setup with recent Xcode
-          echo "Building for Apple Silicon on macOS"
-
-      # ========================================
-      # Install Frontend Dependencies
-      # ========================================
       - name: Install frontend dependencies
         working-directory: frontend
         run: npm ci
 
-      # ========================================
-      # Validate Icons (regenerate if invalid)
-      # ========================================
+      - name: Normalize Cargo.lock
+        run: |
+          cd frontend/src-tauri
+          cargo generate-lockfile
+          cd ../..
+          git diff --exit-code -- frontend/src-tauri/Cargo.lock
+
       - name: Validate and regenerate icons
         working-directory: frontend
         shell: bash
         run: |
-          # Check icon.ico exists and has valid Windows icon magic bytes
-          # Uses Node.js exit code directly — no temp files needed
           if node -e "
             const fs = require('fs');
             const ico = 'src-tauri/icons/icon.ico';
@@ -328,242 +380,270 @@ jobs:
             npx tauri icon src-tauri/icons/app-icon.png
           fi
 
-      # ========================================
-      # Build MCP Binary (native Rust, no Tauri)
-      # ========================================
       - name: Build MCP binary
         working-directory: frontend
         run: node scripts/prepare-sidecar.cjs --release --locked --target ${{ matrix.target }}
 
-      # ========================================
-      # Build Tauri App & Upload to Release
-      # ========================================
       - name: Build Tauri app
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
-          TAURI_KEY_PASSWORD: ''
+          TAURI_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
         with:
           projectPath: frontend
           tauriScript: npx tauri
           args: --target ${{ matrix.target }} -- --locked
-          releaseId: ${{ needs.create-release.outputs.release_id }}
-          releaseBody: ${{ needs.create-release.outputs.release_notes }}
+          releaseId: ${{ needs.prepare-release.outputs.release_id }}
+          tagName: ${{ needs.prepare-release.outputs.tag_name }}
+          releaseDraft: true
+          releaseBody: ${{ needs.prepare-release.outputs.release_notes }}
+          uploadUpdaterJson: false
           updaterJsonPreferNsis: true
 
-      # ========================================
-      # Upload Artifacts (for workflow_dispatch debugging only)
-      # ========================================
-      - name: Upload Windows installers
-        if: matrix.os_name == 'windows' && github.event_name == 'workflow_dispatch'
-        uses: actions/upload-artifact@v4
-        with:
-          name: windows-${{ matrix.arch }}
-          path: |
-            frontend/src-tauri/target/${{ matrix.target }}/release/bundle/nsis/*.exe
-          retention-days: 7
-          if-no-files-found: warn
+  verify-release-assets:
+    needs: [prepare-release, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    environment: release
 
-      - name: Upload macOS installers
-        if: matrix.os_name == 'macos' && github.event_name == 'workflow_dispatch'
-        uses: actions/upload-artifact@v4
-        with:
-          name: macos-${{ matrix.arch }}
-          path: |
-            frontend/src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg
-            frontend/src-tauri/target/${{ matrix.target }}/release/bundle/macos/*.app
-          retention-days: 7
-          if-no-files-found: warn
+    steps:
+      - uses: actions/checkout@v4
 
-      - name: Upload Linux installers
-        if: matrix.os_name == 'linux' && github.event_name == 'workflow_dispatch'
-        uses: actions/upload-artifact@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
         with:
-          name: linux-${{ matrix.arch }}
-          path: |
-            frontend/src-tauri/target/${{ matrix.target }}/release/bundle/deb/*.deb
-            frontend/src-tauri/target/${{ matrix.target }}/release/bundle/appimage/*.AppImage
-          retention-days: 7
-          if-no-files-found: warn
+          node-version: '20'
 
-  # ============================================================================
-  # Publish Release - Mark draft as published after all builds complete
-  # ============================================================================
+      - name: Download draft release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p release-assets
+          gh release download "${{ needs.prepare-release.outputs.tag_name }}" \
+            --repo "${{ github.repository }}" \
+            --dir release-assets \
+            --pattern "*"
+
+      - name: Validate updater payload completeness
+        shell: bash
+        env:
+          RELEASE_NOTES: ${{ needs.prepare-release.outputs.release_notes }}
+          WORKER_URL: ${{ vars.CLOUDFLARE_WORKER_URL || 'https://grafyn-updater.grafyn-updater.workers.dev' }}
+        run: |
+          notes_file="$RUNNER_TEMP/release-notes.txt"
+          printf '%s' "$RELEASE_NOTES" > "$notes_file"
+
+          node frontend/scripts/generate-updater-manifest.cjs \
+            --assets-dir release-assets \
+            --version "${{ needs.prepare-release.outputs.version }}" \
+            --worker-url "$WORKER_URL" \
+            --notes-file "$notes_file" \
+            --out release-assets/latest.json
+
   publish-release:
-    needs: [create-release, build]
-    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [prepare-release, build, verify-release-assets]
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    environment: release
 
     steps:
       - name: Publish release
         uses: actions/github-script@v7
         env:
-          RELEASE_ID: ${{ needs.create-release.outputs.release_id }}
+          RELEASE_ID: ${{ needs.prepare-release.outputs.release_id }}
         with:
           script: |
             await github.rest.repos.updateRelease({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              release_id: parseInt(process.env.RELEASE_ID),
+              release_id: Number(process.env.RELEASE_ID),
               draft: false,
             });
 
-  # ============================================================================
-  # Upload to Cloudflare R2 (for auto-update distribution)
-  # ============================================================================
   upload-to-r2:
-    needs: [build, publish-release]
-    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [prepare-release, publish-release]
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    environment: release
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Get version from tag
-        id: version
-        run: echo "version=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
 
-      - name: Download release assets
+      - name: Download published release assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           mkdir -p release-assets
-          cd release-assets
-
-          # Download all assets from the GitHub Release
-          gh release download "${{ steps.version.outputs.version }}" \
+          gh release download "${{ needs.prepare-release.outputs.tag_name }}" \
             --repo "${{ github.repository }}" \
-            --pattern "*" \
-            || echo "Some assets may not be available yet"
+            --dir release-assets \
+            --pattern "*"
 
-          echo "Downloaded assets:"
-          ls -la
-
-      - name: Rewrite latest.json URLs
+      - name: Read published release timestamp
+        id: release_meta
         env:
-          WORKER_URL: ${{ vars.CLOUDFLARE_WORKER_URL || 'https://grafyn-updater.grafyn-updater.workers.dev' }}
-          VERSION: ${{ steps.version.outputs.version }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
         run: |
-          if [ -f release-assets/latest.json ]; then
-            echo "Original latest.json:"
-            cat release-assets/latest.json
+          published_at=$(gh release view "${{ needs.prepare-release.outputs.tag_name }}" \
+            --repo "${{ github.repository }}" \
+            --json publishedAt \
+            --jq .publishedAt)
+          echo "published_at=$published_at" >> "$GITHUB_OUTPUT"
 
-            # Rewrite GitHub URLs to Worker download URLs
-            # Format 1: /releases/download/<tag>/<filename> (tag-specific URLs)
-            sed -i "s|https://github.com/[^/]*/[^/]*/releases/download/[^/]*/|${WORKER_URL}/download/${VERSION}/|g" release-assets/latest.json
-            # Format 2: /releases/latest/download/<filename> (latest-redirect URLs from tauri-action)
-            sed -i "s|https://github.com/[^/]*/[^/]*/releases/latest/download/|${WORKER_URL}/download/${VERSION}/|g" release-assets/latest.json
+      - name: Generate canonical updater manifest
+        shell: bash
+        env:
+          RELEASE_NOTES: ${{ needs.prepare-release.outputs.release_notes }}
+          WORKER_URL: ${{ vars.CLOUDFLARE_WORKER_URL || 'https://grafyn-updater.grafyn-updater.workers.dev' }}
+        run: |
+          notes_file="$RUNNER_TEMP/release-notes.txt"
+          printf '%s' "$RELEASE_NOTES" > "$notes_file"
 
-            echo ""
-            echo "Rewritten latest.json:"
-            cat release-assets/latest.json
+          node frontend/scripts/generate-updater-manifest.cjs \
+            --assets-dir release-assets \
+            --version "${{ needs.prepare-release.outputs.version }}" \
+            --worker-url "$WORKER_URL" \
+            --pub-date "${{ steps.release_meta.outputs.published_at }}" \
+            --notes-file "$notes_file" \
+            --out release-assets/latest.json
 
-            # Verify no GitHub download URLs leaked through
-            if grep -q 'github.com.*releases.*download' release-assets/latest.json; then
-              echo "ERROR: latest.json still contains GitHub download URLs after rewrite!"
-              echo "Unrewritten URLs:"
-              grep -o 'https://github.com[^"]*' release-assets/latest.json
-              exit 1
-            fi
-          else
-            echo "WARNING: latest.json not found in release assets"
-          fi
-
-      - name: Upload to R2
+      - name: Upload release assets to R2
+        shell: bash
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          VERSION: ${{ steps.version.outputs.version }}
+          VERSION: ${{ needs.prepare-release.outputs.tag_name }}
         run: |
           npm i -g wrangler@3
 
           upload_with_retry() {
-            local file="$1"
-            local key="$2"
+            local source_file="$1"
+            local bucket_key="$2"
             local content_type="${3:-}"
-            local max_attempts=3
             local attempt=1
+            local max_attempts=3
             local delay=5
 
-            while [ $attempt -le $max_attempts ]; do
-              echo "  Attempt $attempt/$max_attempts..."
-              local ct_flag=""
+            while [ "$attempt" -le "$max_attempts" ]; do
+              echo "Uploading ${bucket_key} (attempt ${attempt}/${max_attempts})"
               if [ -n "$content_type" ]; then
-                ct_flag="--content-type $content_type"
+                if wrangler r2 object put "$bucket_key" --file "$source_file" --content-type "$content_type"; then
+                  return 0
+                fi
+              else
+                if wrangler r2 object put "$bucket_key" --file "$source_file"; then
+                  return 0
+                fi
               fi
-              if wrangler r2 object put "$key" --file "$file" $ct_flag 2>&1; then
-                echo "  Upload complete."
-                return 0
+
+              if [ "$attempt" -eq "$max_attempts" ]; then
+                break
               fi
-              echo "  Failed. Retrying in ${delay}s..."
-              sleep $delay
+
+              sleep "$delay"
               delay=$((delay * 3))
               attempt=$((attempt + 1))
             done
-            echo "  ERROR: Failed after $max_attempts attempts"
+
+            echo "ERROR: failed to upload ${bucket_key}" >&2
             return 1
           }
 
-          # Upload latest.json first (if it exists)
-          if [ -f release-assets/latest.json ]; then
-            echo "Uploading latest.json..."
-            upload_with_retry release-assets/latest.json grafyn-releases/latest.json application/json
-          fi
+          upload_with_retry release-assets/latest.json "grafyn-releases/latest.json" application/json
+          upload_with_retry release-assets/latest.json "grafyn-releases/${VERSION}/latest.json" application/json
 
-          # Upload all other assets into versioned directory
           for file in release-assets/*; do
-            filename=$(basename "$file")
-            if [ "$filename" != "latest.json" ]; then
-              echo "Uploading $filename..."
-              upload_with_retry "$file" "grafyn-releases/$VERSION/$filename"
+            filename="$(basename "$file")"
+            if [ "$filename" = "latest.json" ]; then
+              continue
             fi
+
+            upload_with_retry "$file" "grafyn-releases/${VERSION}/${filename}"
           done
-          echo "Upload complete!"
 
-      - name: Verify R2 upload
+      - name: Verify updater endpoint
         env:
+          EXPECTED_VERSION: ${{ needs.prepare-release.outputs.version }}
           WORKER_URL: ${{ vars.CLOUDFLARE_WORKER_URL || 'https://grafyn-updater.grafyn-updater.workers.dev' }}
-          VERSION: ${{ steps.version.outputs.version }}
         run: |
-          EXPECTED_VERSION="${VERSION#v}"
+          sleep 5
+          node <<'NODE'
+          const fs = require('fs')
 
-          # Curl the actual Worker endpoint — the same URL Tauri's updater hits.
-          # This catches account-ID mismatches that wrangler read-back would miss
-          # (since wrangler would read from the same wrong bucket it uploaded to).
-          sleep 5  # allow R2 propagation
-          UPLOADED_VERSION=$(curl -sf "${WORKER_URL}/latest.json" | jq -r '.version')
+          async function main() {
+            const expectedManifest = JSON.parse(fs.readFileSync('release-assets/latest.json', 'utf8'))
+            const response = await fetch(`${process.env.WORKER_URL}/latest.json`)
 
-          if [ "$UPLOADED_VERSION" != "$EXPECTED_VERSION" ]; then
-            echo "::error::R2 latest.json version mismatch! Expected $EXPECTED_VERSION but Worker serves $UPLOADED_VERSION. The CLOUDFLARE_ACCOUNT_ID secret likely points to the wrong account."
-            exit 1
-          fi
-          echo "R2 verified: Worker serves latest.json version = $UPLOADED_VERSION"
+            if (!response.ok) {
+              throw new Error(`updater endpoint returned ${response.status}`)
+            }
 
-  # ============================================================================
-  # Summary
-  # ============================================================================
+            const actualManifest = await response.json()
+            if (actualManifest.version !== process.env.EXPECTED_VERSION) {
+              throw new Error(
+                `expected updater version ${process.env.EXPECTED_VERSION} but received ${actualManifest.version}`,
+              )
+            }
+
+            if (JSON.stringify(actualManifest) !== JSON.stringify(expectedManifest)) {
+              throw new Error('served latest.json does not match the generated manifest')
+            }
+
+            console.log(`Updater endpoint verified for version ${actualManifest.version}`)
+          }
+
+          main().catch((error) => {
+            console.error(error.message)
+            process.exit(1)
+          })
+          NODE
+
+  cleanup-draft:
+    needs: [prepare-release, build, verify-release-assets, publish-release]
+    if: always() && needs.prepare-release.result == 'success' && needs.prepare-release.outputs.created_new == 'true' && (needs.build.result != 'success' || needs.verify-release-assets.result != 'success')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    environment: release
+
+    steps:
+      - name: Delete failed draft release
+        uses: actions/github-script@v7
+        env:
+          RELEASE_ID: ${{ needs.prepare-release.outputs.release_id }}
+        with:
+          script: |
+            await github.rest.repos.deleteRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              release_id: Number(process.env.RELEASE_ID),
+            });
+
   build-summary:
-    needs: [create-release, build, publish-release, upload-to-r2]
+    needs: [prepare-release, build, verify-release-assets, publish-release, upload-to-r2, cleanup-draft]
     runs-on: ubuntu-latest
     if: always()
 
     steps:
-      - name: Build Summary
+      - name: Build summary
         run: |
-          echo "## Build Results" >> $GITHUB_STEP_SUMMARY
+          echo "## Release Results" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Platform | Architecture | Status |" >> $GITHUB_STEP_SUMMARY
-          echo "|----------|--------------|--------|" >> $GITHUB_STEP_SUMMARY
-          echo "| Windows | x64 | ${{ needs.build.result }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Windows | ARM64 | ${{ needs.build.result }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| macOS | ARM64 (Apple Silicon) | ${{ needs.build.result }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Linux | x64 | ${{ needs.build.result }} |" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Artifacts" >> $GITHUB_STEP_SUMMARY
-          echo "Download artifacts from the Actions tab or the Release page." >> $GITHUB_STEP_SUMMARY
+          echo "| Stage | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Prepare release | ${{ needs.prepare-release.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Build matrix | ${{ needs.build.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Verify release assets | ${{ needs.verify-release-assets.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Publish release | ${{ needs.publish-release.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Upload to R2 | ${{ needs.upload-to-r2.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Cleanup draft | ${{ needs.cleanup-draft.result }} |" >> $GITHUB_STEP_SUMMARY
