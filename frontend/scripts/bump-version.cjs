@@ -72,20 +72,5 @@ for (const file of files) {
   fs.writeFileSync(abs, updated, 'utf-8');
   console.log(`  ${file.rel}: ${old} -> ${version}`);
 }
-
-// Regenerate Cargo.lock so CI --locked builds don't fail
-const { execSync } = require('child_process');
-const cargoDir = path.join(root, 'src-tauri');
-try {
-  console.log('\n  Regenerating Cargo.lock...');
-  execSync('cargo generate-lockfile', { cwd: cargoDir, stdio: 'pipe' });
-  console.log('  src-tauri/Cargo.lock: regenerated');
-} catch (e) {
-  console.error('  Warning: failed to regenerate Cargo.lock:', e.message);
-  console.error('  Run "cd src-tauri && cargo generate-lockfile" manually before committing.');
-}
-
-console.log('\nDone! Next steps:');
-console.log(`  git add -A && git commit -m "chore: bump version to ${version}"`);
-console.log(`  git tag v${version}`);
-console.log(`  git push origin main --tags`);
+console.log('\nVersion files updated.');
+console.log(`Preferred release flow: npm run release:tag -- ${version}`);
