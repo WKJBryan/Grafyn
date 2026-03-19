@@ -72,7 +72,7 @@ log = "0.4"
 env_logger = "0.11"
 
 # System paths
-dirs = "5.0"
+dirs = "6.0"
 keyring = "2.3"
 
 # MCP server (optional — only needed for the grafyn-mcp binary)
