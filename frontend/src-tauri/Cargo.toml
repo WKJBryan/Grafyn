@@ -19,7 +19,7 @@ path = "src/mcp.rs"
 required-features = ["mcp"]
 
 [build-dependencies]
-tauri-build = { version = "1.5", features = [], optional = true }
+tauri-build = { version = "2.2", features = [], optional = true }
 
 [dependencies]
 # Tauri core (optional — only needed for the desktop app binary)
