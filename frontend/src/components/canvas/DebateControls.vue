@@ -164,11 +164,6 @@ function handleAutoRound() {
   justify-content: flex-end;
 }
 
-.btn-sm {
-  padding: 4px 10px;
-  font-size: 0.75rem;
-}
-
 .btn-ghost {
   background: transparent;
   color: var(--text-muted);

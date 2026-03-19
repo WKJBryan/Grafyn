@@ -473,10 +473,6 @@ function formatDate(dateStr) {
   margin-bottom: var(--spacing-lg);
 }
 
-.btn-lg {
-  padding: var(--spacing-sm) var(--spacing-lg);
-  font-size: 1rem;
-}
 
 /* Dialog styles */
 .dialog-overlay {
@@ -571,8 +567,4 @@ function formatDate(dateStr) {
   border-top: 1px solid var(--border-subtle);
 }
 
-.btn-sm {
-  padding: 4px 10px;
-  font-size: 0.75rem;
-}
 </style>
