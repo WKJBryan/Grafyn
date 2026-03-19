@@ -18,6 +18,9 @@
     "tauri:dev": "node scripts/run-tauri.cjs dev",
     "tauri:build": "node scripts/run-tauri.cjs build",
     "version:bump": "node scripts/bump-version.cjs",
+    "release:verify": "node scripts/release-verify.cjs",
+    "release:prepare": "node scripts/release-tag.cjs --prepare-only",
+    "release:tag": "node scripts/release-tag.cjs",
     "generate-icons": "node scripts/generate-icons.cjs && npx tauri icon src-tauri/icons/app-icon.png"
   },
   "dependencies": {
