@@ -36,7 +36,7 @@ npm run tauri:build      # Production build → src-tauri/target/release/bundle/
 
 Environment: `set OPENROUTER_API_KEY=your-key` (Windows) or `export OPENROUTER_API_KEY=your-key`
 
-**Version bump:** `npm run version:bump -- X.Y.Z` updates `package.json`, `tauri.conf.json` (version + window title), and `Cargo.toml` in one step.
+**Release prep:** Use `npm run release:prepare -- X.Y.Z` on a release branch (bumps versions, regenerates Cargo.lock, validates, commits). After merging to main, use `npm run release:tag -- X.Y.Z` to create the annotated tag. See `WORKING_GUIDE.md` for the full release process.
 
 ### Testing
 
@@ -254,32 +254,47 @@ The Grafyn Settings UI shows this config snippet with the correct paths pre-fill
 
 | Job | Purpose |
 |-----|---------|
-| `rust-tests` | `cargo test` with Swatinem/rust-cache |
+| `release-preflight` | Validates version alignment + Cargo.lock against all 4 release targets |
+| `rust-tests` | `cargo test` on ubuntu-22.04 with Swatinem/rust-cache |
 | `frontend-tests` | `npm run test:run` (Vitest) |
-| `lint` | `npm run lint` + `cargo clippy` |
-| `security` | `npm audit` |
+| `lint` | `npm run lint` + `cargo clippy -D warnings` |
+| `security` | `npm audit --audit-level=high` |
 | `build` | `npm run build` (Vite production build) |
 | `test-summary` | Aggregates job results into GitHub Actions summary |
 
 ### Release Pipeline
 
-`.github/workflows/release.yml` — triggered by `v*` tags and `workflow_dispatch`.
+`.github/workflows/release.yml` — triggered by `v*` tags. Also supports `workflow_dispatch` with `dry_run` for debugging builds without publishing.
 
 ```
-create-release → build (4-job matrix) → publish-release → upload-to-r2 → build-summary
+prepare-release → build (4-job matrix) → verify-release-assets → publish-release → upload-to-r2 → cleanup-draft → build-summary
 ```
 
 | Job | Purpose |
 |-----|---------|
-| `create-release` | Creates a single **draft** GitHub release (avoids matrix race condition) |
-| `build` | 4-platform matrix: builds MCP binary first, then `tauri-action` (with `releaseId`) bundles it |
-| `publish-release` | Marks draft → published after all builds upload artifacts |
-| `upload-to-r2` | Downloads release assets, rewrites `latest.json` URLs, uploads to Cloudflare R2 |
+| `prepare-release` | Creates/reuses draft release, validates tag matches manifests, generates release notes |
+| `build` | 4-platform matrix: builds MCP binary + `tauri-action` (with `releaseId`) |
+| `verify-release-assets` | Downloads draft assets, regenerates `latest.json`, validates completeness |
+| `publish-release` | Marks draft → published after all builds + verification pass |
+| `upload-to-r2` | Downloads release assets, generates final `latest.json`, uploads to Cloudflare R2 with retry, verifies updater endpoint |
+| `cleanup-draft` | Deletes failed draft releases (only if workflow created a new draft and build/verify failed) |
 | `build-summary` | Writes build status table to GitHub Actions summary |
 
 **Required secrets:** `TAURI_PRIVATE_KEY`, `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`, `FEEDBACK_REPO`, `FEEDBACK_TOKEN`
 
 **Required vars:** `CLOUDFLARE_WORKER_URL` (optional, has default)
+
+### Release Smoke Tests
+
+`.github/workflows/release-smoke.yml` — runs on PRs and pushes to main. Builds Windows (x64 + ARM64) and Linux targets without signing to catch release-only build failures early. macOS is excluded from smoke (10x billing multiplier) and only built at actual release time by `release.yml`.
+
+### Weekly Dependency Check
+
+`.github/workflows/latest-deps.yml` — runs Mondays 4am UTC + manual trigger. Tests `cargo update` + full build + tests with both pinned Rust 1.93.1 and stable toolchains to detect breaking dependency changes early. Uses `continue-on-error` so failures are informational.
+
+### Dependabot
+
+`.github/dependabot.yml` — weekly auto-update PRs for Cargo, npm, and GitHub Actions dependencies.
 
 ## CI Pitfalls (Known Issues & Fixes)
 
@@ -308,6 +323,10 @@ Tauri v1 depends on `libwebkit2gtk-4.0-dev` which **does not exist on Ubuntu 24.
 
 `Cargo.lock` is committed (not gitignored) to ensure reproducible CI builds. Without it, CI resolves fresh dependency versions that may break — e.g., `webkit2gtk` updates that are incompatible with `wry` 0.24.x.
 
+### Cargo.lock Must Be Regenerated After Version Bumps
+
+When `Cargo.toml` version changes, `Cargo.lock` must be regenerated with `cargo generate-lockfile` (not just `cargo update -p grafyn`). The lockfile must satisfy `--locked` for all 4 release targets (Windows x64/ARM64, macOS ARM64, Linux x64) and both feature sets (default features for desktop app, `--no-default-features --features mcp` for MCP binary). The `npm run release:prepare` script handles this automatically.
+
 ### Tauri Features Must Include `process-all` and `protocol-all`
 
 Removing `process-all` or `protocol-all` from the Tauri features in `Cargo.toml` changes the `wry`/`webkit2gtk` feature graph and breaks the Linux build. The `wry` crate's webkitgtk code depends on `SettingsExt` trait methods that are only in scope when these features are enabled.
@@ -315,6 +334,33 @@ Removing `process-all` or `protocol-all` from the Tauri features in `Cargo.toml`
 ### ESLint `_` Prefix Convention
 
 The project's `.eslintrc.cjs` uses `argsIgnorePattern: '^_'` / `varsIgnorePattern: '^_'` / `destructuredArrayIgnorePattern: '^_'` for the `no-unused-vars` rule. Prefix intentionally unused variables with `_` to suppress lint errors.
+
+## Release Rules
+
+### Two-Phase Release Flow
+
+Releases use a prepare → merge → tag workflow. Never push a tag before the version bump PR is merged to main.
+
+1. `npm run release:prepare -- X.Y.Z` on a release branch (bumps versions, regenerates Cargo.lock, validates, commits)
+2. Push the branch, open a PR, let CI pass, merge
+3. `npm run release:tag -- X.Y.Z` on clean main (verifies, creates annotated tag)
+4. `git push origin vX.Y.Z` triggers the release workflow
+
+### Release Scripts
+
+From `frontend/`:
+- `npm run release:verify` — validates version alignment + Cargo.lock against all release targets
+- `npm run release:prepare -- X.Y.Z` — version bump + lockfile regen + validation + commit (use on release branch)
+- `npm run release:tag -- X.Y.Z` — final tag creation (use on clean main after PR merge)
+
+### Release Invariants
+
+- Never hand-edit version numbers for releases — use the release scripts
+- Never reuse a release version/tag
+- Never push directly to main — all changes go through PRs
+- `Cargo.lock` must be regenerated with `cargo generate-lockfile` after any `Cargo.toml` version change
+- The updater manifest (`latest.json`) is generated by `scripts/generate-updater-manifest.cjs`, not by Tauri's built-in generator
+- See `WORKING_GUIDE.md` for the complete release workflow and troubleshooting
 
 ## Deployment
 

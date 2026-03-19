@@ -4,6 +4,13 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run — build all platforms but skip publish and R2 upload'
+        required: false
+        type: boolean
+        default: true
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -57,6 +64,7 @@ jobs:
         run: echo "version=$(node -p \"require('./package.json').version\")" >> "$GITHUB_OUTPUT"
 
       - name: Verify tag matches manifests
+        if: ${{ !inputs.dry_run }}
         shell: bash
         run: |
           expected_tag="v${{ steps.version.outputs.version }}"
@@ -66,6 +74,7 @@ jobs:
           fi
 
       - name: Generate release notes
+        if: ${{ !inputs.dry_run }}
         id: notes
         uses: actions/github-script@v7
         env:
@@ -189,6 +198,7 @@ jobs:
             core.setOutput('changelog', changelog);
 
       - name: Ensure reusable draft release
+        if: ${{ !inputs.dry_run }}
         id: ensure_release
         uses: actions/github-script@v7
         env:
@@ -394,15 +404,16 @@ jobs:
           projectPath: frontend
           tauriScript: npx tauri
           args: --target ${{ matrix.target }} -- --locked
-          releaseId: ${{ needs.prepare-release.outputs.release_id }}
-          tagName: ${{ needs.prepare-release.outputs.tag_name }}
+          releaseId: ${{ needs.prepare-release.outputs.release_id || '' }}
+          tagName: ${{ needs.prepare-release.outputs.tag_name || '' }}
           releaseDraft: true
-          releaseBody: ${{ needs.prepare-release.outputs.release_notes }}
+          releaseBody: ${{ needs.prepare-release.outputs.release_notes || '' }}
           uploadUpdaterJson: false
           updaterJsonPreferNsis: true
 
   verify-release-assets:
     needs: [prepare-release, build]
+    if: ${{ !inputs.dry_run }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -444,6 +455,7 @@ jobs:
 
   publish-release:
     needs: [prepare-release, build, verify-release-assets]
+    if: ${{ !inputs.dry_run }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -465,6 +477,7 @@ jobs:
 
   upload-to-r2:
     needs: [prepare-release, publish-release]
+    if: ${{ !inputs.dry_run }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -610,7 +623,7 @@ jobs:
 
   cleanup-draft:
     needs: [prepare-release, build, verify-release-assets, publish-release]
-    if: always() && needs.prepare-release.result == 'success' && needs.prepare-release.outputs.created_new == 'true' && (needs.build.result != 'success' || needs.verify-release-assets.result != 'success')
+    if: always() && !inputs.dry_run && needs.prepare-release.result == 'success' && needs.prepare-release.outputs.created_new == 'true' && (needs.build.result != 'success' || needs.verify-release-assets.result != 'success')
     runs-on: ubuntu-latest
     permissions:
       contents: write
