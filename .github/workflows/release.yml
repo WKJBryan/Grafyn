@@ -413,6 +413,26 @@ jobs:
           uploadUpdaterJson: false
           updaterJsonPreferNsis: true
 
+      - name: Collect release artifacts
+        shell: bash
+        run: |
+          mkdir -p collected-assets
+          BUNDLE_DIR="frontend/src-tauri/target/${{ matrix.target }}/release/bundle"
+          find "$BUNDLE_DIR" -type f \( \
+            -name "*.exe" -o -name "*.dmg" -o -name "*.deb" \
+            -o -name "*.AppImage" -o -name "*.tar.gz" \
+            -o -name "*.sig" -o -name "*.zip" \
+          \) -exec cp {} collected-assets/ \;
+          echo "Collected artifacts:"
+          ls -la collected-assets/
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets-${{ matrix.os_name }}-${{ matrix.arch }}
+          path: collected-assets/
+          retention-days: 1
+
   verify-release-assets:
     needs: [prepare-release, build]
     if: ${{ !inputs.dry_run }}
@@ -429,15 +449,12 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Download draft release assets
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          mkdir -p release-assets
-          gh release download "${{ needs.prepare-release.outputs.tag_name }}" \
-            --repo "${{ github.repository }}" \
-            --dir release-assets \
-            --pattern "*"
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          pattern: release-assets-*
+          merge-multiple: true
 
       - name: Validate updater payload completeness
         shell: bash
@@ -478,7 +495,7 @@ jobs:
             });
 
   upload-to-r2:
-    needs: [prepare-release, publish-release]
+    needs: [prepare-release, build, publish-release]
     if: ${{ !inputs.dry_run }}
     runs-on: ubuntu-latest
     permissions:
@@ -493,15 +510,12 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Download published release assets
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          mkdir -p release-assets
-          gh release download "${{ needs.prepare-release.outputs.tag_name }}" \
-            --repo "${{ github.repository }}" \
-            --dir release-assets \
-            --pattern "*"
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          pattern: release-assets-*
+          merge-multiple: true
 
       - name: Read published release timestamp
         id: release_meta
