@@ -88,7 +88,7 @@
       }
     },
     "security": {
-      "csp": null
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' https: data:; connect-src 'self' https://openrouter.ai https://grafyn-updater.grafyn-updater.workers.dev"
     },
     "updater": {
       "active": true,

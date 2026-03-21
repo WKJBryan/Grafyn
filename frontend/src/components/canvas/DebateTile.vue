@@ -156,7 +156,7 @@
 
 <script setup>
 import { ref, computed, onBeforeUnmount } from 'vue'
-import { marked } from 'marked'
+import { renderMarkdown } from '@/utils/markdown'
 import GIcon from '@/components/ui/GIcon.vue'
 import DebateControls from './DebateControls.vue'
 
@@ -200,8 +200,7 @@ const lastRoundSummary = computed(() => {
   const firstResponse = responses[modelIds[0]]
   if (!firstResponse || typeof firstResponse !== 'string') return null
 
-  marked.setOptions({ breaks: true, gfm: true })
-  return marked(firstResponse)
+  return renderMarkdown(firstResponse)
 })
 
 // Helper to normalize round data structure
@@ -229,10 +228,9 @@ function getModelName(modelId) {
 
 function renderContent(content) {
   if (!content) return ''
-  marked.setOptions({ breaks: true, gfm: true })
   // Truncate for display in tiles
   const truncated = content.length > 500 ? content.slice(0, 500) + '...' : content
-  return marked(truncated)
+  return renderMarkdown(truncated)
 }
 
 function handleContinue(prompt) {

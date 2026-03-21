@@ -76,7 +76,7 @@
 
 <script setup>
 import { computed, ref, watch, nextTick } from 'vue'
-import { marked } from 'marked'
+import { renderMarkdown } from '@/utils/markdown'
 import GIcon from '@/components/ui/GIcon.vue'
 
 const props = defineProps({
@@ -102,12 +102,7 @@ const statusClass = computed(() => ({
 
 const renderedContent = computed(() => {
   if (!props.response.content) return ''
-  // Configure marked for safe rendering
-  marked.setOptions({
-    breaks: true,
-    gfm: true
-  })
-  return marked(props.response.content)
+  return renderMarkdown(props.response.content)
 })
 
 // Auto-scroll during streaming

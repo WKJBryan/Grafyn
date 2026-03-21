@@ -183,7 +183,7 @@
 
 <script setup>
 import { ref, computed, onBeforeUnmount } from 'vue'
-import { marked } from 'marked'
+import { renderMarkdown } from '@/utils/markdown'
 import GIcon from '@/components/ui/GIcon.vue'
 
 const MIN_WIDTH = 280
@@ -273,10 +273,9 @@ const lastRoundSummary = computed(() => {
   const firstResponse = responses[modelIds[0]]
   if (!firstResponse) return null
 
-  marked.setOptions({ breaks: true, gfm: true })
   // Show full content (scrollable in UI)
   if (typeof firstResponse !== 'string') return null
-  return marked(firstResponse)
+  return renderMarkdown(firstResponse)
 })
 
 // Methods
@@ -316,8 +315,7 @@ function renderContent(content) {
   if (typeof content !== 'string') {
     content = JSON.stringify(content)
   }
-  marked.setOptions({ breaks: true, gfm: true })
-  return marked(content)  // Full content, no truncation
+  return renderMarkdown(content)
 }
 
 function handleMouseDown(e) {

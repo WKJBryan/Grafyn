@@ -69,6 +69,7 @@ impl CanvasStore {
 
     /// Get a full session by ID (from cache, falls back to disk)
     pub fn get_session(&mut self, id: &str) -> Result<CanvasSession> {
+        Self::validate_session_id(id)?;
         if let Some(session) = self.session_cache.get(id) {
             return Ok(session.clone());
         }
@@ -146,6 +147,7 @@ impl CanvasStore {
 
     /// Delete a session
     pub fn delete_session(&mut self, id: &str) -> Result<()> {
+        Self::validate_session_id(id)?;
         let path = self.session_path(id);
         std::fs::remove_file(&path).with_context(|| format!("Failed to delete session: {}", id))?;
         self.session_cache.remove(id);
@@ -389,6 +391,14 @@ impl CanvasStore {
     pub fn save_session(&mut self, session: &CanvasSession) -> Result<()> {
         self.session_cache.insert(session.id.clone(), session.clone());
         self.write_session_file(session)
+    }
+
+    /// Validate that a session ID doesn't contain path traversal sequences
+    fn validate_session_id(id: &str) -> Result<()> {
+        if id.is_empty() || id.contains('/') || id.contains('\\') || id.contains("..") {
+            anyhow::bail!("Invalid session ID: {}", id);
+        }
+        Ok(())
     }
 
     /// Get the file path for a session ID

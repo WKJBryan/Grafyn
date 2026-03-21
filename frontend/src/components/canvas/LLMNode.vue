@@ -373,7 +373,7 @@
 
 <script setup>
 import { ref, computed, onBeforeUnmount, watch, nextTick } from 'vue'
-import { marked } from 'marked'
+import { renderMarkdown } from '@/utils/markdown'
 import GIcon from '@/components/ui/GIcon.vue'
 
 const MIN_WIDTH = 280
@@ -460,8 +460,7 @@ const headerStyle = computed(() => ({
 
 const renderedContent = computed(() => {
   if (!props.response.content || props.isStreaming) return ''
-  marked.setOptions({ breaks: true, gfm: true })
-  return marked(props.response.content)
+  return renderMarkdown(props.response.content)
 })
 
 // Watch for branch input focus

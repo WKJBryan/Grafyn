@@ -142,6 +142,7 @@
 <script setup>
 import { ref, computed, watch } from 'vue'
 import { marked } from 'marked'
+import DOMPurify from 'dompurify'
 import { notes, zettelkasten } from '@/api/client'
 import { useToast } from '@/composables/useToast'
 import LinkCandidateModal from './LinkCandidateModal.vue'
@@ -183,9 +184,14 @@ watch(() => props.note, (newNote) => {
   isDirty.value = false
 }, { deep: true })
 
+// HTML-escape helper for safe attribute interpolation
+function escapeHtml(str) {
+  return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;')
+}
+
 const renderedContent = computed(() => {
   if (!localNote.value.content) return ''
-  
+
   // Configure marked to add IDs to headings for On This Page navigation
   marked.use({
     renderer: {
@@ -195,34 +201,39 @@ const renderedContent = computed(() => {
       }
     }
   })
-  
+
   let html = marked(localNote.value.content)
-  
+
   // Render embed syntax ![[Note]] - these become embedded content placeholders
   html = html.replace(
     /!\[\[([^\]|#]+)(?:#([^\]|]+))?(?:\|([^\]]+))?\]\]/g,
-    (match, target, anchor, display) => {
-      const anchorAttr = anchor ? ` data-anchor="${anchor}"` : ''
-      return `<div class="embed-placeholder" data-target="${target}"${anchorAttr}>
+    (_match, target, anchor, display) => {
+      const safeTarget = escapeHtml(target)
+      const safeAnchor = anchor ? escapeHtml(anchor) : ''
+      const anchorAttr = anchor ? ` data-anchor="${safeAnchor}"` : ''
+      const displayText = escapeHtml(display || target)
+      return `<div class="embed-placeholder" data-target="${safeTarget}"${anchorAttr}>
         <span class="embed-icon">📄</span>
-        <span class="embed-title">${display || target}${anchor ? '#' + anchor : ''}</span>
+        <span class="embed-title">${displayText}${anchor ? '#' + safeAnchor : ''}</span>
         <span class="embed-hint">Click to view embedded content</span>
       </div>`
     }
   )
-  
+
   // Render wikilinks with optional heading anchors
   // [[Note#Heading]] or [[Note#^block-id]] or [[Note|Display]]
   html = html.replace(
     /\[\[([^\]|#]+)(?:#([^\]|]+))?(?:\|([^\]]+))?\]\]/g,
-    (match, target, anchor, display) => {
-      const text = display || (anchor ? `${target}#${anchor}` : target)
-      const anchorAttr = anchor ? ` data-anchor="${anchor}"` : ''
-      return `<span class="wikilink" data-target="${target}"${anchorAttr}>${text}</span>`
+    (_match, target, anchor, display) => {
+      const safeTarget = escapeHtml(target)
+      const safeAnchor = anchor ? escapeHtml(anchor) : ''
+      const text = escapeHtml(display || (anchor ? `${target}#${anchor}` : target))
+      const anchorAttr = anchor ? ` data-anchor="${safeAnchor}"` : ''
+      return `<span class="wikilink" data-target="${safeTarget}"${anchorAttr}>${text}</span>`
     }
   )
-  
-  return html
+
+  return DOMPurify.sanitize(html)
 })
 
 function handleDirty() {

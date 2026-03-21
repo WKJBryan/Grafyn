@@ -74,6 +74,7 @@ impl KnowledgeStore {
 
     /// Get a full note by ID
     pub fn get_note(&self, id: &str) -> Result<Note> {
+        Self::validate_note_id(id)?;
         let path = self.note_path(id);
         self.read_note_file(&path)
             .with_context(|| format!("Note not found: {}", id))
@@ -110,6 +111,7 @@ impl KnowledgeStore {
 
     /// Update an existing note
     pub fn update_note(&mut self, id: &str, update: NoteUpdate) -> Result<Note> {
+        Self::validate_note_id(id)?;
         let mut note = self.get_note(id)?;
 
         if let Some(title) = update.title {
@@ -149,6 +151,7 @@ impl KnowledgeStore {
 
     /// Delete a note
     pub fn delete_note(&mut self, id: &str) -> Result<()> {
+        Self::validate_note_id(id)?;
         let path = self.note_path(id);
         std::fs::remove_file(&path).with_context(|| format!("Failed to delete note: {}", id))?;
 
@@ -193,6 +196,18 @@ impl KnowledgeStore {
             counter += 1;
         }
         id
+    }
+
+    /// Validate that a note ID doesn't contain path traversal sequences
+    fn validate_note_id(id: &str) -> Result<()> {
+        if id.is_empty()
+            || id.contains('/')
+            || id.contains('\\')
+            || id.contains("..")
+        {
+            anyhow::bail!("Invalid note ID: {}", id);
+        }
+        Ok(())
     }
 
     /// Get the file path for a note ID
