@@ -1,4 +1,7 @@
-//! Feedback service for submitting bug reports and feature requests to GitHub
+//! Feedback service for submitting bug reports and feature requests via Cloudflare Worker proxy.
+//!
+//! The worker holds the GitHub token server-side. The desktop app sends feedback
+//! to the worker with an anti-abuse key, and the worker creates the GitHub issue.
 
 use crate::models::feedback::{
     FeedbackCreate, FeedbackResponse, FeedbackStatus, FeedbackType, PendingFeedback, SystemInfo,
@@ -8,51 +11,36 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-const GITHUB_API_URL: &str = "https://api.github.com";
+/// Worker base URL for the Grafyn updater/feedback proxy.
+const WORKER_URL: &str = "https://grafyn-updater.grafyn-updater.workers.dev";
 
-/// Service for handling feedback submission to GitHub Issues
+/// Anti-abuse key sent via X-Feedback-Key header.
+/// This is NOT a secret — it only prevents casual abuse of the feedback endpoint.
+/// The worst case if extracted is spam issues on a public repo.
+const FEEDBACK_KEY: &str = "gfyn-fb-a7x9k2m4";
+
+/// Service for handling feedback submission via Cloudflare Worker proxy
 #[derive(Debug, Clone)]
 pub struct FeedbackService {
     client: Client,
     store_path: PathBuf,
-    repo: String,
-    token: String,
 }
 
 impl FeedbackService {
-    /// Create a new feedback service using runtime environment variables.
+    /// Create a new feedback service. No environment variables needed.
     pub fn new(store_path: PathBuf) -> Self {
         // Create the pending feedback directory
         std::fs::create_dir_all(&store_path).ok();
 
-        // Load configuration from environment
-        let repo = std::env::var("GITHUB_FEEDBACK_REPO").unwrap_or_default();
-        let token = std::env::var("GITHUB_FEEDBACK_TOKEN").unwrap_or_default();
-
         Self {
             client: Client::new(),
             store_path,
-            repo,
-            token,
         }
-    }
-
-    /// Check if the service is properly configured
-    pub fn is_configured(&self) -> bool {
-        !self.repo.is_empty() && !self.token.is_empty()
     }
 
     /// Get the current status of the feedback service
     pub fn get_status(&self) -> FeedbackStatus {
         let pending = self.get_pending().unwrap_or_default();
-
-        if !self.is_configured() {
-            return FeedbackStatus {
-                configured: false,
-                pending_count: pending.len(),
-                message: "Feedback submission is unavailable. Runtime env vars GITHUB_FEEDBACK_REPO and GITHUB_FEEDBACK_TOKEN are not configured.".to_string(),
-            };
-        }
 
         FeedbackStatus {
             configured: true,
@@ -81,7 +69,7 @@ impl FeedbackService {
         }
     }
 
-    /// Submit feedback - creates GitHub issue or queues if offline
+    /// Submit feedback - sends to worker proxy or queues if offline
     pub async fn submit(&self, mut feedback: FeedbackCreate) -> Result<FeedbackResponse> {
         // Validate input
         feedback.validate().map_err(|e| anyhow::anyhow!(e))?;
@@ -91,21 +79,14 @@ impl FeedbackService {
             feedback.system_info = Some(self.get_system_info(None));
         }
 
-        // Check configuration
-        if !self.is_configured() {
-            return Ok(FeedbackResponse::error(
-                "Feedback submission is unavailable. Missing runtime GITHUB_FEEDBACK_REPO and GITHUB_FEEDBACK_TOKEN configuration.",
-            ));
-        }
-
         // Check connectivity
         if !self.is_online().await {
             self.queue_feedback(feedback)?;
             return Ok(FeedbackResponse::queued());
         }
 
-        // Submit to GitHub
-        match self.submit_to_github(&feedback).await {
+        // Submit to worker
+        match self.submit_to_worker(&feedback).await {
             Ok(response) => Ok(response),
             Err(e) => {
                 // Queue on failure
@@ -116,25 +97,18 @@ impl FeedbackService {
         }
     }
 
-    /// Check if we can reach GitHub API
+    /// Check if we can reach the worker
     async fn is_online(&self) -> bool {
         self.client
-            .head(format!("{}/rate_limit", GITHUB_API_URL))
-            .header("Authorization", format!("Bearer {}", self.token))
-            .header("User-Agent", "Grafyn-Desktop")
+            .get(WORKER_URL)
             .send()
             .await
             .map(|r| r.status().is_success())
             .unwrap_or(false)
     }
 
-    /// Submit feedback directly to GitHub Issues API
-    async fn submit_to_github(&self, feedback: &FeedbackCreate) -> Result<FeedbackResponse> {
-        let (owner, repo) = self
-            .repo
-            .split_once('/')
-            .context("Invalid repo format, expected 'owner/repo'")?;
-
+    /// Submit feedback to the Cloudflare Worker proxy
+    async fn submit_to_worker(&self, feedback: &FeedbackCreate) -> Result<FeedbackResponse> {
         // Build issue body
         let body = self.format_issue_body(feedback);
 
@@ -145,7 +119,7 @@ impl FeedbackService {
             FeedbackType::General => vec!["feedback", "user-feedback"],
         };
 
-        let request_body = GitHubIssueCreate {
+        let request_body = WorkerFeedbackRequest {
             title: feedback.title.clone(),
             body,
             labels,
@@ -153,25 +127,22 @@ impl FeedbackService {
 
         let response = self
             .client
-            .post(format!("{}/repos/{}/{}/issues", GITHUB_API_URL, owner, repo))
-            .header("Authorization", format!("Bearer {}", self.token))
-            .header("User-Agent", "Grafyn-Desktop")
-            .header("Accept", "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", "2022-11-28")
+            .post(format!("{}/feedback", WORKER_URL))
+            .header("X-Feedback-Key", FEEDBACK_KEY)
             .json(&request_body)
             .send()
             .await
-            .context("Failed to send request to GitHub")?;
+            .context("Failed to send request to feedback proxy")?;
 
         if !response.status().is_success() {
             let error_text = response.text().await.unwrap_or_default();
-            return Err(anyhow::anyhow!("GitHub API error: {}", error_text));
+            return Err(anyhow::anyhow!("Feedback proxy error: {}", error_text));
         }
 
-        let issue: GitHubIssueResponse = response
+        let issue: WorkerFeedbackResponse = response
             .json()
             .await
-            .context("Failed to parse GitHub response")?;
+            .context("Failed to parse feedback proxy response")?;
 
         Ok(FeedbackResponse::success(issue.number, issue.html_url))
     }
@@ -254,10 +225,6 @@ impl FeedbackService {
 
     /// Retry submitting pending feedback items
     pub async fn retry_pending(&self) -> Result<Vec<FeedbackResponse>> {
-        if !self.is_configured() {
-            return Ok(vec![]);
-        }
-
         if !self.is_online().await {
             return Ok(vec![]);
         }
@@ -266,7 +233,7 @@ impl FeedbackService {
         let mut results = Vec::new();
 
         for mut item in pending {
-            match self.submit_to_github(&item.feedback).await {
+            match self.submit_to_worker(&item.feedback).await {
                 Ok(response) => {
                     // Remove from queue on success
                     let file_path = self.store_path.join(format!("{}.json", item.id));
@@ -300,6 +267,10 @@ impl FeedbackService {
 
     /// Clear a specific pending feedback item
     pub fn clear_pending(&self, id: &str) -> Result<()> {
+        // Validate ID to prevent path traversal
+        if id.is_empty() || id.contains('/') || id.contains('\\') || id.contains("..") {
+            anyhow::bail!("Invalid feedback ID: {}", id);
+        }
         let file_path = self.store_path.join(format!("{}.json", id));
         if file_path.exists() {
             std::fs::remove_file(&file_path).context("Failed to remove pending feedback file")?;
@@ -308,17 +279,17 @@ impl FeedbackService {
     }
 }
 
-// GitHub API types
+// Worker proxy request/response types
 
 #[derive(Debug, Serialize)]
-struct GitHubIssueCreate {
+struct WorkerFeedbackRequest {
     title: String,
     body: String,
     labels: Vec<&'static str>,
 }
 
 #[derive(Debug, Deserialize)]
-struct GitHubIssueResponse {
+struct WorkerFeedbackResponse {
     number: u64,
     html_url: String,
 }

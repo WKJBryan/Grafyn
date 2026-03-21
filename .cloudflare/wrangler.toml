@@ -6,3 +6,7 @@ compatibility_date = "2024-12-01"
 [[r2_buckets]]
 binding = "RELEASES"
 bucket_name = "grafyn-releases"
+
+# Feedback proxy config (secrets set via `wrangler secret put`)
+[vars]
+FEEDBACK_REPO = "WKJBryan/Grafyn"
