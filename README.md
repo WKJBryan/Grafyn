@@ -1,141 +1,99 @@
-# Grafyn
+<p align="center">
+  <img src="frontend/src-tauri/icons/icon.png" alt="Grafyn" width="128" height="128">
+</p>
 
-A desktop knowledge graph platform with full-text search, Obsidian-style linking, Multi-LLM Canvas, and MCP (Model Context Protocol) integration for Claude Desktop.
+<h1 align="center">Grafyn</h1>
+
+<p align="center">
+  A desktop knowledge graph with full-text search, multi-LLM canvas, and MCP integration.
+  <br>
+  <strong>Windows</strong> &middot; <strong>macOS</strong> &middot; <strong>Linux</strong>
+</p>
+
+<p align="center">
+  <a href="https://github.com/WKJBryan/Grafyn/releases/latest"><img src="https://img.shields.io/github/v/release/WKJBryan/Grafyn?style=flat-square&color=blue" alt="Release"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL--3.0-green?style=flat-square" alt="License: GPL-3.0"></a>
+  <a href="https://github.com/WKJBryan/Grafyn/actions/workflows/test.yml"><img src="https://img.shields.io/github/actions/workflow/status/WKJBryan/Grafyn/test.yml?branch=main&style=flat-square&label=tests" alt="Tests"></a>
+  <a href="https://github.com/WKJBryan/Grafyn/releases"><img src="https://img.shields.io/github/downloads/WKJBryan/Grafyn/total?style=flat-square&color=orange" alt="Downloads"></a>
+</p>
+
+<p align="center">
+  <a href="https://github.com/WKJBryan/Grafyn/releases/latest">Download</a> &middot;
+  <a href="#features">Features</a> &middot;
+  <a href="#quick-start">Quick Start</a> &middot;
+  <a href="#mcp-integration">MCP for Claude</a>
+</p>
+
+---
 
 ## Features
 
-### Core Knowledge Management
-- **Obsidian-compatible notes** — Markdown files with YAML frontmatter and `[[wikilinks]]`
-- **Full-text search** — Tantivy BM25 keyword search with graph-aware similarity ranking
-- **Backlinks & graph** — Automatic bidirectional link tracking with force-directed visualization
-- **Note workflows** — Draft → Evidence → Canonical status progression
+### Knowledge Management
+- **Markdown notes** with `[[wikilinks]]` and YAML frontmatter (Obsidian-compatible)
+- **Full-text search** powered by Tantivy with graph-aware ranking
+- **Backlink graph** with force-directed D3.js visualization
+- **Note workflows** — Draft, Evidence, Canonical status progression
 
 ### Multi-LLM Canvas
-- **Compare AI models** — Send one prompt to multiple models simultaneously
-- **Real-time streaming** — Parallel response streaming from 100+ models via OpenRouter
-- **Semantic note context** — Automatically retrieves relevant notes as LLM context
-- **Infinite canvas** — D3.js-powered zoom/pan interface with draggable tiles
-- **Debate mode** — Models critique and respond to each other
-- **Export to notes** — Convert canvas sessions to knowledge base notes
+- **Compare models side-by-side** — send one prompt to GPT-4, Claude, Gemini, and 100+ others simultaneously
+- **Real-time streaming** — parallel responses via OpenRouter
+- **Semantic note context** — automatically retrieves relevant notes as LLM context
+- **Debate mode** — models critique and build on each other's responses
+- **Infinite canvas** — drag, zoom, and pan with D3.js
+- **Smart web search** — auto-detects queries that benefit from live web results
 
-### AI Integration
-- **MCP Server** — Native Rust binary for Claude Desktop integration (stdio transport)
-- **Conversation Import** — Import chat history from ChatGPT, Claude, Grok, and Gemini
-- **Distillation** — Transform container notes into atomic notes and topic hubs (configurable LLM model)
-- **Link Discovery** — AI-powered suggestions for connecting related notes (Zettelkasten)
+### AI-Powered Tools
+- **Distillation** — split large notes into atomic notes and topic hubs using LLM or rules-based extraction
+- **Link Discovery** — AI suggests connections between notes (Zettelkasten-style)
+- **Conversation Import** — bring in chat history from ChatGPT, Claude, Grok, and Gemini
 
-### Feedback & Bug Reporting
-- **In-app feedback** — Submit bug reports, feature requests, and general feedback
-- **GitHub Issues integration** — Submissions automatically create GitHub issues
-- **Offline support** — Feedback queued when offline, auto-retries on reconnect
-
-## Tech Stack
-
-### Frontend (Vue 3)
-- **Framework**: Vue 3.4+ with Composition API
-- **State Management**: Pinia
-- **Build Tool**: Vite 5.0+
-- **Visualization**: D3.js v7+
-- **Markdown**: marked 11.0+
-
-### Desktop Backend (Tauri + Rust)
-- **Framework**: Tauri 1.8
-- **Search Engine**: Tantivy 0.22
-- **Graph**: petgraph 0.6
-- **LLM API**: OpenRouter via reqwest
-- **MCP**: rmcp 0.15 (stdio transport)
-- **Async Runtime**: tokio 1.0
+### MCP Integration
+- **Native Rust MCP server** bundled with the app for Claude Desktop
+- 10 tools: note CRUD, search, backlinks, outgoing links, recall, and conversation import
+- Zero-config — copy the config snippet from Grafyn Settings into Claude Desktop
 
 ## Quick Start
 
-### Prerequisites
+### Download
 
-- Node.js 18+
-- Rust via [rustup](https://rustup.rs/)
-- Platform-specific build tools:
-  - **Windows**: Visual Studio Build Tools 2022 with C++ workload
-  - **macOS**: Xcode Command Line Tools (`xcode-select --install`)
-  - **Linux**: `sudo apt install build-essential libgtk-3-dev libwebkit2gtk-4.0-dev`
+Grab the latest installer from [Releases](https://github.com/WKJBryan/Grafyn/releases/latest):
 
-### Setup
+| Platform | File |
+|----------|------|
+| **Windows (64-bit)** | `Grafyn_*_x64-setup.exe` |
+| **Windows (ARM)** | `Grafyn_*_arm64-setup.exe` |
+| **macOS (Apple Silicon)** | `Grafyn_*_aarch64.dmg` |
+| **Linux (Debian/Ubuntu)** | `grafyn_*_amd64.deb` |
+| **Linux (Universal)** | `grafyn_*_amd64.AppImage` |
+
+Grafyn auto-updates after installation.
+
+### Build from Source
+
+**Prerequisites:** Node.js 20+, Rust via [rustup](https://rustup.rs/), and [Tauri v1 dependencies](https://v1.tauri.app/v1/guides/getting-started/prerequisites).
 
 ```bash
 cd frontend
 npm install
+node scripts/generate-icons.cjs    # first build only
 
-# Generate app icons (required for first build)
-node scripts/generate-icons.cjs
-
-# Development mode with hot reload
-npm run tauri:dev
-
-# Production build (auto-builds the bundled grafyn-mcp sidecar first)
-npm run tauri:build
+npm run tauri:dev                   # dev mode with hot reload
+npm run tauri:build                 # production build
 ```
-If `TAURI_PRIVATE_KEY` is not set, local builds automatically skip the signed updater bundle and still produce normal installer artifacts. Release CI still signs updater bundles because it provides the key.
 
-**Build output:**
-- Windows: `src-tauri/target/release/bundle/nsis/Grafyn_0.1.1_x64-setup.exe`
-- macOS: `src-tauri/target/release/bundle/dmg/Grafyn_0.1.1_aarch64.dmg`
-- Linux: `src-tauri/target/release/bundle/deb/grafyn_0.1.1_amd64.deb`
+### Configuration
 
-## Configuration
+On first launch, Grafyn walks you through setup:
+1. **Vault path** — where your markdown notes are stored (default: `~/Documents/Grafyn/vault/`)
+2. **OpenRouter API key** — required for Canvas, distillation, and link discovery ([get one here](https://openrouter.ai/keys))
 
-### Environment Variables
+All data stays on your machine. No account needed.
 
-| Variable | Description |
-|----------|-------------|
-| `OPENROUTER_API_KEY` | Required for Multi-LLM Canvas, distillation, link discovery |
-| `GITHUB_FEEDBACK_REPO` | Target repo for feedback issues (format: `owner/repo`) |
-| `GITHUB_FEEDBACK_TOKEN` | GitHub PAT with `issues:write` scope |
-| `RUST_LOG` | Logging level (default: `info`) |
+## MCP Integration
 
-### In-App Settings
+Connect Claude Desktop to your knowledge base:
 
-The Settings UI (`Settings` button in the header) manages:
-- **Vault path** — location of your markdown notes folder
-- **OpenRouter API key** — for LLM features
-- **LLM model** — model used for distillation and link discovery (default: `anthropic/claude-3.5-haiku`)
-- **Theme** — light, dark, or system
-
-## Usage
-
-### Notes
-
-1. Click **"+ New Note"** in the header
-2. Write content in Markdown with `[[wikilinks]]` to other notes
-3. Set status (draft/evidence/canonical) and add tags
-4. Save — note is automatically indexed for search
-
-### Search
-
-- **Full-text search**: Type naturally in the search bar
-- **Operators**: `tag:python`, `status:canonical`, `type:atomic`
-- **Filters**: Include/exclude tags with `+tag` or `-tag`
-
-### Multi-LLM Canvas
-
-1. Navigate to the Canvas tab
-2. Create a new session
-3. Click **"+ Prompt"** to open the prompt dialog
-4. Select models to compare (e.g., GPT-4, Claude, Gemini)
-5. Enter your prompt — responses stream in real-time with relevant notes as context
-6. Use **Debate Mode** to have models critique each other
-7. Export insights to your knowledge base
-
-### Conversation Import
-
-1. Export conversations from ChatGPT, Claude, Grok, or Gemini
-2. Navigate to the Import tab
-3. Upload the JSON file
-4. Review parsed conversations with quality scores
-5. Select conversations to import as notes
-
-### MCP Integration (Claude Desktop)
-
-Connect Claude Desktop to your knowledge base using the bundled MCP server:
-
-1. Open Grafyn Settings → copy the MCP config snippet
+1. Open Grafyn **Settings** and copy the MCP config snippet
 2. Add it to your `claude_desktop_config.json`:
 
 ```json
@@ -149,114 +107,48 @@ Connect Claude Desktop to your knowledge base using the bundled MCP server:
 }
 ```
 
-The MCP server provides 10 tools: note CRUD, search, backlinks, outgoing links, recall, and conversation import.
-
-### Feedback & Bug Reporting
-
-1. Click the feedback button in the header
-2. Select feedback type (Bug Report, Feature Request, or General)
-3. Enter a title and description
-4. Submit — creates a GitHub issue automatically
-
-Feedback is queued when offline and automatically submitted when connectivity is restored.
+The MCP server is a standalone Rust binary (`grafyn-mcp`) bundled with the installer. It shares the same vault and search index as the desktop app.
 
 ## Architecture
 
-```
-┌────────────────────────────────────────────────┐
-│           Tauri Desktop App (Single Binary)     │
-│  ┌──────────────────────────────────────────┐  │
-│  │         Vue 3 Frontend (WebView)          │  │
-│  └──────────────────┬───────────────────────┘  │
-│                     │ Tauri IPC (invoke)        │
-│  ┌──────────────────▼───────────────────────┐  │
-│  │            Rust Backend                   │  │
-│  │  Commands → Services → Local Filesystem   │  │
-│  │  (notes, search, graph, canvas, distill,   │  │
-│  │   settings, feedback, mcp, memory,         │  │
-│  │   import, priority, retrieval, zettelkasten)│  │
-│  └──────────────────────────────────────────┘  │
-│  ~/Documents/Grafyn/                          │
-│  ├── vault/  (markdown notes)                   │
-│  └── data/   (search index, canvas, settings)   │
-└────────────────────────────────────────────────┘
-```
-
-### Project Structure
+Single binary, no server — Tauri wraps a Vue 3 frontend with a Rust backend.
 
 ```
-frontend/
-├── src/
-│   ├── views/             # Page components (4 views)
-│   ├── components/        # UI components (32 total)
-│   │   ├── canvas/        # Canvas-specific (13 components)
-│   │   └── import/        # Import-specific (1 component)
-│   ├── stores/            # Pinia state (3 stores)
-│   └── api/               # Tauri IPC client
-└── src-tauri/             # Rust backend
-    ├── src/
-    │   ├── commands/      # 65 IPC handlers across 13 modules
-    │   ├── services/      # Business logic
-    │   ├── models/        # Data structures
-    │   └── mcp.rs         # MCP server binary entry point
-    └── Cargo.toml
+Tauri Desktop App
+├── Vue 3 Frontend (WebView)
+│   └── Tauri IPC (invoke)
+├── Rust Backend
+│   ├── 65 IPC commands across 13 modules
+│   ├── Tantivy full-text search
+│   ├── petgraph link graph
+│   └── OpenRouter LLM integration
+├── grafyn-mcp (bundled MCP server)
+└── ~/Documents/Grafyn/
+    ├── vault/  (markdown notes)
+    └── data/   (search index, canvas sessions, settings)
 ```
 
-## Testing
+## Tech Stack
 
-```bash
-# Rust tests (49 tests)
-cd frontend/src-tauri
-cargo test
-
-# Frontend tests (230 tests)
-cd frontend
-npm run test:run
-```
-
-## Security
-
-Desktop app — all data stored locally on disk. No server-side authentication needed.
-
-- **Path traversal protection** — sanitized note IDs, resolved paths
-- **Local-only storage** — notes and indexes stay on your machine
-- **API key management** — OpenRouter key stored in local app data, never transmitted except to OpenRouter
-
-## CI/CD
-
-### Test Pipeline
-
-`.github/workflows/test.yml` — runs on push to main and PRs: Rust tests, frontend tests, linting (ESLint + Clippy), security audit, and Vite production build.
-
-### Release Pipeline
-
-`.github/workflows/release.yml` — triggered by `v*` tags:
-
-1. **Create release** — single draft GitHub release
-2. **Build** — 4-platform matrix (Windows x64/ARM, macOS ARM, Linux x64) builds Tauri bundles with bundled MCP binary
-3. **Publish release** — draft → published after all builds complete
-4. **Upload to R2** — assets mirrored to Cloudflare R2 for auto-update distribution
-
-Manual builds can be triggered via `workflow_dispatch` without creating a release. The workflow and local `npm run tauri:build` now use the same sidecar-prep path so the bundled `grafyn-mcp` binary is generated consistently before packaging.
+| Layer | Technology |
+|-------|-----------|
+| Frontend | Vue 3, Vite, Pinia, D3.js |
+| Desktop | Tauri 1.8 |
+| Search | Tantivy 0.22 |
+| Graph | petgraph 0.6 |
+| LLM | OpenRouter via reqwest |
+| MCP | rmcp (stdio transport) |
+| Updates | Cloudflare R2 + Workers |
 
 ## Contributing
 
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/amazing-feature`)
-3. Make your changes
-4. Write tests for new functionality
-5. Run the test suite (`cargo test` and `npm run test:run`)
-6. Submit a pull request
+1. Fork and create a feature branch
+2. Make changes and add tests
+3. Run `cargo test` and `npm run test:run`
+4. Submit a pull request
 
-### Code Style
-
-- **Frontend**: ESLint + Prettier (configured)
-- **Rust**: `cargo fmt` and `cargo clippy`
+See [CLAUDE.md](CLAUDE.md) for detailed architecture docs, IPC command reference, and CI pitfalls.
 
 ## License
 
-[Add your license here]
-
-## Support
-
-For issues and questions, please open an issue on GitHub.
+[GPL-3.0](LICENSE)
