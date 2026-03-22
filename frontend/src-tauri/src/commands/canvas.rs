@@ -17,6 +17,12 @@ use tauri::State;
 const COMPACT_HISTORY_RECENT_TURNS: usize = 2;
 const COMPACT_HISTORY_EXCERPT_CHARS: usize = 240;
 
+// LLM node layout constants
+const LLM_NODE_WIDTH: f64 = 280.0;
+const LLM_NODE_HEIGHT: f64 = 200.0;
+const LLM_NODE_Y_STEP: f64 = 300.0; // height(200) + 100px gap for content overflow
+const LLM_NODE_X_GAP: f64 = 80.0;
+
 #[derive(Debug, Clone)]
 struct ConversationTurn {
     prompt: String,
@@ -102,13 +108,13 @@ pub async fn send_prompt(
 
     // Compute LLM node positions (offset from prompt tile)
     let prompt_pos = request.position.clone().unwrap_or_default();
-    let llm_start_x = prompt_pos.x + prompt_pos.width + 80.0;
+    let llm_start_x = prompt_pos.x + prompt_pos.width + LLM_NODE_X_GAP;
 
     // Create initial responses map with positions
     let mut responses: HashMap<String, ModelResponse> = HashMap::new();
     for (i, model_id) in request.models.iter().enumerate() {
         let model_name = model_id.split('/').last().unwrap_or(model_id).to_string();
-        let llm_y = prompt_pos.y + (i as f64) * 280.0;
+        let llm_y = prompt_pos.y + (i as f64) * LLM_NODE_Y_STEP;
         responses.insert(
             model_id.clone(),
             ModelResponse {
@@ -123,8 +129,8 @@ pub async fn send_prompt(
                 position: TilePosition {
                     x: llm_start_x,
                     y: llm_y,
-                    width: 280.0,
-                    height: 200.0,
+                    width: LLM_NODE_WIDTH,
+                    height: LLM_NODE_HEIGHT,
                 },
             },
         );
@@ -1021,7 +1027,7 @@ pub async fn add_models_to_tile(
     // Calculate positions for new models
     let existing_count = tile.responses.len();
     let prompt_pos = &tile.position;
-    let llm_start_x = prompt_pos.x + prompt_pos.width + 80.0;
+    let llm_start_x = prompt_pos.x + prompt_pos.width + LLM_NODE_X_GAP;
 
     // Add initial pending responses
     {
@@ -1030,7 +1036,7 @@ pub async fn add_models_to_tile(
         if let Some(t) = session.prompt_tiles.iter_mut().find(|t| t.id == tile_id) {
             for (i, model_id) in request.model_ids.iter().enumerate() {
                 let model_name = model_id.split('/').last().unwrap_or(model_id).to_string();
-                let llm_y = prompt_pos.y + ((existing_count + i) as f64) * 280.0;
+                let llm_y = prompt_pos.y + ((existing_count + i) as f64) * LLM_NODE_Y_STEP;
                 t.models.push(model_id.clone());
                 t.responses.insert(
                     model_id.clone(),
@@ -1046,8 +1052,8 @@ pub async fn add_models_to_tile(
                         position: TilePosition {
                             x: llm_start_x,
                             y: llm_y,
-                            width: 280.0,
-                            height: 200.0,
+                            width: LLM_NODE_WIDTH,
+                            height: LLM_NODE_HEIGHT,
                         },
                     },
                 );

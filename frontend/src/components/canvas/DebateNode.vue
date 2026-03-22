@@ -507,7 +507,7 @@ onBeforeUnmount(() => {
 }
 
 .node-content {
-  flex: 1;
+  flex-shrink: 0;
   padding: var(--spacing-sm);
   display: flex;
   flex-direction: column;
@@ -546,11 +546,13 @@ onBeforeUnmount(() => {
 
 /* Conclusion preview */
 .conclusion-preview {
+  flex: 1;
   padding: var(--spacing-sm);
   background: color-mix(in srgb, var(--accent-cyan) 5%, transparent);
   border-top: 1px solid var(--border-subtle);
-  max-height: 150px;
-  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
 }
 
 .conclusion-label {
@@ -563,10 +565,10 @@ onBeforeUnmount(() => {
 }
 
 .conclusion-text {
+  flex: 1;
   font-size: 0.75rem;
   color: var(--text-primary);
   line-height: 1.4;
-  max-height: 120px;
   overflow-y: auto;
 }
 

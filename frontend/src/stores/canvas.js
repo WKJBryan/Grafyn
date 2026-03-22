@@ -213,7 +213,7 @@ export const useCanvasStore = defineStore('canvas', () => {
         const parentPos = parentTile.responses[parentModelId].position
         position = {
           x: parentPos.x,
-          y: parentPos.y + (parentPos.height || 200) + 60,
+          y: parentPos.y + (parentPos.height || 200) + 80,
           width: 400,
           height: 300
         }
