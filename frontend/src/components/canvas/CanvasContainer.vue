@@ -37,74 +37,16 @@
         >
           <button
             class="btn btn-secondary btn-sm"
-            :disabled="!session || promptTiles.length === 0"
+            :disabled="!session || promptTiles.length === 0 || arranging"
             title="Auto-arrange nodes"
-            @click="toggleArrangeMenu"
+            @click="handleAutoArrange"
           >
             <GIcon
               name="layout-grid"
               :size="14"
               class="icon"
             /> Arrange
-            <GIcon
-              name="chevron-down"
-              :size="12"
-              class="dropdown-arrow"
-            />
           </button>
-          <div
-            v-if="showArrangeMenu"
-            class="dropdown-menu"
-          >
-            <div class="dropdown-header">
-              Layout Algorithm
-            </div>
-            <button
-              class="dropdown-item"
-              :class="{ active: layoutAlgorithm === 'hierarchical' }"
-              @click="handleAutoArrange('hierarchical')"
-            >
-              <GIcon
-                name="tree-pine"
-                :size="18"
-                class="layout-icon"
-              />
-              <div class="layout-info">
-                <span class="layout-name">Hierarchical</span>
-                <span class="layout-desc">Tree layout from left to right</span>
-              </div>
-            </button>
-            <button
-              class="dropdown-item"
-              :class="{ active: layoutAlgorithm === 'force-directed' }"
-              @click="handleAutoArrange('force-directed')"
-            >
-              <GIcon
-                name="orbit"
-                :size="18"
-                class="layout-icon"
-              />
-              <div class="layout-info">
-                <span class="layout-name">Force-Directed</span>
-                <span class="layout-desc">Physics-based node positioning</span>
-              </div>
-            </button>
-            <button
-              class="dropdown-item"
-              :class="{ active: layoutAlgorithm === 'circular' }"
-              @click="handleAutoArrange('circular')"
-            >
-              <GIcon
-                name="circle"
-                :size="18"
-                class="layout-icon"
-              />
-              <div class="layout-info">
-                <span class="layout-name">Circular</span>
-                <span class="layout-desc">Nodes arranged in a circle</span>
-              </div>
-            </button>
-          </div>
         </div>
         <PinnedNotesPanel data-guide="pinned-notes-btn" />
         <button
@@ -384,7 +326,7 @@
 import { ref, computed, onMounted, onBeforeUnmount, watch, shallowRef } from 'vue'
 import { select } from 'd3-selection'
 import { zoom as d3Zoom, zoomIdentity } from 'd3-zoom'
-import { forceSimulation, forceLink, forceManyBody, forceCenter, forceCollide } from 'd3-force'
+
 import 'd3-transition'
 import { useCanvasStore } from '@/stores/canvas'
 import { settings as settingsApi, isDesktopApp } from '@/api/client'
@@ -422,7 +364,6 @@ const expandedDebates = ref([])  // IDs of expanded debate nodes
 const showAddModelDialog = ref(false)
 const addModelContext = ref(null)  // { tileId, existingModelIds }
 const showArrangeMenu = ref(false)
-const layoutAlgorithm = ref('hierarchical')  // 'hierarchical', 'force-directed', 'circular'
 const arranging = ref(false)  // Loading state during arrangement
 const arrangeDropdown = ref(null)  // Ref for dropdown element
 const showApiKeyRequired = ref(false)  // Show API key required dialog
@@ -1045,11 +986,6 @@ async function handleSaveAsNote() {
   }
 }
 
-// Toggle arrange menu dropdown
-function toggleArrangeMenu() {
-  showArrangeMenu.value = !showArrangeMenu.value
-}
-
 // Close arrange menu when clicking outside
 function handleClickOutside(event) {
   if (arrangeDropdown.value && !arrangeDropdown.value.contains(event.target)) {
@@ -1057,248 +993,157 @@ function handleClickOutside(event) {
   }
 }
 
-// Auto-arrange nodes with different layout algorithms
-async function handleAutoArrange(algorithm = 'hierarchical') {
+// Auto-arrange nodes in hierarchical tree layout
+async function handleAutoArrange() {
   if (!session.value || promptTiles.value.length === 0) return
-  
+
   arranging.value = true
   showArrangeMenu.value = false
-  layoutAlgorithm.value = algorithm
-  
+
   const positions = {}
-  const NODE_GAP = 80
-  const PROMPT_WIDTH = 200
-  const PROMPT_HEIGHT = 120
-  const LLM_WIDTH = 280
-  const LLM_HEIGHT = 220
-  const DEBATE_WIDTH = 280
-  const DEBATE_HEIGHT = 200
-  
+  const NODE_GAP = 100
+  const DEFAULT_PROMPT_WIDTH = 400
+  const DEFAULT_PROMPT_HEIGHT = 300
+  const DEFAULT_LLM_WIDTH = 280
+  const DEFAULT_LLM_HEIGHT = 200
+  const DEFAULT_DEBATE_WIDTH = 400
+  const DEFAULT_DEBATE_HEIGHT = 300
+
   try {
-    if (algorithm === 'hierarchical') {
-      // Hierarchical tree layout
-      let globalY = 50
-      
-      const rootTiles = promptTiles.value.filter(t => !t.parent_tile_id)
-      
-      const layoutPromptTree = (tile, startX, startY) => {
-        let treeHeight = 0
-        let currentY = startY
-        
-        positions[`prompt:${tile.id}`] = {
-          x: startX,
-          y: currentY,
-          width: PROMPT_WIDTH,
-          height: PROMPT_HEIGHT
+    let globalY = 50
+
+    const rootTiles = promptTiles.value.filter(t => !t.parent_tile_id)
+
+    // Build map of which prompt tiles have debates (for reserving space in the tree)
+    const tileDebateMap = {}
+    for (const debate of debates.value) {
+      for (const sourceTileId of debate.source_tile_ids || []) {
+        if (!tileDebateMap[sourceTileId]) {
+          tileDebateMap[sourceTileId] = []
         }
-        
-        const responses = Object.entries(tile.responses || {})
-        const llmX = startX + PROMPT_WIDTH + NODE_GAP
-        
-        if (responses.length === 0) {
-          treeHeight = PROMPT_HEIGHT
-        } else {
-          for (const [modelId, _response] of responses) {
-            positions[`llm:${tile.id}:${modelId}`] = {
-              x: llmX,
-              y: currentY,
-              width: LLM_WIDTH,
-              height: LLM_HEIGHT
-            }
-            
-            const branches = promptTiles.value.filter(
-              t => t.parent_tile_id === tile.id && t.parent_model_id === modelId
-            )
-            
-            let llmSubtreeHeight = LLM_HEIGHT
-            
-            if (branches.length > 0) {
-              const branchX = llmX + LLM_WIDTH + NODE_GAP
-              let branchY = currentY
-              
-              for (const branch of branches) {
-                const branchHeight = layoutPromptTree(branch, branchX, branchY)
-                branchY += branchHeight + NODE_GAP
-                llmSubtreeHeight = Math.max(llmSubtreeHeight, branchY - currentY - NODE_GAP)
-              }
-            }
-            
-            currentY += llmSubtreeHeight + NODE_GAP
+        tileDebateMap[sourceTileId].push(debate)
+      }
+    }
+
+    const layoutPromptTree = (tile, startX, startY) => {
+      let treeHeight = 0
+      let currentY = startY
+
+      const promptWidth = tile.position?.width || DEFAULT_PROMPT_WIDTH
+      const promptHeight = tile.position?.height || DEFAULT_PROMPT_HEIGHT
+
+      positions[`prompt:${tile.id}`] = {
+        x: startX,
+        y: currentY,
+        width: promptWidth,
+        height: promptHeight
+      }
+
+      const responses = Object.entries(tile.responses || {})
+      const llmX = startX + promptWidth + NODE_GAP
+
+      // Check if this tile has a debate — if so, reserve space for it after LLM nodes
+      const tileDebates = tileDebateMap[tile.id] || []
+      const debateSpace = tileDebates.length > 0
+        ? Math.max(...tileDebates.map(d => (d.position?.width || DEFAULT_DEBATE_WIDTH))) + NODE_GAP
+        : 0
+
+      if (responses.length === 0) {
+        treeHeight = promptHeight
+      } else {
+        for (const [modelId, response] of responses) {
+          const llmWidth = response.position?.width || DEFAULT_LLM_WIDTH
+          const llmHeight = response.position?.height || DEFAULT_LLM_HEIGHT
+
+          positions[`llm:${tile.id}:${modelId}`] = {
+            x: llmX,
+            y: currentY,
+            width: llmWidth,
+            height: llmHeight
           }
-          
-          treeHeight = currentY - startY - NODE_GAP
+
+          const branches = promptTiles.value.filter(
+            t => t.parent_tile_id === tile.id && t.parent_model_id === modelId
+          )
+
+          let llmSubtreeHeight = llmHeight
+
+          if (branches.length > 0) {
+            // Push branches right by debate width if this tile has a debate
+            const branchX = llmX + llmWidth + NODE_GAP + debateSpace
+            let branchY = currentY
+
+            for (const branch of branches) {
+              const branchHeight = layoutPromptTree(branch, branchX, branchY)
+              branchY += branchHeight + NODE_GAP
+              llmSubtreeHeight = Math.max(llmSubtreeHeight, branchY - currentY - NODE_GAP)
+            }
+          }
+
+          currentY += llmSubtreeHeight + NODE_GAP
         }
-        
-        if (responses.length > 0) {
-          const promptCenterY = startY + (treeHeight - PROMPT_HEIGHT) / 2
-          positions[`prompt:${tile.id}`].y = promptCenterY
+
+        treeHeight = currentY - startY - NODE_GAP
+      }
+
+      if (responses.length > 0) {
+        const promptCenterY = startY + (treeHeight - promptHeight) / 2
+        positions[`prompt:${tile.id}`].y = promptCenterY
+      }
+
+      return Math.max(treeHeight, promptHeight)
+    }
+
+    for (const rootTile of rootTiles) {
+      const treeHeight = layoutPromptTree(rootTile, 50, globalY)
+      globalY += treeHeight + NODE_GAP * 2
+    }
+
+    // Position debates — next to connected LLM nodes, centered vertically
+    for (const debate of debates.value) {
+      const debateWidth = debate.position?.width || DEFAULT_DEBATE_WIDTH
+      const debateHeight = debate.position?.height || DEFAULT_DEBATE_HEIGHT
+
+      // Find positions of connected LLM nodes
+      const connectedPositions = []
+      for (const sourceTileId of debate.source_tile_ids || []) {
+        for (const modelId of debate.participating_models || []) {
+          const key = `llm:${sourceTileId}:${modelId}`
+          if (positions[key]) {
+            connectedPositions.push(positions[key])
+          }
         }
-        
-        return Math.max(treeHeight, PROMPT_HEIGHT)
       }
-      
-      for (const rootTile of rootTiles) {
-        const treeHeight = layoutPromptTree(rootTile, 50, globalY)
-        globalY += treeHeight + NODE_GAP * 2
-      }
-      
-      // Position debates
-      let maxX = 0
-      for (const pos of Object.values(positions)) {
-        maxX = Math.max(maxX, pos.x + (pos.width || LLM_WIDTH))
-      }
-      
-      const debateX = maxX + NODE_GAP * 2
-      let debateY = 50
-      
-      for (const debate of debates.value) {
+
+      if (connectedPositions.length > 0) {
+        // X: to the right of the connected LLM nodes (in the gap we reserved)
+        const maxLlmRight = Math.max(...connectedPositions.map(p => p.x + p.width))
+        const debateX = maxLlmRight + NODE_GAP
+
+        // Y: vertically centered between the connected model tiles
+        const minY = Math.min(...connectedPositions.map(p => p.y))
+        const maxY = Math.max(...connectedPositions.map(p => p.y + p.height))
+        const debateY = minY + (maxY - minY - debateHeight) / 2
+
         positions[`debate:${debate.id}`] = {
           x: debateX,
           y: debateY,
-          width: DEBATE_WIDTH,
-          height: DEBATE_HEIGHT
+          width: debateWidth,
+          height: debateHeight
         }
-        debateY += DEBATE_HEIGHT + NODE_GAP
-      }
-      
-    } else if (algorithm === 'force-directed') {
-      // Force-directed layout using D3
-      const nodes = []
-      const links = []
-      
-      // Create nodes
-      for (const tile of promptTiles.value) {
-        nodes.push({
-          id: `prompt:${tile.id}`,
-          type: 'prompt',
-          width: PROMPT_WIDTH,
-          height: PROMPT_HEIGHT,
-          x: tile.position?.x || Math.random() * 800,
-          y: tile.position?.y || Math.random() * 600
-        })
-        
-        for (const [modelId, response] of Object.entries(tile.responses || {})) {
-          const llmId = `llm:${tile.id}:${modelId}`
-          nodes.push({
-            id: llmId,
-            type: 'llm',
-            width: LLM_WIDTH,
-            height: LLM_HEIGHT,
-            x: response.position?.x || Math.random() * 800,
-            y: response.position?.y || Math.random() * 600
-          })
-          
-          // Link prompt to LLM
-          links.push({
-            source: `prompt:${tile.id}`,
-            target: llmId
-          })
-          
-          // Link LLM to branches
-          for (const branch of promptTiles.value) {
-            if (branch.parent_tile_id === tile.id && branch.parent_model_id === modelId) {
-              links.push({
-                source: llmId,
-                target: `prompt:${branch.id}`
-              })
-            }
-          }
+      } else {
+        // Fallback: place to the right of everything
+        let maxX = 0
+        for (const pos of Object.values(positions)) {
+          maxX = Math.max(maxX, pos.x + (pos.width || DEFAULT_LLM_WIDTH))
+        }
+        positions[`debate:${debate.id}`] = {
+          x: maxX + NODE_GAP,
+          y: 50,
+          width: debateWidth,
+          height: debateHeight
         }
       }
-      
-      for (const debate of debates.value) {
-        nodes.push({
-          id: `debate:${debate.id}`,
-          type: 'debate',
-          width: DEBATE_WIDTH,
-          height: DEBATE_HEIGHT,
-          x: debate.position?.x || Math.random() * 800,
-          y: debate.position?.y || Math.random() * 600
-        })
-        
-        // Link source LLMs to debate
-        for (const sourceTileId of debate.source_tile_ids || []) {
-          const sourceTile = promptTiles.value.find(t => t.id === sourceTileId)
-          if (sourceTile) {
-            for (const modelId of debate.participating_models || []) {
-              if (sourceTile.responses[modelId]) {
-                links.push({
-                  source: `llm:${sourceTileId}:${modelId}`,
-                  target: `debate:${debate.id}`
-                })
-              }
-            }
-          }
-        }
-      }
-      
-      // Run force simulation
-      const simulation = forceSimulation(nodes)
-        .force('link', forceLink(links).id(d => d.id).distance(150))
-        .force('charge', forceManyBody().strength(-300))
-        .force('center', forceCenter(400, 300))
-        .force('collision', forceCollide().radius(d => (d.width + d.height) / 4))
-        .stop()
-      
-      // Run simulation for 300 iterations
-      for (let i = 0; i < 300; i++) {
-        simulation.tick()
-      }
-      
-      // Extract final positions
-      for (const node of nodes) {
-        positions[node.id] = {
-          x: Math.max(50, node.x - node.width / 2),
-          y: Math.max(50, node.y - node.height / 2),
-          width: node.width,
-          height: node.height
-        }
-      }
-      
-    } else if (algorithm === 'circular') {
-      // Circular layout
-      const nodes = []
-      
-      // Collect all nodes
-      for (const tile of promptTiles.value) {
-        nodes.push({
-          id: `prompt:${tile.id}`,
-          width: PROMPT_WIDTH,
-          height: PROMPT_HEIGHT
-        })
-        
-        for (const [modelId, _response] of Object.entries(tile.responses || {})) {
-          nodes.push({
-            id: `llm:${tile.id}:${modelId}`,
-            width: LLM_WIDTH,
-            height: LLM_HEIGHT
-          })
-        }
-      }
-      
-      for (const debate of debates.value) {
-        nodes.push({
-          id: `debate:${debate.id}`,
-          width: DEBATE_WIDTH,
-          height: DEBATE_HEIGHT
-        })
-      }
-      
-      // Arrange in a circle
-      const centerX = 400
-      const centerY = 300
-      const radius = Math.min(centerX, centerY) - 100
-      const angleStep = (2 * Math.PI) / nodes.length
-      
-      nodes.forEach((node, i) => {
-        const angle = i * angleStep
-        positions[node.id] = {
-          x: centerX + radius * Math.cos(angle) - node.width / 2,
-          y: centerY + radius * Math.sin(angle) - node.height / 2,
-          width: node.width,
-          height: node.height
-        }
-      })
     }
     
     // Send batch update to backend
@@ -1382,11 +1227,6 @@ async function handleAutoArrange(algorithm = 'hierarchical') {
   display: inline-block;
 }
 
-.dropdown-arrow {
-  font-size: 0.7rem;
-  margin-left: 4px;
-  opacity: 0.7;
-}
 
 .dropdown-menu {
   position: absolute;

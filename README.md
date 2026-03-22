@@ -24,6 +24,8 @@
   <a href="#mcp-integration">MCP for Claude</a>
 </p>
 
+> **Early development** — expect rough edges. Bug reports welcome via [Issues](https://github.com/WKJBryan/Grafyn/issues).
+
 ---
 
 ## Features
