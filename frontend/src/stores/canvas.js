@@ -702,6 +702,14 @@ export const useCanvasStore = defineStore('canvas', () => {
       const request = { model_ids: newModelIds }
 
       const unlisten = await setupTauriStreamListener(sessionId, {
+        models_added: (data) => {
+          const tile = currentSession.value.prompt_tiles.find(t => t.id === data.tile_id)
+          if (tile) {
+            for (const [modelId, response] of Object.entries(data.responses)) {
+              tile.responses[modelId] = response
+            }
+          }
+        },
         chunk: (data) => {
           modelContent[data.model_id] = (modelContent[data.model_id] || '') + data.chunk
           updateTileResponseLocal(tileId, data.model_id, modelContent[data.model_id], 'streaming')

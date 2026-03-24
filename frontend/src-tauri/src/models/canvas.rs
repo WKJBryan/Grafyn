@@ -441,6 +441,11 @@ pub enum CanvasStreamEvent {
         model_id: String,
         error: String,
     },
+    ModelsAdded {
+        session_id: String,
+        tile_id: String,
+        responses: HashMap<String, ModelResponse>,
+    },
     ContextNotes {
         session_id: String,
         tile_id: String,
