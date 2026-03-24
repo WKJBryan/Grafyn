@@ -1029,7 +1029,8 @@ pub async fn add_models_to_tile(
     let prompt_pos = &tile.position;
     let llm_start_x = prompt_pos.x + prompt_pos.width + LLM_NODE_X_GAP;
 
-    // Add initial pending responses
+    // Add initial pending responses and notify frontend before streaming
+    let mut new_responses: HashMap<String, ModelResponse> = HashMap::new();
     {
         let mut store = state.canvas_store.write().await;
         let mut session = store.get_session(&session_id).map_err(|e| e.to_string())?;
@@ -1037,31 +1038,40 @@ pub async fn add_models_to_tile(
             for (i, model_id) in request.model_ids.iter().enumerate() {
                 let model_name = model_id.split('/').last().unwrap_or(model_id).to_string();
                 let llm_y = prompt_pos.y + ((existing_count + i) as f64) * LLM_NODE_Y_STEP;
-                t.models.push(model_id.clone());
-                t.responses.insert(
-                    model_id.clone(),
-                    ModelResponse {
-                        id: uuid::Uuid::new_v4().to_string(),
-                        model_id: model_id.clone(),
-                        model_name,
-                        content: String::new(),
-                        status: ResponseStatus::Pending,
-                        error: None,
-                        tokens_used: None,
-                        created_at: now,
-                        position: TilePosition {
-                            x: llm_start_x,
-                            y: llm_y,
-                            width: LLM_NODE_WIDTH,
-                            height: LLM_NODE_HEIGHT,
-                        },
+                let response = ModelResponse {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    model_id: model_id.clone(),
+                    model_name,
+                    content: String::new(),
+                    status: ResponseStatus::Pending,
+                    error: None,
+                    tokens_used: None,
+                    created_at: now,
+                    position: TilePosition {
+                        x: llm_start_x,
+                        y: llm_y,
+                        width: LLM_NODE_WIDTH,
+                        height: LLM_NODE_HEIGHT,
                     },
-                );
+                };
+                new_responses.insert(model_id.clone(), response.clone());
+                t.models.push(model_id.clone());
+                t.responses.insert(model_id.clone(), response);
             }
             session.updated_at = Utc::now();
             store.save_session(&session).map_err(|e| e.to_string())?;
         }
     }
+
+    // Notify frontend about new responses before streaming starts
+    let _ = window.emit(
+        "canvas-stream",
+        CanvasStreamEvent::ModelsAdded {
+            session_id: session_id.clone(),
+            tile_id: tile_id.clone(),
+            responses: new_responses,
+        },
+    );
 
     // Spawn streaming task
     let openrouter_arc = state.openrouter.clone();
