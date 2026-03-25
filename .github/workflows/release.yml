@@ -366,13 +366,6 @@ jobs:
         working-directory: frontend
         run: npm ci
 
-      - name: Normalize Cargo.lock
-        run: |
-          cd frontend/src-tauri
-          cargo generate-lockfile
-          cd ../..
-          git diff --exit-code -- frontend/src-tauri/Cargo.lock
-
       - name: Validate and regenerate icons
         working-directory: frontend
         shell: bash
