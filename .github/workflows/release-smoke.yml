@@ -75,12 +75,9 @@ jobs:
         working-directory: frontend
         run: npm ci
 
-      - name: Normalize Cargo.lock
-        run: |
-          cd frontend/src-tauri
-          cargo generate-lockfile
-          cd ../..
-          git diff --exit-code -- frontend/src-tauri/Cargo.lock
+      - name: Validate Cargo.lock
+        working-directory: frontend/src-tauri
+        run: cargo check --locked --target ${{ matrix.target }}
 
       - name: Validate and regenerate icons
         working-directory: frontend
