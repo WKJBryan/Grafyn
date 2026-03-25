@@ -150,7 +150,3 @@ Tauri Desktop App
 4. Submit a pull request
 
 See [CLAUDE.md](CLAUDE.md) for detailed architecture docs, IPC command reference, and CI pitfalls.
-
-## License
-
-[GPL-3.0](LICENSE)
