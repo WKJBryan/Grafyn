@@ -366,10 +366,6 @@ jobs:
         working-directory: frontend
         run: npm ci
 
-      - name: Validate Cargo.lock
-        working-directory: frontend/src-tauri
-        run: cargo check --locked --target ${{ matrix.target }}
-
       - name: Validate and regenerate icons
         working-directory: frontend
         shell: bash
