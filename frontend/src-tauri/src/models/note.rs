@@ -83,6 +83,9 @@ pub struct Note {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub wikilinks: Vec<String>,
+    /// Typed wikilinks with relationship information
+    #[serde(default)]
+    pub parsed_links: Vec<ParsedLink>,
     /// Additional frontmatter properties
     #[serde(default)]
     pub properties: HashMap<String, serde_json::Value>,
@@ -100,6 +103,7 @@ impl Default for Note {
             created_at: now,
             updated_at: now,
             wikilinks: Vec::new(),
+            parsed_links: Vec::new(),
             properties: HashMap::new(),
         }
     }
@@ -218,13 +222,101 @@ pub struct HubUpdate {
     pub atomic_ids_added: Vec<String>,
 }
 
-/// Graph neighbor information
+/// Semantic relationship type between linked notes
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RelationType {
+    #[default]
+    Related,
+    Supports,
+    Contradicts,
+    Expands,
+    Questions,
+    Answers,
+    Example,
+    PartOf,
+    /// Bare [[wikilink]] with no type annotation
+    Untyped,
+}
+
+impl RelationType {
+    /// Get the reverse relation for backlinks
+    pub fn reverse(&self) -> Self {
+        match self {
+            RelationType::Supports => RelationType::Related,
+            RelationType::Contradicts => RelationType::Contradicts,
+            RelationType::Expands => RelationType::Related,
+            RelationType::Questions => RelationType::Answers,
+            RelationType::Answers => RelationType::Questions,
+            RelationType::Example => RelationType::Related,
+            RelationType::PartOf => RelationType::Related,
+            other => other.clone(),
+        }
+    }
+
+    /// Parse from string (case-insensitive)
+    pub fn from_str_lossy(s: &str) -> Self {
+        match s.to_lowercase().replace('-', "_").as_str() {
+            "related" => RelationType::Related,
+            "supports" => RelationType::Supports,
+            "contradicts" => RelationType::Contradicts,
+            "expands" => RelationType::Expands,
+            "questions" => RelationType::Questions,
+            "answers" => RelationType::Answers,
+            "example" => RelationType::Example,
+            "part_of" | "partof" => RelationType::PartOf,
+            _ => RelationType::Untyped,
+        }
+    }
+}
+
+impl std::fmt::Display for RelationType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RelationType::Related => write!(f, "related"),
+            RelationType::Supports => write!(f, "supports"),
+            RelationType::Contradicts => write!(f, "contradicts"),
+            RelationType::Expands => write!(f, "expands"),
+            RelationType::Questions => write!(f, "questions"),
+            RelationType::Answers => write!(f, "answers"),
+            RelationType::Example => write!(f, "example"),
+            RelationType::PartOf => write!(f, "part_of"),
+            RelationType::Untyped => write!(f, "untyped"),
+        }
+    }
+}
+
+/// A parsed wikilink with optional relationship type
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ParsedLink {
+    pub target_title: String,
+    pub relation: RelationType,
+}
+
+/// A typed edge in the note graph
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TypedEdge {
+    pub target_id: String,
+    pub relation: RelationType,
+}
+
+/// Direction of a link (outgoing or backlink)
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum LinkDirection {
+    Outgoing,
+    Backlink,
+}
+
+/// Graph neighbor information with relationship type
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GraphNeighbor {
     pub note: NoteMeta,
-    pub link_type: LinkType,
+    pub direction: LinkDirection,
+    pub relation: RelationType,
 }
 
+// Keep old LinkType as alias for backward compat with frontend
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum LinkType {
