@@ -1,4 +1,4 @@
-use crate::models::note::{NoteStatus, SearchResult};
+use crate::models::note::{NoteMeta, NoteStatus, SearchResult};
 use anyhow::Result;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -133,6 +133,34 @@ impl PriorityScoringService {
 
         // Re-sort by final score descending
         results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    }
+
+    /// Compute a priority boost for a single note (for chunk-level retrieval).
+    pub fn compute_boost(&self, note: &NoteMeta) -> f32 {
+        let now = Utc::now();
+        let mut boost = 0.0_f32;
+
+        // Recency boost
+        let age_days = (now - note.updated_at).num_hours() as f32 / 24.0;
+        let decay = (-age_days * 0.693 / self.settings.recency_half_life_days).exp();
+        boost += self.settings.recency_weight * decay;
+
+        // Status boost
+        let status_weight = match note.status {
+            NoteStatus::Canonical => self.settings.content_type_weights.canonical,
+            NoteStatus::Evidence => self.settings.content_type_weights.evidence,
+            NoteStatus::Draft => self.settings.content_type_weights.draft,
+        };
+        boost += status_weight - 1.0;
+
+        // Tag boosts
+        for tag in &note.tags {
+            if let Some(&tag_boost) = self.settings.tag_boosts.get(tag) {
+                boost += tag_boost;
+            }
+        }
+
+        boost
     }
 }
 

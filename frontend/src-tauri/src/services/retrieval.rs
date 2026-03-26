@@ -7,7 +7,8 @@
 //! This replaces pure BM25 similarity with context-aware ranking that
 //! leverages the Zettelkasten graph structure.
 
-use crate::models::note::NoteMeta;
+use crate::models::note::{ChunkResult, NoteMeta};
+use crate::services::chunk_index::ChunkIndex;
 use crate::services::graph_index::GraphIndex;
 use crate::services::priority::PriorityScoringService;
 use crate::services::search::SearchService;
@@ -233,6 +234,89 @@ impl RetrievalService {
         results.truncate(limit);
 
         Ok(results)
+    }
+
+    /// Chunk-level retrieval with token budgeting.
+    ///
+    /// Searches the chunk index, applies graph and hub boosts from the note-level
+    /// graph, then greedily fills the token budget with the best-scoring chunks.
+    pub fn retrieve_chunks(
+        &self,
+        chunk_index: &ChunkIndex,
+        graph: &GraphIndex,
+        priority: &PriorityScoringService,
+        query: &str,
+        token_budget: usize,
+        context_note_ids: &[String],
+    ) -> std::result::Result<Vec<ChunkResult>, String> {
+        // Step 1: Search chunks (3x limit since chunks are smaller than notes)
+        let search_limit = self.config.base_search_limit * 3;
+        let mut chunks = chunk_index
+            .search_chunks(query, search_limit)
+            .map_err(|e| e.to_string())?;
+
+        if chunks.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Step 2: Build seed set from context notes + top chunk parents
+        let mut seed_ids: HashSet<String> = context_note_ids.iter().cloned().collect();
+        for chunk in chunks.iter().take(10) {
+            seed_ids.insert(chunk.parent_note_id.clone());
+        }
+
+        // Step 3: Expand graph for proximity boost
+        let neighbors = self.expand_graph(&seed_ids, graph);
+
+        // Step 4: Apply graph proximity and hub boosts to chunk scores
+        for chunk in chunks.iter_mut() {
+            let parent_id = &chunk.parent_note_id;
+
+            // Priority scoring (recency, status, tags) via parent note
+            if let Some(meta) = graph.get_note_meta(parent_id) {
+                let priority_boost = priority.compute_boost(&meta);
+                chunk.search_score += priority_boost;
+            }
+
+            // Graph proximity boost
+            if let Some((_meta, hops)) = neighbors.get(parent_id) {
+                let proximity_boost =
+                    self.config.graph_proximity_weight / (*hops as f32);
+                chunk.search_score += proximity_boost;
+            }
+
+            // Hub boost
+            let backlink_count = graph.get_backlinks(parent_id).len();
+            if backlink_count >= self.config.hub_threshold {
+                let hub_boost = self.config.hub_boost_weight
+                    * (backlink_count as f32 / self.config.hub_threshold as f32).min(3.0);
+                chunk.search_score += hub_boost;
+            }
+        }
+
+        // Step 5: Sort by score descending
+        chunks.sort_by(|a, b| {
+            b.search_score
+                .partial_cmp(&a.search_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        // Step 6: Greedy token-budget fill
+        let mut selected = Vec::new();
+        let mut running_tokens = 0;
+
+        for chunk in chunks {
+            if running_tokens + chunk.token_estimate <= token_budget {
+                running_tokens += chunk.token_estimate;
+                selected.push(chunk);
+            }
+            // Stop early if budget is nearly exhausted
+            if running_tokens >= token_budget {
+                break;
+            }
+        }
+
+        Ok(selected)
     }
 
     /// Expand the graph from seed IDs, returning a map of discovered neighbors

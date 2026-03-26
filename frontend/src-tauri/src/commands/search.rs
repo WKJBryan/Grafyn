@@ -113,5 +113,13 @@ pub async fn reindex(state: State<'_, AppState>) -> Result<(), String> {
         graph.build_from_notes(&notes);
     }
 
+    // Rebuild chunk index
+    {
+        let mut chunks = state.chunk_index.write().await;
+        if let Err(e) = chunks.reindex_all(&notes) {
+            log::error!("Failed to rebuild chunk index: {}", e);
+        }
+    }
+
     Ok(())
 }

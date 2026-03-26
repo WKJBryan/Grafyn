@@ -324,6 +324,23 @@ pub enum LinkType {
     Backlink,
 }
 
+// ── Chunk-level retrieval types ───────────────────────────────────────────
+
+/// A chunk-level search result: a segment of a note with parent context
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChunkResult {
+    pub chunk_id: String,
+    pub parent_note_id: String,
+    pub parent_title: String,
+    pub text: String,
+    pub start_char: usize,
+    pub end_char: usize,
+    pub depth_score: f64,
+    pub search_score: f32,
+    /// Approximate token count (words * 4/3)
+    pub token_estimate: usize,
+}
+
 // ── Zettelkasten link discovery types ─────────────────────────────────────
 
 /// A candidate link discovered between notes
