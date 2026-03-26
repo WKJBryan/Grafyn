@@ -45,7 +45,7 @@ notify = "6.1"
 serde_yaml = "0.9"
 
 # Search
-tantivy = "0.22"
+tantivy = "0.25"
 
 # Graph data structure
 petgraph = "0.6"
