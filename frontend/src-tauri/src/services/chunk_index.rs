@@ -308,6 +308,7 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
             wikilinks: vec![],
+            parsed_links: vec![],
             properties: HashMap::new(),
         }
     }
