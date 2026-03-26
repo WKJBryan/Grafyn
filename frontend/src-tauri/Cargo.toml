@@ -73,7 +73,7 @@ env_logger = "0.11"
 
 # System paths
 dirs = "5.0"
-keyring = "2.3"
+keyring = "3.6"
 
 # MCP server (optional — only needed for the grafyn-mcp binary)
 rmcp = { version = "0.15", features = ["server", "transport-io"], optional = true }
