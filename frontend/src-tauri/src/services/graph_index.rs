@@ -1,13 +1,15 @@
-use crate::models::note::{GraphNeighbor, LinkType, Note, NoteMeta};
-use std::collections::{HashMap, HashSet};
+use crate::models::note::{
+    GraphNeighbor, LinkDirection, Note, NoteMeta, RelationType, TypedEdge,
+};
+use std::collections::HashMap;
 
 /// Service for managing the note link graph (backlinks and outgoing links)
 #[derive(Debug, Clone, Default)]
 pub struct GraphIndex {
-    /// Map from note ID to set of note IDs it links to
-    outgoing: HashMap<String, HashSet<String>>,
-    /// Map from note ID to set of note IDs that link to it
-    backlinks: HashMap<String, HashSet<String>>,
+    /// Map from note ID to typed edges it links to
+    outgoing: HashMap<String, Vec<TypedEdge>>,
+    /// Map from note ID to typed edges that link to it (with reverse relation)
+    backlinks: HashMap<String, Vec<TypedEdge>>,
     /// Map from note title to note ID for resolving wikilinks
     title_to_id: HashMap<String, String>,
     /// Cached note metadata for quick lookups
@@ -42,20 +44,30 @@ impl GraphIndex {
             self.note_meta.insert(note.id.clone(), NoteMeta::from(note));
         }
 
-        // Build link graph
+        // Build link graph from typed links
         for note in notes {
-            let outgoing_set = self.outgoing.entry(note.id.clone()).or_default();
+            let outgoing_edges = self.outgoing.entry(note.id.clone()).or_default();
 
-            for link_title in &note.wikilinks {
-                // Try to resolve the wikilink to a note ID
-                if let Some(target_id) = self.title_to_id.get(&link_title.to_lowercase()) {
-                    outgoing_set.insert(target_id.clone());
+            for parsed_link in &note.parsed_links {
+                if let Some(target_id) =
+                    self.title_to_id.get(&parsed_link.target_title.to_lowercase())
+                {
+                    // Avoid duplicate edges to the same target
+                    if !outgoing_edges.iter().any(|e| e.target_id == *target_id) {
+                        outgoing_edges.push(TypedEdge {
+                            target_id: target_id.clone(),
+                            relation: parsed_link.relation.clone(),
+                        });
 
-                    // Add backlink
-                    self.backlinks
-                        .entry(target_id.clone())
-                        .or_default()
-                        .insert(note.id.clone());
+                        // Add backlink with reverse relation
+                        self.backlinks
+                            .entry(target_id.clone())
+                            .or_default()
+                            .push(TypedEdge {
+                                target_id: note.id.clone(),
+                                relation: parsed_link.relation.reverse(),
+                            });
+                    }
                 }
             }
         }
@@ -79,37 +91,47 @@ impl GraphIndex {
             .insert(note.title.to_lowercase(), note.id.clone());
         self.note_meta.insert(note.id.clone(), NoteMeta::from(note));
 
-        // Add new links
-        let outgoing_set = self.outgoing.entry(note.id.clone()).or_default();
+        // Add new typed links
+        let outgoing_edges = self.outgoing.entry(note.id.clone()).or_default();
 
-        for link_title in &note.wikilinks {
-            if let Some(target_id) = self.title_to_id.get(&link_title.to_lowercase()) {
-                outgoing_set.insert(target_id.clone());
+        for parsed_link in &note.parsed_links {
+            if let Some(target_id) =
+                self.title_to_id.get(&parsed_link.target_title.to_lowercase())
+            {
+                if !outgoing_edges.iter().any(|e| e.target_id == *target_id) {
+                    outgoing_edges.push(TypedEdge {
+                        target_id: target_id.clone(),
+                        relation: parsed_link.relation.clone(),
+                    });
 
-                self.backlinks
-                    .entry(target_id.clone())
-                    .or_default()
-                    .insert(note.id.clone());
+                    self.backlinks
+                        .entry(target_id.clone())
+                        .or_default()
+                        .push(TypedEdge {
+                            target_id: note.id.clone(),
+                            relation: parsed_link.relation.reverse(),
+                        });
+                }
             }
         }
     }
 
     /// Remove a note from the index
     pub fn remove_note(&mut self, note_id: &str) {
-        // Remove outgoing links
+        // Remove outgoing links and clean up corresponding backlinks
         if let Some(outgoing) = self.outgoing.remove(note_id) {
-            for target_id in outgoing {
-                if let Some(backlinks) = self.backlinks.get_mut(&target_id) {
-                    backlinks.remove(note_id);
+            for edge in outgoing {
+                if let Some(backlinks) = self.backlinks.get_mut(&edge.target_id) {
+                    backlinks.retain(|e| e.target_id != note_id);
                 }
             }
         }
 
-        // Remove backlinks pointing to this note
+        // Remove backlinks pointing to this note and clean up corresponding outgoing
         if let Some(backlinks) = self.backlinks.remove(note_id) {
-            for source_id in backlinks {
-                if let Some(outgoing) = self.outgoing.get_mut(&source_id) {
-                    outgoing.remove(note_id);
+            for edge in backlinks {
+                if let Some(outgoing) = self.outgoing.get_mut(&edge.target_id) {
+                    outgoing.retain(|e| e.target_id != note_id);
                 }
             }
         }
@@ -123,9 +145,10 @@ impl GraphIndex {
     pub fn get_backlinks(&self, note_id: &str) -> Vec<NoteMeta> {
         self.backlinks
             .get(note_id)
-            .map(|ids| {
-                ids.iter()
-                    .filter_map(|id| self.note_meta.get(id).cloned())
+            .map(|edges| {
+                edges
+                    .iter()
+                    .filter_map(|e| self.note_meta.get(&e.target_id).cloned())
                     .collect()
             })
             .unwrap_or_default()
@@ -135,25 +158,61 @@ impl GraphIndex {
     pub fn get_outgoing(&self, note_id: &str) -> Vec<NoteMeta> {
         self.outgoing
             .get(note_id)
-            .map(|ids| {
-                ids.iter()
-                    .filter_map(|id| self.note_meta.get(id).cloned())
+            .map(|edges| {
+                edges
+                    .iter()
+                    .filter_map(|e| self.note_meta.get(&e.target_id).cloned())
                     .collect()
             })
             .unwrap_or_default()
     }
 
-    /// Get all neighbors (both backlinks and outgoing) for graph visualization
+    /// Get typed backlinks with relationship information
+    pub fn get_typed_backlinks(&self, note_id: &str) -> Vec<(NoteMeta, RelationType)> {
+        self.backlinks
+            .get(note_id)
+            .map(|edges| {
+                edges
+                    .iter()
+                    .filter_map(|e| {
+                        self.note_meta
+                            .get(&e.target_id)
+                            .map(|meta| (meta.clone(), e.relation.clone()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Get typed outgoing links with relationship information
+    pub fn get_typed_outgoing(&self, note_id: &str) -> Vec<(NoteMeta, RelationType)> {
+        self.outgoing
+            .get(note_id)
+            .map(|edges| {
+                edges
+                    .iter()
+                    .filter_map(|e| {
+                        self.note_meta
+                            .get(&e.target_id)
+                            .map(|meta| (meta.clone(), e.relation.clone()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Get all neighbors (both backlinks and outgoing) with typed relationships
     pub fn get_neighbors(&self, note_id: &str) -> Vec<GraphNeighbor> {
         let mut neighbors = Vec::new();
 
         // Add outgoing links
         if let Some(outgoing) = self.outgoing.get(note_id) {
-            for target_id in outgoing {
-                if let Some(meta) = self.note_meta.get(target_id) {
+            for edge in outgoing {
+                if let Some(meta) = self.note_meta.get(&edge.target_id) {
                     neighbors.push(GraphNeighbor {
                         note: meta.clone(),
-                        link_type: LinkType::Outgoing,
+                        direction: LinkDirection::Outgoing,
+                        relation: edge.relation.clone(),
                     });
                 }
             }
@@ -161,11 +220,12 @@ impl GraphIndex {
 
         // Add backlinks
         if let Some(backlinks) = self.backlinks.get(note_id) {
-            for source_id in backlinks {
-                if let Some(meta) = self.note_meta.get(source_id) {
+            for edge in backlinks {
+                if let Some(meta) = self.note_meta.get(&edge.target_id) {
                     neighbors.push(GraphNeighbor {
                         note: meta.clone(),
-                        link_type: LinkType::Backlink,
+                        direction: LinkDirection::Backlink,
+                        relation: edge.relation.clone(),
                     });
                 }
             }
@@ -229,11 +289,12 @@ impl GraphIndex {
         }
 
         // Build links from outgoing map
-        for (source, targets) in &self.outgoing {
-            for target in targets {
+        for (source, edges) in &self.outgoing {
+            for edge in edges {
                 links.push(GraphLink {
                     source: source.clone(),
-                    target: target.clone(),
+                    target: edge.target_id.clone(),
+                    relation: edge.relation.to_string(),
                 });
             }
         }
@@ -279,11 +340,12 @@ pub struct GraphNode {
     pub group: String,
 }
 
-/// A directed link between two nodes
+/// A directed link between two nodes with relationship type
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct GraphLink {
     pub source: String,
     pub target: String,
+    pub relation: String,
 }
 
 /// Statistics about the note graph
