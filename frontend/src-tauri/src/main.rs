@@ -8,6 +8,7 @@ mod services;
 use models::boot::BootStatus;
 use services::{
     canvas_store::CanvasStore,
+    chunk_index::ChunkIndex,
     feedback::FeedbackService,
     graph_index::GraphIndex,
     knowledge_store::KnowledgeStore,
@@ -34,6 +35,7 @@ pub struct AppState {
     pub settings_service: Arc<RwLock<SettingsService>>,
     pub priority_service: Arc<RwLock<PriorityScoringService>>,
     pub retrieval_service: Arc<RwLock<RetrievalService>>,
+    pub chunk_index: Arc<RwLock<ChunkIndex>>,
     /// MemoryService is stateless — no lock needed, just Arc for shared ownership
     pub memory_service: Arc<MemoryService>,
     pub boot_state: Arc<RwLock<BootStatus>>,
@@ -87,6 +89,22 @@ fn main() {
                     })
                 }
             };
+            // Initialize chunk index (parallel to search index)
+            let chunk_index = match ChunkIndex::new(data_path.clone()) {
+                Ok(c) => c,
+                Err(e) => {
+                    log::error!("Failed to initialize chunk index: {}. Attempting rebuild.", e);
+                    let chunk_path = data_path.join("chunk_index");
+                    if chunk_path.exists() {
+                        let _ = std::fs::remove_dir_all(&chunk_path);
+                    }
+                    ChunkIndex::new(data_path.clone()).unwrap_or_else(|e2| {
+                        log::error!("Chunk index initialization failed: {}", e2);
+                        std::process::exit(1);
+                    })
+                }
+            };
+
             let canvas_store = CanvasStore::new(data_path.join("canvas"));
 
             // Get OpenRouter API key from settings, fall back to environment
@@ -119,6 +137,7 @@ fn main() {
                 settings_service: Arc::new(RwLock::new(settings_service)),
                 priority_service: Arc::new(RwLock::new(priority_service)),
                 retrieval_service: Arc::new(RwLock::new(retrieval_service)),
+                chunk_index: Arc::new(RwLock::new(chunk_index)),
                 memory_service: Arc::new(MemoryService::new()),
                 boot_state,
             };
@@ -266,6 +285,13 @@ async fn warm_start_services(app_handle: tauri::AppHandle, state: AppState) -> R
     {
         let mut search = state.search_service.write().await;
         search.reindex_all(&full_notes).map_err(|e| e.to_string())?;
+    }
+
+    {
+        let mut chunks = state.chunk_index.write().await;
+        if let Err(e) = chunks.reindex_all(&full_notes) {
+            log::error!("Failed to build chunk index: {}", e);
+        }
     }
 
     publish_boot_status(
