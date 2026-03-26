@@ -25,7 +25,7 @@
     "generate-icons": "node scripts/generate-icons.cjs && npx tauri icon src-tauri/icons/app-icon.png"
   },
   "dependencies": {
-    "@tauri-apps/api": "^1.6.0",
+    "@tauri-apps/api": "^2.10.1",
     "d3-drag": "^3.0.0",
     "d3-force": "^3.0.0",
     "d3-selection": "^3.0.0",
