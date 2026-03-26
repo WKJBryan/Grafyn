@@ -276,14 +276,27 @@ function initGraph() {
     .force('y', forceY(canvasHeight / 2).strength(currentForces.value.center))
     .force('collide', forceCollide(30).strength(0.7))
     
-  // Draw lines
+  // Relation type → link color mapping
+  const relationColors = {
+    supports: '#4ade80',     // green
+    contradicts: '#f87171',  // red
+    expands: '#60a5fa',      // blue
+    questions: '#fbbf24',    // yellow
+    answers: '#a78bfa',      // purple
+    example: '#2dd4bf',      // teal
+    part_of: '#fb923c',      // orange
+    related: '#6b7280',      // gray
+    untyped: '#4a4a4f',      // default
+  }
+
+  // Draw lines with relation-based coloring
   const link = zoomGroup.append('g')
     .attr('class', 'links-group')
-    .attr('stroke', '#4a4a4f')
     .attr('stroke-opacity', 0.6)
     .selectAll('line')
     .data(links)
     .join('line')
+    .attr('stroke', d => relationColors[d.relation] || '#4a4a4f')
     .attr('stroke-width', currentDisplay.value.linkThickness)
     .attr('marker-end', currentDisplay.value.arrows ? 'url(#arrowhead)' : null)
     

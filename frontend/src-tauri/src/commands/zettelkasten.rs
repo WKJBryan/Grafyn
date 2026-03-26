@@ -1,6 +1,6 @@
 use crate::models::note::{
     ApplyLinksRequest, ApplyLinksResponse, CreateLinkResponse, DiscoverLinksResponse, NoteUpdate,
-    ZettelLinkCandidate,
+    RelationType, ZettelLinkCandidate,
 };
 use crate::services::openrouter::ChatMessage;
 use crate::services::yake::{self, YakeConfig, STOPWORDS};
@@ -28,35 +28,34 @@ lazy_static! {
 
 // ── Link type definitions ────────────────────────────────────────────────
 
-/// Hardcoded link type definitions matching the Python API
+/// Link type definitions derived from the RelationType enum
 fn link_type_definitions() -> Vec<serde_json::Value> {
-    serde_json::json!([
-        { "id": "related",     "label": "Related",     "description": "General topical relationship", "reverse": "related" },
-        { "id": "supports",    "label": "Supports",    "description": "Provides evidence or backing", "reverse": "related" },
-        { "id": "contradicts", "label": "Contradicts", "description": "Presents opposing evidence",  "reverse": "contradicts" },
-        { "id": "expands",     "label": "Expands",     "description": "Elaborates on the concept",   "reverse": "related" },
-        { "id": "questions",   "label": "Questions",   "description": "Raises questions about",      "reverse": "answers" },
-        { "id": "answers",     "label": "Answers",     "description": "Answers questions from",      "reverse": "questions" },
-        { "id": "example",     "label": "Example",     "description": "Provides a concrete example", "reverse": "related" },
-        { "id": "part_of",     "label": "Part Of",     "description": "Is a component of",           "reverse": "related" }
-    ])
-    .as_array()
-    .unwrap()
-    .clone()
+    let types = [
+        (RelationType::Related, "Related", "General topical relationship"),
+        (RelationType::Supports, "Supports", "Provides evidence or backing"),
+        (RelationType::Contradicts, "Contradicts", "Presents opposing evidence"),
+        (RelationType::Expands, "Expands", "Elaborates on the concept"),
+        (RelationType::Questions, "Questions", "Raises questions about"),
+        (RelationType::Answers, "Answers", "Answers questions from"),
+        (RelationType::Example, "Example", "Provides a concrete example"),
+        (RelationType::PartOf, "Part Of", "Is a component of"),
+    ];
+    types
+        .iter()
+        .map(|(rt, label, desc)| {
+            serde_json::json!({
+                "id": rt.to_string(),
+                "label": label,
+                "description": desc,
+                "reverse": rt.reverse().to_string(),
+            })
+        })
+        .collect()
 }
 
 /// Get the reverse link type for bidirectional linking
-fn reverse_link_type(link_type: &str) -> &'static str {
-    match link_type {
-        "supports" => "related",
-        "contradicts" => "contradicts",
-        "expands" => "related",
-        "questions" => "answers",
-        "answers" => "questions",
-        "example" => "related",
-        "part_of" => "related",
-        _ => "related",
-    }
+fn reverse_link_type(link_type: &str) -> String {
+    RelationType::from_str_lossy(link_type).reverse().to_string()
 }
 
 // ── Key term extraction ──────────────────────────────────────────────────
@@ -701,7 +700,7 @@ pub async fn apply_links(
         };
 
         {
-            if let Some(new_content) = add_wikilink_to_content(&target_content, &source_title, reverse_type) {
+            if let Some(new_content) = add_wikilink_to_content(&target_content, &source_title, &reverse_type) {
                 let mut store = state.knowledge_store.write().await;
                 let _ = store.update_note(
                     &candidate.target_id,
@@ -796,7 +795,7 @@ pub async fn create_link(
         let store = state.knowledge_store.read().await;
         let target = store.get_note(&targetId).map_err(|e| e.to_string())?;
 
-        if let Some(new_content) = add_wikilink_to_content(&target.content, &source_title, reverse) {
+        if let Some(new_content) = add_wikilink_to_content(&target.content, &source_title, &reverse) {
             drop(store);
             let mut store = state.knowledge_store.write().await;
             let _ = store.update_note(

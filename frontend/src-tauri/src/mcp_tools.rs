@@ -144,6 +144,15 @@ struct NoteMetaResponse {
     tags: Vec<String>,
 }
 
+#[derive(Serialize)]
+struct TypedNoteMetaResponse {
+    id: String,
+    title: String,
+    status: String,
+    tags: Vec<String>,
+    relation: String,
+}
+
 fn text_result(text: String) -> Result<CallToolResult, McpError> {
     Ok(CallToolResult::success(vec![Content::text(text)]))
 }
@@ -359,39 +368,41 @@ impl GrafynMcpServer {
         }
     }
 
-    #[tool(description = "Get all notes that link TO a specific note (backlinks). Shows which notes reference this one via [[wikilinks]].")]
+    #[tool(description = "Get all notes that link TO a specific note (backlinks) with relationship types. Shows which notes reference this one via [[wikilinks]] and how they relate (supports, contradicts, expands, etc.).")]
     async fn get_backlinks(
         &self,
         Parameters(params): Parameters<BacklinksParams>,
     ) -> Result<CallToolResult, McpError> {
         let graph = self.graph_index.read().await;
-        let backlinks = graph.get_backlinks(&params.note_id);
-        let response: Vec<NoteMetaResponse> = backlinks
+        let backlinks = graph.get_typed_backlinks(&params.note_id);
+        let response: Vec<TypedNoteMetaResponse> = backlinks
             .into_iter()
-            .map(|n| NoteMetaResponse {
+            .map(|(n, relation)| TypedNoteMetaResponse {
                 id: n.id,
                 title: n.title,
                 status: n.status.to_string(),
                 tags: n.tags,
+                relation: relation.to_string(),
             })
             .collect();
         json_result(&response)
     }
 
-    #[tool(description = "Get all notes that a specific note links FROM (outgoing links). Shows what [[wikilinks]] exist in the note's content.")]
+    #[tool(description = "Get all notes that a specific note links FROM (outgoing links) with relationship types. Shows what [[wikilinks]] exist in the note's content and the relationship type (supports, contradicts, expands, etc.).")]
     async fn get_outgoing(
         &self,
         Parameters(params): Parameters<OutgoingParams>,
     ) -> Result<CallToolResult, McpError> {
         let graph = self.graph_index.read().await;
-        let outgoing = graph.get_outgoing(&params.note_id);
-        let response: Vec<NoteMetaResponse> = outgoing
+        let outgoing = graph.get_typed_outgoing(&params.note_id);
+        let response: Vec<TypedNoteMetaResponse> = outgoing
             .into_iter()
-            .map(|n| NoteMetaResponse {
+            .map(|(n, relation)| TypedNoteMetaResponse {
                 id: n.id,
                 title: n.title,
                 status: n.status.to_string(),
                 tags: n.tags,
+                relation: relation.to_string(),
             })
             .collect();
         json_result(&response)
