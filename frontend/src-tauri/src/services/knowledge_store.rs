@@ -1,4 +1,6 @@
-use crate::models::note::{Note, NoteCreate, NoteFrontmatter, NoteMeta, NoteUpdate};
+use crate::models::note::{
+    Note, NoteCreate, NoteFrontmatter, NoteMeta, NoteUpdate, ParsedLink, RelationType,
+};
 use anyhow::{Context, Result};
 use chrono::Utc;
 use gray_matter::{engine::YAML, Matter};
@@ -10,6 +12,11 @@ use walkdir::WalkDir;
 lazy_static! {
     /// Regex for extracting wikilinks: [[Target]] or [[Target|Display]]
     static ref WIKILINK_REGEX: Regex = Regex::new(r"\[\[([^\]|]+)(?:\|[^\]]+)?\]\]").unwrap();
+
+    /// Regex for extracting typed wikilinks: [[Target]] (relation_type)
+    /// Captures: group 1 = target title, group 2 = optional relation type
+    static ref TYPED_WIKILINK_REGEX: Regex =
+        Regex::new(r"\[\[([^\]|]+)(?:\|[^\]]+)?\]\]\s*(?:\((\w+)\))?").unwrap();
 }
 
 /// Service for managing markdown notes with YAML frontmatter
@@ -94,12 +101,14 @@ impl KnowledgeStore {
             created_at: now,
             updated_at: now,
             wikilinks: Vec::new(),
+            parsed_links: Vec::new(),
             properties: create.properties,
         };
 
         // Extract wikilinks from content
         let mut note = note;
         note.wikilinks = self.extract_wikilinks(&note.content);
+        note.parsed_links = self.extract_typed_wikilinks(&note.content);
 
         self.write_note_file(&note)?;
 
@@ -120,6 +129,7 @@ impl KnowledgeStore {
         if let Some(content) = update.content {
             note.content = content;
             note.wikilinks = self.extract_wikilinks(&note.content);
+            note.parsed_links = self.extract_typed_wikilinks(&note.content);
         }
         if let Some(status) = update.status {
             note.status = status;
@@ -161,11 +171,30 @@ impl KnowledgeStore {
         Ok(())
     }
 
-    /// Extract wikilinks from markdown content
+    /// Extract wikilinks from markdown content (titles only, for backward compat)
     pub fn extract_wikilinks(&self, content: &str) -> Vec<String> {
         WIKILINK_REGEX
             .captures_iter(content)
             .filter_map(|cap| cap.get(1).map(|m| m.as_str().to_string()))
+            .collect()
+    }
+
+    /// Extract typed wikilinks with relationship information
+    /// Parses: [[Target]] (supports), [[Target]], - [[Target]] (expands)
+    pub fn extract_typed_wikilinks(&self, content: &str) -> Vec<ParsedLink> {
+        TYPED_WIKILINK_REGEX
+            .captures_iter(content)
+            .filter_map(|cap| {
+                let target_title = cap.get(1)?.as_str().to_string();
+                let relation = cap
+                    .get(2)
+                    .map(|m| RelationType::from_str_lossy(m.as_str()))
+                    .unwrap_or(RelationType::Untyped);
+                Some(ParsedLink {
+                    target_title,
+                    relation,
+                })
+            })
             .collect()
     }
 
@@ -249,6 +278,7 @@ impl KnowledgeStore {
 
         let body = parsed.content;
         let wikilinks = self.extract_wikilinks(&body);
+        let parsed_links = self.extract_typed_wikilinks(&body);
 
         Ok(Note {
             id,
@@ -259,6 +289,7 @@ impl KnowledgeStore {
             created_at,
             updated_at,
             wikilinks,
+            parsed_links,
             properties: frontmatter.extra,
         })
     }

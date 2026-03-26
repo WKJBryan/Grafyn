@@ -382,6 +382,15 @@ mod tests {
     use std::collections::HashMap;
 
     fn make_note(id: &str, title: &str, wikilinks: Vec<&str>) -> Note {
+        use crate::models::note::{ParsedLink, RelationType};
+        let wikilink_strings: Vec<String> = wikilinks.into_iter().map(String::from).collect();
+        let parsed_links = wikilink_strings
+            .iter()
+            .map(|title| ParsedLink {
+                target_title: title.clone(),
+                relation: RelationType::Untyped,
+            })
+            .collect();
         Note {
             id: id.to_string(),
             title: title.to_string(),
@@ -390,7 +399,8 @@ mod tests {
             tags: vec![],
             created_at: Utc::now(),
             updated_at: Utc::now(),
-            wikilinks: wikilinks.into_iter().map(String::from).collect(),
+            wikilinks: wikilink_strings,
+            parsed_links,
             properties: HashMap::new(),
         }
     }
