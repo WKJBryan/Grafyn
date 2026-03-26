@@ -64,7 +64,7 @@ uuid = { version = "1.6", features = ["v4", "serde"] }
 anyhow = "1.0"
 
 # HTTP client for OpenRouter
-reqwest = { version = "0.12", features = ["json", "stream"] }
+reqwest = { version = "0.13", features = ["json", "stream"] }
 futures = "0.3"
 
 # Logging
