@@ -11,9 +11,16 @@ function mountDialog(props = {}) {
     global: {
       stubs: {
         ModelSelector: {
-          props: ['modelValue'],
-          emits: ['update:modelValue'],
-          template: '<button class="model-selector-stub" @click="$emit(\'update:modelValue\', [\'openai/gpt-4o\'])" />'
+          props: ['modelValue', 'presets'],
+          emits: ['update:modelValue', 'create-preset'],
+          template: `
+            <div>
+              <div class="preset-props">{{ presets.length }}</div>
+              <div class="selection-props">{{ modelValue.length }}</div>
+              <button class="model-selector-stub" @click="$emit('update:modelValue', ['openai/gpt-4o'])" />
+              <button class="create-preset-stub" @click="$emit('create-preset', { name: 'Fast trio', modelIds: ['openai/gpt-4o'] })" />
+            </div>
+          `
         },
         ContextBudgetDisplay: {
           template: '<div class="budget-stub" />'
@@ -66,5 +73,24 @@ describe('PromptDialog', () => {
 
     expect(wrapper.find('.web-search-hint').text()).toContain('OpenRouter is not configured')
     expect(wrapper.find('.web-search-hint').classes()).toContain('disabled')
+  })
+
+  it('passes presets into the selector and starts with no selected models', () => {
+    const wrapper = mountDialog({
+      presets: [{ id: 'preset-1', name: 'Fast', model_ids: ['openai/gpt-4o'] }]
+    })
+
+    expect(wrapper.find('.preset-props').text()).toBe('1')
+    expect(wrapper.find('.selection-props').text()).toBe('0')
+  })
+
+  it('forwards preset creation events from the selector', async () => {
+    const wrapper = mountDialog()
+
+    await wrapper.find('.create-preset-stub').trigger('click')
+
+    expect(wrapper.emitted('create-preset')).toEqual([
+      [{ name: 'Fast trio', modelIds: ['openai/gpt-4o'] }]
+    ])
   })
 })

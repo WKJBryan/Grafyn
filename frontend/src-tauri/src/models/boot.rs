@@ -58,9 +58,9 @@ mod tests {
 
     #[test]
     fn failed_status_preserves_error() {
-        let status = BootStatus::failed("building_indices", "Startup failed", "disk error");
+        let status = BootStatus::failed("building_search_index", "Startup failed", "disk error");
         assert!(!status.ready);
-        assert_eq!(status.phase, "building_indices");
+        assert_eq!(status.phase, "building_search_index");
         assert_eq!(status.error.as_deref(), Some("disk error"));
     }
 }

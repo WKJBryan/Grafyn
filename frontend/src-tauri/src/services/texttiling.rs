@@ -264,8 +264,8 @@ fn map_boundaries_to_offsets(
 /// Searches within 200 characters in either direction.
 fn snap_to_paragraph(text: &str, pos: usize) -> usize {
     let search_range = 200;
-    let start = pos.saturating_sub(search_range);
-    let end = (pos + search_range).min(text.len());
+    let start = previous_char_boundary(text, pos.saturating_sub(search_range));
+    let end = next_char_boundary(text, (pos + search_range).min(text.len()));
 
     if end <= start {
         return pos;
@@ -293,6 +293,22 @@ fn snap_to_paragraph(text: &str, pos: usize) -> usize {
     }
 
     best_pos
+}
+
+fn previous_char_boundary(text: &str, mut index: usize) -> usize {
+    index = index.min(text.len());
+    while index > 0 && !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
+fn next_char_boundary(text: &str, mut index: usize) -> usize {
+    index = index.min(text.len());
+    while index < text.len() && !text.is_char_boundary(index) {
+        index += 1;
+    }
+    index
 }
 
 // ── Short segment merging ────────────────────────────────────────────────
@@ -589,6 +605,16 @@ mod tests {
         let snapped = snap_to_paragraph(text, 25);
         // Should snap to the \n\n at position 21, returning position 23 (after \n\n)
         assert_eq!(snapped, 23);
+    }
+
+    #[test]
+    fn test_snap_to_paragraph_handles_unicode_boundaries() {
+        let text = format!("{}—{}\n\nNext paragraph here.", "a".repeat(202), "b".repeat(250));
+        let snapped = snap_to_paragraph(&text, 403);
+        let expected = text.find("\n\n").unwrap() + 2;
+
+        assert_eq!(snapped, expected);
+        assert!(text.is_char_boundary(snapped));
     }
 
     #[test]

@@ -157,4 +157,87 @@ describe('Canvas Store', () => {
       error_message: 'OpenRouter request failed: rate limit exceeded'
     })
   })
+
+  it('sendPrompt stores empty model completions as an error response', async () => {
+    let streamHandler
+    listenMock.mockImplementation(async (_eventName, handler) => {
+      streamHandler = handler
+      return unlistenMock
+    })
+
+    vi.spyOn(apiClient.canvas, 'sendPrompt').mockImplementation(async () => {
+      streamHandler({
+        payload: {
+          session_id: 'session-1',
+          type: 'tile_created',
+          tile: {
+            id: 'tile-1',
+            prompt: 'Hello',
+            responses: {
+              'openai/gpt-4': {
+                status: 'pending',
+                content: '',
+                position: { x: 0, y: 0, width: 280, height: 200 }
+              }
+            }
+          }
+        }
+      })
+      streamHandler({
+        payload: {
+          session_id: 'session-1',
+          type: 'error',
+          tile_id: 'tile-1',
+          model_id: 'openai/gpt-4',
+          error: 'No response returned from model'
+        }
+      })
+      return 'tile-1'
+    })
+
+    const store = useCanvasStore()
+    store.currentSession = {
+      id: 'session-1',
+      prompt_tiles: [],
+      debates: []
+    }
+
+    await store.sendPrompt('Hello', ['openai/gpt-4'])
+
+    expect(store.currentSession.prompt_tiles[0].responses['openai/gpt-4']).toMatchObject({
+      status: 'error',
+      content: '',
+      error_message: 'No response returned from model'
+    })
+  })
+
+  it('loadSession maps persisted backend errors onto response.error_message', async () => {
+    vi.spyOn(apiClient.canvas, 'get').mockResolvedValue({
+      id: 'session-1',
+      prompt_tiles: [
+        {
+          id: 'tile-1',
+          prompt: 'Hello',
+          responses: {
+            'openai/gpt-4': {
+              status: 'error',
+              content: '',
+              error: 'No response returned from model',
+              position: { x: 0, y: 0, width: 280, height: 200 }
+            }
+          }
+        }
+      ],
+      debates: []
+    })
+
+    const store = useCanvasStore()
+    await store.loadSession('session-1')
+
+    expect(store.currentSession.prompt_tiles[0].responses['openai/gpt-4']).toMatchObject({
+      status: 'error',
+      error: 'No response returned from model',
+      error_message: 'No response returned from model'
+    })
+  })
 })

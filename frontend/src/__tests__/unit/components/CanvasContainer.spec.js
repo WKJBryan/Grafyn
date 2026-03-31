@@ -2,7 +2,7 @@ import { describe, expect, it, beforeEach, vi } from 'vitest'
 import { mount, flushPromises } from '@vue/test-utils'
 import CanvasContainer from '@/components/canvas/CanvasContainer.vue'
 
-const { store, getOpenRouterStatus, getStatus } = vi.hoisted(() => ({
+const { store, getOpenRouterStatus, getStatus, getSettings, updateSettings, toastSuccess } = vi.hoisted(() => ({
   store: {
     currentSession: {
       id: 'session-1',
@@ -40,7 +40,10 @@ const { store, getOpenRouterStatus, getStatus } = vi.hoisted(() => ({
     updatePinnedNotes: vi.fn().mockResolvedValue()
   },
   getOpenRouterStatus: vi.fn(),
-  getStatus: vi.fn()
+  getStatus: vi.fn(),
+  getSettings: vi.fn(),
+  updateSettings: vi.fn(),
+  toastSuccess: vi.fn()
 }))
 
 vi.mock('@/stores/canvas', () => ({
@@ -49,10 +52,23 @@ vi.mock('@/stores/canvas', () => ({
 
 vi.mock('@/api/client', () => ({
   settings: {
+    get: getSettings,
     getOpenRouterStatus,
-    getStatus
+    getStatus,
+    update: updateSettings
   },
   isDesktopApp: () => true
+}))
+
+vi.mock('@/composables/useToast', () => ({
+  useToast: () => ({
+    success: toastSuccess,
+    error: vi.fn(),
+    warning: vi.fn(),
+    info: vi.fn(),
+    remove: vi.fn(),
+    toasts: []
+  })
 }))
 
 vi.mock('d3-selection', () => ({
@@ -117,7 +133,7 @@ function mountContainer() {
         AddModelDialog: { template: '<div />' },
         PinnedNotesPanel: { template: '<div />' },
         PromptDialog: {
-          props: ['models', 'branchContext', 'smartWebSearch', 'openRouterConfigured'],
+          props: ['models', 'presets', 'branchContext', 'smartWebSearch', 'openRouterConfigured'],
           template: `
             <div class="prompt-dialog-stub">
               <button class="submit-stub" @click="$emit('submit', {
@@ -128,6 +144,33 @@ function mountContainer() {
                 contextMode: 'knowledge_search',
                 webSearch: false
               })" />
+            </div>
+          `
+        }
+      }
+    }
+  })
+}
+
+function mountContainerWithPresetPromptStub() {
+  return mount(CanvasContainer, {
+    props: {
+      sessionId: 'session-1'
+    },
+    global: {
+      stubs: {
+        PromptNode: { template: '<div />' },
+        LLMNode: { template: '<div />' },
+        DebateNode: { template: '<div />' },
+        AddModelDialog: { template: '<div />' },
+        PinnedNotesPanel: { template: '<div />' },
+        PromptDialog: {
+          props: ['presets'],
+          template: `
+            <div class="prompt-dialog-stub">
+              <div class="preset-count">{{ presets.length }}</div>
+              <button class="create-preset-stub" @click="$emit('create-preset', { name: 'Fast trio', modelIds: ['openai/gpt-4o'] })" />
+              <button class="update-preset-stub" @click="$emit('update-preset', { id: 'preset-1', modelIds: ['openai/gpt-4o'] })" />
             </div>
           `
         }
@@ -172,7 +215,10 @@ describe('CanvasContainer', () => {
     store.promptTiles = []
     store.debates = []
     store.availableModels = [{ id: 'openai/gpt-4o', name: 'GPT-4o', context_length: 128000 }]
+    getSettings.mockResolvedValue({ smart_web_search: true, canvas_model_presets: [] })
     getStatus.mockResolvedValue({ smart_web_search: true })
+    updateSettings.mockResolvedValue({})
+    toastSuccess.mockReset()
   })
 
   it('opens the API key required dialog when the prompt button is clicked without a configured key', async () => {
@@ -291,5 +337,75 @@ describe('CanvasContainer', () => {
     expect(dialog.exists()).toBe(true)
     expect(dialog.text()).toContain('openai/gpt-4o')
     expect(dialog.text()).toContain('anthropic/claude-3.5-sonnet')
+  })
+
+  it('loads saved presets from settings and passes them into the prompt dialog', async () => {
+    getOpenRouterStatus.mockResolvedValue({ has_key: true, is_configured: true })
+    getSettings.mockResolvedValue({
+      smart_web_search: true,
+      canvas_model_presets: [
+        { id: 'preset-1', name: 'Quality', model_ids: ['openai/gpt-4o'] }
+      ]
+    })
+
+    const wrapper = mountContainerWithPresetPromptStub()
+    await flushPromises()
+
+    await wrapper.find('[data-guide="canvas-prompt-btn"]').trigger('click')
+    await flushPromises()
+
+    expect(wrapper.find('.preset-count').text()).toBe('1')
+  })
+
+  it('persists a created preset through settings updates', async () => {
+    getOpenRouterStatus.mockResolvedValue({ has_key: true, is_configured: true })
+
+    const wrapper = mountContainerWithPresetPromptStub()
+    await flushPromises()
+
+    await wrapper.find('[data-guide="canvas-prompt-btn"]').trigger('click')
+    await flushPromises()
+    await wrapper.find('.create-preset-stub').trigger('click')
+    await flushPromises()
+
+    expect(updateSettings).toHaveBeenCalledWith({
+      canvas_model_presets: [
+        expect.objectContaining({
+          name: 'Fast trio',
+          model_ids: ['openai/gpt-4o']
+        })
+      ]
+    })
+    expect(wrapper.text()).toContain('Saved preset "Fast trio"')
+  })
+
+  it('persists preset model updates through settings updates', async () => {
+    getOpenRouterStatus.mockResolvedValue({ has_key: true, is_configured: true })
+    getSettings.mockResolvedValue({
+      smart_web_search: true,
+      canvas_model_presets: [
+        { id: 'preset-1', name: 'Quality', model_ids: ['anthropic/claude-3.5-sonnet'] }
+      ]
+    })
+
+    const wrapper = mountContainerWithPresetPromptStub()
+    await flushPromises()
+
+    await wrapper.find('[data-guide="canvas-prompt-btn"]').trigger('click')
+    await flushPromises()
+    await wrapper.find('.update-preset-stub').trigger('click')
+    await flushPromises()
+
+    expect(updateSettings).toHaveBeenCalledWith({
+      canvas_model_presets: [
+        {
+          id: 'preset-1',
+          name: 'Quality',
+          model_ids: ['openai/gpt-4o']
+        }
+      ]
+    })
+    expect(toastSuccess).toHaveBeenCalledWith('Updated preset "Quality"', 2500)
+    expect(wrapper.text()).toContain('Updated preset "Quality"')
   })
 })
