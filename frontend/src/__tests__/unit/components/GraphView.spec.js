@@ -146,8 +146,8 @@ describe('GraphView', () => {
   it('waits for boot readiness before loading graph data', async () => {
     const bootStore = useBootStore()
     bootStore.setStatus({
-      phase: 'building_indices',
-      message: 'Building graph and search index',
+      phase: 'building_search_index',
+      message: 'Building search index',
       ready: false,
       error: null,
     })

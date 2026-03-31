@@ -7,6 +7,7 @@ use crate::models::canvas::{
 };
 use crate::models::note::{NoteCreate, NoteStatus};
 use crate::services::openrouter::ChatMessage;
+use crate::services::retrieval::RetrievalResult;
 use crate::AppState;
 use chrono::Utc;
 use futures::StreamExt;
@@ -16,6 +17,16 @@ use tauri::State;
 
 const COMPACT_HISTORY_RECENT_TURNS: usize = 2;
 const COMPACT_HISTORY_EXCERPT_CHARS: usize = 240;
+const EMPTY_MODEL_RESPONSE_ERROR: &str = "No response returned from model";
+const MIN_RETRIEVAL_SCORE_FOR_NOTES: f32 = 5.0;
+const MIN_CANVAS_QUERY_TOKEN_LEN: usize = 3;
+const CANVAS_RETRIEVAL_STOPWORDS: &[&str] = &[
+    "a", "an", "and", "are", "as", "at", "be", "but", "by", "can", "do", "for", "from", "how",
+    "i", "if", "in", "into", "is", "it", "its", "like", "make", "more", "my", "not", "of",
+    "on", "or", "our", "real", "so", "that", "the", "their", "them", "there", "these", "they",
+    "this", "to", "up", "use", "want", "was", "we", "what", "when", "where", "which", "who",
+    "why", "with", "works", "would", "you", "your",
+];
 
 // LLM node layout constants
 const LLM_NODE_WIDTH: f64 = 280.0;
@@ -35,6 +46,18 @@ struct ResolvedPromptContext {
     messages: Vec<ChatMessage>,
     context_notes: Vec<TileContextNote>,
     system_prompt: Option<String>,
+}
+
+type StreamedResponseUpdate = (String, String, ResponseStatus, Option<String>);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetrievalDecisionReason {
+    NoResults,
+    WeakTopScore,
+    NoKeywordMatch,
+    NoSnippet,
+    NoLexicalOverlap,
+    UseRetrievedNotes,
 }
 
 /// List all canvas sessions
@@ -248,57 +271,43 @@ pub async fn send_prompt(
                                     }
                                 }
                                 Ok(Some(Err(e))) => {
-                                    let _ = window.emit(
-                                        "canvas-stream",
-                                        CanvasStreamEvent::Error {
-                                            session_id: session_id.clone(),
-                                            tile_id: tile_id.clone(),
-                                            model_id: model_id.clone(),
-                                            error: e.to_string(),
-                                        },
+                                    let error = e.to_string();
+                                    emit_canvas_error(
+                                        &window,
+                                        &session_id,
+                                        &tile_id,
+                                        &model_id,
+                                        &error,
                                     );
-                                    return (model_id, e.to_string(), ResponseStatus::Error);
+                                    return (model_id, String::new(), ResponseStatus::Error, Some(error));
                                 }
                                 Ok(None) => break, // Stream ended naturally
                                 Err(_) => {
-                                    let _ = window.emit(
-                                        "canvas-stream",
-                                        CanvasStreamEvent::Error {
-                                            session_id: session_id.clone(),
-                                            tile_id: tile_id.clone(),
-                                            model_id: model_id.clone(),
-                                            error: "Stream idle timeout (60s)".to_string(),
-                                        },
+                                    let error = "Stream idle timeout (60s)".to_string();
+                                    emit_canvas_error(
+                                        &window,
+                                        &session_id,
+                                        &tile_id,
+                                        &model_id,
+                                        &error,
                                     );
-                                    return (model_id, full_content, ResponseStatus::Error);
+                                    return (model_id, full_content, ResponseStatus::Error, Some(error));
                                 }
                             }
                         }
 
-                        // Emit per-model completion immediately
-                        let _ = window.emit(
-                            "canvas-stream",
-                            CanvasStreamEvent::Complete {
-                                session_id: session_id.clone(),
-                                tile_id: tile_id.clone(),
-                                model_id: model_id.clone(),
-                                tokens_used: None,
-                            },
-                        );
-
-                        (model_id, full_content, ResponseStatus::Completed)
+                        finalize_streamed_model_response(
+                            &window,
+                            &session_id,
+                            &tile_id,
+                            model_id,
+                            full_content,
+                        )
                     }
                     Err(e) => {
-                        let _ = window.emit(
-                            "canvas-stream",
-                            CanvasStreamEvent::Error {
-                                session_id: session_id.clone(),
-                                tile_id: tile_id.clone(),
-                                model_id: model_id.clone(),
-                                error: e.to_string(),
-                            },
-                        );
-                        (model_id, e.to_string(), ResponseStatus::Error)
+                        let error = e.to_string();
+                        emit_canvas_error(&window, &session_id, &tile_id, &model_id, &error);
+                        (model_id, String::new(), ResponseStatus::Error, Some(error))
                     }
                 }
             });
@@ -1135,56 +1144,43 @@ pub async fn add_models_to_tile(
                                     }
                                 }
                                 Ok(Some(Err(e))) => {
-                                    let _ = window.emit(
-                                        "canvas-stream",
-                                        CanvasStreamEvent::Error {
-                                            session_id: session_id.clone(),
-                                            tile_id: tile_id.clone(),
-                                            model_id: model_id.clone(),
-                                            error: e.to_string(),
-                                        },
+                                    let error = e.to_string();
+                                    emit_canvas_error(
+                                        &window,
+                                        &session_id,
+                                        &tile_id,
+                                        &model_id,
+                                        &error,
                                     );
-                                    return (model_id, e.to_string(), ResponseStatus::Error);
+                                    return (model_id, String::new(), ResponseStatus::Error, Some(error));
                                 }
                                 Ok(None) => break,
                                 Err(_) => {
-                                    let _ = window.emit(
-                                        "canvas-stream",
-                                        CanvasStreamEvent::Error {
-                                            session_id: session_id.clone(),
-                                            tile_id: tile_id.clone(),
-                                            model_id: model_id.clone(),
-                                            error: "Stream idle timeout (60s)".to_string(),
-                                        },
+                                    let error = "Stream idle timeout (60s)".to_string();
+                                    emit_canvas_error(
+                                        &window,
+                                        &session_id,
+                                        &tile_id,
+                                        &model_id,
+                                        &error,
                                     );
-                                    return (model_id, full_content, ResponseStatus::Error);
+                                    return (model_id, full_content, ResponseStatus::Error, Some(error));
                                 }
                             }
                         }
 
-                        let _ = window.emit(
-                            "canvas-stream",
-                            CanvasStreamEvent::Complete {
-                                session_id: session_id.clone(),
-                                tile_id: tile_id.clone(),
-                                model_id: model_id.clone(),
-                                tokens_used: None,
-                            },
-                        );
-
-                        (model_id, full_content, ResponseStatus::Completed)
+                        finalize_streamed_model_response(
+                            &window,
+                            &session_id,
+                            &tile_id,
+                            model_id,
+                            full_content,
+                        )
                     }
                     Err(e) => {
-                        let _ = window.emit(
-                            "canvas-stream",
-                            CanvasStreamEvent::Error {
-                                session_id: session_id.clone(),
-                                tile_id: tile_id.clone(),
-                                model_id: model_id.clone(),
-                                error: e.to_string(),
-                            },
-                        );
-                        (model_id, e.to_string(), ResponseStatus::Error)
+                        let error = e.to_string();
+                        emit_canvas_error(&window, &session_id, &tile_id, &model_id, &error);
+                        (model_id, String::new(), ResponseStatus::Error, Some(error))
                     }
                 }
             });
@@ -1252,6 +1248,7 @@ pub async fn regenerate_response(
         let _ = store.update_tile_response(
             &session_id, &tile_id, &model_id, "",
             ResponseStatus::Streaming,
+            None,
         );
     }
 
@@ -1281,6 +1278,7 @@ pub async fn regenerate_response(
             Ok(stream) => {
                 let mut stream = Box::pin(stream);
                 let mut full_content = String::new();
+                let mut final_error: Option<String> = None;
 
                 while let Some(chunk_result) = stream.next().await {
                     match chunk_result {
@@ -1299,55 +1297,48 @@ pub async fn regenerate_response(
                             }
                         }
                         Err(e) => {
-                            let _ = window.emit(
-                                "canvas-stream",
-                                CanvasStreamEvent::Error {
-                                    session_id: session_id.clone(),
-                                    tile_id: tile_id.clone(),
-                                    model_id: model_id.clone(),
-                                    error: e.to_string(),
-                                },
-                            );
+                            let error = e.to_string();
+                            emit_canvas_error(&window, &session_id, &tile_id, &model_id, &error);
+                            final_error = Some(error);
                             break;
                         }
                     }
                 }
 
+                let (final_content, final_status) = if final_error.is_some() {
+                    (full_content, ResponseStatus::Error)
+                } else {
+                    let update =
+                        classify_streamed_model_response(model_id.clone(), full_content.clone());
+                    final_error = update.3.clone();
+                    if let Some(error) = final_error.as_deref() {
+                        emit_canvas_error(&window, &session_id, &tile_id, &model_id, error);
+                    } else {
+                        emit_canvas_complete(&window, &session_id, &tile_id, &model_id);
+                    }
+                    (update.1, update.2)
+                };
+
                 {
                     let mut store = canvas_store_arc.write().await;
                     let _ = store.update_tile_response(
-                        &session_id, &tile_id, &model_id, &full_content,
-                        ResponseStatus::Completed,
+                        &session_id, &tile_id, &model_id, &final_content,
+                        final_status,
+                        final_error.as_deref(),
                     );
                 }
-
-                let _ = window.emit(
-                    "canvas-stream",
-                    CanvasStreamEvent::Complete {
-                        session_id: session_id.clone(),
-                        tile_id: tile_id.clone(),
-                        model_id: model_id.clone(),
-                        tokens_used: None,
-                    },
-                );
             }
             Err(e) => {
+                let error = e.to_string();
                 {
                     let mut store = canvas_store_arc.write().await;
                     let _ = store.update_tile_response(
-                        &session_id, &tile_id, &model_id, &e.to_string(),
+                        &session_id, &tile_id, &model_id, "",
                         ResponseStatus::Error,
+                        Some(error.as_str()),
                     );
                 }
-                let _ = window.emit(
-                    "canvas-stream",
-                    CanvasStreamEvent::Error {
-                        session_id: session_id.clone(),
-                        tile_id: tile_id.clone(),
-                        model_id: model_id.clone(),
-                        error: e.to_string(),
-                    },
-                );
+                emit_canvas_error(&window, &session_id, &tile_id, &model_id, &error);
             }
         }
 
@@ -1383,6 +1374,176 @@ fn prompt_request_from_tile(
     }
 }
 
+fn emit_canvas_error(
+    window: &tauri::Window,
+    session_id: &str,
+    tile_id: &str,
+    model_id: &str,
+    error: &str,
+) {
+    let _ = window.emit(
+        "canvas-stream",
+        CanvasStreamEvent::Error {
+            session_id: session_id.to_string(),
+            tile_id: tile_id.to_string(),
+            model_id: model_id.to_string(),
+            error: error.to_string(),
+        },
+    );
+}
+
+fn emit_canvas_complete(
+    window: &tauri::Window,
+    session_id: &str,
+    tile_id: &str,
+    model_id: &str,
+) {
+    let _ = window.emit(
+        "canvas-stream",
+        CanvasStreamEvent::Complete {
+            session_id: session_id.to_string(),
+            tile_id: tile_id.to_string(),
+            model_id: model_id.to_string(),
+            tokens_used: None,
+        },
+    );
+}
+
+fn finalize_streamed_model_response(
+    window: &tauri::Window,
+    session_id: &str,
+    tile_id: &str,
+    model_id: String,
+    full_content: String,
+) -> StreamedResponseUpdate {
+    let update = classify_streamed_model_response(model_id, full_content);
+
+    if let Some(error) = &update.3 {
+        emit_canvas_error(window, session_id, tile_id, &update.0, error);
+    } else {
+        emit_canvas_complete(window, session_id, tile_id, &update.0);
+    }
+
+    update
+}
+
+fn classify_streamed_model_response(
+    model_id: String,
+    full_content: String,
+) -> StreamedResponseUpdate {
+    if full_content.trim().is_empty() {
+        (
+            model_id,
+            String::new(),
+            ResponseStatus::Error,
+            Some(EMPTY_MODEL_RESPONSE_ERROR.to_string()),
+        )
+    } else {
+        (model_id, full_content, ResponseStatus::Completed, None)
+    }
+}
+
+fn truncate_note_context_content(content: &str, max_chars: usize) -> String {
+    let mut truncated = String::new();
+    let mut chars = content.chars();
+    for _ in 0..max_chars {
+        match chars.next() {
+            Some(ch) => truncated.push(ch),
+            None => return truncated,
+        }
+    }
+
+    if chars.next().is_some() {
+        truncated.push_str("...");
+    }
+
+    truncated
+}
+
+fn normalize_canvas_query_tokens(text: &str) -> Vec<String> {
+    let normalized: String = text
+        .chars()
+        .map(|ch| {
+            if ch.is_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                ' '
+            }
+        })
+        .collect();
+
+    normalized
+        .split_whitespace()
+        .filter(|token| token.len() >= MIN_CANVAS_QUERY_TOKEN_LEN)
+        .filter(|token| !CANVAS_RETRIEVAL_STOPWORDS.contains(token))
+        .map(str::to_string)
+        .collect()
+}
+
+fn matching_canvas_query_tokens(
+    query_tokens: &[String],
+    title: &str,
+    snippet: &str,
+) -> HashSet<String> {
+    let candidate_tokens: HashSet<String> = normalize_canvas_query_tokens(&format!(
+        "{} {}",
+        title, snippet
+    ))
+    .into_iter()
+    .collect();
+
+    query_tokens
+        .iter()
+        .filter(|token| candidate_tokens.contains(token.as_str()))
+        .cloned()
+        .collect()
+}
+
+fn should_use_retrieved_notes(
+    prompt: &str,
+    retrieval_results: &[RetrievalResult],
+) -> RetrievalDecisionReason {
+    let Some(top_result) = retrieval_results.first() else {
+        return RetrievalDecisionReason::NoResults;
+    };
+
+    if top_result.score < MIN_RETRIEVAL_SCORE_FOR_NOTES {
+        return RetrievalDecisionReason::WeakTopScore;
+    }
+
+    if !top_result
+        .relevance_reasons
+        .iter()
+        .any(|reason| reason == "keyword match")
+    {
+        return RetrievalDecisionReason::NoKeywordMatch;
+    }
+
+    let query_tokens = normalize_canvas_query_tokens(prompt);
+
+    let mut saw_snippet = false;
+    for result in retrieval_results {
+        if result.snippet.trim().is_empty() {
+            continue;
+        }
+
+        saw_snippet = true;
+        let matched_tokens =
+            matching_canvas_query_tokens(&query_tokens, &result.note.title, &result.snippet);
+        let has_long_match = matched_tokens.iter().any(|token| token.len() >= 6);
+
+        if matched_tokens.len() >= 2 || (has_long_match && !matched_tokens.is_empty()) {
+            return RetrievalDecisionReason::UseRetrievedNotes;
+        }
+    }
+
+    if !saw_snippet {
+        RetrievalDecisionReason::NoSnippet
+    } else {
+        RetrievalDecisionReason::NoLexicalOverlap
+    }
+}
+
 async fn resolve_prompt_context(
     state: &AppState,
     session: &CanvasSession,
@@ -1402,17 +1563,27 @@ async fn resolve_prompt_context(
                 .unwrap_or_default()
         };
 
+        let retrieval_decision = should_use_retrieved_notes(&request.prompt, &retrieval_results);
+        if retrieval_decision != RetrievalDecisionReason::UseRetrievedNotes {
+            log::info!(
+                "Canvas knowledge search fallback for prompt {:?}: {:?}",
+                request.prompt,
+                retrieval_decision
+            );
+            return Ok(ResolvedPromptContext {
+                messages,
+                context_notes: Vec::new(),
+                system_prompt: request.system_prompt.clone(),
+            });
+        }
+
         let note_contexts: Vec<(String, String, String)> = {
             let store = state.knowledge_store.read().await;
             retrieval_results
                 .iter()
                 .filter_map(|r| {
                     store.get_note(&r.note.id).ok().map(|note| {
-                        let truncated = if note.content.len() > 1500 {
-                            format!("{}...", &note.content[..1500])
-                        } else {
-                            note.content.clone()
-                        };
+                        let truncated = truncate_note_context_content(&note.content, 1500);
                         (note.id.clone(), note.title.clone(), truncated)
                     })
                 })
@@ -1725,6 +1896,28 @@ mod tests {
         }
     }
 
+    fn build_retrieval_result(
+        id: &str,
+        title: &str,
+        snippet: &str,
+        score: f32,
+        reasons: &[&str],
+    ) -> RetrievalResult {
+        RetrievalResult {
+            note: crate::models::note::NoteMeta {
+                id: id.to_string(),
+                title: title.to_string(),
+                status: NoteStatus::default(),
+                tags: Vec::new(),
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            },
+            score,
+            snippet: snippet.to_string(),
+            relevance_reasons: reasons.iter().map(|reason| reason.to_string()).collect(),
+        }
+    }
+
     #[test]
     fn test_build_note_context_prompt_with_notes() {
         let notes = vec![
@@ -1831,5 +2024,84 @@ mod tests {
         assert_eq!(request.web_search_max_results, 8);
         assert_eq!(request.temperature, 0.3);
         assert_eq!(request.max_tokens, Some(4096));
+    }
+
+    #[test]
+    fn test_classify_streamed_model_response_rejects_empty_content() {
+        let update = classify_streamed_model_response(
+            "openai/gpt-4".to_string(),
+            "   \n\t".to_string(),
+        );
+
+        assert_eq!(update.0, "openai/gpt-4");
+        assert_eq!(update.1, "");
+        assert_eq!(update.2, ResponseStatus::Error);
+        assert_eq!(update.3.as_deref(), Some(EMPTY_MODEL_RESPONSE_ERROR));
+    }
+
+    #[test]
+    fn test_classify_streamed_model_response_accepts_non_empty_content() {
+        let update = classify_streamed_model_response(
+            "openai/gpt-4".to_string(),
+            "Answer".to_string(),
+        );
+
+        assert_eq!(update.2, ResponseStatus::Completed);
+        assert_eq!(update.3, None);
+        assert_eq!(update.1, "Answer");
+    }
+
+    #[test]
+    fn test_should_use_retrieved_notes_accepts_relevant_matches() {
+        let results = vec![build_retrieval_result(
+            "note-1",
+            "Mirofish architecture ideas",
+            "A note about robust social media posting architecture.",
+            12.0,
+            &["keyword match"],
+        )];
+
+        let decision = should_use_retrieved_notes(
+            "How can I make the Mirofish social media architecture more robust?",
+            &results,
+        );
+
+        assert_eq!(decision, RetrievalDecisionReason::UseRetrievedNotes);
+    }
+
+    #[test]
+    fn test_should_use_retrieved_notes_rejects_off_topic_matches() {
+        let results = vec![build_retrieval_result(
+            "note-1",
+            "Claude skills overview",
+            "General AI skills and coding workflow tips.",
+            72.0,
+            &["keyword match", "hub (5 backlinks)"],
+        )];
+
+        let decision = should_use_retrieved_notes(
+            "How can I make the Mirofish social media architecture more robust?",
+            &results,
+        );
+
+        assert_eq!(decision, RetrievalDecisionReason::NoLexicalOverlap);
+    }
+
+    #[test]
+    fn test_should_use_retrieved_notes_rejects_graph_only_results() {
+        let results = vec![build_retrieval_result(
+            "note-1",
+            "Mirofish architecture",
+            "A note about robust social media posting architecture.",
+            20.0,
+            &["graph neighbor (1 hop)", "hub (4 backlinks)"],
+        )];
+
+        let decision = should_use_retrieved_notes(
+            "How can I make the Mirofish social media architecture more robust?",
+            &results,
+        );
+
+        assert_eq!(decision, RetrievalDecisionReason::NoKeywordMatch);
     }
 }

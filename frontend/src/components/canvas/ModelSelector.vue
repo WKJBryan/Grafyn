@@ -38,6 +38,22 @@
     </div>
 
     <div class="quick-actions">
+      <div
+        v-for="preset in presetSummaries"
+        :key="preset.id"
+        class="preset-inline"
+        :class="{ active: selectedPreset && preset.id === selectedPreset.id, disabled: preset.validModelIds.length === 0 }"
+      >
+        <button
+          class="btn btn-sm preset-chip"
+          :disabled="preset.validModelIds.length === 0"
+          :title="presetTooltip(preset)"
+          @click="applyPreset(preset)"
+        >
+          <span class="preset-name">{{ preset.name }}</span>
+          <span class="preset-meta">{{ preset.validModelIds.length }}</span>
+        </button>
+      </div>
       <button
         class="btn btn-sm btn-ghost"
         @click="selectPopular"
@@ -56,7 +72,73 @@
       >
         Clear
       </button>
+      <button
+        class="btn btn-sm btn-ghost preset-manage-btn"
+        :disabled="editPresetDisabled"
+        :title="editPresetTitle"
+        @click="updateSelectedPreset"
+      >
+        Update
+      </button>
+      <button
+        class="btn btn-sm btn-ghost preset-manage-btn danger"
+        :disabled="deletePresetDisabled"
+        :title="deletePresetTitle"
+        @click="deleteSelectedPreset"
+      >
+        Delete
+      </button>
+      <button
+        class="btn btn-sm btn-ghost save-current-btn"
+        :disabled="saveCurrentDisabled"
+        :title="saveCurrentTitle"
+        @click="openCreatePreset"
+      >
+        New Preset
+      </button>
     </div>
+
+    <div
+      v-if="showPresetEditor"
+      class="preset-editor"
+    >
+      <input
+        ref="presetNameInput"
+        v-model="presetDraftName"
+        type="text"
+        class="preset-input"
+        placeholder="Preset name"
+        @keydown.enter.prevent="submitPresetEditor"
+        @keydown.escape.prevent="closePresetEditor"
+      >
+      <button
+        class="btn btn-sm btn-primary"
+        :disabled="!canSubmitPreset"
+        @click="submitPresetEditor"
+      >
+        Save
+      </button>
+      <button
+        class="btn btn-sm btn-ghost"
+        @click="closePresetEditor"
+      >
+        Cancel
+      </button>
+    </div>
+
+    <p
+      v-if="presetHelper"
+      class="preset-helper"
+    >
+      {{ presetHelper }}
+    </p>
+
+    <p
+      v-if="presetError"
+      class="preset-error"
+    >
+      {{ presetError }}
+    </p>
 
     <div class="model-groups">
       <div
@@ -117,8 +199,10 @@
 </template>
 
 <script setup>
-import { ref, computed } from 'vue'
+import { ref, computed, nextTick } from 'vue'
 import GIcon from '@/components/ui/GIcon.vue'
+
+const MAX_PRESETS = 8
 
 const props = defineProps({
   models: {
@@ -128,19 +212,81 @@ const props = defineProps({
   modelValue: {
     type: Array,
     default: () => []
+  },
+  presets: {
+    type: Array,
+    default: () => []
   }
 })
 
-const emit = defineEmits(['update:modelValue'])
+const emit = defineEmits(['update:modelValue', 'create-preset', 'update-preset', 'delete-preset'])
 
 // Local state
 const searchQuery = ref('')
 const expandedGroups = ref(new Set(['openai', 'anthropic', 'google']))
+const presetNameInput = ref(null)
+const presetDraftName = ref(null)
+const activePresetId = ref(null)
+const presetError = ref('')
 
 // Computed
 const selectedModels = computed({
   get: () => props.modelValue,
   set: (val) => emit('update:modelValue', val)
+})
+
+const showPresetEditor = computed(() => presetDraftName.value !== null)
+
+const availableModelIds = computed(() => new Set(props.models.map(model => model.id)))
+
+const presetSummaries = computed(() => {
+  return props.presets.map(preset => {
+    const validModelIds = preset.model_ids.filter(modelId => availableModelIds.value.has(modelId))
+    return {
+      ...preset,
+      validModelIds,
+      isActive: areSameSelection(validModelIds, selectedModels.value)
+    }
+  })
+})
+
+const selectedPreset = computed(() => {
+  if (activePresetId.value) {
+    const focusedPreset = props.presets.find(preset => preset.id === activePresetId.value)
+    if (focusedPreset) return focusedPreset
+  }
+  return presetSummaries.value.find(preset => preset.isActive) ?? null
+})
+const canSubmitPreset = computed(() => (presetDraftName.value ?? '').trim().length > 0)
+const saveCurrentDisabled = computed(() => selectedModels.value.length === 0 || props.presets.length >= MAX_PRESETS)
+const saveCurrentTitle = computed(() => {
+  if (selectedModels.value.length === 0) return 'Select one or more models first'
+  if (props.presets.length >= MAX_PRESETS) return `Maximum ${MAX_PRESETS} presets reached`
+  return 'Create a new preset from the current model selection'
+})
+const editPresetDisabled = computed(() => !selectedPreset.value || selectedModels.value.length === 0)
+const editPresetTitle = computed(() => {
+  if (!selectedPreset.value) return 'Select a preset first'
+  if (selectedModels.value.length === 0) return 'Select one or more models to update this preset'
+  return `Replace "${selectedPreset.value.name}" with the current selection`
+})
+const deletePresetDisabled = computed(() => !selectedPreset.value)
+const deletePresetTitle = computed(() => {
+  if (!selectedPreset.value) return 'Select a preset first'
+  return `Delete "${selectedPreset.value.name}"`
+})
+const presetHelper = computed(() => {
+  if (presetError.value) return ''
+  if (props.presets.length >= MAX_PRESETS) {
+    return `Maximum ${MAX_PRESETS} presets reached. Delete one to save another.`
+  }
+  if (props.presets.length === 0) {
+    return 'Save a model group to reuse it across canvases.'
+  }
+  if (!selectedPreset.value) {
+    return 'Click a preset once to target it for Update/Delete, or click it again to apply it.'
+  }
+  return `Updating "${selectedPreset.value.name}" with the current selected models.`
 })
 
 const filteredModels = computed(() => {
@@ -197,6 +343,89 @@ function clearSelection() {
   selectedModels.value = []
 }
 
+function presetTooltip(preset) {
+  if (preset.validModelIds.length === 0) {
+    return 'No models from this preset are available here'
+  }
+  if (selectedPreset.value?.id === preset.id && !preset.isActive) {
+    return `Click again to apply "${preset.name}"`
+  }
+  return `Target "${preset.name}" for edit/delete, or click again to apply it`
+}
+
+function openCreatePreset() {
+  if (saveCurrentDisabled.value) return
+  presetDraftName.value = ''
+  presetError.value = ''
+  focusPresetInput()
+}
+
+function closePresetEditor() {
+  presetDraftName.value = null
+  presetError.value = ''
+}
+
+function focusPresetInput() {
+  nextTick(() => {
+    presetNameInput.value?.focus()
+    presetNameInput.value?.select()
+  })
+}
+
+function applyPreset(preset) {
+  if (preset.validModelIds.length === 0) return
+  const isTargeted = selectedPreset.value?.id === preset.id
+  activePresetId.value = preset.id
+
+  if (!isTargeted && !preset.isActive && selectedModels.value.length > 0) {
+    return
+  }
+
+  selectedModels.value = [...preset.validModelIds]
+}
+
+function submitPresetEditor() {
+  const name = presetDraftName.value.trim()
+  if (!name) {
+    presetError.value = 'Preset name cannot be empty.'
+    return
+  }
+
+  const normalized = name.toLowerCase()
+  const duplicate = props.presets.find(preset => preset.name.trim().toLowerCase() === normalized)
+
+  if (duplicate) {
+    presetError.value = 'Preset names must be unique.'
+    return
+  }
+
+  if (props.presets.length >= MAX_PRESETS) {
+    presetError.value = `You can save up to ${MAX_PRESETS} presets.`
+    return
+  }
+
+  emit('create-preset', {
+    name,
+    modelIds: [...selectedModels.value]
+  })
+
+  closePresetEditor()
+}
+
+function updateSelectedPreset() {
+  if (editPresetDisabled.value || !selectedPreset.value) return
+  emit('update-preset', {
+    id: selectedPreset.value.id,
+    modelIds: [...selectedModels.value]
+  })
+}
+
+function deleteSelectedPreset() {
+  if (deletePresetDisabled.value || !selectedPreset.value) return
+  activePresetId.value = null
+  emit('delete-preset', selectedPreset.value.id)
+}
+
 function formatContextLength(length) {
   if (!length) return '?'
   if (length >= 1000000) return `${(length / 1000000).toFixed(1)}M`
@@ -228,6 +457,13 @@ function getModelDisplayName(modelId) {
 function removeModel(modelId) {
   selectedModels.value = selectedModels.value.filter(id => id !== modelId)
 }
+
+function areSameSelection(left, right) {
+  if (left.length !== right.length) return false
+  const leftSorted = [...left].sort()
+  const rightSorted = [...right].sort()
+  return leftSorted.every((value, index) => value === rightSorted[index])
+}
 </script>
 
 <style scoped>
@@ -250,6 +486,95 @@ function removeModel(modelId) {
   margin: 0;
   font-size: 0.875rem;
   color: var(--text-primary);
+}
+
+.preset-chip {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 160px;
+  border-color: var(--border-subtle);
+  color: var(--text-secondary);
+  background: transparent;
+}
+
+.preset-chip:hover:not(:disabled) {
+  background: var(--bg-tertiary);
+  border-color: var(--text-muted);
+}
+
+.preset-chip:disabled {
+  cursor: not-allowed;
+}
+
+.preset-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.8125rem;
+}
+
+.preset-meta {
+  flex-shrink: 0;
+  font-size: 0.6875rem;
+  color: var(--text-muted);
+}
+
+.preset-inline {
+  display: flex;
+  align-items: center;
+  flex-shrink: 0;
+}
+
+.preset-inline.active .preset-chip {
+  border-color: color-mix(in srgb, var(--accent-primary) 60%, transparent);
+  color: var(--accent-primary);
+  background: color-mix(in srgb, var(--accent-primary) 10%, var(--bg-secondary));
+}
+
+.preset-inline.disabled {
+  opacity: 0.65;
+}
+
+.preset-manage-btn.danger:hover {
+  color: #9a5d0d;
+}
+
+.preset-helper,
+.preset-error {
+  margin: 0;
+  font-size: 0.75rem;
+}
+
+.preset-helper {
+  color: var(--text-muted);
+}
+
+.preset-error {
+  color: var(--accent-red, #f87171);
+}
+
+.preset-editor {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.preset-input {
+  flex: 1;
+  min-width: 0;
+  padding: 7px 10px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  color: var(--text-primary);
+  font-size: 0.8125rem;
+}
+
+.preset-input:focus {
+  border-color: var(--accent-primary);
+  outline: none;
 }
 
 .selected-count {
@@ -335,8 +660,10 @@ function removeModel(modelId) {
 
 .quick-actions {
   display: flex;
+  flex-wrap: wrap;
   gap: var(--spacing-xs);
   flex-shrink: 0;
+  align-items: center;
 }
 
 .model-groups {
@@ -478,5 +805,27 @@ function removeModel(modelId) {
 .btn-ghost:hover {
   background: var(--bg-tertiary);
   border-color: var(--text-muted);
+}
+
+.preset-manage-btn {
+  background: rgba(217, 145, 51, 0.12);
+  border-color: rgba(217, 145, 51, 0.3);
+  color: #9a5d0d;
+}
+
+.preset-manage-btn:hover:not(:disabled) {
+  background: rgba(217, 145, 51, 0.18);
+  border-color: rgba(217, 145, 51, 0.42);
+}
+
+.save-current-btn {
+  background: rgba(37, 153, 137, 0.14);
+  border-color: rgba(37, 153, 137, 0.34);
+  color: #1f7f74;
+}
+
+.save-current-btn:hover:not(:disabled) {
+  background: rgba(37, 153, 137, 0.2);
+  border-color: rgba(37, 153, 137, 0.45);
 }
 </style>

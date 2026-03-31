@@ -21,6 +21,10 @@
         <ModelSelector
           v-model="selectedModels"
           :models="filteredModels"
+          :presets="presets"
+          @create-preset="emit('create-preset', $event)"
+          @update-preset="emit('update-preset', $event)"
+          @delete-preset="emit('delete-preset', $event)"
         />
       </div>
 
@@ -53,13 +57,17 @@ const props = defineProps({
     type: Array,
     default: () => []
   },
+  presets: {
+    type: Array,
+    default: () => []
+  },
   existingModelIds: {
     type: Array,
     default: () => []
   }
 })
 
-const emit = defineEmits(['submit', 'cancel'])
+const emit = defineEmits(['submit', 'cancel', 'create-preset', 'update-preset', 'delete-preset'])
 
 const selectedModels = ref([])
 
