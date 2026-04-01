@@ -236,20 +236,28 @@
     <PromptDialog
       v-if="showPromptDialog"
       :models="availableModels"
+      :presets="canvasModelPresets"
       :branch-context="branchContext"
       :smart-web-search="smartWebSearch"
       :open-router-configured="hasApiKey"
       @submit="handlePromptSubmit"
       @cancel="closeBranchDialog"
+      @create-preset="handleCreatePreset"
+      @update-preset="handleUpdatePreset"
+      @delete-preset="handleDeletePreset"
     />
 
     <!-- Add Model Dialog -->
     <AddModelDialog
       v-if="showAddModelDialog"
       :models="availableModels"
+      :presets="canvasModelPresets"
       :existing-model-ids="addModelContext?.existingModelIds || []"
       @submit="handleAddModelDialogSubmit"
       @cancel="handleAddModelDialogCancel"
+      @create-preset="handleCreatePreset"
+      @update-preset="handleUpdatePreset"
+      @delete-preset="handleDeletePreset"
     />
 
     <!-- API Key Required Dialog -->
@@ -330,6 +338,7 @@ import { zoom as d3Zoom, zoomIdentity } from 'd3-zoom'
 import 'd3-transition'
 import { useCanvasStore } from '@/stores/canvas'
 import { settings as settingsApi, isDesktopApp } from '@/api/client'
+import { useToast } from '@/composables/useToast'
 import PromptNode from './PromptNode.vue'
 import LLMNode from './LLMNode.vue'
 import DebateNode from './DebateNode.vue'
@@ -348,6 +357,7 @@ const props = defineProps({
 const emit = defineEmits(['session-loaded'])
 
 const canvasStore = useCanvasStore()
+const toast = useToast()
 
 // Refs
 const container = ref(null)
@@ -369,6 +379,7 @@ const arrangeDropdown = ref(null)  // Ref for dropdown element
 const showApiKeyRequired = ref(false)  // Show API key required dialog
 const hasApiKey = ref(true)  // Assume true initially, check on mount
 const smartWebSearch = ref(true)  // Smart web search auto-detection (loaded from settings)
+const canvasModelPresets = ref([])
 
 // D3 zoom
 let zoom = null
@@ -593,6 +604,7 @@ watch(() => props.sessionId, async (newId) => {
 onMounted(async () => {
   initZoom()
   canvasStore.loadModels()
+  await loadCanvasPreferences()
 
   // Add click outside listener for dropdown
   document.addEventListener('click', handleClickOutside)
@@ -816,6 +828,100 @@ async function refreshOpenRouterStatus() {
   hasApiKey.value = status?.is_configured || false
   smartWebSearch.value = settingsData?.smart_web_search ?? true
   return hasApiKey.value
+}
+
+async function loadCanvasPreferences() {
+  try {
+    const settingsData = await settingsApi.get()
+    smartWebSearch.value = settingsData?.smart_web_search ?? true
+    canvasModelPresets.value = Array.isArray(settingsData?.canvas_model_presets)
+      ? settingsData.canvas_model_presets
+      : []
+  } catch (err) {
+    console.error('Failed to load canvas preferences:', err)
+    canvasModelPresets.value = []
+  }
+}
+
+function showCanvasMessage(type, text, duration = 5000) {
+  saveMessage.value = { type, text }
+  setTimeout(() => {
+    if (saveMessage.value?.text === text) {
+      saveMessage.value = null
+    }
+  }, duration)
+}
+
+function createPresetId() {
+  if (globalThis.crypto?.randomUUID) {
+    return globalThis.crypto.randomUUID()
+  }
+  return `preset-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
+}
+
+async function persistCanvasModelPresets(nextPresets, failureText) {
+  const previousPresets = canvasModelPresets.value.map(preset => ({
+    ...preset,
+    model_ids: [...preset.model_ids]
+  }))
+
+  canvasModelPresets.value = nextPresets
+
+  try {
+    await settingsApi.update({
+      canvas_model_presets: nextPresets
+    })
+  } catch (err) {
+    canvasModelPresets.value = previousPresets
+    console.error('Failed to persist canvas model presets:', err)
+    showCanvasMessage('error', failureText)
+    throw err
+  }
+}
+
+async function handleCreatePreset({ name, modelIds }) {
+  const nextPresets = [
+    ...canvasModelPresets.value,
+    {
+      id: createPresetId(),
+      name,
+      model_ids: [...new Set(modelIds)]
+    }
+  ]
+
+  try {
+    await persistCanvasModelPresets(nextPresets, 'Failed to save preset')
+    showCanvasMessage('success', `Saved preset "${name}"`, 2500)
+  } catch (_) { /* persistCanvasModelPresets handles error display */ }
+}
+
+async function handleUpdatePreset({ id, modelIds }) {
+  const existing = canvasModelPresets.value.find(preset => preset.id === id)
+  if (!existing) return
+
+  const nextPresets = canvasModelPresets.value.map(preset => (
+    preset.id === id
+      ? { ...preset, model_ids: [...new Set(modelIds)] }
+      : preset
+  ))
+
+  try {
+    await persistCanvasModelPresets(nextPresets, 'Failed to update preset')
+    toast.success(`Updated preset "${existing.name}"`, 2500)
+    showCanvasMessage('success', `Updated preset "${existing.name}"`, 2500)
+  } catch (_) { /* persistCanvasModelPresets handles error display */ }
+}
+
+async function handleDeletePreset(id) {
+  const existing = canvasModelPresets.value.find(preset => preset.id === id)
+  if (!existing) return
+
+  const nextPresets = canvasModelPresets.value.filter(preset => preset.id !== id)
+
+  try {
+    await persistCanvasModelPresets(nextPresets, 'Failed to delete preset')
+    showCanvasMessage('success', `Deleted preset "${existing.name}"`, 2500)
+  } catch (_) { /* persistCanvasModelPresets handles error display */ }
 }
 
 // Debate expand/collapse

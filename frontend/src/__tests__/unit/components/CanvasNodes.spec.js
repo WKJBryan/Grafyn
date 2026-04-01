@@ -306,6 +306,29 @@ describe('Canvas Nodes', () => {
     expect(errorWrapper.find('.think-harder-btn').exists()).toBe(false)
   })
 
+  it('renders backend-provided empty-response errors in the node body', () => {
+    const wrapper = mountAttached(LLMNode, {
+      props: {
+        tileId: 'tile-1',
+        modelId: 'openai/gpt-4',
+        response: {
+          status: 'error',
+          content: '',
+          model_name: 'GPT-4',
+          error_message: 'No response returned from model',
+          color: '#7c5cff',
+          position: { x: 0, y: 0, width: 280, height: 200 }
+        },
+        isStreaming: false,
+        availableModels: []
+      }
+    })
+
+    expect(wrapper.find('.error-message').exists()).toBe(true)
+    expect(wrapper.find('.error-message').text()).toContain('No response returned from model')
+    expect(wrapper.find('.complete-indicator').exists()).toBe(false)
+  })
+
   it('shows a web-search badge on response nodes when live web search was used', () => {
     const wrapper = mountAttached(LLMNode, {
       props: {

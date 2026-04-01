@@ -2,6 +2,18 @@
 
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CanvasModelPreset {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub model_ids: Vec<String>,
+}
+
+fn default_canvas_model_presets() -> Vec<CanvasModelPreset> {
+    Vec::new()
+}
+
 /// User-configurable settings for the desktop app
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserSettings {
@@ -33,6 +45,10 @@ pub struct UserSettings {
     /// Whether smart web search auto-detection is enabled in canvas
     #[serde(default = "default_smart_web_search")]
     pub smart_web_search: bool,
+
+    /// Saved model presets for canvas prompts
+    #[serde(default = "default_canvas_model_presets")]
+    pub canvas_model_presets: Vec<CanvasModelPreset>,
 }
 
 fn default_theme() -> String {
@@ -57,6 +73,7 @@ impl Default for UserSettings {
             mcp_enabled: false,
             llm_model: default_llm_model(),
             smart_web_search: true,
+            canvas_model_presets: default_canvas_model_presets(),
         }
     }
 }
@@ -107,6 +124,7 @@ pub struct SettingsUpdate {
     pub mcp_enabled: Option<bool>,
     pub llm_model: Option<String>,
     pub smart_web_search: Option<bool>,
+    pub canvas_model_presets: Option<Vec<CanvasModelPreset>>,
 }
 
 /// Response for settings status check
@@ -120,6 +138,7 @@ pub struct SettingsStatus {
     pub mcp_enabled: bool,
     pub llm_model: String,
     pub smart_web_search: bool,
+    pub canvas_model_presets: Vec<CanvasModelPreset>,
 }
 
 impl From<&UserSettings> for SettingsStatus {
@@ -133,6 +152,34 @@ impl From<&UserSettings> for SettingsStatus {
             mcp_enabled: settings.mcp_enabled,
             llm_model: settings.llm_model.clone(),
             smart_web_search: settings.smart_web_search,
+            canvas_model_presets: settings.canvas_model_presets.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_settings_start_with_empty_canvas_presets() {
+        let settings = UserSettings::default();
+        assert!(settings.canvas_model_presets.is_empty());
+    }
+
+    #[test]
+    fn older_settings_payloads_deserialize_without_canvas_presets() {
+        let json = r#"{
+            "vault_path": "C:\\Vault",
+            "setup_completed": true,
+            "theme": "dark",
+            "mcp_enabled": false,
+            "llm_model": "openai/gpt-4o",
+            "smart_web_search": true
+        }"#;
+
+        let settings: UserSettings = serde_json::from_str(json).expect("settings should deserialize");
+        assert!(settings.canvas_model_presets.is_empty());
+        assert_eq!(settings.llm_model, "openai/gpt-4o");
     }
 }

@@ -2,12 +2,13 @@
 //!
 //! Orchestrates a multi-stage retrieval pipeline that combines keyword search
 //! (Tantivy BM25), priority scoring (recency/status/tags), graph expansion
-//! (N-hop wikilink neighbors), and hub detection (highly-connected notes).
+//! (N-hop wikilink neighbors with relation-type weighting), and hub detection
+//! (highly-connected notes).
 //!
 //! This replaces pure BM25 similarity with context-aware ranking that
 //! leverages the Zettelkasten graph structure.
 
-use crate::models::note::{ChunkResult, NoteMeta};
+use crate::models::note::{ChunkResult, NoteMeta, RelationType};
 use crate::services::chunk_index::ChunkIndex;
 use crate::services::graph_index::GraphIndex;
 use crate::services::priority::PriorityScoringService;
@@ -16,6 +17,63 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+
+/// Per-relation-type weights for graph expansion scoring.
+///
+/// Edges with stronger relationships (like `supports`) get higher
+/// boosts than generic `related` or `untyped` links.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelationWeights {
+    pub supports: f32,
+    pub contradicts: f32,
+    pub expands: f32,
+    pub questions: f32,
+    pub answers: f32,
+    pub example: f32,
+    pub part_of: f32,
+    pub related: f32,
+    pub untyped: f32,
+}
+
+impl Default for RelationWeights {
+    fn default() -> Self {
+        Self {
+            supports: 1.5,
+            contradicts: 1.2,
+            expands: 1.3,
+            questions: 1.1,
+            answers: 1.2,
+            example: 1.1,
+            part_of: 1.2,
+            related: 1.0,
+            untyped: 1.0,
+        }
+    }
+}
+
+impl RelationWeights {
+    pub fn weight_for(&self, relation: &RelationType) -> f32 {
+        match relation {
+            RelationType::Supports => self.supports,
+            RelationType::Contradicts => self.contradicts,
+            RelationType::Expands => self.expands,
+            RelationType::Questions => self.questions,
+            RelationType::Answers => self.answers,
+            RelationType::Example => self.example,
+            RelationType::PartOf => self.part_of,
+            RelationType::Related => self.related,
+            RelationType::Untyped => self.untyped,
+        }
+    }
+}
+
+fn default_token_budget() -> usize {
+    4000
+}
+
+fn default_chunk_retrieval_enabled() -> bool {
+    true
+}
 
 /// Configuration for the temporal + graph-aware retrieval pipeline
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -30,6 +88,15 @@ pub struct RetrievalConfig {
     pub hub_threshold: usize,
     /// Maximum base search results before graph expansion
     pub base_search_limit: usize,
+    /// Default token budget for chunk-level retrieval (1000-32000)
+    #[serde(default = "default_token_budget")]
+    pub default_token_budget: usize,
+    /// Whether chunk-level retrieval is enabled for canvas context
+    #[serde(default = "default_chunk_retrieval_enabled")]
+    pub chunk_retrieval_enabled: bool,
+    /// Per-relation-type weights for graph expansion
+    #[serde(default)]
+    pub relation_weights: RelationWeights,
 }
 
 impl Default for RetrievalConfig {
@@ -40,6 +107,9 @@ impl Default for RetrievalConfig {
             hub_boost_weight: 0.15,
             hub_threshold: 3,
             base_search_limit: 50,
+            default_token_budget: 4000,
+            chunk_retrieval_enabled: true,
+            relation_weights: RelationWeights::default(),
         }
     }
 }
@@ -59,6 +129,13 @@ struct CandidateEntry {
     score: f32,
     snippet: String,
     reasons: Vec<String>,
+}
+
+/// A neighbor discovered during graph expansion
+struct ExpandedNeighbor {
+    meta: NoteMeta,
+    hops: usize,
+    best_relation: RelationType,
 }
 
 /// Temporal + graph-aware retrieval service
@@ -112,6 +189,15 @@ impl RetrievalService {
         if let Some(v) = update.base_search_limit {
             self.config.base_search_limit = v.clamp(10, 200);
         }
+        if let Some(v) = update.default_token_budget {
+            self.config.default_token_budget = v.clamp(1000, 32000);
+        }
+        if let Some(v) = update.chunk_retrieval_enabled {
+            self.config.chunk_retrieval_enabled = v;
+        }
+        if let Some(v) = update.relation_weights {
+            self.config.relation_weights = v;
+        }
         self.save_to_disk()?;
         Ok(self.config.clone())
     }
@@ -120,7 +206,7 @@ impl RetrievalService {
     ///   1. Tantivy keyword search (base candidates)
     ///   2. Enrich with real timestamps from GraphIndex
     ///   3. Priority scoring (recency, status, tag boosts)
-    ///   4. Graph expansion (N-hop neighbors of top results + context notes)
+    ///   4. Graph expansion (N-hop neighbors with relation-type weighting)
     ///   5. Hub boost (highly-connected notes score higher)
     ///   6. Sort by final score, truncate to limit
     pub fn retrieve(
@@ -163,7 +249,7 @@ impl RetrievalService {
             );
         }
 
-        // Step 4: Graph expansion — add N-hop neighbors of top search results + context notes
+        // Step 4: Graph expansion — add N-hop neighbors with relation-type weighting
         let seed_ids: HashSet<String> = search_results
             .iter()
             .take(10) // Only expand from top 10 to avoid combinatorial explosion
@@ -173,29 +259,36 @@ impl RetrievalService {
 
         let graph_neighbors = self.expand_graph(&seed_ids, graph);
 
-        for (note_id, (meta, hops)) in &graph_neighbors {
-            let proximity_boost = self.config.graph_proximity_weight / (*hops as f32);
+        for (note_id, neighbor) in &graph_neighbors {
+            let relation_weight = self
+                .config
+                .relation_weights
+                .weight_for(&neighbor.best_relation);
+            let proximity_boost =
+                self.config.graph_proximity_weight / (neighbor.hops as f32) * relation_weight;
 
             if let Some(entry) = candidates.get_mut(note_id) {
                 // Already a search result — add graph proximity boost
                 entry.score += proximity_boost;
                 entry.reasons.push(format!(
-                    "graph neighbor ({} hop{})",
-                    hops,
-                    if *hops == 1 { "" } else { "s" }
+                    "graph neighbor ({} hop{}, {})",
+                    neighbor.hops,
+                    if neighbor.hops == 1 { "" } else { "s" },
+                    neighbor.best_relation
                 ));
             } else {
                 // New candidate discovered via graph expansion
                 candidates.insert(
                     note_id.clone(),
                     CandidateEntry {
-                        meta: meta.clone(),
+                        meta: neighbor.meta.clone(),
                         score: proximity_boost,
                         snippet: String::new(),
                         reasons: vec![format!(
-                            "graph neighbor ({} hop{})",
-                            hops,
-                            if *hops == 1 { "" } else { "s" }
+                            "graph neighbor ({} hop{}, {})",
+                            neighbor.hops,
+                            if neighbor.hops == 1 { "" } else { "s" },
+                            neighbor.best_relation
                         )],
                     },
                 );
@@ -238,8 +331,8 @@ impl RetrievalService {
 
     /// Chunk-level retrieval with token budgeting.
     ///
-    /// Searches the chunk index, applies graph and hub boosts from the note-level
-    /// graph, then greedily fills the token budget with the best-scoring chunks.
+    /// Searches the chunk index, applies graph boosts with relation-type weighting,
+    /// then greedily fills the token budget with the best-scoring chunks.
     pub fn retrieve_chunks(
         &self,
         chunk_index: &ChunkIndex,
@@ -278,10 +371,14 @@ impl RetrievalService {
                 chunk.search_score += priority_boost;
             }
 
-            // Graph proximity boost
-            if let Some((_meta, hops)) = neighbors.get(parent_id) {
+            // Graph proximity boost with relation-type weighting
+            if let Some(neighbor) = neighbors.get(parent_id) {
+                let relation_weight = self
+                    .config
+                    .relation_weights
+                    .weight_for(&neighbor.best_relation);
                 let proximity_boost =
-                    self.config.graph_proximity_weight / (*hops as f32);
+                    self.config.graph_proximity_weight / (neighbor.hops as f32) * relation_weight;
                 chunk.search_score += proximity_boost;
             }
 
@@ -319,17 +416,18 @@ impl RetrievalService {
         Ok(selected)
     }
 
-    /// Expand the graph from seed IDs, returning a map of discovered neighbors
-    /// with their minimum hop distance from any seed.
+    /// Expand the graph from seed IDs, returning discovered neighbors with
+    /// their minimum hop distance and the relation type of the discovering edge.
     ///
-    /// Explores both outgoing links (wikilinks) and backlinks (reverse edges)
-    /// for bidirectional graph traversal.
+    /// Explores both outgoing links and backlinks (bidirectional).
+    /// Relation types are preserved so callers can weight edges differently
+    /// (e.g., `supports` edges get a higher boost than `untyped`).
     fn expand_graph(
         &self,
         seed_ids: &HashSet<String>,
         graph: &GraphIndex,
-    ) -> HashMap<String, (NoteMeta, usize)> {
-        let mut neighbors: HashMap<String, (NoteMeta, usize)> = HashMap::new();
+    ) -> HashMap<String, ExpandedNeighbor> {
+        let mut neighbors: HashMap<String, ExpandedNeighbor> = HashMap::new();
         let mut visited: HashSet<String> = seed_ids.clone();
         let mut frontier: HashSet<String> = seed_ids.clone();
 
@@ -337,19 +435,27 @@ impl RetrievalService {
             let mut next_frontier = HashSet::new();
 
             for id in &frontier {
-                // Outgoing links (this note links to...)
-                for meta in graph.get_outgoing(id) {
+                // Outgoing links with relation types
+                for (meta, relation) in graph.get_typed_outgoing(id) {
                     if !visited.contains(&meta.id) {
                         let nid = meta.id.clone();
-                        neighbors.entry(nid.clone()).or_insert((meta, hop));
+                        neighbors.entry(nid.clone()).or_insert(ExpandedNeighbor {
+                            meta,
+                            hops: hop,
+                            best_relation: relation,
+                        });
                         next_frontier.insert(nid);
                     }
                 }
-                // Backlinks (linked by...)
-                for meta in graph.get_backlinks(id) {
+                // Backlinks with relation types
+                for (meta, relation) in graph.get_typed_backlinks(id) {
                     if !visited.contains(&meta.id) {
                         let nid = meta.id.clone();
-                        neighbors.entry(nid.clone()).or_insert((meta, hop));
+                        neighbors.entry(nid.clone()).or_insert(ExpandedNeighbor {
+                            meta,
+                            hops: hop,
+                            best_relation: relation,
+                        });
                         next_frontier.insert(nid);
                     }
                 }
@@ -371,24 +477,49 @@ pub struct RetrievalConfigUpdate {
     pub hub_boost_weight: Option<f32>,
     pub hub_threshold: Option<usize>,
     pub base_search_limit: Option<usize>,
+    pub default_token_budget: Option<usize>,
+    pub chunk_retrieval_enabled: Option<bool>,
+    pub relation_weights: Option<RelationWeights>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::note::{Note, NoteStatus};
+    use crate::models::note::{Note, NoteStatus, ParsedLink};
     use crate::services::graph_index::GraphIndex;
     use chrono::Utc;
     use std::collections::HashMap;
 
     fn make_note(id: &str, title: &str, wikilinks: Vec<&str>) -> Note {
-        use crate::models::note::{ParsedLink, RelationType};
         let wikilink_strings: Vec<String> = wikilinks.into_iter().map(String::from).collect();
         let parsed_links = wikilink_strings
             .iter()
             .map(|title| ParsedLink {
                 target_title: title.clone(),
                 relation: RelationType::Untyped,
+            })
+            .collect();
+        Note {
+            id: id.to_string(),
+            title: title.to_string(),
+            content: format!("Content of {}", title),
+            status: NoteStatus::Draft,
+            tags: vec![],
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            wikilinks: wikilink_strings,
+            parsed_links,
+            properties: HashMap::new(),
+        }
+    }
+
+    fn make_typed_note(id: &str, title: &str, links: Vec<(&str, RelationType)>) -> Note {
+        let wikilink_strings: Vec<String> = links.iter().map(|(t, _)| t.to_string()).collect();
+        let parsed_links = links
+            .into_iter()
+            .map(|(target, relation)| ParsedLink {
+                target_title: target.to_string(),
+                relation,
             })
             .collect();
         Note {
@@ -413,6 +544,10 @@ mod tests {
         assert_eq!(config.hub_boost_weight, 0.15);
         assert_eq!(config.hub_threshold, 3);
         assert_eq!(config.base_search_limit, 50);
+        assert_eq!(config.default_token_budget, 4000);
+        assert!(config.chunk_retrieval_enabled);
+        assert_eq!(config.relation_weights.supports, 1.5);
+        assert_eq!(config.relation_weights.untyped, 1.0);
     }
 
     #[test]
@@ -440,7 +575,7 @@ mod tests {
 
         // A→B (outgoing), so B is a 1-hop neighbor
         assert!(neighbors.contains_key("b"));
-        assert_eq!(neighbors["b"].1, 1);
+        assert_eq!(neighbors["b"].hops, 1);
         // C is 2 hops away — shouldn't be reached at depth 1
         assert!(!neighbors.contains_key("c"));
         // D is disconnected
@@ -469,9 +604,9 @@ mod tests {
 
         // B is 1 hop (A→B), C is 2 hops (A→B→C)
         assert!(neighbors.contains_key("b"));
-        assert_eq!(neighbors["b"].1, 1);
+        assert_eq!(neighbors["b"].hops, 1);
         assert!(neighbors.contains_key("c"));
-        assert_eq!(neighbors["c"].1, 2);
+        assert_eq!(neighbors["c"].hops, 2);
         // D is disconnected
         assert!(!neighbors.contains_key("d"));
     }
@@ -540,11 +675,14 @@ mod tests {
 
         let updated = svc
             .update_config(RetrievalConfigUpdate {
-                graph_hop_depth: Some(10),       // max 3
+                graph_hop_depth: Some(10),         // max 3
                 graph_proximity_weight: Some(5.0), // max 1.0
-                hub_boost_weight: Some(-1.0),    // min 0.0
-                hub_threshold: Some(0),          // min 1
-                base_search_limit: Some(1),      // min 10
+                hub_boost_weight: Some(-1.0),      // min 0.0
+                hub_threshold: Some(0),            // min 1
+                base_search_limit: Some(1),        // min 10
+                default_token_budget: Some(100),   // min 1000
+                chunk_retrieval_enabled: Some(false),
+                relation_weights: None,
             })
             .unwrap();
 
@@ -553,6 +691,8 @@ mod tests {
         assert_eq!(updated.hub_boost_weight, 0.0);
         assert_eq!(updated.hub_threshold, 1);
         assert_eq!(updated.base_search_limit, 10);
+        assert_eq!(updated.default_token_budget, 1000);
+        assert!(!updated.chunk_retrieval_enabled);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -595,6 +735,70 @@ mod tests {
         let neighbors = svc.expand_graph(&seeds, &graph);
 
         // C is reachable directly from A (1 hop), even though B→C exists (2 hops)
-        assert_eq!(neighbors["c"].1, 1);
+        assert_eq!(neighbors["c"].hops, 1);
+    }
+
+    #[test]
+    fn test_expand_graph_preserves_relation_types() {
+        let notes = vec![
+            make_typed_note(
+                "a",
+                "Note A",
+                vec![
+                    ("Note B", RelationType::Supports),
+                    ("Note C", RelationType::Contradicts),
+                ],
+            ),
+            make_note("b", "Note B", vec![]),
+            make_note("c", "Note C", vec![]),
+        ];
+
+        let mut graph = GraphIndex::new();
+        graph.build_from_notes(&notes);
+
+        let svc = RetrievalService {
+            config: RetrievalConfig {
+                graph_hop_depth: 1,
+                ..Default::default()
+            },
+            config_path: PathBuf::from("/tmp/test_retrieval.json"),
+        };
+
+        let seeds: HashSet<String> = ["a".to_string()].into_iter().collect();
+        let neighbors = svc.expand_graph(&seeds, &graph);
+
+        assert_eq!(neighbors["b"].best_relation, RelationType::Supports);
+        assert_eq!(neighbors["c"].best_relation, RelationType::Contradicts);
+    }
+
+    #[test]
+    fn test_relation_weights() {
+        let weights = RelationWeights::default();
+        assert!(
+            weights.weight_for(&RelationType::Supports)
+                > weights.weight_for(&RelationType::Untyped)
+        );
+        assert!(
+            weights.weight_for(&RelationType::Contradicts)
+                > weights.weight_for(&RelationType::Untyped)
+        );
+        assert_eq!(weights.weight_for(&RelationType::Untyped), 1.0);
+        assert_eq!(weights.weight_for(&RelationType::Related), 1.0);
+    }
+
+    #[test]
+    fn test_backward_compatible_config_deserialization() {
+        // Old config without new fields should deserialize with defaults
+        let old_json = r#"{
+            "graph_hop_depth": 2,
+            "graph_proximity_weight": 0.2,
+            "hub_boost_weight": 0.15,
+            "hub_threshold": 3,
+            "base_search_limit": 50
+        }"#;
+        let config: RetrievalConfig = serde_json::from_str(old_json).unwrap();
+        assert_eq!(config.default_token_budget, 4000);
+        assert!(config.chunk_retrieval_enabled);
+        assert_eq!(config.relation_weights.supports, 1.5);
     }
 }

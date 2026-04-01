@@ -142,6 +142,10 @@ impl SettingsService {
             self.settings.smart_web_search = smart_web_search;
         }
 
+        if let Some(canvas_model_presets) = update.canvas_model_presets {
+            self.settings.canvas_model_presets = canvas_model_presets;
+        }
+
         // Persist to disk
         self.save()?;
 
@@ -239,12 +243,15 @@ fn clear_openrouter_api_key() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::settings::CanvasModelPreset;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn test_default_settings() {
         let settings = UserSettings::default();
         assert!(settings.needs_setup());
         assert!(!settings.has_openrouter_key());
+        assert!(settings.canvas_model_presets.is_empty());
     }
 
     #[test]
@@ -256,5 +263,48 @@ mod tests {
 
         assert!(!settings.needs_setup());
         assert!(settings.has_openrouter_key());
+    }
+
+    #[test]
+    fn test_update_persists_canvas_model_presets() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after epoch")
+            .as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!("grafyn-settings-{unique}"));
+        std::fs::create_dir_all(&temp_dir).expect("temp dir should be created");
+        let config_path = temp_dir.join("settings.json");
+
+        let mut service = SettingsService {
+            config_path: config_path.clone(),
+            settings: UserSettings::default(),
+        };
+
+        let presets = vec![CanvasModelPreset {
+            id: "preset-1".to_string(),
+            name: "Fast trio".to_string(),
+            model_ids: vec!["openai/gpt-4o".to_string(), "anthropic/claude-3.5-sonnet".to_string()],
+        }];
+
+        let updated = service
+            .update(SettingsUpdate {
+                vault_path: None,
+                openrouter_api_key: None,
+                setup_completed: None,
+                theme: None,
+                mcp_enabled: None,
+                llm_model: None,
+                smart_web_search: None,
+                canvas_model_presets: Some(presets.clone()),
+            })
+            .expect("settings update should succeed");
+
+        assert_eq!(updated.canvas_model_presets, presets);
+
+        let persisted = std::fs::read_to_string(config_path).expect("settings file should exist");
+        assert!(persisted.contains("\"canvas_model_presets\""));
+        assert!(persisted.contains("\"Fast trio\""));
+
+        let _ = std::fs::remove_dir_all(temp_dir);
     }
 }

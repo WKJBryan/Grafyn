@@ -346,15 +346,21 @@ impl CanvasStore {
         &mut self,
         session_id: &str,
         tile_id: &str,
-        updates: &[(String, String, crate::models::canvas::ResponseStatus)],
+        updates: &[(
+            String,
+            String,
+            crate::models::canvas::ResponseStatus,
+            Option<String>,
+        )],
     ) -> Result<()> {
         let session = self.get_session_mut(session_id)?;
 
         if let Some(tile) = session.prompt_tiles.iter_mut().find(|t| t.id == tile_id) {
-            for (model_id, content, status) in updates {
+            for (model_id, content, status, error) in updates {
                 if let Some(response) = tile.responses.get_mut(model_id) {
                     response.content = content.clone();
                     response.status = status.clone();
+                    response.error = error.clone();
                 }
             }
         }
@@ -372,6 +378,7 @@ impl CanvasStore {
         model_id: &str,
         content: &str,
         status: crate::models::canvas::ResponseStatus,
+        error: Option<&str>,
     ) -> Result<()> {
         let session = self.get_session_mut(session_id)?;
 
@@ -379,6 +386,7 @@ impl CanvasStore {
             if let Some(response) = tile.responses.get_mut(model_id) {
                 response.content = content.to_string();
                 response.status = status;
+                response.error = error.map(str::to_string);
             }
         }
 

@@ -4,11 +4,11 @@
     :data-phase="status.phase"
   >
     <div class="startup-shell">
-      <div class="startup-orbit">
-        <div class="startup-core" />
-        <div class="startup-ring startup-ring-primary" />
-        <div class="startup-ring startup-ring-secondary" />
-      </div>
+      <img
+        class="startup-logo"
+        src="@/assets/grafyn-logo.png"
+        alt="Grafyn"
+      >
 
       <div class="startup-copy">
         <p class="startup-kicker">
@@ -79,38 +79,12 @@ defineEmits(['dismiss'])
   backdrop-filter: blur(14px);
 }
 
-.startup-orbit {
-  position: relative;
+.startup-logo {
   width: 108px;
   height: 108px;
   margin-bottom: 28px;
-}
-
-.startup-core,
-.startup-ring {
-  position: absolute;
-  inset: 0;
-  border-radius: 999px;
-}
-
-.startup-core {
-  inset: 24px;
-  background: radial-gradient(circle at 30% 30%, #6c71c4, #268bd2 70%, #2aa198 100%);
-  box-shadow: 0 0 40px rgba(108, 113, 196, 0.4);
-}
-
-.startup-ring {
-  border: 1px solid rgba(147, 161, 161, 0.22);
-}
-
-.startup-ring-primary {
-  animation: orbit-spin 8s linear infinite;
-}
-
-.startup-ring-secondary {
-  inset: 10px;
-  border-style: dashed;
-  animation: orbit-spin-reverse 5.5s linear infinite;
+  object-fit: contain;
+  border-radius: 16px;
 }
 
 .startup-copy {
@@ -160,13 +134,4 @@ defineEmits(['dismiss'])
   100% { transform: translateX(320%); }
 }
 
-@keyframes orbit-spin {
-  from { transform: rotate(0deg); }
-  to { transform: rotate(360deg); }
-}
-
-@keyframes orbit-spin-reverse {
-  from { transform: rotate(360deg); }
-  to { transform: rotate(0deg); }
-}
 </style>

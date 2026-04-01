@@ -32,6 +32,32 @@ export const useCanvasStore = defineStore('canvas', () => {
   function removeStreaming(modelId) { streamingModels.value.delete(modelId); triggerRef(streamingModels) }
   function clearStreaming() { streamingModels.value.clear(); triggerRef(streamingModels) }
 
+  function normalizeResponse(response) {
+    if (!response) return response
+
+    return {
+      ...response,
+      error_message: response.error_message ?? response.error ?? null
+    }
+  }
+
+  function normalizeSession(session) {
+    if (!session?.prompt_tiles) return session
+
+    return {
+      ...session,
+      prompt_tiles: session.prompt_tiles.map(tile => ({
+        ...tile,
+        responses: Object.fromEntries(
+          Object.entries(tile.responses || {}).map(([modelId, response]) => [
+            modelId,
+            normalizeResponse(response)
+          ])
+        )
+      }))
+    }
+  }
+
   // Getters
   const promptTiles = computed(() => currentSession.value?.prompt_tiles || [])
   const debates = computed(() => currentSession.value?.debates || [])
@@ -96,7 +122,7 @@ export const useCanvasStore = defineStore('canvas', () => {
     loading.value = true
     error.value = null
     try {
-      currentSession.value = await canvasApi.get(sessionId)
+      currentSession.value = normalizeSession(await canvasApi.get(sessionId))
     } catch (err) {
       error.value = err.message || 'Failed to load session'
       console.error('Failed to load canvas session:', err)
@@ -109,7 +135,7 @@ export const useCanvasStore = defineStore('canvas', () => {
     loading.value = true
     error.value = null
     try {
-      const session = await canvasApi.create(data)
+      const session = normalizeSession(await canvasApi.create(data))
       sessions.value.unshift(session)
       currentSession.value = session
       return session
@@ -124,7 +150,7 @@ export const useCanvasStore = defineStore('canvas', () => {
 
   async function updateSession(sessionId, data) {
     try {
-      const updated = await canvasApi.update(sessionId, data)
+      const updated = normalizeSession(await canvasApi.update(sessionId, data))
 
       // Update in sessions list
       const idx = sessions.value.findIndex(s => s.id === sessionId)
@@ -310,6 +336,9 @@ export const useCanvasStore = defineStore('canvas', () => {
     if (tile && tile.responses[modelId]) {
       tile.responses[modelId].content = content
       tile.responses[modelId].status = status
+      tile.responses[modelId].error = status === 'error'
+        ? (errorMessage || content || 'Error occurred')
+        : null
       tile.responses[modelId].error_message = status === 'error'
         ? (errorMessage || content || 'Error occurred')
         : null

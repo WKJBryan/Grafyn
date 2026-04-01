@@ -20,6 +20,7 @@ use services::{
     settings::SettingsService,
 };
 use std::sync::Arc;
+use std::time::Instant;
 use tauri::Manager;
 use tokio::sync::RwLock;
 
@@ -248,9 +249,12 @@ fn main() {
 }
 
 async fn warm_start_services(app_handle: tauri::AppHandle, state: AppState) -> Result<(), String> {
-    publish_boot_status(
+    let boot_started = Instant::now();
+
+    publish_boot_phase(
         &app_handle,
         &state,
+        &boot_started,
         BootStatus::new("opening_store", "Loading notes from your vault"),
     )
     .await;
@@ -270,10 +274,11 @@ async fn warm_start_services(app_handle: tauri::AppHandle, state: AppState) -> R
         notes
     };
 
-    publish_boot_status(
+    publish_boot_phase(
         &app_handle,
         &state,
-        BootStatus::new("building_indices", "Building graph and search index"),
+        &boot_started,
+        BootStatus::new("building_graph", "Building graph from your notes"),
     )
     .await;
 
@@ -282,10 +287,26 @@ async fn warm_start_services(app_handle: tauri::AppHandle, state: AppState) -> R
         graph.build_from_notes(&full_notes);
     }
 
+    publish_boot_phase(
+        &app_handle,
+        &state,
+        &boot_started,
+        BootStatus::new("building_search_index", "Building search index"),
+    )
+    .await;
+
     {
         let mut search = state.search_service.write().await;
         search.reindex_all(&full_notes).map_err(|e| e.to_string())?;
     }
+
+    publish_boot_phase(
+        &app_handle,
+        &state,
+        &boot_started,
+        BootStatus::new("building_chunk_index", "Building chunk index"),
+    )
+    .await;
 
     {
         let mut chunks = state.chunk_index.write().await;
@@ -294,9 +315,10 @@ async fn warm_start_services(app_handle: tauri::AppHandle, state: AppState) -> R
         }
     }
 
-    publish_boot_status(
+    publish_boot_phase(
         &app_handle,
         &state,
+        &boot_started,
         BootStatus::ready("Grafyn is ready"),
     )
     .await;
@@ -304,14 +326,44 @@ async fn warm_start_services(app_handle: tauri::AppHandle, state: AppState) -> R
     Ok(())
 }
 
-async fn publish_boot_status(app_handle: &tauri::AppHandle, state: &AppState, status: BootStatus) {
-    {
-        let mut boot_state = state.boot_state.write().await;
-        *boot_state = status.clone();
-    }
+async fn publish_boot_phase(
+    app_handle: &tauri::AppHandle,
+    state: &AppState,
+    boot_started: &Instant,
+    status: BootStatus,
+) {
+    log::info!(
+        "Boot phase '{}' at {:.2?}: {}",
+        status.phase,
+        boot_started.elapsed(),
+        status.message
+    );
+    publish_boot_status(app_handle, state, status).await;
+}
 
-    if let Some(window) = app_handle.get_window("main") {
-        let _ = window.emit("boot-status", status);
+async fn update_boot_state(boot_state: &Arc<RwLock<BootStatus>>, status: &BootStatus) {
+    let mut current = boot_state.write().await;
+    *current = status.clone();
+}
+
+async fn publish_boot_status(app_handle: &tauri::AppHandle, state: &AppState, status: BootStatus) {
+    update_boot_state(&state.boot_state, &status).await;
+
+    let _ = app_handle.emit_all("boot-status", status);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn update_boot_state_replaces_existing_status() {
+        let boot_state = Arc::new(RwLock::new(BootStatus::default()));
+        let next = BootStatus::new("building_search_index", "Building search index");
+
+        update_boot_state(&boot_state, &next).await;
+
+        assert_eq!(*boot_state.read().await, next);
     }
 }
 
