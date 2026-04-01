@@ -1,13 +1,16 @@
 //! MCP Tool Definitions for Grafyn
 //!
-//! Implements 10 MCP tools that expose the knowledge base to Claude Desktop
+//! Implements 12 MCP tools that expose the knowledge base to Claude Desktop
 //! and other MCP clients via the rmcp crate.
 
 use crate::models::note::{NoteCreate, NoteStatus, NoteUpdate};
+use crate::services::chunk_index::ChunkIndex;
 use crate::services::graph_index::GraphIndex;
 use crate::services::import;
 use crate::services::knowledge_store::KnowledgeStore;
 use crate::services::memory::MemoryService;
+use crate::services::priority::PriorityScoringService;
+use crate::services::retrieval::RetrievalService;
 use crate::services::search::SearchService;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -26,6 +29,9 @@ pub struct GrafynMcpServer {
     pub search_service: Arc<RwLock<SearchService>>,
     pub graph_index: Arc<RwLock<GraphIndex>>,
     pub memory_service: Arc<RwLock<MemoryService>>,
+    pub chunk_index: Option<Arc<RwLock<ChunkIndex>>>,
+    pub retrieval_service: Arc<RwLock<RetrievalService>>,
+    pub priority_service: Arc<RwLock<PriorityScoringService>>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -110,10 +116,28 @@ pub struct RecallParams {
     #[schemars(description = "Maximum results (default: 5)")]
     #[serde(default = "default_recall_limit")]
     pub limit: usize,
+    #[schemars(description = "Token budget for chunk-level retrieval. When set, returns relevant paragraphs within this budget instead of whole notes.")]
+    pub token_budget: Option<usize>,
 }
 
 fn default_recall_limit() -> usize {
     5
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SearchChunksParams {
+    #[schemars(description = "Search query string")]
+    pub query: String,
+    #[schemars(description = "Token budget — returns best-matching paragraphs that fit within this limit (default: 4000)")]
+    #[serde(default = "default_token_budget")]
+    pub token_budget: usize,
+    #[schemars(description = "Note IDs to use as context for graph-boosted scoring")]
+    #[serde(default)]
+    pub context_note_ids: Vec<String>,
+}
+
+fn default_token_budget() -> usize {
+    4000
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -179,12 +203,18 @@ impl GrafynMcpServer {
         search_service: Arc<RwLock<SearchService>>,
         graph_index: Arc<RwLock<GraphIndex>>,
         memory_service: Arc<RwLock<MemoryService>>,
+        chunk_index: Option<Arc<RwLock<ChunkIndex>>>,
+        retrieval_service: Arc<RwLock<RetrievalService>>,
+        priority_service: Arc<RwLock<PriorityScoringService>>,
     ) -> Self {
         Self {
             knowledge_store,
             search_service,
             graph_index,
             memory_service,
+            chunk_index,
+            retrieval_service,
+            priority_service,
             tool_router: Self::tool_router(),
         }
     }
@@ -495,40 +525,112 @@ impl GrafynMcpServer {
         json_result(&result)
     }
 
-    #[tool(description = "Search with graph-aware boosting. Notes connected to context notes via wikilinks get a relevance boost. Best for finding related knowledge.")]
+    #[tool(description = "Search with graph-aware boosting. When token_budget is set, returns relevant paragraphs (chunks) within that budget using the full retrieval pipeline. Without token_budget, returns note-level results with graph boosting.")]
     async fn recall_relevant(
         &self,
         Parameters(params): Parameters<RecallParams>,
     ) -> Result<CallToolResult, McpError> {
-        let search = self.search_service.read().await;
-        let graph = self.graph_index.read().await;
-        let memory = self.memory_service.read().await;
+        // If token_budget is set and chunk index is available, use chunk retrieval
+        if let (Some(budget), Some(chunk_index)) = (params.token_budget, &self.chunk_index) {
+            let chunk_index = chunk_index.read().await;
+            let graph = self.graph_index.read().await;
+            let priority = self.priority_service.read().await;
+            let retrieval = self.retrieval_service.read().await;
 
-        match memory.recall_relevant(
-            &search,
-            &graph,
-            &params.query,
-            &params.context_note_ids,
-            params.limit,
-        ) {
-            Ok(results) => {
-                let response: Vec<serde_json::Value> = results
-                    .into_iter()
-                    .map(|r| {
-                        serde_json::json!({
-                            "note_id": r.note_id,
-                            "title": r.title,
-                            "snippet": r.snippet,
-                            "score": r.score,
-                            "graph_boost": r.graph_boost,
-                            "total_score": r.total_score,
-                            "tags": r.tags,
+            match retrieval.retrieve_chunks(
+                &chunk_index, &graph, &priority,
+                &params.query, budget, &params.context_note_ids,
+            ) {
+                Ok(chunks) => {
+                    let response: Vec<serde_json::Value> = chunks
+                        .into_iter()
+                        .map(|c| {
+                            serde_json::json!({
+                                "parent_note_id": c.parent_note_id,
+                                "parent_title": c.parent_title,
+                                "text": c.text,
+                                "score": c.search_score,
+                                "token_estimate": c.token_estimate,
+                            })
                         })
-                    })
-                    .collect();
+                        .collect();
+                    json_result(&response)
+                }
+                Err(e) => err_result(format!("Chunk recall failed: {}", e)),
+            }
+        } else {
+            // Note-level recall (original behavior)
+            let search = self.search_service.read().await;
+            let graph = self.graph_index.read().await;
+            let memory = self.memory_service.read().await;
+
+            match memory.recall_relevant(
+                &search,
+                &graph,
+                &params.query,
+                &params.context_note_ids,
+                params.limit,
+            ) {
+                Ok(results) => {
+                    let response: Vec<serde_json::Value> = results
+                        .into_iter()
+                        .map(|r| {
+                            serde_json::json!({
+                                "note_id": r.note_id,
+                                "title": r.title,
+                                "snippet": r.snippet,
+                                "score": r.score,
+                                "graph_boost": r.graph_boost,
+                                "total_score": r.total_score,
+                                "tags": r.tags,
+                            })
+                        })
+                        .collect();
+                    json_result(&response)
+                }
+                Err(e) => err_result(format!("Recall failed: {}", e)),
+            }
+        }
+    }
+
+    #[tool(description = "Search for relevant paragraphs across all notes with token budgeting. Returns the best-matching text chunks that fit within the token budget, scored with graph-aware boosting. Ideal for retrieving precise context without exceeding token limits.")]
+    async fn search_chunks(
+        &self,
+        Parameters(params): Parameters<SearchChunksParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let Some(chunk_index) = &self.chunk_index else {
+            return err_result(
+                "Chunk index not available. Run the Grafyn app first to build it.".into(),
+            );
+        };
+
+        let chunk_index = chunk_index.read().await;
+        let graph = self.graph_index.read().await;
+        let priority = self.priority_service.read().await;
+        let retrieval = self.retrieval_service.read().await;
+
+        match retrieval.retrieve_chunks(
+            &chunk_index, &graph, &priority,
+            &params.query, params.token_budget, &params.context_note_ids,
+        ) {
+            Ok(chunks) => {
+                let total_tokens: usize = chunks.iter().map(|c| c.token_estimate).sum();
+                let response = serde_json::json!({
+                    "chunks": chunks.iter().map(|c| {
+                        serde_json::json!({
+                            "parent_note_id": c.parent_note_id,
+                            "parent_title": c.parent_title,
+                            "text": c.text,
+                            "score": c.search_score,
+                            "token_estimate": c.token_estimate,
+                        })
+                    }).collect::<Vec<_>>(),
+                    "total_tokens": total_tokens,
+                    "token_budget": params.token_budget,
+                });
                 json_result(&response)
             }
-            Err(e) => err_result(format!("Recall failed: {}", e)),
+            Err(e) => err_result(format!("Chunk search failed: {}", e)),
         }
     }
 }
@@ -540,7 +642,8 @@ impl ServerHandler for GrafynMcpServer {
             instructions: Some(
                 "Grafyn knowledge base server. Use tools to search, browse, and manage \
                  markdown notes with [[wikilinks]], tags, and a graph of connections. \
-                 Notes have statuses: draft, evidence, canonical."
+                 Notes have statuses: draft, evidence, canonical. \
+                 Use search_chunks for token-budgeted paragraph-level retrieval."
                     .into(),
             ),
             capabilities: ServerCapabilities::builder().enable_tools().build(),

@@ -5,7 +5,7 @@ use crate::models::canvas::{
     ResponseStatus, SessionCreate, SessionMeta, SessionUpdate, TileContextNote, TilePosition,
     TilePositionUpdate,
 };
-use crate::models::note::{NoteCreate, NoteStatus};
+use crate::models::note::{ChunkResult, NoteCreate, NoteStatus};
 use crate::services::openrouter::ChatMessage;
 use crate::services::retrieval::RetrievalResult;
 use crate::AppState;
@@ -1553,6 +1553,8 @@ async fn resolve_prompt_context(
 
     if matches!(request.context_mode, ContextMode::KnowledgeSearch | ContextMode::Semantic) {
         let pinned_ids = session.pinned_note_ids.clone();
+
+        // Quality gate: note-level retrieval to check if vault has relevant content
         let retrieval_results = {
             let search = state.search_service.read().await;
             let graph = state.graph_index.read().await;
@@ -1577,41 +1579,78 @@ async fn resolve_prompt_context(
             });
         }
 
-        let note_contexts: Vec<(String, String, String)> = {
-            let store = state.knowledge_store.read().await;
-            retrieval_results
+        // Check if chunk-level retrieval is enabled
+        let chunk_enabled = {
+            let retrieval = state.retrieval_service.read().await;
+            retrieval.get_config().chunk_retrieval_enabled
+        };
+
+        if chunk_enabled {
+            // Chunk-level context: retrieve relevant paragraphs within token budget
+            let chunks = {
+                let retrieval = state.retrieval_service.read().await;
+                let chunk_index = state.chunk_index.read().await;
+                let graph = state.graph_index.read().await;
+                let priority = state.priority_service.read().await;
+                let token_budget = retrieval.get_config().default_token_budget;
+                retrieval
+                    .retrieve_chunks(
+                        &chunk_index, &graph, &priority,
+                        &request.prompt, token_budget, &pinned_ids,
+                    )
+                    .unwrap_or_default()
+            };
+
+            if chunks.is_empty() {
+                log::info!("Chunk retrieval returned no results, falling back to note-level");
+                return resolve_note_level_context(
+                    state, messages, &retrieval_results, &pinned_ids, &request.system_prompt,
+                ).await;
+            }
+
+            let total_tokens: usize = chunks.iter().map(|c| c.token_estimate).sum();
+            let parent_count = chunks.iter().map(|c| &c.parent_note_id).collect::<HashSet<_>>().len();
+            log::info!(
+                "Canvas using chunk retrieval: {} chunks from {} notes (~{} tokens)",
+                chunks.len(), parent_count, total_tokens
+            );
+
+            // Build context notes from chunk parent notes (deduped)
+            let mut seen_notes: HashSet<String> = HashSet::new();
+            let context_notes: Vec<TileContextNote> = chunks
                 .iter()
-                .filter_map(|r| {
-                    store.get_note(&r.note.id).ok().map(|note| {
-                        let truncated = truncate_note_context_content(&note.content, 1500);
-                        (note.id.clone(), note.title.clone(), truncated)
-                    })
+                .filter_map(|c| {
+                    if seen_notes.insert(c.parent_note_id.clone()) {
+                        Some(TileContextNote {
+                            id: c.parent_note_id.clone(),
+                            title: c.parent_title.clone(),
+                            snippet: truncate_note_context_content(&c.text, 200),
+                            score: c.search_score,
+                            pinned: pinned_ids.contains(&c.parent_note_id),
+                        })
+                    } else {
+                        None
+                    }
                 })
-                .collect()
-        };
+                .collect();
 
-        let context_notes: Vec<TileContextNote> = retrieval_results
-            .iter()
-            .map(|r| TileContextNote {
-                id: r.note.id.clone(),
-                title: r.note.title.clone(),
-                snippet: r.snippet.clone(),
-                score: r.score,
-                pinned: pinned_ids.contains(&r.note.id),
+            let note_prompt = build_chunk_context_prompt(&chunks);
+            let system_prompt = match &request.system_prompt {
+                Some(user_sp) if !user_sp.is_empty() => format!("{}\n\n{}", note_prompt, user_sp),
+                _ => note_prompt,
+            };
+
+            Ok(ResolvedPromptContext {
+                messages,
+                context_notes,
+                system_prompt: Some(system_prompt),
             })
-            .collect();
-
-        let note_prompt = build_note_context_prompt(&note_contexts);
-        let system_prompt = match &request.system_prompt {
-            Some(user_sp) if !user_sp.is_empty() => format!("{}\n\n{}", note_prompt, user_sp),
-            _ => note_prompt,
-        };
-
-        Ok(ResolvedPromptContext {
-            messages,
-            context_notes,
-            system_prompt: Some(system_prompt),
-        })
+        } else {
+            log::info!("Canvas using note-level context (chunk retrieval disabled)");
+            resolve_note_level_context(
+                state, messages, &retrieval_results, &pinned_ids, &request.system_prompt,
+            ).await
+        }
     } else {
         Ok(ResolvedPromptContext {
             messages,
@@ -1619,6 +1658,51 @@ async fn resolve_prompt_context(
             system_prompt: request.system_prompt.clone(),
         })
     }
+}
+
+/// Fall back to note-level context when chunk retrieval is disabled or returns nothing.
+async fn resolve_note_level_context(
+    state: &AppState,
+    messages: Vec<ChatMessage>,
+    retrieval_results: &[RetrievalResult],
+    pinned_ids: &[String],
+    user_system_prompt: &Option<String>,
+) -> Result<ResolvedPromptContext, String> {
+    let note_contexts: Vec<(String, String, String)> = {
+        let store = state.knowledge_store.read().await;
+        retrieval_results
+            .iter()
+            .filter_map(|r| {
+                store.get_note(&r.note.id).ok().map(|note| {
+                    let truncated = truncate_note_context_content(&note.content, 1500);
+                    (note.id.clone(), note.title.clone(), truncated)
+                })
+            })
+            .collect()
+    };
+
+    let context_notes: Vec<TileContextNote> = retrieval_results
+        .iter()
+        .map(|r| TileContextNote {
+            id: r.note.id.clone(),
+            title: r.note.title.clone(),
+            snippet: r.snippet.clone(),
+            score: r.score,
+            pinned: pinned_ids.contains(&r.note.id),
+        })
+        .collect();
+
+    let note_prompt = build_note_context_prompt(&note_contexts);
+    let system_prompt = match user_system_prompt {
+        Some(user_sp) if !user_sp.is_empty() => format!("{}\n\n{}", note_prompt, user_sp),
+        _ => note_prompt,
+    };
+
+    Ok(ResolvedPromptContext {
+        messages,
+        context_notes,
+        system_prompt: Some(system_prompt),
+    })
 }
 
 fn build_canvas_messages(
@@ -1797,6 +1881,47 @@ fn truncate_for_compact_history(content: &str) -> String {
 
 /// Build a system prompt that includes retrieved note context.
 /// Used by send_prompt when context_mode is Semantic.
+fn build_chunk_context_prompt(chunks: &[ChunkResult]) -> String {
+    let mut prompt = String::from(
+        "You are a helpful knowledge assistant for the user's personal note-taking system (Grafyn). \
+         Answer questions using the context from the user's notes below. \
+         Reference specific notes by title when citing information. \
+         If the notes don't contain relevant information, say so honestly.\n\n",
+    );
+
+    if chunks.is_empty() {
+        prompt.push_str("No relevant notes were found for this query.\n");
+        return prompt;
+    }
+
+    // Group chunks by parent note, preserving insertion order
+    let mut note_order: Vec<String> = Vec::new();
+    let mut note_map: HashMap<String, (String, Vec<&str>)> = HashMap::new();
+
+    for chunk in chunks {
+        let entry = note_map
+            .entry(chunk.parent_note_id.clone())
+            .or_insert_with(|| {
+                note_order.push(chunk.parent_note_id.clone());
+                (chunk.parent_title.clone(), Vec::new())
+            });
+        entry.1.push(&chunk.text);
+    }
+
+    prompt.push_str("## Relevant Notes\n\n");
+    for note_id in &note_order {
+        if let Some((title, texts)) = note_map.get(note_id) {
+            prompt.push_str(&format!("### {} (id: {})\n", title, note_id));
+            for text in texts {
+                prompt.push_str(text);
+                prompt.push_str("\n\n");
+            }
+        }
+    }
+
+    prompt
+}
+
 fn build_note_context_prompt(notes: &[(String, String, String)]) -> String {
     let mut prompt = String::from(
         "You are a helpful knowledge assistant for the user's personal note-taking system (Grafyn). \
@@ -1937,6 +2062,64 @@ mod tests {
         let notes: Vec<(String, String, String)> = vec![];
         let prompt = build_note_context_prompt(&notes);
 
+        assert!(prompt.contains("No relevant notes were found"));
+    }
+
+    #[test]
+    fn test_build_chunk_context_prompt_groups_by_parent() {
+        let chunks = vec![
+            ChunkResult {
+                chunk_id: "c1".into(),
+                parent_note_id: "note-a".into(),
+                parent_title: "Note A".into(),
+                text: "First paragraph of A".into(),
+                start_char: 0,
+                end_char: 20,
+                depth_score: 1.0,
+                search_score: 5.0,
+                token_estimate: 10,
+            },
+            ChunkResult {
+                chunk_id: "c2".into(),
+                parent_note_id: "note-b".into(),
+                parent_title: "Note B".into(),
+                text: "Content of B".into(),
+                start_char: 0,
+                end_char: 12,
+                depth_score: 1.0,
+                search_score: 4.0,
+                token_estimate: 8,
+            },
+            ChunkResult {
+                chunk_id: "c3".into(),
+                parent_note_id: "note-a".into(),
+                parent_title: "Note A".into(),
+                text: "Second paragraph of A".into(),
+                start_char: 21,
+                end_char: 42,
+                depth_score: 0.5,
+                search_score: 3.5,
+                token_estimate: 10,
+            },
+        ];
+        let prompt = build_chunk_context_prompt(&chunks);
+
+        // Both chunks from Note A should be under the same heading
+        assert!(prompt.contains("### Note A (id: note-a)"));
+        assert!(prompt.contains("First paragraph of A"));
+        assert!(prompt.contains("Second paragraph of A"));
+        assert!(prompt.contains("### Note B (id: note-b)"));
+        assert!(prompt.contains("Content of B"));
+        // Note A should appear before Note B (insertion order from chunks)
+        let a_pos = prompt.find("Note A").unwrap();
+        let b_pos = prompt.find("Note B").unwrap();
+        assert!(a_pos < b_pos);
+    }
+
+    #[test]
+    fn test_build_chunk_context_prompt_empty() {
+        let chunks: Vec<ChunkResult> = vec![];
+        let prompt = build_chunk_context_prompt(&chunks);
         assert!(prompt.contains("No relevant notes were found"));
     }
 

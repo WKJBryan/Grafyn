@@ -18,9 +18,12 @@ mod services;
 mod mcp_tools;
 
 use crate::mcp_tools::GrafynMcpServer;
+use crate::services::chunk_index::ChunkIndex;
 use crate::services::graph_index::GraphIndex;
 use crate::services::knowledge_store::KnowledgeStore;
 use crate::services::memory::MemoryService;
+use crate::services::priority::PriorityScoringService;
+use crate::services::retrieval::RetrievalService;
 use crate::services::search::SearchService;
 use crate::services::settings::SettingsService;
 use clap::Parser;
@@ -107,6 +110,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let memory_service = MemoryService::new();
+    let priority_service = PriorityScoringService::new(data_path.clone());
+    let retrieval_service = RetrievalService::new(data_path.clone());
+
+    // Try to open chunk index (read-only — Tauri app may hold the writer lock)
+    let chunk_index = match ChunkIndex::new_readonly(data_path.clone()) {
+        Ok(ci) => {
+            log::info!("Chunk index opened in read-only mode");
+            Some(Arc::new(RwLock::new(ci)))
+        }
+        Err(e) => {
+            log::warn!("Chunk index not available: {}. search_chunks and chunk recall will be disabled.", e);
+            None
+        }
+    };
 
     // Create MCP server
     let server = GrafynMcpServer::new(
@@ -114,6 +131,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::new(RwLock::new(search_service)),
         Arc::new(RwLock::new(graph_index)),
         Arc::new(RwLock::new(memory_service)),
+        chunk_index,
+        Arc::new(RwLock::new(retrieval_service)),
+        Arc::new(RwLock::new(priority_service)),
     );
 
     log::info!("Starting Grafyn MCP server on stdio...");
