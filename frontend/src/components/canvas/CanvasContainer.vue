@@ -892,7 +892,7 @@ async function handleCreatePreset({ name, modelIds }) {
   try {
     await persistCanvasModelPresets(nextPresets, 'Failed to save preset')
     showCanvasMessage('success', `Saved preset "${name}"`, 2500)
-  } catch {}
+  } catch (_) { /* persistCanvasModelPresets handles error display */ }
 }
 
 async function handleUpdatePreset({ id, modelIds }) {
@@ -909,7 +909,7 @@ async function handleUpdatePreset({ id, modelIds }) {
     await persistCanvasModelPresets(nextPresets, 'Failed to update preset')
     toast.success(`Updated preset "${existing.name}"`, 2500)
     showCanvasMessage('success', `Updated preset "${existing.name}"`, 2500)
-  } catch {}
+  } catch (_) { /* persistCanvasModelPresets handles error display */ }
 }
 
 async function handleDeletePreset(id) {
@@ -921,7 +921,7 @@ async function handleDeletePreset(id) {
   try {
     await persistCanvasModelPresets(nextPresets, 'Failed to delete preset')
     showCanvasMessage('success', `Deleted preset "${existing.name}"`, 2500)
-  } catch {}
+  } catch (_) { /* persistCanvasModelPresets handles error display */ }
 }
 
 // Debate expand/collapse
