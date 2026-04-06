@@ -1,5 +1,5 @@
 import { defineStore } from 'pinia'
-import { ref, shallowRef, computed, triggerRef } from 'vue'
+import { ref, shallowRef, computed, triggerRef, toRaw } from 'vue'
 import { canvas as canvasApi } from '@/api/client'
 
 export const DEFAULT_WEB_SEARCH_MAX_RESULTS = 5
@@ -345,6 +345,56 @@ export const useCanvasStore = defineStore('canvas', () => {
     }
   }
 
+  function collectDescendantTileIds(tileId, parentModelId = null) {
+    if (!currentSession.value) return new Set()
+
+    const descendants = new Set()
+    const queue = currentSession.value.prompt_tiles
+      .filter(tile =>
+        tile.parent_tile_id === tileId &&
+        (parentModelId === null || tile.parent_model_id === parentModelId)
+      )
+      .map(tile => tile.id)
+
+    while (queue.length > 0) {
+      const currentId = queue.shift()
+      if (!currentId || descendants.has(currentId)) continue
+
+      descendants.add(currentId)
+
+      const directChildren = currentSession.value.prompt_tiles
+        .filter(tile => tile.parent_tile_id === currentId)
+        .map(tile => tile.id)
+
+      queue.push(...directChildren)
+    }
+
+    return descendants
+  }
+
+  function pruneDependentDebates(removedTileIds, deletedResponse = null) {
+    if (!currentSession.value) return []
+
+    return currentSession.value.debates.filter(debate => {
+      const sourceTileIds = debate.source_tile_ids || []
+
+      if (removedTileIds.size > 0 && sourceTileIds.some(sourceTileId => removedTileIds.has(sourceTileId))) {
+        return false
+      }
+
+      if (deletedResponse) {
+        const usesDeletedResponse = sourceTileIds.includes(deletedResponse.tileId) &&
+          (debate.participating_models || []).includes(deletedResponse.modelId)
+
+        if (usesDeletedResponse) {
+          return false
+        }
+      }
+
+      return true
+    })
+  }
+
   // Debounce timers for position persistence — optimistic updates are instant,
   // but backend writes (JSON serialize + disk I/O) are debounced to avoid
   // hammering the backend at 60fps during drag operations.
@@ -441,38 +491,29 @@ export const useCanvasStore = defineStore('canvas', () => {
   async function deleteTile(tileId) {
     if (!currentSession.value) return
 
-    // Optimistic update - remove from prompt tiles
-    const tileIndex = currentSession.value.prompt_tiles.findIndex(t => t.id === tileId)
-    let removedTile = null
-    if (tileIndex !== -1) {
-      removedTile = currentSession.value.prompt_tiles[tileIndex]
-      currentSession.value.prompt_tiles.splice(tileIndex, 1)
-      // Also remove any child tiles
-      currentSession.value.prompt_tiles = currentSession.value.prompt_tiles.filter(
-        t => t.parent_tile_id !== tileId
-      )
+    const previousSession = structuredClone(toRaw(currentSession.value))
+    const tileIdsToRemove = collectDescendantTileIds(tileId)
+
+    if (currentSession.value.prompt_tiles.some(tile => tile.id === tileId)) {
+      tileIdsToRemove.add(tileId)
     }
 
-    // Also try to remove from debates
-    const debateIndex = currentSession.value.debates.findIndex(d => d.id === tileId)
-    let removedDebate = null
-    if (debateIndex !== -1) {
-      removedDebate = currentSession.value.debates[debateIndex]
-      currentSession.value.debates.splice(debateIndex, 1)
-    }
+    currentSession.value.prompt_tiles = currentSession.value.prompt_tiles.filter(
+      tile => !tileIdsToRemove.has(tile.id)
+    )
+    currentSession.value.debates = currentSession.value.debates.filter(
+      debate => debate.id !== tileId
+    )
+    currentSession.value.debates = pruneDependentDebates(tileIdsToRemove).filter(
+      debate => debate.id !== tileId
+    )
 
     // Persist to backend
     try {
       await canvasApi.deleteTile(currentSession.value.id, tileId)
     } catch (err) {
       console.error('Failed to delete tile:', err)
-      // Revert optimistic update on error
-      if (removedTile) {
-        currentSession.value.prompt_tiles.push(removedTile)
-      }
-      if (removedDebate) {
-        currentSession.value.debates.push(removedDebate)
-      }
+      currentSession.value = previousSession
       throw err
     }
   }
@@ -484,21 +525,21 @@ export const useCanvasStore = defineStore('canvas', () => {
     const tile = currentSession.value.prompt_tiles.find(t => t.id === tileId)
     if (!tile) return
 
-    // Optimistic update
-    const removedResponse = tile.responses[modelId]
+    const previousSession = structuredClone(toRaw(currentSession.value))
+    const tileIdsToRemove = collectDescendantTileIds(tileId, modelId)
+
     delete tile.responses[modelId]
-    const modelIndex = tile.models.indexOf(modelId)
-    if (modelIndex !== -1) tile.models.splice(modelIndex, 1)
+    tile.models = tile.models.filter(model => model !== modelId)
+    currentSession.value.prompt_tiles = currentSession.value.prompt_tiles.filter(
+      promptTile => !tileIdsToRemove.has(promptTile.id)
+    )
+    currentSession.value.debates = pruneDependentDebates(tileIdsToRemove, { tileId, modelId })
 
     try {
       await canvasApi.deleteResponse(currentSession.value.id, tileId, modelId)
     } catch (err) {
       console.error('Failed to delete response:', err)
-      // Revert
-      if (removedResponse) {
-        tile.responses[modelId] = removedResponse
-        tile.models.push(modelId)
-      }
+      currentSession.value = previousSession
       throw err
     }
   }

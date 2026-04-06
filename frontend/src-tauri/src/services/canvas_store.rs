@@ -4,7 +4,7 @@ use crate::models::canvas::{
 };
 use anyhow::{Context, Result};
 use chrono::Utc;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use walkdir::WalkDir;
 
@@ -30,6 +30,61 @@ impl CanvasStore {
             session_cache: HashMap::new(),
             list_cache_ready: false,
         }
+    }
+
+    fn collect_descendant_tile_ids(
+        session: &CanvasSession,
+        tile_id: &str,
+        parent_model_id: Option<&str>,
+    ) -> HashSet<String> {
+        let mut descendants = HashSet::new();
+        let mut frontier: Vec<String> = session
+            .prompt_tiles
+            .iter()
+            .filter(|tile| {
+                tile.parent_tile_id.as_deref() == Some(tile_id)
+                    && parent_model_id.map_or(true, |model_id| {
+                        tile.parent_model_id.as_deref() == Some(model_id)
+                    })
+            })
+            .map(|tile| tile.id.clone())
+            .collect();
+
+        while let Some(current_id) = frontier.pop() {
+            if !descendants.insert(current_id.clone()) {
+                continue;
+            }
+
+            for child_id in session
+                .prompt_tiles
+                .iter()
+                .filter(|tile| tile.parent_tile_id.as_deref() == Some(current_id.as_str()))
+                .map(|tile| tile.id.clone())
+            {
+                frontier.push(child_id);
+            }
+        }
+
+        descendants
+    }
+
+    fn debate_uses_removed_tiles(debate: &Debate, removed_tile_ids: &HashSet<String>) -> bool {
+        !removed_tile_ids.is_empty()
+            && debate
+                .source_tile_ids
+                .iter()
+                .any(|source_tile_id| removed_tile_ids.contains(source_tile_id))
+    }
+
+    fn debate_uses_deleted_response(debate: &Debate, tile_id: &str, model_id: &str) -> bool {
+        debate
+            .source_tile_ids
+            .iter()
+            .any(|source_tile_id| source_tile_id == tile_id)
+            && debate
+                .participating_models
+                .iter()
+                .any(|participating_model| participating_model == model_id)
     }
 
     /// Ensure all sessions are loaded into cache (called once, on first list)
@@ -167,12 +222,18 @@ impl CanvasStore {
     /// Delete a prompt tile and its children from a session
     pub fn delete_tile(&mut self, session_id: &str, tile_id: &str) -> Result<()> {
         let session = self.get_session_mut(session_id)?;
+        let mut removed_tile_ids = Self::collect_descendant_tile_ids(session, tile_id, None);
+        removed_tile_ids.insert(tile_id.to_string());
 
-        // Remove tile and any children that reference it as parent
-        session.prompt_tiles.retain(|t| t.id != tile_id && t.parent_tile_id.as_deref() != Some(tile_id));
+        // Remove tile and its full descendant tree.
+        session
+            .prompt_tiles
+            .retain(|tile| !removed_tile_ids.contains(&tile.id));
 
-        // Also check debates - remove if matching ID
-        session.debates.retain(|d| d.id != tile_id);
+        // Remove direct debate nodes and any debates tied to the deleted subtree.
+        session
+            .debates
+            .retain(|debate| !Self::debate_uses_removed_tiles(debate, &removed_tile_ids));
 
         session.updated_at = Utc::now();
         let session = session.clone();
@@ -183,11 +244,20 @@ impl CanvasStore {
     /// Delete a single model response from a tile
     pub fn delete_response(&mut self, session_id: &str, tile_id: &str, model_id: &str) -> Result<()> {
         let session = self.get_session_mut(session_id)?;
+        let descendants = Self::collect_descendant_tile_ids(session, tile_id, Some(model_id));
 
         if let Some(tile) = session.prompt_tiles.iter_mut().find(|t| t.id == tile_id) {
             tile.responses.remove(model_id);
             tile.models.retain(|m| m != model_id);
         }
+
+        session
+            .prompt_tiles
+            .retain(|tile| !descendants.contains(&tile.id));
+        session.debates.retain(|debate| {
+            !Self::debate_uses_removed_tiles(debate, &descendants)
+                && !Self::debate_uses_deleted_response(debate, tile_id, model_id)
+        });
 
         session.updated_at = Utc::now();
         let session = session.clone();
@@ -431,5 +501,213 @@ impl CanvasStore {
             .with_context(|| format!("Failed to write session: {:?}", path))?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::canvas::{Debate, ModelResponse, PromptTile, ResponseStatus, SessionCreate};
+    use tempfile::tempdir;
+
+    fn build_response(model_id: &str) -> ModelResponse {
+        ModelResponse {
+            model_id: model_id.to_string(),
+            model_name: model_id.to_string(),
+            status: ResponseStatus::Completed,
+            ..ModelResponse::default()
+        }
+    }
+
+    fn build_tile(
+        id: &str,
+        parent_tile_id: Option<&str>,
+        parent_model_id: Option<&str>,
+        model_ids: &[&str],
+    ) -> PromptTile {
+        let mut tile = PromptTile {
+            id: id.to_string(),
+            parent_tile_id: parent_tile_id.map(str::to_string),
+            parent_model_id: parent_model_id.map(str::to_string),
+            ..PromptTile::default()
+        };
+
+        tile.models = model_ids.iter().map(|model_id| model_id.to_string()).collect();
+        for model_id in model_ids {
+            tile.responses
+                .insert((*model_id).to_string(), build_response(model_id));
+        }
+
+        tile
+    }
+
+    fn build_debate(id: &str, source_tile_ids: &[&str], participating_models: &[&str]) -> Debate {
+        Debate {
+            id: id.to_string(),
+            source_tile_ids: source_tile_ids.iter().map(|tile_id| tile_id.to_string()).collect(),
+            participating_models: participating_models
+                .iter()
+                .map(|model_id| model_id.to_string())
+                .collect(),
+            ..Debate::default()
+        }
+    }
+
+    #[test]
+    fn delete_tile_removes_all_descendants() {
+        let temp_dir = tempdir().expect("temp dir should be created");
+        let mut store = CanvasStore::new(temp_dir.path().to_path_buf());
+        let session = store
+            .create_session(SessionCreate {
+                title: "Tree".to_string(),
+                description: None,
+                tags: Vec::new(),
+            })
+            .expect("session should be created");
+
+        let root = PromptTile {
+            id: "root".to_string(),
+            ..PromptTile::default()
+        };
+        let child = PromptTile {
+            id: "child".to_string(),
+            parent_tile_id: Some("root".to_string()),
+            ..PromptTile::default()
+        };
+        let grandchild = PromptTile {
+            id: "grandchild".to_string(),
+            parent_tile_id: Some("child".to_string()),
+            ..PromptTile::default()
+        };
+        let unrelated = PromptTile {
+            id: "unrelated".to_string(),
+            ..PromptTile::default()
+        };
+
+        store.add_tile(&session.id, root).expect("root should be added");
+        store.add_tile(&session.id, child).expect("child should be added");
+        store
+            .add_tile(&session.id, grandchild)
+            .expect("grandchild should be added");
+        store
+            .add_tile(&session.id, unrelated)
+            .expect("unrelated should be added");
+
+        store
+            .delete_tile(&session.id, "root")
+            .expect("delete should succeed");
+
+        let remaining_ids: Vec<String> = store
+            .get_session(&session.id)
+            .expect("session should still load")
+            .prompt_tiles
+            .into_iter()
+            .map(|tile| tile.id)
+            .collect();
+
+        assert_eq!(remaining_ids, vec!["unrelated".to_string()]);
+    }
+
+    #[test]
+    fn delete_tile_removes_debates_for_removed_subtree() {
+        let temp_dir = tempdir().expect("temp dir should be created");
+        let mut store = CanvasStore::new(temp_dir.path().to_path_buf());
+        let session = store
+            .create_session(SessionCreate {
+                title: "Debates".to_string(),
+                description: None,
+                tags: Vec::new(),
+            })
+            .expect("session should be created");
+
+        store
+            .add_tile(&session.id, build_tile("root", None, None, &["model-a"]))
+            .expect("root should be added");
+        store
+            .add_tile(&session.id, build_tile("child", Some("root"), Some("model-a"), &["model-a"]))
+            .expect("child should be added");
+        store
+            .add_tile(&session.id, build_tile("sibling", None, None, &["model-b"]))
+            .expect("sibling should be added");
+        store
+            .add_debate(&session.id, build_debate("debate-root", &["child"], &["model-a"]))
+            .expect("root debate should be added");
+        store
+            .add_debate(&session.id, build_debate("debate-sibling", &["sibling"], &["model-b"]))
+            .expect("sibling debate should be added");
+
+        store
+            .delete_tile(&session.id, "root")
+            .expect("delete should succeed");
+
+        let session = store.get_session(&session.id).expect("session should still load");
+        let remaining_tile_ids: Vec<String> =
+            session.prompt_tiles.into_iter().map(|tile| tile.id).collect();
+        let remaining_debate_ids: Vec<String> =
+            session.debates.into_iter().map(|debate| debate.id).collect();
+
+        assert_eq!(remaining_tile_ids, vec!["sibling".to_string()]);
+        assert_eq!(remaining_debate_ids, vec!["debate-sibling".to_string()]);
+    }
+
+    #[test]
+    fn delete_response_removes_only_the_deleted_model_branch() {
+        let temp_dir = tempdir().expect("temp dir should be created");
+        let mut store = CanvasStore::new(temp_dir.path().to_path_buf());
+        let session = store
+            .create_session(SessionCreate {
+                title: "Responses".to_string(),
+                description: None,
+                tags: Vec::new(),
+            })
+            .expect("session should be created");
+
+        store
+            .add_tile(&session.id, build_tile("root", None, None, &["model-a", "model-b"]))
+            .expect("root should be added");
+        store
+            .add_tile(&session.id, build_tile("branch-a", Some("root"), Some("model-a"), &["model-a"]))
+            .expect("branch-a should be added");
+        store
+            .add_tile(
+                &session.id,
+                build_tile("branch-a-child", Some("branch-a"), Some("model-a"), &["model-a"]),
+            )
+            .expect("branch-a-child should be added");
+        store
+            .add_tile(&session.id, build_tile("branch-b", Some("root"), Some("model-b"), &["model-b"]))
+            .expect("branch-b should be added");
+        store
+            .add_debate(&session.id, build_debate("debate-a", &["root"], &["model-a"]))
+            .expect("debate-a should be added");
+        store
+            .add_debate(&session.id, build_debate("debate-branch-a", &["branch-a"], &["model-a"]))
+            .expect("debate-branch-a should be added");
+        store
+            .add_debate(&session.id, build_debate("debate-b", &["root"], &["model-b"]))
+            .expect("debate-b should be added");
+
+        store
+            .delete_response(&session.id, "root", "model-a")
+            .expect("delete response should succeed");
+
+        let session = store.get_session(&session.id).expect("session should still load");
+        let remaining_tile_ids: Vec<String> =
+            session.prompt_tiles.iter().map(|tile| tile.id.clone()).collect();
+        let remaining_debate_ids: Vec<String> =
+            session.debates.iter().map(|debate| debate.id.clone()).collect();
+        let root = session
+            .prompt_tiles
+            .iter()
+            .find(|tile| tile.id == "root")
+            .expect("root tile should remain");
+
+        assert_eq!(
+            remaining_tile_ids,
+            vec!["root".to_string(), "branch-b".to_string()]
+        );
+        assert_eq!(root.models, vec!["model-b".to_string()]);
+        assert!(!root.responses.contains_key("model-a"));
+        assert_eq!(remaining_debate_ids, vec!["debate-b".to_string()]);
     }
 }
