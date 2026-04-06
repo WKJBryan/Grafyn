@@ -29,6 +29,7 @@ tauri = { version = "1.8", optional = true, features = [
     "path-all",
     "process-all",
     "protocol-all",
+    "shell-open",
     "updater",
     "window-all"
 ] }

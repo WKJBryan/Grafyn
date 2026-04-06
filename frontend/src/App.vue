@@ -28,11 +28,29 @@ const route = useRoute()
 const guide = useGuide()
 const boot = useBootStore()
 
+function handleExternalLinkClick(event) {
+  let el = event.target
+  while (el && el.tagName !== 'A') {
+    el = el.parentElement
+  }
+  if (!el) return
+
+  const href = el.getAttribute('href')
+  if (href && (href.startsWith('http://') || href.startsWith('https://'))) {
+    event.preventDefault()
+    import('@tauri-apps/api/shell').then(({ open }) => open(href))
+  }
+}
+
 onMounted(() => {
   window.dispatchEvent(new Event('grafyn-app-mounted'))
   boot.initialize()
   guide.setCurrentRoute(route.path)
   guide.checkNewFeatures()
+
+  if (window.__TAURI__) {
+    document.addEventListener('click', handleExternalLinkClick)
+  }
 })
 
 let tipTimer = null
@@ -46,6 +64,7 @@ watch(() => route.path, (path) => {
 
 onBeforeUnmount(() => {
   boot.cleanup()
+  document.removeEventListener('click', handleExternalLinkClick)
 })
 </script>
 
