@@ -6,6 +6,7 @@
  * - Search API methods (query, similar)
  * - Graph API methods (backlinks, outgoing, neighbors, rebuild, full, unlinked)
  * - Canvas API methods (list, get, create, update, delete, getModels, sendPrompt, etc.)
+ * - Twin collector API methods (records, traces, feedback, export)
  * - Feedback API methods (submit, status, getSystemInfo, getPending, retryPending)
  * - Settings API methods (get, getStatus, update, completeSetup, pickVaultFolder, etc.)
  * - MCP API methods (getStatus, getConfigSnippet)
@@ -28,6 +29,7 @@ import {
   search,
   graph,
   canvas,
+  twin,
   feedback,
   settings,
   mcp,
@@ -232,6 +234,35 @@ describe('API Client (Tauri)', () => {
       mockInvoke.mockResolvedValue({ note_id: 'n1' })
       await canvas.exportToNote('s1')
       expect(mockInvoke).toHaveBeenCalledWith('export_to_note', { sessionId: 's1' })
+    })
+  })
+
+  describe('Twin API', () => {
+    it('listRecords() invokes list_user_records', async () => {
+      mockInvoke.mockResolvedValue([])
+      await twin.listRecords()
+      expect(mockInvoke).toHaveBeenCalledWith('list_user_records', {})
+    })
+
+    it('recordCanvasFeedback() invokes record_canvas_feedback', async () => {
+      const request = {
+        feedback_type: 'accept',
+        response: { tile_id: 'tile-1', model_id: 'model-a' }
+      }
+
+      mockInvoke.mockResolvedValue({ trace_event_id: 'evt-1', created_record_ids: ['rec-1'] })
+      await twin.recordCanvasFeedback('session-1', request)
+      expect(mockInvoke).toHaveBeenCalledWith('record_canvas_feedback', {
+        sessionId: 'session-1',
+        request
+      })
+    })
+
+    it('exportData() invokes export_twin_data', async () => {
+      const request = { eval_percentage: 20 }
+      mockInvoke.mockResolvedValue({ train: { count: 1 }, eval: { count: 1 }, holdout: { count: 0 } })
+      await twin.exportData(request)
+      expect(mockInvoke).toHaveBeenCalledWith('export_twin_data', { request })
     })
   })
 

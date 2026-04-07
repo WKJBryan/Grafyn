@@ -2,10 +2,14 @@ import { describe, it, expect, beforeEach, vi } from 'vitest'
 import { mount, flushPromises } from '@vue/test-utils'
 import CanvasView from '@/views/CanvasView.vue'
 
-const push = vi.fn()
-const loadSessions = vi.fn().mockResolvedValue()
-const loadSession = vi.fn().mockResolvedValue()
-const loadModels = vi.fn().mockResolvedValue()
+const { push, loadSessions, loadSession, loadModels, updateSettings, setTheme } = vi.hoisted(() => ({
+  push: vi.fn(),
+  loadSessions: vi.fn().mockResolvedValue(),
+  loadSession: vi.fn().mockResolvedValue(),
+  loadModels: vi.fn().mockResolvedValue(),
+  updateSettings: vi.fn().mockResolvedValue({}),
+  setTheme: vi.fn()
+}))
 
 vi.mock('vue-router', () => ({
   useRoute: () => ({
@@ -35,12 +39,15 @@ vi.mock('@/stores/canvas', () => ({
 vi.mock('@/stores/theme', () => ({
   useThemeStore: () => ({
     theme: 'dark',
-    toggleTheme: vi.fn()
+    setTheme
   })
 }))
 
 vi.mock('@/api/client', () => ({
-  isDesktopApp: () => true
+  isDesktopApp: () => true,
+  settings: {
+    update: updateSettings
+  }
 }))
 
 vi.mock('@/composables/useGuide', () => ({
@@ -90,5 +97,25 @@ describe('CanvasView', () => {
     await wrapper.find('[data-guide="canvas-settings-btn"]').trigger('click')
 
     expect(wrapper.find('.settings-modal-stub').text()).toContain('true')
+  })
+
+  it('persists the canvas theme toggle into settings', async () => {
+    const wrapper = mount(CanvasView, {
+      global: {
+        stubs: {
+          RouterLink: { template: '<a><slot /></a>' },
+          CanvasContainer: { template: '<div class="canvas-container-stub" />' },
+          SettingsModal: { template: '<div class="settings-modal-stub" />' },
+          ConfirmDialog: { template: '<div />' }
+        }
+      }
+    })
+
+    await flushPromises()
+    await wrapper.find('[title="Toggle Theme"]').trigger('click')
+    await flushPromises()
+
+    expect(setTheme).toHaveBeenCalledWith('light')
+    expect(updateSettings).toHaveBeenCalledWith({ theme: 'light' })
   })
 })

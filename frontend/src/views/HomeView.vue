@@ -116,13 +116,9 @@
           >
             <div class="editor-panel">
               <div class="editor-panel-header">
-                <input
-                  v-model="selectedNote.title"
-                  type="text"
-                  class="title-input"
-                  placeholder="Note title..."
-                  @input="handleDirty"
-                >
+                <div class="editor-panel-title">
+                  {{ selectedNote.title || 'Untitled note' }}
+                </div>
                 <button
                   class="close-btn"
                   @click="handleCloseNote"
@@ -278,7 +274,6 @@ const toast = useToast()
 const selectedTags = ref([])
 const showDeleteConfirm = ref(false)
 const pendingDeleteId = ref(null)
-const isDirty = ref(false)
 const showTopicSelector = ref(false)
 const showFeedbackModal = ref(false)
 const showSettingsModal = ref(false)
@@ -286,6 +281,7 @@ const isSetupMode = ref(false)
 const isDesktop = isDesktopApp()
 const contradictions = ref([])
 const graphRefreshKey = ref(0)
+let selectedNoteRequestId = 0
 
 // Extract all unique tags
 const allTags = computed(() => {
@@ -433,29 +429,37 @@ async function loadNotes() {
 
 function handleSearchSelect(noteId) {
   selectedNoteId.value = noteId
-  loadSelectedNote()
+  loadSelectedNote(noteId)
 }
 
 function handleNoteSelect(noteId) {
   selectedNoteId.value = noteId
-  loadSelectedNote()
+  loadSelectedNote(noteId)
 }
 
 function handleGraphNodeClick(noteId) {
   selectedNoteId.value = noteId
-  loadSelectedNote()
+  loadSelectedNote(noteId)
 }
 
-async function loadSelectedNote() {
-  if (!selectedNoteId.value) {
+async function loadSelectedNote(noteId = selectedNoteId.value) {
+  if (!noteId) {
     selectedNote.value = null
     return
   }
 
+  const requestId = ++selectedNoteRequestId
+
   try {
-    const note = await notesApi.get(selectedNoteId.value)
+    const note = await notesApi.get(noteId)
+    if (requestId !== selectedNoteRequestId || selectedNoteId.value !== noteId) {
+      return
+    }
     selectedNote.value = note
   } catch (error) {
+    if (requestId !== selectedNoteRequestId) {
+      return
+    }
     console.error('Failed to load note:', error)
   }
 }
@@ -481,15 +485,11 @@ function handleTopicSelected({ note_type, topic }) {
   }
 }
 
-function handleDirty() {
-  isDirty.value = true
-}
-
 async function handleSaveNote(id, data) {
   try {
     const saveData = {
       ...data,
-      title: selectedNote.value.title
+      title: data.title ?? selectedNote.value.title
     }
     if (id) {
       await notesApi.update(id, saveData)
@@ -499,7 +499,6 @@ async function handleSaveNote(id, data) {
     }
     await loadNotes()
     await loadSelectedNote()
-    isDirty.value = false
     toast.success('Note saved')
   } catch (error) {
     console.error('Failed to save note:', error)
@@ -759,25 +758,18 @@ function handleSetupComplete() {
   padding: var(--spacing-md);
   border-bottom: 1px solid var(--bg-tertiary);
   background: var(--bg-secondary);
+  gap: var(--spacing-md);
 }
 
-.editor-panel-header .title-input {
+.editor-panel-header .editor-panel-title {
   flex: 1;
   font-size: 1.25rem;
   font-weight: 600;
-  background: transparent;
-  border: none;
   color: var(--text-primary);
-  padding: 0;
-  margin-right: var(--spacing-md);
-}
-
-.editor-panel-header .title-input:focus {
-  outline: none;
-}
-
-.editor-panel-header .title-input::placeholder {
-  color: var(--text-muted);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .close-btn {

@@ -18,6 +18,7 @@ use services::{
     retrieval::RetrievalService,
     search::SearchService,
     settings::SettingsService,
+    twin_store::TwinStore,
 };
 use std::sync::Arc;
 use std::time::Instant;
@@ -37,6 +38,7 @@ pub struct AppState {
     pub priority_service: Arc<RwLock<PriorityScoringService>>,
     pub retrieval_service: Arc<RwLock<RetrievalService>>,
     pub chunk_index: Arc<RwLock<ChunkIndex>>,
+    pub twin_store: Arc<RwLock<TwinStore>>,
     /// MemoryService is stateless — no lock needed, just Arc for shared ownership
     pub memory_service: Arc<MemoryService>,
     pub boot_state: Arc<RwLock<BootStatus>>,
@@ -107,6 +109,7 @@ fn main() {
             };
 
             let canvas_store = CanvasStore::new(data_path.join("canvas"));
+            let twin_store = TwinStore::new(data_path.join("twin"));
 
             // Get OpenRouter API key from settings, fall back to environment
             let api_key = settings_service
@@ -139,6 +142,7 @@ fn main() {
                 priority_service: Arc::new(RwLock::new(priority_service)),
                 retrieval_service: Arc::new(RwLock::new(retrieval_service)),
                 chunk_index: Arc::new(RwLock::new(chunk_index)),
+                twin_store: Arc::new(RwLock::new(twin_store)),
                 memory_service: Arc::new(MemoryService::new()),
                 boot_state,
             };
@@ -198,6 +202,14 @@ fn main() {
             commands::canvas::continue_debate,
             commands::canvas::add_models_to_tile,
             commands::canvas::regenerate_response,
+            // Twin collector commands
+            commands::twin::list_user_records,
+            commands::twin::get_user_record,
+            commands::twin::create_user_record,
+            commands::twin::update_user_record,
+            commands::twin::get_session_trace,
+            commands::twin::record_canvas_feedback,
+            commands::twin::export_twin_data,
             // Feedback commands
             commands::feedback::submit_feedback,
             commands::feedback::get_system_info,

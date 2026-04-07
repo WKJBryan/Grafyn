@@ -109,9 +109,9 @@
 </template>
 
 <script setup>
-import { ref, computed, watch } from 'vue'
+import { ref, computed, watch, onBeforeUnmount } from 'vue'
 import GIcon from '@/components/ui/GIcon.vue'
-import { search as searchApi } from '@/api/client'
+import { search as searchApi, notes as notesApi } from '@/api/client'
 import { useCanvasStore } from '@/stores/canvas'
 
 const canvasStore = useCanvasStore()
@@ -121,6 +121,7 @@ const searchQuery = ref('')
 const searchResults = ref([])
 const pinnedNotes = ref([])
 let searchTimer = null
+let pinnedNotesSyncToken = 0
 
 const hasSession = computed(() => canvasStore.hasSession)
 
@@ -132,17 +133,44 @@ function isPinned(noteId) {
   return canvasStore.currentSession?.pinned_note_ids?.includes(noteId) || false
 }
 
-// Sync pinned notes display when session changes
-watch(() => canvasStore.currentSession?.pinned_note_ids, async (ids) => {
-  if (!ids || ids.length === 0) {
+async function syncPinnedNotes(ids) {
+  const nextIds = Array.isArray(ids) ? ids : []
+  const syncToken = ++pinnedNotesSyncToken
+
+  if (nextIds.length === 0) {
     pinnedNotes.value = []
     return
   }
-  // We only need titles for display — search for each pinned ID
-  // For efficiency, just store id+title pairs from when they were pinned
-  // Keep existing ones, remove unpinned
-  pinnedNotes.value = pinnedNotes.value.filter(n => ids.includes(n.id))
-}, { immediate: true })
+
+  const existingNotesById = new Map(
+    pinnedNotes.value.map(note => [note.id, note])
+  )
+
+  const resolvedNotes = await Promise.all(nextIds.map(async (id) => {
+    const existingNote = existingNotesById.get(id)
+    if (existingNote) return existingNote
+
+    try {
+      const note = await notesApi.get(id)
+      return note ? { id: note.id, title: note.title } : null
+    } catch (_err) {
+      return { id, title: id }
+    }
+  }))
+
+  if (syncToken !== pinnedNotesSyncToken) return
+
+  pinnedNotes.value = resolvedNotes.filter(Boolean)
+}
+
+// Sync pinned notes display when session changes or reloads
+watch(
+  () => canvasStore.currentSession?.pinned_note_ids || [],
+  (ids) => {
+    void syncPinnedNotes(ids)
+  },
+  { immediate: true }
+)
 
 function handleSearch() {
   clearTimeout(searchTimer)
@@ -153,10 +181,17 @@ function handleSearch() {
   searchTimer = setTimeout(async () => {
     try {
       const results = await searchApi.query(searchQuery.value, { limit: 8 })
-      searchResults.value = results.map(r => ({
-        id: r.id,
-        title: r.title
-      }))
+      searchResults.value = results
+        .map(result => {
+          const note = result.note || result
+          if (!note?.id || !note?.title) return null
+
+          return {
+            id: note.id,
+            title: note.title
+          }
+        })
+        .filter(Boolean)
     } catch (_err) {
       searchResults.value = []
     }
@@ -177,6 +212,11 @@ async function unpinNote(noteId) {
   pinnedNotes.value = pinnedNotes.value.filter(n => n.id !== noteId)
   await canvasStore.updatePinnedNotes(newIds)
 }
+
+onBeforeUnmount(() => {
+  clearTimeout(searchTimer)
+  pinnedNotesSyncToken++
+})
 </script>
 
 <style scoped>

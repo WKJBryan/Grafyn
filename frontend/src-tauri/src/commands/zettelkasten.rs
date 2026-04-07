@@ -1,3 +1,4 @@
+use crate::commands::sync_chunk_index_for_notes;
 use crate::models::note::{
     ApplyLinksRequest, ApplyLinksResponse, CreateLinkResponse, DiscoverLinksResponse, NoteUpdate,
     RelationType, ZettelLinkCandidate,
@@ -653,6 +654,7 @@ pub async fn apply_links(
     let links_attempted = requested_candidates.len();
 
     let mut links_created = 0;
+    let mut dirty_note_ids: HashSet<String> = HashSet::new();
 
     for candidate in &requested_candidates {
         let (target_title, target_content) = {
@@ -663,6 +665,7 @@ pub async fn apply_links(
             };
             (target.title.clone(), target.content.clone())
         };
+        let mut target_updated = false;
 
         // Add forward link (source → target)
         let source_updated = {
@@ -702,18 +705,22 @@ pub async fn apply_links(
         {
             if let Some(new_content) = add_wikilink_to_content(&target_content, &source_title, &reverse_type) {
                 let mut store = state.knowledge_store.write().await;
-                let _ = store.update_note(
+                target_updated = store.update_note(
                     &candidate.target_id,
                     NoteUpdate {
                         content: Some(new_content),
                         ..Default::default()
                     },
-                );
+                ).is_ok();
             }
         }
 
         if source_updated {
             links_created += 1;
+            dirty_note_ids.insert(noteId.clone());
+        }
+        if target_updated {
+            dirty_note_ids.insert(candidate.target_id.clone());
         }
 
         // Update search index for both notes
@@ -744,6 +751,17 @@ pub async fn apply_links(
         }
     }
 
+    if !dirty_note_ids.is_empty() {
+        let dirty_notes = {
+            let store = state.knowledge_store.read().await;
+            dirty_note_ids
+                .iter()
+                .filter_map(|id| store.get_note(id).ok())
+                .collect::<Vec<_>>()
+        };
+        sync_chunk_index_for_notes(state.inner(), &dirty_notes).await;
+    }
+
     Ok(ApplyLinksResponse {
         note_id: noteId,
         links_created,
@@ -760,6 +778,7 @@ pub async fn create_link(
     #[allow(non_snake_case)] linkType: Option<String>,
 ) -> Result<CreateLinkResponse, String> {
     let link_type = linkType.unwrap_or_else(|| "related".to_string());
+    let mut dirty_note_ids: HashSet<String> = HashSet::new();
 
     // Get both notes
     let (source_title, target_title) = {
@@ -786,6 +805,7 @@ pub async fn create_link(
                     },
                 )
                 .map_err(|e| e.to_string())?;
+            dirty_note_ids.insert(sourceId.clone());
         }
     }
 
@@ -805,6 +825,7 @@ pub async fn create_link(
                     ..Default::default()
                 },
             );
+            dirty_note_ids.insert(targetId.clone());
         }
     }
 
@@ -832,6 +853,17 @@ pub async fn create_link(
         if let Ok(target) = store.get_note(&targetId) {
             graph.update_note(&target);
         }
+    }
+
+    if !dirty_note_ids.is_empty() {
+        let dirty_notes = {
+            let store = state.knowledge_store.read().await;
+            dirty_note_ids
+                .iter()
+                .filter_map(|id| store.get_note(id).ok())
+                .collect::<Vec<_>>()
+        };
+        sync_chunk_index_for_notes(state.inner(), &dirty_notes).await;
     }
 
     Ok(CreateLinkResponse {

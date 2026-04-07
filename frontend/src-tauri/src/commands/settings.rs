@@ -79,6 +79,14 @@ pub async fn update_settings(
             graph.build_from_notes(&notes);
         }
 
+        // Rebuild chunk index used by semantic canvas context
+        {
+            let mut chunks = state.chunk_index.write().await;
+            if let Err(e) = chunks.reindex_all(&notes) {
+                log::error!("Failed to rebuild chunk index after vault change: {}", e);
+            }
+        }
+
         log::info!("Services rebuilt for new vault path");
     }
 
