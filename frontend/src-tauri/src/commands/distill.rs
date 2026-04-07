@@ -1,3 +1,4 @@
+use crate::commands::{sync_chunk_index_for_note, sync_chunk_index_for_notes};
 use crate::models::note::{
     DeduplicationAction, DistillRequest, DistillResponse, ExtractionMode, HubCreatePolicy,
     HubUpdate, NoteCreate, NoteStatus, NoteUpdate,
@@ -660,6 +661,7 @@ async fn update_hub(
                 let mut graph = state.graph_index.write().await;
                 graph.update_note(&updated_note);
             }
+            sync_chunk_index_for_note(state, &updated_note).await;
         }
 
         Some(HubUpdate {
@@ -707,6 +709,7 @@ async fn update_hub(
                 let mut graph = state.graph_index.write().await;
                 graph.update_note(&created_note);
             }
+            sync_chunk_index_for_note(state, &created_note).await;
 
             Some(HubUpdate {
                 hub_id: created_note.id,
@@ -808,6 +811,7 @@ pub async fn distill_note(
     let mut hub_updates: Vec<HubUpdate> = Vec::new();
     let mut skipped_duplicates: usize = 0;
     let mut merged_into: Vec<String> = Vec::new();
+    let mut chunk_updates = Vec::new();
 
     for (i, candidate) in candidates.iter().enumerate() {
         // Check for duplicates
@@ -864,6 +868,7 @@ pub async fn distill_note(
                                 let mut graph = state.graph_index.write().await;
                                 graph.update_note(&updated_note);
                             }
+                            chunk_updates.push(updated_note);
                         }
                     }
 
@@ -930,6 +935,7 @@ pub async fn distill_note(
             let mut graph = state.graph_index.write().await;
             graph.update_note(&created);
         }
+        chunk_updates.push(created.clone());
 
         created_ids.push(created.id.clone());
 
@@ -989,6 +995,7 @@ pub async fn distill_note(
                 let mut graph = state.graph_index.write().await;
                 graph.update_note(&updated_note);
             }
+            chunk_updates.push(updated_note);
             true
         } else {
             false
@@ -996,6 +1003,8 @@ pub async fn distill_note(
     } else {
         false
     };
+
+    sync_chunk_index_for_notes(state.inner(), &chunk_updates).await;
 
     // 7. Build response message
     let count = created_ids.len();

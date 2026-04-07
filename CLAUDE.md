@@ -116,7 +116,9 @@ import { notes, search, graph, canvas, settings, mcp, memory,
 [[Note Title|Display]]      → Custom display text
 ```
 
-**Graph Index:** Parses all notes on `build_index()` to construct adjacency lists. Backlinks are reverse edges: if A links to B, B has backlink from A.
+**Typed links:** Wikilinks support relationship annotations: `- [[Target]] (supports)`. Nine `RelationType` variants: `related`, `supports`, `contradicts`, `expands`, `questions`, `answers`, `example`, `part_of`, `untyped`. Bare `[[wikilinks]]` get `Untyped`. The graph index stores `TypedEdge` with relation types; backlinks get the reverse relation via `RelationType::reverse()`.
+
+**Graph Index:** Parses all notes on `build_index()` to construct typed adjacency lists (`Vec<TypedEdge>`). Backlinks are reverse edges: if A links to B, B has backlink from A. Methods: `get_outgoing()`/`get_backlinks()` return `Vec<NoteMeta>`; `get_typed_outgoing()`/`get_typed_backlinks()` return `Vec<(NoteMeta, RelationType)>`.
 
 ### Note Status Workflow
 
@@ -165,7 +167,7 @@ Discovers potential links using semantic similarity and LLM analysis. Three meth
 
 Compare responses from multiple LLM models simultaneously via OpenRouter. Features: parallel model streaming, infinite canvas with D3.js zoom/pan, model debate mode, session persistence in `data/canvas/`, **semantic note context** (retrieves relevant notes as LLM system prompt).
 
-**Semantic context mode:** When `context_mode == Semantic` (the default), `send_prompt` uses the retrieval pipeline to find relevant notes, fetches their content, and injects it as system prompt context. Pinned notes per session (`pinned_note_ids`) are always included. Context notes are stored on the tile and emitted via `ContextNotes` event for frontend display.
+**Semantic context mode:** When `context_mode == Semantic` (the default), `send_prompt` runs a two-stage pipeline: (1) note-level retrieval as a quality gate, (2) if `chunk_retrieval_enabled` (default: `true`), chunk-level retrieval fills relevant paragraphs within `default_token_budget` (default: 4000 tokens). Falls back to whole-note truncation (1500 chars) if chunks are empty or disabled. Pinned notes per session (`pinned_note_ids`) are always included. Context notes are stored on the tile and emitted via `ContextNotes` event for frontend display.
 
 **Streaming architecture:** Commands return immediately, spawn async tasks, stream via `canvas-stream` Tauri events (`TileCreated`, `ContextNotes`, `Chunk`, `Complete`, `Error`, `SessionSaved`, debate variants). Frontend listens via `@tauri-apps/api/event`.
 
@@ -181,9 +183,11 @@ Import conversations from ChatGPT, Claude, Grok, or Gemini as evidence notes. Fo
 
 ### Temporal + Graph-Aware Retrieval
 
-Pipeline: Tantivy keyword search → timestamp enrichment from GraphIndex → priority scoring (recency/status/tags) → N-hop graph expansion (bidirectional wikilinks) → hub boost (highly-connected notes) → top-K results with relevance reasons.
+**Note-level pipeline:** Tantivy keyword search → timestamp enrichment from GraphIndex → priority scoring (recency/status/tags) → N-hop graph expansion (bidirectional, with relation-type weighting) → hub boost (highly-connected notes) → top-K results with relevance reasons. Graph expansion uses `get_typed_outgoing()`/`get_typed_backlinks()` and multiplies proximity boost by `RelationWeights` (e.g., `supports: 1.5x`, `contradicts: 1.2x`, `untyped: 1.0x`).
 
-Configurable via `RetrievalConfig` (persisted in `data/retrieval_config.json`): `graph_hop_depth`, `graph_proximity_weight`, `hub_boost_weight`, `hub_threshold`, `base_search_limit`.
+**Chunk-level pipeline:** `retrieve_chunks()` searches the `ChunkIndex` (paragraph-level Tantivy index built via TextTiling), applies the same graph/hub/priority boosts via parent note, then greedily fills a token budget. Used by canvas semantic mode for precise context injection.
+
+Configurable via `RetrievalConfig` (persisted in `data/retrieval_config.json`): `graph_hop_depth`, `graph_proximity_weight`, `hub_boost_weight`, `hub_threshold`, `base_search_limit`, `default_token_budget`, `chunk_retrieval_enabled`, `relation_weights`.
 
 ### Feedback & Bug Reporting
 
@@ -231,7 +235,7 @@ cd frontend/src-tauri
 cargo build --release --bin grafyn-mcp --no-default-features --features mcp
 ```
 
-**10 MCP tools:** `list_notes`, `get_note`, `create_note`, `update_note`, `delete_note`, `search_notes`, `get_backlinks`, `get_outgoing`, `recall_relevant`, `import_conversation`
+**11 MCP tools:** `list_notes`, `get_note`, `create_note`, `update_note`, `delete_note`, `search_notes`, `get_backlinks`, `get_outgoing`, `recall_relevant` (with optional `token_budget` for chunk retrieval), `search_chunks` (paragraph-level search with token budgeting), `import_conversation`
 
 **Connecting Claude Desktop:** Add to `claude_desktop_config.json`:
 ```json

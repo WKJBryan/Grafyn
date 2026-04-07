@@ -1,6 +1,6 @@
 import { defineStore } from 'pinia'
 import { ref, shallowRef, computed, triggerRef, toRaw } from 'vue'
-import { canvas as canvasApi } from '@/api/client'
+import { canvas as canvasApi, twin as twinApi } from '@/api/client'
 
 export const DEFAULT_WEB_SEARCH_MAX_RESULTS = 5
 export const THINK_HARDER_WEB_SEARCH_MAX_RESULTS = 8
@@ -23,14 +23,35 @@ export const useCanvasStore = defineStore('canvas', () => {
   // shallowRef avoids deep reactivity tracking — these update on every streaming chunk,
   // so deep proxying wastes cycles. Use triggerRef() after mutations to notify watchers.
   const streamingModels = shallowRef(new Set())
+  const streamingModelCounts = new Map()
   // Debate streaming state: { [debateId]: { currentRound, models: { [modelId]: text }, completedRounds: [] } }
   // Kept as ref() (not shallowRef) because deeply nested mutations need automatic reactivity for streaming display
   const debateStreamingContent = ref({})
 
   // shallowRef mutation helpers — wrap mutation + triggerRef
-  function addStreaming(modelId) { streamingModels.value.add(modelId); triggerRef(streamingModels) }
-  function removeStreaming(modelId) { streamingModels.value.delete(modelId); triggerRef(streamingModels) }
-  function clearStreaming() { streamingModels.value.clear(); triggerRef(streamingModels) }
+  function addStreaming(modelId) {
+    const count = streamingModelCounts.get(modelId) || 0
+    streamingModelCounts.set(modelId, count + 1)
+    streamingModels.value.add(modelId)
+    triggerRef(streamingModels)
+  }
+
+  function removeStreaming(modelId) {
+    const count = streamingModelCounts.get(modelId) || 0
+    if (count <= 1) {
+      streamingModelCounts.delete(modelId)
+      streamingModels.value.delete(modelId)
+    } else {
+      streamingModelCounts.set(modelId, count - 1)
+    }
+    triggerRef(streamingModels)
+  }
+
+  function clearStreaming() {
+    streamingModelCounts.clear()
+    streamingModels.value.clear()
+    triggerRef(streamingModels)
+  }
 
   function normalizeResponse(response) {
     if (!response) return response
@@ -965,6 +986,50 @@ export const useCanvasStore = defineStore('canvas', () => {
     )
   }
 
+  async function recordCanvasFeedback(request) {
+    if (!currentSession.value) {
+      throw new Error('No active session')
+    }
+
+    return twinApi.recordCanvasFeedback(currentSession.value.id, request)
+  }
+
+  async function recordPreferenceFeedback(tileId, modelId, feedbackType, rationale = null, content = null) {
+    return recordCanvasFeedback({
+      feedback_type: feedbackType,
+      response: {
+        tile_id: tileId,
+        model_id: modelId
+      },
+      rationale,
+      content
+    })
+  }
+
+  async function recordSelectionRanking(responseRefs, rationale = null, content = null) {
+    return recordCanvasFeedback({
+      feedback_type: 'ranking',
+      ranked_responses: responseRefs,
+      rationale,
+      content
+    })
+  }
+
+  async function captureInsight(kind, content, options = {}) {
+    return recordCanvasFeedback({
+      feedback_type: 'insight',
+      kind,
+      content,
+      rationale: options.rationale ?? null,
+      response: options.response ?? null,
+      confidence: options.confidence ?? 0.8
+    })
+  }
+
+  async function exportTwinData(request = {}) {
+    return twinApi.exportData(request)
+  }
+
   return {
     // State
     sessions,
@@ -1007,6 +1072,11 @@ export const useCanvasStore = defineStore('canvas', () => {
     thinkHarderFromResponse,
     addModelToTile,
     regenerateResponse,
-    updatePinnedNotes
+    updatePinnedNotes,
+    recordCanvasFeedback,
+    recordPreferenceFeedback,
+    recordSelectionRanking,
+    captureInsight,
+    exportTwinData
   }
 })

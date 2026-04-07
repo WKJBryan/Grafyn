@@ -195,7 +195,7 @@ import { ref, computed, onMounted, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useCanvasStore } from '@/stores/canvas'
 import { useThemeStore } from '@/stores/theme'
-import { isDesktopApp } from '@/api/client'
+import { isDesktopApp, settings as settingsApi } from '@/api/client'
 import CanvasContainer from '@/components/canvas/CanvasContainer.vue'
 import SettingsModal from '@/components/SettingsModal.vue'
 import ConfirmDialog from '@/components/ConfirmDialog.vue'
@@ -218,8 +218,15 @@ const _isDesktop = isDesktopApp()
 const guide = useGuide()
 
 // Function to toggle theme
-function handleThemeToggle() {
-  themeStore.toggleTheme()
+async function handleThemeToggle() {
+  const nextTheme = themeStore.theme === 'dark' ? 'light' : 'dark'
+  themeStore.setTheme(nextTheme)
+
+  try {
+    await settingsApi.update({ theme: nextTheme })
+  } catch (err) {
+    console.error('Failed to persist theme preference:', err)
+  }
 }
 
 // Computed

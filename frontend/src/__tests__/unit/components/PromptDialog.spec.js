@@ -38,34 +38,49 @@ describe('PromptDialog', () => {
     expect(wrapper.find('.context-mode-hint').text()).toContain('This does not search the live web')
   })
 
-  it('submits web search enabled when the Canvas default is on', async () => {
+  it('submits web search enabled for freshness-sensitive prompts when Canvas auto-search is on', async () => {
     const wrapper = mountDialog({
       smartWebSearch: true,
       openRouterConfigured: true
     })
 
     await wrapper.find('.model-selector-stub').trigger('click')
-    await wrapper.find('#prompt').setValue('Tell me about anything')
+    await wrapper.find('#prompt').setValue('What is the latest version of Node.js?')
     await wrapper.vm.$nextTick()
     await wrapper.find('.btn-primary').trigger('click')
 
     expect(wrapper.emitted('submit')[0][0].webSearch).toBe(true)
-    expect(wrapper.find('.web-search-hint').text()).toContain('Live web search is on for this prompt by default')
+    expect(wrapper.find('.web-search-hint').text()).toContain('Live web search will run for this prompt')
   })
 
-  it('submits web search disabled when the Canvas default is off', async () => {
+  it('keeps web search off for self-contained prompts even when Canvas auto-search is on', async () => {
+    const wrapper = mountDialog({
+      smartWebSearch: true,
+      openRouterConfigured: true
+    })
+
+    await wrapper.find('.model-selector-stub').trigger('click')
+    await wrapper.find('#prompt').setValue('Explain recursion in simple terms')
+    await wrapper.vm.$nextTick()
+    await wrapper.find('.btn-primary').trigger('click')
+
+    expect(wrapper.emitted('submit')[0][0].webSearch).toBe(false)
+    expect(wrapper.find('.web-search-hint').text()).toContain('will stay off')
+  })
+
+  it('submits web search disabled when Canvas auto-search is off', async () => {
     const wrapper = mountDialog({
       smartWebSearch: false,
       openRouterConfigured: true
     })
 
     await wrapper.find('.model-selector-stub').trigger('click')
-    await wrapper.find('#prompt').setValue('Tell me about anything')
+    await wrapper.find('#prompt').setValue('What is the latest version of Node.js?')
     await wrapper.vm.$nextTick()
     await wrapper.find('.btn-primary').trigger('click')
 
     expect(wrapper.emitted('submit')[0][0].webSearch).toBe(false)
-    expect(wrapper.find('.web-search-hint').text()).toContain('Live web search is off for this prompt')
+    expect(wrapper.find('.web-search-hint').text()).toContain('Enable Canvas Web Search in Settings')
   })
 
   it('shows that live web search is off when OpenRouter is unavailable', () => {

@@ -51,12 +51,52 @@
         <PinnedNotesPanel data-guide="pinned-notes-btn" />
         <button
           class="btn btn-secondary btn-sm"
+          :disabled="selectedLLMNodes.length !== 1"
+          title="Record that the selected response matches you"
+          @click="handleRecordFeedback('accept')"
+        >
+          Matches Me
+        </button>
+        <button
+          class="btn btn-secondary btn-sm"
+          :disabled="selectedLLMNodes.length !== 1"
+          title="Record that the selected response does not match you"
+          @click="handleRecordFeedback('reject')"
+        >
+          Not Me
+        </button>
+        <button
+          class="btn btn-secondary btn-sm"
+          :disabled="selectedLLMNodes.length < 2"
+          title="Record an explicit ranking using the current selection order"
+          @click="handleRankSelection"
+        >
+          Rank Selection
+        </button>
+        <button
+          class="btn btn-secondary btn-sm"
+          :disabled="!session"
+          title="Capture a durable fact, preference, or reasoning record"
+          @click="handleCaptureInsight"
+        >
+          Capture Insight
+        </button>
+        <button
+          class="btn btn-secondary btn-sm"
           data-guide="canvas-save-btn"
           :disabled="!session || saving"
           title="Save as Note"
           @click="handleSaveAsNote"
         >
           {{ saving ? 'Saving...' : 'Save as Note' }}
+        </button>
+        <button
+          class="btn btn-secondary btn-sm"
+          :disabled="!session || exportingTwin"
+          title="Export curated twin records into train/eval/holdout bundles"
+          @click="handleExportTwinData"
+        >
+          {{ exportingTwin ? 'Exporting...' : 'Export Twin Data' }}
         </button>
         <span class="toolbar-divider" />
         <button
@@ -368,6 +408,7 @@ const viewport = ref({ x: 0, y: 0, zoom: 1 })
 const selectedNodes = ref([])  // Format: "prompt:{id}", "llm:{tileId}:{modelId}", "debate:{id}"
 const showPromptDialog = ref(false)
 const saving = ref(false)
+const exportingTwin = ref(false)
 const saveMessage = ref(null)
 const branchContext = ref(null)  // { parentTileId, parentModelId, parentContent }
 const expandedDebates = ref([])  // IDs of expanded debate nodes
@@ -417,6 +458,10 @@ const selectedLLMNodes = computed(() => {
       return { tileId: parts[1], modelId: parts.slice(2).join(':') }
     })
 })
+
+function getResponseNode(tileId, modelId) {
+  return llmNodes.value.find(node => node.tileId === tileId && node.modelId === modelId) || null
+}
 
 // Edge paths — cached via position snapshot to avoid recomputation during streaming.
 // Content changes (chunks) don't affect edges; only position/structure changes do.
@@ -529,6 +574,20 @@ const transformStyle = computed(() => ({
 // Minimap scale (canvas is max ~5000x5000, minimap is 150x100)
 const MINIMAP_SCALE = 0.02
 
+function getSurfaceSize() {
+  if (!surface.value) {
+    return {
+      width: window.innerWidth,
+      height: window.innerHeight
+    }
+  }
+
+  return {
+    width: surface.value.clientWidth || window.innerWidth,
+    height: surface.value.clientHeight || window.innerHeight
+  }
+}
+
 function minimapPromptStyle(tile) {
   return {
     left: `${tile.position.x * MINIMAP_SCALE}px`,
@@ -551,8 +610,9 @@ function minimapLLMStyle(node) {
 
 const minimapViewportStyle = computed(() => {
   if (!surface.value) return {}
-  const w = (window.innerWidth / viewport.value.zoom) * MINIMAP_SCALE
-  const h = (window.innerHeight / viewport.value.zoom) * MINIMAP_SCALE
+  const { width, height } = getSurfaceSize()
+  const w = (width / viewport.value.zoom) * MINIMAP_SCALE
+  const h = (height / viewport.value.zoom) * MINIMAP_SCALE
   const x = (-viewport.value.x / viewport.value.zoom) * MINIMAP_SCALE
   const y = (-viewport.value.y / viewport.value.zoom) * MINIMAP_SCALE
   return {
@@ -564,10 +624,11 @@ const minimapViewportStyle = computed(() => {
 })
 
 function panToNode(position) {
+  const { width, height } = getSurfaceSize()
   const centerX = position.x + (position.width || 200) / 2
   const centerY = position.y + (position.height || 200) / 2
-  const newX = -centerX * viewport.value.zoom + window.innerWidth / 2
-  const newY = -centerY * viewport.value.zoom + window.innerHeight / 2
+  const newX = -centerX * viewport.value.zoom + width / 2
+  const newY = -centerY * viewport.value.zoom + height / 2
   
   viewport.value = { ...viewport.value, x: newX, y: newY }
   
@@ -818,6 +879,147 @@ function handleNodeSelect({ tileId, modelId }) {
 
 function clearSelection() {
   selectedNodes.value = []
+}
+
+async function handleRecordFeedback(feedbackType) {
+  if (selectedLLMNodes.value.length !== 1) return
+
+  const [selectedNode] = selectedLLMNodes.value
+  const responseNode = getResponseNode(selectedNode.tileId, selectedNode.modelId)
+  const label = responseNode?.response?.model_name || selectedNode.modelId
+  const promptText = feedbackType === 'accept'
+    ? `Optional note for why ${label} matches you. Leave blank to just record the signal.`
+    : `Optional note for why ${label} does not match you. Leave blank to just record the signal.`
+  const rationale = globalThis.prompt?.(promptText, '')
+  if (typeof rationale !== 'string') return
+
+  try {
+    await canvasStore.recordPreferenceFeedback(
+      selectedNode.tileId,
+      selectedNode.modelId,
+      feedbackType,
+      rationale.trim() || null
+    )
+    clearSelection()
+    showCanvasMessage(
+      'success',
+      feedbackType === 'accept'
+        ? `Recorded that ${label} matches you`
+        : `Recorded that ${label} does not match you`,
+      2500
+    )
+  } catch (err) {
+    console.error('Failed to record canvas feedback:', err)
+    showCanvasMessage('error', err.message || 'Failed to record feedback')
+  }
+}
+
+async function handleRankSelection() {
+  if (selectedLLMNodes.value.length < 2) return
+
+  const rankedResponses = selectedLLMNodes.value.map(({ tileId, modelId }, index) => {
+    const responseNode = getResponseNode(tileId, modelId)
+    const label = responseNode?.response?.model_name || modelId
+    return {
+      rank: index + 1,
+      tileId,
+      modelId,
+      label
+    }
+  })
+
+  const preview = rankedResponses
+    .map(item => `${item.rank}. ${item.label}`)
+    .join('\n')
+  const rationale = globalThis.prompt?.(
+    `Current selection order will be stored as the ranking:\n\n${preview}\n\nOptional note about why this ordering fits you:`,
+    ''
+  )
+  if (typeof rationale !== 'string') return
+
+  try {
+    await canvasStore.recordSelectionRanking(
+      rankedResponses.map(item => ({
+        tile_id: item.tileId,
+        model_id: item.modelId
+      })),
+      rationale.trim() || null
+    )
+    clearSelection()
+    showCanvasMessage('success', 'Recorded preference ranking', 2500)
+  } catch (err) {
+    console.error('Failed to record ranking:', err)
+    showCanvasMessage('error', err.message || 'Failed to record ranking')
+  }
+}
+
+async function handleCaptureInsight() {
+  if (!session.value) return
+
+  const kind = globalThis.prompt?.(
+    'Record kind? Use fact, preference, or reasoning_pattern.',
+    'fact'
+  )
+  if (typeof kind !== 'string') return
+
+  const normalizedKind = kind.trim().toLowerCase()
+  if (!['fact', 'preference', 'reasoning_pattern'].includes(normalizedKind)) {
+    showCanvasMessage('error', 'Insight kind must be fact, preference, or reasoning_pattern')
+    return
+  }
+
+  const content = globalThis.prompt?.(
+    'What should be captured as a durable user-model record?',
+    ''
+  )
+  if (typeof content !== 'string') return
+  if (!content.trim()) {
+    showCanvasMessage('error', 'Insight content cannot be empty')
+    return
+  }
+
+  const rationale = globalThis.prompt?.(
+    'Optional note about why this matters or what evidence supports it.',
+    ''
+  )
+  if (typeof rationale !== 'string') return
+
+  const evidenceNode = selectedLLMNodes.value.length === 1
+    ? {
+        tile_id: selectedLLMNodes.value[0].tileId,
+        model_id: selectedLLMNodes.value[0].modelId
+      }
+    : null
+
+  try {
+    await canvasStore.captureInsight(normalizedKind, content.trim(), {
+      rationale: rationale.trim() || null,
+      response: evidenceNode
+    })
+    showCanvasMessage('success', 'Captured twin insight', 2500)
+  } catch (err) {
+    console.error('Failed to capture insight:', err)
+    showCanvasMessage('error', err.message || 'Failed to capture insight')
+  }
+}
+
+async function handleExportTwinData() {
+  if (!session.value || exportingTwin.value) return
+
+  exportingTwin.value = true
+  try {
+    const bundle = await canvasStore.exportTwinData()
+    showCanvasMessage(
+      'success',
+      `Twin export ready: ${bundle.train.count} train / ${bundle.eval.count} eval / ${bundle.holdout.count} holdout`,
+      5000
+    )
+  } catch (err) {
+    console.error('Failed to export twin data:', err)
+    showCanvasMessage('error', err.message || 'Failed to export twin data')
+  } finally {
+    exportingTwin.value = false
+  }
 }
 
 async function refreshOpenRouterStatus() {

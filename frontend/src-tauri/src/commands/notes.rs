@@ -1,3 +1,4 @@
+use crate::commands::{remove_note_chunks_from_index, sync_chunk_index_for_note};
 use crate::models::note::{Note, NoteCreate, NoteMeta, NoteUpdate};
 use crate::AppState;
 use tauri::State;
@@ -40,15 +41,7 @@ pub async fn create_note(note: NoteCreate, state: State<'_, AppState>) -> Result
     }
 
     // Update chunk index
-    {
-        let mut chunks = state.chunk_index.write().await;
-        if let Err(e) = chunks.index_note_chunks(&created_note) {
-            log::error!("Failed to index chunks for note '{}': {}", created_note.id, e);
-        }
-        if let Err(e) = chunks.commit() {
-            log::error!("Failed to commit chunk index: {}", e);
-        }
-    }
+    sync_chunk_index_for_note(state.inner(), &created_note).await;
 
     Ok(created_note)
 }
@@ -81,15 +74,7 @@ pub async fn update_note(
     }
 
     // Update chunk index
-    {
-        let mut chunks = state.chunk_index.write().await;
-        if let Err(e) = chunks.index_note_chunks(&updated_note) {
-            log::error!("Failed to index chunks for note '{}': {}", updated_note.id, e);
-        }
-        if let Err(e) = chunks.commit() {
-            log::error!("Failed to commit chunk index: {}", e);
-        }
-    }
+    sync_chunk_index_for_note(state.inner(), &updated_note).await;
 
     Ok(updated_note)
 }
@@ -118,15 +103,7 @@ pub async fn delete_note(id: String, state: State<'_, AppState>) -> Result<(), S
     }
 
     // Remove from chunk index
-    {
-        let mut chunks = state.chunk_index.write().await;
-        if let Err(e) = chunks.remove_note_chunks(&id) {
-            log::error!("Failed to remove chunks for note '{}': {}", id, e);
-        }
-        if let Err(e) = chunks.commit() {
-            log::error!("Failed to commit chunk index: {}", e);
-        }
-    }
+    remove_note_chunks_from_index(state.inner(), &id).await;
 
     Ok(())
 }

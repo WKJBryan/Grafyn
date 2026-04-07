@@ -12,4 +12,5 @@ pub mod search;
 pub mod settings;
 pub mod similarity;
 pub mod texttiling;
+pub mod twin_store;
 pub mod yake;

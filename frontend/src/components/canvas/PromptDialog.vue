@@ -184,6 +184,7 @@ import { ref, computed } from 'vue'
 import ModelSelector from './ModelSelector.vue'
 import ContextBudgetDisplay from './ContextBudgetDisplay.vue'
 import GIcon from '@/components/ui/GIcon.vue'
+import { detectWebSearch } from '@/composables/useWebSearchDetection'
 
 const props = defineProps({
   models: {
@@ -219,17 +220,30 @@ const temperature = ref(0.7)
 const showAdvanced = ref(false)
 const contextMode = ref('knowledge_search')  // Default to knowledge search for note lookup
 
-const resolvedWebSearch = computed(() => props.openRouterConfigured && props.smartWebSearch)
+const searchDetection = computed(() => detectWebSearch(prompt.value))
+const resolvedWebSearch = computed(() => (
+  props.openRouterConfigured &&
+  props.smartWebSearch &&
+  searchDetection.value.shouldSearch
+))
 const webSearchHint = computed(() => {
-  if (resolvedWebSearch.value) {
-    return 'Live web search is on for this prompt by default.'
-  }
-
   if (!props.openRouterConfigured) {
     return 'Live web search is off because OpenRouter is not configured.'
   }
 
-  return 'Live web search is off for this prompt. Enable Canvas Web Search in Settings to use live sources.'
+  if (!props.smartWebSearch) {
+    return 'Live web search is off for this prompt. Enable Canvas Web Search in Settings to use live sources.'
+  }
+
+  if (!prompt.value.trim()) {
+    return 'Live web search turns on automatically for prompts that look freshness-sensitive or explicitly ask for research.'
+  }
+
+  if (searchDetection.value.shouldSearch) {
+    return `Live web search will run for this prompt (${searchDetection.value.reason}).`
+  }
+
+  return 'This prompt looks self-contained, so live web search will stay off.'
 })
 
 // Context mode descriptions

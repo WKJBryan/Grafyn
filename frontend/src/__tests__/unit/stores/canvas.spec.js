@@ -386,4 +386,45 @@ describe('Canvas Store', () => {
     expect(store.currentSession.prompt_tiles[0].responses['model-a']).toBeUndefined()
     expect(store.currentSession.debates.map(debate => debate.id)).toEqual(['debate-b'])
   })
+
+  it('recordPreferenceFeedback stores explicit canvas feedback against the current session', async () => {
+    const feedbackSpy = vi.spyOn(apiClient.twin, 'recordCanvasFeedback').mockResolvedValue({
+      trace_event_id: 'evt-1',
+      created_record_ids: ['rec-1']
+    })
+
+    const store = useCanvasStore()
+    store.currentSession = {
+      id: 'session-1',
+      prompt_tiles: [],
+      debates: []
+    }
+
+    const result = await store.recordPreferenceFeedback('tile-1', 'model-a', 'accept', 'This answer matches me')
+
+    expect(feedbackSpy).toHaveBeenCalledWith('session-1', {
+      feedback_type: 'accept',
+      response: {
+        tile_id: 'tile-1',
+        model_id: 'model-a'
+      },
+      rationale: 'This answer matches me',
+      content: null
+    })
+    expect(result.created_record_ids).toEqual(['rec-1'])
+  })
+
+  it('exportTwinData proxies export requests to the twin API', async () => {
+    const exportSpy = vi.spyOn(apiClient.twin, 'exportData').mockResolvedValue({
+      train: { count: 3 },
+      eval: { count: 1 },
+      holdout: { count: 1 }
+    })
+
+    const store = useCanvasStore()
+    const result = await store.exportTwinData({ eval_percentage: 20 })
+
+    expect(exportSpy).toHaveBeenCalledWith({ eval_percentage: 20 })
+    expect(result.eval.count).toBe(1)
+  })
 })

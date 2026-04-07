@@ -6,6 +6,8 @@ use std::collections::HashMap;
 /// Service for managing the note link graph (backlinks and outgoing links)
 #[derive(Debug, Clone, Default)]
 pub struct GraphIndex {
+    /// Cached full notes so incremental updates can rebuild the graph accurately.
+    notes: HashMap<String, Note>,
     /// Map from note ID to typed edges it links to
     outgoing: HashMap<String, Vec<TypedEdge>>,
     /// Map from note ID to typed edges that link to it (with reverse relation)
@@ -36,30 +38,37 @@ impl GraphIndex {
     /// Build the graph from full notes (with wikilinks)
     pub fn build_from_notes(&mut self, notes: &[Note]) {
         self.clear();
-
-        // Build title-to-ID mapping and cache metadata
         for note in notes {
+            self.notes.insert(note.id.clone(), note.clone());
+        }
+        self.rebuild_from_cached_notes();
+    }
+
+    fn rebuild_from_cached_notes(&mut self) {
+        self.outgoing.clear();
+        self.backlinks.clear();
+        self.title_to_id.clear();
+        self.note_meta.clear();
+
+        for note in self.notes.values() {
             self.title_to_id
                 .insert(note.title.to_lowercase(), note.id.clone());
             self.note_meta.insert(note.id.clone(), NoteMeta::from(note));
         }
 
-        // Build link graph from typed links
-        for note in notes {
+        for note in self.notes.values() {
             let outgoing_edges = self.outgoing.entry(note.id.clone()).or_default();
 
             for parsed_link in &note.parsed_links {
                 if let Some(target_id) =
                     self.title_to_id.get(&parsed_link.target_title.to_lowercase())
                 {
-                    // Avoid duplicate edges to the same target
-                    if !outgoing_edges.iter().any(|e| e.target_id == *target_id) {
+                    if !outgoing_edges.iter().any(|edge| edge.target_id == *target_id) {
                         outgoing_edges.push(TypedEdge {
                             target_id: target_id.clone(),
                             relation: parsed_link.relation.clone(),
                         });
 
-                        // Add backlink with reverse relation
                         self.backlinks
                             .entry(target_id.clone())
                             .or_default()
@@ -75,6 +84,7 @@ impl GraphIndex {
 
     /// Clear the index
     pub fn clear(&mut self) {
+        self.notes.clear();
         self.outgoing.clear();
         self.backlinks.clear();
         self.title_to_id.clear();
@@ -83,62 +93,14 @@ impl GraphIndex {
 
     /// Add or update a note in the index
     pub fn update_note(&mut self, note: &Note) {
-        // Remove old links
-        self.remove_note(&note.id);
-
-        // Update title mapping
-        self.title_to_id
-            .insert(note.title.to_lowercase(), note.id.clone());
-        self.note_meta.insert(note.id.clone(), NoteMeta::from(note));
-
-        // Add new typed links
-        let outgoing_edges = self.outgoing.entry(note.id.clone()).or_default();
-
-        for parsed_link in &note.parsed_links {
-            if let Some(target_id) =
-                self.title_to_id.get(&parsed_link.target_title.to_lowercase())
-            {
-                if !outgoing_edges.iter().any(|e| e.target_id == *target_id) {
-                    outgoing_edges.push(TypedEdge {
-                        target_id: target_id.clone(),
-                        relation: parsed_link.relation.clone(),
-                    });
-
-                    self.backlinks
-                        .entry(target_id.clone())
-                        .or_default()
-                        .push(TypedEdge {
-                            target_id: note.id.clone(),
-                            relation: parsed_link.relation.reverse(),
-                        });
-                }
-            }
-        }
+        self.notes.insert(note.id.clone(), note.clone());
+        self.rebuild_from_cached_notes();
     }
 
     /// Remove a note from the index
     pub fn remove_note(&mut self, note_id: &str) {
-        // Remove outgoing links and clean up corresponding backlinks
-        if let Some(outgoing) = self.outgoing.remove(note_id) {
-            for edge in outgoing {
-                if let Some(backlinks) = self.backlinks.get_mut(&edge.target_id) {
-                    backlinks.retain(|e| e.target_id != note_id);
-                }
-            }
-        }
-
-        // Remove backlinks pointing to this note and clean up corresponding outgoing
-        if let Some(backlinks) = self.backlinks.remove(note_id) {
-            for edge in backlinks {
-                if let Some(outgoing) = self.outgoing.get_mut(&edge.target_id) {
-                    outgoing.retain(|e| e.target_id != note_id);
-                }
-            }
-        }
-
-        // Remove from title mapping
-        self.title_to_id.retain(|_, v| v != note_id);
-        self.note_meta.remove(note_id);
+        self.notes.remove(note_id);
+        self.rebuild_from_cached_notes();
     }
 
     /// Get all notes that link to the given note (backlinks)
@@ -355,4 +317,68 @@ pub struct GraphStats {
     pub total_links: usize,
     pub notes_with_backlinks: usize,
     pub orphan_notes: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::note::{NoteStatus, ParsedLink};
+    use chrono::Utc;
+    use std::collections::HashMap;
+
+    fn make_note(id: &str, title: &str, links: Vec<(&str, RelationType)>) -> Note {
+        Note {
+            id: id.to_string(),
+            title: title.to_string(),
+            content: format!("Content of {}", title),
+            status: NoteStatus::Draft,
+            tags: Vec::new(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            wikilinks: links.iter().map(|(target, _)| target.to_string()).collect(),
+            parsed_links: links
+                .into_iter()
+                .map(|(target_title, relation)| ParsedLink {
+                    target_title: target_title.to_string(),
+                    relation,
+                })
+                .collect(),
+            properties: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn update_note_resolves_links_from_existing_notes() {
+        let mut graph = GraphIndex::new();
+        let source = make_note("source", "Source", vec![("Target", RelationType::Related)]);
+
+        graph.build_from_notes(&[source]);
+        assert!(graph.get_outgoing("source").is_empty());
+
+        graph.update_note(&make_note("target", "Target", vec![]));
+
+        let outgoing = graph.get_outgoing("source");
+        let backlinks = graph.get_backlinks("target");
+
+        assert_eq!(outgoing.len(), 1);
+        assert_eq!(outgoing[0].id, "target");
+        assert_eq!(backlinks.len(), 1);
+        assert_eq!(backlinks[0].id, "source");
+    }
+
+    #[test]
+    fn update_note_rebuilds_links_after_title_change() {
+        let mut graph = GraphIndex::new();
+        let source = make_note("source", "Source", vec![("Renamed Target", RelationType::Supports)]);
+        let target = make_note("target", "Old Target", vec![]);
+
+        graph.build_from_notes(&[source, target]);
+        assert!(graph.get_backlinks("target").is_empty());
+
+        graph.update_note(&make_note("target", "Renamed Target", vec![]));
+
+        let backlinks = graph.get_backlinks("target");
+        assert_eq!(backlinks.len(), 1);
+        assert_eq!(backlinks[0].id, "source");
+    }
 }

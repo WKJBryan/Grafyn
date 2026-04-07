@@ -244,6 +244,35 @@ describe('HomeView', () => {
 
       expect(getSpy).toHaveBeenCalledWith('note-1')
     })
+
+    it('keeps the newest selected note when earlier requests finish later', async () => {
+      vi.spyOn(apiClient.notes, 'list').mockResolvedValue([])
+
+      let resolveFirst
+      let resolveSecond
+      vi.spyOn(apiClient.notes, 'get').mockImplementation((id) => {
+        if (id === 'note-2') {
+          return new Promise((resolve) => { resolveFirst = resolve })
+        }
+        if (id === 'note-4') {
+          return new Promise((resolve) => { resolveSecond = resolve })
+        }
+        return Promise.resolve({ id, title: id })
+      })
+
+      wrapper = mount(HomeView)
+      await flushPromises()
+
+      await wrapper.find('.tree-nav-stub').trigger('click')
+      await wrapper.find('.mini-graph-stub').trigger('click')
+
+      resolveSecond({ id: 'note-4', title: 'Newest Note' })
+      await flushPromises()
+      resolveFirst({ id: 'note-2', title: 'Older Note' })
+      await flushPromises()
+
+      expect(wrapper.find('.editor-panel-title').text()).toBe('Newest Note')
+    })
   })
 
   // ============================================================================
@@ -278,6 +307,38 @@ describe('HomeView', () => {
       expect(wrapper.find('.editor-panel-overlay').exists()).toBe(true)
       expect(wrapper.find('.note-editor-stub').exists()).toBe(true)
       expect(wrapper.find('.full-graph-container').exists()).toBe(true)
+    })
+
+    it('saves the title emitted by NoteEditor instead of forcing the stale header title', async () => {
+      vi.spyOn(apiClient.notes, 'list').mockResolvedValue([])
+      vi.spyOn(apiClient.notes, 'get')
+        .mockResolvedValueOnce({
+          id: 'note-5',
+          title: 'Original Title',
+          content: '',
+          status: 'draft',
+          tags: []
+        })
+        .mockResolvedValueOnce({
+          id: 'note-5',
+          title: 'Updated',
+          content: '',
+          status: 'draft',
+          tags: []
+        })
+      const updateSpy = vi.spyOn(apiClient.notes, 'update').mockResolvedValue({})
+
+      wrapper = mount(HomeView)
+      await flushPromises()
+
+      await wrapper.find('.full-graph-stub').trigger('click')
+      await flushPromises()
+      await wrapper.find('.save-btn').trigger('click')
+      await flushPromises()
+
+      expect(updateSpy).toHaveBeenCalledWith('note-5', expect.objectContaining({
+        title: 'Updated'
+      }))
     })
   })
 })

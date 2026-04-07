@@ -1,3 +1,4 @@
+use crate::commands::sync_chunk_index_for_note;
 use crate::models::canvas::{
     AddModelsRequest, AvailableModel, CanvasSession, CanvasStreamEvent, ContextMode,
     CanvasViewport, Debate, DebateContinueRequest, DebateResponse, DebateRound,
@@ -6,14 +7,19 @@ use crate::models::canvas::{
     TilePositionUpdate,
 };
 use crate::models::note::{ChunkResult, NoteCreate, NoteStatus};
+use crate::models::twin::TraceEventType;
 use crate::services::openrouter::ChatMessage;
 use crate::services::retrieval::RetrievalResult;
+use crate::services::twin_store::TwinStore;
 use crate::AppState;
 use chrono::Utc;
 use futures::StreamExt;
+use serde_json::json;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Duration;
 use tauri::State;
+use tokio::sync::RwLock;
 
 const COMPACT_HISTORY_RECENT_TURNS: usize = 2;
 const COMPACT_HISTORY_EXCERPT_CHARS: usize = 240;
@@ -81,7 +87,23 @@ pub async fn create_session(
     state: State<'_, AppState>,
 ) -> Result<CanvasSession, String> {
     let mut store = state.canvas_store.write().await;
-    store.create_session(session).map_err(|e| e.to_string())
+    let created = store.create_session(session).map_err(|e| e.to_string())?;
+    drop(store);
+
+    append_canvas_trace(
+        state.twin_store.clone(),
+        &created.id,
+        TraceEventType::SessionCreated,
+        json!({
+            "title": created.title.clone(),
+            "description": created.description.clone(),
+            "tags": created.tags.clone(),
+            "status": created.status.clone(),
+        }),
+    )
+    .await;
+
+    Ok(created)
 }
 
 /// Update a canvas session
@@ -92,14 +114,45 @@ pub async fn update_session(
     state: State<'_, AppState>,
 ) -> Result<CanvasSession, String> {
     let mut store = state.canvas_store.write().await;
-    store.update_session(&id, update).map_err(|e| e.to_string())
+    let updated = store.update_session(&id, update).map_err(|e| e.to_string())?;
+    drop(store);
+
+    append_canvas_trace(
+        state.twin_store.clone(),
+        &updated.id,
+        TraceEventType::SessionUpdated,
+        json!({
+            "title": updated.title.clone(),
+            "description": updated.description.clone(),
+            "tags": updated.tags.clone(),
+            "status": updated.status.clone(),
+            "viewport": updated.viewport.clone(),
+            "pinned_note_ids": updated.pinned_note_ids.clone(),
+        }),
+    )
+    .await;
+
+    Ok(updated)
 }
 
 /// Delete a canvas session
 #[tauri::command]
 pub async fn delete_session(id: String, state: State<'_, AppState>) -> Result<(), String> {
     let mut store = state.canvas_store.write().await;
-    store.delete_session(&id).map_err(|e| e.to_string())
+    store.delete_session(&id).map_err(|e| e.to_string())?;
+    drop(store);
+
+    append_canvas_trace(
+        state.twin_store.clone(),
+        &id,
+        TraceEventType::SessionDeleted,
+        json!({
+            "session_id": id,
+        }),
+    )
+    .await;
+
+    Ok(())
 }
 
 /// Get list of available LLM models
@@ -182,6 +235,24 @@ pub async fn send_prompt(
         store.add_tile(&session_id, tile.clone()).map_err(|e| e.to_string())?;
     }
 
+    append_canvas_trace(
+        state.twin_store.clone(),
+        &session_id,
+        TraceEventType::PromptSubmitted,
+        json!({
+            "tile_id": tile.id.clone(),
+            "prompt": tile.prompt.clone(),
+            "models": tile.models.clone(),
+            "context_mode": tile.context_mode.clone(),
+            "parent_tile_id": tile.parent_tile_id.clone(),
+            "parent_model_id": tile.parent_model_id.clone(),
+            "context_note_ids": tile.context_notes.iter().map(|note| note.id.clone()).collect::<Vec<_>>(),
+            "web_search": tile.web_search,
+            "web_search_max_results": tile.web_search_max_results,
+        }),
+    )
+    .await;
+
     // Emit TileCreated event
     let _ = window.emit(
         "canvas-stream",
@@ -206,6 +277,7 @@ pub async fn send_prompt(
     // Clone what we need for the spawned task
     let openrouter_arc = state.openrouter.clone();
     let canvas_store_arc = state.canvas_store.clone();
+    let twin_store_arc = state.twin_store.clone();
     let models = request.models.clone();
     let messages = resolved_context.messages.clone();
     let system_prompt = resolved_context.system_prompt.clone();
@@ -331,6 +403,15 @@ pub async fn send_prompt(
             );
         }
 
+        append_model_result_traces(
+            twin_store_arc.clone(),
+            &session_id_clone,
+            &tile_id_clone,
+            "send_prompt",
+            &results,
+        )
+        .await;
+
         // Emit session saved after all models complete
         let _ = window.emit(
             "canvas-stream",
@@ -366,7 +447,20 @@ pub async fn delete_tile(
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     let mut store = state.canvas_store.write().await;
-    store.delete_tile(&session_id, &tile_id).map_err(|e| e.to_string())
+    store.delete_tile(&session_id, &tile_id).map_err(|e| e.to_string())?;
+    drop(store);
+
+    append_canvas_trace(
+        state.twin_store.clone(),
+        &session_id,
+        TraceEventType::TileDeleted,
+        json!({
+            "tile_id": tile_id,
+        }),
+    )
+    .await;
+
+    Ok(())
 }
 
 /// Delete a single model response from a tile
@@ -380,7 +474,21 @@ pub async fn delete_response(
     let mut store = state.canvas_store.write().await;
     store
         .delete_response(&session_id, &tile_id, &model_id)
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    drop(store);
+
+    append_canvas_trace(
+        state.twin_store.clone(),
+        &session_id,
+        TraceEventType::ResponseDeleted,
+        json!({
+            "tile_id": tile_id,
+            "model_id": model_id,
+        }),
+    )
+    .await;
+
+    Ok(())
 }
 
 /// Update viewport zoom/pan state
@@ -495,6 +603,19 @@ pub async fn export_to_note(
         graph.update_note(&note);
     }
 
+    sync_chunk_index_for_note(state.inner(), &note).await;
+
+    append_canvas_trace(
+        state.twin_store.clone(),
+        &session_id,
+        TraceEventType::NoteExported,
+        json!({
+            "note_id": note.id.clone(),
+            "title": note.title.clone(),
+        }),
+    )
+    .await;
+
     Ok(serde_json::json!({
         "note_id": note.id,
         "title": note.title,
@@ -559,6 +680,20 @@ pub async fn start_debate(
         let mut store = state.canvas_store.write().await;
         store.add_debate(&session_id, debate.clone()).map_err(|e| e.to_string())?;
     }
+
+    append_canvas_trace(
+        state.twin_store.clone(),
+        &session_id,
+        TraceEventType::DebateStarted,
+        json!({
+            "debate_id": debate.id.clone(),
+            "source_tile_ids": debate.source_tile_ids.clone(),
+            "participating_models": debate.participating_models.clone(),
+            "debate_mode": debate.debate_mode.clone(),
+            "max_rounds": request.max_rounds,
+        }),
+    )
+    .await;
 
     // Emit debate created
     let _ = window.emit(
@@ -808,6 +943,18 @@ pub async fn continue_debate(
         .find(|d| d.id == debate_id)
         .ok_or_else(|| "Debate not found".to_string())?
         .clone();
+
+    append_canvas_trace(
+        state.twin_store.clone(),
+        &session_id,
+        TraceEventType::DebateContinued,
+        json!({
+            "debate_id": debate_id.clone(),
+            "prompt": request.prompt.clone(),
+            "participating_models": debate.participating_models.clone(),
+        }),
+    )
+    .await;
 
     let openrouter_arc = state.openrouter.clone();
     let canvas_store_arc = state.canvas_store.clone();
@@ -1085,6 +1232,7 @@ pub async fn add_models_to_tile(
     // Spawn streaming task
     let openrouter_arc = state.openrouter.clone();
     let canvas_store_arc = state.canvas_store.clone();
+    let twin_store_arc = state.twin_store.clone();
     let messages = resolved_context.messages.clone();
     let system_prompt = resolved_context.system_prompt.clone();
     let web_search = prompt_request.web_search;
@@ -1204,6 +1352,25 @@ pub async fn add_models_to_tile(
             );
         }
 
+        append_canvas_trace(
+            twin_store_arc.clone(),
+            &session_id,
+            TraceEventType::ModelsAdded,
+            json!({
+                "tile_id": tile_id.clone(),
+                "model_ids": results.iter().map(|(model_id, _, _, _)| model_id.clone()).collect::<Vec<_>>(),
+            }),
+        )
+        .await;
+        append_model_result_traces(
+            twin_store_arc.clone(),
+            &session_id,
+            &tile_id,
+            "add_models_to_tile",
+            &results,
+        )
+        .await;
+
         let _ = window.emit(
             "canvas-stream",
             CanvasStreamEvent::SessionSaved {
@@ -1254,6 +1421,7 @@ pub async fn regenerate_response(
 
     let openrouter_arc = state.openrouter.clone();
     let canvas_store_arc = state.canvas_store.clone();
+    let twin_store_arc = state.twin_store.clone();
     let messages = resolved_context.messages.clone();
     let system_prompt = resolved_context.system_prompt.clone();
     let web_search = request.web_search;
@@ -1323,10 +1491,24 @@ pub async fn regenerate_response(
                     let mut store = canvas_store_arc.write().await;
                     let _ = store.update_tile_response(
                         &session_id, &tile_id, &model_id, &final_content,
-                        final_status,
+                        final_status.clone(),
                         final_error.as_deref(),
                     );
                 }
+
+                append_canvas_trace(
+                    twin_store_arc.clone(),
+                    &session_id,
+                    TraceEventType::ResponseRegenerated,
+                    json!({
+                        "tile_id": tile_id.clone(),
+                        "model_id": model_id.clone(),
+                        "status": final_status,
+                        "error": final_error.clone(),
+                        "content": final_content.clone(),
+                    }),
+                )
+                .await;
             }
             Err(e) => {
                 let error = e.to_string();
@@ -1339,6 +1521,19 @@ pub async fn regenerate_response(
                     );
                 }
                 emit_canvas_error(&window, &session_id, &tile_id, &model_id, &error);
+                append_canvas_trace(
+                    twin_store_arc.clone(),
+                    &session_id,
+                    TraceEventType::ResponseRegenerated,
+                    json!({
+                        "tile_id": tile_id.clone(),
+                        "model_id": model_id.clone(),
+                        "status": ResponseStatus::Error,
+                        "error": error,
+                        "content": "",
+                    }),
+                )
+                .await;
             }
         }
 
@@ -1371,6 +1566,49 @@ fn prompt_request_from_tile(
         max_tokens,
         web_search: tile.web_search,
         web_search_max_results: tile.web_search_max_results,
+    }
+}
+
+async fn append_canvas_trace(
+    twin_store_arc: Arc<RwLock<TwinStore>>,
+    session_id: &str,
+    event_type: TraceEventType,
+    payload: serde_json::Value,
+) {
+    let mut twin_store = twin_store_arc.write().await;
+    if let Err(error) = twin_store.append_trace_event(session_id, event_type, payload) {
+        log::error!("Failed to append twin trace for session '{}': {}", session_id, error);
+    }
+}
+
+async fn append_model_result_traces(
+    twin_store_arc: Arc<RwLock<TwinStore>>,
+    session_id: &str,
+    tile_id: &str,
+    trigger: &str,
+    results: &[StreamedResponseUpdate],
+) {
+    for (model_id, content, status, error) in results {
+        let event_type = if *status == ResponseStatus::Error {
+            TraceEventType::ResponseErrored
+        } else {
+            TraceEventType::ResponseCompleted
+        };
+
+        append_canvas_trace(
+            twin_store_arc.clone(),
+            session_id,
+            event_type,
+            json!({
+                "tile_id": tile_id,
+                "model_id": model_id,
+                "trigger": trigger,
+                "status": status,
+                "content": content,
+                "error": error,
+            }),
+        )
+        .await;
     }
 }
 

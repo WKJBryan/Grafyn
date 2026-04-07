@@ -1,3 +1,4 @@
+use crate::commands::sync_chunk_index_for_notes;
 use crate::models::import::{ImportPreview, ImportResult};
 use crate::models::note::{NoteCreate, NoteStatus};
 use crate::services::import;
@@ -52,6 +53,7 @@ pub async fn apply_import(
     };
 
     let mut note_ids = Vec::new();
+    let mut created_notes = Vec::new();
     let mut errors = Vec::new();
     let mut skipped = 0;
 
@@ -125,8 +127,11 @@ pub async fn apply_import(
             graph.update_note(&created);
         }
 
-        note_ids.push(created.id);
+        note_ids.push(created.id.clone());
+        created_notes.push(created);
     }
+
+    sync_chunk_index_for_notes(state.inner(), &created_notes).await;
 
     let imported = note_ids.len();
     let message = format!(

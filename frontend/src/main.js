@@ -2,6 +2,8 @@ import { createApp } from 'vue'
 import { createPinia } from 'pinia'
 import App from './App.vue'
 import router from './router'
+import { settings } from './api/client'
+import { resolveThemePreference, useThemeStore } from './stores/theme'
 import './style.css'
 
 function removeBootstrapSplash() {
@@ -26,7 +28,25 @@ window.addEventListener('grafyn-app-mounted', () => {
   })
 }, { once: true })
 
-const app = createApp(App)
-app.use(createPinia())
-app.use(router)
-app.mount('#app')
+const pinia = createPinia()
+const themeStore = useThemeStore(pinia)
+
+async function syncThemeFromSettings() {
+  try {
+    const currentSettings = await settings.get()
+    themeStore.setTheme(resolveThemePreference(currentSettings?.theme))
+  } catch (error) {
+    console.error('Failed to load theme setting:', error)
+  }
+}
+
+async function bootstrap() {
+  await syncThemeFromSettings()
+
+  const app = createApp(App)
+  app.use(pinia)
+  app.use(router)
+  app.mount('#app')
+}
+
+void bootstrap()

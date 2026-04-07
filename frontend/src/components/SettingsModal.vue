@@ -141,6 +141,12 @@
           >
             🔐 An API key is already stored securely. Enter a new key to replace it, or leave this blank to keep it.
           </p>
+          <p
+            v-else-if="openrouterKeyDirty && !openrouterKey"
+            class="setting-hint warning"
+          >
+            ⚠️ Saving now will remove your stored OpenRouter API key.
+          </p>
         </div>
 
         <!-- LLM Model Section (non-setup only, requires API key) -->
@@ -407,6 +413,7 @@ const hasStoredOpenRouterKey = ref(false)
 const openrouterKeyDirty = ref(false)
 const editingOpenRouterKey = ref(false)
 const theme = ref('system')
+const savedTheme = ref('system')
 const llmModel = ref('anthropic/claude-3.5-haiku')
 const smartWebSearch = ref(true)
 const keyValidationState = ref(null) // 'validating' | 'valid' | 'invalid' | null
@@ -532,6 +539,7 @@ const loadCurrentSettings = async () => {
       openrouterKeyDirty.value = false
       editingOpenRouterKey.value = false
       theme.value = currentSettings.theme || 'system'
+      savedTheme.value = theme.value
       llmModel.value = currentSettings.llm_model || 'anthropic/claude-3.5-haiku'
       smartWebSearch.value = currentSettings.smart_web_search ?? true
     }
@@ -570,7 +578,6 @@ const handleApiKeyFocus = () => {
 const handleApiKeyBlur = async (event) => {
   if (editingOpenRouterKey.value && !event.target.value) {
     editingOpenRouterKey.value = false
-    openrouterKeyDirty.value = false
   }
 
   openrouterKey.value = event.target.value
@@ -657,6 +664,7 @@ const saveSettings = async () => {
     if (props.isSetup) {
       emit('setup-complete')
     } else {
+      savedTheme.value = theme.value
       emit('saved')
     }
 
@@ -669,14 +677,22 @@ const saveSettings = async () => {
   }
 }
 
+const restoreThemePreview = () => {
+  if (theme.value !== savedTheme.value) {
+    theme.value = savedTheme.value
+  }
+}
+
 // Navigate to import page
 const goToImport = () => {
+  restoreThemePreview()
   isOpen.value = false
   router.push('/import')
 }
 
 // Open feedback modal (emit to parent)
 const openFeedback = () => {
+  restoreThemePreview()
   isOpen.value = false
   emit('open-feedback')
 }
@@ -684,6 +700,7 @@ const openFeedback = () => {
 // Handle close (only allowed if not in setup mode)
 const handleClose = () => {
   if (!props.isSetup) {
+    restoreThemePreview()
     isOpen.value = false
   }
 }

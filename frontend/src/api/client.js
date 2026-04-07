@@ -91,6 +91,24 @@ export const canvas = {
     invoke('regenerate_response', { sessionId, tileId, modelId }),
 }
 
+// Twin collector API
+export const twin = {
+  listRecords: () => invoke('list_user_records', {}),
+
+  getRecord: (id) => invoke('get_user_record', { id }),
+
+  createRecord: (record) => invoke('create_user_record', { record }),
+
+  updateRecord: (id, update) => invoke('update_user_record', { id, update }),
+
+  getSessionTrace: (sessionId) => invoke('get_session_trace', { sessionId }),
+
+  recordCanvasFeedback: (sessionId, request) =>
+    invoke('record_canvas_feedback', { sessionId, request }),
+
+  exportData: (request = {}) => invoke('export_twin_data', { request }),
+}
+
 // Feedback API
 export const feedback = {
   submit: (data) => invoke('submit_feedback', { feedback: data }),
