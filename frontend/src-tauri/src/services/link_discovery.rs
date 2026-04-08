@@ -15,6 +15,8 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
+#[cfg(feature = "tauri-app")]
+use std::time::Instant;
 
 #[cfg(feature = "tauri-app")]
 use crate::services::openrouter::ChatMessage;
@@ -23,6 +25,7 @@ use crate::AppState;
 
 const MAX_LOCAL_CANDIDATES: usize = 40;
 const DEFAULT_CHUNK_LIMIT: usize = 60;
+const PROFILE_VECTOR_TEXT_LIMIT: usize = 1600;
 
 lazy_static! {
     static ref PROPER_NOUN_RE: Regex = Regex::new(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+\b").unwrap();
@@ -128,7 +131,6 @@ impl QueuePriority {
 #[derive(Debug, Clone)]
 pub struct DiscoverySnapshot {
     pub source_profile: LinkDiscoveryProfile,
-    pub all_profiles: HashMap<String, LinkDiscoveryProfile>,
     pub dismissed_target_ids: HashSet<String>,
 }
 
@@ -367,7 +369,6 @@ impl LinkDiscoveryService {
 
         Some(DiscoverySnapshot {
             source_profile,
-            all_profiles: self.profiles.clone(),
             dismissed_target_ids,
         })
     }
@@ -807,7 +808,7 @@ pub fn rank_local_candidates(
 
 pub fn sample_exploratory_candidates(
     source_profile: &LinkDiscoveryProfile,
-    all_profiles: &[LinkDiscoveryProfile],
+    all_profiles: &HashMap<String, LinkDiscoveryProfile>,
     excluded_ids: &HashSet<String>,
     limit: usize,
 ) -> Vec<RankedLinkCandidate> {
@@ -823,7 +824,7 @@ pub fn sample_exploratory_candidates(
         .collect::<HashSet<_>>();
 
     let mut plausible_pool = all_profiles
-        .iter()
+        .values()
         .filter(|profile| {
             profile.note_id != source_profile.note_id && !excluded_ids.contains(&profile.note_id)
         })
@@ -856,13 +857,7 @@ pub fn sample_exploratory_candidates(
                 source_profile.note_id, profile.note_id, source_profile.content_hash
             ));
 
-            Some((
-                seed,
-                exploration_score,
-                weak_signal,
-                is_unlinked,
-                profile.clone(),
-            ))
+            Some((seed, exploration_score, weak_signal, is_unlinked, profile))
         })
         .collect::<Vec<_>>();
 
@@ -998,7 +993,8 @@ pub fn build_profile(
 ) -> LinkDiscoveryProfile {
     let summary = extract_summary(&note.content);
     let clean_content = clean_markdown(&note.content);
-    let vector_source = format!("{} {} {}", note.title, summary, clean_content);
+    let compact_content = truncate_text(clean_content.trim(), PROFILE_VECTOR_TEXT_LIMIT);
+    let vector_source = format!("{} {} {}", note.title, summary, compact_content);
     let provider = TfIdfProvider::new();
     let term_vector = provider.encode(&vector_source).terms;
     let key_terms = extract_key_terms(&vector_source)
@@ -1160,6 +1156,8 @@ pub async fn discover_for_note(
     max_links: usize,
     allow_cache: bool,
 ) -> Result<DiscoverLinksResponse, String> {
+    let total_started_at = Instant::now();
+
     if mode == DiscoverMode::Manual {
         return Ok(DiscoverLinksResponse {
             note_id: note_id.to_string(),
@@ -1174,6 +1172,11 @@ pub async fn discover_for_note(
     if allow_cache {
         let discovery = state.link_discovery.read().await;
         if let Some(cached) = discovery.get_cached_response(note_id, max_links) {
+            log::debug!(
+                "Discover links {:?} for '{}' served from cache",
+                mode,
+                note_id
+            );
             return Ok(cached);
         }
     }
@@ -1216,30 +1219,42 @@ pub async fn discover_for_note(
         build_second_hop_counts(&graph, &snapshot.source_profile)
     };
 
-    let mut ranked_links =
-        build_local_ranked_candidates(&snapshot, &note_results, &chunk_results, &second_hop_counts);
+    let ranking_started_at = Instant::now();
+    let (mut ranked_links, mut exploratory_ranked) = {
+        let discovery = state.link_discovery.read().await;
+        let ranked_links = build_local_ranked_candidates(
+            &snapshot.source_profile,
+            &snapshot.dismissed_target_ids,
+            &discovery.profiles,
+            &note_results,
+            &chunk_results,
+            &second_hop_counts,
+        );
+
+        let mut excluded_ids = snapshot.dismissed_target_ids.clone();
+        excluded_ids.insert(snapshot.source_profile.note_id.clone());
+        excluded_ids.extend(snapshot.source_profile.existing_link_ids.iter().cloned());
+        excluded_ids.extend(
+            ranked_links
+                .iter()
+                .take(MAX_LOCAL_CANDIDATES)
+                .map(|candidate| candidate.candidate.target_id.clone()),
+        );
+
+        let exploratory_ranked = sample_exploratory_candidates(
+            &snapshot.source_profile,
+            &discovery.profiles,
+            &excluded_ids,
+            exploratory_limit(max_links),
+        );
+
+        (ranked_links, exploratory_ranked)
+    };
+
     if mode.include_llm() {
         ranked_links =
             rerank_with_llm(state, &snapshot.source_profile, ranked_links, "strong", 8).await;
     }
-
-    let mut excluded_ids = snapshot.dismissed_target_ids.clone();
-    excluded_ids.insert(snapshot.source_profile.note_id.clone());
-    excluded_ids.extend(snapshot.source_profile.existing_link_ids.iter().cloned());
-    excluded_ids.extend(
-        ranked_links
-            .iter()
-            .take(MAX_LOCAL_CANDIDATES)
-            .map(|candidate| candidate.candidate.target_id.clone()),
-    );
-
-    let profile_list = snapshot.all_profiles.values().cloned().collect::<Vec<_>>();
-    let mut exploratory_ranked = sample_exploratory_candidates(
-        &snapshot.source_profile,
-        &profile_list,
-        &excluded_ids,
-        exploratory_limit(max_links),
-    );
     if mode.include_llm() {
         exploratory_ranked = rerank_with_llm(
             state,
@@ -1250,6 +1265,16 @@ pub async fn discover_for_note(
         )
         .await;
     }
+
+    log::debug!(
+        "Discover links {:?} for '{}' completed in {} ms (ranking {} ms, notes {}, chunks {})",
+        mode,
+        note_id,
+        total_started_at.elapsed().as_millis(),
+        ranking_started_at.elapsed().as_millis(),
+        note_results.len(),
+        chunk_results.len()
+    );
 
     let links = ranked_links
         .iter()
@@ -1289,24 +1314,24 @@ pub async fn discover_for_note(
 }
 
 fn build_local_ranked_candidates(
-    snapshot: &DiscoverySnapshot,
+    source_profile: &LinkDiscoveryProfile,
+    dismissed_target_ids: &HashSet<String>,
+    all_profiles: &HashMap<String, LinkDiscoveryProfile>,
     note_results: &[RetrievalResult],
     chunk_results: &[ChunkResult],
     second_hop_counts: &HashMap<String, usize>,
 ) -> Vec<RankedLinkCandidate> {
-    let source_tags = snapshot
-        .source_profile
+    let source_tags = source_profile
         .tags
         .iter()
         .map(|tag| tag.to_lowercase())
         .collect::<HashSet<_>>();
-    let excluded_ids = snapshot
-        .source_profile
+    let excluded_ids = source_profile
         .existing_link_ids
         .iter()
         .cloned()
-        .chain(std::iter::once(snapshot.source_profile.note_id.clone()))
-        .chain(snapshot.dismissed_target_ids.iter().cloned())
+        .chain(std::iter::once(source_profile.note_id.clone()))
+        .chain(dismissed_target_ids.iter().cloned())
         .collect::<HashSet<_>>();
 
     let max_note_score = note_results
@@ -1326,10 +1351,10 @@ fn build_local_ranked_candidates(
         if excluded_ids.contains(&result.note.id) {
             continue;
         }
-        if let Some(profile) = snapshot.all_profiles.get(&result.note.id) {
+        if let Some(profile) = all_profiles.get(&result.note.id) {
             let entry = signals_map
                 .entry(result.note.id.clone())
-                .or_insert_with(|| base_signals(snapshot, profile));
+                .or_insert_with(|| base_signals(profile));
             entry.note_score = (result.score / max_note_score) as f64;
             if entry.snippet.is_empty() {
                 entry.snippet = result.snippet.clone();
@@ -1341,10 +1366,10 @@ fn build_local_ranked_candidates(
         if excluded_ids.contains(&chunk.parent_note_id) {
             continue;
         }
-        if let Some(profile) = snapshot.all_profiles.get(&chunk.parent_note_id) {
+        if let Some(profile) = all_profiles.get(&chunk.parent_note_id) {
             let entry = signals_map
                 .entry(chunk.parent_note_id.clone())
-                .or_insert_with(|| base_signals(snapshot, profile));
+                .or_insert_with(|| base_signals(profile));
             let normalized = (chunk.search_score / max_chunk_score) as f64;
             if normalized > entry.chunk_score {
                 entry.chunk_score = normalized;
@@ -1363,23 +1388,22 @@ fn build_local_ranked_candidates(
         if excluded_ids.contains(candidate_id) {
             continue;
         }
-        if let Some(profile) = snapshot.all_profiles.get(candidate_id) {
+        if let Some(profile) = all_profiles.get(candidate_id) {
             let entry = signals_map
                 .entry(candidate_id.clone())
-                .or_insert_with(|| base_signals(snapshot, profile));
+                .or_insert_with(|| base_signals(profile));
             let second_hop_score = (*count as f64 / max_second_hop).clamp(0.0, 1.0);
             entry.graph_proximity = entry.graph_proximity.max(second_hop_score);
         }
     }
 
-    let source_link_set = snapshot
-        .source_profile
+    let source_link_set = source_profile
         .existing_link_ids
         .iter()
         .cloned()
         .collect::<HashSet<_>>();
     for (candidate_id, entry) in &mut signals_map {
-        if let Some(profile) = snapshot.all_profiles.get(candidate_id) {
+        if let Some(profile) = all_profiles.get(candidate_id) {
             let candidate_tags = profile
                 .tags
                 .iter()
@@ -1396,7 +1420,7 @@ fn build_local_ranked_candidates(
             entry.tag_overlap = tag_overlap;
             entry.tag_overlap_ratio = tag_overlap as f64 / tag_union as f64;
             entry.key_term_cosine =
-                cosine_similarity(&snapshot.source_profile.term_vector, &profile.term_vector);
+                cosine_similarity(&source_profile.term_vector, &profile.term_vector);
             if !source_link_set.is_empty() {
                 let overlap_score =
                     (shared_neighbors as f64 / source_link_set.len() as f64).clamp(0.0, 1.0);
@@ -1419,10 +1443,7 @@ fn build_local_ranked_candidates(
     rank_local_candidates(signals, MAX_LOCAL_CANDIDATES)
 }
 
-fn base_signals(
-    _snapshot: &DiscoverySnapshot,
-    profile: &LinkDiscoveryProfile,
-) -> LocalCandidateSignals {
+fn base_signals(profile: &LinkDiscoveryProfile) -> LocalCandidateSignals {
     LocalCandidateSignals {
         target_id: profile.note_id.clone(),
         target_title: profile.title.clone(),
@@ -1671,34 +1692,40 @@ mod tests {
             last_discovered_at: None,
             is_stale: true,
         };
-        let candidates = vec![
-            LinkDiscoveryProfile {
-                note_id: "a".to_string(),
-                title: "A".to_string(),
-                tags: vec!["ai".to_string()],
-                summary: "Machine learning systems".to_string(),
-                key_terms: vec!["machine learning".to_string()],
-                term_vector: HashMap::from([("machine".to_string(), 1.0)]),
-                existing_link_ids: Vec::new(),
-                content_hash: "a".to_string(),
-                updated_at: Utc::now(),
-                last_discovered_at: None,
-                is_stale: true,
-            },
-            LinkDiscoveryProfile {
-                note_id: "b".to_string(),
-                title: "B".to_string(),
-                tags: vec!["research".to_string()],
-                summary: "Model evaluation".to_string(),
-                key_terms: vec!["model evaluation".to_string()],
-                term_vector: HashMap::from([("model".to_string(), 1.0)]),
-                existing_link_ids: vec!["n9".to_string()],
-                content_hash: "b".to_string(),
-                updated_at: Utc::now(),
-                last_discovered_at: None,
-                is_stale: true,
-            },
-        ];
+        let candidates = HashMap::from([
+            (
+                "a".to_string(),
+                LinkDiscoveryProfile {
+                    note_id: "a".to_string(),
+                    title: "A".to_string(),
+                    tags: vec!["ai".to_string()],
+                    summary: "Machine learning systems".to_string(),
+                    key_terms: vec!["machine learning".to_string()],
+                    term_vector: HashMap::from([("machine".to_string(), 1.0)]),
+                    existing_link_ids: Vec::new(),
+                    content_hash: "a".to_string(),
+                    updated_at: Utc::now(),
+                    last_discovered_at: None,
+                    is_stale: true,
+                },
+            ),
+            (
+                "b".to_string(),
+                LinkDiscoveryProfile {
+                    note_id: "b".to_string(),
+                    title: "B".to_string(),
+                    tags: vec!["research".to_string()],
+                    summary: "Model evaluation".to_string(),
+                    key_terms: vec!["model evaluation".to_string()],
+                    term_vector: HashMap::from([("model".to_string(), 1.0)]),
+                    existing_link_ids: vec!["n9".to_string()],
+                    content_hash: "b".to_string(),
+                    updated_at: Utc::now(),
+                    last_discovered_at: None,
+                    is_stale: true,
+                },
+            ),
+        ]);
 
         let first = sample_exploratory_candidates(&source, &candidates, &HashSet::new(), 2);
         let second = sample_exploratory_candidates(&source, &candidates, &HashSet::new(), 2);
