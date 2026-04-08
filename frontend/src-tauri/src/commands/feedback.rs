@@ -1,6 +1,8 @@
 //! Tauri commands for feedback submission
 
-use crate::models::feedback::{FeedbackCreate, FeedbackResponse, FeedbackStatus, SystemInfo, PendingFeedback};
+use crate::models::feedback::{
+    FeedbackCreate, FeedbackResponse, FeedbackStatus, PendingFeedback, SystemInfo,
+};
 use crate::AppState;
 use tauri::State;
 
@@ -11,10 +13,7 @@ pub async fn submit_feedback(
     state: State<'_, AppState>,
 ) -> Result<FeedbackResponse, String> {
     let service = state.feedback_service.read().await;
-    service
-        .submit(feedback)
-        .await
-        .map_err(|e| e.to_string())
+    service.submit(feedback).await.map_err(|e| e.to_string())
 }
 
 /// Get system information for the feedback form
@@ -49,18 +48,12 @@ pub async fn retry_pending_feedback(
     state: State<'_, AppState>,
 ) -> Result<Vec<FeedbackResponse>, String> {
     let service = state.feedback_service.read().await;
-    service
-        .retry_pending()
-        .await
-        .map_err(|e| e.to_string())
+    service.retry_pending().await.map_err(|e| e.to_string())
 }
 
 /// Clear a specific pending feedback item
 #[tauri::command]
-pub async fn clear_pending_feedback(
-    id: String,
-    state: State<'_, AppState>,
-) -> Result<(), String> {
+pub async fn clear_pending_feedback(id: String, state: State<'_, AppState>) -> Result<(), String> {
     let service = state.feedback_service.read().await;
     service.clear_pending(&id).map_err(|e| e.to_string())
 }

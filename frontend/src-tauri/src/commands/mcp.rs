@@ -63,10 +63,7 @@ pub async fn get_mcp_config_snippet(state: State<'_, AppState>) -> Result<String
 ///
 /// Tauri bundles external binaries in the same directory as the main app.
 fn find_mcp_binary() -> Option<String> {
-    let exe_dir = std::env::current_exe()
-        .ok()?
-        .parent()?
-        .to_path_buf();
+    let exe_dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
 
     // Check for platform-specific binary name
     let binary_name = if cfg!(target_os = "windows") {

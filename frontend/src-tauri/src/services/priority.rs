@@ -132,7 +132,11 @@ impl PriorityScoringService {
         }
 
         // Re-sort by final score descending
-        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        results.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
     }
 
     /// Compute a priority boost for a single note (for chunk-level retrieval).
@@ -179,7 +183,13 @@ mod tests {
     use crate::models::note::NoteMeta;
     use chrono::{Duration, Utc};
 
-    fn make_result(id: &str, status: NoteStatus, age_days: i64, tags: Vec<&str>, score: f32) -> SearchResult {
+    fn make_result(
+        id: &str,
+        status: NoteStatus,
+        age_days: i64,
+        tags: Vec<&str>,
+        score: f32,
+    ) -> SearchResult {
         SearchResult {
             note: NoteMeta {
                 id: id.to_string(),

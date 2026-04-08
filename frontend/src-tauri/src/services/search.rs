@@ -88,7 +88,9 @@ impl SearchService {
         let schema = index.schema();
         let id_field = schema.get_field("id").context("Missing id field")?;
         let title_field = schema.get_field("title").context("Missing title field")?;
-        let content_field = schema.get_field("content").context("Missing content field")?;
+        let content_field = schema
+            .get_field("content")
+            .context("Missing content field")?;
         let tags_field = schema.get_field("tags").context("Missing tags field")?;
         let status_field = schema.get_field("status").context("Missing status field")?;
 
@@ -248,7 +250,12 @@ impl SearchService {
     }
 
     /// Find notes similar to a given note (by content overlap)
-    pub fn find_similar(&self, note_id: &str, content: &str, limit: usize) -> Result<Vec<SearchResult>> {
+    pub fn find_similar(
+        &self,
+        note_id: &str,
+        content: &str,
+        limit: usize,
+    ) -> Result<Vec<SearchResult>> {
         // Use important words from the content as a query
         let query_words: Vec<&str> = content
             .split_whitespace()
@@ -291,11 +298,7 @@ fn create_snippet(content: &str, query: &str, max_len: usize) -> String {
     let start = best_pos.saturating_sub(max_len / 2);
     let end = (start + max_len).min(content.len());
 
-    let mut snippet: String = content
-        .chars()
-        .skip(start)
-        .take(end - start)
-        .collect();
+    let mut snippet: String = content.chars().skip(start).take(end - start).collect();
 
     // Add ellipsis if truncated
     if start > 0 {

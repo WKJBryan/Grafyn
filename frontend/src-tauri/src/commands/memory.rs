@@ -1,4 +1,6 @@
-use crate::models::memory::{ExtractRequest, ExtractedClaim, Contradiction, RecallRequest, RecallResult};
+use crate::models::memory::{
+    Contradiction, ExtractRequest, ExtractedClaim, RecallRequest, RecallResult,
+};
 use crate::AppState;
 use tauri::State;
 
@@ -46,7 +48,9 @@ pub async fn find_contradictions(
     let search = state.search_service.read().await;
     let store = state.knowledge_store.read().await;
 
-    state.memory_service.find_contradictions(&search, &store, &note_id)
+    state
+        .memory_service
+        .find_contradictions(&search, &store, &note_id)
 }
 
 /// Extract claims from conversation
@@ -55,5 +59,7 @@ pub async fn extract_claims(
     request: ExtractRequest,
     state: State<'_, AppState>,
 ) -> Result<Vec<ExtractedClaim>, String> {
-    Ok(state.memory_service.extract_from_conversation(&request.messages))
+    Ok(state
+        .memory_service
+        .extract_from_conversation(&request.messages))
 }

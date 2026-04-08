@@ -130,11 +130,16 @@
       v-if="showLinkModal"
       :note-id="note.id"
       :candidates="linkCandidates"
+      :exploratory-candidates="exploratoryLinkCandidates"
       :loading="isDiscovering"
       :error="linkError"
+      :cached-at="linkCachedAt"
+      :is-stale="linkIsStale"
+      :source="linkSource"
       @close="showLinkModal = false"
       @retry="handleDiscoverLinks"
       @applied="handleLinksApplied"
+      @dismissed="handleSuggestionDismissed"
     />
   </div>
 </template>
@@ -167,7 +172,11 @@ const distillMode = ref('algorithm')
 const showLinkModal = ref(false)
 const isDiscovering = ref(false)
 const linkCandidates = ref([])
+const exploratoryLinkCandidates = ref([])
 const linkError = ref(null)
+const linkCachedAt = ref(null)
+const linkIsStale = ref(false)
+const linkSource = ref('')
 
 // Computed: can distill if status is evidence, has canvas-export tag, or source is mcp
 const canDistill = computed(() => {
@@ -322,6 +331,10 @@ async function handleDiscoverLinks() {
   try {
     const result = await zettelkasten.discoverLinks(props.note.id, distillMode.value)
     linkCandidates.value = result.links || []
+    exploratoryLinkCandidates.value = result.exploratory_links || []
+    linkCachedAt.value = result.cached_at || null
+    linkIsStale.value = Boolean(result.is_stale)
+    linkSource.value = result.source || ''
   } catch (e) {
     console.error('Link discovery failed:', e)
     linkError.value = e.response?.data?.detail || e.message || e.toString() || 'Link discovery failed'
@@ -333,6 +346,17 @@ async function handleDiscoverLinks() {
 function handleLinksApplied() {
   showLinkModal.value = false
   linkCandidates.value = []
+  exploratoryLinkCandidates.value = []
+  linkCachedAt.value = null
+  linkIsStale.value = false
+  linkSource.value = ''
+}
+
+function handleSuggestionDismissed(targetId) {
+  linkCandidates.value = linkCandidates.value.filter(candidate => candidate.target_id !== targetId)
+  exploratoryLinkCandidates.value = exploratoryLinkCandidates.value.filter(
+    candidate => candidate.target_id !== targetId
+  )
 }
 </script>
 

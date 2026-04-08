@@ -38,7 +38,8 @@ fn normalize_tag(tag: &str) -> String {
 
 /// Normalize and deduplicate a list of tags
 fn normalize_all_tags(tags: &[String]) -> Vec<String> {
-    let mut set: std::collections::HashSet<String> = tags.iter().map(|t| normalize_tag(t)).collect();
+    let mut set: std::collections::HashSet<String> =
+        tags.iter().map(|t| normalize_tag(t)).collect();
     // Remove empty strings
     set.remove("");
     let mut sorted: Vec<String> = set.into_iter().collect();
@@ -116,12 +117,7 @@ struct AtomicCandidate {
 }
 
 /// META_SECTIONS that should be skipped during extraction
-const META_SECTIONS: &[&str] = &[
-    "metadata",
-    "extracted atomic notes",
-    "sources",
-    "updates",
-];
+const META_SECTIONS: &[&str] = &["metadata", "extracted atomic notes", "sources", "updates"];
 
 /// Extract up to 5 summary bullet points from a section body
 fn extract_summary_bullets(body: &str) -> Vec<String> {
@@ -165,10 +161,7 @@ fn merge_and_limit_tags(section_tags: Vec<String>, inherited: &[String]) -> Vec<
 /// with `### Message N` children), performs a secondary split on H3 to produce
 /// individual candidates from each sub-section. This handles imported
 /// conversation container notes which pack all content under a single H2.
-fn extract_candidates_rules(
-    content: &str,
-    container_tags: &[String],
-) -> Vec<AtomicCandidate> {
+fn extract_candidates_rules(content: &str, container_tags: &[String]) -> Vec<AtomicCandidate> {
     let mut candidates = Vec::new();
     let inherited = inherited_tags(container_tags);
 
@@ -426,8 +419,9 @@ async fn extract_candidates_llm(
                     }
                 }
                 let recommended_tags = merge_and_limit_tags(section_tags, &inherited);
-                let suggested_hub =
-                    c.suggested_hub.or_else(|| suggest_hub(&c.title, &recommended_tags));
+                let suggested_hub = c
+                    .suggested_hub
+                    .or_else(|| suggest_hub(&c.title, &recommended_tags));
 
                 AtomicCandidate {
                     title: c.title,
@@ -458,8 +452,9 @@ async fn extract_candidates_llm(
         .map(|c| {
             let section_tags: Vec<String> = c.tags.iter().map(|t| normalize_tag(t)).collect();
             let recommended_tags = merge_and_limit_tags(section_tags, &inherited);
-            let suggested_hub =
-                c.suggested_hub.or_else(|| suggest_hub(&c.title, &recommended_tags));
+            let suggested_hub = c
+                .suggested_hub
+                .or_else(|| suggest_hub(&c.title, &recommended_tags));
 
             AtomicCandidate {
                 title: c.title,
@@ -481,10 +476,7 @@ async fn extract_candidates_llm(
 ///
 /// Splits the note content at detected topic boundaries, then uses YAKE to
 /// generate titles and tags for each segment.
-fn extract_candidates_texttile(
-    content: &str,
-    container_tags: &[String],
-) -> Vec<AtomicCandidate> {
+fn extract_candidates_texttile(content: &str, container_tags: &[String]) -> Vec<AtomicCandidate> {
     let config = TextTilingConfig::default();
     let segments = texttiling::segment(content, &config);
     let inherited = inherited_tags(container_tags);
@@ -603,15 +595,8 @@ fn apply_hub_policy(
 // ── Hub management ─────────────────────────────────────────────────────────
 
 /// Create or update a hub note, returning a HubUpdate if successful
-async fn update_hub(
-    hub_title: &str,
-    atomic_id: &str,
-    state: &AppState,
-) -> Option<HubUpdate> {
-    let hub_id = hub_title
-        .replace(' ', "_")
-        .replace(':', "")
-        .to_lowercase();
+async fn update_hub(hub_title: &str, atomic_id: &str, state: &AppState) -> Option<HubUpdate> {
+    let hub_id = hub_title.replace(' ', "_").replace(':', "").to_lowercase();
 
     // Check if hub exists
     let hub_exists = {
@@ -632,10 +617,8 @@ async fn update_hub(
         }
 
         let new_content = if hub.content.contains("## Atomic Notes") {
-            hub.content.replace(
-                "## Atomic Notes",
-                &format!("## Atomic Notes\n- {}", link),
-            )
+            hub.content
+                .replace("## Atomic Notes", &format!("## Atomic Notes\n- {}", link))
         } else {
             format!("{}\n\n## Atomic Notes\n- {}", hub.content, link)
         };
@@ -815,8 +798,7 @@ pub async fn distill_note(
 
     for (i, candidate) in candidates.iter().enumerate() {
         // Check for duplicates
-        if let Some((existing_id, existing_title)) =
-            find_duplicate(&candidate.title, &state).await
+        if let Some((existing_id, existing_title)) = find_duplicate(&candidate.title, &state).await
         {
             match request.dedup_action {
                 DeduplicationAction::Skip => {
@@ -837,10 +819,8 @@ pub async fn distill_note(
                         .collect::<Vec<_>>()
                         .join("\n");
 
-                    let merge_section = format!(
-                        "\n\n## Merged from [[{}]]\n{}\n",
-                        note.title, summary_list
-                    );
+                    let merge_section =
+                        format!("\n\n## Merged from [[{}]]\n{}\n", note.title, summary_list);
 
                     let existing_note = {
                         let store = state.knowledge_store.read().await;
@@ -972,7 +952,10 @@ pub async fn distill_note(
                 &note.content[end..]
             )
         } else {
-            format!("{}\n\n{}\n{}", note.content, section_header, section_content)
+            format!(
+                "{}\n\n{}\n{}",
+                note.content, section_header, section_content
+            )
         };
 
         let update = NoteUpdate {
@@ -1016,10 +999,7 @@ pub async fn distill_note(
         parts.push(format!("skipped {} duplicates", skipped_duplicates));
     }
     if !merged_into.is_empty() {
-        parts.push(format!(
-            "merged into {} existing notes",
-            merged_into.len()
-        ));
+        parts.push(format!("merged into {} existing notes", merged_into.len()));
     }
     if let Some(fallback) = llm_fallback_msg {
         parts.push(fallback);
@@ -1127,28 +1107,24 @@ mod tests {
 
     #[test]
     fn test_hub_policy_never() {
-        let candidates = vec![
-            AtomicCandidate {
-                title: "Test".into(),
-                summary: vec![],
-                recommended_tags: vec!["rust".into()],
-                suggested_hub: Some("Hub: Rust".into()),
-            },
-        ];
+        let candidates = vec![AtomicCandidate {
+            title: "Test".into(),
+            summary: vec![],
+            recommended_tags: vec!["rust".into()],
+            suggested_hub: Some("Hub: Rust".into()),
+        }];
         let result = apply_hub_policy(&candidates, &HubCreatePolicy::Never);
         assert_eq!(result, vec![None]);
     }
 
     #[test]
     fn test_hub_policy_always() {
-        let candidates = vec![
-            AtomicCandidate {
-                title: "Test".into(),
-                summary: vec![],
-                recommended_tags: vec!["rust".into()],
-                suggested_hub: Some("Hub: Rust".into()),
-            },
-        ];
+        let candidates = vec![AtomicCandidate {
+            title: "Test".into(),
+            summary: vec![],
+            recommended_tags: vec!["rust".into()],
+            suggested_hub: Some("Hub: Rust".into()),
+        }];
         let result = apply_hub_policy(&candidates, &HubCreatePolicy::Always);
         assert_eq!(result, vec![Some("Hub: Rust".into())]);
     }

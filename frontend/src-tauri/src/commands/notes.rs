@@ -1,4 +1,7 @@
-use crate::commands::{remove_note_chunks_from_index, sync_chunk_index_for_note};
+use crate::commands::{
+    remove_link_discovery_note, remove_note_chunks_from_index, sync_chunk_index_for_note,
+    sync_link_discovery_for_note,
+};
 use crate::models::note::{Note, NoteCreate, NoteMeta, NoteUpdate};
 use crate::AppState;
 use tauri::State;
@@ -30,7 +33,11 @@ pub async fn create_note(note: NoteCreate, state: State<'_, AppState>) -> Result
             log::error!("Failed to index note '{}': {}", created_note.id, e);
         }
         if let Err(e) = search.commit() {
-            log::error!("Failed to commit search index after creating note '{}': {}", created_note.id, e);
+            log::error!(
+                "Failed to commit search index after creating note '{}': {}",
+                created_note.id,
+                e
+            );
         }
     }
 
@@ -42,6 +49,7 @@ pub async fn create_note(note: NoteCreate, state: State<'_, AppState>) -> Result
 
     // Update chunk index
     sync_chunk_index_for_note(state.inner(), &created_note).await;
+    sync_link_discovery_for_note(state.inner(), &created_note).await;
 
     Ok(created_note)
 }
@@ -63,7 +71,11 @@ pub async fn update_note(
             log::error!("Failed to index note '{}': {}", updated_note.id, e);
         }
         if let Err(e) = search.commit() {
-            log::error!("Failed to commit search index after updating note '{}': {}", updated_note.id, e);
+            log::error!(
+                "Failed to commit search index after updating note '{}': {}",
+                updated_note.id,
+                e
+            );
         }
     }
 
@@ -75,6 +87,7 @@ pub async fn update_note(
 
     // Update chunk index
     sync_chunk_index_for_note(state.inner(), &updated_note).await;
+    sync_link_discovery_for_note(state.inner(), &updated_note).await;
 
     Ok(updated_note)
 }
@@ -92,7 +105,11 @@ pub async fn delete_note(id: String, state: State<'_, AppState>) -> Result<(), S
             log::error!("Failed to remove note '{}' from search index: {}", id, e);
         }
         if let Err(e) = search.commit() {
-            log::error!("Failed to commit search index after deleting note '{}': {}", id, e);
+            log::error!(
+                "Failed to commit search index after deleting note '{}': {}",
+                id,
+                e
+            );
         }
     }
 
@@ -104,6 +121,7 @@ pub async fn delete_note(id: String, state: State<'_, AppState>) -> Result<(), S
 
     // Remove from chunk index
     remove_note_chunks_from_index(state.inner(), &id).await;
+    remove_link_discovery_note(state.inner(), &id).await;
 
     Ok(())
 }

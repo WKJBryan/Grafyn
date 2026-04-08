@@ -139,6 +139,10 @@
         <!-- Right Sidebar: Info, Graph, Backlinks & Mentions -->
         <aside class="sidebar-right">
           <div class="sidebar-section">
+            <LinkSuggestionInbox @navigate="handleNoteSelect" />
+          </div>
+
+          <div class="sidebar-section">
             <div class="section-title">
               Interactive Graph
             </div>
@@ -258,6 +262,7 @@ import UnlinkedMentions from '../components/UnlinkedMentions.vue'
 import MiniGraph from '../components/MiniGraph.vue'
 import OnThisPage from '../components/OnThisPage.vue'
 import GraphView from '../components/GraphView.vue'
+import LinkSuggestionInbox from '../components/LinkSuggestionInbox.vue'
 import TopicSelector from '../components/TopicSelector.vue'
 import FeedbackModal from '../components/FeedbackModal.vue'
 import SettingsModal from '../components/SettingsModal.vue'

@@ -141,10 +141,7 @@ fn extract_messages(messages_list: &[serde_json::Value]) -> Vec<ParsedMessage> {
     let mut messages = Vec::new();
 
     for (i, msg_data) in messages_list.iter().enumerate() {
-        let msg_type = msg_data
-            .get("type")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let msg_type = msg_data.get("type").and_then(|v| v.as_str()).unwrap_or("");
         let sender = msg_data
             .get("sender")
             .and_then(|v| v.as_str())
@@ -227,7 +224,9 @@ fn extract_message_content(msg_data: &serde_json::Value) -> String {
                     if let Some(s) = part.as_str() {
                         return Some(s.to_string());
                     }
-                    part.get("text").and_then(|v| v.as_str()).map(|s| s.to_string())
+                    part.get("text")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
                 })
                 .collect();
             return parts.join("\n");

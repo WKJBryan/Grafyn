@@ -270,6 +270,34 @@
           </label>
         </div>
 
+        <div
+          v-if="!isSetup"
+          class="setting-section"
+        >
+          <label class="setting-label">
+            <span class="label-icon">🔗</span>
+            Link Discovery
+          </label>
+          <p class="setting-description">
+            Keep the link inbox warm in the background. The local discovery pass is cheap; optional LLM reranking spends OpenRouter budget only on higher-priority notes.
+          </p>
+          <label class="checkbox-label">
+            <input
+              v-model="backgroundLinkDiscoveryEnabled"
+              type="checkbox"
+            >
+            <span>{{ backgroundLinkDiscoveryEnabled ? 'Background discovery enabled' : 'Background discovery paused' }}</span>
+          </label>
+          <label class="checkbox-label secondary-checkbox">
+            <input
+              v-model="backgroundLinkDiscoveryLlmEnabled"
+              type="checkbox"
+              :disabled="!backgroundLinkDiscoveryEnabled || !(openrouterKey || hasStoredOpenRouterKey)"
+            >
+            <span>Allow background LLM reranking for high-priority notes</span>
+          </label>
+        </div>
+
         <!-- MCP Integration Section (desktop only, non-setup only) -->
         <div
           v-if="!isSetup && isDesktop"
@@ -416,6 +444,8 @@ const theme = ref('system')
 const savedTheme = ref('system')
 const llmModel = ref('anthropic/claude-3.5-haiku')
 const smartWebSearch = ref(true)
+const backgroundLinkDiscoveryEnabled = ref(true)
+const backgroundLinkDiscoveryLlmEnabled = ref(false)
 const keyValidationState = ref(null) // 'validating' | 'valid' | 'invalid' | null
 
 // LLM model state
@@ -542,6 +572,10 @@ const loadCurrentSettings = async () => {
       savedTheme.value = theme.value
       llmModel.value = currentSettings.llm_model || 'anthropic/claude-3.5-haiku'
       smartWebSearch.value = currentSettings.smart_web_search ?? true
+      backgroundLinkDiscoveryEnabled.value =
+        currentSettings.background_link_discovery_enabled ?? true
+      backgroundLinkDiscoveryLlmEnabled.value =
+        currentSettings.background_link_discovery_llm_enabled ?? false
     }
     const status = await settingsApi.getOpenRouterStatus()
     hasStoredOpenRouterKey.value = Boolean(status?.has_key)
@@ -649,6 +683,8 @@ const saveSettings = async () => {
       theme: theme.value,
       llm_model: llmModel.value || null,
       smart_web_search: smartWebSearch.value,
+      background_link_discovery_enabled: backgroundLinkDiscoveryEnabled.value,
+      background_link_discovery_llm_enabled: backgroundLinkDiscoveryLlmEnabled.value,
     }
     if (openrouterKeyDirty.value) {
       // Empty string means explicit clear. Missing field means keep existing key.

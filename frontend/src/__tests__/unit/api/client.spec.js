@@ -447,6 +447,30 @@ describe('API Client (Tauri)', () => {
       await zettelkasten.getLinkTypes()
       expect(mockInvoke).toHaveBeenCalledWith('get_link_types', {})
     })
+
+    it('listSuggestionQueue() invokes list_link_suggestion_queue', async () => {
+      mockInvoke.mockResolvedValue([])
+      await zettelkasten.listSuggestionQueue('pending', 12)
+      expect(mockInvoke).toHaveBeenCalledWith('list_link_suggestion_queue', {
+        status: 'pending',
+        limit: 12,
+      })
+    })
+
+    it('dismissSuggestion() invokes dismiss_link_suggestion', async () => {
+      mockInvoke.mockResolvedValue({})
+      await zettelkasten.dismissSuggestion('n1', 'n2')
+      expect(mockInvoke).toHaveBeenCalledWith('dismiss_link_suggestion', {
+        noteId: 'n1',
+        targetId: 'n2',
+      })
+    })
+
+    it('getDiscoveryStatus() invokes get_link_discovery_status', async () => {
+      mockInvoke.mockResolvedValue({})
+      await zettelkasten.getDiscoveryStatus()
+      expect(mockInvoke).toHaveBeenCalledWith('get_link_discovery_status', {})
+    })
   })
 
   // ============================================================================

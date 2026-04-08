@@ -15,10 +15,7 @@ pub async fn list_user_records(state: State<'_, AppState>) -> Result<Vec<UserRec
 }
 
 #[tauri::command]
-pub async fn get_user_record(
-    id: String,
-    state: State<'_, AppState>,
-) -> Result<UserRecord, String> {
+pub async fn get_user_record(id: String, state: State<'_, AppState>) -> Result<UserRecord, String> {
     let mut store = state.twin_store.write().await;
     store
         .get_user_record(&id)
@@ -65,7 +62,9 @@ pub async fn export_twin_data(
     state: State<'_, AppState>,
 ) -> Result<crate::models::twin::ExportBundle, String> {
     let mut store = state.twin_store.write().await;
-    store.export_bundle(request).map_err(|error| error.to_string())
+    store
+        .export_bundle(request)
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -94,7 +93,9 @@ pub async fn record_canvas_feedback(
     };
 
     let mut created_record_ids = Vec::new();
-    if let Some(record_create) = build_record_from_feedback(&session, &session_id, &trace_event, &request)? {
+    if let Some(record_create) =
+        build_record_from_feedback(&session, &session_id, &trace_event, &request)?
+    {
         let record = {
             let mut twin_store = state.twin_store.write().await;
             twin_store
@@ -125,7 +126,9 @@ fn build_feedback_payload(
     request: &CanvasFeedbackRequest,
 ) -> Result<serde_json::Value, String> {
     let payload = match &request.feedback_type {
-        CanvasFeedbackType::Accept | CanvasFeedbackType::Reject | CanvasFeedbackType::Correction => {
+        CanvasFeedbackType::Accept
+        | CanvasFeedbackType::Reject
+        | CanvasFeedbackType::Correction => {
             let response_ref = request
                 .response
                 .as_ref()
@@ -241,9 +244,7 @@ fn build_record_from_feedback(
             let content = request.content.clone().unwrap_or_else(|| {
                 format!(
                     "{} response from {} for prompt: {}",
-                    label,
-                    response.model_name,
-                    tile.prompt
+                    label, response.model_name, tile.prompt
                 )
             });
 

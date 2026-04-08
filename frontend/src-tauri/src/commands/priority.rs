@@ -4,9 +4,7 @@ use tauri::State;
 
 /// Get current priority scoring settings
 #[tauri::command]
-pub async fn get_priority_settings(
-    state: State<'_, AppState>,
-) -> Result<PrioritySettings, String> {
+pub async fn get_priority_settings(state: State<'_, AppState>) -> Result<PrioritySettings, String> {
     let svc = state.priority_service.read().await;
     Ok(svc.get_settings().clone())
 }

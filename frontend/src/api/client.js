@@ -183,6 +183,14 @@ export const zettelkasten = {
     invoke('create_link', { sourceId, targetId, linkType }),
 
   getLinkTypes: () => invoke('get_link_types', {}),
+
+  listSuggestionQueue: (status = 'pending', limit = 25) =>
+    invoke('list_link_suggestion_queue', { status, limit }),
+
+  dismissSuggestion: (noteId, targetId) =>
+    invoke('dismiss_link_suggestion', { noteId, targetId }),
+
+  getDiscoveryStatus: () => invoke('get_link_discovery_status', {}),
 }
 
 // Retrieval API (temporal + graph-aware)

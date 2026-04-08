@@ -32,7 +32,11 @@ impl KnowledgeStore {
     pub fn new(vault_path: PathBuf) -> Self {
         // Ensure vault directory exists
         if let Err(e) = std::fs::create_dir_all(&vault_path) {
-            log::error!("Failed to create vault directory {}: {}", vault_path.display(), e);
+            log::error!(
+                "Failed to create vault directory {}: {}",
+                vault_path.display(),
+                e
+            );
         }
         let mut store = Self {
             vault_path,
@@ -45,7 +49,11 @@ impl KnowledgeStore {
     /// Update the vault path at runtime (e.g., after settings change)
     pub fn set_vault_path(&mut self, vault_path: PathBuf) {
         if let Err(e) = std::fs::create_dir_all(&vault_path) {
-            log::error!("Failed to create vault directory {}: {}", vault_path.display(), e);
+            log::error!(
+                "Failed to create vault directory {}: {}",
+                vault_path.display(),
+                e
+            );
         }
         log::info!("Vault path updated to {:?}", vault_path);
         self.vault_path = vault_path;
@@ -229,11 +237,7 @@ impl KnowledgeStore {
 
     /// Validate that a note ID doesn't contain path traversal sequences
     fn validate_note_id(id: &str) -> Result<()> {
-        if id.is_empty()
-            || id.contains('/')
-            || id.contains('\\')
-            || id.contains("..")
-        {
+        if id.is_empty() || id.contains('/') || id.contains('\\') || id.contains("..") {
             anyhow::bail!("Invalid note ID: {}", id);
         }
         Ok(())
@@ -272,9 +276,10 @@ impl KnowledgeStore {
 
         let now = Utc::now();
         let created_at = frontmatter.created_at.unwrap_or(now);
-        let updated_at = frontmatter.updated_at.or_else(|| {
-            file_modified.map(|t| chrono::DateTime::<Utc>::from(t))
-        }).unwrap_or(now);
+        let updated_at = frontmatter
+            .updated_at
+            .or_else(|| file_modified.map(|t| chrono::DateTime::<Utc>::from(t)))
+            .unwrap_or(now);
 
         let body = parsed.content;
         let wikilinks = self.extract_wikilinks(&body);

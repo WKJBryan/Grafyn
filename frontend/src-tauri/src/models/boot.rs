@@ -28,7 +28,11 @@ impl BootStatus {
         }
     }
 
-    pub fn failed(phase: impl Into<String>, message: impl Into<String>, error: impl Into<String>) -> Self {
+    pub fn failed(
+        phase: impl Into<String>,
+        message: impl Into<String>,
+        error: impl Into<String>,
+    ) -> Self {
         Self {
             phase: phase.into(),
             message: message.into(),

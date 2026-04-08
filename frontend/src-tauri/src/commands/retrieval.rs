@@ -23,9 +23,7 @@ pub async fn retrieve_relevant(
 
 /// Get current retrieval configuration
 #[tauri::command]
-pub async fn get_retrieval_config(
-    state: State<'_, AppState>,
-) -> Result<RetrievalConfig, String> {
+pub async fn get_retrieval_config(state: State<'_, AppState>) -> Result<RetrievalConfig, String> {
     let retrieval = state.retrieval_service.read().await;
     Ok(retrieval.get_config().clone())
 }

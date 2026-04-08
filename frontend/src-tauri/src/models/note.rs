@@ -317,6 +317,7 @@ pub struct GraphNeighbor {
 }
 
 // Keep old LinkType as alias for backward compat with frontend
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum LinkType {
@@ -358,6 +359,18 @@ pub struct ZettelLinkCandidate {
 pub struct DiscoverLinksResponse {
     pub note_id: String,
     pub links: Vec<ZettelLinkCandidate>,
+    #[serde(default)]
+    pub exploratory_links: Vec<ZettelLinkCandidate>,
+    #[serde(default)]
+    pub cached_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub is_stale: bool,
+    #[serde(default = "default_discovery_response_source")]
+    pub source: String,
+}
+
+fn default_discovery_response_source() -> String {
+    "fresh".to_string()
 }
 
 /// Request to apply discovered links

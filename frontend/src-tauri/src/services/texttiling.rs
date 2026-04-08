@@ -334,8 +334,7 @@ fn merge_short_segments(segments: &mut Vec<TextSegment>, min_words: usize) {
                 let content = segments[i].content.clone();
                 let end = segments[i].end_char;
                 segments[i - 1].end_char = end;
-                segments[i - 1].content =
-                    format!("{}\n\n{}", segments[i - 1].content, content);
+                segments[i - 1].content = format!("{}\n\n{}", segments[i - 1].content, content);
                 segments.remove(i);
             } else {
                 i += 1;
@@ -553,7 +552,8 @@ mod tests {
                       Pattern matching enables expressive control flow in Rust programs. \
                       Error handling uses Result and Option types for safe error propagation.";
 
-        let topic2 = "Ocean biology studies marine ecosystems and underwater biodiversity worldwide. \
+        let topic2 =
+            "Ocean biology studies marine ecosystems and underwater biodiversity worldwide. \
                       Coral reefs support thousands of fish species in tropical waters. \
                       Phytoplankton produce most of Earth's oxygen through photosynthesis daily. \
                       Deep sea vents host unique chemosynthetic organisms near ocean floor. \
@@ -609,7 +609,11 @@ mod tests {
 
     #[test]
     fn test_snap_to_paragraph_handles_unicode_boundaries() {
-        let text = format!("{}—{}\n\nNext paragraph here.", "a".repeat(202), "b".repeat(250));
+        let text = format!(
+            "{}—{}\n\nNext paragraph here.",
+            "a".repeat(202),
+            "b".repeat(250)
+        );
         let snapped = snap_to_paragraph(&text, 403);
         let expected = text.find("\n\n").unwrap() + 2;
 

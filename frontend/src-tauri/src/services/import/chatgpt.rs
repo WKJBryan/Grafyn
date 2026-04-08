@@ -177,7 +177,9 @@ fn extract_content(message: &serde_json::Value) -> String {
                 if let Some(s) = part.as_str() {
                     Some(s.to_string())
                 } else {
-                    part.get("text").and_then(|t| t.as_str()).map(|s| s.to_string())
+                    part.get("text")
+                        .and_then(|t| t.as_str())
+                        .map(|s| s.to_string())
                 }
             })
             .collect();
@@ -199,7 +201,9 @@ fn extract_content(message: &serde_json::Value) -> String {
                 if let Some(s) = part.as_str() {
                     return Some(s.to_string());
                 }
-                part.get("text").and_then(|t| t.as_str()).map(|s| s.to_string())
+                part.get("text")
+                    .and_then(|t| t.as_str())
+                    .map(|s| s.to_string())
             })
             .collect();
         return text_parts.join("\n");

@@ -37,7 +37,11 @@ impl OpenRouterService {
         } else if self.api_key.len() <= 8 {
             Some("****".to_string())
         } else {
-            Some(format!("{}...{}", &self.api_key[..4], &self.api_key[self.api_key.len()-4..]))
+            Some(format!(
+                "{}...{}",
+                &self.api_key[..4],
+                &self.api_key[self.api_key.len() - 4..]
+            ))
         }
     }
 

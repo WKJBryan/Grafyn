@@ -23,7 +23,11 @@ impl SettingsService {
             .join("Grafyn");
 
         if let Err(e) = std::fs::create_dir_all(&config_dir) {
-            log::error!("Failed to create config directory {}: {}", config_dir.display(), e);
+            log::error!(
+                "Failed to create config directory {}: {}",
+                config_dir.display(),
+                e
+            );
         }
 
         Self {
@@ -40,13 +44,17 @@ impl SettingsService {
             .join("Grafyn");
 
         if let Err(e) = std::fs::create_dir_all(&config_dir) {
-            log::error!("Failed to create config directory {}: {}", config_dir.display(), e);
+            log::error!(
+                "Failed to create config directory {}: {}",
+                config_dir.display(),
+                e
+            );
         }
         let config_path = config_dir.join("settings.json");
 
         let mut settings: UserSettings = if config_path.exists() {
-            let content = std::fs::read_to_string(&config_path)
-                .context("Failed to read settings file")?;
+            let content =
+                std::fs::read_to_string(&config_path).context("Failed to read settings file")?;
             serde_json::from_str(&content).unwrap_or_default()
         } else {
             UserSettings::default()
@@ -74,7 +82,10 @@ impl SettingsService {
         // Re-save after migration so settings.json no longer contains plaintext API keys.
         if migrated_legacy_plaintext_key {
             if let Err(error) = service.save() {
-                log::warn!("Failed to persist settings cleanup after key migration: {}", error);
+                log::warn!(
+                    "Failed to persist settings cleanup after key migration: {}",
+                    error
+                );
             }
         }
 
@@ -98,8 +109,7 @@ impl SettingsService {
             // Validate the path exists (or can be created)
             let path = PathBuf::from(&vault_path);
             if !path.exists() {
-                std::fs::create_dir_all(&path)
-                    .context("Failed to create vault directory")?;
+                std::fs::create_dir_all(&path).context("Failed to create vault directory")?;
             }
             self.settings.vault_path = Some(vault_path);
         }
@@ -107,12 +117,18 @@ impl SettingsService {
         if let Some(api_key) = update.openrouter_api_key {
             self.settings.openrouter_api_key = if api_key.is_empty() {
                 if let Err(error) = clear_openrouter_api_key() {
-                    log::warn!("Failed to clear OpenRouter API key from OS keychain: {}", error);
+                    log::warn!(
+                        "Failed to clear OpenRouter API key from OS keychain: {}",
+                        error
+                    );
                 }
                 None
             } else {
                 if let Err(error) = store_openrouter_api_key(&api_key) {
-                    log::warn!("Failed to store OpenRouter API key in OS keychain: {}", error);
+                    log::warn!(
+                        "Failed to store OpenRouter API key in OS keychain: {}",
+                        error
+                    );
                 }
                 Some(api_key)
             };
@@ -142,6 +158,17 @@ impl SettingsService {
             self.settings.smart_web_search = smart_web_search;
         }
 
+        if let Some(background_link_discovery_enabled) = update.background_link_discovery_enabled {
+            self.settings.background_link_discovery_enabled = background_link_discovery_enabled;
+        }
+
+        if let Some(background_link_discovery_llm_enabled) =
+            update.background_link_discovery_llm_enabled
+        {
+            self.settings.background_link_discovery_llm_enabled =
+                background_link_discovery_llm_enabled;
+        }
+
         if let Some(canvas_model_presets) = update.canvas_model_presets {
             self.settings.canvas_model_presets = canvas_model_presets;
         }
@@ -154,10 +181,9 @@ impl SettingsService {
 
     /// Save settings to disk
     fn save(&self) -> Result<()> {
-        let json = serde_json::to_string_pretty(&self.settings)
-            .context("Failed to serialize settings")?;
-        std::fs::write(&self.config_path, json)
-            .context("Failed to write settings file")?;
+        let json =
+            serde_json::to_string_pretty(&self.settings).context("Failed to serialize settings")?;
+        std::fs::write(&self.config_path, json).context("Failed to write settings file")?;
         log::info!("Settings saved to {:?}", self.config_path);
         Ok(())
     }
@@ -196,7 +222,10 @@ impl SettingsService {
     /// Clear the OpenRouter API key
     pub fn clear_openrouter_key(&mut self) -> Result<()> {
         if let Err(error) = clear_openrouter_api_key() {
-            log::warn!("Failed to clear OpenRouter API key from OS keychain: {}", error);
+            log::warn!(
+                "Failed to clear OpenRouter API key from OS keychain: {}",
+                error
+            );
         }
         self.settings.openrouter_api_key = None;
         self.save()
@@ -283,7 +312,10 @@ mod tests {
         let presets = vec![CanvasModelPreset {
             id: "preset-1".to_string(),
             name: "Fast trio".to_string(),
-            model_ids: vec!["openai/gpt-4o".to_string(), "anthropic/claude-3.5-sonnet".to_string()],
+            model_ids: vec![
+                "openai/gpt-4o".to_string(),
+                "anthropic/claude-3.5-sonnet".to_string(),
+            ],
         }];
 
         let updated = service
@@ -295,6 +327,8 @@ mod tests {
                 mcp_enabled: None,
                 llm_model: None,
                 smart_web_search: None,
+                background_link_discovery_enabled: None,
+                background_link_discovery_llm_enabled: None,
                 canvas_model_presets: Some(presets.clone()),
             })
             .expect("settings update should succeed");
