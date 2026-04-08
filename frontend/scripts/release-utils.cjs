@@ -164,9 +164,16 @@ function assertVersionsAligned() {
 }
 
 function listGitChanges() {
-  const output = run('git', ['status', '--porcelain=v1', '--untracked-files=all'], {
+  const result = spawn('git', ['status', '--porcelain=v1', '--untracked-files=all'], {
     cwd: repoRoot,
   })
+
+  if (result.status !== 0) {
+    const output = [result.stdout, result.stderr].filter(Boolean).join('\n').trim()
+    fail('command failed: git status --porcelain=v1 --untracked-files=all', output)
+  }
+
+  const output = result.stdout || ''
 
   if (!output) {
     return []
