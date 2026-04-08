@@ -71,15 +71,21 @@
           v-if="entry.links?.length"
           class="entry-section"
         >
-          <div class="entry-section-title">Strong Matches</div>
+          <div class="entry-section-title">
+            Strong Matches
+          </div>
           <div
             v-for="candidate in entry.links"
             :key="entry.note_id + '-strong-' + candidate.target_id"
             class="entry-candidate"
           >
             <div class="candidate-copy">
-              <div class="candidate-title">{{ candidate.target_title }}</div>
-              <div class="candidate-reason">{{ candidate.reason }}</div>
+              <div class="candidate-title">
+                {{ candidate.target_title }}
+              </div>
+              <div class="candidate-reason">
+                {{ candidate.reason }}
+              </div>
             </div>
             <div class="candidate-controls">
               <span class="candidate-confidence">{{ Math.round(candidate.confidence * 100) }}%</span>
@@ -103,15 +109,21 @@
           v-if="entry.exploratory_links?.length"
           class="entry-section"
         >
-          <div class="entry-section-title">Exploratory</div>
+          <div class="entry-section-title">
+            Exploratory
+          </div>
           <div
             v-for="candidate in entry.exploratory_links"
             :key="entry.note_id + '-exploratory-' + candidate.target_id"
             class="entry-candidate"
           >
             <div class="candidate-copy">
-              <div class="candidate-title">{{ candidate.target_title }}</div>
-              <div class="candidate-reason">{{ candidate.reason }}</div>
+              <div class="candidate-title">
+                {{ candidate.target_title }}
+              </div>
+              <div class="candidate-reason">
+                {{ candidate.reason }}
+              </div>
             </div>
             <div class="candidate-controls">
               <span class="candidate-confidence">{{ Math.round(candidate.confidence * 100) }}%</span>
@@ -140,7 +152,7 @@ import { onMounted, onUnmounted, ref } from 'vue'
 import { zettelkasten } from '@/api/client'
 import { useToast } from '@/composables/useToast'
 
-const emit = defineEmits(['navigate'])
+defineEmits(['navigate'])
 const toast = useToast()
 
 const entries = ref([])
