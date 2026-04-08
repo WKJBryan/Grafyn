@@ -15,6 +15,30 @@
       </div>
 
       <div class="modal-body">
+        <div
+          v-if="!loading && !error && (cachedAt || isStale)"
+          class="discovery-meta"
+        >
+          <span
+            v-if="source"
+            class="meta-pill"
+          >
+            {{ source === 'cache' ? 'Cached' : 'Fresh' }}
+          </span>
+          <span
+            v-if="isStale"
+            class="meta-pill warning"
+          >
+            Stale
+          </span>
+          <span
+            v-if="cachedAt"
+            class="meta-text"
+          >
+            {{ formatCachedAt(cachedAt) }}
+          </span>
+        </div>
+
         <!-- Loading -->
         <div
           v-if="loading"
@@ -40,7 +64,7 @@
 
         <!-- No results -->
         <div
-          v-else-if="candidates.length === 0"
+          v-else-if="allCandidates.length === 0"
           class="empty-state"
         >
           <p>No link candidates found for this note.</p>
@@ -57,51 +81,71 @@
               type="checkbox"
               @change="toggleAll"
             >
-            <span>Select all ({{ candidates.length }} candidates)</span>
+            <span>Select all ({{ allCandidates.length }} candidates)</span>
           </label>
 
           <div
-            v-for="candidate in candidates"
-            :key="candidate.target_id"
-            class="candidate-item"
-            :class="{ selected: selected.has(candidate.target_id) }"
+            v-for="section in sections"
+            :key="section.key"
+            class="candidate-section"
           >
-            <label class="candidate-check">
-              <input
-                type="checkbox"
-                :checked="selected.has(candidate.target_id)"
-                @change="toggleCandidate(candidate.target_id)"
-              >
-            </label>
-            <div class="candidate-info">
-              <div class="candidate-header">
-                <span class="candidate-title">{{ candidate.target_title }}</span>
-                <span
-                  class="confidence-badge"
-                  :class="confidenceClass(candidate.confidence)"
+            <div class="section-header">
+              <h4>{{ section.title }}</h4>
+              <span class="section-count">{{ section.items.length }}</span>
+            </div>
+
+            <div
+              v-for="candidate in section.items"
+              :key="section.key + '-' + candidate.target_id"
+              class="candidate-item"
+              :class="{ selected: selected.has(candidate.target_id) }"
+            >
+              <label class="candidate-check">
+                <input
+                  type="checkbox"
+                  :checked="selected.has(candidate.target_id)"
+                  @change="toggleCandidate(candidate.target_id)"
                 >
-                  {{ Math.round(candidate.confidence * 100) }}%
-                </span>
+              </label>
+              <div class="candidate-info">
+                <div class="candidate-header">
+                  <span class="candidate-title">{{ candidate.target_title }}</span>
+                  <span
+                    class="confidence-badge"
+                    :class="confidenceClass(candidate.confidence)"
+                  >
+                    {{ Math.round(candidate.confidence * 100) }}%
+                  </span>
+                </div>
+                <div
+                  v-if="candidate.reason"
+                  class="candidate-reason"
+                >
+                  {{ candidate.reason }}
+                </div>
+                <div class="candidate-actions">
+                  <span
+                    class="link-type-badge"
+                    :class="'type-' + candidate.link_type"
+                  >
+                    {{ candidate.link_type }}
+                  </span>
+                  <button
+                    class="dismiss-btn"
+                    :disabled="dismissing.has(candidate.target_id)"
+                    @click="dismissCandidate(candidate.target_id)"
+                  >
+                    {{ dismissing.has(candidate.target_id) ? 'Dismissing...' : 'Dismiss' }}
+                  </button>
+                </div>
               </div>
-              <div
-                v-if="candidate.reason"
-                class="candidate-reason"
-              >
-                {{ candidate.reason }}
-              </div>
-              <span
-                class="link-type-badge"
-                :class="'type-' + candidate.link_type"
-              >
-                {{ candidate.link_type }}
-              </span>
             </div>
           </div>
         </div>
       </div>
 
       <div
-        v-if="candidates.length > 0"
+        v-if="allCandidates.length > 0"
         class="modal-footer"
       >
         <button
@@ -136,6 +180,10 @@ const props = defineProps({
     type: Array,
     default: () => [],
   },
+  exploratoryCandidates: {
+    type: Array,
+    default: () => [],
+  },
   loading: {
     type: Boolean,
     default: false,
@@ -144,24 +192,43 @@ const props = defineProps({
     type: String,
     default: null,
   },
+  cachedAt: {
+    type: String,
+    default: null,
+  },
+  isStale: {
+    type: Boolean,
+    default: false,
+  },
+  source: {
+    type: String,
+    default: '',
+  },
 })
 
-const emit = defineEmits(['close', 'retry', 'applied'])
+const emit = defineEmits(['close', 'retry', 'applied', 'dismissed'])
 const toast = useToast()
 
 const selected = ref(new Set())
 const applying = ref(false)
+const dismissing = ref(new Set())
+
+const allCandidates = computed(() => [...props.candidates, ...props.exploratoryCandidates])
+const sections = computed(() => [
+  { key: 'strong', title: 'Strong Matches', items: props.candidates },
+  { key: 'exploratory', title: 'Exploratory', items: props.exploratoryCandidates },
+].filter(section => section.items.length > 0))
 
 const allSelected = computed({
-  get: () => selected.value.size === props.candidates.length && props.candidates.length > 0,
+  get: () => selected.value.size === allCandidates.value.length && allCandidates.value.length > 0,
   set: () => {},
 })
 
 function toggleAll() {
-  if (selected.value.size === props.candidates.length) {
+  if (selected.value.size === allCandidates.value.length) {
     selected.value = new Set()
   } else {
-    selected.value = new Set(props.candidates.map(c => c.target_id))
+    selected.value = new Set(allCandidates.value.map(c => c.target_id))
   }
 }
 
@@ -181,12 +248,43 @@ function confidenceClass(confidence) {
   return 'confidence-low'
 }
 
+function formatCachedAt(cachedAt) {
+  try {
+    return `Updated ${new Date(cachedAt).toLocaleString()}`
+  } catch {
+    return 'Updated recently'
+  }
+}
+
+async function dismissCandidate(targetId) {
+  if (dismissing.value.has(targetId)) return
+
+  const next = new Set(dismissing.value)
+  next.add(targetId)
+  dismissing.value = next
+
+  try {
+    await zettelkasten.dismissSuggestion(props.noteId, targetId)
+    const selectedNext = new Set(selected.value)
+    selectedNext.delete(targetId)
+    selected.value = selectedNext
+    emit('dismissed', targetId)
+  } catch (e) {
+    console.error('Failed to dismiss link suggestion:', e)
+    toast.error('Failed to dismiss suggestion')
+  } finally {
+    const done = new Set(dismissing.value)
+    done.delete(targetId)
+    dismissing.value = done
+  }
+}
+
 async function handleApply() {
   if (selected.value.size === 0 || applying.value) return
 
   applying.value = true
   try {
-    const selectedCandidates = props.candidates.filter(candidate => selected.value.has(candidate.target_id))
+    const selectedCandidates = allCandidates.value.filter(candidate => selected.value.has(candidate.target_id))
     const result = await zettelkasten.applyLinks(props.noteId, selectedCandidates)
     toast.success(`Created ${result.links_created} link${result.links_created !== 1 ? 's' : ''}`)
     emit('applied', result)
@@ -269,6 +367,32 @@ async function handleApply() {
   flex: 1;
 }
 
+.discovery-meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.meta-pill {
+  padding: 4px 8px;
+  border-radius: 999px;
+  background: var(--bg-tertiary);
+  color: var(--text-secondary);
+  font-size: 0.75rem;
+}
+
+.meta-pill.warning {
+  background: rgba(245, 158, 11, 0.16);
+  color: #f59e0b;
+}
+
+.meta-text {
+  color: var(--text-muted);
+  font-size: 0.8rem;
+}
+
 .loading-state,
 .empty-state,
 .error-state {
@@ -316,6 +440,30 @@ async function handleApply() {
 .candidates-list {
   display: flex;
   flex-direction: column;
+  gap: 12px;
+}
+
+.candidate-section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.section-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.section-header h4 {
+  margin: 0;
+  font-size: 0.95rem;
+  color: var(--text-primary);
+}
+
+.section-count {
+  color: var(--text-muted);
+  font-size: 0.8rem;
 }
 
 .candidate-item {
@@ -394,6 +542,13 @@ async function handleApply() {
   line-height: 1.4;
 }
 
+.candidate-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
 .link-type-badge {
   display: inline-block;
   font-size: 0.65rem;
@@ -404,6 +559,19 @@ async function handleApply() {
   border-radius: var(--radius-sm);
   color: var(--text-muted);
   background: var(--bg-tertiary);
+}
+
+.dismiss-btn {
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 0.8rem;
+}
+
+.dismiss-btn:disabled {
+  opacity: 0.6;
+  cursor: wait;
 }
 
 .type-supports { color: #22c55e; background: rgba(34, 197, 94, 0.1); }

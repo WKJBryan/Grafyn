@@ -5,14 +5,20 @@ use tauri::State;
 
 /// Get all notes that link to the given note (backlinks)
 #[tauri::command]
-pub async fn get_backlinks(note_id: String, state: State<'_, AppState>) -> Result<Vec<NoteMeta>, String> {
+pub async fn get_backlinks(
+    note_id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<NoteMeta>, String> {
     let graph = state.graph_index.read().await;
     Ok(graph.get_backlinks(&note_id))
 }
 
 /// Get all notes that the given note links to (outgoing links)
 #[tauri::command]
-pub async fn get_outgoing(note_id: String, state: State<'_, AppState>) -> Result<Vec<NoteMeta>, String> {
+pub async fn get_outgoing(
+    note_id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<NoteMeta>, String> {
     let graph = state.graph_index.read().await;
     Ok(graph.get_outgoing(&note_id))
 }

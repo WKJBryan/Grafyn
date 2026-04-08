@@ -151,10 +151,8 @@ mod tests {
 
     #[test]
     fn test_sparse_tf_vector_cosine_orthogonal() {
-        let v1 =
-            SparseTfVector::from_terms([("rust".to_string(), 1.0)].into_iter().collect());
-        let v2 =
-            SparseTfVector::from_terms([("python".to_string(), 1.0)].into_iter().collect());
+        let v1 = SparseTfVector::from_terms([("rust".to_string(), 1.0)].into_iter().collect());
+        let v2 = SparseTfVector::from_terms([("python".to_string(), 1.0)].into_iter().collect());
 
         let sim = v1.cosine_similarity(&v2);
         assert!((sim).abs() < 1e-10);
@@ -163,8 +161,7 @@ mod tests {
     #[test]
     fn test_sparse_tf_vector_cosine_empty() {
         let v1 = SparseTfVector::new();
-        let v2 =
-            SparseTfVector::from_terms([("rust".to_string(), 1.0)].into_iter().collect());
+        let v2 = SparseTfVector::from_terms([("rust".to_string(), 1.0)].into_iter().collect());
 
         assert_eq!(v1.cosine_similarity(&v2), 0.0);
         assert_eq!(v2.cosine_similarity(&v1), 0.0);

@@ -46,6 +46,14 @@ pub struct UserSettings {
     #[serde(default = "default_smart_web_search")]
     pub smart_web_search: bool,
 
+    /// Whether the background link discovery scheduler is enabled
+    #[serde(default = "default_background_link_discovery_enabled")]
+    pub background_link_discovery_enabled: bool,
+
+    /// Whether background discovery may use LLM reranking for high-priority notes
+    #[serde(default)]
+    pub background_link_discovery_llm_enabled: bool,
+
     /// Saved model presets for canvas prompts
     #[serde(default = "default_canvas_model_presets")]
     pub canvas_model_presets: Vec<CanvasModelPreset>,
@@ -63,6 +71,10 @@ fn default_smart_web_search() -> bool {
     true
 }
 
+fn default_background_link_discovery_enabled() -> bool {
+    true
+}
+
 impl Default for UserSettings {
     fn default() -> Self {
         Self {
@@ -73,6 +85,8 @@ impl Default for UserSettings {
             mcp_enabled: false,
             llm_model: default_llm_model(),
             smart_web_search: true,
+            background_link_discovery_enabled: default_background_link_discovery_enabled(),
+            background_link_discovery_llm_enabled: false,
             canvas_model_presets: default_canvas_model_presets(),
         }
     }
@@ -108,7 +122,9 @@ impl UserSettings {
     /// Get the effective data path (always in app data directory)
     pub fn effective_data_path(&self) -> std::path::PathBuf {
         dirs::data_local_dir()
-            .unwrap_or_else(|| dirs::document_dir().unwrap_or_else(|| std::path::PathBuf::from(".")))
+            .unwrap_or_else(|| {
+                dirs::document_dir().unwrap_or_else(|| std::path::PathBuf::from("."))
+            })
             .join("Grafyn")
             .join("data")
     }
@@ -124,6 +140,8 @@ pub struct SettingsUpdate {
     pub mcp_enabled: Option<bool>,
     pub llm_model: Option<String>,
     pub smart_web_search: Option<bool>,
+    pub background_link_discovery_enabled: Option<bool>,
+    pub background_link_discovery_llm_enabled: Option<bool>,
     pub canvas_model_presets: Option<Vec<CanvasModelPreset>>,
 }
 
@@ -138,6 +156,8 @@ pub struct SettingsStatus {
     pub mcp_enabled: bool,
     pub llm_model: String,
     pub smart_web_search: bool,
+    pub background_link_discovery_enabled: bool,
+    pub background_link_discovery_llm_enabled: bool,
     pub canvas_model_presets: Vec<CanvasModelPreset>,
 }
 
@@ -152,6 +172,8 @@ impl From<&UserSettings> for SettingsStatus {
             mcp_enabled: settings.mcp_enabled,
             llm_model: settings.llm_model.clone(),
             smart_web_search: settings.smart_web_search,
+            background_link_discovery_enabled: settings.background_link_discovery_enabled,
+            background_link_discovery_llm_enabled: settings.background_link_discovery_llm_enabled,
             canvas_model_presets: settings.canvas_model_presets.clone(),
         }
     }
@@ -165,6 +187,8 @@ mod tests {
     fn default_settings_start_with_empty_canvas_presets() {
         let settings = UserSettings::default();
         assert!(settings.canvas_model_presets.is_empty());
+        assert!(settings.background_link_discovery_enabled);
+        assert!(!settings.background_link_discovery_llm_enabled);
     }
 
     #[test]
@@ -178,8 +202,11 @@ mod tests {
             "smart_web_search": true
         }"#;
 
-        let settings: UserSettings = serde_json::from_str(json).expect("settings should deserialize");
+        let settings: UserSettings =
+            serde_json::from_str(json).expect("settings should deserialize");
         assert!(settings.canvas_model_presets.is_empty());
         assert_eq!(settings.llm_model, "openai/gpt-4o");
+        assert!(settings.background_link_discovery_enabled);
+        assert!(!settings.background_link_discovery_llm_enabled);
     }
 }

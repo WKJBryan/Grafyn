@@ -1,6 +1,6 @@
 use crate::models::canvas::{
-    CanvasSession, CanvasViewport, Debate, LLMNodePositionUpdate,
-    PromptTile, SessionCreate, SessionMeta, SessionUpdate, TilePosition, TilePositionUpdate,
+    CanvasSession, CanvasViewport, Debate, LLMNodePositionUpdate, PromptTile, SessionCreate,
+    SessionMeta, SessionUpdate, TilePosition, TilePositionUpdate,
 };
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -111,11 +111,8 @@ impl CanvasStore {
     /// List all sessions (metadata only)
     pub fn list_sessions(&mut self) -> Result<Vec<SessionMeta>> {
         self.ensure_list_cache();
-        let mut sessions: Vec<SessionMeta> = self
-            .session_cache
-            .values()
-            .map(SessionMeta::from)
-            .collect();
+        let mut sessions: Vec<SessionMeta> =
+            self.session_cache.values().map(SessionMeta::from).collect();
 
         // Sort by updated_at descending
         sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
@@ -130,7 +127,8 @@ impl CanvasStore {
         }
         // Cache miss: load from disk
         let path = self.session_path(id);
-        let session = self.read_session_file(&path)
+        let session = self
+            .read_session_file(&path)
             .with_context(|| format!("Session not found: {}", id))?;
         self.session_cache.insert(id.to_string(), session.clone());
         Ok(session)
@@ -140,7 +138,8 @@ impl CanvasStore {
     fn get_session_mut(&mut self, id: &str) -> Result<&mut CanvasSession> {
         if !self.session_cache.contains_key(id) {
             let path = self.session_path(id);
-            let session = self.read_session_file(&path)
+            let session = self
+                .read_session_file(&path)
                 .with_context(|| format!("Session not found: {}", id))?;
             self.session_cache.insert(id.to_string(), session);
         }
@@ -242,7 +241,12 @@ impl CanvasStore {
     }
 
     /// Delete a single model response from a tile
-    pub fn delete_response(&mut self, session_id: &str, tile_id: &str, model_id: &str) -> Result<()> {
+    pub fn delete_response(
+        &mut self,
+        session_id: &str,
+        tile_id: &str,
+        model_id: &str,
+    ) -> Result<()> {
         let session = self.get_session_mut(session_id)?;
         let descendants = Self::collect_descendant_tile_ids(session, tile_id, Some(model_id));
 
@@ -467,7 +471,8 @@ impl CanvasStore {
 
     /// Save a full session object (used after streaming completes)
     pub fn save_session(&mut self, session: &CanvasSession) -> Result<()> {
-        self.session_cache.insert(session.id.clone(), session.clone());
+        self.session_cache
+            .insert(session.id.clone(), session.clone());
         self.write_session_file(session)
     }
 
@@ -489,7 +494,8 @@ impl CanvasStore {
         let content = std::fs::read_to_string(path)
             .with_context(|| format!("Failed to read file: {:?}", path))?;
 
-        serde_json::from_str(&content).with_context(|| format!("Failed to parse session: {:?}", path))
+        serde_json::from_str(&content)
+            .with_context(|| format!("Failed to parse session: {:?}", path))
     }
 
     /// Write a session to file
@@ -532,7 +538,10 @@ mod tests {
             ..PromptTile::default()
         };
 
-        tile.models = model_ids.iter().map(|model_id| model_id.to_string()).collect();
+        tile.models = model_ids
+            .iter()
+            .map(|model_id| model_id.to_string())
+            .collect();
         for model_id in model_ids {
             tile.responses
                 .insert((*model_id).to_string(), build_response(model_id));
@@ -544,7 +553,10 @@ mod tests {
     fn build_debate(id: &str, source_tile_ids: &[&str], participating_models: &[&str]) -> Debate {
         Debate {
             id: id.to_string(),
-            source_tile_ids: source_tile_ids.iter().map(|tile_id| tile_id.to_string()).collect(),
+            source_tile_ids: source_tile_ids
+                .iter()
+                .map(|tile_id| tile_id.to_string())
+                .collect(),
             participating_models: participating_models
                 .iter()
                 .map(|model_id| model_id.to_string())
@@ -584,8 +596,12 @@ mod tests {
             ..PromptTile::default()
         };
 
-        store.add_tile(&session.id, root).expect("root should be added");
-        store.add_tile(&session.id, child).expect("child should be added");
+        store
+            .add_tile(&session.id, root)
+            .expect("root should be added");
+        store
+            .add_tile(&session.id, child)
+            .expect("child should be added");
         store
             .add_tile(&session.id, grandchild)
             .expect("grandchild should be added");
@@ -624,27 +640,44 @@ mod tests {
             .add_tile(&session.id, build_tile("root", None, None, &["model-a"]))
             .expect("root should be added");
         store
-            .add_tile(&session.id, build_tile("child", Some("root"), Some("model-a"), &["model-a"]))
+            .add_tile(
+                &session.id,
+                build_tile("child", Some("root"), Some("model-a"), &["model-a"]),
+            )
             .expect("child should be added");
         store
             .add_tile(&session.id, build_tile("sibling", None, None, &["model-b"]))
             .expect("sibling should be added");
         store
-            .add_debate(&session.id, build_debate("debate-root", &["child"], &["model-a"]))
+            .add_debate(
+                &session.id,
+                build_debate("debate-root", &["child"], &["model-a"]),
+            )
             .expect("root debate should be added");
         store
-            .add_debate(&session.id, build_debate("debate-sibling", &["sibling"], &["model-b"]))
+            .add_debate(
+                &session.id,
+                build_debate("debate-sibling", &["sibling"], &["model-b"]),
+            )
             .expect("sibling debate should be added");
 
         store
             .delete_tile(&session.id, "root")
             .expect("delete should succeed");
 
-        let session = store.get_session(&session.id).expect("session should still load");
-        let remaining_tile_ids: Vec<String> =
-            session.prompt_tiles.into_iter().map(|tile| tile.id).collect();
-        let remaining_debate_ids: Vec<String> =
-            session.debates.into_iter().map(|debate| debate.id).collect();
+        let session = store
+            .get_session(&session.id)
+            .expect("session should still load");
+        let remaining_tile_ids: Vec<String> = session
+            .prompt_tiles
+            .into_iter()
+            .map(|tile| tile.id)
+            .collect();
+        let remaining_debate_ids: Vec<String> = session
+            .debates
+            .into_iter()
+            .map(|debate| debate.id)
+            .collect();
 
         assert_eq!(remaining_tile_ids, vec!["sibling".to_string()]);
         assert_eq!(remaining_debate_ids, vec!["debate-sibling".to_string()]);
@@ -663,39 +696,70 @@ mod tests {
             .expect("session should be created");
 
         store
-            .add_tile(&session.id, build_tile("root", None, None, &["model-a", "model-b"]))
+            .add_tile(
+                &session.id,
+                build_tile("root", None, None, &["model-a", "model-b"]),
+            )
             .expect("root should be added");
         store
-            .add_tile(&session.id, build_tile("branch-a", Some("root"), Some("model-a"), &["model-a"]))
+            .add_tile(
+                &session.id,
+                build_tile("branch-a", Some("root"), Some("model-a"), &["model-a"]),
+            )
             .expect("branch-a should be added");
         store
             .add_tile(
                 &session.id,
-                build_tile("branch-a-child", Some("branch-a"), Some("model-a"), &["model-a"]),
+                build_tile(
+                    "branch-a-child",
+                    Some("branch-a"),
+                    Some("model-a"),
+                    &["model-a"],
+                ),
             )
             .expect("branch-a-child should be added");
         store
-            .add_tile(&session.id, build_tile("branch-b", Some("root"), Some("model-b"), &["model-b"]))
+            .add_tile(
+                &session.id,
+                build_tile("branch-b", Some("root"), Some("model-b"), &["model-b"]),
+            )
             .expect("branch-b should be added");
         store
-            .add_debate(&session.id, build_debate("debate-a", &["root"], &["model-a"]))
+            .add_debate(
+                &session.id,
+                build_debate("debate-a", &["root"], &["model-a"]),
+            )
             .expect("debate-a should be added");
         store
-            .add_debate(&session.id, build_debate("debate-branch-a", &["branch-a"], &["model-a"]))
+            .add_debate(
+                &session.id,
+                build_debate("debate-branch-a", &["branch-a"], &["model-a"]),
+            )
             .expect("debate-branch-a should be added");
         store
-            .add_debate(&session.id, build_debate("debate-b", &["root"], &["model-b"]))
+            .add_debate(
+                &session.id,
+                build_debate("debate-b", &["root"], &["model-b"]),
+            )
             .expect("debate-b should be added");
 
         store
             .delete_response(&session.id, "root", "model-a")
             .expect("delete response should succeed");
 
-        let session = store.get_session(&session.id).expect("session should still load");
-        let remaining_tile_ids: Vec<String> =
-            session.prompt_tiles.iter().map(|tile| tile.id.clone()).collect();
-        let remaining_debate_ids: Vec<String> =
-            session.debates.iter().map(|debate| debate.id.clone()).collect();
+        let session = store
+            .get_session(&session.id)
+            .expect("session should still load");
+        let remaining_tile_ids: Vec<String> = session
+            .prompt_tiles
+            .iter()
+            .map(|tile| tile.id.clone())
+            .collect();
+        let remaining_debate_ids: Vec<String> = session
+            .debates
+            .iter()
+            .map(|debate| debate.id.clone())
+            .collect();
         let root = session
             .prompt_tiles
             .iter()

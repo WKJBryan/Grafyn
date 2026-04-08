@@ -55,11 +55,7 @@ impl FeedbackService {
 
     /// Get system information for the current platform
     pub fn get_system_info(&self, current_page: Option<String>) -> SystemInfo {
-        let platform = format!(
-            "{} {}",
-            std::env::consts::OS,
-            std::env::consts::ARCH
-        );
+        let platform = format!("{} {}", std::env::consts::OS, std::env::consts::ARCH);
 
         SystemInfo {
             platform,
@@ -254,10 +250,7 @@ impl FeedbackService {
                         item.retry_count,
                         e
                     );
-                    results.push(FeedbackResponse::error(format!(
-                        "Failed to submit: {}",
-                        e
-                    )));
+                    results.push(FeedbackResponse::error(format!("Failed to submit: {}", e)));
                 }
             }
         }

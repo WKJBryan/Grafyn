@@ -1,44 +1,52 @@
-use crate::commands::sync_chunk_index_for_notes;
+use crate::commands::{sync_chunk_index_for_notes, sync_link_discovery_for_notes};
+use crate::models::link_discovery::{
+    DismissLinkSuggestionResponse, LinkDiscoveryStatus, LinkSuggestionQueueEntry,
+};
 use crate::models::note::{
     ApplyLinksRequest, ApplyLinksResponse, CreateLinkResponse, DiscoverLinksResponse, NoteUpdate,
     RelationType, ZettelLinkCandidate,
 };
-use crate::services::openrouter::ChatMessage;
-use crate::services::yake::{self, YakeConfig, STOPWORDS};
+use crate::services::link_discovery::discover_for_note;
 use crate::AppState;
-use lazy_static::lazy_static;
-use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use tauri::State;
-
-lazy_static! {
-    /// Multi-word proper nouns (e.g. "Machine Learning")
-    static ref PROPER_NOUN_RE: Regex =
-        Regex::new(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+\b").unwrap();
-    /// Acronyms (e.g. "API", "LLM")
-    static ref ACRONYM_RE: Regex = Regex::new(r"\b[A-Z]{2,}\b").unwrap();
-    /// Long words likely to be meaningful concepts
-    static ref LONG_WORD_RE: Regex = Regex::new(r"\b[a-z]{4,}\b").unwrap();
-    /// Wikilink pattern for removal during term extraction
-    static ref WIKILINK_RE: Regex = Regex::new(r"\[\[.+?\]\]").unwrap();
-    /// Fenced code block removal
-    static ref FENCED_CODE_RE: Regex = Regex::new(r"(?s)```.*?```").unwrap();
-    /// Inline code removal
-    static ref INLINE_CODE_RE: Regex = Regex::new(r"`[^`]+`").unwrap();
-}
 
 // ── Link type definitions ────────────────────────────────────────────────
 
 /// Link type definitions derived from the RelationType enum
 fn link_type_definitions() -> Vec<serde_json::Value> {
     let types = [
-        (RelationType::Related, "Related", "General topical relationship"),
-        (RelationType::Supports, "Supports", "Provides evidence or backing"),
-        (RelationType::Contradicts, "Contradicts", "Presents opposing evidence"),
-        (RelationType::Expands, "Expands", "Elaborates on the concept"),
-        (RelationType::Questions, "Questions", "Raises questions about"),
+        (
+            RelationType::Related,
+            "Related",
+            "General topical relationship",
+        ),
+        (
+            RelationType::Supports,
+            "Supports",
+            "Provides evidence or backing",
+        ),
+        (
+            RelationType::Contradicts,
+            "Contradicts",
+            "Presents opposing evidence",
+        ),
+        (
+            RelationType::Expands,
+            "Expands",
+            "Elaborates on the concept",
+        ),
+        (
+            RelationType::Questions,
+            "Questions",
+            "Raises questions about",
+        ),
         (RelationType::Answers, "Answers", "Answers questions from"),
-        (RelationType::Example, "Example", "Provides a concrete example"),
+        (
+            RelationType::Example,
+            "Example",
+            "Provides a concrete example",
+        ),
         (RelationType::PartOf, "Part Of", "Is a component of"),
     ];
     types
@@ -56,52 +64,9 @@ fn link_type_definitions() -> Vec<serde_json::Value> {
 
 /// Get the reverse link type for bidirectional linking
 fn reverse_link_type(link_type: &str) -> String {
-    RelationType::from_str_lossy(link_type).reverse().to_string()
-}
-
-// ── Key term extraction ──────────────────────────────────────────────────
-
-/// Extract key terms from markdown content using YAKE keyphrases + regex patterns.
-///
-/// YAKE provides statistically significant multi-word keyphrases. Regex patterns
-/// supplement with proper nouns and acronyms that YAKE may miss.
-fn extract_key_terms(content: &str) -> HashSet<String> {
-    let stopwords: HashSet<&str> = STOPWORDS.iter().copied().collect();
-
-    // Clean content: remove code blocks, inline code, wikilinks
-    let clean = FENCED_CODE_RE.replace_all(content, "");
-    let clean = INLINE_CODE_RE.replace_all(&clean, "");
-    let clean = WIKILINK_RE.replace_all(&clean, "");
-
-    let mut terms = HashSet::new();
-
-    // Primary: YAKE keyphrases (lowercased, up to bigrams for overlap matching)
-    let config = YakeConfig {
-        max_ngram_size: 2,
-        top_k: 15,
-        ..YakeConfig::default()
-    };
-    for kp in yake::extract_keyphrases(&clean, &config) {
-        terms.insert(kp.text.to_lowercase());
-    }
-
-    // Supplementary: proper nouns (lowercased)
-    for m in PROPER_NOUN_RE.find_iter(&clean) {
-        let t = m.as_str().to_lowercase();
-        if t.len() >= 3 && !stopwords.contains(t.as_str()) {
-            terms.insert(t);
-        }
-    }
-
-    // Supplementary: acronyms (lowercased)
-    for m in ACRONYM_RE.find_iter(&clean) {
-        let t = m.as_str().to_lowercase();
-        if t.len() >= 2 {
-            terms.insert(t);
-        }
-    }
-
-    terms
+    RelationType::from_str_lossy(link_type)
+        .reverse()
+        .to_string()
 }
 
 // ── Wikilink insertion ───────────────────────────────────────────────────
@@ -123,9 +88,7 @@ fn add_wikilink_to_content(content: &str, target_title: &str, link_type: &str) -
     let mut inserted = false;
 
     // Look for "## Related Concepts" or "## See Also"
-    let related_idx = lines
-        .iter()
-        .position(|l| l.trim() == "## Related Concepts");
+    let related_idx = lines.iter().position(|l| l.trim() == "## Related Concepts");
     let see_also_idx = lines.iter().position(|l| l.trim() == "## See Also");
     let sources_idx = lines.iter().position(|l| l.trim() == "## Sources");
 
@@ -183,321 +146,6 @@ fn add_wikilink_to_content(content: &str, target_title: &str, link_type: &str) -
     Some(result_lines.join("\n"))
 }
 
-// ── Discovery strategies ─────────────────────────────────────────────────
-
-/// Strategy A: Tantivy full-text search
-/// Uses the note's title + first paragraph as a query, normalizes BM25 scores to 0-1
-async fn find_search_links(
-    state: &AppState,
-    note_id: &str,
-    title: &str,
-    content: &str,
-    max_links: usize,
-) -> Vec<ZettelLinkCandidate> {
-    // Build query from title + first paragraph
-    let first_para = content
-        .lines()
-        .filter(|l| !l.starts_with('#') && !l.starts_with("---") && !l.trim().is_empty())
-        .take(3)
-        .collect::<Vec<_>>()
-        .join(" ");
-
-    let query = format!("{} {}", title, first_para);
-    let query = query.trim();
-    if query.is_empty() {
-        return Vec::new();
-    }
-
-    let results = {
-        let search = state.search_service.read().await;
-        match search.search(query, max_links * 2) {
-            Ok(r) => r,
-            Err(e) => {
-                log::warn!("Tantivy search failed during link discovery: {}", e);
-                return Vec::new();
-            }
-        }
-    };
-
-    if results.is_empty() {
-        return Vec::new();
-    }
-
-    // Find max score for normalization (BM25 scores are unbounded)
-    let max_score = results
-        .iter()
-        .map(|r| r.score)
-        .fold(0.0_f32, f32::max)
-        .max(0.001); // avoid division by zero
-
-    results
-        .into_iter()
-        .filter(|r| {
-            r.note.id != note_id && r.score > 0.0
-        })
-        .take(max_links)
-        .map(|r| {
-            let normalized = (r.score / max_score) as f64;
-            let link_type = if normalized >= 0.85 {
-                "expands"
-            } else {
-                "related"
-            };
-            ZettelLinkCandidate {
-                target_id: r.note.id.clone(),
-                target_title: r.note.title.clone(),
-                link_type: link_type.to_string(),
-                confidence: (normalized * 100.0).round() / 100.0, // 2 decimal places
-                reason: format!("Search similarity: {:.2}", normalized),
-            }
-        })
-        .collect()
-}
-
-/// Strategy B: Keyword and tag overlap
-async fn find_keyword_links(
-    state: &AppState,
-    note_id: &str,
-    content: &str,
-    tags: &[String],
-) -> Vec<ZettelLinkCandidate> {
-    let note_terms = extract_key_terms(content);
-    let note_tags: HashSet<String> = tags.iter().map(|t| t.to_lowercase()).collect();
-
-    if note_terms.is_empty() && note_tags.is_empty() {
-        return Vec::new();
-    }
-
-    // Get all notes to compare against
-    let all_notes = {
-        let store = state.knowledge_store.read().await;
-        store.list_notes().unwrap_or_default()
-    };
-
-    let mut candidates = Vec::new();
-
-    for meta in &all_notes {
-        if meta.id == note_id {
-            continue;
-        }
-
-        // Get full note content for term extraction
-        let other_content = {
-            let store = state.knowledge_store.read().await;
-            match store.get_note(&meta.id) {
-                Ok(n) => n.content.clone(),
-                Err(_) => continue,
-            }
-        };
-
-        let other_terms = extract_key_terms(&other_content);
-        let other_tags: HashSet<String> = meta.tags.iter().map(|t| t.to_lowercase()).collect();
-
-        let term_overlap = note_terms.intersection(&other_terms).count();
-        let tag_overlap = note_tags.intersection(&other_tags).count();
-
-        // Require meaningful overlap (YAKE keyphrases are higher-quality terms)
-        if term_overlap >= 2 || (tag_overlap >= 1 && term_overlap >= 1) {
-            let confidence = ((term_overlap as f64 * 0.12) + (tag_overlap as f64 * 0.25)).min(0.9);
-            candidates.push(ZettelLinkCandidate {
-                target_id: meta.id.clone(),
-                target_title: meta.title.clone(),
-                link_type: "related".to_string(),
-                confidence: (confidence * 100.0).round() / 100.0,
-                reason: format!("Shared {} keyphrases, {} tags", term_overlap, tag_overlap),
-            });
-        }
-    }
-
-    candidates.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap_or(std::cmp::Ordering::Equal));
-    candidates.truncate(5);
-    candidates
-}
-
-/// Strategy C: LLM-based discovery via OpenRouter
-async fn find_llm_links(
-    state: &AppState,
-    note_id: &str,
-    title: &str,
-    content: &str,
-    max_links: usize,
-) -> Vec<ZettelLinkCandidate> {
-    // Check if OpenRouter is configured
-    let is_configured = {
-        let or = state.openrouter.read().await;
-        or.is_configured()
-    };
-    if !is_configured {
-        return Vec::new();
-    }
-
-    // Get context notes (up to 15, excluding self)
-    let context_notes: Vec<(String, String)> = {
-        let store = state.knowledge_store.read().await;
-        store
-            .list_notes()
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|m| m.id != note_id)
-            .take(15)
-            .map(|m| (m.id.clone(), m.title.clone()))
-            .collect()
-    };
-
-    if context_notes.is_empty() {
-        return Vec::new();
-    }
-
-    // Build context string
-    let context_list = context_notes
-        .iter()
-        .enumerate()
-        .map(|(i, (_, t))| format!("{}. {}", i + 1, t))
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    // Extract TL;DR if present
-    let summary = content
-        .lines()
-        .skip_while(|l| !l.contains("## TL;DR"))
-        .skip(1)
-        .take_while(|l| !l.starts_with("## "))
-        .collect::<Vec<_>>()
-        .join(" ");
-
-    let note_desc = if summary.trim().is_empty() {
-        format!("TITLE: {}", title)
-    } else {
-        format!("TITLE: {}\nSUMMARY: {}", title, summary.trim())
-    };
-
-    let prompt = format!(
-        "Given this note:\n{}\n\n\
-        And these existing notes in the knowledge base:\n{}\n\n\
-        Identify up to {} notes that are conceptually related. For each, provide:\n\
-        - \"title\": exact title from the list above\n\
-        - \"type\": one of: related, supports, contradicts, expands, questions, answers, example, part_of\n\
-        - \"reason\": brief explanation (max 100 chars)\n\n\
-        Respond ONLY with a JSON array. Example:\n\
-        [{{\"title\": \"Note Title\", \"type\": \"related\", \"reason\": \"Both discuss X\"}}]",
-        note_desc, context_list, max_links
-    );
-
-    let messages = vec![ChatMessage {
-        role: "user".to_string(),
-        content: prompt,
-    }];
-
-    let model = {
-        let settings = state.settings_service.read().await;
-        settings.get().llm_model.clone()
-    };
-
-    let response = {
-        let or = state.openrouter.read().await;
-        match or
-            .chat(&model, messages, None, Some(0.2), Some(800), false, 5)
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                log::warn!("LLM link discovery failed: {}", e);
-                return Vec::new();
-            }
-        }
-    };
-
-    // Parse JSON array from response
-    parse_llm_links(&response, &context_notes, state).await
-}
-
-/// Parse the LLM JSON response into link candidates
-async fn parse_llm_links(
-    response: &str,
-    context_notes: &[(String, String)],
-    state: &AppState,
-) -> Vec<ZettelLinkCandidate> {
-    // Extract JSON array from response (may have surrounding text)
-    let json_re = Regex::new(r"(?s)\[.*\]").unwrap();
-    let json_str = match json_re.find(response) {
-        Some(m) => m.as_str(),
-        None => return Vec::new(),
-    };
-
-    let parsed: Vec<serde_json::Value> = match serde_json::from_str(json_str) {
-        Ok(v) => v,
-        Err(_) => return Vec::new(),
-    };
-
-    // Build title→ID lookup from context notes
-    let title_map: HashMap<String, String> = context_notes
-        .iter()
-        .map(|(id, title)| (title.to_lowercase(), id.clone()))
-        .collect();
-
-    // Also use graph index for resolution
-    let graph = state.graph_index.read().await;
-
-    let valid_types: HashSet<&str> = [
-        "related",
-        "supports",
-        "contradicts",
-        "expands",
-        "questions",
-        "answers",
-        "example",
-        "part_of",
-    ]
-    .iter()
-    .copied()
-    .collect();
-
-    let mut links = Vec::new();
-
-    for item in &parsed {
-        let title = match item.get("title").and_then(|v| v.as_str()) {
-            Some(t) => t.trim().to_string(),
-            None => continue,
-        };
-
-        // Resolve title to ID
-        let target_id = title_map
-            .get(&title.to_lowercase())
-            .cloned()
-            .or_else(|| graph.resolve_link(&title));
-
-        let target_id = match target_id {
-            Some(id) => id,
-            None => continue,
-        };
-
-        let link_type = item
-            .get("type")
-            .and_then(|v| v.as_str())
-            .filter(|t| valid_types.contains(t))
-            .unwrap_or("related")
-            .to_string();
-
-        let reason = item
-            .get("reason")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .chars()
-            .take(100)
-            .collect::<String>();
-
-        links.push(ZettelLinkCandidate {
-            target_id,
-            target_title: title,
-            link_type,
-            confidence: 0.75,
-            reason,
-        });
-    }
-
-    links
-}
-
 /// Deduplicate candidates, keeping the highest confidence for each target
 fn deduplicate_links(links: Vec<ZettelLinkCandidate>) -> Vec<ZettelLinkCandidate> {
     let mut seen: HashMap<String, ZettelLinkCandidate> = HashMap::new();
@@ -529,8 +177,17 @@ impl DiscoverMode {
         }
     }
 
+    #[cfg(test)]
     fn include_llm(self) -> bool {
         matches!(self, Self::Llm)
+    }
+}
+
+fn to_service_mode(mode: DiscoverMode) -> crate::services::link_discovery::DiscoverMode {
+    match mode {
+        DiscoverMode::Manual => crate::services::link_discovery::DiscoverMode::Manual,
+        DiscoverMode::Algorithm => crate::services::link_discovery::DiscoverMode::Algorithm,
+        DiscoverMode::Llm => crate::services::link_discovery::DiscoverMode::Llm,
     }
 }
 
@@ -546,48 +203,14 @@ pub async fn discover_links(
 ) -> Result<DiscoverLinksResponse, String> {
     let discover_mode = DiscoverMode::parse(mode.as_deref());
     let max_links = maxLinks.unwrap_or(10);
-
-    if discover_mode == DiscoverMode::Manual {
-        return Ok(DiscoverLinksResponse {
-            note_id: noteId,
-            links: Vec::new(),
-        });
-    }
-
-    // Get the source note
-    let (title, content, tags) = {
-        let store = state.knowledge_store.read().await;
-        let note = store.get_note(&noteId).map_err(|e| e.to_string())?;
-        (note.title.clone(), note.content.clone(), note.tags.clone())
-    };
-
-    // Run all three strategies
-    let search_links = find_search_links(&state, &noteId, &title, &content, max_links).await;
-    let keyword_links = find_keyword_links(&state, &noteId, &content, &tags).await;
-    let llm_links = if discover_mode.include_llm() {
-        find_llm_links(&state, &noteId, &title, &content, max_links).await
-    } else {
-        Vec::new()
-    };
-
-    // Merge, deduplicate, sort by confidence
-    let mut all_links = Vec::new();
-    all_links.extend(search_links);
-    all_links.extend(keyword_links);
-    all_links.extend(llm_links);
-
-    let mut links = deduplicate_links(all_links);
-    links.sort_by(|a, b| {
-        b.confidence
-            .partial_cmp(&a.confidence)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    links.truncate(max_links);
-
-    Ok(DiscoverLinksResponse {
-        note_id: noteId,
-        links,
-    })
+    discover_for_note(
+        state.inner(),
+        &noteId,
+        to_service_mode(discover_mode),
+        max_links,
+        true,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -599,7 +222,10 @@ mod tests {
         assert_eq!(DiscoverMode::parse(None), DiscoverMode::Llm);
         assert_eq!(DiscoverMode::parse(Some("suggested")), DiscoverMode::Llm);
         assert_eq!(DiscoverMode::parse(Some("llm")), DiscoverMode::Llm);
-        assert_eq!(DiscoverMode::parse(Some("algorithm")), DiscoverMode::Algorithm);
+        assert_eq!(
+            DiscoverMode::parse(Some("algorithm")),
+            DiscoverMode::Algorithm
+        );
         assert_eq!(DiscoverMode::parse(Some("manual")), DiscoverMode::Manual);
     }
 
@@ -627,23 +253,21 @@ pub async fn apply_links(
         deduplicate_links(request.candidates.clone())
     } else {
         // Backward-compatibility path for older callers that only send IDs.
-        let candidates = {
-            let store = state.knowledge_store.read().await;
-            let note = store.get_note(&noteId).map_err(|e| e.to_string())?;
-
-            let (title, content, tags) = (note.title.clone(), note.content.clone(), note.tags.clone());
-            drop(store);
-
-            let search_links = find_search_links(&state, &noteId, &title, &content, 20).await;
-            let keyword_links = find_keyword_links(&state, &noteId, &content, &tags).await;
-            let llm_links = find_llm_links(&state, &noteId, &title, &content, 20).await;
-
-            let mut all = Vec::new();
-            all.extend(search_links);
-            all.extend(keyword_links);
-            all.extend(llm_links);
-            deduplicate_links(all)
-        };
+        let response = discover_for_note(
+            state.inner(),
+            &noteId,
+            crate::services::link_discovery::DiscoverMode::Llm,
+            20,
+            true,
+        )
+        .await?;
+        let candidates = deduplicate_links(
+            response
+                .links
+                .into_iter()
+                .chain(response.exploratory_links.into_iter())
+                .collect(),
+        );
 
         let requested: HashSet<String> = request.link_ids.iter().cloned().collect();
         candidates
@@ -703,15 +327,19 @@ pub async fn apply_links(
         };
 
         {
-            if let Some(new_content) = add_wikilink_to_content(&target_content, &source_title, &reverse_type) {
+            if let Some(new_content) =
+                add_wikilink_to_content(&target_content, &source_title, &reverse_type)
+            {
                 let mut store = state.knowledge_store.write().await;
-                target_updated = store.update_note(
-                    &candidate.target_id,
-                    NoteUpdate {
-                        content: Some(new_content),
-                        ..Default::default()
-                    },
-                ).is_ok();
+                target_updated = store
+                    .update_note(
+                        &candidate.target_id,
+                        NoteUpdate {
+                            content: Some(new_content),
+                            ..Default::default()
+                        },
+                    )
+                    .is_ok();
             }
         }
 
@@ -760,6 +388,14 @@ pub async fn apply_links(
                 .collect::<Vec<_>>()
         };
         sync_chunk_index_for_notes(state.inner(), &dirty_notes).await;
+        sync_link_discovery_for_notes(state.inner(), &dirty_notes).await;
+        state.link_discovery.write().await.record_links_applied(
+            &noteId,
+            &requested_candidates
+                .iter()
+                .map(|candidate| candidate.target_id.clone())
+                .collect::<Vec<_>>(),
+        );
     }
 
     Ok(ApplyLinksResponse {
@@ -793,7 +429,9 @@ pub async fn create_link(
         let store = state.knowledge_store.read().await;
         let source = store.get_note(&sourceId).map_err(|e| e.to_string())?;
 
-        if let Some(new_content) = add_wikilink_to_content(&source.content, &target_title, &link_type) {
+        if let Some(new_content) =
+            add_wikilink_to_content(&source.content, &target_title, &link_type)
+        {
             drop(store);
             let mut store = state.knowledge_store.write().await;
             store
@@ -815,7 +453,8 @@ pub async fn create_link(
         let store = state.knowledge_store.read().await;
         let target = store.get_note(&targetId).map_err(|e| e.to_string())?;
 
-        if let Some(new_content) = add_wikilink_to_content(&target.content, &source_title, &reverse) {
+        if let Some(new_content) = add_wikilink_to_content(&target.content, &source_title, &reverse)
+        {
             drop(store);
             let mut store = state.knowledge_store.write().await;
             let _ = store.update_note(
@@ -864,6 +503,12 @@ pub async fn create_link(
                 .collect::<Vec<_>>()
         };
         sync_chunk_index_for_notes(state.inner(), &dirty_notes).await;
+        sync_link_discovery_for_notes(state.inner(), &dirty_notes).await;
+        state
+            .link_discovery
+            .write()
+            .await
+            .record_links_applied(&sourceId, std::slice::from_ref(&targetId));
     }
 
     Ok(CreateLinkResponse {
@@ -878,4 +523,36 @@ pub async fn create_link(
 #[tauri::command]
 pub async fn get_link_types() -> Result<Vec<serde_json::Value>, String> {
     Ok(link_type_definitions())
+}
+
+/// List cached link suggestions for the global inbox.
+#[tauri::command]
+pub async fn list_link_suggestion_queue(
+    state: State<'_, AppState>,
+    status: Option<String>,
+    limit: Option<usize>,
+) -> Result<Vec<LinkSuggestionQueueEntry>, String> {
+    let discovery = state.link_discovery.read().await;
+    Ok(discovery.list_queue_entries(status.as_deref(), limit.unwrap_or(25)))
+}
+
+/// Dismiss a cached suggestion so it does not reappear until the note changes again.
+#[tauri::command]
+pub async fn dismiss_link_suggestion(
+    state: State<'_, AppState>,
+    #[allow(non_snake_case)] noteId: String,
+    #[allow(non_snake_case)] targetId: String,
+) -> Result<DismissLinkSuggestionResponse, String> {
+    let mut discovery = state.link_discovery.write().await;
+    Ok(discovery.dismiss_suggestion(&noteId, &targetId))
+}
+
+/// Get background discovery worker status and queue metrics.
+#[tauri::command]
+pub async fn get_link_discovery_status(
+    state: State<'_, AppState>,
+) -> Result<LinkDiscoveryStatus, String> {
+    let settings = state.settings_service.read().await;
+    let discovery = state.link_discovery.read().await;
+    Ok(discovery.status(settings.get()))
 }

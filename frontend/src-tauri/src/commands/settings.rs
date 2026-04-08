@@ -1,5 +1,6 @@
 //! Tauri commands for user settings management
 
+use crate::commands::rebuild_link_discovery;
 use crate::models::settings::{SettingsStatus, SettingsUpdate, UserSettings};
 use crate::AppState;
 use tauri::State;
@@ -87,6 +88,8 @@ pub async fn update_settings(
             }
         }
 
+        rebuild_link_discovery(state.inner(), &notes).await;
+
         log::info!("Services rebuilt for new vault path");
     }
 
@@ -110,18 +113,14 @@ pub async fn pick_vault_folder() -> Result<Option<String>, String> {
 
     FileDialogBuilder::new()
         .set_title("Select Vault Folder")
-        .set_directory(
-            dirs::document_dir()
-                .unwrap_or_else(|| std::path::PathBuf::from(".")),
-        )
+        .set_directory(dirs::document_dir().unwrap_or_else(|| std::path::PathBuf::from(".")))
         .pick_folder(move |folder_path| {
             let path = folder_path.map(|p| p.to_string_lossy().to_string());
             let _ = tx.send(path);
         });
 
     // Wait for the dialog result
-    rx.recv()
-        .map_err(|e| format!("Dialog error: {}", e))
+    rx.recv().map_err(|e| format!("Dialog error: {}", e))
 }
 
 /// Check if OpenRouter API key is valid by making a test request

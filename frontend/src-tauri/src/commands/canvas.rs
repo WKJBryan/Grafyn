@@ -1,10 +1,9 @@
 use crate::commands::sync_chunk_index_for_note;
 use crate::models::canvas::{
-    AddModelsRequest, AvailableModel, CanvasSession, CanvasStreamEvent, ContextMode,
-    CanvasViewport, Debate, DebateContinueRequest, DebateResponse, DebateRound,
-    DebateStartRequest, LLMNodePositionUpdate, ModelResponse, PromptRequest, PromptTile,
-    ResponseStatus, SessionCreate, SessionMeta, SessionUpdate, TileContextNote, TilePosition,
-    TilePositionUpdate,
+    AddModelsRequest, AvailableModel, CanvasSession, CanvasStreamEvent, CanvasViewport,
+    ContextMode, Debate, DebateContinueRequest, DebateResponse, DebateRound, DebateStartRequest,
+    LLMNodePositionUpdate, ModelResponse, PromptRequest, PromptTile, ResponseStatus, SessionCreate,
+    SessionMeta, SessionUpdate, TileContextNote, TilePosition, TilePositionUpdate,
 };
 use crate::models::note::{ChunkResult, NoteCreate, NoteStatus};
 use crate::models::twin::TraceEventType;
@@ -27,11 +26,11 @@ const EMPTY_MODEL_RESPONSE_ERROR: &str = "No response returned from model";
 const MIN_RETRIEVAL_SCORE_FOR_NOTES: f32 = 5.0;
 const MIN_CANVAS_QUERY_TOKEN_LEN: usize = 3;
 const CANVAS_RETRIEVAL_STOPWORDS: &[&str] = &[
-    "a", "an", "and", "are", "as", "at", "be", "but", "by", "can", "do", "for", "from", "how",
-    "i", "if", "in", "into", "is", "it", "its", "like", "make", "more", "my", "not", "of",
-    "on", "or", "our", "real", "so", "that", "the", "their", "them", "there", "these", "they",
-    "this", "to", "up", "use", "want", "was", "we", "what", "when", "where", "which", "who",
-    "why", "with", "works", "would", "you", "your",
+    "a", "an", "and", "are", "as", "at", "be", "but", "by", "can", "do", "for", "from", "how", "i",
+    "if", "in", "into", "is", "it", "its", "like", "make", "more", "my", "not", "of", "on", "or",
+    "our", "real", "so", "that", "the", "their", "them", "there", "these", "they", "this", "to",
+    "up", "use", "want", "was", "we", "what", "when", "where", "which", "who", "why", "with",
+    "works", "would", "you", "your",
 ];
 
 // LLM node layout constants
@@ -114,7 +113,9 @@ pub async fn update_session(
     state: State<'_, AppState>,
 ) -> Result<CanvasSession, String> {
     let mut store = state.canvas_store.write().await;
-    let updated = store.update_session(&id, update).map_err(|e| e.to_string())?;
+    let updated = store
+        .update_session(&id, update)
+        .map_err(|e| e.to_string())?;
     drop(store);
 
     append_canvas_trace(
@@ -157,7 +158,9 @@ pub async fn delete_session(id: String, state: State<'_, AppState>) -> Result<()
 
 /// Get list of available LLM models
 #[tauri::command]
-pub async fn get_available_models(state: State<'_, AppState>) -> Result<Vec<AvailableModel>, String> {
+pub async fn get_available_models(
+    state: State<'_, AppState>,
+) -> Result<Vec<AvailableModel>, String> {
     let openrouter = state.openrouter.read().await;
     openrouter
         .get_available_models()
@@ -232,7 +235,9 @@ pub async fn send_prompt(
     // Save tile to session
     {
         let mut store = state.canvas_store.write().await;
-        store.add_tile(&session_id, tile.clone()).map_err(|e| e.to_string())?;
+        store
+            .add_tile(&session_id, tile.clone())
+            .map_err(|e| e.to_string())?;
     }
 
     append_canvas_trace(
@@ -322,11 +327,7 @@ pub async fn send_prompt(
                         let mut full_content = String::new();
 
                         loop {
-                            match tokio::time::timeout(
-                                Duration::from_secs(60),
-                                stream.next(),
-                            )
-                            .await
+                            match tokio::time::timeout(Duration::from_secs(60), stream.next()).await
                             {
                                 Ok(Some(Ok(chunk))) => {
                                     if !chunk.is_empty() {
@@ -351,7 +352,12 @@ pub async fn send_prompt(
                                         &model_id,
                                         &error,
                                     );
-                                    return (model_id, String::new(), ResponseStatus::Error, Some(error));
+                                    return (
+                                        model_id,
+                                        String::new(),
+                                        ResponseStatus::Error,
+                                        Some(error),
+                                    );
                                 }
                                 Ok(None) => break, // Stream ended naturally
                                 Err(_) => {
@@ -363,7 +369,12 @@ pub async fn send_prompt(
                                         &model_id,
                                         &error,
                                     );
-                                    return (model_id, full_content, ResponseStatus::Error, Some(error));
+                                    return (
+                                        model_id,
+                                        full_content,
+                                        ResponseStatus::Error,
+                                        Some(error),
+                                    );
                                 }
                             }
                         }
@@ -396,11 +407,7 @@ pub async fn send_prompt(
         // Batch update store with all results in a single write
         {
             let mut store = canvas_store_arc.write().await;
-            let _ = store.batch_update_tile_responses(
-                &session_id_clone,
-                &tile_id_clone,
-                &results,
-            );
+            let _ = store.batch_update_tile_responses(&session_id_clone, &tile_id_clone, &results);
         }
 
         append_model_result_traces(
@@ -447,7 +454,9 @@ pub async fn delete_tile(
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     let mut store = state.canvas_store.write().await;
-    store.delete_tile(&session_id, &tile_id).map_err(|e| e.to_string())?;
+    store
+        .delete_tile(&session_id, &tile_id)
+        .map_err(|e| e.to_string())?;
     drop(store);
 
     append_canvas_trace(
@@ -499,7 +508,9 @@ pub async fn update_viewport(
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     let mut store = state.canvas_store.write().await;
-    store.update_viewport(&session_id, viewport).map_err(|e| e.to_string())
+    store
+        .update_viewport(&session_id, viewport)
+        .map_err(|e| e.to_string())
 }
 
 /// Update an LLM response node's position
@@ -563,7 +574,10 @@ pub async fn export_to_note(
     for debate in &session.debates {
         content.push_str("## Debate\n\n");
         for round in &debate.rounds {
-            content.push_str(&format!("### Round {} - {}\n\n", round.round_number, round.topic));
+            content.push_str(&format!(
+                "### Round {} - {}\n\n",
+                round.round_number, round.topic
+            ));
             for resp in &round.responses {
                 content.push_str(&format!(
                     "**{} ({}):**\n\n{}\n\n",
@@ -576,13 +590,15 @@ pub async fn export_to_note(
     // Create note via knowledge store
     let mut ks = state.knowledge_store.write().await;
 
-    let note = ks.create_note(NoteCreate {
-        title: session.title.clone(),
-        content,
-        status: NoteStatus::Evidence,
-        tags: session.tags.clone(),
-        properties: HashMap::new(),
-    }).map_err(|e| e.to_string())?;
+    let note = ks
+        .create_note(NoteCreate {
+            title: session.title.clone(),
+            content,
+            status: NoteStatus::Evidence,
+            tags: session.tags.clone(),
+            properties: HashMap::new(),
+        })
+        .map_err(|e| e.to_string())?;
 
     drop(ks);
 
@@ -593,7 +609,11 @@ pub async fn export_to_note(
             log::error!("Failed to index exported note '{}': {}", note.id, e);
         }
         if let Err(e) = search.commit() {
-            log::error!("Failed to commit search index after export '{}': {}", note.id, e);
+            log::error!(
+                "Failed to commit search index after export '{}': {}",
+                note.id,
+                e
+            );
         }
     }
 
@@ -655,8 +675,14 @@ pub async fn start_debate(
     }
 
     // Calculate position (to the right of source tiles)
-    let max_x = session.prompt_tiles.iter()
-        .flat_map(|t| t.responses.values().map(|r| r.position.x + r.position.width))
+    let max_x = session
+        .prompt_tiles
+        .iter()
+        .flat_map(|t| {
+            t.responses
+                .values()
+                .map(|r| r.position.x + r.position.width)
+        })
         .fold(0.0_f64, f64::max);
 
     let debate = Debate {
@@ -678,7 +704,9 @@ pub async fn start_debate(
     // Save debate to session
     {
         let mut store = state.canvas_store.write().await;
-        store.add_debate(&session_id, debate.clone()).map_err(|e| e.to_string())?;
+        store
+            .add_debate(&session_id, debate.clone())
+            .map_err(|e| e.to_string())?;
     }
 
     append_canvas_trace(
@@ -772,11 +800,8 @@ pub async fn start_debate(
                             let mut full_content = String::new();
 
                             loop {
-                                match tokio::time::timeout(
-                                    Duration::from_secs(60),
-                                    stream.next(),
-                                )
-                                .await
+                                match tokio::time::timeout(Duration::from_secs(60), stream.next())
+                                    .await
                                 {
                                     Ok(Some(Ok(chunk))) => {
                                         if !chunk.is_empty() {
@@ -982,7 +1007,10 @@ pub async fn continue_debate(
             }
             context.push('\n');
         }
-        context.push_str(&format!("New prompt: {}\n\nRespond to this new direction.", request.prompt));
+        context.push_str(&format!(
+            "New prompt: {}\n\nRespond to this new direction.",
+            request.prompt
+        ));
 
         // Stream all models concurrently using JoinSet
         let mut join_set = tokio::task::JoinSet::new();
@@ -1011,11 +1039,7 @@ pub async fn continue_debate(
                         let mut full_content = String::new();
 
                         loop {
-                            match tokio::time::timeout(
-                                Duration::from_secs(60),
-                                stream.next(),
-                            )
-                            .await
+                            match tokio::time::timeout(Duration::from_secs(60), stream.next()).await
                             {
                                 Ok(Some(Ok(chunk))) => {
                                     if !chunk.is_empty() {
@@ -1108,7 +1132,7 @@ pub async fn continue_debate(
                                 model_id: model_id.clone(),
                                 round_number: round_num,
                             },
-                    );
+                        );
                         DebateResponse {
                             model_id,
                             model_name,
@@ -1271,11 +1295,7 @@ pub async fn add_models_to_tile(
                         let mut full_content = String::new();
 
                         loop {
-                            match tokio::time::timeout(
-                                Duration::from_secs(60),
-                                stream.next(),
-                            )
-                            .await
+                            match tokio::time::timeout(Duration::from_secs(60), stream.next()).await
                             {
                                 Ok(Some(Ok(chunk))) => {
                                     if !chunk.is_empty() {
@@ -1300,7 +1320,12 @@ pub async fn add_models_to_tile(
                                         &model_id,
                                         &error,
                                     );
-                                    return (model_id, String::new(), ResponseStatus::Error, Some(error));
+                                    return (
+                                        model_id,
+                                        String::new(),
+                                        ResponseStatus::Error,
+                                        Some(error),
+                                    );
                                 }
                                 Ok(None) => break,
                                 Err(_) => {
@@ -1312,7 +1337,12 @@ pub async fn add_models_to_tile(
                                         &model_id,
                                         &error,
                                     );
-                                    return (model_id, full_content, ResponseStatus::Error, Some(error));
+                                    return (
+                                        model_id,
+                                        full_content,
+                                        ResponseStatus::Error,
+                                        Some(error),
+                                    );
                                 }
                             }
                         }
@@ -1345,11 +1375,7 @@ pub async fn add_models_to_tile(
         // Batch update store
         {
             let mut store = canvas_store_arc.write().await;
-            let _ = store.batch_update_tile_responses(
-                &session_id,
-                &tile_id,
-                &results,
-            );
+            let _ = store.batch_update_tile_responses(&session_id, &tile_id, &results);
         }
 
         append_canvas_trace(
@@ -1373,9 +1399,7 @@ pub async fn add_models_to_tile(
 
         let _ = window.emit(
             "canvas-stream",
-            CanvasStreamEvent::SessionSaved {
-                session_id,
-            },
+            CanvasStreamEvent::SessionSaved { session_id },
         );
     });
 
@@ -1413,7 +1437,10 @@ pub async fn regenerate_response(
     {
         let mut store = state.canvas_store.write().await;
         let _ = store.update_tile_response(
-            &session_id, &tile_id, &model_id, "",
+            &session_id,
+            &tile_id,
+            &model_id,
+            "",
             ResponseStatus::Streaming,
             None,
         );
@@ -1490,7 +1517,10 @@ pub async fn regenerate_response(
                 {
                     let mut store = canvas_store_arc.write().await;
                     let _ = store.update_tile_response(
-                        &session_id, &tile_id, &model_id, &final_content,
+                        &session_id,
+                        &tile_id,
+                        &model_id,
+                        &final_content,
                         final_status.clone(),
                         final_error.as_deref(),
                     );
@@ -1515,7 +1545,10 @@ pub async fn regenerate_response(
                 {
                     let mut store = canvas_store_arc.write().await;
                     let _ = store.update_tile_response(
-                        &session_id, &tile_id, &model_id, "",
+                        &session_id,
+                        &tile_id,
+                        &model_id,
+                        "",
                         ResponseStatus::Error,
                         Some(error.as_str()),
                     );
@@ -1539,9 +1572,7 @@ pub async fn regenerate_response(
 
         let _ = window.emit(
             "canvas-stream",
-            CanvasStreamEvent::SessionSaved {
-                session_id,
-            },
+            CanvasStreamEvent::SessionSaved { session_id },
         );
     });
 
@@ -1577,7 +1608,11 @@ async fn append_canvas_trace(
 ) {
     let mut twin_store = twin_store_arc.write().await;
     if let Err(error) = twin_store.append_trace_event(session_id, event_type, payload) {
-        log::error!("Failed to append twin trace for session '{}': {}", session_id, error);
+        log::error!(
+            "Failed to append twin trace for session '{}': {}",
+            session_id,
+            error
+        );
     }
 }
 
@@ -1630,12 +1665,7 @@ fn emit_canvas_error(
     );
 }
 
-fn emit_canvas_complete(
-    window: &tauri::Window,
-    session_id: &str,
-    tile_id: &str,
-    model_id: &str,
-) {
+fn emit_canvas_complete(window: &tauri::Window, session_id: &str, tile_id: &str, model_id: &str) {
     let _ = window.emit(
         "canvas-stream",
         CanvasStreamEvent::Complete {
@@ -1723,12 +1753,10 @@ fn matching_canvas_query_tokens(
     title: &str,
     snippet: &str,
 ) -> HashSet<String> {
-    let candidate_tokens: HashSet<String> = normalize_canvas_query_tokens(&format!(
-        "{} {}",
-        title, snippet
-    ))
-    .into_iter()
-    .collect();
+    let candidate_tokens: HashSet<String> =
+        normalize_canvas_query_tokens(&format!("{} {}", title, snippet))
+            .into_iter()
+            .collect();
 
     query_tokens
         .iter()
@@ -1789,7 +1817,10 @@ async fn resolve_prompt_context(
 ) -> Result<ResolvedPromptContext, String> {
     let messages = build_canvas_messages(session, request)?;
 
-    if matches!(request.context_mode, ContextMode::KnowledgeSearch | ContextMode::Semantic) {
+    if matches!(
+        request.context_mode,
+        ContextMode::KnowledgeSearch | ContextMode::Semantic
+    ) {
         let pinned_ids = session.pinned_note_ids.clone();
 
         // Quality gate: note-level retrieval to check if vault has relevant content
@@ -1833,8 +1864,12 @@ async fn resolve_prompt_context(
                 let token_budget = retrieval.get_config().default_token_budget;
                 retrieval
                     .retrieve_chunks(
-                        &chunk_index, &graph, &priority,
-                        &request.prompt, token_budget, &pinned_ids,
+                        &chunk_index,
+                        &graph,
+                        &priority,
+                        &request.prompt,
+                        token_budget,
+                        &pinned_ids,
                     )
                     .unwrap_or_default()
             };
@@ -1842,15 +1877,26 @@ async fn resolve_prompt_context(
             if chunks.is_empty() {
                 log::info!("Chunk retrieval returned no results, falling back to note-level");
                 return resolve_note_level_context(
-                    state, messages, &retrieval_results, &pinned_ids, &request.system_prompt,
-                ).await;
+                    state,
+                    messages,
+                    &retrieval_results,
+                    &pinned_ids,
+                    &request.system_prompt,
+                )
+                .await;
             }
 
             let total_tokens: usize = chunks.iter().map(|c| c.token_estimate).sum();
-            let parent_count = chunks.iter().map(|c| &c.parent_note_id).collect::<HashSet<_>>().len();
+            let parent_count = chunks
+                .iter()
+                .map(|c| &c.parent_note_id)
+                .collect::<HashSet<_>>()
+                .len();
             log::info!(
                 "Canvas using chunk retrieval: {} chunks from {} notes (~{} tokens)",
-                chunks.len(), parent_count, total_tokens
+                chunks.len(),
+                parent_count,
+                total_tokens
             );
 
             // Build context notes from chunk parent notes (deduped)
@@ -1886,8 +1932,13 @@ async fn resolve_prompt_context(
         } else {
             log::info!("Canvas using note-level context (chunk retrieval disabled)");
             resolve_note_level_context(
-                state, messages, &retrieval_results, &pinned_ids, &request.system_prompt,
-            ).await
+                state,
+                messages,
+                &retrieval_results,
+                &pinned_ids,
+                &request.system_prompt,
+            )
+            .await
         }
     } else {
         Ok(ResolvedPromptContext {
@@ -2088,8 +2139,7 @@ fn build_selected_parent_chain(
 }
 
 fn build_compact_history_summary(turns: &[ConversationTurn]) -> String {
-    let mut summary =
-        String::from("Conversation summary before the most recent turns:\n");
+    let mut summary = String::from("Conversation summary before the most recent turns:\n");
 
     for (index, turn) in turns.iter().enumerate() {
         summary.push_str(&format!(
@@ -2243,7 +2293,12 @@ mod tests {
         }
     }
 
-    fn build_request(prompt: &str, parent_tile_id: &str, parent_model_id: &str, context_mode: ContextMode) -> PromptRequest {
+    fn build_request(
+        prompt: &str,
+        parent_tile_id: &str,
+        parent_model_id: &str,
+        context_mode: ContextMode,
+    ) -> PromptRequest {
         PromptRequest {
             prompt: prompt.to_string(),
             system_prompt: None,
@@ -2364,11 +2419,37 @@ mod tests {
     #[test]
     fn test_build_selected_parent_chain_returns_root_to_leaf_order() {
         let session = build_session(vec![
-            build_tile("tile-1", "Root prompt", "openai/gpt-4", "Root response", None, None),
-            build_tile("tile-2", "Follow-up prompt", "openai/gpt-4", "Follow-up response", Some("tile-1"), Some("openai/gpt-4")),
-            build_tile("tile-3", "Deep prompt", "openai/gpt-4", "Deep response", Some("tile-2"), Some("openai/gpt-4")),
+            build_tile(
+                "tile-1",
+                "Root prompt",
+                "openai/gpt-4",
+                "Root response",
+                None,
+                None,
+            ),
+            build_tile(
+                "tile-2",
+                "Follow-up prompt",
+                "openai/gpt-4",
+                "Follow-up response",
+                Some("tile-1"),
+                Some("openai/gpt-4"),
+            ),
+            build_tile(
+                "tile-3",
+                "Deep prompt",
+                "openai/gpt-4",
+                "Deep response",
+                Some("tile-2"),
+                Some("openai/gpt-4"),
+            ),
         ]);
-        let request = build_request("Newest prompt", "tile-3", "openai/gpt-4", ContextMode::FullHistory);
+        let request = build_request(
+            "Newest prompt",
+            "tile-3",
+            "openai/gpt-4",
+            ContextMode::FullHistory,
+        );
 
         let turns = build_selected_parent_chain(&session, &request).unwrap();
 
@@ -2381,10 +2462,29 @@ mod tests {
     #[test]
     fn test_build_full_history_messages_interleaves_user_and_assistant_turns() {
         let session = build_session(vec![
-            build_tile("tile-1", "Root prompt", "openai/gpt-4", "Root response", None, None),
-            build_tile("tile-2", "Branch prompt", "openai/gpt-4", "Branch response", Some("tile-1"), Some("openai/gpt-4")),
+            build_tile(
+                "tile-1",
+                "Root prompt",
+                "openai/gpt-4",
+                "Root response",
+                None,
+                None,
+            ),
+            build_tile(
+                "tile-2",
+                "Branch prompt",
+                "openai/gpt-4",
+                "Branch response",
+                Some("tile-1"),
+                Some("openai/gpt-4"),
+            ),
         ]);
-        let request = build_request("Final prompt", "tile-2", "openai/gpt-4", ContextMode::FullHistory);
+        let request = build_request(
+            "Final prompt",
+            "tile-2",
+            "openai/gpt-4",
+            ContextMode::FullHistory,
+        );
 
         let messages = build_full_history_messages(&session, &request).unwrap();
 
@@ -2401,17 +2501,47 @@ mod tests {
     #[test]
     fn test_build_compact_history_messages_summarizes_older_turns() {
         let session = build_session(vec![
-            build_tile("tile-1", "Prompt 1", "openai/gpt-4", "Response 1", None, None),
-            build_tile("tile-2", "Prompt 2", "openai/gpt-4", "Response 2", Some("tile-1"), Some("openai/gpt-4")),
-            build_tile("tile-3", "Prompt 3", "openai/gpt-4", "Response 3", Some("tile-2"), Some("openai/gpt-4")),
-            build_tile("tile-4", "Prompt 4", "openai/gpt-4", "Response 4", Some("tile-3"), Some("openai/gpt-4")),
+            build_tile(
+                "tile-1",
+                "Prompt 1",
+                "openai/gpt-4",
+                "Response 1",
+                None,
+                None,
+            ),
+            build_tile(
+                "tile-2",
+                "Prompt 2",
+                "openai/gpt-4",
+                "Response 2",
+                Some("tile-1"),
+                Some("openai/gpt-4"),
+            ),
+            build_tile(
+                "tile-3",
+                "Prompt 3",
+                "openai/gpt-4",
+                "Response 3",
+                Some("tile-2"),
+                Some("openai/gpt-4"),
+            ),
+            build_tile(
+                "tile-4",
+                "Prompt 4",
+                "openai/gpt-4",
+                "Response 4",
+                Some("tile-3"),
+                Some("openai/gpt-4"),
+            ),
         ]);
         let request = build_request("Prompt 5", "tile-4", "openai/gpt-4", ContextMode::Compact);
 
         let messages = build_compact_history_messages(&session, &request).unwrap();
 
         assert_eq!(messages.len(), 6);
-        assert!(messages[0].content.contains("Conversation summary before the most recent turns"));
+        assert!(messages[0]
+            .content
+            .contains("Conversation summary before the most recent turns"));
         assert!(messages[0].content.contains("Prompt 1"));
         assert!(messages[1].content.contains("Prompt 3"));
         assert!(messages[2].content.contains("Response 3"));
@@ -2421,10 +2551,29 @@ mod tests {
     #[test]
     fn test_build_selected_parent_chain_errors_when_parent_response_is_missing() {
         let session = build_session(vec![
-            build_tile("tile-1", "Root prompt", "openai/gpt-4", "Root response", None, None),
-            build_tile("tile-2", "Branch prompt", "anthropic/claude", "Branch response", Some("tile-1"), Some("openai/gpt-4")),
+            build_tile(
+                "tile-1",
+                "Root prompt",
+                "openai/gpt-4",
+                "Root response",
+                None,
+                None,
+            ),
+            build_tile(
+                "tile-2",
+                "Branch prompt",
+                "anthropic/claude",
+                "Branch response",
+                Some("tile-1"),
+                Some("openai/gpt-4"),
+            ),
         ]);
-        let request = build_request("Next prompt", "tile-2", "openai/gpt-4", ContextMode::FullHistory);
+        let request = build_request(
+            "Next prompt",
+            "tile-2",
+            "openai/gpt-4",
+            ContextMode::FullHistory,
+        );
 
         let err = build_selected_parent_chain(&session, &request).unwrap_err();
 
@@ -2439,7 +2588,8 @@ mod tests {
             ..build_tile("tile-1", "Prompt", "openai/gpt-4", "Response", None, None)
         };
 
-        let request = prompt_request_from_tile(&tile, vec!["openai/gpt-4".to_string()], 0.3, Some(4096));
+        let request =
+            prompt_request_from_tile(&tile, vec!["openai/gpt-4".to_string()], 0.3, Some(4096));
 
         assert!(request.web_search);
         assert_eq!(request.web_search_max_results, 8);
@@ -2449,10 +2599,8 @@ mod tests {
 
     #[test]
     fn test_classify_streamed_model_response_rejects_empty_content() {
-        let update = classify_streamed_model_response(
-            "openai/gpt-4".to_string(),
-            "   \n\t".to_string(),
-        );
+        let update =
+            classify_streamed_model_response("openai/gpt-4".to_string(), "   \n\t".to_string());
 
         assert_eq!(update.0, "openai/gpt-4");
         assert_eq!(update.1, "");
@@ -2462,10 +2610,8 @@ mod tests {
 
     #[test]
     fn test_classify_streamed_model_response_accepts_non_empty_content() {
-        let update = classify_streamed_model_response(
-            "openai/gpt-4".to_string(),
-            "Answer".to_string(),
-        );
+        let update =
+            classify_streamed_model_response("openai/gpt-4".to_string(), "Answer".to_string());
 
         assert_eq!(update.2, ResponseStatus::Completed);
         assert_eq!(update.3, None);

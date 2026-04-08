@@ -112,10 +112,7 @@ fn extract_messages(messages_list: &[serde_json::Value]) -> Vec<ParsedMessage> {
     let mut messages = Vec::new();
 
     for (i, msg_data) in messages_list.iter().enumerate() {
-        let role_str = msg_data
-            .get("role")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let role_str = msg_data.get("role").and_then(|v| v.as_str()).unwrap_or("");
 
         let role = match role_str {
             "user" => "user",
@@ -180,10 +177,7 @@ fn extract_message_content(msg_data: &serde_json::Value) -> String {
                     return Some(text.to_string());
                 }
                 if let Some(code) = part.get("code").and_then(|v| v.as_str()) {
-                    let lang = part
-                        .get("language")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
+                    let lang = part.get("language").and_then(|v| v.as_str()).unwrap_or("");
                     return Some(format!("```{}\n{}\n```", lang, code));
                 }
                 None

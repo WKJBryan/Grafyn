@@ -7,17 +7,10 @@ mod services;
 
 use models::boot::BootStatus;
 use services::{
-    canvas_store::CanvasStore,
-    chunk_index::ChunkIndex,
-    feedback::FeedbackService,
-    graph_index::GraphIndex,
-    knowledge_store::KnowledgeStore,
-    memory::MemoryService,
-    openrouter::OpenRouterService,
-    priority::PriorityScoringService,
-    retrieval::RetrievalService,
-    search::SearchService,
-    settings::SettingsService,
+    canvas_store::CanvasStore, chunk_index::ChunkIndex, feedback::FeedbackService,
+    graph_index::GraphIndex, knowledge_store::KnowledgeStore, link_discovery::LinkDiscoveryService,
+    memory::MemoryService, openrouter::OpenRouterService, priority::PriorityScoringService,
+    retrieval::RetrievalService, search::SearchService, settings::SettingsService,
     twin_store::TwinStore,
 };
 use std::sync::Arc;
@@ -38,6 +31,7 @@ pub struct AppState {
     pub priority_service: Arc<RwLock<PriorityScoringService>>,
     pub retrieval_service: Arc<RwLock<RetrievalService>>,
     pub chunk_index: Arc<RwLock<ChunkIndex>>,
+    pub link_discovery: Arc<RwLock<LinkDiscoveryService>>,
     pub twin_store: Arc<RwLock<TwinStore>>,
     /// MemoryService is stateless — no lock needed, just Arc for shared ownership
     pub memory_service: Arc<MemoryService>,
@@ -66,10 +60,18 @@ fn main() {
 
             // Create directories if they don't exist
             if let Err(e) = std::fs::create_dir_all(&vault_path) {
-                log::error!("Failed to create vault directory {}: {}", vault_path.display(), e);
+                log::error!(
+                    "Failed to create vault directory {}: {}",
+                    vault_path.display(),
+                    e
+                );
             }
             if let Err(e) = std::fs::create_dir_all(&data_path) {
-                log::error!("Failed to create data directory {}: {}", data_path.display(), e);
+                log::error!(
+                    "Failed to create data directory {}: {}",
+                    data_path.display(),
+                    e
+                );
             }
 
             // Initialize services
@@ -78,7 +80,10 @@ fn main() {
             let search_service = match SearchService::new(data_path.clone()) {
                 Ok(s) => s,
                 Err(e) => {
-                    log::error!("Failed to initialize search service: {}. Attempting index rebuild.", e);
+                    log::error!(
+                        "Failed to initialize search service: {}. Attempting index rebuild.",
+                        e
+                    );
                     // Try deleting corrupted index and retrying
                     let index_path = data_path.join("search_index");
                     if index_path.exists() {
@@ -96,7 +101,10 @@ fn main() {
             let chunk_index = match ChunkIndex::new(data_path.clone()) {
                 Ok(c) => c,
                 Err(e) => {
-                    log::error!("Failed to initialize chunk index: {}. Attempting rebuild.", e);
+                    log::error!(
+                        "Failed to initialize chunk index: {}. Attempting rebuild.",
+                        e
+                    );
                     let chunk_path = data_path.join("chunk_index");
                     if chunk_path.exists() {
                         let _ = std::fs::remove_dir_all(&chunk_path);
@@ -124,6 +132,7 @@ fn main() {
 
             // Initialize retrieval service
             let retrieval_service = RetrievalService::new(data_path.clone());
+            let link_discovery = LinkDiscoveryService::new(data_path.clone());
 
             // Initialize feedback service using runtime environment only.
             // Release builds must not embed repository credentials.
@@ -142,6 +151,7 @@ fn main() {
                 priority_service: Arc::new(RwLock::new(priority_service)),
                 retrieval_service: Arc::new(RwLock::new(retrieval_service)),
                 chunk_index: Arc::new(RwLock::new(chunk_index)),
+                link_discovery: Arc::new(RwLock::new(link_discovery)),
                 twin_store: Arc::new(RwLock::new(twin_store)),
                 memory_service: Arc::new(MemoryService::new()),
                 boot_state,
@@ -152,13 +162,16 @@ fn main() {
             let app_handle = app.handle();
             let state = app.state::<AppState>().inner().clone();
             tauri::async_runtime::spawn(async move {
-                if let Err(error) = warm_start_services(app_handle.clone(), state.clone()).await {
-                    publish_boot_status(
-                        &app_handle,
-                        &state,
-                        BootStatus::failed("failed", "Startup failed", error),
-                    )
-                    .await;
+                match warm_start_services(app_handle.clone(), state.clone()).await {
+                    Ok(()) => start_link_discovery_worker(state.clone()),
+                    Err(error) => {
+                        publish_boot_status(
+                            &app_handle,
+                            &state,
+                            BootStatus::failed("failed", "Startup failed", error),
+                        )
+                        .await;
+                    }
                 }
             });
 
@@ -244,6 +257,9 @@ fn main() {
             commands::zettelkasten::apply_links,
             commands::zettelkasten::create_link,
             commands::zettelkasten::get_link_types,
+            commands::zettelkasten::list_link_suggestion_queue,
+            commands::zettelkasten::dismiss_link_suggestion,
+            commands::zettelkasten::get_link_discovery_status,
             // Import commands
             commands::import::preview_import,
             commands::import::apply_import,
@@ -331,6 +347,19 @@ async fn warm_start_services(app_handle: tauri::AppHandle, state: AppState) -> R
         &app_handle,
         &state,
         &boot_started,
+        BootStatus::new("building_link_discovery", "Preparing link discovery cache"),
+    )
+    .await;
+
+    {
+        let mut discovery = state.link_discovery.write().await;
+        discovery.bootstrap(&full_notes);
+    }
+
+    publish_boot_phase(
+        &app_handle,
+        &state,
+        &boot_started,
         BootStatus::ready("Grafyn is ready"),
     )
     .await;
@@ -364,6 +393,51 @@ async fn publish_boot_status(app_handle: &tauri::AppHandle, state: &AppState, st
     let _ = app_handle.emit_all("boot-status", status);
 }
 
+fn start_link_discovery_worker(state: AppState) {
+    tauri::async_runtime::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(12)).await;
+
+            let settings = {
+                let settings = state.settings_service.read().await;
+                settings.get().clone()
+            };
+
+            let job = {
+                let mut discovery = state.link_discovery.write().await;
+                discovery.next_background_job(&settings)
+            };
+
+            let Some(job) = job else {
+                continue;
+            };
+
+            let result = services::link_discovery::discover_for_note(
+                &state,
+                &job.note_id,
+                job.mode,
+                10,
+                false,
+            )
+            .await;
+
+            let mut discovery = state.link_discovery.write().await;
+            match result {
+                Ok(_) => discovery.complete_background_job(&job.note_id, None),
+                Err(error) => {
+                    log::warn!(
+                        "Background link discovery failed for '{}' ({}): {}",
+                        job.note_id,
+                        job.priority,
+                        error
+                    );
+                    discovery.complete_background_job(&job.note_id, Some("stale"));
+                }
+            }
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -378,4 +452,3 @@ mod tests {
         assert_eq!(*boot_state.read().await, next);
     }
 }
-

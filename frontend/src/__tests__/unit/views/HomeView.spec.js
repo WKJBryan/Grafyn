@@ -86,6 +86,14 @@ vi.mock('@/components/GraphView.vue', () => ({
   },
 }))
 
+vi.mock('@/components/LinkSuggestionInbox.vue', () => ({
+  default: {
+    name: 'LinkSuggestionInbox',
+    template: '<div class="link-inbox-stub" @click="$emit(\'navigate\', \'note-6\')"></div>',
+    emits: ['navigate'],
+  },
+}))
+
 vi.mock('@/components/TagTree.vue', () => ({
   default: {
     name: 'TagTree',
@@ -188,6 +196,15 @@ describe('HomeView', () => {
       await flushPromises()
 
       expect(wrapper.find('.sidebar-right .mini-graph-stub').exists()).toBe(true)
+    })
+
+    it('renders the link inbox in the right sidebar', async () => {
+      vi.spyOn(apiClient.notes, 'list').mockResolvedValue([])
+
+      wrapper = mount(HomeView)
+      await flushPromises()
+
+      expect(wrapper.find('.sidebar-right .link-inbox-stub').exists()).toBe(true)
     })
   })
 

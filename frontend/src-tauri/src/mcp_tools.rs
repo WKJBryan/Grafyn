@@ -116,7 +116,9 @@ pub struct RecallParams {
     #[schemars(description = "Maximum results (default: 5)")]
     #[serde(default = "default_recall_limit")]
     pub limit: usize,
-    #[schemars(description = "Token budget for chunk-level retrieval. When set, returns relevant paragraphs within this budget instead of whole notes.")]
+    #[schemars(
+        description = "Token budget for chunk-level retrieval. When set, returns relevant paragraphs within this budget instead of whole notes."
+    )]
     pub token_budget: Option<usize>,
 }
 
@@ -128,7 +130,9 @@ fn default_recall_limit() -> usize {
 pub struct SearchChunksParams {
     #[schemars(description = "Search query string")]
     pub query: String,
-    #[schemars(description = "Token budget — returns best-matching paragraphs that fit within this limit (default: 4000)")]
+    #[schemars(
+        description = "Token budget — returns best-matching paragraphs that fit within this limit (default: 4000)"
+    )]
     #[serde(default = "default_token_budget")]
     pub token_budget: usize,
     #[schemars(description = "Note IDs to use as context for graph-boosted scoring")]
@@ -142,7 +146,9 @@ fn default_token_budget() -> usize {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ImportParams {
-    #[schemars(description = "Absolute path to a conversation export file (JSON or DMS). Supports ChatGPT, Claude, Grok, and Gemini formats.")]
+    #[schemars(
+        description = "Absolute path to a conversation export file (JSON or DMS). Supports ChatGPT, Claude, Grok, and Gemini formats."
+    )]
     pub file_path: String,
     #[schemars(description = "IDs of specific conversations to import. Empty array imports all.")]
     #[serde(default)]
@@ -219,7 +225,9 @@ impl GrafynMcpServer {
         }
     }
 
-    #[tool(description = "List all notes in the knowledge base with metadata (title, status, tags). Returns JSON array sorted by last updated.")]
+    #[tool(
+        description = "List all notes in the knowledge base with metadata (title, status, tags). Returns JSON array sorted by last updated."
+    )]
     async fn list_notes(&self) -> Result<CallToolResult, McpError> {
         let ks = self.knowledge_store.read().await;
         match ks.list_notes() {
@@ -239,7 +247,9 @@ impl GrafynMcpServer {
         }
     }
 
-    #[tool(description = "Get the full content of a note by ID. Returns title, status, tags, and markdown content including wikilinks.")]
+    #[tool(
+        description = "Get the full content of a note by ID. Returns title, status, tags, and markdown content including wikilinks."
+    )]
     async fn get_note(
         &self,
         Parameters(params): Parameters<GetNoteParams>,
@@ -257,7 +267,9 @@ impl GrafynMcpServer {
         }
     }
 
-    #[tool(description = "Create a new note. ID is auto-generated from title. Content supports [[wikilinks]]. Returns the created note.")]
+    #[tool(
+        description = "Create a new note. ID is auto-generated from title. Content supports [[wikilinks]]. Returns the created note."
+    )]
     async fn create_note(
         &self,
         Parameters(params): Parameters<CreateNoteParams>,
@@ -300,7 +312,9 @@ impl GrafynMcpServer {
         }
     }
 
-    #[tool(description = "Update an existing note by ID. Only provided fields are changed (title, content, tags, status). Returns the updated note.")]
+    #[tool(
+        description = "Update an existing note by ID. Only provided fields are changed (title, content, tags, status). Returns the updated note."
+    )]
     async fn update_note(
         &self,
         Parameters(params): Parameters<UpdateNoteParams>,
@@ -343,7 +357,9 @@ impl GrafynMcpServer {
         }
     }
 
-    #[tool(description = "Delete a note by ID. This permanently removes the markdown file. Returns confirmation.")]
+    #[tool(
+        description = "Delete a note by ID. This permanently removes the markdown file. Returns confirmation."
+    )]
     async fn delete_note(
         &self,
         Parameters(params): Parameters<DeleteNoteParams>,
@@ -371,7 +387,9 @@ impl GrafynMcpServer {
         }
     }
 
-    #[tool(description = "Full-text search across all notes. Searches titles and content. Returns matching notes with relevance scores and snippets.")]
+    #[tool(
+        description = "Full-text search across all notes. Searches titles and content. Returns matching notes with relevance scores and snippets."
+    )]
     async fn search_notes(
         &self,
         Parameters(params): Parameters<SearchParams>,
@@ -398,7 +416,9 @@ impl GrafynMcpServer {
         }
     }
 
-    #[tool(description = "Get all notes that link TO a specific note (backlinks) with relationship types. Shows which notes reference this one via [[wikilinks]] and how they relate (supports, contradicts, expands, etc.).")]
+    #[tool(
+        description = "Get all notes that link TO a specific note (backlinks) with relationship types. Shows which notes reference this one via [[wikilinks]] and how they relate (supports, contradicts, expands, etc.)."
+    )]
     async fn get_backlinks(
         &self,
         Parameters(params): Parameters<BacklinksParams>,
@@ -418,7 +438,9 @@ impl GrafynMcpServer {
         json_result(&response)
     }
 
-    #[tool(description = "Get all notes that a specific note links FROM (outgoing links) with relationship types. Shows what [[wikilinks]] exist in the note's content and the relationship type (supports, contradicts, expands, etc.).")]
+    #[tool(
+        description = "Get all notes that a specific note links FROM (outgoing links) with relationship types. Shows what [[wikilinks]] exist in the note's content and the relationship type (supports, contradicts, expands, etc.)."
+    )]
     async fn get_outgoing(
         &self,
         Parameters(params): Parameters<OutgoingParams>,
@@ -438,7 +460,9 @@ impl GrafynMcpServer {
         json_result(&response)
     }
 
-    #[tool(description = "Import conversations from ChatGPT, Claude, Grok, or Gemini export files as evidence notes. Auto-detects format. Returns created note IDs.")]
+    #[tool(
+        description = "Import conversations from ChatGPT, Claude, Grok, or Gemini export files as evidence notes. Auto-detects format. Returns created note IDs."
+    )]
     async fn import_conversation(
         &self,
         Parameters(params): Parameters<ImportParams>,
@@ -450,8 +474,7 @@ impl GrafynMcpServer {
         };
 
         // Auto-detect and parse
-        let platform = import::detect_platform(&content)
-            .unwrap_or("unknown");
+        let platform = import::detect_platform(&content).unwrap_or("unknown");
         let all_conversations = match import::parse_content(&content) {
             Ok(c) => c,
             Err(e) => return err_result(format!("Failed to parse: {}", e)),
@@ -485,9 +508,18 @@ impl GrafynMcpServer {
                 tags,
                 properties: {
                     let mut props = std::collections::HashMap::new();
-                    props.insert("source".into(), serde_json::Value::String(conv.platform.clone()));
-                    props.insert("source_id".into(), serde_json::Value::String(conv.id.clone()));
-                    props.insert("created_via".into(), serde_json::Value::String("mcp-import".into()));
+                    props.insert(
+                        "source".into(),
+                        serde_json::Value::String(conv.platform.clone()),
+                    );
+                    props.insert(
+                        "source_id".into(),
+                        serde_json::Value::String(conv.id.clone()),
+                    );
+                    props.insert(
+                        "created_via".into(),
+                        serde_json::Value::String("mcp-import".into()),
+                    );
                     props
                 },
             };
@@ -525,7 +557,9 @@ impl GrafynMcpServer {
         json_result(&result)
     }
 
-    #[tool(description = "Search with graph-aware boosting. When token_budget is set, returns relevant paragraphs (chunks) within that budget using the full retrieval pipeline. Without token_budget, returns note-level results with graph boosting.")]
+    #[tool(
+        description = "Search with graph-aware boosting. When token_budget is set, returns relevant paragraphs (chunks) within that budget using the full retrieval pipeline. Without token_budget, returns note-level results with graph boosting."
+    )]
     async fn recall_relevant(
         &self,
         Parameters(params): Parameters<RecallParams>,
@@ -538,8 +572,12 @@ impl GrafynMcpServer {
             let retrieval = self.retrieval_service.read().await;
 
             match retrieval.retrieve_chunks(
-                &chunk_index, &graph, &priority,
-                &params.query, budget, &params.context_note_ids,
+                &chunk_index,
+                &graph,
+                &priority,
+                &params.query,
+                budget,
+                &params.context_note_ids,
             ) {
                 Ok(chunks) => {
                     let response: Vec<serde_json::Value> = chunks
@@ -593,7 +631,9 @@ impl GrafynMcpServer {
         }
     }
 
-    #[tool(description = "Search for relevant paragraphs across all notes with token budgeting. Returns the best-matching text chunks that fit within the token budget, scored with graph-aware boosting. Ideal for retrieving precise context without exceeding token limits.")]
+    #[tool(
+        description = "Search for relevant paragraphs across all notes with token budgeting. Returns the best-matching text chunks that fit within the token budget, scored with graph-aware boosting. Ideal for retrieving precise context without exceeding token limits."
+    )]
     async fn search_chunks(
         &self,
         Parameters(params): Parameters<SearchChunksParams>,
@@ -610,8 +650,12 @@ impl GrafynMcpServer {
         let retrieval = self.retrieval_service.read().await;
 
         match retrieval.retrieve_chunks(
-            &chunk_index, &graph, &priority,
-            &params.query, params.token_budget, &params.context_note_ids,
+            &chunk_index,
+            &graph,
+            &priority,
+            &params.query,
+            params.token_budget,
+            &params.context_note_ids,
         ) {
             Ok(chunks) => {
                 let total_tokens: usize = chunks.iter().map(|c| c.token_estimate).sum();

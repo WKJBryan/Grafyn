@@ -15,12 +15,9 @@ pub fn can_parse(content: &str) -> bool {
     };
 
     if let Some(obj) = data.as_object() {
-        return obj.keys().any(|k| {
-            matches!(
-                k.as_str(),
-                "meta" | "speaker_stats" | "grok_mode"
-            )
-        });
+        return obj
+            .keys()
+            .any(|k| matches!(k.as_str(), "meta" | "speaker_stats" | "grok_mode"));
     }
 
     false
@@ -89,9 +86,7 @@ fn parse_enhanced(data: &serde_json::Value) -> Option<ParsedConversation> {
     Some(ParsedConversation {
         id: format!(
             "grok_{}",
-            exported_at
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown")
+            exported_at.and_then(|v| v.as_str()).unwrap_or("unknown")
         ),
         title,
         platform: "grok".to_string(),
@@ -111,10 +106,7 @@ fn extract_enhanced_messages(chats: &[serde_json::Value]) -> Vec<ParsedMessage> 
     let mut messages = Vec::new();
 
     for (i, chat) in chats.iter().enumerate() {
-        let msg_type = chat
-            .get("type")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let msg_type = chat.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
         let role = match msg_type {
             "prompt" => "user",
@@ -170,7 +162,9 @@ fn extract_enhanced_content(message_obj: Option<&serde_json::Value>) -> String {
                         if let Some(s) = part.as_str() {
                             return Some(s.to_string());
                         }
-                        part.get("data").and_then(|d| d.as_str()).map(|s| s.to_string())
+                        part.get("data")
+                            .and_then(|d| d.as_str())
+                            .map(|s| s.to_string())
                     })
                     .collect();
                 return parts.join("\n");
@@ -208,11 +202,14 @@ fn parse_generic(data: &serde_json::Value) -> Option<ParsedConversation> {
             .get("role")
             .and_then(|v| v.as_str())
             .or_else(|| {
-                msg_data.get("type").and_then(|v| v.as_str()).map(|t| match t {
-                    "prompt" => "user",
-                    "response" => "assistant",
-                    _ => "user",
-                })
+                msg_data
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .map(|t| match t {
+                        "prompt" => "user",
+                        "response" => "assistant",
+                        _ => "user",
+                    })
             })
             .unwrap_or(if i % 2 == 0 { "user" } else { "assistant" });
 
@@ -262,7 +259,8 @@ mod tests {
 
     #[test]
     fn test_can_parse_grok() {
-        let content = r#"{"meta": {"title": "Test"}, "chats": [{"type": "prompt", "message": "hi"}]}"#;
+        let content =
+            r#"{"meta": {"title": "Test"}, "chats": [{"type": "prompt", "message": "hi"}]}"#;
         assert!(can_parse(content));
     }
 

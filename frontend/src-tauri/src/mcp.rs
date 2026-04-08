@@ -13,9 +13,9 @@
 // Suppress dead_code warnings for the unused services/models.
 #![allow(dead_code)]
 
+mod mcp_tools;
 mod models;
 mod services;
-mod mcp_tools;
 
 use crate::mcp_tools::GrafynMcpServer;
 use crate::services::chunk_index::ChunkIndex;
@@ -120,7 +120,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Some(Arc::new(RwLock::new(ci)))
         }
         Err(e) => {
-            log::warn!("Chunk index not available: {}. search_chunks and chunk recall will be disabled.", e);
+            log::warn!(
+                "Chunk index not available: {}. search_chunks and chunk recall will be disabled.",
+                e
+            );
             None
         }
     };
@@ -173,9 +176,7 @@ fn resolve_paths(cli_vault: Option<PathBuf>, cli_data: Option<PathBuf>) -> (Path
         .or_else(|| settings.as_ref().map(|s| s.data_path()))
         .unwrap_or_else(|| {
             dirs::data_local_dir()
-                .unwrap_or_else(|| {
-                    dirs::document_dir().unwrap_or_else(|| PathBuf::from("."))
-                })
+                .unwrap_or_else(|| dirs::document_dir().unwrap_or_else(|| PathBuf::from(".")))
                 .join("Grafyn")
                 .join("data")
         });

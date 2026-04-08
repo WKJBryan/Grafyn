@@ -1,3 +1,4 @@
+use crate::commands::rebuild_link_discovery;
 use crate::models::note::SearchResult;
 use crate::AppState;
 use tauri::State;
@@ -120,6 +121,8 @@ pub async fn reindex(state: State<'_, AppState>) -> Result<(), String> {
             log::error!("Failed to rebuild chunk index: {}", e);
         }
     }
+
+    rebuild_link_discovery(state.inner(), &notes).await;
 
     Ok(())
 }

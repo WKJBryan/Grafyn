@@ -9,6 +9,7 @@ const mockToast = vi.hoisted(() => ({
 
 const mockZettelkastenApi = vi.hoisted(() => ({
   applyLinks: vi.fn(),
+  dismissSuggestion: vi.fn(),
 }))
 
 vi.mock('@/composables/useToast', () => ({
@@ -58,5 +59,18 @@ describe('LinkCandidateModal', () => {
 
     expect(mockZettelkastenApi.applyLinks).toHaveBeenCalledWith('n1', [candidates[0]])
     expect(mockToast.success).toHaveBeenCalledWith('Created 1 link')
+  })
+
+  it('renders strong and exploratory sections separately', () => {
+    wrapper = mount(LinkCandidateModal, {
+      props: {
+        noteId: 'n1',
+        candidates: [candidates[0]],
+        exploratoryCandidates: [candidates[1]],
+      },
+    })
+
+    expect(wrapper.text()).toContain('Strong Matches')
+    expect(wrapper.text()).toContain('Exploratory')
   })
 })

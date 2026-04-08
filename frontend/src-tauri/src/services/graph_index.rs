@@ -1,6 +1,4 @@
-use crate::models::note::{
-    GraphNeighbor, LinkDirection, Note, NoteMeta, RelationType, TypedEdge,
-};
+use crate::models::note::{GraphNeighbor, LinkDirection, Note, NoteMeta, RelationType, TypedEdge};
 use std::collections::HashMap;
 
 /// Service for managing the note link graph (backlinks and outgoing links)
@@ -60,10 +58,14 @@ impl GraphIndex {
             let outgoing_edges = self.outgoing.entry(note.id.clone()).or_default();
 
             for parsed_link in &note.parsed_links {
-                if let Some(target_id) =
-                    self.title_to_id.get(&parsed_link.target_title.to_lowercase())
+                if let Some(target_id) = self
+                    .title_to_id
+                    .get(&parsed_link.target_title.to_lowercase())
                 {
-                    if !outgoing_edges.iter().any(|edge| edge.target_id == *target_id) {
+                    if !outgoing_edges
+                        .iter()
+                        .any(|edge| edge.target_id == *target_id)
+                    {
                         outgoing_edges.push(TypedEdge {
                             target_id: target_id.clone(),
                             relation: parsed_link.relation.clone(),
@@ -234,11 +236,7 @@ impl GraphIndex {
 
         // Build nodes from all known notes
         for (id, meta) in &self.note_meta {
-            let backlink_count = self
-                .backlinks
-                .get(id)
-                .map(|s| s.len())
-                .unwrap_or(0);
+            let backlink_count = self.backlinks.get(id).map(|s| s.len()).unwrap_or(0);
 
             nodes.push(GraphNode {
                 id: id.clone(),
@@ -268,11 +266,7 @@ impl GraphIndex {
     pub fn stats(&self) -> GraphStats {
         let total_notes = self.note_meta.len();
         let total_links: usize = self.outgoing.values().map(|s| s.len()).sum();
-        let notes_with_backlinks = self
-            .backlinks
-            .values()
-            .filter(|s| !s.is_empty())
-            .count();
+        let notes_with_backlinks = self.backlinks.values().filter(|s| !s.is_empty()).count();
         let orphan_notes = self.get_unlinked().len();
 
         GraphStats {
@@ -369,7 +363,11 @@ mod tests {
     #[test]
     fn update_note_rebuilds_links_after_title_change() {
         let mut graph = GraphIndex::new();
-        let source = make_note("source", "Source", vec![("Renamed Target", RelationType::Supports)]);
+        let source = make_note(
+            "source",
+            "Source",
+            vec![("Renamed Target", RelationType::Supports)],
+        );
         let target = make_note("target", "Old Target", vec![]);
 
         graph.build_from_notes(&[source, target]);

@@ -46,3 +46,26 @@ pub(crate) async fn remove_note_chunks_from_index(state: &AppState, note_id: &st
         log::error!("Failed to commit chunk index: {}", error);
     }
 }
+
+pub(crate) async fn sync_link_discovery_for_note(state: &AppState, note: &Note) {
+    sync_link_discovery_for_notes(state, std::slice::from_ref(note)).await;
+}
+
+pub(crate) async fn sync_link_discovery_for_notes(state: &AppState, notes: &[Note]) {
+    if notes.is_empty() {
+        return;
+    }
+
+    let mut discovery = state.link_discovery.write().await;
+    discovery.sync_notes(notes);
+}
+
+pub(crate) async fn rebuild_link_discovery(state: &AppState, notes: &[Note]) {
+    let mut discovery = state.link_discovery.write().await;
+    discovery.bootstrap(notes);
+}
+
+pub(crate) async fn remove_link_discovery_note(state: &AppState, note_id: &str) {
+    let mut discovery = state.link_discovery.write().await;
+    discovery.remove_note(note_id);
+}

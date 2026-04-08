@@ -34,16 +34,12 @@ impl ChunkIndex {
         let mut schema_builder = Schema::builder();
 
         let chunk_id_field = schema_builder.add_text_field("chunk_id", STRING | STORED);
-        let parent_note_id_field =
-            schema_builder.add_text_field("parent_note_id", STRING | STORED);
+        let parent_note_id_field = schema_builder.add_text_field("parent_note_id", STRING | STORED);
         let parent_title_field = schema_builder.add_text_field("parent_title", TEXT | STORED);
         let text_field = schema_builder.add_text_field("text", TEXT | STORED);
-        let start_char_field =
-            schema_builder.add_u64_field("start_char", STORED);
-        let end_char_field =
-            schema_builder.add_u64_field("end_char", STORED);
-        let depth_score_field =
-            schema_builder.add_f64_field("depth_score", STORED);
+        let start_char_field = schema_builder.add_u64_field("start_char", STORED);
+        let end_char_field = schema_builder.add_u64_field("end_char", STORED);
+        let depth_score_field = schema_builder.add_f64_field("depth_score", STORED);
 
         let schema = schema_builder.build();
 
@@ -142,8 +138,7 @@ impl ChunkIndex {
         let writer = self.writer.as_mut().context("Writer not available")?;
 
         // Delete existing chunks for this note
-        let term =
-            tantivy::Term::from_field_text(self.parent_note_id_field, &note.id);
+        let term = tantivy::Term::from_field_text(self.parent_note_id_field, &note.id);
         writer.delete_term(term);
 
         // Segment note content using TextTiling
@@ -214,8 +209,10 @@ impl ChunkIndex {
     /// Search chunks by query, returning results ordered by BM25 score.
     pub fn search_chunks(&self, query: &str, limit: usize) -> Result<Vec<ChunkResult>> {
         let searcher = self.reader.searcher();
-        let query_parser =
-            QueryParser::for_index(searcher.index(), vec![self.text_field, self.parent_title_field]);
+        let query_parser = QueryParser::for_index(
+            searcher.index(),
+            vec![self.text_field, self.parent_title_field],
+        );
 
         let parsed_query = query_parser
             .parse_query(query)

@@ -140,8 +140,7 @@ impl TwinStore {
             metadata: create.metadata,
         };
 
-        self.record_cache
-            .insert(record.id.clone(), record.clone());
+        self.record_cache.insert(record.id.clone(), record.clone());
         self.write_record_file(&record)?;
 
         Ok(record)
@@ -174,8 +173,7 @@ impl TwinStore {
         }
 
         record.updated_at = Utc::now();
-        self.record_cache
-            .insert(record.id.clone(), record.clone());
+        self.record_cache.insert(record.id.clone(), record.clone());
         self.write_record_file(&record)?;
 
         Ok(record)
@@ -184,9 +182,7 @@ impl TwinStore {
     pub fn export_bundle(&mut self, request: TwinExportRequest) -> Result<ExportBundle> {
         self.ensure_record_cache()?;
 
-        let eval_percentage = request
-            .eval_percentage
-            .unwrap_or(DEFAULT_EVAL_PERCENTAGE);
+        let eval_percentage = request.eval_percentage.unwrap_or(DEFAULT_EVAL_PERCENTAGE);
         let holdout_percentage = request
             .holdout_percentage
             .unwrap_or(DEFAULT_HOLDOUT_PERCENTAGE);
@@ -195,19 +191,19 @@ impl TwinStore {
             anyhow::bail!("Eval and holdout percentages must total less than 100");
         }
 
-        let bundle_name = request
-            .bundle_name
-            .as_deref()
-            .unwrap_or("latest")
-            .trim();
+        let bundle_name = request.bundle_name.as_deref().unwrap_or("latest").trim();
         if bundle_name.is_empty() {
             anyhow::bail!("Bundle name cannot be empty");
         }
         Self::validate_file_id(bundle_name)?;
 
         let output_dir = self.exports_path.join(bundle_name);
-        std::fs::create_dir_all(&output_dir)
-            .with_context(|| format!("Failed to create export directory: {}", output_dir.display()))?;
+        std::fs::create_dir_all(&output_dir).with_context(|| {
+            format!(
+                "Failed to create export directory: {}",
+                output_dir.display()
+            )
+        })?;
 
         let train_path = output_dir.join("train.jsonl");
         let eval_path = output_dir.join("eval.jsonl");
@@ -294,7 +290,10 @@ impl TwinStore {
             self.trace_cache.insert(session_id.to_string(), trace);
         }
 
-        Ok(self.trace_cache.get_mut(session_id).expect("trace inserted"))
+        Ok(self
+            .trace_cache
+            .get_mut(session_id)
+            .expect("trace inserted"))
     }
 
     fn ensure_record_cache(&mut self) -> Result<()> {

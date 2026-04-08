@@ -199,9 +199,15 @@ fn classify_claim(text: &str) -> Option<&str> {
         return Some("question");
     }
 
-    if ["insight", "learned", "realized", "key takeaway", "important"]
-        .iter()
-        .any(|kw| lower.contains(kw))
+    if [
+        "insight",
+        "learned",
+        "realized",
+        "key takeaway",
+        "important",
+    ]
+    .iter()
+    .any(|kw| lower.contains(kw))
     {
         return Some("insight");
     }

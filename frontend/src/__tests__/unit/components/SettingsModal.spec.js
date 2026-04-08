@@ -58,7 +58,9 @@ describe('SettingsModal', () => {
       vault_path: 'C:\\Vault',
       theme: 'system',
       llm_model: 'openai/gpt-4o',
-      smart_web_search: true
+      smart_web_search: true,
+      background_link_discovery_enabled: true,
+      background_link_discovery_llm_enabled: false
     })
     settingsStatus.mockResolvedValue({ has_key: true })
     getModels.mockResolvedValue([])
@@ -146,5 +148,25 @@ describe('SettingsModal', () => {
 
     expect(themeStore.setTheme).toHaveBeenLastCalledWith('light')
     expect(wrapper.emitted('update:modelValue')?.at(-1)).toEqual([false])
+  })
+
+  it('persists background link discovery settings', async () => {
+    const wrapper = mount(SettingsModal, {
+      props: {
+        modelValue: true,
+        isSetup: false
+      }
+    })
+
+    await flushPromises()
+
+    const checkboxes = wrapper.findAll('input[type="checkbox"]')
+    await checkboxes.at(-1).setValue(true)
+    await wrapper.find('.save-btn').trigger('click')
+
+    expect(settingsUpdate).toHaveBeenCalledWith(expect.objectContaining({
+      background_link_discovery_enabled: true,
+      background_link_discovery_llm_enabled: true
+    }))
   })
 })
