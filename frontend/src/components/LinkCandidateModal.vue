@@ -64,15 +64,41 @@
 
         <!-- No results -->
         <div
-          v-else-if="allCandidates.length === 0"
+          v-else-if="allCandidates.length === 0 && topicHubCandidates.length === 0"
           class="empty-state"
         >
           <p>No link candidates found for this note.</p>
         </div>
 
+        <div
+          v-if="!loading && !error && topicHubCandidates.length > 0"
+          class="topic-hub-panel"
+        >
+          <div class="section-header">
+            <h4>Topic Hubs</h4>
+            <span class="section-count">{{ topicHubCandidates.length }}</span>
+          </div>
+          <p class="topic-hub-copy">
+            Topic membership is auto-managed. These hubs shape graph navigation and retrieval, but they are not applied as manual note links.
+          </p>
+          <div class="topic-hub-list">
+            <div
+              v-for="hub in topicHubCandidates"
+              :key="hub.hub_id"
+              class="topic-hub-item"
+            >
+              <div class="topic-hub-title">{{ hub.hub_title }}</div>
+              <div class="topic-hub-meta">
+                <span class="topic-key">{{ hub.topic_key }}</span>
+                <span class="topic-source">{{ hub.membership_source || 'auto' }}</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
         <!-- Candidate list -->
         <div
-          v-else
+          v-if="!loading && !error && allCandidates.length > 0"
           class="candidates-list"
         >
           <label class="select-all-row">
@@ -181,6 +207,10 @@ const props = defineProps({
     default: () => [],
   },
   exploratoryCandidates: {
+    type: Array,
+    default: () => [],
+  },
+  topicHubCandidates: {
     type: Array,
     default: () => [],
   },
@@ -441,6 +471,54 @@ async function handleApply() {
   display: flex;
   flex-direction: column;
   gap: 12px;
+}
+
+.topic-hub-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.topic-hub-copy {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 0.82rem;
+  line-height: 1.45;
+}
+
+.topic-hub-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.topic-hub-item {
+  padding: 10px 12px;
+  border: 1px solid rgba(245, 158, 11, 0.22);
+  background: rgba(245, 158, 11, 0.08);
+  border-radius: var(--radius-md);
+}
+
+.topic-hub-title {
+  font-size: 0.9rem;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.topic-hub-meta {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 4px;
+}
+
+.topic-key,
+.topic-source {
+  font-size: 0.72rem;
+  color: var(--text-secondary);
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.08);
 }
 
 .candidate-section {

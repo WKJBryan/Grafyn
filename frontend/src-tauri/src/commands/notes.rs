@@ -1,6 +1,6 @@
 use crate::commands::{
-    remove_link_discovery_note, remove_note_chunks_from_index, sync_chunk_index_for_note,
-    sync_link_discovery_for_note,
+    enqueue_vault_optimizer_note, remove_link_discovery_note, remove_note_chunks_from_index,
+    sync_topic_hubs,
 };
 use crate::models::note::{Note, NoteCreate, NoteMeta, NoteUpdate};
 use crate::AppState;
@@ -25,33 +25,14 @@ pub async fn get_note(id: String, state: State<'_, AppState>) -> Result<Note, St
 pub async fn create_note(note: NoteCreate, state: State<'_, AppState>) -> Result<Note, String> {
     let mut store = state.knowledge_store.write().await;
     let created_note = store.create_note(note).map_err(|e| e.to_string())?;
+    let created_id = created_note.id.clone();
+    drop(store);
 
-    // Update search index
-    {
-        let mut search = state.search_service.write().await;
-        if let Err(e) = search.index_note(&created_note) {
-            log::error!("Failed to index note '{}': {}", created_note.id, e);
-        }
-        if let Err(e) = search.commit() {
-            log::error!(
-                "Failed to commit search index after creating note '{}': {}",
-                created_note.id,
-                e
-            );
-        }
-    }
+    sync_topic_hubs(state.inner()).await?;
+    enqueue_vault_optimizer_note(state.inner(), &created_id, "note_created").await;
 
-    // Update graph index
-    {
-        let mut graph = state.graph_index.write().await;
-        graph.update_note(&created_note);
-    }
-
-    // Update chunk index
-    sync_chunk_index_for_note(state.inner(), &created_note).await;
-    sync_link_discovery_for_note(state.inner(), &created_note).await;
-
-    Ok(created_note)
+    let store = state.knowledge_store.read().await;
+    store.get_note(&created_id).map_err(|e| e.to_string())
 }
 
 /// Update an existing note
@@ -63,33 +44,14 @@ pub async fn update_note(
 ) -> Result<Note, String> {
     let mut store = state.knowledge_store.write().await;
     let updated_note = store.update_note(&id, update).map_err(|e| e.to_string())?;
+    let updated_id = updated_note.id.clone();
+    drop(store);
 
-    // Update search index
-    {
-        let mut search = state.search_service.write().await;
-        if let Err(e) = search.index_note(&updated_note) {
-            log::error!("Failed to index note '{}': {}", updated_note.id, e);
-        }
-        if let Err(e) = search.commit() {
-            log::error!(
-                "Failed to commit search index after updating note '{}': {}",
-                updated_note.id,
-                e
-            );
-        }
-    }
+    sync_topic_hubs(state.inner()).await?;
+    enqueue_vault_optimizer_note(state.inner(), &updated_id, "note_updated").await;
 
-    // Update graph index
-    {
-        let mut graph = state.graph_index.write().await;
-        graph.update_note(&updated_note);
-    }
-
-    // Update chunk index
-    sync_chunk_index_for_note(state.inner(), &updated_note).await;
-    sync_link_discovery_for_note(state.inner(), &updated_note).await;
-
-    Ok(updated_note)
+    let store = state.knowledge_store.read().await;
+    store.get_note(&updated_id).map_err(|e| e.to_string())
 }
 
 /// Delete a note
@@ -97,8 +59,8 @@ pub async fn update_note(
 pub async fn delete_note(id: String, state: State<'_, AppState>) -> Result<(), String> {
     let mut store = state.knowledge_store.write().await;
     store.delete_note(&id).map_err(|e| e.to_string())?;
+    drop(store);
 
-    // Remove from search index
     {
         let mut search = state.search_service.write().await;
         if let Err(e) = search.remove_note(&id) {
@@ -113,15 +75,10 @@ pub async fn delete_note(id: String, state: State<'_, AppState>) -> Result<(), S
         }
     }
 
-    // Remove from graph index
-    {
-        let mut graph = state.graph_index.write().await;
-        graph.remove_note(&id);
-    }
-
-    // Remove from chunk index
     remove_note_chunks_from_index(state.inner(), &id).await;
     remove_link_discovery_note(state.inner(), &id).await;
+    sync_topic_hubs(state.inner()).await?;
+    enqueue_vault_optimizer_note(state.inner(), &id, "note_deleted").await;
 
     Ok(())
 }

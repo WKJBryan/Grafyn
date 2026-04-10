@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::HashMap;
 
 /// Note status workflow: draft → evidence → canonical
@@ -78,10 +79,20 @@ pub struct Note {
     pub id: String,
     pub title: String,
     pub content: String,
+    #[serde(default)]
+    pub relative_path: String,
+    #[serde(default)]
+    pub aliases: Vec<String>,
     pub status: NoteStatus,
     pub tags: Vec<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    #[serde(default)]
+    pub schema_version: u32,
+    #[serde(default)]
+    pub migration_source: Option<String>,
+    #[serde(default)]
+    pub optimizer_managed: bool,
     pub wikilinks: Vec<String>,
     /// Typed wikilinks with relationship information
     #[serde(default)]
@@ -91,6 +102,14 @@ pub struct Note {
     pub properties: HashMap<String, serde_json::Value>,
 }
 
+pub const PROP_IS_TOPIC_HUB: &str = "is_topic_hub";
+pub const PROP_TOPIC_KEY: &str = "topic_key";
+pub const PROP_TOPIC_HUB_IDS: &str = "topic_hub_ids";
+pub const PROP_TOPIC_ALIASES: &str = "topic_aliases";
+pub const PROP_INFERRED_LINK_IDS: &str = "inferred_link_ids";
+pub const PROP_AUTO_INSERTED_LINK_IDS: &str = "auto_inserted_link_ids";
+pub const CURRENT_NOTE_SCHEMA_VERSION: u32 = 2;
+
 impl Default for Note {
     fn default() -> Self {
         let now = Utc::now();
@@ -98,14 +117,164 @@ impl Default for Note {
             id: String::new(),
             title: String::new(),
             content: String::new(),
+            relative_path: String::new(),
+            aliases: Vec::new(),
             status: NoteStatus::Draft,
             tags: Vec::new(),
             created_at: now,
             updated_at: now,
+            schema_version: CURRENT_NOTE_SCHEMA_VERSION,
+            migration_source: None,
+            optimizer_managed: false,
             wikilinks: Vec::new(),
             parsed_links: Vec::new(),
             properties: HashMap::new(),
         }
+    }
+}
+
+impl Note {
+    pub fn is_topic_hub(&self) -> bool {
+        self.properties
+            .get(PROP_IS_TOPIC_HUB)
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+            || self.title.starts_with("Hub: ")
+            || self.tags.iter().any(|tag| tag == "hub")
+    }
+
+    pub fn topic_key(&self) -> Option<String> {
+        self.properties
+            .get(PROP_TOPIC_KEY)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+    }
+
+    pub fn topic_hub_ids(&self) -> Vec<String> {
+        self.properties
+            .get(PROP_TOPIC_HUB_IDS)
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToOwned::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn topic_aliases(&self) -> Vec<String> {
+        self.properties
+            .get(PROP_TOPIC_ALIASES)
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToOwned::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn inferred_link_ids(&self) -> Vec<String> {
+        self.properties
+            .get(PROP_INFERRED_LINK_IDS)
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToOwned::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn auto_inserted_link_ids(&self) -> Vec<String> {
+        self.properties
+            .get(PROP_AUTO_INSERTED_LINK_IDS)
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToOwned::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn set_inferred_link_ids(&mut self, values: Vec<String>) {
+        set_optional_string_array(&mut self.properties, PROP_INFERRED_LINK_IDS, values);
+    }
+
+    pub fn set_auto_inserted_link_ids(&mut self, values: Vec<String>) {
+        set_optional_string_array(&mut self.properties, PROP_AUTO_INSERTED_LINK_IDS, values);
+    }
+
+    pub fn set_topic_hub_metadata(
+        &mut self,
+        is_topic_hub: bool,
+        topic_key: Option<String>,
+        topic_hub_ids: Vec<String>,
+        topic_aliases: Vec<String>,
+    ) {
+        set_optional_bool(&mut self.properties, PROP_IS_TOPIC_HUB, is_topic_hub);
+        set_optional_string(&mut self.properties, PROP_TOPIC_KEY, topic_key);
+        set_optional_string_array(&mut self.properties, PROP_TOPIC_HUB_IDS, topic_hub_ids);
+        set_optional_string_array(&mut self.properties, PROP_TOPIC_ALIASES, topic_aliases);
+    }
+}
+
+fn set_optional_bool(properties: &mut HashMap<String, Value>, key: &str, value: bool) {
+    if value {
+        properties.insert(key.to_string(), Value::Bool(true));
+    } else {
+        properties.remove(key);
+    }
+}
+
+fn set_optional_string(properties: &mut HashMap<String, Value>, key: &str, value: Option<String>) {
+    if let Some(value) = value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        properties.insert(key.to_string(), Value::String(value));
+    } else {
+        properties.remove(key);
+    }
+}
+
+fn set_optional_string_array(
+    properties: &mut HashMap<String, Value>,
+    key: &str,
+    values: Vec<String>,
+) {
+    let cleaned = values
+        .into_iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+
+    if cleaned.is_empty() {
+        properties.remove(key);
+    } else {
+        properties.insert(
+            key.to_string(),
+            Value::Array(cleaned.into_iter().map(Value::String).collect()),
+        );
     }
 }
 
@@ -114,10 +283,20 @@ impl Default for Note {
 pub struct NoteMeta {
     pub id: String,
     pub title: String,
+    #[serde(default)]
+    pub relative_path: String,
+    #[serde(default)]
+    pub aliases: Vec<String>,
     pub status: NoteStatus,
     pub tags: Vec<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    #[serde(default)]
+    pub schema_version: u32,
+    #[serde(default)]
+    pub migration_source: Option<String>,
+    #[serde(default)]
+    pub optimizer_managed: bool,
 }
 
 impl From<&Note> for NoteMeta {
@@ -125,10 +304,15 @@ impl From<&Note> for NoteMeta {
         Self {
             id: note.id.clone(),
             title: note.title.clone(),
+            relative_path: note.relative_path.clone(),
+            aliases: note.aliases.clone(),
             status: note.status.clone(),
             tags: note.tags.clone(),
             created_at: note.created_at,
             updated_at: note.updated_at,
+            schema_version: note.schema_version,
+            migration_source: note.migration_source.clone(),
+            optimizer_managed: note.optimizer_managed,
         }
     }
 }
@@ -139,9 +323,19 @@ pub struct NoteCreate {
     pub title: String,
     pub content: String,
     #[serde(default)]
+    pub relative_path: Option<String>,
+    #[serde(default)]
+    pub aliases: Vec<String>,
+    #[serde(default)]
     pub status: NoteStatus,
     #[serde(default)]
     pub tags: Vec<String>,
+    #[serde(default = "default_note_schema_version")]
+    pub schema_version: u32,
+    #[serde(default)]
+    pub migration_source: Option<String>,
+    #[serde(default)]
+    pub optimizer_managed: bool,
     #[serde(default)]
     pub properties: HashMap<String, serde_json::Value>,
 }
@@ -151,19 +345,34 @@ pub struct NoteCreate {
 pub struct NoteUpdate {
     pub title: Option<String>,
     pub content: Option<String>,
+    pub relative_path: Option<String>,
+    pub aliases: Option<Vec<String>>,
     pub status: Option<NoteStatus>,
     pub tags: Option<Vec<String>>,
+    pub schema_version: Option<u32>,
+    pub migration_source: Option<String>,
+    pub optimizer_managed: Option<bool>,
     pub properties: Option<HashMap<String, serde_json::Value>>,
 }
 
 /// YAML frontmatter structure
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct NoteFrontmatter {
+    #[serde(default)]
+    pub note_id: Option<String>,
     pub title: String,
+    #[serde(default)]
+    pub aliases: Vec<String>,
     #[serde(default)]
     pub status: String,
     #[serde(default)]
     pub tags: Vec<String>,
+    #[serde(default = "default_note_schema_version")]
+    pub schema_version: u32,
+    #[serde(default)]
+    pub migration_source: Option<String>,
+    #[serde(default)]
+    pub optimizer_managed: bool,
     #[serde(default)]
     pub created_at: Option<DateTime<Utc>>,
     #[serde(default)]
@@ -290,6 +499,8 @@ impl std::fmt::Display for RelationType {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ParsedLink {
     pub target_title: String,
+    #[serde(default)]
+    pub target_path: Option<String>,
     pub relation: RelationType,
 }
 
@@ -298,6 +509,8 @@ pub struct ParsedLink {
 pub struct TypedEdge {
     pub target_id: String,
     pub relation: RelationType,
+    #[serde(default = "default_graph_edge_provenance")]
+    pub provenance: GraphEdgeProvenance,
 }
 
 /// Direction of a link (outgoing or backlink)
@@ -314,6 +527,70 @@ pub struct GraphNeighbor {
     pub note: NoteMeta,
     pub direction: LinkDirection,
     pub relation: RelationType,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GraphNodeKind {
+    Note,
+    TopicHub,
+}
+
+impl std::fmt::Display for GraphNodeKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GraphNodeKind::Note => write!(f, "note"),
+            GraphNodeKind::TopicHub => write!(f, "topic_hub"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GraphEdgeKind {
+    NoteLink,
+    TopicMembership,
+    TopicRelated,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum GraphEdgeProvenance {
+    #[default]
+    Explicit,
+    Inferred,
+    Topic,
+    AutoInserted,
+}
+
+impl std::fmt::Display for GraphEdgeProvenance {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GraphEdgeProvenance::Explicit => write!(f, "explicit"),
+            GraphEdgeProvenance::Inferred => write!(f, "inferred"),
+            GraphEdgeProvenance::Topic => write!(f, "topic"),
+            GraphEdgeProvenance::AutoInserted => write!(f, "auto_inserted"),
+        }
+    }
+}
+
+impl std::fmt::Display for GraphEdgeKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GraphEdgeKind::NoteLink => write!(f, "note_link"),
+            GraphEdgeKind::TopicMembership => write!(f, "topic_membership"),
+            GraphEdgeKind::TopicRelated => write!(f, "topic_related"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TopicHubCandidate {
+    pub hub_id: String,
+    pub hub_title: String,
+    pub topic_key: String,
+    #[serde(default)]
+    pub membership_source: String,
 }
 
 // Keep old LinkType as alias for backward compat with frontend
@@ -362,6 +639,8 @@ pub struct DiscoverLinksResponse {
     #[serde(default)]
     pub exploratory_links: Vec<ZettelLinkCandidate>,
     #[serde(default)]
+    pub topic_hubs: Vec<TopicHubCandidate>,
+    #[serde(default)]
     pub cached_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub is_stale: bool,
@@ -371,6 +650,14 @@ pub struct DiscoverLinksResponse {
 
 fn default_discovery_response_source() -> String {
     "fresh".to_string()
+}
+
+fn default_note_schema_version() -> u32 {
+    CURRENT_NOTE_SCHEMA_VERSION
+}
+
+fn default_graph_edge_provenance() -> GraphEdgeProvenance {
+    GraphEdgeProvenance::Explicit
 }
 
 /// Request to apply discovered links

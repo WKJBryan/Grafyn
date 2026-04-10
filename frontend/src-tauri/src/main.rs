@@ -9,9 +9,10 @@ use models::boot::BootStatus;
 use services::{
     canvas_store::CanvasStore, chunk_index::ChunkIndex, feedback::FeedbackService,
     graph_index::GraphIndex, knowledge_store::KnowledgeStore, link_discovery::LinkDiscoveryService,
-    memory::MemoryService, openrouter::OpenRouterService, priority::PriorityScoringService,
-    retrieval::RetrievalService, search::SearchService, settings::SettingsService,
-    twin_store::TwinStore,
+    markdown_migration::MarkdownMigrationService, memory::MemoryService,
+    openrouter::OpenRouterService, priority::PriorityScoringService, retrieval::RetrievalService,
+    search::SearchService, settings::SettingsService, twin_store::TwinStore,
+    vault_optimizer::VaultOptimizerService,
 };
 use std::sync::Arc;
 use std::time::Instant;
@@ -32,6 +33,8 @@ pub struct AppState {
     pub retrieval_service: Arc<RwLock<RetrievalService>>,
     pub chunk_index: Arc<RwLock<ChunkIndex>>,
     pub link_discovery: Arc<RwLock<LinkDiscoveryService>>,
+    pub markdown_migration: Arc<RwLock<MarkdownMigrationService>>,
+    pub vault_optimizer: Arc<RwLock<VaultOptimizerService>>,
     pub twin_store: Arc<RwLock<TwinStore>>,
     /// MemoryService is stateless — no lock needed, just Arc for shared ownership
     pub memory_service: Arc<MemoryService>,
@@ -75,7 +78,7 @@ fn main() {
             }
 
             // Initialize services
-            let knowledge_store = KnowledgeStore::new(vault_path.clone());
+            let knowledge_store = KnowledgeStore::new(vault_path.clone(), data_path.clone());
             let graph_index = GraphIndex::new();
             let search_service = match SearchService::new(data_path.clone()) {
                 Ok(s) => s,
@@ -133,6 +136,8 @@ fn main() {
             // Initialize retrieval service
             let retrieval_service = RetrievalService::new(data_path.clone());
             let link_discovery = LinkDiscoveryService::new(data_path.clone());
+            let markdown_migration = MarkdownMigrationService::new(data_path.clone());
+            let vault_optimizer = VaultOptimizerService::new(data_path.clone());
 
             // Initialize feedback service using runtime environment only.
             // Release builds must not embed repository credentials.
@@ -152,6 +157,8 @@ fn main() {
                 retrieval_service: Arc::new(RwLock::new(retrieval_service)),
                 chunk_index: Arc::new(RwLock::new(chunk_index)),
                 link_discovery: Arc::new(RwLock::new(link_discovery)),
+                markdown_migration: Arc::new(RwLock::new(markdown_migration)),
+                vault_optimizer: Arc::new(RwLock::new(vault_optimizer)),
                 twin_store: Arc::new(RwLock::new(twin_store)),
                 memory_service: Arc::new(MemoryService::new()),
                 boot_state,
@@ -163,7 +170,10 @@ fn main() {
             let state = app.state::<AppState>().inner().clone();
             tauri::async_runtime::spawn(async move {
                 match warm_start_services(app_handle.clone(), state.clone()).await {
-                    Ok(()) => start_link_discovery_worker(state.clone()),
+                    Ok(()) => {
+                        start_link_discovery_worker(state.clone());
+                        start_vault_optimizer_worker(state.clone());
+                    }
                     Err(error) => {
                         publish_boot_status(
                             &app_handle,
@@ -238,6 +248,16 @@ fn main() {
             commands::settings::pick_vault_folder,
             commands::settings::validate_openrouter_key,
             commands::settings::get_openrouter_status,
+            // Migration + optimizer commands
+            commands::migration::preview_markdown_migration,
+            commands::migration::apply_markdown_migration,
+            commands::migration::get_markdown_migration_status,
+            commands::migration::rollback_markdown_migration,
+            commands::migration::get_vault_optimizer_status,
+            commands::migration::update_vault_optimizer_settings,
+            commands::migration::list_vault_optimizer_decisions,
+            commands::migration::get_vault_optimizer_inbox,
+            commands::migration::rollback_vault_optimizer_change,
             // Distill commands
             commands::distill::distill_note,
             commands::distill::normalize_tags,
@@ -287,20 +307,15 @@ async fn warm_start_services(app_handle: tauri::AppHandle, state: AppState) -> R
     )
     .await;
 
-    let full_notes = {
-        let store = state.knowledge_store.read().await;
-        let note_metas = store.list_notes().map_err(|e| e.to_string())?;
-        let note_ids: Vec<String> = note_metas.iter().map(|m| m.id.clone()).collect();
-        let mut notes = Vec::with_capacity(note_ids.len());
+    {
+        let migration = state.markdown_migration.read().await;
+        let mut store = state.knowledge_store.write().await;
+        migration
+            .backfill_legacy_grafyn_notes(&mut store)
+            .map_err(|error| error.to_string())?;
+    }
 
-        for id in note_ids {
-            if let Ok(note) = store.get_note(&id) {
-                notes.push(note);
-            }
-        }
-
-        notes
-    };
+    let full_notes = crate::commands::sync_topic_hubs(&state).await?;
 
     publish_boot_phase(
         &app_handle,
@@ -343,17 +358,9 @@ async fn warm_start_services(app_handle: tauri::AppHandle, state: AppState) -> R
         }
     }
 
-    publish_boot_phase(
-        &app_handle,
-        &state,
-        &boot_started,
-        BootStatus::new("building_link_discovery", "Preparing link discovery cache"),
-    )
-    .await;
-
     {
-        let mut discovery = state.link_discovery.write().await;
-        discovery.bootstrap(&full_notes);
+        let mut optimizer = state.vault_optimizer.write().await;
+        optimizer.bootstrap(&full_notes);
     }
 
     publish_boot_phase(
@@ -433,6 +440,29 @@ fn start_link_discovery_worker(state: AppState) {
                     );
                     discovery.complete_background_job(&job.note_id, Some("stale"));
                 }
+            }
+        }
+    });
+}
+
+fn start_vault_optimizer_worker(state: AppState) {
+    tauri::async_runtime::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+
+            let settings = {
+                let settings = state.settings_service.read().await;
+                settings.get().clone()
+            };
+
+            let result = {
+                let mut store = state.knowledge_store.write().await;
+                let mut optimizer = state.vault_optimizer.write().await;
+                optimizer.run_next(&mut store, &settings)
+            };
+
+            if let Err(error) = result {
+                log::warn!("Background vault optimizer failed: {}", error);
             }
         }
     });

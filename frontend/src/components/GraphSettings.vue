@@ -35,19 +35,11 @@
           <div class="filter-group">
             <label class="checkbox-label">
               <input
-                v-model="filters.showContainers"
+                v-model="filters.showNotes"
                 type="checkbox"
                 @change="emitFilters"
               >
-              <span class="pill container">Container</span>
-            </label>
-            <label class="checkbox-label">
-              <input
-                v-model="filters.showAtomics"
-                type="checkbox"
-                @change="emitFilters"
-              >
-              <span class="pill atomic">Atomic</span>
+              <span class="pill note">Note</span>
             </label>
             <label class="checkbox-label">
               <input
@@ -264,10 +256,8 @@ const displayOpen = ref(false)
 const forcesOpen = ref(false)
 
 const filters = reactive({
-  showContainers: true,
-  showAtomics: true,
+  showNotes: true,
   showHubs: true,
-  showGeneral: true,
   search: ''
 })
 
@@ -286,10 +276,8 @@ const forces = reactive({
 })
 
 const groupColors = {
-  'Hub': '#f59e0b',
-  'Container': '#8b5cf6',
-  'Atomic': '#10b981',
-  'General': '#6b7280'
+  'Topic hub': '#f59e0b',
+  'Note': '#6b7280'
 }
 
 function emitFilters() {
@@ -430,10 +418,8 @@ emitForces()
   font-weight: 500;
 }
 
-.pill.container { background: rgba(139, 92, 246, 0.2); color: #8b5cf6; }
-.pill.atomic { background: rgba(16, 185, 129, 0.2); color: #10b981; }
+.pill.note { background: rgba(107, 114, 128, 0.2); color: #6b7280; }
 .pill.hub { background: rgba(245, 158, 11, 0.2); color: #f59e0b; }
-.pill.general { background: rgba(107, 114, 128, 0.2); color: #6b7280; }
 
 .search-input {
   width: 100%;

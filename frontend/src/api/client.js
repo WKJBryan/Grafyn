@@ -139,6 +139,31 @@ export const settings = {
   getOpenRouterStatus: () => invoke('get_openrouter_status', {}),
 }
 
+export const migration = {
+  preview: (vaultPath, request) => invoke('preview_markdown_migration', { vaultPath, request }),
+
+  apply: (previewId, request) => invoke('apply_markdown_migration', { previewId, request }),
+
+  status: (runId = null) => invoke('get_markdown_migration_status', { runId }),
+
+  rollback: (runId) => invoke('rollback_markdown_migration', { runId }),
+}
+
+export const optimizer = {
+  status: () => invoke('get_vault_optimizer_status', {}),
+
+  updateSettings: (update) => invoke('update_vault_optimizer_settings', { update }),
+
+  decisions: (limit = 20, cursor = null) =>
+    invoke('list_vault_optimizer_decisions', { limit, cursor }),
+
+  inbox: (status = null, limit = 20) =>
+    invoke('get_vault_optimizer_inbox', { status, limit }),
+
+  rollbackChange: (changeId) =>
+    invoke('rollback_vault_optimizer_change', { changeId }),
+}
+
 // MCP API
 export const mcp = {
   getStatus: () => invoke('get_mcp_status', {}),

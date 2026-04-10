@@ -93,11 +93,11 @@ describe('GraphView', () => {
   let wrapper
   const mockGraphData = {
     nodes: [
-      { id: '1', label: 'Note 1', val: 5 },
-      { id: '2', label: 'Note 2', val: 1 },
+      { id: '1', label: 'Note 1', val: 5, node_kind: 'note' },
+      { id: '2', label: 'Hub: Topic', val: 1, node_kind: 'topic_hub', note_type: 'hub' },
     ],
     links: [
-      { source: '1', target: '2' }
+      { source: '1', target: '2', edge_kind: 'topic_membership' }
     ]
   }
 
@@ -139,8 +139,8 @@ describe('GraphView', () => {
     expect(apiClient.graph.full).toHaveBeenCalledTimes(1)
 
     // Stats rendered
-    expect(wrapper.find('.toolbar-stats').text()).toContain('2 Notes')
-    expect(wrapper.find('.toolbar-stats').text()).toContain('1 Links')
+    expect(wrapper.find('.toolbar-stats').text()).toContain('2 Nodes')
+    expect(wrapper.find('.toolbar-stats').text()).toContain('1 Edges')
   })
 
   it('waits for boot readiness before loading graph data', async () => {

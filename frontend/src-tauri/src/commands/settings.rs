@@ -1,6 +1,6 @@
 //! Tauri commands for user settings management
 
-use crate::commands::rebuild_link_discovery;
+use crate::commands::rebuild_all_indexes;
 use crate::models::settings::{SettingsStatus, SettingsUpdate, UserSettings};
 use crate::AppState;
 use tauri::State;
@@ -56,40 +56,7 @@ pub async fn update_settings(
             ks.set_vault_path(new_vault_path);
         }
 
-        // Read all notes from new vault and rebuild indices
-        let notes = {
-            let ks = state.knowledge_store.read().await;
-            let metas = ks.list_notes().unwrap_or_default();
-            metas
-                .iter()
-                .filter_map(|m| ks.get_note(&m.id).ok())
-                .collect::<Vec<_>>()
-        };
-
-        // Rebuild search index
-        {
-            let mut search = state.search_service.write().await;
-            if let Err(e) = search.reindex_all(&notes) {
-                log::error!("Failed to reindex after vault change: {}", e);
-            }
-        }
-
-        // Rebuild graph index
-        {
-            let mut graph = state.graph_index.write().await;
-            graph.build_from_notes(&notes);
-        }
-
-        // Rebuild chunk index used by semantic canvas context
-        {
-            let mut chunks = state.chunk_index.write().await;
-            if let Err(e) = chunks.reindex_all(&notes) {
-                log::error!("Failed to rebuild chunk index after vault change: {}", e);
-            }
-        }
-
-        rebuild_link_discovery(state.inner(), &notes).await;
-
+        rebuild_all_indexes(state.inner()).await?;
         log::info!("Services rebuilt for new vault path");
     }
 

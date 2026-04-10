@@ -73,4 +73,24 @@ describe('LinkCandidateModal', () => {
     expect(wrapper.text()).toContain('Strong Matches')
     expect(wrapper.text()).toContain('Exploratory')
   })
+
+  it('renders topic hubs separately from manual link candidates', () => {
+    wrapper = mount(LinkCandidateModal, {
+      props: {
+        noteId: 'n1',
+        topicHubCandidates: [
+          {
+            hub_id: 'hub-ai',
+            hub_title: 'Hub: AI',
+            topic_key: 'ai',
+            membership_source: 'auto',
+          },
+        ],
+      },
+    })
+
+    expect(wrapper.text()).toContain('Topic Hubs')
+    expect(wrapper.text()).toContain('Hub: AI')
+    expect(wrapper.text()).not.toContain('Select all')
+  })
 })

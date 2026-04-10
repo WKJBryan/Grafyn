@@ -169,6 +169,61 @@ impl SettingsService {
                 background_link_discovery_llm_enabled;
         }
 
+        if let Some(background_vault_optimizer_enabled) = update.background_vault_optimizer_enabled
+        {
+            self.settings.background_vault_optimizer_enabled = background_vault_optimizer_enabled;
+        }
+
+        if let Some(background_vault_optimizer_llm_enabled) =
+            update.background_vault_optimizer_llm_enabled
+        {
+            self.settings.background_vault_optimizer_llm_enabled =
+                background_vault_optimizer_llm_enabled;
+        }
+
+        if let Some(background_vault_optimizer_budget_monthly) =
+            update.background_vault_optimizer_budget_monthly
+        {
+            self.settings.background_vault_optimizer_budget_monthly =
+                background_vault_optimizer_budget_monthly;
+        }
+
+        if let Some(background_vault_optimizer_max_daily_writes) =
+            update.background_vault_optimizer_max_daily_writes
+        {
+            self.settings.background_vault_optimizer_max_daily_writes =
+                background_vault_optimizer_max_daily_writes.max(1);
+        }
+
+        if let Some(background_vault_optimizer_edit_mode) =
+            update.background_vault_optimizer_edit_mode
+        {
+            self.settings.background_vault_optimizer_edit_mode =
+                if background_vault_optimizer_edit_mode.trim().is_empty() {
+                    "sidecar_first".to_string()
+                } else {
+                    background_vault_optimizer_edit_mode
+                };
+        }
+
+        if let Some(background_vault_optimizer_program_enabled) =
+            update.background_vault_optimizer_program_enabled
+        {
+            self.settings.background_vault_optimizer_program_enabled =
+                background_vault_optimizer_program_enabled;
+        }
+
+        if let Some(vault_optimizer_program_path) = update.vault_optimizer_program_path {
+            self.settings.vault_optimizer_program_path = if vault_optimizer_program_path
+                .trim()
+                .is_empty()
+            {
+                "_grafyn/program.md".to_string()
+            } else {
+                vault_optimizer_program_path.replace('\\', "/")
+            };
+        }
+
         if let Some(canvas_model_presets) = update.canvas_model_presets {
             self.settings.canvas_model_presets = canvas_model_presets;
         }
@@ -329,6 +384,13 @@ mod tests {
                 smart_web_search: None,
                 background_link_discovery_enabled: None,
                 background_link_discovery_llm_enabled: None,
+                background_vault_optimizer_enabled: None,
+                background_vault_optimizer_llm_enabled: None,
+                background_vault_optimizer_budget_monthly: None,
+                background_vault_optimizer_max_daily_writes: None,
+                background_vault_optimizer_edit_mode: None,
+                background_vault_optimizer_program_enabled: None,
+                vault_optimizer_program_path: None,
                 canvas_model_presets: Some(presets.clone()),
             })
             .expect("settings update should succeed");

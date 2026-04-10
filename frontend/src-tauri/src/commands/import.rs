@@ -71,8 +71,13 @@ pub async fn apply_import(
         let note_create = NoteCreate {
             title: conv.title.clone(),
             content: markdown,
+            relative_path: None,
+            aliases: Vec::new(),
             status: NoteStatus::Evidence,
             tags,
+            schema_version: crate::models::note::CURRENT_NOTE_SCHEMA_VERSION,
+            migration_source: Some("import".to_string()),
+            optimizer_managed: false,
             properties: {
                 let mut props = std::collections::HashMap::new();
                 props.insert(

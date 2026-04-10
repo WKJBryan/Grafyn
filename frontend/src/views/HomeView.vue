@@ -143,6 +143,10 @@
           </div>
 
           <div class="sidebar-section">
+            <VaultOptimizerPanel />
+          </div>
+
+          <div class="sidebar-section">
             <div class="section-title">
               Interactive Graph
             </div>
@@ -263,6 +267,7 @@ import MiniGraph from '../components/MiniGraph.vue'
 import OnThisPage from '../components/OnThisPage.vue'
 import GraphView from '../components/GraphView.vue'
 import LinkSuggestionInbox from '../components/LinkSuggestionInbox.vue'
+import VaultOptimizerPanel from '../components/VaultOptimizerPanel.vue'
 import TopicSelector from '../components/TopicSelector.vue'
 import FeedbackModal from '../components/FeedbackModal.vue'
 import SettingsModal from '../components/SettingsModal.vue'
