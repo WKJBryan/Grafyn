@@ -65,7 +65,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(&data_path)?;
 
     // Initialize services
-    let knowledge_store = KnowledgeStore::new(vault_path);
+    let knowledge_store = KnowledgeStore::new(vault_path, data_path.clone());
 
     // Try full SearchService first; fall back to read-only if writer lock is held
     let search_service = match SearchService::new(data_path.clone()) {

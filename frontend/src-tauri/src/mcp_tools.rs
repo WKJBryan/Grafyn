@@ -3,7 +3,7 @@
 //! Implements 12 MCP tools that expose the knowledge base to Claude Desktop
 //! and other MCP clients via the rmcp crate.
 
-use crate::models::note::{NoteCreate, NoteStatus, NoteUpdate};
+use crate::models::note::{NoteCreate, NoteStatus, NoteUpdate, CURRENT_NOTE_SCHEMA_VERSION};
 use crate::services::chunk_index::ChunkIndex;
 use crate::services::graph_index::GraphIndex;
 use crate::services::import;
@@ -278,8 +278,13 @@ impl GrafynMcpServer {
         let create = NoteCreate {
             title: params.title,
             content: params.content,
+            relative_path: None,
+            aliases: Vec::new(),
             status,
             tags: params.tags,
+            schema_version: CURRENT_NOTE_SCHEMA_VERSION,
+            migration_source: None,
+            optimizer_managed: false,
             properties: Default::default(),
         };
 
@@ -323,8 +328,13 @@ impl GrafynMcpServer {
         let update = NoteUpdate {
             title: params.title,
             content: params.content,
+            relative_path: None,
+            aliases: None,
             status: params.status.map(|s: String| s.parse().unwrap_or_default()),
             tags: params.tags,
+            schema_version: None,
+            migration_source: None,
+            optimizer_managed: None,
             properties: None,
         };
 
@@ -504,8 +514,13 @@ impl GrafynMcpServer {
             let note_create = NoteCreate {
                 title: conv.title.clone(),
                 content: markdown,
+                relative_path: None,
+                aliases: Vec::new(),
                 status: NoteStatus::Evidence,
                 tags,
+                schema_version: CURRENT_NOTE_SCHEMA_VERSION,
+                migration_source: Some("mcp-import".into()),
+                optimizer_managed: false,
                 properties: {
                     let mut props = std::collections::HashMap::new();
                     props.insert(
