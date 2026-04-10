@@ -1,4 +1,4 @@
-use crate::commands::{sync_chunk_index_for_note, sync_chunk_index_for_notes};
+use crate::commands::{sync_chunk_index_for_note, sync_chunk_index_for_notes, sync_topic_hubs};
 use crate::models::note::{
     DeduplicationAction, DistillRequest, DistillResponse, ExtractionMode, HubCreatePolicy,
     HubUpdate, NoteCreate, NoteStatus, NoteUpdate,
@@ -595,6 +595,7 @@ fn apply_hub_policy(
 // ── Hub management ─────────────────────────────────────────────────────────
 
 /// Create or update a hub note, returning a HubUpdate if successful
+#[allow(dead_code)]
 async fn update_hub(hub_title: &str, atomic_id: &str, state: &AppState) -> Option<HubUpdate> {
     let hub_id = hub_title.replace(' ', "_").replace(':', "").to_lowercase();
 
@@ -671,8 +672,13 @@ async fn update_hub(hub_title: &str, atomic_id: &str, state: &AppState) -> Optio
         let hub_create = NoteCreate {
             title: hub_title.to_string(),
             content,
+            relative_path: None,
+            aliases: Vec::new(),
             status: NoteStatus::Draft,
             tags: vec!["hub".to_string(), "grafyn".to_string()],
+            schema_version: crate::models::note::CURRENT_NOTE_SCHEMA_VERSION,
+            migration_source: None,
+            optimizer_managed: true,
             properties: Default::default(),
         };
 
@@ -705,6 +711,40 @@ async fn update_hub(hub_title: &str, atomic_id: &str, state: &AppState) -> Optio
             None
         }
     }
+}
+
+fn build_topic_hub_updates(
+    notes: &[crate::models::note::Note],
+    atomic_ids: &[String],
+    existing_hub_ids: &std::collections::HashSet<String>,
+) -> Vec<HubUpdate> {
+    let mut updates = std::collections::HashMap::<String, HubUpdate>::new();
+
+    for atomic_id in atomic_ids {
+        for membership in crate::services::topic_hub::collect_note_topic_hubs(notes, atomic_id) {
+            let entry = updates
+                .entry(membership.hub_id.clone())
+                .or_insert_with(|| HubUpdate {
+                    hub_id: membership.hub_id.clone(),
+                    hub_title: membership.hub_title.clone(),
+                    action: if existing_hub_ids.contains(&membership.hub_id) {
+                        "updated".to_string()
+                    } else {
+                        "created".to_string()
+                    },
+                    atomic_ids_added: Vec::new(),
+                });
+            entry.atomic_ids_added.push(atomic_id.clone());
+        }
+    }
+
+    let mut ordered = updates.into_values().collect::<Vec<_>>();
+    for update in &mut ordered {
+        update.atomic_ids_added.sort();
+        update.atomic_ids_added.dedup();
+    }
+    ordered.sort_by(|left, right| left.hub_title.cmp(&right.hub_title));
+    ordered
 }
 
 // ── Main distill command ───────────────────────────────────────────────────
@@ -786,12 +826,23 @@ pub async fn distill_note(
         });
     }
 
+    let existing_hub_ids = {
+        let store = state.knowledge_store.read().await;
+        store
+            .list_full_notes()
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .filter(|existing| existing.is_topic_hub())
+            .map(|existing| existing.id)
+            .collect::<std::collections::HashSet<_>>()
+    };
+
     // 4. Apply hub policy — determine which candidates get hubs
     let hub_assignments = apply_hub_policy(&candidates, &request.hub_policy);
 
     // 5. Create atomic notes (with deduplication)
     let mut created_ids: Vec<String> = Vec::new();
-    let mut hub_updates: Vec<HubUpdate> = Vec::new();
+    let hub_updates: Vec<HubUpdate>;
     let mut skipped_duplicates: usize = 0;
     let mut merged_into: Vec<String> = Vec::new();
     let mut chunk_updates = Vec::new();
@@ -862,6 +913,12 @@ pub async fn distill_note(
         }
 
         let mut tags = candidate.recommended_tags.clone();
+        if let Some(hub_title) = hub_assignments[i].as_ref() {
+            let hub_topic_tag = normalize_tag(hub_title.trim_start_matches("Hub: "));
+            if !hub_topic_tag.is_empty() {
+                tags.push(hub_topic_tag);
+            }
+        }
         tags.push("draft".to_string());
         let tags = normalize_all_tags(&tags);
 
@@ -888,8 +945,13 @@ pub async fn distill_note(
         let note_create = NoteCreate {
             title: candidate.title.clone(),
             content,
+            relative_path: None,
+            aliases: Vec::new(),
             status: NoteStatus::Draft,
             tags,
+            schema_version: crate::models::note::CURRENT_NOTE_SCHEMA_VERSION,
+            migration_source: None,
+            optimizer_managed: false,
             properties: Default::default(),
         };
 
@@ -918,13 +980,6 @@ pub async fn distill_note(
         chunk_updates.push(created.clone());
 
         created_ids.push(created.id.clone());
-
-        // Create/update hub if policy allows
-        if let Some(ref hub_title) = hub_assignments[i] {
-            if let Some(hu) = update_hub(hub_title, &created.id, &state).await {
-                hub_updates.push(hu);
-            }
-        }
     }
 
     // 6. Update container note with extracted links
@@ -988,6 +1043,8 @@ pub async fn distill_note(
     };
 
     sync_chunk_index_for_notes(state.inner(), &chunk_updates).await;
+    let synced_notes = sync_topic_hubs(state.inner()).await?;
+    hub_updates = build_topic_hub_updates(&synced_notes, &created_ids, &existing_hub_ids);
 
     // 7. Build response message
     let count = created_ids.len();
@@ -1056,23 +1113,16 @@ pub async fn normalize_tags(
         ..Default::default()
     };
 
-    let updated = {
+    {
         let mut store = state.knowledge_store.write().await;
-        store.update_note(&id, update).map_err(|e| e.to_string())?
-    };
-
-    // Update search + graph
-    {
-        let mut search = state.search_service.write().await;
-        let _ = search.index_note(&updated);
-        let _ = search.commit();
-    }
-    {
-        let mut graph = state.graph_index.write().await;
-        graph.update_note(&updated);
+        store.update_note(&id, update).map_err(|e| e.to_string())?;
     }
 
-    Ok(updated)
+    let synced_notes = sync_topic_hubs(state.inner()).await?;
+    synced_notes
+        .into_iter()
+        .find(|updated| updated.id == id)
+        .ok_or_else(|| "Updated note not found after topic sync".to_string())
 }
 
 #[cfg(test)]

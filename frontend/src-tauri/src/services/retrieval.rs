@@ -249,6 +249,8 @@ impl RetrievalService {
             );
         }
 
+        self.apply_topic_hub_boosts(&mut candidates, graph, context_note_ids);
+
         // Step 4: Graph expansion — add N-hop neighbors with relation-type weighting
         let seed_ids: HashSet<String> = search_results
             .iter()
@@ -382,6 +384,14 @@ impl RetrievalService {
                 chunk.search_score += proximity_boost;
             }
 
+            let topic_boost = context_note_ids
+                .iter()
+                .map(|context_id| graph.topic_relation_score(context_id, parent_id))
+                .fold(0.0_f64, f64::max) as f32;
+            if topic_boost > 0.0 {
+                chunk.search_score += self.config.graph_proximity_weight * topic_boost * 0.75;
+            }
+
             // Hub boost
             let backlink_count = graph.get_backlinks(parent_id).len();
             if backlink_count >= self.config.hub_threshold {
@@ -467,6 +477,43 @@ impl RetrievalService {
 
         neighbors
     }
+
+    fn apply_topic_hub_boosts(
+        &self,
+        candidates: &mut HashMap<String, CandidateEntry>,
+        graph: &GraphIndex,
+        context_note_ids: &[String],
+    ) {
+        if context_note_ids.is_empty() {
+            return;
+        }
+
+        for (candidate_id, entry) in candidates.iter_mut() {
+            let topic_score = context_note_ids
+                .iter()
+                .map(|context_id| graph.topic_relation_score(context_id, candidate_id))
+                .fold(0.0_f64, f64::max) as f32;
+
+            if topic_score <= 0.0 {
+                continue;
+            }
+
+            let shared_hub = context_note_ids.iter().any(|context_id| {
+                let context_hubs = graph.get_note_topic_hub_ids(context_id);
+                let candidate_hubs = graph.get_note_topic_hub_ids(candidate_id);
+                context_hubs
+                    .iter()
+                    .any(|hub_id| candidate_hubs.contains(hub_id))
+            });
+
+            entry.score += self.config.graph_proximity_weight * topic_score * 0.75;
+            entry.reasons.push(if shared_hub {
+                "shared topic hub".to_string()
+            } else {
+                "adjacent topic hub".to_string()
+            });
+        }
+    }
 }
 
 /// Partial update for retrieval config
@@ -496,6 +543,7 @@ mod tests {
             .iter()
             .map(|title| ParsedLink {
                 target_title: title.clone(),
+                target_path: None,
                 relation: RelationType::Untyped,
             })
             .collect();
@@ -503,10 +551,15 @@ mod tests {
             id: id.to_string(),
             title: title.to_string(),
             content: format!("Content of {}", title),
+            relative_path: format!("{}.md", id),
+            aliases: Vec::new(),
             status: NoteStatus::Draft,
             tags: vec![],
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            schema_version: crate::models::note::CURRENT_NOTE_SCHEMA_VERSION,
+            migration_source: None,
+            optimizer_managed: false,
             wikilinks: wikilink_strings,
             parsed_links,
             properties: HashMap::new(),
@@ -519,6 +572,7 @@ mod tests {
             .into_iter()
             .map(|(target, relation)| ParsedLink {
                 target_title: target.to_string(),
+                target_path: None,
                 relation,
             })
             .collect();
@@ -526,10 +580,15 @@ mod tests {
             id: id.to_string(),
             title: title.to_string(),
             content: format!("Content of {}", title),
+            relative_path: format!("{}.md", id),
+            aliases: Vec::new(),
             status: NoteStatus::Draft,
             tags: vec![],
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            schema_version: crate::models::note::CURRENT_NOTE_SCHEMA_VERSION,
+            migration_source: None,
+            optimizer_managed: false,
             wikilinks: wikilink_strings,
             parsed_links,
             properties: HashMap::new(),

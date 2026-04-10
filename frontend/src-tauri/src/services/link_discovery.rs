@@ -1,7 +1,9 @@
 use crate::models::link_discovery::{
     DismissLinkSuggestionResponse, LinkDiscoveryStatus, LinkSuggestionQueueEntry,
 };
-use crate::models::note::{ChunkResult, DiscoverLinksResponse, Note, ZettelLinkCandidate};
+use crate::models::note::{
+    ChunkResult, DiscoverLinksResponse, Note, TopicHubCandidate, ZettelLinkCandidate,
+};
 use crate::models::settings::UserSettings;
 use crate::services::retrieval::RetrievalResult;
 use crate::services::similarity::{SimilarityProvider, TfIdfProvider};
@@ -63,6 +65,12 @@ pub struct LinkDiscoveryProfile {
     pub note_id: String,
     pub title: String,
     pub tags: Vec<String>,
+    #[serde(default)]
+    pub topic_key: Option<String>,
+    #[serde(default)]
+    pub topic_hub_ids: Vec<String>,
+    #[serde(default)]
+    pub is_topic_hub: bool,
     pub summary: String,
     pub key_terms: Vec<String>,
     pub term_vector: HashMap<String, f64>,
@@ -206,10 +214,7 @@ impl LinkDiscoveryService {
 
     pub fn bootstrap(&mut self, notes: &[Note]) {
         let actual_ids: HashSet<String> = notes.iter().map(|note| note.id.clone()).collect();
-        let title_to_id = notes
-            .iter()
-            .map(|note| (note.title.to_lowercase(), note.id.clone()))
-            .collect::<HashMap<_, _>>();
+        let title_to_id = build_reference_index(notes);
 
         for note in notes {
             let previous = self.stored_notes.get(&note.id).cloned();
@@ -270,6 +275,10 @@ impl LinkDiscoveryService {
             .map(|(id, profile)| (profile.title.to_lowercase(), id.clone()))
             .collect::<HashMap<_, _>>();
         title_to_id.insert(note.title.to_lowercase(), note.id.clone());
+        title_to_id.insert(note.relative_path.to_lowercase(), note.id.clone());
+        for alias in &note.aliases {
+            title_to_id.entry(alias.to_lowercase()).or_insert_with(|| note.id.clone());
+        }
 
         let previous = self.stored_notes.get(&note.id).cloned();
         let last_discovered_at = previous.as_ref().and_then(|record| record.cached_at);
@@ -616,10 +625,51 @@ impl LinkDiscoveryService {
                 .take(exploratory_limit(max_links))
                 .cloned()
                 .collect(),
+            topic_hubs: self.build_topic_hub_candidates(&record.profile),
             cached_at: record.cached_at,
             is_stale: record.is_stale,
             source: source.to_string(),
         }
+    }
+
+    fn build_topic_hub_candidates(&self, profile: &LinkDiscoveryProfile) -> Vec<TopicHubCandidate> {
+        let mut topic_hubs = if profile.is_topic_hub {
+            vec![TopicHubCandidate {
+                hub_id: profile.note_id.clone(),
+                hub_title: profile.title.clone(),
+                topic_key: profile
+                    .topic_key
+                    .clone()
+                    .unwrap_or_else(|| profile.title.to_lowercase()),
+                membership_source: "hub".to_string(),
+            }]
+        } else {
+            profile
+                .topic_hub_ids
+                .iter()
+                .filter_map(|hub_id| {
+                    let hub_profile = self.profiles.get(hub_id)?;
+                    Some(TopicHubCandidate {
+                        hub_id: hub_id.clone(),
+                        hub_title: hub_profile.title.clone(),
+                        topic_key: hub_profile
+                            .topic_key
+                            .clone()
+                            .or_else(|| profile.topic_key.clone())
+                            .unwrap_or_else(|| hub_profile.title.to_lowercase()),
+                        membership_source: "auto".to_string(),
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+
+        topic_hubs.sort_by(|left, right| {
+            left.hub_title
+                .cmp(&right.hub_title)
+                .then_with(|| left.hub_id.cmp(&right.hub_id))
+        });
+        topic_hubs.dedup_by(|left, right| left.hub_id == right.hub_id);
+        topic_hubs
     }
 
     fn enqueue(&mut self, note_id: String, priority: QueuePriority) {
@@ -826,7 +876,9 @@ pub fn sample_exploratory_candidates(
     let mut plausible_pool = all_profiles
         .values()
         .filter(|profile| {
-            profile.note_id != source_profile.note_id && !excluded_ids.contains(&profile.note_id)
+            !profile.is_topic_hub
+                && profile.note_id != source_profile.note_id
+                && !excluded_ids.contains(&profile.note_id)
         })
         .filter_map(|profile| {
             let term_cosine = cosine_similarity(&source_profile.term_vector, &profile.term_vector);
@@ -1003,7 +1055,13 @@ pub fn build_profile(
     let existing_link_ids = note
         .parsed_links
         .iter()
-        .filter_map(|parsed_link| title_to_id.get(&parsed_link.target_title.to_lowercase()))
+        .filter_map(|parsed_link| {
+            parsed_link
+                .target_path
+                .as_ref()
+                .and_then(|target_path| title_to_id.get(&target_path.to_lowercase()))
+                .or_else(|| title_to_id.get(&parsed_link.target_title.to_lowercase()))
+        })
         .cloned()
         .collect::<HashSet<_>>()
         .into_iter()
@@ -1013,6 +1071,9 @@ pub fn build_profile(
         note_id: note.id.clone(),
         title: note.title.clone(),
         tags: note.tags.clone(),
+        topic_key: note.topic_key(),
+        topic_hub_ids: note.topic_hub_ids(),
+        is_topic_hub: note.is_topic_hub(),
         summary,
         key_terms,
         term_vector,
@@ -1027,6 +1088,21 @@ pub fn build_profile(
         last_discovered_at,
         is_stale: last_discovered_at.is_none(),
     }
+}
+
+fn build_reference_index(notes: &[Note]) -> HashMap<String, String> {
+    let mut refs = HashMap::new();
+    for note in notes {
+        refs.entry(note.title.to_lowercase())
+            .or_insert_with(|| note.id.clone());
+        refs.entry(note.relative_path.to_lowercase())
+            .or_insert_with(|| note.id.clone());
+        for alias in &note.aliases {
+            refs.entry(alias.to_lowercase())
+                .or_insert_with(|| note.id.clone());
+        }
+    }
+    refs
 }
 
 pub fn cosine_similarity(a: &HashMap<String, f64>, b: &HashMap<String, f64>) -> f64 {
@@ -1163,6 +1239,7 @@ pub async fn discover_for_note(
             note_id: note_id.to_string(),
             links: Vec::new(),
             exploratory_links: Vec::new(),
+            topic_hubs: Vec::new(),
             cached_at: None,
             is_stale: false,
             source: "fresh".to_string(),
@@ -1209,14 +1286,44 @@ pub async fn discover_for_note(
 
     let chunk_results = {
         let chunks = state.chunk_index.read().await;
-        chunks
-            .search_chunks(&query, DEFAULT_CHUNK_LIMIT)
+        let graph = state.graph_index.read().await;
+        let priority = state.priority_service.read().await;
+        let retrieval = state.retrieval_service.read().await;
+        retrieval
+            .retrieve_chunks(
+                &chunks,
+                &graph,
+                &priority,
+                &query,
+                DEFAULT_CHUNK_LIMIT * 32,
+                &[note_id.to_string()],
+            )
             .unwrap_or_default()
     };
 
     let second_hop_counts = {
         let graph = state.graph_index.read().await;
         build_second_hop_counts(&graph, &snapshot.source_profile)
+    };
+
+    let topic_relation_scores = {
+        let graph = state.graph_index.read().await;
+        note_results
+            .iter()
+            .map(|result| result.note.id.clone())
+            .chain(
+                chunk_results
+                    .iter()
+                    .map(|chunk| chunk.parent_note_id.clone()),
+            )
+            .chain(second_hop_counts.keys().cloned())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .map(|candidate_id| {
+                let score = graph.topic_relation_score(note_id, &candidate_id);
+                (candidate_id, score)
+            })
+            .collect::<HashMap<_, _>>()
     };
 
     let ranking_started_at = Instant::now();
@@ -1229,6 +1336,7 @@ pub async fn discover_for_note(
             &note_results,
             &chunk_results,
             &second_hop_counts,
+            &topic_relation_scores,
         );
 
         let mut excluded_ids = snapshot.dismissed_target_ids.clone();
@@ -1294,6 +1402,7 @@ pub async fn discover_for_note(
             note_id: note_id.to_string(),
             links: links.clone(),
             exploratory_links: exploratory_links.clone(),
+            topic_hubs: Vec::new(),
             cached_at: Some(Utc::now()),
             is_stale: false,
             source: "fresh".to_string(),
@@ -1307,6 +1416,7 @@ pub async fn discover_for_note(
             .into_iter()
             .take(exploratory_limit(max_links))
             .collect(),
+        topic_hubs: stored.topic_hubs,
         cached_at: stored.cached_at,
         is_stale: stored.is_stale,
         source: "fresh".to_string(),
@@ -1320,6 +1430,7 @@ fn build_local_ranked_candidates(
     note_results: &[RetrievalResult],
     chunk_results: &[ChunkResult],
     second_hop_counts: &HashMap<String, usize>,
+    topic_relation_scores: &HashMap<String, f64>,
 ) -> Vec<RankedLinkCandidate> {
     let source_tags = source_profile
         .tags
@@ -1352,6 +1463,9 @@ fn build_local_ranked_candidates(
             continue;
         }
         if let Some(profile) = all_profiles.get(&result.note.id) {
+            if profile.is_topic_hub {
+                continue;
+            }
             let entry = signals_map
                 .entry(result.note.id.clone())
                 .or_insert_with(|| base_signals(profile));
@@ -1367,6 +1481,9 @@ fn build_local_ranked_candidates(
             continue;
         }
         if let Some(profile) = all_profiles.get(&chunk.parent_note_id) {
+            if profile.is_topic_hub {
+                continue;
+            }
             let entry = signals_map
                 .entry(chunk.parent_note_id.clone())
                 .or_insert_with(|| base_signals(profile));
@@ -1389,6 +1506,9 @@ fn build_local_ranked_candidates(
             continue;
         }
         if let Some(profile) = all_profiles.get(candidate_id) {
+            if profile.is_topic_hub {
+                continue;
+            }
             let entry = signals_map
                 .entry(candidate_id.clone())
                 .or_insert_with(|| base_signals(profile));
@@ -1404,6 +1524,9 @@ fn build_local_ranked_candidates(
         .collect::<HashSet<_>>();
     for (candidate_id, entry) in &mut signals_map {
         if let Some(profile) = all_profiles.get(candidate_id) {
+            if profile.is_topic_hub {
+                continue;
+            }
             let candidate_tags = profile
                 .tags
                 .iter()
@@ -1425,6 +1548,9 @@ fn build_local_ranked_candidates(
                 let overlap_score =
                     (shared_neighbors as f64 / source_link_set.len() as f64).clamp(0.0, 1.0);
                 entry.graph_proximity = entry.graph_proximity.max(overlap_score);
+            }
+            if let Some(topic_score) = topic_relation_scores.get(candidate_id) {
+                entry.graph_proximity = entry.graph_proximity.max(*topic_score);
             }
         }
     }
@@ -1605,15 +1731,21 @@ mod tests {
             id: id.to_string(),
             title: title.to_string(),
             content: content.to_string(),
+            relative_path: format!("{}.md", id),
+            aliases: Vec::new(),
             status: NoteStatus::Draft,
             tags: tags.iter().map(|tag| tag.to_string()).collect(),
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            schema_version: crate::models::note::CURRENT_NOTE_SCHEMA_VERSION,
+            migration_source: None,
+            optimizer_managed: false,
             wikilinks: links.iter().map(|link| link.to_string()).collect(),
             parsed_links: links
                 .iter()
                 .map(|link| ParsedLink {
                     target_title: (*link).to_string(),
+                    target_path: None,
                     relation: RelationType::Related,
                 })
                 .collect(),
@@ -1680,6 +1812,9 @@ mod tests {
             note_id: "source".to_string(),
             title: "Source".to_string(),
             tags: vec!["ai".to_string()],
+            topic_key: None,
+            topic_hub_ids: Vec::new(),
+            is_topic_hub: false,
             summary: "About machine learning".to_string(),
             key_terms: vec!["machine learning".to_string()],
             term_vector: HashMap::from([
@@ -1699,6 +1834,9 @@ mod tests {
                     note_id: "a".to_string(),
                     title: "A".to_string(),
                     tags: vec!["ai".to_string()],
+                    topic_key: None,
+                    topic_hub_ids: Vec::new(),
+                    is_topic_hub: false,
                     summary: "Machine learning systems".to_string(),
                     key_terms: vec!["machine learning".to_string()],
                     term_vector: HashMap::from([("machine".to_string(), 1.0)]),
@@ -1715,6 +1853,9 @@ mod tests {
                     note_id: "b".to_string(),
                     title: "B".to_string(),
                     tags: vec!["research".to_string()],
+                    topic_key: None,
+                    topic_hub_ids: Vec::new(),
+                    is_topic_hub: false,
                     summary: "Model evaluation".to_string(),
                     key_terms: vec!["model evaluation".to_string()],
                     term_vector: HashMap::from([("model".to_string(), 1.0)]),

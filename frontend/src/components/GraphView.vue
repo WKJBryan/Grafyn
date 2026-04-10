@@ -8,11 +8,17 @@
         v-if="stats"
         class="toolbar-stats"
       >
-        <span class="stat-item">{{ stats.nodes }} Notes</span>
+        <span class="stat-item">{{ stats.nodes }} Nodes</span>
         <span class="stat-divider">•</span>
-        <span class="stat-item">{{ stats.edges }} Links</span>
+        <span class="stat-item">{{ stats.edges }} Edges</span>
       </div>
       <div class="toolbar-actions">
+        <div class="graph-legend">
+          <span class="legend-item"><i class="legend-swatch explicit" />Explicit</span>
+          <span class="legend-item"><i class="legend-swatch inferred" />Inferred</span>
+          <span class="legend-item"><i class="legend-swatch topic" />Topic</span>
+          <span class="legend-item"><i class="legend-swatch auto" />Auto</span>
+        </div>
         <button
           class="btn btn-secondary btn-sm"
           title="Refresh Graph"
@@ -120,10 +126,8 @@ let allLinks = []
 
 // Settings state
 const currentFilters = ref({
-  showContainers: true,
-  showAtomics: true,
+  showNotes: true,
   showHubs: true,
-  showGeneral: true,
   search: ''
 })
 
@@ -203,14 +207,11 @@ async function loadGraph() {
 function applyFilters() {
   const f = currentFilters.value
   
-  // Filter nodes by type and search
+  // Filter nodes by kind and search
   nodes = allNodes.filter(node => {
-    // Type filter
-    const type = node.note_type || 'general'
-    if (type === 'container' && !f.showContainers) return false
-    if (type === 'atomic' && !f.showAtomics) return false
-    if (type === 'hub' && !f.showHubs) return false
-    if (type === 'general' && !f.showGeneral) return false
+    const nodeKind = node.node_kind || (node.note_type === 'hub' ? 'topic_hub' : 'note')
+    if (nodeKind === 'topic_hub' && !f.showHubs) return false
+    if (nodeKind !== 'topic_hub' && !f.showNotes) return false
     
     // Search filter
     if (f.search && !node.label.toLowerCase().includes(f.search.toLowerCase())) {
@@ -276,19 +277,6 @@ function initGraph() {
     .force('y', forceY(canvasHeight / 2).strength(currentForces.value.center))
     .force('collide', forceCollide(30).strength(0.7))
     
-  // Relation type → link color mapping
-  const relationColors = {
-    supports: '#4ade80',     // green
-    contradicts: '#f87171',  // red
-    expands: '#60a5fa',      // blue
-    questions: '#fbbf24',    // yellow
-    answers: '#a78bfa',      // purple
-    example: '#2dd4bf',      // teal
-    part_of: '#fb923c',      // orange
-    related: '#6b7280',      // gray
-    untyped: '#4a4a4f',      // default
-  }
-
   // Draw lines with relation-based coloring
   const link = zoomGroup.append('g')
     .attr('class', 'links-group')
@@ -296,7 +284,7 @@ function initGraph() {
     .selectAll('line')
     .data(links)
     .join('line')
-    .attr('stroke', d => relationColors[d.relation] || '#4a4a4f')
+    .attr('stroke', d => getLinkColor(d))
     .attr('stroke-width', currentDisplay.value.linkThickness)
     .attr('marker-end', currentDisplay.value.arrows ? 'url(#arrowhead)' : null)
     
@@ -316,9 +304,9 @@ function initGraph() {
   // Node circles with hub-based coloring
   node.append('circle')
     .attr('r', d => getNodeRadius(d))
-    .attr('fill', d => d.group || '#6b7280')
+    .attr('fill', d => getNodeColor(d))
     .attr('stroke', '#fff')
-    .attr('stroke-width', 1.5)
+    .attr('stroke-width', d => isTopicHub(d) ? 2.5 : 1.5)
     .attr('class', 'node-circle')
     
   // Node labels
@@ -351,7 +339,40 @@ function initGraph() {
 function getNodeRadius(node) {
   const baseSize = currentDisplay.value.nodeSize
   const valFactor = Math.max(1, Math.min(3, (node.val || 1) * 0.5))
-  return baseSize * valFactor
+  return baseSize * valFactor * (isTopicHub(node) ? 1.15 : 1)
+}
+
+function isTopicHub(node) {
+  return (node.node_kind || '') === 'topic_hub' || node.note_type === 'hub'
+}
+
+function getNodeColor(node) {
+  if (isTopicHub(node)) return '#f59e0b'
+  return node.group || '#6b7280'
+}
+
+function getLinkColor(link) {
+  const edgeKind = link.edge_kind || 'note_link'
+  const provenance = link.provenance || 'explicit'
+
+  if (edgeKind === 'topic_membership') return '#f59e0b'
+  if (edgeKind === 'topic_related') return '#c084fc'
+  if (provenance === 'inferred') return '#38bdf8'
+  if (provenance === 'auto_inserted') return '#22c55e'
+
+  const relationColors = {
+    supports: '#4ade80',
+    contradicts: '#f87171',
+    expands: '#60a5fa',
+    questions: '#fbbf24',
+    answers: '#a78bfa',
+    example: '#2dd4bf',
+    part_of: '#fb923c',
+    related: '#6b7280',
+    untyped: '#4a4a4f',
+  }
+
+  return relationColors[link.relation] || '#4a4a4f'
 }
 
 function updateTextOpacity() {
@@ -512,6 +533,32 @@ function resetZoom() {
   background: var(--bg-primary);
   z-index: 10;
 }
+
+.graph-legend {
+  display: flex;
+  gap: 0.75rem;
+  margin-right: 0.75rem;
+  color: var(--text-secondary);
+  font-size: 0.75rem;
+}
+
+.legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.legend-swatch {
+  width: 10px;
+  height: 10px;
+  border-radius: 999px;
+  display: inline-block;
+}
+
+.legend-swatch.explicit { background: #6b7280; }
+.legend-swatch.inferred { background: #38bdf8; }
+.legend-swatch.topic { background: #f59e0b; }
+.legend-swatch.auto { background: #22c55e; }
 
 .toolbar-stats {
   font-size: 0.75rem;

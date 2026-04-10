@@ -50,18 +50,7 @@ pub async fn get_full_graph(state: State<'_, AppState>) -> Result<FullGraph, Str
 /// Rebuild the graph index from all notes
 #[tauri::command]
 pub async fn rebuild_graph(state: State<'_, AppState>) -> Result<GraphStats, String> {
-    // Get all full notes
-    let notes = {
-        let store = state.knowledge_store.read().await;
-        let metas = store.list_notes().map_err(|e| e.to_string())?;
-        let mut notes = Vec::new();
-        for meta in metas {
-            if let Ok(note) = store.get_note(&meta.id) {
-                notes.push(note);
-            }
-        }
-        notes
-    };
+    let notes = crate::commands::sync_topic_hubs(state.inner()).await?;
 
     // Rebuild graph
     let mut graph = state.graph_index.write().await;

@@ -594,8 +594,13 @@ pub async fn export_to_note(
         .create_note(NoteCreate {
             title: session.title.clone(),
             content,
+            relative_path: None,
+            aliases: Vec::new(),
             status: NoteStatus::Evidence,
             tags: session.tags.clone(),
+            schema_version: crate::models::note::CURRENT_NOTE_SCHEMA_VERSION,
+            migration_source: None,
+            optimizer_managed: false,
             properties: HashMap::new(),
         })
         .map_err(|e| e.to_string())?;
@@ -2325,10 +2330,15 @@ mod tests {
             note: crate::models::note::NoteMeta {
                 id: id.to_string(),
                 title: title.to_string(),
+                relative_path: format!("{}.md", id),
+                aliases: Vec::new(),
                 status: NoteStatus::default(),
                 tags: Vec::new(),
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
+                schema_version: crate::models::note::CURRENT_NOTE_SCHEMA_VERSION,
+                migration_source: None,
+                optimizer_managed: false,
             },
             score,
             snippet: snippet.to_string(),

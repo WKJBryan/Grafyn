@@ -93,6 +93,13 @@
           >
             ⚠️ Please select a vault location to continue
           </p>
+          <button
+            v-if="vaultPath"
+            class="action-btn action-btn-secondary"
+            @click="showMigrationModal = true"
+          >
+            Migrate Markdown Vault
+          </button>
         </div>
 
         <!-- OpenRouter API Key Section (Desktop only) -->
@@ -298,6 +305,80 @@
           </label>
         </div>
 
+        <div
+          v-if="!isSetup"
+          class="setting-section"
+        >
+          <label class="setting-label">
+            <span class="label-icon">🧭</span>
+            Vault Optimizer
+          </label>
+          <p class="setting-description">
+            Continuously refines aliases, topic hubs, and inferred links inside your vault, while staying within the selected write mode.
+          </p>
+          <label class="checkbox-label">
+            <input
+              v-model="backgroundVaultOptimizerEnabled"
+              type="checkbox"
+            >
+            <span>{{ backgroundVaultOptimizerEnabled ? 'Optimizer enabled' : 'Optimizer paused' }}</span>
+          </label>
+          <label class="checkbox-label secondary-checkbox">
+            <input
+              v-model="backgroundVaultOptimizerLlmEnabled"
+              type="checkbox"
+              :disabled="!backgroundVaultOptimizerEnabled || !(openrouterKey || hasStoredOpenRouterKey)"
+            >
+            <span>Allow optimizer LLM refinement</span>
+          </label>
+          <div class="optimizer-grid">
+            <label class="optimizer-field">
+              <span>Edit Mode</span>
+              <select v-model="backgroundVaultOptimizerEditMode">
+                <option value="sidecar_first">Sidecar First</option>
+                <option value="hybrid">Hybrid</option>
+                <option value="full_rewrite">Full Rewrite</option>
+              </select>
+            </label>
+            <label class="optimizer-field">
+              <span>Monthly LLM Budget</span>
+              <input
+                v-model.number="backgroundVaultOptimizerBudgetMonthly"
+                type="number"
+                min="0"
+              >
+            </label>
+            <label class="optimizer-field">
+              <span>Max Daily Writes</span>
+              <input
+                v-model.number="backgroundVaultOptimizerMaxDailyWrites"
+                type="number"
+                min="1"
+              >
+            </label>
+            <label class="optimizer-field">
+              <span>Program File</span>
+              <input
+                v-model="vaultOptimizerProgramPath"
+                type="text"
+              >
+            </label>
+          </div>
+          <label class="checkbox-label secondary-checkbox">
+            <input
+              v-model="backgroundVaultOptimizerProgramEnabled"
+              type="checkbox"
+            >
+            <span>Use the vault-local optimizer program file</span>
+          </label>
+          <div
+            v-if="optimizerStatus"
+            class="optimizer-status-chip"
+          >
+            Queue {{ optimizerStatus.queue_size }} · Inbox {{ optimizerStatus.inbox_count }} · Rollback rate {{ (optimizerStatus.rollback_rate * 100).toFixed(0) }}%
+          </div>
+        </div>
+
         <!-- MCP Integration Section (desktop only, non-setup only) -->
         <div
           v-if="!isSetup && isDesktop"
@@ -402,14 +483,20 @@
       </div>
     </div>
   </div>
+  <MarkdownMigrationModal
+    v-model="showMigrationModal"
+    :vault-path="vaultPath"
+    @applied="handleMigrationApplied"
+  />
 </template>
 
 <script setup>
 import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
 import { useRouter } from 'vue-router'
-import { settings as settingsApi, mcp as mcpApi, canvas as canvasApi, isDesktopApp } from '@/api/client'
+import { settings as settingsApi, mcp as mcpApi, canvas as canvasApi, optimizer as optimizerApi, isDesktopApp } from '@/api/client'
 import { useToast } from '@/composables/useToast'
 import { useThemeStore } from '@/stores/theme'
+import MarkdownMigrationModal from '@/components/MarkdownMigrationModal.vue'
 
 const props = defineProps({
   modelValue: {
@@ -446,7 +533,16 @@ const llmModel = ref('anthropic/claude-3.5-haiku')
 const smartWebSearch = ref(true)
 const backgroundLinkDiscoveryEnabled = ref(true)
 const backgroundLinkDiscoveryLlmEnabled = ref(false)
+const backgroundVaultOptimizerEnabled = ref(true)
+const backgroundVaultOptimizerLlmEnabled = ref(false)
+const backgroundVaultOptimizerBudgetMonthly = ref(0)
+const backgroundVaultOptimizerMaxDailyWrites = ref(25)
+const backgroundVaultOptimizerEditMode = ref('sidecar_first')
+const backgroundVaultOptimizerProgramEnabled = ref(true)
+const vaultOptimizerProgramPath = ref('_grafyn/program.md')
+const optimizerStatus = ref(null)
 const keyValidationState = ref(null) // 'validating' | 'valid' | 'invalid' | null
+const showMigrationModal = ref(false)
 
 // LLM model state
 const availableModels = ref([])
@@ -576,9 +672,24 @@ const loadCurrentSettings = async () => {
         currentSettings.background_link_discovery_enabled ?? true
       backgroundLinkDiscoveryLlmEnabled.value =
         currentSettings.background_link_discovery_llm_enabled ?? false
+      backgroundVaultOptimizerEnabled.value =
+        currentSettings.background_vault_optimizer_enabled ?? true
+      backgroundVaultOptimizerLlmEnabled.value =
+        currentSettings.background_vault_optimizer_llm_enabled ?? false
+      backgroundVaultOptimizerBudgetMonthly.value =
+        currentSettings.background_vault_optimizer_budget_monthly ?? 0
+      backgroundVaultOptimizerMaxDailyWrites.value =
+        currentSettings.background_vault_optimizer_max_daily_writes ?? 25
+      backgroundVaultOptimizerEditMode.value =
+        currentSettings.background_vault_optimizer_edit_mode || 'sidecar_first'
+      backgroundVaultOptimizerProgramEnabled.value =
+        currentSettings.background_vault_optimizer_program_enabled ?? true
+      vaultOptimizerProgramPath.value =
+        currentSettings.vault_optimizer_program_path || '_grafyn/program.md'
     }
     const status = await settingsApi.getOpenRouterStatus()
     hasStoredOpenRouterKey.value = Boolean(status?.has_key)
+    optimizerStatus.value = await optimizerApi.status()
 
     // Load MCP status (binary availability + config snippet)
     await loadMcpStatus()
@@ -685,6 +796,13 @@ const saveSettings = async () => {
       smart_web_search: smartWebSearch.value,
       background_link_discovery_enabled: backgroundLinkDiscoveryEnabled.value,
       background_link_discovery_llm_enabled: backgroundLinkDiscoveryLlmEnabled.value,
+      background_vault_optimizer_enabled: backgroundVaultOptimizerEnabled.value,
+      background_vault_optimizer_llm_enabled: backgroundVaultOptimizerLlmEnabled.value,
+      background_vault_optimizer_budget_monthly: backgroundVaultOptimizerBudgetMonthly.value,
+      background_vault_optimizer_max_daily_writes: backgroundVaultOptimizerMaxDailyWrites.value,
+      background_vault_optimizer_edit_mode: backgroundVaultOptimizerEditMode.value,
+      background_vault_optimizer_program_enabled: backgroundVaultOptimizerProgramEnabled.value,
+      vault_optimizer_program_path: vaultOptimizerProgramPath.value,
     }
     if (openrouterKeyDirty.value) {
       // Empty string means explicit clear. Missing field means keep existing key.
@@ -711,6 +829,12 @@ const saveSettings = async () => {
   } finally {
     isSaving.value = false
   }
+}
+
+const handleMigrationApplied = async () => {
+  toast.success('Vault migration complete. Reindexing panels…')
+  await loadCurrentSettings()
+  emit('saved')
 }
 
 const restoreThemePreview = () => {
@@ -823,6 +947,45 @@ onMounted(() => {
 
 .setting-section:last-child {
   margin-bottom: 0;
+}
+
+.optimizer-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 12px;
+}
+
+.optimizer-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  color: var(--text-secondary, #666);
+  font-size: 0.9rem;
+}
+
+.optimizer-field input,
+.optimizer-field select {
+  border: 1px solid var(--border-color, #e0e0e0);
+  border-radius: 8px;
+  background: var(--bg-secondary, #f7f7f8);
+  color: var(--text-primary, #1a1a1a);
+  padding: 10px 12px;
+}
+
+.optimizer-status-chip {
+  margin-top: 12px;
+  border: 1px solid var(--border-color, #e0e0e0);
+  border-radius: 999px;
+  padding: 8px 12px;
+  color: var(--text-secondary, #666);
+  font-size: 0.85rem;
+  display: inline-flex;
+  align-items: center;
+}
+
+.action-btn-secondary {
+  margin-top: 12px;
 }
 
 .setting-label {

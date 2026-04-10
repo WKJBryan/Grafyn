@@ -1,4 +1,4 @@
-use crate::commands::rebuild_link_discovery;
+use crate::commands::rebuild_all_indexes;
 use crate::models::note::SearchResult;
 use crate::AppState;
 use tauri::State;
@@ -89,40 +89,6 @@ pub async fn find_similar(
 /// Reindex all notes
 #[tauri::command]
 pub async fn reindex(state: State<'_, AppState>) -> Result<(), String> {
-    // Get all full notes
-    let notes = {
-        let store = state.knowledge_store.read().await;
-        let metas = store.list_notes().map_err(|e| e.to_string())?;
-        let mut notes = Vec::new();
-        for meta in metas {
-            if let Ok(note) = store.get_note(&meta.id) {
-                notes.push(note);
-            }
-        }
-        notes
-    };
-
-    // Reindex search
-    {
-        let mut search = state.search_service.write().await;
-        search.reindex_all(&notes).map_err(|e| e.to_string())?;
-    }
-
-    // Rebuild graph
-    {
-        let mut graph = state.graph_index.write().await;
-        graph.build_from_notes(&notes);
-    }
-
-    // Rebuild chunk index
-    {
-        let mut chunks = state.chunk_index.write().await;
-        if let Err(e) = chunks.reindex_all(&notes) {
-            log::error!("Failed to rebuild chunk index: {}", e);
-        }
-    }
-
-    rebuild_link_discovery(state.inner(), &notes).await;
-
+    rebuild_all_indexes(state.inner()).await?;
     Ok(())
 }

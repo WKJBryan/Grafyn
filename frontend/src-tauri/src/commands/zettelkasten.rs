@@ -1,4 +1,4 @@
-use crate::commands::{sync_chunk_index_for_notes, sync_link_discovery_for_notes};
+use crate::commands::{enqueue_vault_optimizer_note, sync_topic_hubs};
 use crate::models::link_discovery::{
     DismissLinkSuggestionResponse, LinkDiscoveryStatus, LinkSuggestionQueueEntry,
 };
@@ -350,52 +350,13 @@ pub async fn apply_links(
         if target_updated {
             dirty_note_ids.insert(candidate.target_id.clone());
         }
-
-        // Update search index for both notes
-        {
-            let store = state.knowledge_store.read().await;
-            let mut search = state.search_service.write().await;
-
-            if let Ok(source) = store.get_note(&noteId) {
-                let _ = search.index_note(&source);
-            }
-            if let Ok(target) = store.get_note(&candidate.target_id) {
-                let _ = search.index_note(&target);
-            }
-            let _ = search.commit();
-        }
-
-        // Update graph
-        {
-            let store = state.knowledge_store.read().await;
-            let mut graph = state.graph_index.write().await;
-
-            if let Ok(source) = store.get_note(&noteId) {
-                graph.update_note(&source);
-            }
-            if let Ok(target) = store.get_note(&candidate.target_id) {
-                graph.update_note(&target);
-            }
-        }
     }
 
     if !dirty_note_ids.is_empty() {
-        let dirty_notes = {
-            let store = state.knowledge_store.read().await;
-            dirty_note_ids
-                .iter()
-                .filter_map(|id| store.get_note(id).ok())
-                .collect::<Vec<_>>()
-        };
-        sync_chunk_index_for_notes(state.inner(), &dirty_notes).await;
-        sync_link_discovery_for_notes(state.inner(), &dirty_notes).await;
-        state.link_discovery.write().await.record_links_applied(
-            &noteId,
-            &requested_candidates
-                .iter()
-                .map(|candidate| candidate.target_id.clone())
-                .collect::<Vec<_>>(),
-        );
+        sync_topic_hubs(state.inner()).await?;
+        for note_id in &dirty_note_ids {
+            enqueue_vault_optimizer_note(state.inner(), note_id, "links_applied").await;
+        }
     }
 
     Ok(ApplyLinksResponse {
@@ -468,47 +429,11 @@ pub async fn create_link(
         }
     }
 
-    // Update search index + graph for both notes
-    {
-        let store = state.knowledge_store.read().await;
-        let mut search = state.search_service.write().await;
-
-        if let Ok(source) = store.get_note(&sourceId) {
-            let _ = search.index_note(&source);
-        }
-        if let Ok(target) = store.get_note(&targetId) {
-            let _ = search.index_note(&target);
-        }
-        let _ = search.commit();
-    }
-
-    {
-        let store = state.knowledge_store.read().await;
-        let mut graph = state.graph_index.write().await;
-
-        if let Ok(source) = store.get_note(&sourceId) {
-            graph.update_note(&source);
-        }
-        if let Ok(target) = store.get_note(&targetId) {
-            graph.update_note(&target);
-        }
-    }
-
     if !dirty_note_ids.is_empty() {
-        let dirty_notes = {
-            let store = state.knowledge_store.read().await;
-            dirty_note_ids
-                .iter()
-                .filter_map(|id| store.get_note(id).ok())
-                .collect::<Vec<_>>()
-        };
-        sync_chunk_index_for_notes(state.inner(), &dirty_notes).await;
-        sync_link_discovery_for_notes(state.inner(), &dirty_notes).await;
-        state
-            .link_discovery
-            .write()
-            .await
-            .record_links_applied(&sourceId, std::slice::from_ref(&targetId));
+        sync_topic_hubs(state.inner()).await?;
+        for note_id in &dirty_note_ids {
+            enqueue_vault_optimizer_note(state.inner(), note_id, "link_created").await;
+        }
     }
 
     Ok(CreateLinkResponse {
@@ -544,7 +469,10 @@ pub async fn dismiss_link_suggestion(
     #[allow(non_snake_case)] targetId: String,
 ) -> Result<DismissLinkSuggestionResponse, String> {
     let mut discovery = state.link_discovery.write().await;
-    Ok(discovery.dismiss_suggestion(&noteId, &targetId))
+    let response = discovery.dismiss_suggestion(&noteId, &targetId);
+    drop(discovery);
+    enqueue_vault_optimizer_note(state.inner(), &noteId, "link_dismissed").await;
+    Ok(response)
 }
 
 /// Get background discovery worker status and queue metrics.

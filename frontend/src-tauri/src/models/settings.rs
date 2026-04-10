@@ -54,6 +54,34 @@ pub struct UserSettings {
     #[serde(default)]
     pub background_link_discovery_llm_enabled: bool,
 
+    /// Whether the continuous vault optimizer is enabled
+    #[serde(default = "default_background_vault_optimizer_enabled")]
+    pub background_vault_optimizer_enabled: bool,
+
+    /// Whether the vault optimizer may use LLM refinement when budget allows
+    #[serde(default)]
+    pub background_vault_optimizer_llm_enabled: bool,
+
+    /// Soft monthly LLM budget for optimizer work, in USD whole dollars
+    #[serde(default = "default_background_vault_optimizer_budget_monthly")]
+    pub background_vault_optimizer_budget_monthly: u32,
+
+    /// Maximum number of optimizer-authored note writes per day
+    #[serde(default = "default_background_vault_optimizer_max_daily_writes")]
+    pub background_vault_optimizer_max_daily_writes: u32,
+
+    /// Write mode for optimizer-authored note edits
+    #[serde(default = "default_background_vault_optimizer_edit_mode")]
+    pub background_vault_optimizer_edit_mode: String,
+
+    /// Whether the vault-local program.md policy file is active
+    #[serde(default = "default_background_vault_optimizer_program_enabled")]
+    pub background_vault_optimizer_program_enabled: bool,
+
+    /// Path to the vault-local optimizer program file relative to the vault root
+    #[serde(default = "default_vault_optimizer_program_path")]
+    pub vault_optimizer_program_path: String,
+
     /// Saved model presets for canvas prompts
     #[serde(default = "default_canvas_model_presets")]
     pub canvas_model_presets: Vec<CanvasModelPreset>,
@@ -75,6 +103,30 @@ fn default_background_link_discovery_enabled() -> bool {
     true
 }
 
+fn default_background_vault_optimizer_enabled() -> bool {
+    true
+}
+
+fn default_background_vault_optimizer_budget_monthly() -> u32 {
+    0
+}
+
+fn default_background_vault_optimizer_max_daily_writes() -> u32 {
+    25
+}
+
+fn default_background_vault_optimizer_edit_mode() -> String {
+    "sidecar_first".to_string()
+}
+
+fn default_background_vault_optimizer_program_enabled() -> bool {
+    true
+}
+
+fn default_vault_optimizer_program_path() -> String {
+    "_grafyn/program.md".to_string()
+}
+
 impl Default for UserSettings {
     fn default() -> Self {
         Self {
@@ -87,6 +139,16 @@ impl Default for UserSettings {
             smart_web_search: true,
             background_link_discovery_enabled: default_background_link_discovery_enabled(),
             background_link_discovery_llm_enabled: false,
+            background_vault_optimizer_enabled: default_background_vault_optimizer_enabled(),
+            background_vault_optimizer_llm_enabled: false,
+            background_vault_optimizer_budget_monthly:
+                default_background_vault_optimizer_budget_monthly(),
+            background_vault_optimizer_max_daily_writes:
+                default_background_vault_optimizer_max_daily_writes(),
+            background_vault_optimizer_edit_mode: default_background_vault_optimizer_edit_mode(),
+            background_vault_optimizer_program_enabled:
+                default_background_vault_optimizer_program_enabled(),
+            vault_optimizer_program_path: default_vault_optimizer_program_path(),
             canvas_model_presets: default_canvas_model_presets(),
         }
     }
@@ -142,6 +204,13 @@ pub struct SettingsUpdate {
     pub smart_web_search: Option<bool>,
     pub background_link_discovery_enabled: Option<bool>,
     pub background_link_discovery_llm_enabled: Option<bool>,
+    pub background_vault_optimizer_enabled: Option<bool>,
+    pub background_vault_optimizer_llm_enabled: Option<bool>,
+    pub background_vault_optimizer_budget_monthly: Option<u32>,
+    pub background_vault_optimizer_max_daily_writes: Option<u32>,
+    pub background_vault_optimizer_edit_mode: Option<String>,
+    pub background_vault_optimizer_program_enabled: Option<bool>,
+    pub vault_optimizer_program_path: Option<String>,
     pub canvas_model_presets: Option<Vec<CanvasModelPreset>>,
 }
 
@@ -158,6 +227,13 @@ pub struct SettingsStatus {
     pub smart_web_search: bool,
     pub background_link_discovery_enabled: bool,
     pub background_link_discovery_llm_enabled: bool,
+    pub background_vault_optimizer_enabled: bool,
+    pub background_vault_optimizer_llm_enabled: bool,
+    pub background_vault_optimizer_budget_monthly: u32,
+    pub background_vault_optimizer_max_daily_writes: u32,
+    pub background_vault_optimizer_edit_mode: String,
+    pub background_vault_optimizer_program_enabled: bool,
+    pub vault_optimizer_program_path: String,
     pub canvas_model_presets: Vec<CanvasModelPreset>,
 }
 
@@ -174,6 +250,18 @@ impl From<&UserSettings> for SettingsStatus {
             smart_web_search: settings.smart_web_search,
             background_link_discovery_enabled: settings.background_link_discovery_enabled,
             background_link_discovery_llm_enabled: settings.background_link_discovery_llm_enabled,
+            background_vault_optimizer_enabled: settings.background_vault_optimizer_enabled,
+            background_vault_optimizer_llm_enabled: settings.background_vault_optimizer_llm_enabled,
+            background_vault_optimizer_budget_monthly: settings
+                .background_vault_optimizer_budget_monthly,
+            background_vault_optimizer_max_daily_writes: settings
+                .background_vault_optimizer_max_daily_writes,
+            background_vault_optimizer_edit_mode: settings
+                .background_vault_optimizer_edit_mode
+                .clone(),
+            background_vault_optimizer_program_enabled: settings
+                .background_vault_optimizer_program_enabled,
+            vault_optimizer_program_path: settings.vault_optimizer_program_path.clone(),
             canvas_model_presets: settings.canvas_model_presets.clone(),
         }
     }
@@ -189,6 +277,11 @@ mod tests {
         assert!(settings.canvas_model_presets.is_empty());
         assert!(settings.background_link_discovery_enabled);
         assert!(!settings.background_link_discovery_llm_enabled);
+        assert!(settings.background_vault_optimizer_enabled);
+        assert!(!settings.background_vault_optimizer_llm_enabled);
+        assert_eq!(settings.background_vault_optimizer_budget_monthly, 0);
+        assert_eq!(settings.background_vault_optimizer_edit_mode, "sidecar_first");
+        assert_eq!(settings.vault_optimizer_program_path, "_grafyn/program.md");
     }
 
     #[test]
@@ -208,5 +301,8 @@ mod tests {
         assert_eq!(settings.llm_model, "openai/gpt-4o");
         assert!(settings.background_link_discovery_enabled);
         assert!(!settings.background_link_discovery_llm_enabled);
+        assert!(settings.background_vault_optimizer_enabled);
+        assert!(!settings.background_vault_optimizer_llm_enabled);
+        assert_eq!(settings.background_vault_optimizer_budget_monthly, 0);
     }
 }

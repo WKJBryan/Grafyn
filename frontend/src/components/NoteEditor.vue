@@ -131,6 +131,7 @@
       :note-id="note.id"
       :candidates="linkCandidates"
       :exploratory-candidates="exploratoryLinkCandidates"
+      :topic-hub-candidates="topicHubCandidates"
       :loading="isDiscovering"
       :error="linkError"
       :cached-at="linkCachedAt"
@@ -173,6 +174,7 @@ const showLinkModal = ref(false)
 const isDiscovering = ref(false)
 const linkCandidates = ref([])
 const exploratoryLinkCandidates = ref([])
+const topicHubCandidates = ref([])
 const linkError = ref(null)
 const linkCachedAt = ref(null)
 const linkIsStale = ref(false)
@@ -326,12 +328,15 @@ async function handleDiscoverLinks() {
   isDiscovering.value = true
   linkError.value = null
   linkCandidates.value = []
+  exploratoryLinkCandidates.value = []
+  topicHubCandidates.value = []
   showLinkModal.value = true
 
   try {
     const result = await zettelkasten.discoverLinks(props.note.id, distillMode.value)
     linkCandidates.value = result.links || []
     exploratoryLinkCandidates.value = result.exploratory_links || []
+    topicHubCandidates.value = result.topic_hubs || []
     linkCachedAt.value = result.cached_at || null
     linkIsStale.value = Boolean(result.is_stale)
     linkSource.value = result.source || ''
@@ -347,6 +352,7 @@ function handleLinksApplied() {
   showLinkModal.value = false
   linkCandidates.value = []
   exploratoryLinkCandidates.value = []
+  topicHubCandidates.value = []
   linkCachedAt.value = null
   linkIsStale.value = false
   linkSource.value = ''

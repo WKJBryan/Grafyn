@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { mount, flushPromises } from '@vue/test-utils'
 import SettingsModal from '@/components/SettingsModal.vue'
 
-const { settingsGet, settingsStatus, settingsUpdate, pickVaultFolder, validateOpenRouterKey, getModels, getMcpStatus, themeStore, toast, routerPush } = vi.hoisted(() => ({
+const { settingsGet, settingsStatus, settingsUpdate, pickVaultFolder, validateOpenRouterKey, getModels, getMcpStatus, optimizerStatus, themeStore, toast, routerPush } = vi.hoisted(() => ({
   settingsGet: vi.fn(),
   settingsStatus: vi.fn(),
   settingsUpdate: vi.fn(),
@@ -10,6 +10,7 @@ const { settingsGet, settingsStatus, settingsUpdate, pickVaultFolder, validateOp
   validateOpenRouterKey: vi.fn(),
   getModels: vi.fn(),
   getMcpStatus: vi.fn(),
+  optimizerStatus: vi.fn(),
   themeStore: {
     setTheme: vi.fn()
   },
@@ -33,6 +34,9 @@ vi.mock('@/api/client', () => ({
   },
   canvas: {
     getModels
+  },
+  optimizer: {
+    status: optimizerStatus
   },
   isDesktopApp: () => true
 }))
@@ -65,6 +69,7 @@ describe('SettingsModal', () => {
     settingsStatus.mockResolvedValue({ has_key: true })
     getModels.mockResolvedValue([])
     getMcpStatus.mockResolvedValue({ available: false, config_snippet: '' })
+    optimizerStatus.mockResolvedValue({ queue_size: 0, inbox_count: 0, rollback_rate: 0 })
     themeStore.setTheme.mockReset()
     window.matchMedia = vi.fn().mockReturnValue({
       matches: false,
@@ -161,7 +166,7 @@ describe('SettingsModal', () => {
     await flushPromises()
 
     const checkboxes = wrapper.findAll('input[type="checkbox"]')
-    await checkboxes.at(-1).setValue(true)
+    await checkboxes.at(2).setValue(true)
     await wrapper.find('.save-btn').trigger('click')
 
     expect(settingsUpdate).toHaveBeenCalledWith(expect.objectContaining({

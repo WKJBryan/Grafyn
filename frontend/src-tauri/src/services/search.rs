@@ -236,10 +236,15 @@ impl SearchService {
                 note: NoteMeta {
                     id,
                     title,
+                    relative_path: String::new(),
+                    aliases: Vec::new(),
                     status,
                     tags,
                     created_at: chrono::Utc::now(), // Not stored in index
                     updated_at: chrono::Utc::now(),
+                    schema_version: crate::models::note::CURRENT_NOTE_SCHEMA_VERSION,
+                    migration_source: None,
+                    optimizer_managed: false,
                 },
                 score,
                 snippet: Some(snippet),
