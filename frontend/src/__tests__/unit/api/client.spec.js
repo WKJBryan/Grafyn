@@ -258,6 +258,34 @@ describe('API Client (Tauri)', () => {
       })
     })
 
+    it('runInference() invokes run_twin_inference', async () => {
+      mockInvoke.mockResolvedValue({ created_records: 1 })
+      await twin.runInference()
+      expect(mockInvoke).toHaveBeenCalledWith('run_twin_inference', {})
+    })
+
+    it('getReview() invokes get_twin_review', async () => {
+      mockInvoke.mockResolvedValue([])
+      await twin.getReview()
+      expect(mockInvoke).toHaveBeenCalledWith('get_twin_review', {})
+    })
+
+    it('resolveEvidence() invokes resolve_user_record_evidence', async () => {
+      mockInvoke.mockResolvedValue([])
+      await twin.resolveEvidence('record-1')
+      expect(mockInvoke).toHaveBeenCalledWith('resolve_user_record_evidence', { id: 'record-1' })
+    })
+
+    it('setPromotion() invokes set_user_record_promotion', async () => {
+      mockInvoke.mockResolvedValue({ id: 'record-1', promotion_state: 'rejected' })
+      await twin.setPromotion('record-1', 'rejected', 'wrong inference')
+      expect(mockInvoke).toHaveBeenCalledWith('set_user_record_promotion', {
+        id: 'record-1',
+        promotionState: 'rejected',
+        rationale: 'wrong inference'
+      })
+    })
+
     it('exportData() invokes export_twin_data', async () => {
       const request = { eval_percentage: 20 }
       mockInvoke.mockResolvedValue({ train: { count: 1 }, eval: { count: 1 }, holdout: { count: 0 } })

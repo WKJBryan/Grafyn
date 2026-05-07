@@ -34,6 +34,54 @@
         {{ truncatedPrompt }}
       </p>
     </div>
+
+    <div
+      v-if="tile.context_notes?.length || approvedTwinRecords.length || candidateTwinRecords.length"
+      class="context-summary"
+    >
+      <div
+        v-if="tile.context_notes?.length"
+        class="context-row"
+      >
+        <span class="context-label">Notes</span>
+        <span
+          v-for="note in tile.context_notes"
+          :key="note.id"
+          class="context-chip note"
+          :title="note.snippet"
+        >
+          {{ note.title }}
+        </span>
+      </div>
+      <div
+        v-if="approvedTwinRecords.length"
+        class="context-row"
+      >
+        <span class="context-label">Approved</span>
+        <span
+          v-for="record in approvedTwinRecords"
+          :key="record.id"
+          class="context-chip approved"
+          :title="record.content"
+        >
+          {{ truncateRecord(record.content) }}
+        </span>
+      </div>
+      <div
+        v-if="candidateTwinRecords.length"
+        class="context-row"
+      >
+        <span class="context-label">Candidate</span>
+        <span
+          v-for="record in candidateTwinRecords"
+          :key="record.id"
+          class="context-chip candidate"
+          :title="record.content"
+        >
+          {{ truncateRecord(record.content) }}
+        </span>
+      </div>
+    </div>
     
     <div class="node-footer">
       <span class="model-count">→ {{ modelCount }} model{{ modelCount !== 1 ? 's' : '' }}</span>
@@ -120,6 +168,9 @@ const hasCompletedResponse = computed(() =>
   Object.values(props.tile.responses).some(r => r.status === 'completed')
 )
 
+const approvedTwinRecords = computed(() => props.tile.approved_twin_records || [])
+const candidateTwinRecords = computed(() => props.tile.candidate_twin_records || [])
+
 const truncatedPrompt = computed(() => {
   const prompt = props.tile.prompt
   return prompt.length > 100 ? prompt.slice(0, 100) + '...' : prompt
@@ -137,6 +188,11 @@ function formatTime(dateStr) {
   if (!dateStr) return ''
   const date = new Date(dateStr)
   return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+}
+
+function truncateRecord(content) {
+  if (!content) return ''
+  return content.length > 44 ? `${content.slice(0, 44)}...` : content
 }
 
 function handleMouseDown(e) {
@@ -333,6 +389,51 @@ onBeforeUnmount(() => {
   margin: 0;
   word-wrap: break-word;
   overflow-wrap: break-word;
+}
+
+.context-summary {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 0 var(--spacing-sm) var(--spacing-sm);
+}
+
+.context-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+
+.context-label {
+  color: var(--text-muted);
+  font-size: 0.625rem;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.context-chip {
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  color: var(--text-secondary);
+  font-size: 0.625rem;
+  max-width: 160px;
+  overflow: hidden;
+  padding: 2px 5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.context-chip.note {
+  background: color-mix(in srgb, var(--accent-cyan) 10%, transparent);
+}
+
+.context-chip.approved {
+  background: color-mix(in srgb, var(--accent-green) 12%, transparent);
+}
+
+.context-chip.candidate {
+  background: color-mix(in srgb, var(--accent-yellow) 12%, transparent);
 }
 
 .node-footer {

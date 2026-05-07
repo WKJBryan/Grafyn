@@ -280,7 +280,10 @@ mod tests {
         assert!(settings.background_vault_optimizer_enabled);
         assert!(!settings.background_vault_optimizer_llm_enabled);
         assert_eq!(settings.background_vault_optimizer_budget_monthly, 0);
-        assert_eq!(settings.background_vault_optimizer_edit_mode, "sidecar_first");
+        assert_eq!(
+            settings.background_vault_optimizer_edit_mode,
+            "sidecar_first"
+        );
         assert_eq!(settings.vault_optimizer_program_path, "_grafyn/program.md");
     }
 

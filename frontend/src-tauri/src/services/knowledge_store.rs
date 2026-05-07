@@ -67,7 +67,10 @@ impl KnowledgeStore {
             );
         }
 
-        let overlay_notes_dir = data_path.join("vault_migration").join("overlay").join("notes");
+        let overlay_notes_dir = data_path
+            .join("vault_migration")
+            .join("overlay")
+            .join("notes");
         let _ = std::fs::create_dir_all(&overlay_notes_dir);
 
         let mut store = Self {
@@ -125,10 +128,8 @@ impl KnowledgeStore {
             match self.read_note_file(path) {
                 Ok(note) => {
                     self.path_index.insert(note.id.clone(), path.to_path_buf());
-                    self.relative_path_index.insert(
-                        normalize_lookup_key(&note.relative_path),
-                        note.id.clone(),
-                    );
+                    self.relative_path_index
+                        .insert(normalize_lookup_key(&note.relative_path), note.id.clone());
                     self.title_index
                         .entry(normalize_lookup_key(&note.title))
                         .or_insert_with(|| note.id.clone());
@@ -140,7 +141,11 @@ impl KnowledgeStore {
                     notes.push(NoteMeta::from(&note));
                 }
                 Err(error) => {
-                    log::warn!("Failed to read markdown note '{}': {}", path.display(), error);
+                    log::warn!(
+                        "Failed to read markdown note '{}': {}",
+                        path.display(),
+                        error
+                    );
                 }
             }
         }
@@ -307,8 +312,11 @@ impl KnowledgeStore {
         if let Some(parent) = self.overlay_path(note_id).parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(self.overlay_path(note_id), serde_json::to_string_pretty(overlay)?)
-            .with_context(|| format!("Failed to write overlay for '{}'", note_id))?;
+        std::fs::write(
+            self.overlay_path(note_id),
+            serde_json::to_string_pretty(overlay)?,
+        )
+        .with_context(|| format!("Failed to write overlay for '{}'", note_id))?;
         Ok(())
     }
 
@@ -517,12 +525,7 @@ impl KnowledgeStore {
             return;
         };
 
-        note.aliases = dedupe_strings(
-            note.aliases
-                .clone()
-                .into_iter()
-                .chain(overlay.aliases),
-        );
+        note.aliases = dedupe_strings(note.aliases.clone().into_iter().chain(overlay.aliases));
         note.tags = dedupe_strings(note.tags.clone().into_iter().chain(overlay.tags));
         if let Some(schema_version) = overlay.schema_version {
             note.schema_version = note.schema_version.max(schema_version);
@@ -648,8 +651,14 @@ impl KnowledgeStore {
         }
 
         let path = Path::new(&normalized);
-        let stem = path.file_stem().and_then(|value| value.to_str()).unwrap_or("note");
-        let ext = path.extension().and_then(|value| value.to_str()).unwrap_or("md");
+        let stem = path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or("note");
+        let ext = path
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("md");
         let parent = path.parent().and_then(|value| value.to_str()).unwrap_or("");
 
         let mut counter = 1;
@@ -658,7 +667,11 @@ impl KnowledgeStore {
             let candidate = if parent.is_empty() {
                 filename.clone()
             } else {
-                format!("{}/{}", normalize_relative_path_for_output(parent), filename)
+                format!(
+                    "{}/{}",
+                    normalize_relative_path_for_output(parent),
+                    filename
+                )
             };
             if !self.vault_path.join(&candidate).exists() {
                 return candidate;
@@ -668,7 +681,11 @@ impl KnowledgeStore {
     }
 
     fn is_reserved_program_path(&self, path: &Path) -> bool {
-        let Some(relative) = path.strip_prefix(&self.vault_path).ok().and_then(|p| p.to_str()) else {
+        let Some(relative) = path
+            .strip_prefix(&self.vault_path)
+            .ok()
+            .and_then(|p| p.to_str())
+        else {
             return false;
         };
         normalize_relative_path_for_output(relative).eq_ignore_ascii_case("_grafyn/program.md")
@@ -680,7 +697,10 @@ fn normalize_lookup_key(value: &str) -> String {
 }
 
 fn normalize_relative_path_for_output(value: &str) -> String {
-    value.replace('\\', "/").trim_start_matches("./").to_string()
+    value
+        .replace('\\', "/")
+        .trim_start_matches("./")
+        .to_string()
 }
 
 fn normalize_note_relative_path(value: &str) -> Result<String> {
@@ -693,7 +713,10 @@ fn normalize_note_relative_path(value: &str) -> Result<String> {
     if Path::new(&normalized).is_absolute() {
         anyhow::bail!("Absolute note paths are not allowed");
     }
-    if normalized.split('/').any(|segment| segment.is_empty() || segment == "..") {
+    if normalized
+        .split('/')
+        .any(|segment| segment.is_empty() || segment == "..")
+    {
         anyhow::bail!("Path traversal is not allowed in note paths");
     }
     if normalized.to_lowercase().ends_with(".md") {
@@ -710,7 +733,11 @@ fn slugify(value: &str) -> String {
         .map(|character| {
             if character.is_ascii_alphanumeric() {
                 character
-            } else if character.is_whitespace() || character == '-' || character == '_' || character == '/' {
+            } else if character.is_whitespace()
+                || character == '-'
+                || character == '_'
+                || character == '/'
+            {
                 '-'
             } else {
                 ' '

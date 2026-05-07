@@ -140,7 +140,9 @@ pub(crate) async fn rebuild_all_indexes(state: &AppState) -> Result<Vec<Note>, S
 
     {
         let mut search = state.search_service.write().await;
-        search.reindex_all(&notes).map_err(|error| error.to_string())?;
+        search
+            .reindex_all(&notes)
+            .map_err(|error| error.to_string())?;
     }
 
     {

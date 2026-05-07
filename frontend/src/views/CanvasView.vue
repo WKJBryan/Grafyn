@@ -79,6 +79,12 @@
 
       <div class="sidebar-footer">
         <router-link
+          to="/twin"
+          class="back-link"
+        >
+          Twin Review
+        </router-link>
+        <router-link
           to="/"
           class="back-link"
         >
@@ -431,6 +437,9 @@ function formatDate(dateStr) {
 .sidebar-footer {
   padding: var(--spacing-md);
   border-top: 1px solid var(--border-subtle);
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-xs);
 }
 
 .back-link {

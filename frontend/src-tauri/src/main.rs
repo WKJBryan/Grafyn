@@ -231,6 +231,10 @@ fn main() {
             commands::twin::create_user_record,
             commands::twin::update_user_record,
             commands::twin::get_session_trace,
+            commands::twin::run_twin_inference,
+            commands::twin::get_twin_review,
+            commands::twin::resolve_user_record_evidence,
+            commands::twin::set_user_record_promotion,
             commands::twin::record_canvas_feedback,
             commands::twin::export_twin_data,
             // Feedback commands

@@ -32,6 +32,13 @@
             >
               Canvas
             </router-link>
+            <router-link
+              to="/twin"
+              class="btn btn-secondary"
+              title="Review inferred twin records"
+            >
+              Twin Review
+            </router-link>
             <button
               class="btn btn-ghost"
               title="Settings"

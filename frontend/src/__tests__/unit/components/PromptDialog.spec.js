@@ -38,6 +38,37 @@ describe('PromptDialog', () => {
     expect(wrapper.find('.context-mode-hint').text()).toContain('This does not search the live web')
   })
 
+  it('shows Twin context mode and emits advisor mode by default', async () => {
+    const wrapper = mountDialog()
+
+    await wrapper.find('.model-selector-stub').trigger('click')
+    await wrapper.find('#prompt').setValue('What should my twin consider?')
+    await wrapper.find('#contextMode').setValue('twin')
+    await wrapper.find('.btn-primary').trigger('click')
+
+    expect(wrapper.text()).toContain('Twin (notes + user records)')
+    expect(wrapper.text()).toContain('Twin Answer Mode')
+    expect(wrapper.emitted('submit')[0][0]).toMatchObject({
+      contextMode: 'twin',
+      twinAnswerMode: 'advisor'
+    })
+  })
+
+  it('emits simulation mode when selected', async () => {
+    const wrapper = mountDialog()
+
+    await wrapper.find('.model-selector-stub').trigger('click')
+    await wrapper.find('#prompt').setValue('Simulate my likely response')
+    await wrapper.find('#contextMode').setValue('twin')
+    await wrapper.findAll('.segmented-control button')[1].trigger('click')
+    await wrapper.find('.btn-primary').trigger('click')
+
+    expect(wrapper.emitted('submit')[0][0]).toMatchObject({
+      contextMode: 'twin',
+      twinAnswerMode: 'simulation'
+    })
+  })
+
   it('submits web search enabled for freshness-sensitive prompts when Canvas auto-search is on', async () => {
     const wrapper = mountDialog({
       smartWebSearch: true,

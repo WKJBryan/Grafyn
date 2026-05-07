@@ -105,7 +105,10 @@ impl GraphIndex {
             let outgoing_edges = self.outgoing.entry(note.id.clone()).or_default();
 
             for (target_id, relation, provenance) in explicit_targets {
-                if !outgoing_edges.iter().any(|edge| edge.target_id == target_id) {
+                if !outgoing_edges
+                    .iter()
+                    .any(|edge| edge.target_id == target_id)
+                {
                     outgoing_edges.push(TypedEdge {
                         target_id: target_id.clone(),
                         relation: relation.clone(),
@@ -615,7 +618,10 @@ impl GraphIndex {
             }
         }
 
-        if let Some(target_id) = self.title_to_id.get(&parsed_link.target_title.to_lowercase()) {
+        if let Some(target_id) = self
+            .title_to_id
+            .get(&parsed_link.target_title.to_lowercase())
+        {
             return Some(target_id.clone());
         }
 

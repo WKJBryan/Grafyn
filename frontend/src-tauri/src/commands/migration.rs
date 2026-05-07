@@ -50,7 +50,12 @@ pub async fn apply_markdown_migration(
                 background_vault_optimizer_llm_enabled: Some(request.enable_llm.unwrap_or(false)),
                 background_vault_optimizer_budget_monthly: None,
                 background_vault_optimizer_max_daily_writes: None,
-                background_vault_optimizer_edit_mode: Some(format!("{:?}", request.mode).to_lowercase().replace("sidecarfirst", "sidecar_first").replace("fullrewrite", "full_rewrite")),
+                background_vault_optimizer_edit_mode: Some(
+                    format!("{:?}", request.mode)
+                        .to_lowercase()
+                        .replace("sidecarfirst", "sidecar_first")
+                        .replace("fullrewrite", "full_rewrite"),
+                ),
                 background_vault_optimizer_program_enabled: Some(true),
                 vault_optimizer_program_path: request.program_path.clone(),
                 canvas_model_presets: None,

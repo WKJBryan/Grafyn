@@ -4,8 +4,8 @@ use crate::models::migration::{
     MarkdownMigrationStatus, MarkdownMigrationTopicCandidate,
 };
 use crate::models::note::{
-    Note, NoteCreate, NoteUpdate, PROP_AUTO_INSERTED_LINK_IDS, PROP_INFERRED_LINK_IDS,
-    PROP_TOPIC_ALIASES, PROP_TOPIC_KEY, CURRENT_NOTE_SCHEMA_VERSION,
+    Note, NoteCreate, NoteUpdate, CURRENT_NOTE_SCHEMA_VERSION, PROP_AUTO_INSERTED_LINK_IDS,
+    PROP_INFERRED_LINK_IDS, PROP_TOPIC_ALIASES, PROP_TOPIC_KEY,
 };
 use crate::services::knowledge_store::KnowledgeStore;
 use crate::services::topic_hub::normalize_topic_key;
@@ -70,8 +70,14 @@ impl MarkdownMigrationService {
         let notes = store.list_full_notes()?;
         let created_at = Utc::now();
         let preview_id = Uuid::new_v4().to_string();
-        let hub_folder = normalize_hub_folder(request.hub_folder.as_deref().unwrap_or("_grafyn/hubs"));
-        let program_path = normalize_program_path(request.program_path.as_deref().unwrap_or("_grafyn/program.md"));
+        let hub_folder =
+            normalize_hub_folder(request.hub_folder.as_deref().unwrap_or("_grafyn/hubs"));
+        let program_path = normalize_program_path(
+            request
+                .program_path
+                .as_deref()
+                .unwrap_or("_grafyn/program.md"),
+        );
 
         let resolution_index = build_reference_index(&notes);
         let existing_hubs = notes
@@ -94,7 +100,9 @@ impl MarkdownMigrationService {
             if !has_frontmatter {
                 summary.files_without_frontmatter += 1;
             }
-            if !raw_content.trim_start().starts_with("---\n") || note.title == humanize_title(&note.relative_path) {
+            if !raw_content.trim_start().starts_with("---\n")
+                || note.title == humanize_title(&note.relative_path)
+            {
                 summary.inferred_titles += 1;
             }
             if !note.aliases.is_empty() {
@@ -146,20 +154,21 @@ impl MarkdownMigrationService {
             if !inferred_link_ids.is_empty() && request.mode.allows_user_note_writes() {
                 summary.proposed_auto_link_edits += inferred_link_ids.len().min(3);
             }
-            if note.schema_version < CURRENT_NOTE_SCHEMA_VERSION && note.migration_source.is_none() {
+            if note.schema_version < CURRENT_NOTE_SCHEMA_VERSION && note.migration_source.is_none()
+            {
                 summary.old_grafyn_notes_eligible_for_backfill += 1;
             }
 
             if let Some(topic_key) = &topic_key {
                 let display_name = display_topic_name(topic_key);
-                let entry = topic_buckets
-                    .entry(topic_key.clone())
-                    .or_insert_with(|| MarkdownMigrationTopicCandidate {
+                let entry = topic_buckets.entry(topic_key.clone()).or_insert_with(|| {
+                    MarkdownMigrationTopicCandidate {
                         topic_key: topic_key.clone(),
                         display_name: display_name.clone(),
                         reuse_existing_hub_id: existing_hubs.get(topic_key).cloned(),
                         ..Default::default()
-                    });
+                    }
+                });
                 entry.member_note_ids.push(note.id.clone());
                 entry.member_note_titles.push(note.title.clone());
             }
@@ -182,8 +191,8 @@ impl MarkdownMigrationService {
             .iter()
             .filter(|candidate| candidate.reuse_existing_hub_id.is_none())
             .count();
-        summary.files_to_create = summary.proposed_hubs
-            + usize::from(!vault_path.join(&program_path).exists());
+        summary.files_to_create =
+            summary.proposed_hubs + usize::from(!vault_path.join(&program_path).exists());
 
         let preview = MarkdownMigrationPreview {
             preview_id: preview_id.clone(),
@@ -315,7 +324,10 @@ impl MarkdownMigrationService {
                     relative_path: Some(note.relative_path.clone()),
                     aliases: Some(merge_unique_strings(note.aliases, proposal.aliases.clone())),
                     status: None,
-                    tags: Some(merge_unique_strings(note.tags, proposal.inferred_tags.clone())),
+                    tags: Some(merge_unique_strings(
+                        note.tags,
+                        proposal.inferred_tags.clone(),
+                    )),
                     schema_version: Some(CURRENT_NOTE_SCHEMA_VERSION),
                     migration_source: Some(MIGRATION_SOURCE_MARKDOWN.to_string()),
                     optimizer_managed: Some(false),
@@ -349,7 +361,10 @@ impl MarkdownMigrationService {
                 migration_source: Some(MIGRATION_SOURCE_MARKDOWN.to_string()),
                 optimizer_managed: true,
                 properties: HashMap::from([
-                    (PROP_TOPIC_KEY.to_string(), Value::String(topic.topic_key.clone())),
+                    (
+                        PROP_TOPIC_KEY.to_string(),
+                        Value::String(topic.topic_key.clone()),
+                    ),
                     (
                         PROP_TOPIC_ALIASES.to_string(),
                         Value::Array(vec![Value::String(topic.display_name.clone())]),
@@ -358,9 +373,7 @@ impl MarkdownMigrationService {
                 ]),
             })?;
             created_hub_note_ids.push(created.id.clone());
-            manifest
-                .created_files
-                .push(created.relative_path.clone());
+            manifest.created_files.push(created.relative_path.clone());
         }
 
         let program_path = Path::new(&preview.vault_path).join(&preview.program_path);
@@ -577,7 +590,10 @@ fn build_reference_index(notes: &[Note]) -> HashMap<String, Vec<String>> {
     index
 }
 
-fn resolve_reference(reference: &str, resolution_index: &HashMap<String, Vec<String>>) -> Option<String> {
+fn resolve_reference(
+    reference: &str,
+    resolution_index: &HashMap<String, Vec<String>>,
+) -> Option<String> {
     resolution_index
         .get(&reference.trim().to_lowercase())
         .and_then(|matches| {
@@ -705,7 +721,10 @@ fn normalize_rewritten_content(title: &str, content: &str, ensure_h1: bool) -> S
     if !ensure_h1 {
         return content.to_string();
     }
-    if content.lines().any(|line| line.trim() == format!("# {}", title)) {
+    if content
+        .lines()
+        .any(|line| line.trim() == format!("# {}", title))
+    {
         return content.to_string();
     }
     format!("# {}\n\n{}", title, content.trim_start())

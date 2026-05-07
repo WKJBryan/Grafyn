@@ -2,6 +2,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+use crate::models::twin::TwinContextRecord;
+
 /// Canvas session containing prompts and model responses
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CanvasSession {
@@ -98,6 +100,14 @@ pub struct PromptTile {
     #[serde(default)]
     pub context_notes: Vec<TileContextNote>,
     #[serde(default)]
+    pub approved_twin_records: Vec<TwinContextRecord>,
+    #[serde(default)]
+    pub candidate_twin_records: Vec<TwinContextRecord>,
+    #[serde(default)]
+    pub twin_answer_mode: TwinAnswerMode,
+    #[serde(default)]
+    pub twin_context_policy: Option<String>,
+    #[serde(default)]
     pub web_search: bool,
     #[serde(default = "default_web_search_max_results")]
     pub web_search_max_results: u32,
@@ -117,6 +127,10 @@ impl Default for PromptTile {
             parent_tile_id: None,
             parent_model_id: None,
             context_notes: Vec::new(),
+            approved_twin_records: Vec::new(),
+            candidate_twin_records: Vec::new(),
+            twin_answer_mode: TwinAnswerMode::default(),
+            twin_context_policy: None,
             web_search: false,
             web_search_max_results: default_web_search_max_results(),
         }
@@ -153,9 +167,18 @@ pub enum ContextMode {
     Compact,
     #[default]
     KnowledgeSearch,
+    Twin,
     /// Legacy alias for KnowledgeSearch — accept "semantic" from old saved sessions
     #[serde(rename = "semantic")]
     Semantic,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TwinAnswerMode {
+    #[default]
+    Advisor,
+    Simulation,
 }
 
 /// Response from a single model
@@ -324,6 +347,10 @@ pub struct PromptRequest {
     #[serde(default)]
     pub context_mode: ContextMode,
     #[serde(default)]
+    pub twin_answer_mode: TwinAnswerMode,
+    #[serde(default)]
+    pub twin_context_policy: Option<String>,
+    #[serde(default)]
     pub parent_tile_id: Option<String>,
     #[serde(default)]
     pub parent_model_id: Option<String>,
@@ -394,6 +421,22 @@ mod tests {
         .unwrap();
 
         assert_eq!(tile.web_search_max_results, 5);
+        assert_eq!(tile.twin_answer_mode, TwinAnswerMode::Advisor);
+        assert!(tile.approved_twin_records.is_empty());
+    }
+
+    #[test]
+    fn prompt_request_accepts_twin_context_mode_and_answer_mode() {
+        let request: PromptRequest = serde_json::from_value(json!({
+            "prompt": "What would my twin do?",
+            "models": ["openai/gpt-4"],
+            "context_mode": "twin",
+            "twin_answer_mode": "simulation"
+        }))
+        .unwrap();
+
+        assert_eq!(request.context_mode, ContextMode::Twin);
+        assert_eq!(request.twin_answer_mode, TwinAnswerMode::Simulation);
     }
 }
 

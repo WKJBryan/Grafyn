@@ -72,10 +72,7 @@ impl HubRegistry {
     }
 
     fn resolve(&self, seed: &str) -> Option<(String, String)> {
-        let normalized = normalize_topic_key(seed);
-        if normalized.is_empty() {
-            return None;
-        }
+        let normalized = canonical_topic_key(seed)?;
 
         if let Some(hub_id) = self.by_alias.get(&normalized) {
             return Some((hub_id.clone(), "exact".to_string()));
@@ -109,6 +106,7 @@ pub fn sync_topic_hubs(store: &mut KnowledgeStore) -> Result<TopicHubSyncResult>
         .map(|note| (note.id.clone(), note))
         .collect::<HashMap<_, _>>();
     let mut changed_note_ids = BTreeSet::new();
+    let mut removed_note_ids = BTreeSet::new();
 
     let existing_hub_ids = notes_by_id
         .values()
@@ -120,6 +118,13 @@ pub fn sync_topic_hubs(store: &mut KnowledgeStore) -> Result<TopicHubSyncResult>
         let Some(current) = notes_by_id.get(&hub_id).cloned() else {
             continue;
         };
+        if should_remove_noisy_auto_hub(&current) {
+            store.delete_note(&current.id)?;
+            notes_by_id.remove(&current.id);
+            removed_note_ids.insert(current.id);
+            continue;
+        }
+
         let desired = standardize_existing_hub(&current);
         if let Some(updated) = persist_if_changed(store, &current, desired)? {
             changed_note_ids.insert(updated.id.clone());
@@ -127,7 +132,12 @@ pub fn sync_topic_hubs(store: &mut KnowledgeStore) -> Result<TopicHubSyncResult>
         }
     }
 
+    for removed_id in remove_duplicate_auto_hubs(store, &mut notes_by_id)? {
+        removed_note_ids.insert(removed_id);
+    }
+
     let mut registry = build_hub_registry(notes_by_id.values());
+    let graph_cluster_seeds = infer_graph_cluster_topic_seeds(&notes_by_id);
 
     let regular_note_ids = notes_by_id
         .values()
@@ -140,7 +150,7 @@ pub fn sync_topic_hubs(store: &mut KnowledgeStore) -> Result<TopicHubSyncResult>
             continue;
         };
 
-        let topic_seeds = candidate_topic_seeds(&current);
+        let topic_seeds = candidate_topic_seeds(&current, graph_cluster_seeds.get(&current.id));
         let mut resolved_hub_ids = Vec::new();
         let mut primary_topic_key = None;
 
@@ -201,7 +211,7 @@ pub fn sync_topic_hubs(store: &mut KnowledgeStore) -> Result<TopicHubSyncResult>
     Ok(TopicHubSyncResult {
         all_notes: store.list_full_notes()?,
         changed_note_ids: changed_note_ids.into_iter().collect(),
-        removed_note_ids: Vec::new(),
+        removed_note_ids: removed_note_ids.into_iter().collect(),
     })
 }
 
@@ -251,6 +261,10 @@ pub fn normalize_topic_key(value: &str) -> String {
     normalized.trim_matches('-').to_string()
 }
 
+pub fn suggest_topic_hub_title(value: &str) -> Option<String> {
+    canonical_topic_key(value).map(|topic_key| hub_title_from_key(&topic_key))
+}
+
 fn display_topic_name(topic_key: &str) -> String {
     topic_key
         .split('-')
@@ -268,21 +282,8 @@ fn display_topic_name(topic_key: &str) -> String {
 
 fn standardize_existing_hub(note: &Note) -> Note {
     let mut desired = note.clone();
-    let topic_key = note
-        .topic_key()
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| {
-            let from_title = normalize_topic_key(&strip_hub_prefix(&note.title));
-            if from_title.is_empty() {
-                note.tags
-                    .iter()
-                    .find(|tag| !is_structural_tag(tag))
-                    .map(|tag| normalize_topic_key(tag))
-                    .unwrap_or_default()
-            } else {
-                from_title
-            }
-        });
+    let raw_topic_key = raw_topic_key_for_hub(note);
+    let topic_key = canonical_topic_key(&raw_topic_key).unwrap_or(raw_topic_key.clone());
 
     let mut tags = note.tags.clone();
     ensure_tag(&mut tags, "hub");
@@ -291,6 +292,13 @@ fn standardize_existing_hub(note: &Note) -> Note {
         ensure_tag(&mut tags, &topic_key);
     }
     desired.tags = sorted_unique(tags);
+    if is_auto_topic_hub(note) && !topic_key.is_empty() {
+        desired.title = hub_title_from_key(&topic_key);
+        desired.aliases = sorted_unique(vec![
+            display_topic_name(&topic_key),
+            display_topic_name(&raw_topic_key),
+        ]);
+    }
     desired.set_topic_hub_metadata(
         true,
         if topic_key.is_empty() {
@@ -301,10 +309,271 @@ fn standardize_existing_hub(note: &Note) -> Note {
         Vec::new(),
         sorted_unique(vec![
             topic_key,
+            raw_topic_key,
             normalize_topic_key(&strip_hub_prefix(&note.title)),
         ]),
     );
     desired
+}
+
+fn remove_duplicate_auto_hubs(
+    store: &mut KnowledgeStore,
+    notes_by_id: &mut HashMap<String, Note>,
+) -> Result<Vec<String>> {
+    let mut by_topic_key: HashMap<String, Vec<String>> = HashMap::new();
+    for note in notes_by_id.values().filter(|note| note.is_topic_hub()) {
+        if let Some(topic_key) = note.topic_key() {
+            by_topic_key
+                .entry(topic_key)
+                .or_default()
+                .push(note.id.clone());
+        }
+    }
+
+    let mut removed = Vec::new();
+    for (topic_key, mut hub_ids) in by_topic_key {
+        if hub_ids.len() < 2 {
+            continue;
+        }
+
+        hub_ids.sort_by(|left, right| {
+            let left_note = notes_by_id.get(left);
+            let right_note = notes_by_id.get(right);
+            hub_keep_score(left_note, &topic_key)
+                .cmp(&hub_keep_score(right_note, &topic_key))
+                .then_with(|| left.cmp(right))
+        });
+
+        for duplicate_id in hub_ids.into_iter().skip(1) {
+            let Some(duplicate) = notes_by_id.get(&duplicate_id).cloned() else {
+                continue;
+            };
+            if !is_auto_topic_hub(&duplicate) {
+                continue;
+            }
+
+            store.delete_note(&duplicate.id)?;
+            notes_by_id.remove(&duplicate.id);
+            removed.push(duplicate.id);
+        }
+    }
+
+    Ok(removed)
+}
+
+fn hub_keep_score(note: Option<&Note>, topic_key: &str) -> (u8, u8) {
+    let Some(note) = note else {
+        return (3, 3);
+    };
+    let expected_title = hub_title_from_key(topic_key);
+    (
+        if is_auto_topic_hub(note) { 1 } else { 0 },
+        if note.title == expected_title { 0 } else { 1 },
+    )
+}
+
+fn infer_graph_cluster_topic_seeds(notes_by_id: &HashMap<String, Note>) -> HashMap<String, String> {
+    let regular_notes = notes_by_id
+        .values()
+        .filter(|note| !note.is_topic_hub())
+        .collect::<Vec<_>>();
+    if regular_notes.len() < 3 {
+        return HashMap::new();
+    }
+
+    let adjacency = build_graph_cluster_adjacency(notes_by_id, &regular_notes);
+    if adjacency.is_empty() {
+        return HashMap::new();
+    }
+
+    let communities = label_propagation_communities(&regular_notes, &adjacency);
+    let mut seeds = HashMap::new();
+    for member_ids in communities.values() {
+        if member_ids.len() < 3 {
+            continue;
+        }
+        let Some(topic_key) = choose_cluster_topic_key(member_ids, notes_by_id) else {
+            continue;
+        };
+        for member_id in member_ids {
+            seeds.insert(member_id.clone(), topic_key.clone());
+        }
+    }
+
+    seeds
+}
+
+fn build_graph_cluster_adjacency(
+    notes_by_id: &HashMap<String, Note>,
+    regular_notes: &[&Note],
+) -> HashMap<String, HashMap<String, usize>> {
+    let regular_ids = regular_notes
+        .iter()
+        .map(|note| note.id.clone())
+        .collect::<HashSet<_>>();
+    let ref_to_id = build_note_reference_index(notes_by_id);
+    let mut adjacency = HashMap::<String, HashMap<String, usize>>::new();
+
+    for note in regular_notes {
+        for parsed_link in &note.parsed_links {
+            let Some(target_id) = resolve_link_target(notes_by_id, &ref_to_id, parsed_link) else {
+                continue;
+            };
+            if !regular_ids.contains(target_id) || target_id == &note.id {
+                continue;
+            }
+            add_cluster_edge(&mut adjacency, &note.id, target_id, 5);
+        }
+    }
+
+    let mut notes_by_seed = HashMap::<String, Vec<String>>::new();
+    for note in regular_notes {
+        for seed in graph_cluster_note_seeds(note) {
+            notes_by_seed.entry(seed).or_default().push(note.id.clone());
+        }
+    }
+
+    for member_ids in notes_by_seed.values_mut() {
+        member_ids.sort();
+        member_ids.dedup();
+        if member_ids.len() < 2 || member_ids.len() > 80 {
+            continue;
+        }
+        for left_index in 0..member_ids.len() {
+            for right_index in (left_index + 1)..member_ids.len() {
+                add_cluster_edge(
+                    &mut adjacency,
+                    &member_ids[left_index],
+                    &member_ids[right_index],
+                    2,
+                );
+            }
+        }
+    }
+
+    adjacency
+}
+
+fn label_propagation_communities(
+    regular_notes: &[&Note],
+    adjacency: &HashMap<String, HashMap<String, usize>>,
+) -> HashMap<String, Vec<String>> {
+    let mut labels = regular_notes
+        .iter()
+        .map(|note| (note.id.clone(), note.id.clone()))
+        .collect::<HashMap<_, _>>();
+    let mut ordered_ids = regular_notes
+        .iter()
+        .map(|note| note.id.clone())
+        .collect::<Vec<_>>();
+    ordered_ids.sort();
+
+    for _ in 0..8 {
+        let mut changed = false;
+        for note_id in &ordered_ids {
+            let Some(neighbors) = adjacency.get(note_id) else {
+                continue;
+            };
+
+            let mut scores = HashMap::<String, usize>::new();
+            for (neighbor_id, weight) in neighbors {
+                let Some(label) = labels.get(neighbor_id) else {
+                    continue;
+                };
+                *scores.entry(label.clone()).or_default() += *weight;
+            }
+
+            let Some((best_label, _)) = scores
+                .into_iter()
+                .max_by(|left, right| left.1.cmp(&right.1).then_with(|| right.0.cmp(&left.0)))
+            else {
+                continue;
+            };
+
+            if labels.get(note_id) != Some(&best_label) {
+                labels.insert(note_id.clone(), best_label);
+                changed = true;
+            }
+        }
+
+        if !changed {
+            break;
+        }
+    }
+
+    let mut communities = HashMap::<String, Vec<String>>::new();
+    for (note_id, label) in labels {
+        communities.entry(label).or_default().push(note_id);
+    }
+    for member_ids in communities.values_mut() {
+        member_ids.sort();
+    }
+    communities
+}
+
+fn choose_cluster_topic_key(
+    member_ids: &[String],
+    notes_by_id: &HashMap<String, Note>,
+) -> Option<String> {
+    let mut counts = HashMap::<String, usize>::new();
+    for member_id in member_ids {
+        let Some(note) = notes_by_id.get(member_id) else {
+            continue;
+        };
+        for seed in graph_cluster_note_seeds(note) {
+            *counts.entry(seed).or_default() += 1;
+        }
+    }
+
+    counts
+        .into_iter()
+        .filter(|(_, count)| *count >= 2)
+        .max_by(|left, right| {
+            left.1
+                .cmp(&right.1)
+                .then_with(|| right.0.len().cmp(&left.0.len()))
+                .then_with(|| right.0.cmp(&left.0))
+        })
+        .map(|(seed, _)| seed)
+}
+
+fn graph_cluster_note_seeds(note: &Note) -> Vec<String> {
+    let mut seeds = note
+        .tags
+        .iter()
+        .filter(|tag| !is_structural_tag(tag))
+        .filter_map(|tag| canonical_topic_key(tag))
+        .collect::<Vec<_>>();
+
+    seeds.extend(
+        ordered_topic_tokens(&note.title)
+            .into_iter()
+            .filter(|token| is_graph_cluster_token(token))
+            .filter_map(|token| canonical_topic_key(&token)),
+    );
+
+    sorted_unique(seeds)
+}
+
+fn add_cluster_edge(
+    adjacency: &mut HashMap<String, HashMap<String, usize>>,
+    left: &str,
+    right: &str,
+    weight: usize,
+) {
+    if left == right {
+        return;
+    }
+    *adjacency
+        .entry(left.to_string())
+        .or_default()
+        .entry(right.to_string())
+        .or_default() += weight;
+    *adjacency
+        .entry(right.to_string())
+        .or_default()
+        .entry(left.to_string())
+        .or_default() += weight;
 }
 
 fn build_hub_registry<'a>(notes: impl Iterator<Item = &'a Note>) -> HubRegistry {
@@ -403,6 +672,7 @@ fn rewrite_hub_note(
         desired.title.clone()
     };
     let summary = build_topic_summary(&display_name, &topic_key, member_ids, notes_by_id);
+    let subtopic_lines = build_subtopic_lines(&topic_key, member_ids, notes_by_id);
     let member_lines = build_member_lines(member_ids, notes_by_id);
     let debate_lines = build_debate_lines(member_ids, notes_by_id);
     let related_lines = build_related_lines(related_hub_ids, notes_by_id);
@@ -412,6 +682,9 @@ fn rewrite_hub_note(
     content.push(String::new());
     content.push("## Summary".to_string());
     content.push(summary);
+    content.push(String::new());
+    content.push("## Subtopics".to_string());
+    content.extend(subtopic_lines);
     content.push(String::new());
     content.push("## Notes In This Topic".to_string());
     content.extend(member_lines);
@@ -496,6 +769,41 @@ fn build_member_lines(member_ids: &[String], notes_by_id: &HashMap<String, Note>
         .collect::<Vec<_>>();
     lines.sort();
     lines
+}
+
+fn build_subtopic_lines(
+    topic_key: &str,
+    member_ids: &[String],
+    notes_by_id: &HashMap<String, Note>,
+) -> Vec<String> {
+    let mut counts = HashMap::<String, usize>::new();
+    for member_id in member_ids {
+        let Some(note) = notes_by_id.get(member_id) else {
+            continue;
+        };
+        for tag in &note.tags {
+            if is_structural_tag(tag) {
+                continue;
+            }
+            let normalized = normalize_topic_key(tag);
+            if normalized.is_empty() || normalized == topic_key {
+                continue;
+            }
+            *counts.entry(normalized).or_default() += 1;
+        }
+    }
+
+    if counts.is_empty() {
+        return vec!["- No stable subtopics detected yet.".to_string()];
+    }
+
+    let mut ordered = counts.into_iter().collect::<Vec<_>>();
+    ordered.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    ordered
+        .into_iter()
+        .take(8)
+        .map(|(tag, count)| format!("- {} ({})", display_topic_name(&tag), count))
+        .collect()
 }
 
 fn build_debate_lines(member_ids: &[String], notes_by_id: &HashMap<String, Note>) -> Vec<String> {
@@ -587,7 +895,7 @@ fn create_topic_hub_note(store: &mut KnowledgeStore, topic_key: &str) -> Result<
     store.create_note(NoteCreate {
         title,
         content: String::new(),
-        relative_path: None,
+        relative_path: Some(format!("_grafyn/hubs/{}/index.md", topic_key)),
         aliases: vec![display_topic_name(topic_key)],
         status: NoteStatus::Draft,
         tags: vec![
@@ -640,25 +948,32 @@ fn persist_if_changed(
 
 fn notes_equal(left: &Note, right: &Note) -> bool {
     left.title == right.title
+        && left.relative_path == right.relative_path
+        && left.aliases == right.aliases
         && left.content == right.content
         && left.status == right.status
         && left.tags == right.tags
+        && left.schema_version == right.schema_version
+        && left.migration_source == right.migration_source
+        && left.optimizer_managed == right.optimizer_managed
         && left.properties == right.properties
 }
 
-fn candidate_topic_seeds(note: &Note) -> Vec<String> {
+fn candidate_topic_seeds(note: &Note, graph_cluster_seed: Option<&String>) -> Vec<String> {
+    if let Some(seed) = graph_cluster_seed.and_then(|seed| canonical_topic_key(seed)) {
+        return vec![seed];
+    }
+
     let mut seeds = note
         .tags
         .iter()
         .filter(|tag| !is_structural_tag(tag))
-        .map(|tag| normalize_topic_key(tag))
-        .filter(|tag| !tag.is_empty())
+        .filter_map(|tag| canonical_topic_key(tag))
         .collect::<Vec<_>>();
 
     if seeds.is_empty() {
         if let Some(topic_key) = note.topic_key() {
-            let normalized = normalize_topic_key(&topic_key);
-            if !normalized.is_empty() {
+            if let Some(normalized) = canonical_topic_key(&topic_key) {
                 seeds.push(normalized);
             }
         }
@@ -801,6 +1116,13 @@ fn hub_title_from_key(topic_key: &str) -> String {
 }
 
 fn title_case_word(word: &str) -> String {
+    if matches!(
+        word,
+        "ai" | "dai" | "llm" | "mcp" | "rag" | "ui" | "ux" | "vr"
+    ) {
+        return word.to_ascii_uppercase();
+    }
+
     let mut chars = word.chars();
     let Some(first) = chars.next() else {
         return String::new();
@@ -811,6 +1133,197 @@ fn title_case_word(word: &str) -> String {
         first.to_ascii_uppercase(),
         chars.as_str().to_ascii_lowercase()
     )
+}
+
+fn raw_topic_key_for_hub(note: &Note) -> String {
+    note.topic_key()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| {
+            let from_title = normalize_topic_key(&strip_hub_prefix(&note.title));
+            if from_title.is_empty() {
+                note.tags
+                    .iter()
+                    .find(|tag| !is_structural_tag(tag))
+                    .map(|tag| normalize_topic_key(tag))
+                    .unwrap_or_default()
+            } else {
+                from_title
+            }
+        })
+}
+
+fn canonical_topic_key(value: &str) -> Option<String> {
+    let normalized = normalize_topic_key(&strip_hub_prefix(value));
+    if normalized.is_empty() {
+        return None;
+    }
+
+    let tokens = ordered_topic_tokens(&normalized);
+    if tokens.is_empty() || tokens.iter().all(|token| is_generic_topic_token(token)) {
+        return None;
+    }
+    if is_model_only_topic(&tokens) || is_transcript_artifact_topic(&tokens) {
+        return None;
+    }
+    if tokens.len() == 1 && tokens[0].len() <= 3 && !is_allowed_short_topic(&tokens[0]) {
+        return None;
+    }
+
+    if tokens.iter().any(|token| token == "dai") {
+        return Some("dai".to_string());
+    }
+    if tokens
+        .iter()
+        .any(|token| matches!(token.as_str(), "course" | "courses" | "credit" | "transfer"))
+    {
+        return Some("courses".to_string());
+    }
+    if tokens
+        .iter()
+        .any(|token| matches!(token.as_str(), "design" | "immersive" | "vr"))
+    {
+        return Some("design".to_string());
+    }
+    if tokens
+        .iter()
+        .any(|token| matches!(token.as_str(), "project" | "task" | "tasks"))
+    {
+        return Some("tasks".to_string());
+    }
+    if tokens.iter().any(|token| token == "device") {
+        return Some("devices".to_string());
+    }
+    if tokens
+        .iter()
+        .any(|token| matches!(token.as_str(), "token" | "tokens"))
+    {
+        return Some("tokens".to_string());
+    }
+    if tokens
+        .iter()
+        .any(|token| matches!(token.as_str(), "llm" | "model" | "models" | "openrouter"))
+    {
+        return Some("ai-models".to_string());
+    }
+    if tokens.iter().any(|token| {
+        matches!(
+            token.as_str(),
+            "decision" | "decisions" | "choice" | "choices"
+        )
+    }) {
+        return Some("decision-making".to_string());
+    }
+
+    Some(normalized)
+}
+
+fn ordered_topic_tokens(value: &str) -> Vec<String> {
+    value
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(|token| token.to_ascii_lowercase())
+        .collect()
+}
+
+fn is_allowed_short_topic(token: &str) -> bool {
+    matches!(token, "ai" | "dai" | "mcp" | "rag" | "ui" | "ux" | "vr")
+}
+
+fn is_graph_cluster_token(token: &str) -> bool {
+    token.len() >= 4 && !is_generic_topic_token(token) && !is_model_or_provider_token(token)
+}
+
+fn is_model_only_topic(tokens: &[String]) -> bool {
+    if tokens.len() <= 2
+        && tokens.iter().any(|token| is_model_or_provider_token(token))
+        && tokens.iter().all(|token| {
+            is_model_or_provider_token(token)
+                || matches!(token.as_str(), "api" | "assistant" | "code")
+        })
+    {
+        return true;
+    }
+
+    tokens
+        .iter()
+        .all(|token| is_model_or_provider_token(token) || is_generic_topic_token(token))
+}
+
+fn is_model_or_provider_token(token: &str) -> bool {
+    matches!(
+        token,
+        "anthropic"
+            | "claude"
+            | "codex"
+            | "copilot"
+            | "cursor"
+            | "gemini"
+            | "gpt"
+            | "grok"
+            | "llama"
+            | "mistral"
+            | "openai"
+            | "qwen"
+            | "sonnet"
+    )
+}
+
+fn is_transcript_artifact_topic(tokens: &[String]) -> bool {
+    tokens
+        .iter()
+        .any(|token| token.chars().all(|c| c.is_ascii_digit()))
+        && tokens
+            .iter()
+            .any(|token| matches!(token.as_str(), "message" | "assistant" | "user"))
+}
+
+fn is_generic_topic_token(token: &str) -> bool {
+    matches!(
+        token,
+        "a" | "an"
+            | "and"
+            | "answer"
+            | "answers"
+            | "approach"
+            | "assistant"
+            | "best"
+            | "chat"
+            | "comparison"
+            | "correct"
+            | "create"
+            | "define"
+            | "detailed"
+            | "different"
+            | "draft"
+            | "example"
+            | "good"
+            | "hub"
+            | "insight"
+            | "message"
+            | "note"
+            | "notes"
+            | "previous"
+            | "question"
+            | "response"
+            | "results"
+            | "since"
+            | "summary"
+            | "sure"
+            | "task"
+            | "the"
+            | "topic"
+            | "user"
+            | "whole"
+    )
+}
+
+fn is_auto_topic_hub(note: &Note) -> bool {
+    note.optimizer_managed || note.migration_source.as_deref() == Some("topic_hub")
+}
+
+fn should_remove_noisy_auto_hub(note: &Note) -> bool {
+    is_auto_topic_hub(note) && canonical_topic_key(&raw_topic_key_for_hub(note)).is_none()
 }
 
 fn is_structural_tag(tag: &str) -> bool {
@@ -824,9 +1337,17 @@ fn is_structural_tag(tag: &str) -> bool {
             | "import"
             | "chatgpt"
             | "claude"
+            | "anthropic"
+            | "openai"
             | "gemini"
             | "grok"
+            | "qwen"
             | "chat"
+            | "assistant"
+            | "user"
+            | "message"
+            | "model"
+            | "models"
             | "canvas-export"
             | "ai-generated"
     )
@@ -861,6 +1382,30 @@ mod tests {
     fn normalizes_topic_keys() {
         assert_eq!(normalize_topic_key("Rust / WASM"), "rust-wasm");
         assert_eq!(normalize_topic_key("  AI Research "), "ai-research");
+    }
+
+    #[test]
+    fn canonicalizes_noisy_minor_topics_into_major_hubs() {
+        assert_eq!(
+            suggest_topic_hub_title("dai-asd").as_deref(),
+            Some("Hub: DAI")
+        );
+        assert_eq!(
+            suggest_topic_hub_title("dai-courses").as_deref(),
+            Some("Hub: DAI")
+        );
+        assert_eq!(
+            suggest_topic_hub_title("design-immersive").as_deref(),
+            Some("Hub: Design")
+        );
+        assert_eq!(
+            suggest_topic_hub_title("design-vr").as_deref(),
+            Some("Hub: Design")
+        );
+        assert_eq!(suggest_topic_hub_title("claude"), None);
+        assert_eq!(suggest_topic_hub_title("message-12-user"), None);
+        assert_eq!(suggest_topic_hub_title("create-detailed"), None);
+        assert_eq!(suggest_topic_hub_title("ddd"), None);
     }
 
     #[test]
@@ -927,6 +1472,98 @@ mod tests {
     }
 
     #[test]
+    fn merges_duplicate_auto_hubs_by_canonical_topic() -> Result<()> {
+        let dir = tempdir()?;
+        let mut store = KnowledgeStore::new(dir.path().to_path_buf(), dir.path().to_path_buf());
+        write_note(
+            &mut store,
+            "DAI course option",
+            "DAI course notes.",
+            &["dai-courses"],
+        )?;
+        write_note(
+            &mut store,
+            "DAI assessment",
+            "DAI assessment notes.",
+            &["dai-asd"],
+        )?;
+
+        let result = sync_topic_hubs(&mut store)?;
+        let hubs = result
+            .all_notes
+            .iter()
+            .filter(|note| note.is_topic_hub())
+            .collect::<Vec<_>>();
+
+        assert_eq!(hubs.len(), 1);
+        assert_eq!(hubs[0].topic_key().as_deref(), Some("dai"));
+        assert_eq!(hubs[0].title, "Hub: DAI");
+        Ok(())
+    }
+
+    #[test]
+    fn does_not_create_model_name_hubs() -> Result<()> {
+        let dir = tempdir()?;
+        let mut store = KnowledgeStore::new(dir.path().to_path_buf(), dir.path().to_path_buf());
+        let note = write_note(
+            &mut store,
+            "Claude output",
+            "Claude response review.",
+            &["claude"],
+        )?;
+
+        let result = sync_topic_hubs(&mut store)?;
+        let updated = store.get_note(&note.id)?;
+
+        assert!(updated.topic_hub_ids().is_empty());
+        assert!(result.all_notes.iter().all(|note| !note.is_topic_hub()));
+        Ok(())
+    }
+
+    #[test]
+    fn graph_clustering_prefers_major_community_hub_over_narrow_tags() -> Result<()> {
+        let dir = tempdir()?;
+        let mut store = KnowledgeStore::new(dir.path().to_path_buf(), dir.path().to_path_buf());
+        let market = write_note(
+            &mut store,
+            "Alpha Market",
+            "Market signal.\n- [[Alpha Budget]] (supports)",
+            &["pricing"],
+        )?;
+        let budget = write_note(
+            &mut store,
+            "Alpha Budget",
+            "Budget signal.\n- [[Alpha Timeline]] (supports)",
+            &["finance"],
+        )?;
+        let timeline = write_note(
+            &mut store,
+            "Alpha Timeline",
+            "Timeline signal.",
+            &["planning"],
+        )?;
+
+        let result = sync_topic_hubs(&mut store)?;
+        let hubs = result
+            .all_notes
+            .iter()
+            .filter(|note| note.is_topic_hub())
+            .collect::<Vec<_>>();
+
+        assert_eq!(hubs.len(), 1);
+        assert_eq!(hubs[0].topic_key().as_deref(), Some("alpha"));
+        assert_eq!(hubs[0].title, "Hub: Alpha");
+
+        for note in [market, budget, timeline] {
+            let updated = store.get_note(&note.id)?;
+            assert_eq!(updated.topic_hub_ids().len(), 1);
+            let hub = store.get_note(&updated.topic_hub_ids()[0])?;
+            assert_eq!(hub.topic_key().as_deref(), Some("alpha"));
+        }
+        Ok(())
+    }
+
+    #[test]
     fn reassigns_note_when_topics_change() -> Result<()> {
         let dir = tempdir()?;
         let mut store = KnowledgeStore::new(dir.path().to_path_buf(), dir.path().to_path_buf());
@@ -976,6 +1613,7 @@ mod tests {
             .expect("hub should exist");
 
         assert!(hub.content.contains("## Summary"));
+        assert!(hub.content.contains("## Subtopics"));
         assert!(hub.content.contains("## Notes In This Topic"));
         assert!(hub.content.contains("## Debates And Questions"));
         assert!(hub.content.contains("contradicts"));

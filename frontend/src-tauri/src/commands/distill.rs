@@ -71,6 +71,7 @@ fn suggest_hub(title: &str, tags: &[String]) -> Option<String> {
     let significant_tags: Vec<&String> = tags
         .iter()
         .filter(|t| *t != "grafyn" && *t != "draft")
+        .filter(|t| crate::services::topic_hub::suggest_topic_hub_title(t).is_some())
         .collect();
 
     if significant_tags.is_empty() {
@@ -92,19 +93,7 @@ fn suggest_hub(title: &str, tags: &[String]) -> Option<String> {
 
     let chosen = best.unwrap_or(&significant_tags[0]);
 
-    // Convert "my-tag" → "Hub: My Tag"
-    let title_case: String = chosen
-        .split('-')
-        .map(|w| {
-            let mut c = w.chars();
-            match c.next() {
-                Some(first) => first.to_uppercase().collect::<String>() + c.as_str(),
-                None => String::new(),
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ");
-    Some(format!("Hub: {}", title_case))
+    crate::services::topic_hub::suggest_topic_hub_title(chosen)
 }
 
 // ── Candidate extraction (rules-based) ─────────────────────────────────────

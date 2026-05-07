@@ -5,54 +5,155 @@
 <h1 align="center">Grafyn</h1>
 
 <p align="center">
-  A desktop knowledge graph with full-text search, multi-LLM canvas, and MCP integration.
+  A desktop knowledge graph and Canvas for capturing how you think, what you know, and how a future digital twin should reason with your evidence.
   <br>
   <strong>Windows</strong> &middot; <strong>macOS</strong> &middot; <strong>Linux</strong>
 </p>
 
 <p align="center">
   <a href="https://github.com/WKJBryan/Grafyn/releases/latest"><img src="https://img.shields.io/github/v/release/WKJBryan/Grafyn?style=flat-square&color=blue" alt="Release"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL--3.0-green?style=flat-square" alt="License: AGPL-3.0"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL--3.0-green?style=flat-square" alt="License: GPL-3.0"></a>
   <a href="https://github.com/WKJBryan/Grafyn/actions/workflows/test.yml"><img src="https://img.shields.io/github/actions/workflow/status/WKJBryan/Grafyn/test.yml?branch=main&style=flat-square&label=tests" alt="Tests"></a>
   <a href="https://github.com/WKJBryan/Grafyn/releases"><img src="https://img.shields.io/github/downloads/WKJBryan/Grafyn/total?style=flat-square&color=orange" alt="Downloads"></a>
 </p>
 
 <p align="center">
   <a href="https://github.com/WKJBryan/Grafyn/releases/latest">Download</a> &middot;
-  <a href="#features">Features</a> &middot;
+  <a href="#what-grafyn-is">What It Is</a> &middot;
+  <a href="#twin-capture-pipeline">Twin Pipeline</a> &middot;
   <a href="#quick-start">Quick Start</a> &middot;
-  <a href="#mcp-integration">MCP for Claude</a>
+  <a href="#developer-guidelines">Guidelines</a>
 </p>
 
-> **Early development** — expect rough edges. Bug reports welcome via [Issues](https://github.com/WKJBryan/Grafyn/issues).
+> **Early development** - expect rough edges. Grafyn is currently focused on local evidence capture, knowledge organization, and the first native RAG twin workflow. It is not yet a scratch-trained personal model.
 
 ---
 
-## Features
+## What Grafyn Is
 
-### Knowledge Management
-- **Markdown notes** with `[[wikilinks]]` and YAML frontmatter (Obsidian-compatible)
-- **Full-text search** powered by Tantivy with graph-aware ranking
-- **Backlink graph** with force-directed D3.js visualization
-- **Note workflows** — Draft, Evidence, Canonical status progression
+Grafyn is a desktop-only app for building a local knowledge vault and using it inside a multi-model Canvas. The long-term goal is to become the capture layer for a personal digital twin pipeline: users work inside Grafyn, Grafyn records explicit and passive evidence about their knowledge and reasoning patterns, and later twin systems can use that evidence.
+
+The current app is not claiming to be "you." It captures evidence about you.
+
+The first usable twin mode is a **native RAG twin**:
+
+1. Retrieve relevant notes from your vault.
+2. Retrieve reviewed user records about your thinking and preferences.
+3. Assemble that context into Canvas prompts.
+4. Let the chosen model answer in either advisor mode or explicitly labeled simulation mode.
+5. Feed your accept/reject/correct/rank feedback back into the evidence loop.
+
+## Core Features
+
+### Knowledge Vault
+
+- Markdown notes with `[[wikilinks]]` and YAML frontmatter.
+- Draft, evidence, and canonical note status workflow.
+- Full-text search powered by Tantivy.
+- Backlinks, outgoing links, and graph-aware retrieval.
+- Conversation import from ChatGPT, Claude, Grok, Gemini, and Codex-style exports.
+
+### Knowledge Graph And Hub Clustering
+
+- D3 force-directed graph view for notes and topic hubs.
+- Auto-managed topic hubs for broad knowledge areas.
+- Deterministic graph-based clustering over explicit links and shared topic/title signals.
+- Label-propagation communities so linked note groups become broader hubs instead of many tiny hubs.
+- Noise filtering so model/provider names such as `Claude` do not become hubs just because they appear in a prompt.
+- Major hubs keep minor recurring tags under a `Subtopics` section instead of exploding the sidebar with one folder per tiny topic.
 
 ### Multi-LLM Canvas
-- **Compare models side-by-side** — send one prompt to GPT-4, Claude, Gemini, and 100+ others simultaneously
-- **Real-time streaming** — parallel responses via OpenRouter
-- **Semantic note context** — automatically retrieves relevant notes as LLM context
-- **Debate mode** — models critique and build on each other's responses
-- **Infinite canvas** — drag, zoom, and pan with D3.js
-- **Smart web search** — auto-detects queries that benefit from live web results
 
-### AI-Powered Tools
-- **Distillation** — split large notes into atomic notes and topic hubs using LLM or rules-based extraction
-- **Link Discovery** — AI suggests connections between notes (Zettelkasten-style)
-- **Conversation Import** — bring in chat history from ChatGPT, Claude, Grok, and Gemini
+- Compare multiple OpenRouter models side by side.
+- Stream responses in parallel.
+- Branch from model responses.
+- Debate mode for model critique and synthesis.
+- Semantic note context from the vault.
+- Twin context mode using reviewed user records.
+- Smart web search detection for prompts that need current information.
+- Save Canvas sessions as notes.
 
-### MCP Integration
-- **Native Rust MCP server** bundled with the app for Claude Desktop
-- 10 tools: note CRUD, search, backlinks, outgoing links, recall, and conversation import
-- Zero-config — copy the config snippet from Grafyn Settings into Claude Desktop
+### Twin Capture And Review
+
+- Canvas feedback controls: `Matches Me`, `Not Me`, `Correct`, `Rank Selection`, `Capture Insight`, and `Export Twin Data`.
+- Local evidence capture from feedback, branching, note exports, canonical promotion, debate choices, and related passive signals.
+- Local signal inference for `Fact`, `Preference`, and `ReasoningPattern` records.
+- Review dashboard at `/twin` for candidate, auto-promoted, endorsed, rejected, private, and no-train records.
+- Evidence resolution so records can be traced back to the prompts, sessions, models, and excerpts that supported them.
+- Revert/reject support that prevents rejected inference keys from being silently auto-promoted again.
+
+### Native RAG Twin
+
+Canvas supports a `Twin` context mode with two answer modes:
+
+- **Advisor** - decision-support assistant using your reviewed notes and user records.
+- **Simulation** - explicitly labeled likely-user-style simulation. It is not represented as the actual user.
+
+Twin context uses:
+
+- Relevant vault notes and chunks.
+- Approved user records: `endorsed` and `auto_promoted`.
+- Relevant candidate records only when they match the prompt, disclosed separately as tentative.
+
+Twin context excludes:
+
+- `rejected`
+- `private`
+- `no_train`
+
+Rejected records are preserved for export as negative evidence, not used as live answer context.
+
+## Twin Capture Pipeline
+
+Grafyn currently learns in the **evidence and retrieval sense**, not by changing model weights.
+
+```text
+User work in Canvas/Notes
+        |
+        v
+Trace events + feedback + note actions
+        |
+        v
+Local signal inference
+        |
+        v
+Evidence-linked user records
+        |
+        v
+Twin Review: endorse / reject / private / no-train
+        |
+        v
+Native RAG twin context + export bundles
+```
+
+### Current Stage: Local Evidence And RAG
+
+Grafyn stores what happened and infers specific records such as:
+
+- "Prefers evidence-backed implementation detail."
+- "Rejects vague strategic answers."
+- "Often asks for blunt tradeoff analysis."
+
+These records are linked to evidence. They are not broad personality labels.
+
+### Export Contract
+
+Twin exports separate reviewed records into different JSONL files:
+
+- `approved_user_records.jsonl` - endorsed and auto-promoted records.
+- `candidate_user_records.jsonl` - tentative records for later review or weak-signal use.
+- `rejected_user_records.jsonl` - negative evidence for future pipelines.
+
+The export manifest includes matching counts and paths.
+
+### Future Training Paths
+
+Grafyn's data can later support stronger personal models, but those are not v1:
+
+- **RAG twin** - implemented first; no model weights change.
+- **Preference/ranking model** - learns what answer shape or decision style you choose.
+- **Local adapters or fine-tuning** - adjusts a capable base model using reviewed examples.
+- **Scratch-trained personal model** - research path only. Prompts alone are not enough; it would require large volumes of personal writing, decisions, outcomes, corrections, and domain evidence.
 
 ## Quick Start
 
@@ -62,41 +163,45 @@ Grab the latest installer from [Releases](https://github.com/WKJBryan/Grafyn/rel
 
 | Platform | File |
 |----------|------|
-| **Windows (64-bit)** | `Grafyn_*_x64-setup.exe` |
-| **Windows (ARM)** | `Grafyn_*_arm64-setup.exe` |
-| **macOS (Apple Silicon)** | `Grafyn_*_aarch64.dmg` |
-| **Linux (Debian/Ubuntu)** | `grafyn_*_amd64.deb` |
-| **Linux (Universal)** | `grafyn_*_amd64.AppImage` |
+| Windows x64 | `Grafyn_*_x64-setup.exe` |
+| Windows ARM64 | `Grafyn_*_arm64-setup.exe` |
+| macOS Apple Silicon | `Grafyn_*_aarch64.dmg` |
+| Linux Debian/Ubuntu | `grafyn_*_amd64.deb` |
+| Linux Universal | `grafyn_*_amd64.AppImage` |
 
 Grafyn auto-updates after installation.
 
-### Build from Source
+### Build From Source
 
-**Prerequisites:** Node.js 20+, Rust via [rustup](https://rustup.rs/), and [Tauri v1 dependencies](https://v1.tauri.app/v1/guides/getting-started/prerequisites).
+Prerequisites:
+
+- Node.js 20+
+- Rust via [rustup](https://rustup.rs/)
+- [Tauri v1 dependencies](https://v1.tauri.app/v1/guides/getting-started/prerequisites)
 
 ```bash
 cd frontend
 npm install
-node scripts/generate-icons.cjs    # first build only
+node scripts/generate-icons.cjs
 
-npm run tauri:dev                   # dev mode with hot reload
-npm run tauri:build                 # production build
+npm run tauri:dev
+npm run tauri:build
 ```
 
 ### Configuration
 
-On first launch, Grafyn walks you through setup:
-1. **Vault path** — where your markdown notes are stored (default: `~/Documents/Grafyn/vault/`)
-2. **OpenRouter API key** — required for Canvas, distillation, and link discovery ([get one here](https://openrouter.ai/keys))
+On first launch, Grafyn walks through setup:
 
-All data stays on your machine. No account needed.
+1. Vault path - where markdown notes are stored. Default: `~/Documents/Grafyn/vault/`.
+2. OpenRouter API key - required for Canvas model execution, distillation, link discovery, and native RAG twin answers.
+
+Local vault data stays on your machine. Canvas model calls send the selected prompt context to the configured model runtime.
 
 ## MCP Integration
 
-Connect Claude Desktop to your knowledge base:
+Grafyn bundles a native Rust MCP server, `grafyn-mcp`, for desktop agents such as Claude Desktop or Codex Desktop.
 
-1. Open Grafyn **Settings** and copy the MCP config snippet
-2. Add it to your `claude_desktop_config.json`:
+Use Grafyn Settings to copy the generated MCP config snippet, or configure it manually:
 
 ```json
 {
@@ -109,44 +214,97 @@ Connect Claude Desktop to your knowledge base:
 }
 ```
 
-The MCP server is a standalone Rust binary (`grafyn-mcp`) bundled with the installer. It shares the same vault and search index as the desktop app.
+The MCP binary shares the same vault and index paths as the desktop app. If the desktop app is holding the search writer lock, MCP falls back to read-only search.
 
 ## Architecture
 
-Single binary, no server — Tauri wraps a Vue 3 frontend with a Rust backend.
+Grafyn is a single desktop app: Vue 3 frontend, Rust/Tauri backend, local filesystem storage.
 
-```
+```text
 Tauri Desktop App
-├── Vue 3 Frontend (WebView)
-│   └── Tauri IPC (invoke)
+├── Vue 3 Frontend
+│   ├── Notes
+│   ├── Knowledge Graph
+│   ├── Canvas
+│   └── Twin Review
 ├── Rust Backend
-│   ├── 65 IPC commands across 13 modules
-│   ├── Tantivy full-text search
-│   ├── petgraph link graph
-│   └── OpenRouter LLM integration
-├── grafyn-mcp (bundled MCP server)
+│   ├── Tauri IPC commands
+│   ├── Knowledge store
+│   ├── Tantivy search and chunk retrieval
+│   ├── Graph index and topic clustering
+│   ├── Canvas session store
+│   ├── Twin evidence store
+│   └── OpenRouter integration
+├── grafyn-mcp
 └── ~/Documents/Grafyn/
-    ├── vault/  (markdown notes)
-    └── data/   (search index, canvas sessions, settings)
+    ├── vault/
+    └── data/
 ```
 
 ## Tech Stack
 
 | Layer | Technology |
-|-------|-----------|
+|-------|------------|
 | Frontend | Vue 3, Vite, Pinia, D3.js |
 | Desktop | Tauri 1.8 |
-| Search | Tantivy 0.22 |
-| Graph | petgraph 0.6 |
-| LLM | OpenRouter via reqwest |
-| MCP | rmcp (stdio transport) |
+| Backend | Rust |
+| Search | Tantivy |
+| Graph | petgraph + local graph algorithms |
+| LLM Runtime | OpenRouter via reqwest |
+| MCP | rmcp over stdio |
+| Storage | Local markdown vault + JSON data files |
 | Updates | Cloudflare R2 + Workers |
+
+## Developer Guidelines
+
+### Product Rules
+
+- Grafyn is desktop-first and local-first. Do not add a hosted backend for core vault or twin storage.
+- Treat user records as evidence-linked claims, not personality labels.
+- Do not silently train on or use records marked `rejected`, `private`, or `no_train`.
+- Candidate records may influence live RAG answers only when relevant and must be disclosed as tentative.
+- Advisor mode is the default for decision support.
+- Simulation mode must be clearly labeled as simulation.
+- Scratch-trained personal models are future research, not current product behavior.
+
+### Hub And Graph Rules
+
+- Prefer broad major hubs over many narrow hubs.
+- Use graph structure first, then deterministic canonicalization as fallback.
+- Model names, providers, transcript artifacts, and generic UI words should not become hubs.
+- Auto-managed duplicate hubs can be merged or removed by sync.
+- User-authored hubs should not be silently deleted.
+- Minor recurring themes belong in a hub's `Subtopics` section unless they become large enough to justify their own major hub.
+
+### Development Commands
+
+```bash
+# Frontend tests
+cd frontend
+npm run test:run
+npm run build
+
+# Prepare Rust/Tauri test prerequisites
+cd frontend
+npm run prepare:sidecar
+
+# Rust tests
+cd frontend/src-tauri
+cargo test
+```
+
+Known test noise:
+
+- Some HomeView unit tests emit `router-link` resolution warnings.
+- A Canvas store test intentionally logs a failed delete.
+- Rust currently warns that `SimilarityProvider::encode_batch` is unused.
 
 ## Contributing
 
-1. Fork and create a feature branch
-2. Make changes and add tests
-3. Run `cargo test` and `npm run test:run`
-4. Submit a pull request
+1. Fork the repository and create a feature branch.
+2. Keep changes scoped and evidence-backed.
+3. Add or update tests for behavior changes.
+4. Run the frontend and Rust verification commands.
+5. Submit a pull request.
 
-See [CLAUDE.md](CLAUDE.md) for detailed architecture docs, IPC command reference, and CI pitfalls.
+See [CLAUDE.md](CLAUDE.md), [WORKING_GUIDE.md](WORKING_GUIDE.md), and [TWIN_RAG_SPEC.md](TWIN_RAG_SPEC.md) for deeper architecture and workflow notes.

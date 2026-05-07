@@ -15,12 +15,9 @@
         <span
           v-if="session"
           class="toolbar-stats"
+          :title="toolbarStatsTitle"
         >
-          <span class="stat-item">{{ promptTiles.length }} Prompts</span>
-          <span class="stat-divider">|</span>
-          <span class="stat-item">{{ llmNodes.length }} Responses</span>
-          <span class="stat-divider">|</span>
-          <span class="stat-item">{{ debates.length }} Debates</span>
+          {{ compactToolbarStats }}
         </span>
         <span
           v-if="session?.linked_note_id"
@@ -49,38 +46,79 @@
           </button>
         </div>
         <PinnedNotesPanel data-guide="pinned-notes-btn" />
-        <button
-          class="btn btn-secondary btn-sm"
-          :disabled="selectedLLMNodes.length !== 1"
-          title="Record that the selected response matches you"
-          @click="handleRecordFeedback('accept')"
+        <div
+          ref="twinActionsDropdown"
+          class="toolbar-dropdown"
         >
-          Matches Me
-        </button>
-        <button
-          class="btn btn-secondary btn-sm"
-          :disabled="selectedLLMNodes.length !== 1"
-          title="Record that the selected response does not match you"
-          @click="handleRecordFeedback('reject')"
-        >
-          Not Me
-        </button>
-        <button
-          class="btn btn-secondary btn-sm"
-          :disabled="selectedLLMNodes.length < 2"
-          title="Record an explicit ranking using the current selection order"
-          @click="handleRankSelection"
-        >
-          Rank Selection
-        </button>
-        <button
-          class="btn btn-secondary btn-sm"
-          :disabled="!session"
-          title="Capture a durable fact, preference, or reasoning record"
-          @click="handleCaptureInsight"
-        >
-          Capture Insight
-        </button>
+          <button
+            class="btn btn-secondary btn-sm"
+            :disabled="!session"
+            title="Twin feedback and export actions"
+            @click="showTwinActionsMenu = !showTwinActionsMenu"
+          >
+            Twin
+            <GIcon
+              name="chevron-down"
+              :size="14"
+              class="icon"
+            />
+          </button>
+          <div
+            v-if="showTwinActionsMenu"
+            class="dropdown-menu twin-actions-menu"
+          >
+            <div class="dropdown-header">
+              Twin Actions
+            </div>
+            <button
+              class="dropdown-item"
+              :disabled="!selectedSingleCompleted"
+              title="Record that the selected response matches you"
+              @click="handleTwinMenuAction(() => handleRecordFeedback('accept'))"
+            >
+              Matches Me
+            </button>
+            <button
+              class="dropdown-item"
+              :disabled="!selectedSingleCompleted"
+              title="Record that the selected response does not match you"
+              @click="handleTwinMenuAction(() => handleRecordFeedback('reject'))"
+            >
+              Not Me
+            </button>
+            <button
+              class="dropdown-item"
+              :disabled="!selectedSingleCompleted"
+              title="Store a correction for the selected response"
+              @click="handleTwinMenuAction(handleCorrectResponse)"
+            >
+              Correct
+            </button>
+            <button
+              class="dropdown-item"
+              :disabled="selectedCompletedLLMNodes.length < 2"
+              title="Record an explicit ranking using the current selection order"
+              @click="handleTwinMenuAction(handleRankSelection)"
+            >
+              Rank Selection
+            </button>
+            <button
+              class="dropdown-item"
+              title="Capture a durable fact, preference, or reasoning record"
+              @click="handleTwinMenuAction(handleCaptureInsight)"
+            >
+              Capture Insight
+            </button>
+            <button
+              class="dropdown-item"
+              :disabled="exportingTwin"
+              title="Export curated twin records into train/eval/holdout bundles"
+              @click="handleTwinMenuAction(handleExportTwinData)"
+            >
+              {{ exportingTwin ? 'Exporting...' : 'Export Twin Data' }}
+            </button>
+          </div>
+        </div>
         <button
           class="btn btn-secondary btn-sm"
           data-guide="canvas-save-btn"
@@ -89,14 +127,6 @@
           @click="handleSaveAsNote"
         >
           {{ saving ? 'Saving...' : 'Save as Note' }}
-        </button>
-        <button
-          class="btn btn-secondary btn-sm"
-          :disabled="!session || exportingTwin"
-          title="Export curated twin records into train/eval/holdout bundles"
-          @click="handleExportTwinData"
-        >
-          {{ exportingTwin ? 'Exporting...' : 'Export Twin Data' }}
         </button>
         <span class="toolbar-divider" />
         <button
@@ -415,8 +445,10 @@ const expandedDebates = ref([])  // IDs of expanded debate nodes
 const showAddModelDialog = ref(false)
 const addModelContext = ref(null)  // { tileId, existingModelIds }
 const showArrangeMenu = ref(false)
+const showTwinActionsMenu = ref(false)
 const arranging = ref(false)  // Loading state during arrangement
 const arrangeDropdown = ref(null)  // Ref for dropdown element
+const twinActionsDropdown = ref(null)
 const showApiKeyRequired = ref(false)  // Show API key required dialog
 const hasApiKey = ref(true)  // Assume true initially, check on mount
 const smartWebSearch = ref(true)  // Smart web search auto-detection (loaded from settings)
@@ -430,6 +462,20 @@ const session = computed(() => canvasStore.currentSession)
 const promptTiles = computed(() => canvasStore.promptTiles)
 const debates = computed(() => canvasStore.debates)
 const availableModels = computed(() => canvasStore.availableModels)
+const compactToolbarStats = computed(() => {
+  return [
+    formatCount(promptTiles.value.length, 'prompt'),
+    formatCount(llmNodes.value.length, 'response'),
+    formatCount(debates.value.length, 'debate')
+  ].join(' / ')
+})
+const toolbarStatsTitle = computed(() => {
+  return [
+    formatCount(promptTiles.value.length, 'prompt', true),
+    formatCount(llmNodes.value.length, 'response', true),
+    formatCount(debates.value.length, 'debate', true)
+  ].join(', ')
+})
 const loading = computed(() => canvasStore.loading)
 const streamingModels = computed(() => canvasStore.streamingModels)
 const debateStreamingContent = computed(() => canvasStore.debateStreamingContent)
@@ -459,8 +505,22 @@ const selectedLLMNodes = computed(() => {
     })
 })
 
+const selectedCompletedLLMNodes = computed(() => {
+  return selectedLLMNodes.value.filter(({ tileId, modelId }) => {
+    const node = getResponseNode(tileId, modelId)
+    return node?.response?.status === 'completed'
+  })
+})
+
+const selectedSingleCompleted = computed(() => selectedCompletedLLMNodes.value.length === 1)
+
 function getResponseNode(tileId, modelId) {
   return llmNodes.value.find(node => node.tileId === tileId && node.modelId === modelId) || null
+}
+
+function formatCount(count, singular, full = false) {
+  if (!full) return `${count} ${singular[0].toUpperCase()}`
+  return `${count} ${singular}${count === 1 ? '' : 's'}`
 }
 
 // Edge paths — cached via position snapshot to avoid recomputation during streaming.
@@ -882,9 +942,9 @@ function clearSelection() {
 }
 
 async function handleRecordFeedback(feedbackType) {
-  if (selectedLLMNodes.value.length !== 1) return
+  if (!selectedSingleCompleted.value) return
 
-  const [selectedNode] = selectedLLMNodes.value
+  const [selectedNode] = selectedCompletedLLMNodes.value
   const responseNode = getResponseNode(selectedNode.tileId, selectedNode.modelId)
   const label = responseNode?.response?.model_name || selectedNode.modelId
   const promptText = feedbackType === 'accept'
@@ -915,9 +975,9 @@ async function handleRecordFeedback(feedbackType) {
 }
 
 async function handleRankSelection() {
-  if (selectedLLMNodes.value.length < 2) return
+  if (selectedCompletedLLMNodes.value.length < 2) return
 
-  const rankedResponses = selectedLLMNodes.value.map(({ tileId, modelId }, index) => {
+  const rankedResponses = selectedCompletedLLMNodes.value.map(({ tileId, modelId }, index) => {
     const responseNode = getResponseNode(tileId, modelId)
     const label = responseNode?.response?.model_name || modelId
     return {
@@ -950,6 +1010,43 @@ async function handleRankSelection() {
   } catch (err) {
     console.error('Failed to record ranking:', err)
     showCanvasMessage('error', err.message || 'Failed to record ranking')
+  }
+}
+
+async function handleCorrectResponse() {
+  if (!selectedSingleCompleted.value) return
+
+  const [selectedNode] = selectedCompletedLLMNodes.value
+  const responseNode = getResponseNode(selectedNode.tileId, selectedNode.modelId)
+  const label = responseNode?.response?.model_name || selectedNode.modelId
+  const content = globalThis.prompt?.(
+    `What correction should Grafyn remember about ${label}'s response?`,
+    ''
+  )
+  if (typeof content !== 'string') return
+  if (!content.trim()) {
+    showCanvasMessage('error', 'Correction cannot be empty')
+    return
+  }
+
+  const rationale = globalThis.prompt?.(
+    'Optional note about what was wrong or what evidence supports the correction.',
+    ''
+  )
+  if (typeof rationale !== 'string') return
+
+  try {
+    await canvasStore.recordCorrectionFeedback(
+      selectedNode.tileId,
+      selectedNode.modelId,
+      content.trim(),
+      rationale.trim() || null
+    )
+    clearSelection()
+    showCanvasMessage('success', 'Recorded correction', 2500)
+  } catch (err) {
+    console.error('Failed to record correction:', err)
+    showCanvasMessage('error', err.message || 'Failed to record correction')
   }
 }
 
@@ -1011,7 +1108,7 @@ async function handleExportTwinData() {
     const bundle = await canvasStore.exportTwinData()
     showCanvasMessage(
       'success',
-      `Twin export ready: ${bundle.train.count} train / ${bundle.eval.count} eval / ${bundle.holdout.count} holdout`,
+      `Twin export ready: ${bundle.approved_user_records.count} approved / ${bundle.candidate_user_records.count} candidate / ${bundle.rejected_user_records.count} rejected`,
       5000
     )
   } catch (err) {
@@ -1154,7 +1251,16 @@ async function handleNewPromptClick() {
   showPromptDialog.value = true
 }
 
-async function handlePromptSubmit({ prompt, models, systemPrompt, temperature, maxTokens = null, contextMode, webSearch }) {
+async function handlePromptSubmit({
+  prompt,
+  models,
+  systemPrompt,
+  temperature,
+  maxTokens = null,
+  contextMode,
+  twinAnswerMode = 'advisor',
+  webSearch
+}) {
   if (isDesktopApp()) {
     try {
       if (!(await refreshOpenRouterStatus())) {
@@ -1182,12 +1288,24 @@ async function handlePromptSubmit({ prompt, models, systemPrompt, temperature, m
         temperature,
         maxTokens,
         contextMode || 'knowledge_search',
+        twinAnswerMode || 'advisor',
         webSearch || false
       )
       branchContext.value = null
     } else {
       // Regular prompt
-      await canvasStore.sendPrompt(prompt, models, systemPrompt, temperature, maxTokens, null, null, contextMode || 'knowledge_search', webSearch || false)
+      await canvasStore.sendPrompt(
+        prompt,
+        models,
+        systemPrompt,
+        temperature,
+        maxTokens,
+        null,
+        null,
+        contextMode || 'knowledge_search',
+        twinAnswerMode || 'advisor',
+        webSearch || false
+      )
     }
   } catch (err) {
     console.error('Failed to send prompt:', err)
@@ -1299,6 +1417,14 @@ function handleClickOutside(event) {
   if (arrangeDropdown.value && !arrangeDropdown.value.contains(event.target)) {
     showArrangeMenu.value = false
   }
+  if (twinActionsDropdown.value && !twinActionsDropdown.value.contains(event.target)) {
+    showTwinActionsMenu.value = false
+  }
+}
+
+function handleTwinMenuAction(action) {
+  action()
+  showTwinActionsMenu.value = false
 }
 
 // Auto-arrange nodes in hierarchical tree layout
@@ -1502,6 +1628,7 @@ async function handleAutoArrange() {
   color: var(--text-muted);
   display: flex;
   gap: var(--spacing-xs);
+  white-space: nowrap;
 }
 
 .stat-divider {
@@ -1527,10 +1654,12 @@ async function handleAutoArrange() {
   display: flex;
   align-items: center;
   gap: var(--spacing-xs);
+  min-width: 0;
 }
 
 /* Arrange Dropdown */
-.arrange-dropdown {
+.arrange-dropdown,
+.toolbar-dropdown {
   position: relative;
   display: inline-block;
 }
@@ -1577,6 +1706,15 @@ async function handleAutoArrange() {
   border-radius: var(--radius-sm);
 }
 
+.dropdown-item:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.dropdown-item:disabled:hover {
+  background: transparent;
+}
+
 .dropdown-item.active {
   background: color-mix(in srgb, var(--accent-primary) 15%, transparent);
   border-left: 3px solid var(--accent-primary);
@@ -1603,6 +1741,10 @@ async function handleAutoArrange() {
 .layout-desc {
   font-size: 0.75rem;
   color: var(--text-muted);
+}
+
+.twin-actions-menu {
+  min-width: 220px;
 }
 
 .zoom-level {
