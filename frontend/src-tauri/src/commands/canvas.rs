@@ -3,10 +3,10 @@ use crate::models::canvas::{
     AddModelsRequest, AvailableModel, CanvasSession, CanvasStreamEvent, CanvasViewport,
     ContextMode, Debate, DebateContinueRequest, DebateResponse, DebateRound, DebateStartRequest,
     LLMNodePositionUpdate, ModelResponse, PromptRequest, PromptTile, ResponseStatus, SessionCreate,
-    SessionMeta, SessionUpdate, TileContextNote, TilePosition, TilePositionUpdate,
+    SessionMeta, SessionUpdate, TileContextNote, TilePosition, TilePositionUpdate, TwinAnswerMode,
 };
 use crate::models::note::{ChunkResult, NoteCreate, NoteStatus};
-use crate::models::twin::TraceEventType;
+use crate::models::twin::{TraceEventType, TwinContextRecord};
 use crate::services::openrouter::ChatMessage;
 use crate::services::retrieval::RetrievalResult;
 use crate::services::twin_store::TwinStore;
@@ -50,6 +50,8 @@ struct ConversationTurn {
 struct ResolvedPromptContext {
     messages: Vec<ChatMessage>,
     context_notes: Vec<TileContextNote>,
+    approved_twin_records: Vec<TwinContextRecord>,
+    candidate_twin_records: Vec<TwinContextRecord>,
     system_prompt: Option<String>,
 }
 
@@ -228,6 +230,10 @@ pub async fn send_prompt(
         parent_tile_id: request.parent_tile_id,
         parent_model_id: request.parent_model_id,
         context_notes: resolved_context.context_notes.clone(),
+        approved_twin_records: resolved_context.approved_twin_records.clone(),
+        candidate_twin_records: resolved_context.candidate_twin_records.clone(),
+        twin_answer_mode: request.twin_answer_mode.clone(),
+        twin_context_policy: request.twin_context_policy.clone(),
         web_search: request.web_search,
         web_search_max_results: request.web_search_max_results,
     };
@@ -252,6 +258,9 @@ pub async fn send_prompt(
             "parent_tile_id": tile.parent_tile_id.clone(),
             "parent_model_id": tile.parent_model_id.clone(),
             "context_note_ids": tile.context_notes.iter().map(|note| note.id.clone()).collect::<Vec<_>>(),
+            "twin_answer_mode": tile.twin_answer_mode.clone(),
+            "approved_twin_record_ids": tile.approved_twin_records.iter().map(|record| record.id.clone()).collect::<Vec<_>>(),
+            "candidate_twin_record_ids": tile.candidate_twin_records.iter().map(|record| record.id.clone()).collect::<Vec<_>>(),
             "web_search": tile.web_search,
             "web_search_max_results": tile.web_search_max_results,
         }),
@@ -1596,6 +1605,8 @@ fn prompt_request_from_tile(
         models,
         position: None,
         context_mode: tile.context_mode.clone(),
+        twin_answer_mode: tile.twin_answer_mode.clone(),
+        twin_context_policy: tile.twin_context_policy.clone(),
         parent_tile_id: tile.parent_tile_id.clone(),
         parent_model_id: tile.parent_model_id.clone(),
         temperature,
@@ -1822,6 +1833,10 @@ async fn resolve_prompt_context(
 ) -> Result<ResolvedPromptContext, String> {
     let messages = build_canvas_messages(session, request)?;
 
+    if request.context_mode == ContextMode::Twin {
+        return resolve_twin_prompt_context(state, messages, session, request).await;
+    }
+
     if matches!(
         request.context_mode,
         ContextMode::KnowledgeSearch | ContextMode::Semantic
@@ -1849,6 +1864,8 @@ async fn resolve_prompt_context(
             return Ok(ResolvedPromptContext {
                 messages,
                 context_notes: Vec::new(),
+                approved_twin_records: Vec::new(),
+                candidate_twin_records: Vec::new(),
                 system_prompt: request.system_prompt.clone(),
             });
         }
@@ -1932,6 +1949,8 @@ async fn resolve_prompt_context(
             Ok(ResolvedPromptContext {
                 messages,
                 context_notes,
+                approved_twin_records: Vec::new(),
+                candidate_twin_records: Vec::new(),
                 system_prompt: Some(system_prompt),
             })
         } else {
@@ -1949,9 +1968,127 @@ async fn resolve_prompt_context(
         Ok(ResolvedPromptContext {
             messages,
             context_notes: Vec::new(),
+            approved_twin_records: Vec::new(),
+            candidate_twin_records: Vec::new(),
             system_prompt: request.system_prompt.clone(),
         })
     }
+}
+
+async fn resolve_twin_prompt_context(
+    state: &AppState,
+    messages: Vec<ChatMessage>,
+    session: &CanvasSession,
+    request: &PromptRequest,
+) -> Result<ResolvedPromptContext, String> {
+    let pinned_ids = session.pinned_note_ids.clone();
+    let retrieval_results = {
+        let search = state.search_service.read().await;
+        let graph = state.graph_index.read().await;
+        let priority = state.priority_service.read().await;
+        let retrieval = state.retrieval_service.read().await;
+        retrieval
+            .retrieve(&search, &graph, &priority, &request.prompt, 5, &pinned_ids)
+            .unwrap_or_default()
+    };
+
+    let should_use_notes = should_use_retrieved_notes(&request.prompt, &retrieval_results)
+        == RetrievalDecisionReason::UseRetrievedNotes;
+    let mut context_notes = Vec::new();
+    let mut note_contexts = Vec::new();
+
+    if should_use_notes {
+        let chunk_enabled = {
+            let retrieval = state.retrieval_service.read().await;
+            retrieval.get_config().chunk_retrieval_enabled
+        };
+
+        if chunk_enabled {
+            let chunks = {
+                let retrieval = state.retrieval_service.read().await;
+                let chunk_index = state.chunk_index.read().await;
+                let graph = state.graph_index.read().await;
+                let priority = state.priority_service.read().await;
+                let token_budget = retrieval.get_config().default_token_budget;
+                retrieval
+                    .retrieve_chunks(
+                        &chunk_index,
+                        &graph,
+                        &priority,
+                        &request.prompt,
+                        token_budget,
+                        &pinned_ids,
+                    )
+                    .unwrap_or_default()
+            };
+
+            if !chunks.is_empty() {
+                let mut seen_notes: HashSet<String> = HashSet::new();
+                for chunk in &chunks {
+                    note_contexts.push((
+                        chunk.parent_note_id.clone(),
+                        chunk.parent_title.clone(),
+                        chunk.text.clone(),
+                    ));
+                    if seen_notes.insert(chunk.parent_note_id.clone()) {
+                        context_notes.push(TileContextNote {
+                            id: chunk.parent_note_id.clone(),
+                            title: chunk.parent_title.clone(),
+                            snippet: truncate_note_context_content(&chunk.text, 200),
+                            score: chunk.search_score,
+                            pinned: pinned_ids.contains(&chunk.parent_note_id),
+                        });
+                    }
+                }
+            }
+        }
+
+        if note_contexts.is_empty() {
+            let store = state.knowledge_store.read().await;
+            for result in &retrieval_results {
+                if let Ok(note) = store.get_note(&result.note.id) {
+                    note_contexts.push((
+                        note.id.clone(),
+                        note.title.clone(),
+                        truncate_note_context_content(&note.content, 1500),
+                    ));
+                    context_notes.push(TileContextNote {
+                        id: result.note.id.clone(),
+                        title: result.note.title.clone(),
+                        snippet: result.snippet.clone(),
+                        score: result.score,
+                        pinned: pinned_ids.contains(&result.note.id),
+                    });
+                }
+            }
+        }
+    }
+
+    let (approved_twin_records, candidate_twin_records) = {
+        let mut twin_store = state.twin_store.write().await;
+        twin_store
+            .select_context_records(&request.prompt)
+            .map_err(|error| error.to_string())?
+    };
+
+    let twin_prompt = build_twin_context_prompt(
+        &note_contexts,
+        &approved_twin_records,
+        &candidate_twin_records,
+        &request.twin_answer_mode,
+    );
+    let system_prompt = match &request.system_prompt {
+        Some(user_sp) if !user_sp.is_empty() => format!("{}\n\n{}", twin_prompt, user_sp),
+        _ => twin_prompt,
+    };
+
+    Ok(ResolvedPromptContext {
+        messages,
+        context_notes,
+        approved_twin_records,
+        candidate_twin_records,
+        system_prompt: Some(system_prompt),
+    })
 }
 
 /// Fall back to note-level context when chunk retrieval is disabled or returns nothing.
@@ -1995,6 +2132,8 @@ async fn resolve_note_level_context(
     Ok(ResolvedPromptContext {
         messages,
         context_notes,
+        approved_twin_records: Vec::new(),
+        candidate_twin_records: Vec::new(),
         system_prompt: Some(system_prompt),
     })
 }
@@ -2235,6 +2374,73 @@ fn build_note_context_prompt(notes: &[(String, String, String)]) -> String {
     prompt
 }
 
+fn build_twin_context_prompt(
+    notes: &[(String, String, String)],
+    approved_records: &[TwinContextRecord],
+    candidate_records: &[TwinContextRecord],
+    answer_mode: &TwinAnswerMode,
+) -> String {
+    let mut prompt = String::from(
+        "You are Grafyn's native RAG twin mode. Use only the provided vault notes and user-reviewed twin records as personal context. \
+         Do not claim to be the user. Keep uncertainty visible, and do not treat tentative candidate records as facts.\n\n",
+    );
+
+    prompt.push_str("## Relevant Vault Notes\n\n");
+    if notes.is_empty() {
+        prompt.push_str("No relevant vault notes were selected for this prompt.\n\n");
+    } else {
+        for (id, title, content) in notes {
+            prompt.push_str(&format!("### {} (id: {})\n{}\n\n", title, id, content));
+        }
+    }
+
+    prompt.push_str("## Approved User Records\n\n");
+    if approved_records.is_empty() {
+        prompt.push_str("No endorsed or auto-promoted user records were selected.\n\n");
+    } else {
+        for record in approved_records {
+            prompt.push_str(&format_twin_record(record));
+        }
+        prompt.push('\n');
+    }
+
+    prompt.push_str("## Tentative Candidate Records\n\n");
+    if candidate_records.is_empty() {
+        prompt.push_str("No relevant candidate records were selected.\n\n");
+    } else {
+        prompt.push_str("These are unreviewed hypotheses. Use them lightly and disclose when they affect the answer.\n");
+        for record in candidate_records {
+            prompt.push_str(&format_twin_record(record));
+        }
+        prompt.push('\n');
+    }
+
+    prompt.push_str("## Instructions\n\n");
+    match answer_mode {
+        TwinAnswerMode::Advisor => prompt.push_str(
+            "Answer as a decision-support assistant for the user. Use approved records as stable personalization. \
+             Use candidate records only as tentative context. Separate what is grounded in notes/records from your recommendation.\n",
+        ),
+        TwinAnswerMode::Simulation => prompt.push_str(
+            "Answer as a likely-user-style simulation for reflection. Label the response as a simulation, not the user's actual view. \
+             Use approved records as stronger style and preference evidence; mention candidate influence as tentative when relevant.\n",
+        ),
+    }
+
+    prompt
+}
+
+fn format_twin_record(record: &TwinContextRecord) -> String {
+    format!(
+        "- [{:?}; {:?}; confidence {:.2}; evidence {}] {}\n",
+        record.kind,
+        record.promotion_state,
+        record.confidence,
+        record.evidence_count,
+        record.content
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2277,6 +2483,10 @@ mod tests {
             parent_tile_id: parent_tile_id.map(str::to_string),
             parent_model_id: parent_model_id.map(str::to_string),
             context_notes: Vec::new(),
+            approved_twin_records: Vec::new(),
+            candidate_twin_records: Vec::new(),
+            twin_answer_mode: TwinAnswerMode::default(),
+            twin_context_policy: None,
             web_search: false,
             web_search_max_results: 5,
         }
@@ -2310,6 +2520,8 @@ mod tests {
             models: vec!["openai/gpt-4".to_string()],
             position: None,
             context_mode,
+            twin_answer_mode: TwinAnswerMode::default(),
+            twin_context_policy: None,
             parent_tile_id: Some(parent_tile_id.to_string()),
             parent_model_id: Some(parent_model_id.to_string()),
             temperature: 0.7,
@@ -2424,6 +2636,53 @@ mod tests {
         let chunks: Vec<ChunkResult> = vec![];
         let prompt = build_chunk_context_prompt(&chunks);
         assert!(prompt.contains("No relevant notes were found"));
+    }
+
+    #[test]
+    fn twin_context_prompt_separates_approved_candidates_and_advisor_instructions() {
+        let approved = vec![TwinContextRecord {
+            id: "record-approved".into(),
+            kind: crate::models::twin::UserRecordKind::Preference,
+            content: "User prefers evidence-backed implementation detail.".into(),
+            confidence: 0.9,
+            promotion_state: crate::models::twin::PromotionState::Endorsed,
+            evidence_count: 4,
+            source_label: Some("approved".into()),
+        }];
+        let candidates = vec![TwinContextRecord {
+            id: "record-candidate".into(),
+            kind: crate::models::twin::UserRecordKind::ReasoningPattern,
+            content: "User may prefer red-team critique before shipping.".into(),
+            confidence: 0.62,
+            promotion_state: crate::models::twin::PromotionState::Candidate,
+            evidence_count: 1,
+            source_label: Some("candidate".into()),
+        }];
+
+        let prompt = build_twin_context_prompt(
+            &[(
+                "note-1".into(),
+                "Decision Notes".into(),
+                "Use tests.".into(),
+            )],
+            &approved,
+            &candidates,
+            &TwinAnswerMode::Advisor,
+        );
+
+        assert!(prompt.contains("## Relevant Vault Notes"));
+        assert!(prompt.contains("## Approved User Records"));
+        assert!(prompt.contains("## Tentative Candidate Records"));
+        assert!(prompt.contains("unreviewed hypotheses"));
+        assert!(prompt.contains("decision-support assistant"));
+    }
+
+    #[test]
+    fn twin_context_prompt_labels_simulation_mode() {
+        let prompt = build_twin_context_prompt(&[], &[], &[], &TwinAnswerMode::Simulation);
+
+        assert!(prompt.contains("likely-user-style simulation"));
+        assert!(prompt.contains("not the user's actual view"));
     }
 
     #[test]
@@ -2605,6 +2864,25 @@ mod tests {
         assert_eq!(request.web_search_max_results, 8);
         assert_eq!(request.temperature, 0.3);
         assert_eq!(request.max_tokens, Some(4096));
+    }
+
+    #[test]
+    fn test_prompt_request_from_tile_preserves_twin_settings() {
+        let tile = PromptTile {
+            context_mode: ContextMode::Twin,
+            twin_answer_mode: TwinAnswerMode::Simulation,
+            twin_context_policy: Some("approved_plus_relevant_candidates".to_string()),
+            ..build_tile("tile-1", "Prompt", "openai/gpt-4", "Response", None, None)
+        };
+
+        let request = prompt_request_from_tile(&tile, vec!["openai/gpt-4".to_string()], 0.7, None);
+
+        assert_eq!(request.context_mode, ContextMode::Twin);
+        assert_eq!(request.twin_answer_mode, TwinAnswerMode::Simulation);
+        assert_eq!(
+            request.twin_context_policy.as_deref(),
+            Some("approved_plus_relevant_candidates")
+        );
     }
 
     #[test]

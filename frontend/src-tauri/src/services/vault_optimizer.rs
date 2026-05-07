@@ -3,8 +3,8 @@ use crate::models::migration::{
     VaultOptimizerStatus,
 };
 use crate::models::note::{
-    Note, NoteUpdate, PROP_INFERRED_LINK_IDS, PROP_TOPIC_ALIASES, PROP_TOPIC_KEY,
-    CURRENT_NOTE_SCHEMA_VERSION,
+    Note, NoteUpdate, CURRENT_NOTE_SCHEMA_VERSION, PROP_INFERRED_LINK_IDS, PROP_TOPIC_ALIASES,
+    PROP_TOPIC_KEY,
 };
 use crate::models::settings::UserSettings;
 use crate::services::knowledge_store::KnowledgeStore;
@@ -152,7 +152,11 @@ impl VaultOptimizerService {
         Ok(decisions)
     }
 
-    pub fn inbox(&self, status: Option<&str>, limit: usize) -> Result<Vec<VaultOptimizerInboxEntry>> {
+    pub fn inbox(
+        &self,
+        status: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<VaultOptimizerInboxEntry>> {
         let mut inbox = self.load_inbox()?;
         if let Some(status) = status {
             inbox.retain(|entry| entry.status.eq_ignore_ascii_case(status));
@@ -289,7 +293,10 @@ impl VaultOptimizerService {
                     schema_version: Some(CURRENT_NOTE_SCHEMA_VERSION),
                     migration_source: Some("vault_optimizer".to_string()),
                     optimizer_managed: Some(false),
-                    properties: Some(merge_note_properties(note.properties.clone(), proposal.properties)),
+                    properties: Some(merge_note_properties(
+                        note.properties.clone(),
+                        proposal.properties,
+                    )),
                 },
             )?;
             OptimizerChange {
@@ -349,14 +356,19 @@ impl VaultOptimizerService {
     fn push_decision(&self, decision: VaultOptimizerDecision) -> Result<()> {
         let mut decisions = self.load_decisions()?;
         decisions.push(decision);
-        std::fs::write(&self.decisions_path, serde_json::to_string_pretty(&decisions)?)?;
+        std::fs::write(
+            &self.decisions_path,
+            serde_json::to_string_pretty(&decisions)?,
+        )?;
         Ok(())
     }
 
     fn load_inbox(&self) -> Result<Vec<VaultOptimizerInboxEntry>> {
         let inbox = std::fs::read_to_string(&self.inbox_path)
             .ok()
-            .and_then(|content| serde_json::from_str::<Vec<VaultOptimizerInboxEntry>>(&content).ok())
+            .and_then(|content| {
+                serde_json::from_str::<Vec<VaultOptimizerInboxEntry>>(&content).ok()
+            })
             .unwrap_or_default();
         Ok(inbox)
     }
@@ -423,7 +435,11 @@ fn build_optimizer_proposal(note: &Note, store: &KnowledgeStore) -> Result<Optim
         if candidate.id == note.id || candidate.title.len() < 6 {
             continue;
         }
-        if note.content.to_lowercase().contains(&candidate.title.to_lowercase()) {
+        if note
+            .content
+            .to_lowercase()
+            .contains(&candidate.title.to_lowercase())
+        {
             inferred_link_ids.push(candidate.id);
         }
     }
@@ -433,11 +449,21 @@ fn build_optimizer_proposal(note: &Note, store: &KnowledgeStore) -> Result<Optim
     let merged_tags = merge_unique_strings(Vec::new(), tags);
     let new_aliases = merged_aliases
         .into_iter()
-        .filter(|alias| !note.aliases.iter().any(|existing| existing.eq_ignore_ascii_case(alias)))
+        .filter(|alias| {
+            !note
+                .aliases
+                .iter()
+                .any(|existing| existing.eq_ignore_ascii_case(alias))
+        })
         .collect::<Vec<_>>();
     let new_tags = merged_tags
         .into_iter()
-        .filter(|tag| !note.tags.iter().any(|existing| existing.eq_ignore_ascii_case(tag)))
+        .filter(|tag| {
+            !note
+                .tags
+                .iter()
+                .any(|existing| existing.eq_ignore_ascii_case(tag))
+        })
         .collect::<Vec<_>>();
 
     let mut properties = HashMap::new();
@@ -465,7 +491,11 @@ fn build_optimizer_proposal(note: &Note, store: &KnowledgeStore) -> Result<Optim
             "aliases +{} | tags +{} | inferred signals {}",
             new_aliases.len(),
             new_tags.len(),
-            if note.content.len() > 400 { "updated" } else { "checked" }
+            if note.content.len() > 400 {
+                "updated"
+            } else {
+                "checked"
+            }
         ),
     })
 }

@@ -84,6 +84,9 @@
             <option value="knowledge_search">
               Vault Notes (relevant notes)
             </option>
+            <option value="twin">
+              Twin (notes + user records)
+            </option>
             <option value="none">
               None (no additional context)
             </option>
@@ -102,6 +105,35 @@
           </select>
           <span class="context-mode-hint">
             {{ contextModeHints[contextMode] }}
+          </span>
+        </div>
+
+        <div
+          v-if="contextMode === 'twin'"
+          class="form-group twin-mode-group"
+        >
+          <label>Twin Answer Mode</label>
+          <div class="segmented-control">
+            <button
+              type="button"
+              :class="{ active: twinAnswerMode === 'advisor' }"
+              @click="twinAnswerMode = 'advisor'"
+            >
+              Advisor
+            </button>
+            <button
+              type="button"
+              :class="{ active: twinAnswerMode === 'simulation' }"
+              @click="twinAnswerMode = 'simulation'"
+            >
+              Simulation
+            </button>
+          </div>
+          <span class="context-mode-hint">
+            {{ twinModeHints[twinAnswerMode] }}
+          </span>
+          <span class="context-mode-hint">
+            Selected vault notes and twin records may be sent to the chosen model runtime.
           </span>
         </div>
 
@@ -219,6 +251,7 @@ const selectedModels = ref([])
 const temperature = ref(0.7)
 const showAdvanced = ref(false)
 const contextMode = ref('knowledge_search')  // Default to knowledge search for note lookup
+const twinAnswerMode = ref('advisor')
 
 const searchDetection = computed(() => detectWebSearch(prompt.value))
 const resolvedWebSearch = computed(() => (
@@ -250,8 +283,14 @@ const webSearchHint = computed(() => {
 const contextModeHints = {
   none: 'No additional context - just your prompt',
   knowledge_search: 'Retrieves relevant notes (+ pinned notes) from your vault as LLM context. This does not search the live web.',
+  twin: 'Retrieves relevant notes plus approved user records and relevant candidate records from Twin Review.',
   full_history: 'Include all conversation turns from the parent chain',
   compact: 'Include recent turns + summary of older context to save tokens'
+}
+
+const twinModeHints = {
+  advisor: 'Decision-support mode uses reviewed memory to help the user reason.',
+  simulation: 'Simulation mode is labeled as likely-user-style reflection, not the user actual view.'
 }
 
 // Computed
@@ -276,6 +315,7 @@ const estimatedTokens = computed(() => {
   const contextMultiplier = {
     none: 1.0,          // No additional context
     knowledge_search: 1.3,  // Knowledge search results
+    twin: 1.6,              // Notes + twin records
     full_history: 1.5,  // Include conversation history
     compact: 1.2        // Compact summary
   }
@@ -306,6 +346,7 @@ function handleSubmit() {
     systemPrompt: showSystemPrompt.value ? systemPrompt.value.trim() : null,
     temperature: temperature.value,
     contextMode: contextMode.value,
+    twinAnswerMode: twinAnswerMode.value,
     webSearch: resolvedWebSearch.value
   })
 }
@@ -520,6 +561,32 @@ function handleSubmit() {
   margin-top: var(--spacing-xs);
   font-size: 0.75rem;
   color: var(--text-muted);
+}
+
+.segmented-control {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 2px;
+  padding: 2px;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+}
+
+.segmented-control button {
+  border: none;
+  border-radius: calc(var(--radius-sm) - 2px);
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: 0.8125rem;
+  font-weight: 600;
+  min-height: 32px;
+}
+
+.segmented-control button.active {
+  background: var(--accent-primary);
+  color: white;
 }
 
 .web-search-hint {

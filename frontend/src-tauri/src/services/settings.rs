@@ -214,14 +214,12 @@ impl SettingsService {
         }
 
         if let Some(vault_optimizer_program_path) = update.vault_optimizer_program_path {
-            self.settings.vault_optimizer_program_path = if vault_optimizer_program_path
-                .trim()
-                .is_empty()
-            {
-                "_grafyn/program.md".to_string()
-            } else {
-                vault_optimizer_program_path.replace('\\', "/")
-            };
+            self.settings.vault_optimizer_program_path =
+                if vault_optimizer_program_path.trim().is_empty() {
+                    "_grafyn/program.md".to_string()
+                } else {
+                    vault_optimizer_program_path.replace('\\', "/")
+                };
         }
 
         if let Some(canvas_model_presets) = update.canvas_model_presets {

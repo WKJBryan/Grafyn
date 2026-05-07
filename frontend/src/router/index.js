@@ -22,6 +22,11 @@ const routes = [
     component: () => import('../views/ImportView.vue'),
   },
   {
+    path: '/twin',
+    name: 'twin-review',
+    component: () => import('../views/TwinReviewView.vue'),
+  },
+  {
     path: '/:pathMatch(.*)*',
     name: 'not-found',
     component: () => import('../views/NotFoundView.vue'),

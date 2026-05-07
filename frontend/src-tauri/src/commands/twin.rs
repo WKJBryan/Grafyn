@@ -1,8 +1,9 @@
 use crate::models::canvas::{CanvasSession, ModelResponse, PromptTile};
 use crate::models::twin::{
     CanvasFeedbackRequest, CanvasFeedbackResult, CanvasFeedbackType, CanvasResponseRef,
-    EvidenceRef, PromotionState, RecordOrigin, SessionTrace, TraceEvent, TraceEventType,
-    TwinExportRequest, UserRecord, UserRecordCreate, UserRecordKind, UserRecordUpdate,
+    EvidenceRef, PromotionState, RecordOrigin, ResolvedEvidenceRef, SessionTrace, TraceEvent,
+    TraceEventType, TwinExportRequest, TwinInferenceRunSummary, TwinReviewRecord, UserRecord,
+    UserRecordCreate, UserRecordKind, UserRecordUpdate,
 };
 use crate::AppState;
 use serde_json::json;
@@ -53,6 +54,46 @@ pub async fn get_session_trace(
     let mut store = state.twin_store.write().await;
     store
         .get_session_trace(&session_id)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn run_twin_inference(
+    state: State<'_, AppState>,
+) -> Result<TwinInferenceRunSummary, String> {
+    let mut store = state.twin_store.write().await;
+    store
+        .run_twin_inference()
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn get_twin_review(state: State<'_, AppState>) -> Result<Vec<TwinReviewRecord>, String> {
+    let mut store = state.twin_store.write().await;
+    store.get_twin_review().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn resolve_user_record_evidence(
+    id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<ResolvedEvidenceRef>, String> {
+    let mut store = state.twin_store.write().await;
+    store
+        .resolve_user_record_evidence(&id)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn set_user_record_promotion(
+    id: String,
+    promotion_state: PromotionState,
+    rationale: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<UserRecord, String> {
+    let mut store = state.twin_store.write().await;
+    store
+        .set_user_record_promotion(&id, promotion_state, rationale)
         .map_err(|error| error.to_string())
 }
 

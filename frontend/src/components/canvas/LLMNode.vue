@@ -304,10 +304,13 @@
           <option value="compact">
             Compact
           </option>
-          <option value="knowledge_search">
-            Knowledge Search
-          </option>
-        </select>
+            <option value="knowledge_search">
+              Knowledge Search
+            </option>
+            <option value="twin">
+              Twin
+            </option>
+          </select>
       </div>
       <div class="branch-actions">
         <button

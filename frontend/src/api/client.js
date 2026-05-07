@@ -103,6 +103,15 @@ export const twin = {
 
   getSessionTrace: (sessionId) => invoke('get_session_trace', { sessionId }),
 
+  runInference: () => invoke('run_twin_inference', {}),
+
+  getReview: () => invoke('get_twin_review', {}),
+
+  resolveEvidence: (id) => invoke('resolve_user_record_evidence', { id }),
+
+  setPromotion: (id, promotionState, rationale = null) =>
+    invoke('set_user_record_promotion', { id, promotionState, rationale }),
+
   recordCanvasFeedback: (sessionId, request) =>
     invoke('record_canvas_feedback', { sessionId, request }),
 

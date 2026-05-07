@@ -126,6 +126,9 @@
             <option value="knowledge_search">
               Knowledge Search
             </option>
+            <option value="twin">
+              Twin
+            </option>
           </select>
         </div>
         <ContextBudgetDisplay

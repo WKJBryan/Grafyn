@@ -277,7 +277,9 @@ impl LinkDiscoveryService {
         title_to_id.insert(note.title.to_lowercase(), note.id.clone());
         title_to_id.insert(note.relative_path.to_lowercase(), note.id.clone());
         for alias in &note.aliases {
-            title_to_id.entry(alias.to_lowercase()).or_insert_with(|| note.id.clone());
+            title_to_id
+                .entry(alias.to_lowercase())
+                .or_insert_with(|| note.id.clone());
         }
 
         let previous = self.stored_notes.get(&note.id).cloned();

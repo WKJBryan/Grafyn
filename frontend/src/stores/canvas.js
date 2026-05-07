@@ -239,6 +239,7 @@ export const useCanvasStore = defineStore('canvas', () => {
     parentTileId = null,
     parentModelId = null,
     contextMode = 'knowledge_search',
+    twinAnswerMode = 'advisor',
     webSearch = false,
     webSearchMaxResults = DEFAULT_WEB_SEARCH_MAX_RESULTS
   ) {
@@ -279,6 +280,8 @@ export const useCanvasStore = defineStore('canvas', () => {
         parent_tile_id: parentTileId,
         parent_model_id: parentModelId,
         context_mode: contextMode,
+        twin_answer_mode: twinAnswerMode,
+        twin_context_policy: contextMode === 'twin' ? 'approved_plus_relevant_candidates' : null,
         position,
         web_search: webSearch,
         web_search_max_results: webSearchMaxResults
@@ -949,6 +952,7 @@ export const useCanvasStore = defineStore('canvas', () => {
     temperature = 0.7,
     maxTokens = null,
     contextMode = 'knowledge_search',
+    twinAnswerMode = 'advisor',
     webSearch = false,
     webSearchMaxResults = DEFAULT_WEB_SEARCH_MAX_RESULTS
   ) {
@@ -961,6 +965,7 @@ export const useCanvasStore = defineStore('canvas', () => {
       parentTileId,
       parentModelId,
       contextMode,
+      twinAnswerMode,
       webSearch,
       webSearchMaxResults
     )
@@ -981,6 +986,7 @@ export const useCanvasStore = defineStore('canvas', () => {
       0.3,
       4096,
       'full_history',
+      'advisor',
       webSearch,
       webSearchMaxResults
     )
@@ -1012,6 +1018,20 @@ export const useCanvasStore = defineStore('canvas', () => {
       ranked_responses: responseRefs,
       rationale,
       content
+    })
+  }
+
+  async function recordCorrectionFeedback(tileId, modelId, content, rationale = null) {
+    return recordCanvasFeedback({
+      feedback_type: 'correction',
+      response: {
+        tile_id: tileId,
+        model_id: modelId
+      },
+      kind: 'fact',
+      content,
+      rationale,
+      confidence: 0.85
     })
   }
 
@@ -1076,6 +1096,7 @@ export const useCanvasStore = defineStore('canvas', () => {
     recordCanvasFeedback,
     recordPreferenceFeedback,
     recordSelectionRanking,
+    recordCorrectionFeedback,
     captureInsight,
     exportTwinData
   }

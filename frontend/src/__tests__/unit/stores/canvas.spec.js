@@ -110,6 +110,51 @@ describe('Canvas Store', () => {
     expect(sendPromptSpy.mock.calls[0][1]).not.toHaveProperty('max_tokens')
   })
 
+  it('sendPrompt includes twin answer mode and context policy for Twin Mode', async () => {
+    let streamHandler
+    listenMock.mockImplementation(async (_eventName, handler) => {
+      streamHandler = handler
+      return unlistenMock
+    })
+
+    const sendPromptSpy = vi.spyOn(apiClient.canvas, 'sendPrompt').mockImplementation(async () => {
+      streamHandler({
+        payload: {
+          session_id: 'session-1',
+          type: 'complete',
+          tile_id: 'tile-1',
+          model_id: 'openai/gpt-4'
+        }
+      })
+      return 'tile-1'
+    })
+
+    const store = useCanvasStore()
+    store.currentSession = {
+      id: 'session-1',
+      prompt_tiles: [],
+      debates: []
+    }
+
+    await store.sendPrompt(
+      'What would my twin consider?',
+      ['openai/gpt-4'],
+      null,
+      0.7,
+      null,
+      null,
+      null,
+      'twin',
+      'simulation'
+    )
+
+    expect(sendPromptSpy).toHaveBeenCalledWith('session-1', expect.objectContaining({
+      context_mode: 'twin',
+      twin_answer_mode: 'simulation',
+      twin_context_policy: 'approved_plus_relevant_candidates'
+    }))
+  })
+
   it('regenerateResponse stores the backend error text on response.error_message', async () => {
     let streamHandler
     listenMock.mockImplementation(async (_eventName, handler) => {

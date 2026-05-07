@@ -37,7 +37,16 @@ const { store, getOpenRouterStatus, getStatus, getSettings, updateSettings, toas
     thinkHarderFromResponse: vi.fn().mockResolvedValue(),
     addModelToTile: vi.fn().mockResolvedValue(),
     regenerateResponse: vi.fn().mockResolvedValue(),
-    updatePinnedNotes: vi.fn().mockResolvedValue()
+    updatePinnedNotes: vi.fn().mockResolvedValue(),
+    recordPreferenceFeedback: vi.fn().mockResolvedValue(),
+    recordCorrectionFeedback: vi.fn().mockResolvedValue(),
+    recordSelectionRanking: vi.fn().mockResolvedValue(),
+    captureInsight: vi.fn().mockResolvedValue(),
+    exportTwinData: vi.fn().mockResolvedValue({
+      approved_user_records: { count: 1 },
+      candidate_user_records: { count: 0 },
+      rejected_user_records: { count: 0 }
+    })
   },
   getOpenRouterStatus: vi.fn(),
   getStatus: vi.fn(),
@@ -127,7 +136,7 @@ function mountContainer() {
         PromptNode: { template: '<div />' },
         LLMNode: {
           props: ['tileId', 'modelId', 'response', 'webSearch'],
-          template: '<div class="llm-node-stub" :data-tile-id="tileId" :data-model-id="modelId" :data-web-search="String(webSearch)" />'
+          template: '<button class="llm-node-stub" :data-tile-id="tileId" :data-model-id="modelId" :data-web-search="String(webSearch)" @click="$emit(\'select\', { tileId, modelId })" />'
         },
         DebateNode: { template: '<div />' },
         AddModelDialog: { template: '<div />' },
@@ -200,6 +209,11 @@ function mountContainerWithAddModelPromptStub() {
       }
     }
   })
+}
+
+async function openTwinActions(wrapper) {
+  await wrapper.findAll('button').find(button => button.text().includes('Twin')).trigger('click')
+  await flushPromises()
 }
 
 describe('CanvasContainer', () => {
@@ -407,5 +421,144 @@ describe('CanvasContainer', () => {
     })
     expect(toastSuccess).toHaveBeenCalledWith('Updated preset "Quality"', 2500)
     expect(wrapper.text()).toContain('Updated preset "Quality"')
+  })
+
+  it('records accept and reject feedback for a completed selected response', async () => {
+    getOpenRouterStatus.mockResolvedValue({ has_key: true, is_configured: true })
+    store.promptTiles = [
+      {
+        id: 'tile-1',
+        prompt: 'Prompt',
+        web_search: false,
+        responses: {
+          'openai/gpt-4o': {
+            status: 'completed',
+            content: 'Answer',
+            model_name: 'GPT-4o',
+            color: '#7c5cff',
+            position: { x: 320, y: 40, width: 280, height: 200 }
+          }
+        },
+        position: { x: 40, y: 40, width: 200, height: 120 }
+      }
+    ]
+    const promptSpy = vi.spyOn(globalThis, 'prompt').mockReturnValue('fits my workflow')
+
+    const wrapper = mountContainer()
+    await flushPromises()
+    await wrapper.find('.llm-node-stub').trigger('click')
+    await openTwinActions(wrapper)
+    await wrapper.findAll('button').find(button => button.text() === 'Matches Me').trigger('click')
+    await flushPromises()
+
+    expect(store.recordPreferenceFeedback).toHaveBeenCalledWith(
+      'tile-1',
+      'openai/gpt-4o',
+      'accept',
+      'fits my workflow'
+    )
+
+    await wrapper.find('.llm-node-stub').trigger('click')
+    await openTwinActions(wrapper)
+    await wrapper.findAll('button').find(button => button.text() === 'Not Me').trigger('click')
+    await flushPromises()
+
+    expect(store.recordPreferenceFeedback).toHaveBeenCalledWith(
+      'tile-1',
+      'openai/gpt-4o',
+      'reject',
+      'fits my workflow'
+    )
+
+    promptSpy.mockRestore()
+  })
+
+  it('records correction feedback for a completed selected response', async () => {
+    getOpenRouterStatus.mockResolvedValue({ has_key: true, is_configured: true })
+    store.promptTiles = [
+      {
+        id: 'tile-1',
+        prompt: 'Prompt',
+        web_search: false,
+        responses: {
+          'openai/gpt-4o': {
+            status: 'completed',
+            content: 'Answer',
+            model_name: 'GPT-4o',
+            color: '#7c5cff',
+            position: { x: 320, y: 40, width: 280, height: 200 }
+          }
+        },
+        position: { x: 40, y: 40, width: 200, height: 120 }
+      }
+    ]
+    const promptSpy = vi
+      .spyOn(globalThis, 'prompt')
+      .mockReturnValueOnce('The correct value is local only.')
+      .mockReturnValueOnce('The answer assumed cloud state.')
+
+    const wrapper = mountContainer()
+    await flushPromises()
+    await wrapper.find('.llm-node-stub').trigger('click')
+    await openTwinActions(wrapper)
+    await wrapper.findAll('button').find(button => button.text() === 'Correct').trigger('click')
+    await flushPromises()
+
+    expect(store.recordCorrectionFeedback).toHaveBeenCalledWith(
+      'tile-1',
+      'openai/gpt-4o',
+      'The correct value is local only.',
+      'The answer assumed cloud state.'
+    )
+
+    promptSpy.mockRestore()
+  })
+
+  it('records rank feedback for completed selected responses', async () => {
+    getOpenRouterStatus.mockResolvedValue({ has_key: true, is_configured: true })
+    store.promptTiles = [
+      {
+        id: 'tile-1',
+        prompt: 'Prompt',
+        web_search: false,
+        responses: {
+          'openai/gpt-4o': {
+            status: 'completed',
+            content: 'Answer A',
+            model_name: 'GPT-4o',
+            color: '#7c5cff',
+            position: { x: 320, y: 40, width: 280, height: 200 }
+          },
+          'anthropic/claude-3.5-sonnet': {
+            status: 'completed',
+            content: 'Answer B',
+            model_name: 'Claude',
+            color: '#00a37f',
+            position: { x: 320, y: 260, width: 280, height: 200 }
+          }
+        },
+        position: { x: 40, y: 40, width: 200, height: 120 }
+      }
+    ]
+    const promptSpy = vi.spyOn(globalThis, 'prompt').mockReturnValue('A is closer to my thinking')
+
+    const wrapper = mountContainer()
+    await flushPromises()
+    const nodes = wrapper.findAll('.llm-node-stub')
+    await nodes[0].trigger('click')
+    await nodes[1].trigger('click')
+    await openTwinActions(wrapper)
+    await wrapper.findAll('button').find(button => button.text() === 'Rank Selection').trigger('click')
+    await flushPromises()
+
+    expect(store.recordSelectionRanking).toHaveBeenCalledWith(
+      [
+        { tile_id: 'tile-1', model_id: 'openai/gpt-4o' },
+        { tile_id: 'tile-1', model_id: 'anthropic/claude-3.5-sonnet' }
+      ],
+      'A is closer to my thinking'
+    )
+
+    promptSpy.mockRestore()
   })
 })

@@ -31,6 +31,12 @@ pub enum PromotionState {
     NoTrain,
 }
 
+impl Default for PromotionState {
+    fn default() -> Self {
+        PromotionState::Candidate
+    }
+}
+
 impl PromotionState {
     pub fn default_for_origin(origin: &RecordOrigin) -> Self {
         match origin {
@@ -62,6 +68,9 @@ pub enum TraceEventType {
     SessionCreated,
     SessionUpdated,
     SessionDeleted,
+    NoteCreated,
+    NoteUpdated,
+    NoteCanonicalPromoted,
     PromptSubmitted,
     ResponseCompleted,
     ResponseErrored,
@@ -178,6 +187,63 @@ pub struct UserRecordUpdate {
     pub metadata: Option<HashMap<String, serde_json::Value>>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TwinInferenceRunSummary {
+    pub inference_version: String,
+    pub scanned_traces: usize,
+    pub scanned_events: usize,
+    pub created_records: usize,
+    pub updated_records: usize,
+    pub auto_promoted_records: usize,
+    pub candidate_records: usize,
+    pub skipped_rejected_records: usize,
+    pub generated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResolvedEvidenceRef {
+    pub trace_id: String,
+    pub event_id: String,
+    pub session_id: String,
+    #[serde(default)]
+    pub tile_id: Option<String>,
+    #[serde(default)]
+    pub model_id: Option<String>,
+    pub event_type: TraceEventType,
+    pub created_at: DateTime<Utc>,
+    #[serde(default)]
+    pub note: Option<String>,
+    #[serde(default)]
+    pub summary: Option<String>,
+    #[serde(default)]
+    pub prompt_excerpt: Option<String>,
+    #[serde(default)]
+    pub response_excerpt: Option<String>,
+    #[serde(default)]
+    pub model_name: Option<String>,
+    pub payload: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TwinReviewRecord {
+    pub record: UserRecord,
+    pub evidence_count: usize,
+    #[serde(default)]
+    pub latest_evidence: Option<ResolvedEvidenceRef>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TwinContextRecord {
+    pub id: String,
+    pub kind: UserRecordKind,
+    pub content: String,
+    pub confidence: f32,
+    pub promotion_state: PromotionState,
+    pub evidence_count: usize,
+    #[serde(default)]
+    pub source_label: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CanvasFeedbackType {
@@ -242,6 +308,9 @@ pub struct ExportBundle {
     pub train: ExportFileSummary,
     pub eval: ExportFileSummary,
     pub holdout: ExportFileSummary,
+    pub approved_user_records: ExportFileSummary,
+    pub candidate_user_records: ExportFileSummary,
+    pub rejected_user_records: ExportFileSummary,
     pub manifest_path: String,
     pub included_records: usize,
     pub excluded_records: usize,
