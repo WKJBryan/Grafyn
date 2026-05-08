@@ -12,6 +12,12 @@
         class="node-icon"
       />
       <span class="node-type">Prompt</span>
+      <span
+        v-if="isDecision"
+        class="decision-badge"
+      >
+        Decision
+      </span>
       <div class="node-actions">
         <button
           class="delete-btn"
@@ -96,6 +102,12 @@
         />
         <span>Web</span>
       </span>
+      <span
+        v-if="tile.decision_metadata?.review_date"
+        class="review-date"
+      >
+        {{ tile.decision_metadata.review_date }}
+      </span>
       <span class="timestamp">{{ formatTime(tile.created_at) }}</span>
     </div>
     
@@ -170,6 +182,7 @@ const hasCompletedResponse = computed(() =>
 
 const approvedTwinRecords = computed(() => props.tile.approved_twin_records || [])
 const candidateTwinRecords = computed(() => props.tile.candidate_twin_records || [])
+const isDecision = computed(() => props.tile.prompt_type === 'decision')
 
 const truncatedPrompt = computed(() => {
   const prompt = props.tile.prompt
@@ -350,6 +363,16 @@ onBeforeUnmount(() => {
   flex: 1;
 }
 
+.decision-badge {
+  padding: 2px 6px;
+  border: 1px solid color-mix(in srgb, var(--accent-cyan) 35%, transparent);
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--accent-cyan) 12%, transparent);
+  color: var(--accent-cyan);
+  font-size: 0.625rem;
+  font-weight: 700;
+}
+
 .node-actions {
   display: flex;
   gap: 2px;
@@ -466,6 +489,11 @@ onBeforeUnmount(() => {
   text-transform: uppercase;
   letter-spacing: 0.04em;
   line-height: 1;
+}
+
+.review-date {
+  color: var(--text-secondary);
+  white-space: nowrap;
 }
 
 .web-search-icon {

@@ -69,6 +69,9 @@ export const useCanvasStore = defineStore('canvas', () => {
       ...session,
       prompt_tiles: session.prompt_tiles.map(tile => ({
         ...tile,
+        prompt_type: tile.prompt_type || 'standard',
+        decision_metadata: tile.decision_metadata || null,
+        decision_episode_id: tile.decision_episode_id || null,
         responses: Object.fromEntries(
           Object.entries(tile.responses || {}).map(([modelId, response]) => [
             modelId,
@@ -241,7 +244,9 @@ export const useCanvasStore = defineStore('canvas', () => {
     contextMode = 'knowledge_search',
     twinAnswerMode = 'advisor',
     webSearch = false,
-    webSearchMaxResults = DEFAULT_WEB_SEARCH_MAX_RESULTS
+    webSearchMaxResults = DEFAULT_WEB_SEARCH_MAX_RESULTS,
+    promptType = 'standard',
+    decisionMetadata = null
   ) {
     if (!currentSession.value) {
       throw new Error('No active session')
@@ -274,6 +279,7 @@ export const useCanvasStore = defineStore('canvas', () => {
 
       const request = {
         prompt,
+        prompt_type: promptType,
         models,
         system_prompt: systemPrompt,
         temperature,
@@ -282,6 +288,7 @@ export const useCanvasStore = defineStore('canvas', () => {
         context_mode: contextMode,
         twin_answer_mode: twinAnswerMode,
         twin_context_policy: contextMode === 'twin' ? 'approved_plus_relevant_candidates' : null,
+        decision_metadata: decisionMetadata,
         position,
         web_search: webSearch,
         web_search_max_results: webSearchMaxResults
@@ -954,7 +961,9 @@ export const useCanvasStore = defineStore('canvas', () => {
     contextMode = 'knowledge_search',
     twinAnswerMode = 'advisor',
     webSearch = false,
-    webSearchMaxResults = DEFAULT_WEB_SEARCH_MAX_RESULTS
+    webSearchMaxResults = DEFAULT_WEB_SEARCH_MAX_RESULTS,
+    promptType = 'standard',
+    decisionMetadata = null
   ) {
     return sendPrompt(
       newPrompt,
@@ -967,7 +976,9 @@ export const useCanvasStore = defineStore('canvas', () => {
       contextMode,
       twinAnswerMode,
       webSearch,
-      webSearchMaxResults
+      webSearchMaxResults,
+      promptType,
+      decisionMetadata
     )
   }
 
@@ -1050,6 +1061,45 @@ export const useCanvasStore = defineStore('canvas', () => {
     return twinApi.exportData(request)
   }
 
+  async function listMemoryDigest() {
+    return twinApi.listMemoryDigest()
+  }
+
+  async function reviewMemoryDigestItem(id, action, rationale = null) {
+    return twinApi.reviewMemoryDigestItem(id, { action, rationale })
+  }
+
+  async function listDecisionEpisodes() {
+    return twinApi.listDecisionEpisodes()
+  }
+
+  async function updateDecisionOutcome(id, update) {
+    return twinApi.updateDecisionOutcome(id, update)
+  }
+
+  async function getDecisionMirrorConfig() {
+    return twinApi.getDecisionMirrorConfig()
+  }
+
+  async function updateDecisionMirrorConfig(update) {
+    return twinApi.updateDecisionMirrorConfig(update)
+  }
+
+  async function resetDecisionMirrorConfig() {
+    return twinApi.resetDecisionMirrorConfig()
+  }
+
+  function isTwinWorkspaceTutorialDismissed() {
+    return localStorage.getItem('grafyn.twinWorkspaceTutorial.dismissed') === 'true'
+  }
+
+  function setTwinWorkspaceTutorialDismissed(dismissed) {
+    localStorage.setItem(
+      'grafyn.twinWorkspaceTutorial.dismissed',
+      dismissed ? 'true' : 'false'
+    )
+  }
+
   return {
     // State
     sessions,
@@ -1098,6 +1148,15 @@ export const useCanvasStore = defineStore('canvas', () => {
     recordSelectionRanking,
     recordCorrectionFeedback,
     captureInsight,
-    exportTwinData
+    exportTwinData,
+    listMemoryDigest,
+    reviewMemoryDigestItem,
+    listDecisionEpisodes,
+    updateDecisionOutcome,
+    getDecisionMirrorConfig,
+    updateDecisionMirrorConfig,
+    resetDecisionMirrorConfig,
+    isTwinWorkspaceTutorialDismissed,
+    setTwinWorkspaceTutorialDismissed
   }
 })

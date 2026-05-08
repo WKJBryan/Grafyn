@@ -116,6 +116,43 @@ export const twin = {
     invoke('record_canvas_feedback', { sessionId, request }),
 
   exportData: (request = {}) => invoke('export_twin_data', { request }),
+
+  listDecisionEpisodes: () => invoke('list_decision_episodes', {}),
+
+  updateDecisionOutcome: (id, update) =>
+    invoke('update_decision_outcome', { id, update }),
+
+  getDecisionMirrorConfig: () => invoke('get_decision_mirror_config', {}),
+
+  updateDecisionMirrorConfig: (update) =>
+    invoke('update_decision_mirror_config', { update }),
+
+  resetDecisionMirrorConfig: () => invoke('reset_decision_mirror_config', {}),
+
+  listMemoryDigest: () => invoke('list_memory_digest', {}),
+
+  reviewMemoryDigestItem: (id, request) =>
+    invoke('review_memory_digest_item', { id, request }),
+
+  listConstitutionItems: () => invoke('list_constitution_items', {}),
+
+  createConstitutionItem: (item) => invoke('create_constitution_item', { item }),
+
+  updateConstitutionItem: (id, update) =>
+    invoke('update_constitution_item', { id, update }),
+
+  reviewConstitutionItem: (id, request) =>
+    invoke('review_constitution_item', { id, request }),
+
+  listActionGaps: () => invoke('list_action_gaps', {}),
+
+  reviewActionGap: (id, request) => invoke('review_action_gap', { id, request }),
+
+  getConstitutionSetup: () => invoke('get_constitution_setup', {}),
+
+  saveConstitutionSetup: (setup) => invoke('save_constitution_setup', { setup }),
+
+  runConstitutionInference: () => invoke('run_constitution_inference', {}),
 }
 
 // Feedback API
@@ -247,5 +284,4 @@ export const importApi = {
   getSupportedFormats: () => invoke('get_supported_formats', {}),
 }
 
-// Always true — this is a desktop-only app now
-export const isDesktopApp = () => true
+export const isDesktopApp = () => typeof window !== 'undefined' && typeof window.__TAURI_IPC__ === 'function'

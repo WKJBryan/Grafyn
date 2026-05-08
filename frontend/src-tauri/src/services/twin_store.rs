@@ -1,8 +1,15 @@
 use crate::models::twin::{
-    EvidenceRef, ExportBundle, ExportFileSummary, PromotionState, RecordOrigin,
-    ResolvedEvidenceRef, SessionTrace, TraceEvent, TraceEventType, TwinContextRecord,
-    TwinExportRequest, TwinInferenceRunSummary, TwinReviewRecord, UserRecord, UserRecordCreate,
-    UserRecordKind, UserRecordUpdate,
+    ActionGap, ActionGapCreate, ConstitutionInferenceSummary, ConstitutionItem,
+    ConstitutionItemCreate, ConstitutionItemUpdate, ConstitutionReviewRequest, ConstitutionSetup,
+    ConstitutionStatus, DecisionEpisode, DecisionEpisodeCreate, DecisionEpisodeWithReflections,
+    DecisionEvidencePacket, DecisionEvidenceSource, DecisionMirrorConfig,
+    DecisionMirrorConfigUpdate, DecisionMirrorPreset, DecisionMirrorWeights, DecisionOutcomeUpdate,
+    EvidenceRef, ExportBundle, ExportFileSummary, MemoryDigestAction, MemoryDigestItem,
+    MemoryDigestReviewRequest, MemoryDigestState, PrimitiveDecisionAssessment, PromotionState,
+    RecordOrigin, ReflectionCard, ReflectionCardCreate, ReflectionScores, ResolvedEvidenceRef,
+    SessionTrace, TraceEvent, TraceEventType, TwinContextRecord, TwinExportRequest,
+    TwinInferenceRunSummary, TwinReviewRecord, UserRecord, UserRecordCreate, UserRecordKind,
+    UserRecordUpdate,
 };
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -22,6 +29,7 @@ const AUTO_PROMOTE_CONFIDENCE: f32 = 0.75;
 const AUTO_PROMOTE_SUPPORT_COUNT: usize = 3;
 const EXCERPT_MAX_CHARS: usize = 220;
 const MAX_TWIN_CANDIDATE_CONTEXT_RECORDS: usize = 8;
+const MAX_MEMORY_DIGEST_ITEMS: usize = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExportSplit {
@@ -35,6 +43,13 @@ pub struct TwinStore {
     root_path: PathBuf,
     traces_path: PathBuf,
     records_path: PathBuf,
+    decisions_path: PathBuf,
+    reflections_path: PathBuf,
+    constitution_path: PathBuf,
+    action_gaps_path: PathBuf,
+    setup_path: PathBuf,
+    decision_mirror_config_path: PathBuf,
+    digest_path: PathBuf,
     exports_path: PathBuf,
     trace_cache: HashMap<String, SessionTrace>,
     record_cache: HashMap<String, UserRecord>,
@@ -45,16 +60,34 @@ impl TwinStore {
     pub fn new(root_path: PathBuf) -> Self {
         let traces_path = root_path.join("traces");
         let records_path = root_path.join("records");
+        let decisions_path = root_path.join("decisions");
+        let reflections_path = root_path.join("reflections");
+        let constitution_path = root_path.join("constitution");
+        let action_gaps_path = root_path.join("action_gaps");
+        let setup_path = root_path.join("constitution_setup.json");
+        let decision_mirror_config_path = root_path.join("decision_mirror_config.json");
+        let digest_path = root_path.join("memory_digest.json");
         let exports_path = root_path.join("exports");
 
         std::fs::create_dir_all(&traces_path).ok();
         std::fs::create_dir_all(&records_path).ok();
+        std::fs::create_dir_all(&decisions_path).ok();
+        std::fs::create_dir_all(&reflections_path).ok();
+        std::fs::create_dir_all(&constitution_path).ok();
+        std::fs::create_dir_all(&action_gaps_path).ok();
         std::fs::create_dir_all(&exports_path).ok();
 
         Self {
             root_path,
             traces_path,
             records_path,
+            decisions_path,
+            reflections_path,
+            constitution_path,
+            action_gaps_path,
+            setup_path,
+            decision_mirror_config_path,
+            digest_path,
             exports_path,
             trace_cache: HashMap::new(),
             record_cache: HashMap::new(),
@@ -123,6 +156,50 @@ impl TwinStore {
         let record = self.read_record_file(&path)?;
         self.record_cache.insert(id.to_string(), record.clone());
         Ok(record)
+    }
+
+    pub fn get_decision_mirror_config(&self) -> Result<DecisionMirrorConfig> {
+        if !self.decision_mirror_config_path.exists() {
+            return Ok(DecisionMirrorConfig::default());
+        }
+
+        let content =
+            std::fs::read_to_string(&self.decision_mirror_config_path).with_context(|| {
+                format!(
+                    "Failed to read decision mirror config {}",
+                    self.decision_mirror_config_path.display()
+                )
+            })?;
+        let mut config: DecisionMirrorConfig =
+            serde_json::from_str(&content).context("Failed to parse decision mirror config")?;
+        config.weights = clamp_decision_mirror_weights(config.weights);
+        Ok(config)
+    }
+
+    pub fn update_decision_mirror_config(
+        &self,
+        update: DecisionMirrorConfigUpdate,
+    ) -> Result<DecisionMirrorConfig> {
+        let mut config = self.get_decision_mirror_config()?;
+        if let Some(preset) = update.preset {
+            config.weights = DecisionMirrorWeights::for_preset(&preset);
+            config.preset = preset;
+        }
+        if let Some(weights) = update.weights {
+            config.weights = clamp_decision_mirror_weights(weights);
+        }
+        if let Some(advanced_enabled) = update.advanced_enabled {
+            config.advanced_enabled = advanced_enabled;
+        }
+
+        self.write_decision_mirror_config_file(&config)?;
+        Ok(config)
+    }
+
+    pub fn reset_decision_mirror_config(&self) -> Result<DecisionMirrorConfig> {
+        let config = DecisionMirrorConfig::default();
+        self.write_decision_mirror_config_file(&config)?;
+        Ok(config)
     }
 
     pub fn create_user_record(&mut self, create: UserRecordCreate) -> Result<UserRecord> {
@@ -438,6 +515,934 @@ impl TwinStore {
         Ok(record)
     }
 
+    pub fn record_decision_episode(
+        &mut self,
+        create: DecisionEpisodeCreate,
+    ) -> Result<DecisionEpisode> {
+        Self::validate_file_id(&create.id)?;
+        Self::validate_file_id(&create.session_id)?;
+        Self::validate_file_id(&create.tile_id)?;
+
+        let now = Utc::now();
+        let episode = DecisionEpisode {
+            id: create.id,
+            session_id: create.session_id,
+            tile_id: create.tile_id,
+            decision: create.decision,
+            options: create.options,
+            stakes: create.stakes,
+            initial_leaning: create.initial_leaning,
+            selected_response: None,
+            chosen_option: None,
+            confidence: None,
+            review_date: create.review_date,
+            outcome: None,
+            regret_score: None,
+            lesson: None,
+            missed_something: None,
+            primitive_assessment: create.primitive_assessment,
+            created_at: now,
+            updated_at: now,
+        };
+
+        self.write_decision_file(&episode)?;
+        self.append_trace_event(
+            &episode.session_id,
+            TraceEventType::DecisionEpisodeCreated,
+            json!({
+                "decision_episode_id": episode.id,
+                "tile_id": episode.tile_id,
+                "decision": episode.decision,
+                "options": episode.options,
+                "stakes": episode.stakes,
+                "initial_leaning": episode.initial_leaning,
+                "review_date": episode.review_date,
+                "primitive_assessment": episode.primitive_assessment,
+            }),
+        )?;
+
+        Ok(episode)
+    }
+
+    pub fn list_decision_episodes(&self) -> Result<Vec<DecisionEpisode>> {
+        let mut episodes = Vec::new();
+        if !self.decisions_path.exists() {
+            return Ok(episodes);
+        }
+
+        for entry in WalkDir::new(&self.decisions_path)
+            .min_depth(1)
+            .max_depth(1)
+            .into_iter()
+            .filter_map(|entry| entry.ok())
+        {
+            let path = entry.path();
+            if path.extension().is_some_and(|ext| ext == "json") {
+                episodes.push(self.read_decision_file(path)?);
+            }
+        }
+
+        episodes.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        Ok(episodes)
+    }
+
+    pub fn update_decision_outcome(
+        &mut self,
+        id: &str,
+        update: DecisionOutcomeUpdate,
+    ) -> Result<DecisionEpisode> {
+        Self::validate_file_id(id)?;
+        let path = self.decision_file_path(id);
+        let mut episode = self.read_decision_file(&path)?;
+
+        if let Some(selected_response) = update.selected_response {
+            episode.selected_response = Some(selected_response);
+        }
+        if let Some(chosen_option) = update.chosen_option {
+            episode.chosen_option = Some(chosen_option);
+        }
+        if let Some(confidence) = update.confidence {
+            episode.confidence = Some(confidence.clamp(0.0, 1.0));
+        }
+        if let Some(review_date) = update.review_date {
+            episode.review_date = Some(review_date);
+        }
+        if let Some(outcome) = update.outcome {
+            episode.outcome = Some(outcome);
+        }
+        if let Some(regret_score) = update.regret_score {
+            episode.regret_score = Some(regret_score.min(10));
+        }
+        if let Some(lesson) = update.lesson {
+            episode.lesson = Some(lesson);
+        }
+        if let Some(missed_something) = update.missed_something {
+            episode.missed_something = Some(missed_something);
+        }
+        if let Some(primitive_assessment) = update.primitive_assessment {
+            episode.primitive_assessment = primitive_assessment;
+        }
+
+        episode.updated_at = Utc::now();
+        self.write_decision_file(&episode)?;
+        self.append_trace_event(
+            &episode.session_id,
+            TraceEventType::OutcomeFollowUpRecorded,
+            json!({
+                "decision_episode_id": episode.id,
+                "tile_id": episode.tile_id,
+                "selected_response": episode.selected_response,
+                "chosen_option": episode.chosen_option,
+                "confidence": episode.confidence,
+                "review_date": episode.review_date,
+                "outcome": episode.outcome,
+                "regret_score": episode.regret_score,
+                "lesson": episode.lesson,
+                "missed_something": episode.missed_something,
+                "primitive_assessment": episode.primitive_assessment,
+            }),
+        )?;
+
+        Ok(episode)
+    }
+
+    pub fn record_reflection_card(
+        &mut self,
+        create: ReflectionCardCreate,
+    ) -> Result<ReflectionCard> {
+        Self::validate_file_id(&create.decision_episode_id)?;
+        Self::validate_file_id(&create.session_id)?;
+        Self::validate_file_id(&create.tile_id)?;
+
+        let config = self.get_decision_mirror_config()?;
+        let mut evidence_packet = match create.evidence_packet.clone() {
+            Some(packet) => packet,
+            None => self.build_decision_evidence_packet(
+                &create.cited_note_ids,
+                &create.cited_user_record_ids,
+                &create.cited_constitution_item_ids,
+                &create.cited_action_gap_ids,
+                &config,
+            )?,
+        };
+        if evidence_packet.config_snapshot.is_none() {
+            evidence_packet.config_snapshot = Some(config.clone());
+        }
+        let scores = score_reflection_card(
+            &create.content,
+            &create.cited_note_ids,
+            &create.cited_user_record_ids,
+            &create.cited_constitution_item_ids,
+            &create.cited_action_gap_ids,
+            &config,
+        );
+        let card = ReflectionCard {
+            id: uuid::Uuid::new_v4().to_string(),
+            decision_episode_id: create.decision_episode_id,
+            session_id: create.session_id,
+            tile_id: create.tile_id,
+            model_id: create.model_id,
+            content: create.content,
+            cited_note_ids: create.cited_note_ids,
+            cited_user_record_ids: create.cited_user_record_ids,
+            cited_constitution_item_ids: create.cited_constitution_item_ids,
+            cited_action_gap_ids: create.cited_action_gap_ids,
+            scores,
+            evidence_packet,
+            created_at: Utc::now(),
+        };
+
+        self.write_reflection_file(&card)?;
+        self.append_trace_event(
+            &card.session_id,
+            TraceEventType::ReflectionCardRecorded,
+            json!({
+                "reflection_card_id": card.id,
+                "decision_episode_id": card.decision_episode_id,
+                "tile_id": card.tile_id,
+                "model_id": card.model_id,
+                "cited_note_ids": card.cited_note_ids,
+                "cited_user_record_ids": card.cited_user_record_ids,
+                "cited_constitution_item_ids": card.cited_constitution_item_ids,
+                "cited_action_gap_ids": card.cited_action_gap_ids,
+                "scores": card.scores,
+                "evidence_packet": card.evidence_packet,
+            }),
+        )?;
+
+        Ok(card)
+    }
+
+    fn build_decision_evidence_packet(
+        &mut self,
+        cited_note_ids: &[String],
+        cited_user_record_ids: &[String],
+        cited_constitution_item_ids: &[String],
+        cited_action_gap_ids: &[String],
+        config: &DecisionMirrorConfig,
+    ) -> Result<DecisionEvidencePacket> {
+        self.ensure_record_cache()?;
+        let weights = &config.weights;
+        let mut selected_sources = Vec::new();
+
+        for id in cited_note_ids {
+            selected_sources.push(DecisionEvidenceSource {
+                source_type: "note".to_string(),
+                id: id.clone(),
+                label: format!("Note {}", id),
+                weight: weights.notes_weight,
+                reason: "Selected by vault retrieval for this decision".to_string(),
+            });
+        }
+
+        for id in cited_user_record_ids {
+            if let Ok(record) = self.get_user_record(id) {
+                let (source_type, weight) = match &record.promotion_state {
+                    PromotionState::Endorsed | PromotionState::AutoPromoted => {
+                        ("approved_record", weights.approved_records_weight)
+                    }
+                    PromotionState::Candidate => {
+                        ("candidate_record", weights.candidate_records_weight)
+                    }
+                    PromotionState::Rejected
+                    | PromotionState::Private
+                    | PromotionState::NoTrain => {
+                        continue;
+                    }
+                };
+                selected_sources.push(DecisionEvidenceSource {
+                    source_type: source_type.to_string(),
+                    id: record.id,
+                    label: excerpt(&record.content),
+                    weight,
+                    reason: format!(
+                        "{} user record selected for live twin context",
+                        promotion_state_label(&record.promotion_state)
+                    ),
+                });
+            }
+        }
+
+        for id in cited_constitution_item_ids {
+            let label = self
+                .read_constitution_file(&self.constitution_file_path(id))
+                .ok()
+                .map(|item| excerpt(&item.claim))
+                .unwrap_or_else(|| format!("Constitution {}", id));
+            selected_sources.push(DecisionEvidenceSource {
+                source_type: "constitution_item".to_string(),
+                id: id.clone(),
+                label,
+                weight: weights.constitution_weight,
+                reason: "Higher-order constitution item selected for decision framing".to_string(),
+            });
+        }
+
+        for id in cited_action_gap_ids {
+            let label = self
+                .read_action_gap_file(&self.action_gap_file_path(id))
+                .ok()
+                .map(|gap| excerpt(&gap.decision_risk))
+                .unwrap_or_else(|| format!("Action Gap {}", id));
+            selected_sources.push(DecisionEvidenceSource {
+                source_type: "action_gap".to_string(),
+                id: id.clone(),
+                label,
+                weight: weights.action_gaps_weight,
+                reason: "Action gap selected as decision risk context".to_string(),
+            });
+        }
+
+        let mut excluded_private_count = self
+            .record_cache
+            .values()
+            .filter(|record| record.promotion_state == PromotionState::Private)
+            .count();
+        let mut excluded_rejected_count = self
+            .record_cache
+            .values()
+            .filter(|record| record.promotion_state == PromotionState::Rejected)
+            .count();
+        let mut excluded_no_train_count = self
+            .record_cache
+            .values()
+            .filter(|record| record.promotion_state == PromotionState::NoTrain)
+            .count();
+
+        for item in self.list_constitution_items()? {
+            match item.status {
+                ConstitutionStatus::Private => excluded_private_count += 1,
+                ConstitutionStatus::Rejected | ConstitutionStatus::NotMe => {
+                    excluded_rejected_count += 1
+                }
+                ConstitutionStatus::NoTrain => excluded_no_train_count += 1,
+                ConstitutionStatus::Candidate
+                | ConstitutionStatus::Active
+                | ConstitutionStatus::Softened => {}
+            }
+        }
+        for gap in self.list_action_gaps()? {
+            match gap.status {
+                ConstitutionStatus::Private => excluded_private_count += 1,
+                ConstitutionStatus::Rejected | ConstitutionStatus::NotMe => {
+                    excluded_rejected_count += 1
+                }
+                ConstitutionStatus::NoTrain => excluded_no_train_count += 1,
+                ConstitutionStatus::Candidate
+                | ConstitutionStatus::Active
+                | ConstitutionStatus::Softened => {}
+            }
+        }
+
+        Ok(DecisionEvidencePacket {
+            selected_sources,
+            excluded_private_count,
+            excluded_rejected_count,
+            excluded_no_train_count,
+            created_at: Some(Utc::now()),
+            config_snapshot: Some(config.clone()),
+        })
+    }
+
+    pub fn list_memory_digest(&mut self) -> Result<Vec<MemoryDigestItem>> {
+        self.ensure_record_cache()?;
+        let mut existing = self.read_memory_digest_file()?;
+        let mut existing_by_id = existing
+            .iter()
+            .cloned()
+            .map(|item| (item.id.clone(), item))
+            .collect::<HashMap<_, _>>();
+        let now = Utc::now();
+        let records = self
+            .record_cache
+            .values()
+            .filter(|record| memory_digest_trigger(record).is_some())
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut clusters: HashMap<String, Vec<UserRecord>> = HashMap::new();
+
+        for record in records {
+            clusters
+                .entry(memory_digest_cluster_key(&record))
+                .or_default()
+                .push(record);
+        }
+
+        for mut records in clusters.into_values() {
+            records.sort_by(|a, b| {
+                b.evidence_refs
+                    .len()
+                    .cmp(&a.evidence_refs.len())
+                    .then_with(|| {
+                        b.confidence
+                            .partial_cmp(&a.confidence)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .then_with(|| b.updated_at.cmp(&a.updated_at))
+            });
+            let primary = match records.first() {
+                Some(record) => record,
+                None => continue,
+            };
+            let item_id = stable_digest_id(&records);
+            if existing_by_id.contains_key(&item_id) {
+                continue;
+            }
+
+            let record_ids = records
+                .iter()
+                .map(|record| record.id.clone())
+                .collect::<Vec<_>>();
+            let evidence_count = records
+                .iter()
+                .map(|record| record.evidence_refs.len())
+                .sum::<usize>();
+            let confidence = records
+                .iter()
+                .map(|record| record.confidence)
+                .fold(0.0_f32, f32::max);
+            let trigger_reason = if records.len() > 1 {
+                format!("{} related patterns clustered for review", records.len())
+            } else {
+                memory_digest_trigger(primary)
+                    .unwrap_or("pattern needs review")
+                    .to_string()
+            };
+            let latest_evidence = self
+                .resolve_evidence_refs(&primary.evidence_refs)
+                .ok()
+                .and_then(|mut refs| refs.drain(..).next());
+            let item = MemoryDigestItem {
+                id: item_id.clone(),
+                pattern: primary.content.clone(),
+                evidence_count,
+                confidence,
+                trigger_reason,
+                latest_evidence,
+                record_ids,
+                state: MemoryDigestState::Pending,
+                created_at: now,
+                updated_at: now,
+            };
+            existing_by_id.insert(item_id, item);
+        }
+
+        existing = existing_by_id.into_values().collect();
+        existing.sort_by(|a, b| {
+            digest_state_sort_key(&a.state)
+                .cmp(&digest_state_sort_key(&b.state))
+                .then_with(|| b.evidence_count.cmp(&a.evidence_count))
+                .then_with(|| {
+                    b.confidence
+                        .partial_cmp(&a.confidence)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .then_with(|| b.updated_at.cmp(&a.updated_at))
+        });
+        self.write_memory_digest_file(&existing)?;
+
+        Ok(existing
+            .into_iter()
+            .filter(|item| item.state == MemoryDigestState::Pending)
+            .take(MAX_MEMORY_DIGEST_ITEMS)
+            .collect())
+    }
+
+    pub fn review_memory_digest_item(
+        &mut self,
+        id: &str,
+        request: MemoryDigestReviewRequest,
+    ) -> Result<MemoryDigestItem> {
+        Self::validate_file_id(id)?;
+        let mut items = self.read_memory_digest_file()?;
+        if !items.iter().any(|item| item.id == id) {
+            let _ = self.list_memory_digest()?;
+            items = self.read_memory_digest_file()?;
+        }
+
+        let item_index = items
+            .iter()
+            .position(|item| item.id == id)
+            .ok_or_else(|| anyhow::anyhow!("Memory digest item not found: {}", id))?;
+        let mut item = items[item_index].clone();
+        item.state = memory_digest_state_for_action(&request.action);
+        item.updated_at = Utc::now();
+        items[item_index] = item.clone();
+        self.write_memory_digest_file(&items)?;
+
+        for record_id in &item.record_ids {
+            if self.get_user_record(record_id).is_err() {
+                continue;
+            }
+
+            let promotion_state = match request.action {
+                MemoryDigestAction::Keep => Some(PromotionState::Endorsed),
+                MemoryDigestAction::Soften => Some(PromotionState::Candidate),
+                MemoryDigestAction::NotMe | MemoryDigestAction::Reject => {
+                    Some(PromotionState::Rejected)
+                }
+                MemoryDigestAction::Private => Some(PromotionState::Private),
+                MemoryDigestAction::NoTrain => Some(PromotionState::NoTrain),
+            };
+
+            if let Some(state) = promotion_state {
+                let _ = self.set_user_record_promotion(
+                    record_id,
+                    state,
+                    request
+                        .rationale
+                        .clone()
+                        .or_else(|| Some(format!("Memory digest action: {:?}", request.action))),
+                );
+            }
+
+            if request.action == MemoryDigestAction::Soften {
+                if let Ok(record) = self.get_user_record(record_id) {
+                    let _ = self.update_user_record(
+                        record_id,
+                        UserRecordUpdate {
+                            confidence: Some((record.confidence * 0.85).max(0.35)),
+                            ..UserRecordUpdate::default()
+                        },
+                    );
+                }
+            }
+        }
+
+        Ok(item)
+    }
+
+    pub fn list_decision_episodes_with_reflections(
+        &self,
+    ) -> Result<Vec<DecisionEpisodeWithReflections>> {
+        let cards = self.list_reflection_cards()?;
+        let mut cards_by_episode: HashMap<String, Vec<ReflectionCard>> = HashMap::new();
+        for card in cards {
+            cards_by_episode
+                .entry(card.decision_episode_id.clone())
+                .or_default()
+                .push(card);
+        }
+
+        let mut episodes = self
+            .list_decision_episodes()?
+            .into_iter()
+            .map(|episode| {
+                let mut reflection_cards = cards_by_episode.remove(&episode.id).unwrap_or_default();
+                reflection_cards.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+                let feedback_events = self.decision_feedback_events(&episode).unwrap_or_default();
+                DecisionEpisodeWithReflections {
+                    episode,
+                    reflection_cards,
+                    feedback_events,
+                }
+            })
+            .collect::<Vec<_>>();
+        episodes.sort_by(|a, b| b.episode.updated_at.cmp(&a.episode.updated_at));
+        Ok(episodes)
+    }
+
+    pub fn list_constitution_items(&self) -> Result<Vec<ConstitutionItem>> {
+        let mut items = Vec::new();
+        if !self.constitution_path.exists() {
+            return Ok(items);
+        }
+
+        for entry in WalkDir::new(&self.constitution_path)
+            .min_depth(1)
+            .max_depth(1)
+            .into_iter()
+            .filter_map(|entry| entry.ok())
+        {
+            let path = entry.path();
+            if path.extension().is_some_and(|ext| ext == "json") {
+                items.push(self.read_constitution_file(path)?);
+            }
+        }
+
+        items.sort_by(|a, b| {
+            constitution_status_sort_key(&a.status)
+                .cmp(&constitution_status_sort_key(&b.status))
+                .then_with(|| {
+                    b.priority
+                        .partial_cmp(&a.priority)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .then_with(|| b.updated_at.cmp(&a.updated_at))
+        });
+        Ok(items)
+    }
+
+    pub fn create_constitution_item(
+        &self,
+        create: ConstitutionItemCreate,
+    ) -> Result<ConstitutionItem> {
+        let now = Utc::now();
+        let item = ConstitutionItem {
+            id: uuid::Uuid::new_v4().to_string(),
+            claim: create.claim,
+            dimension: create.dimension,
+            scope: create.scope,
+            priority: create.priority.clamp(0.0, 1.0),
+            confidence: create.confidence.clamp(0.0, 1.0),
+            status: create.status,
+            evidence_refs: create.evidence_refs,
+            tensions: create.tensions,
+            linked_record_ids: create.linked_record_ids,
+            source: create.source,
+            created_at: now,
+            updated_at: now,
+        };
+        self.write_constitution_file(&item)?;
+        Ok(item)
+    }
+
+    pub fn update_constitution_item(
+        &self,
+        id: &str,
+        update: ConstitutionItemUpdate,
+    ) -> Result<ConstitutionItem> {
+        Self::validate_file_id(id)?;
+        let path = self.constitution_file_path(id);
+        let mut item = self.read_constitution_file(&path)?;
+        if let Some(claim) = update.claim {
+            item.claim = claim;
+        }
+        if let Some(dimension) = update.dimension {
+            item.dimension = dimension;
+        }
+        if let Some(scope) = update.scope {
+            item.scope = scope;
+        }
+        if let Some(priority) = update.priority {
+            item.priority = priority.clamp(0.0, 1.0);
+        }
+        if let Some(confidence) = update.confidence {
+            item.confidence = confidence.clamp(0.0, 1.0);
+        }
+        if let Some(status) = update.status {
+            item.status = status;
+        }
+        if let Some(tensions) = update.tensions {
+            item.tensions = tensions;
+        }
+        item.updated_at = Utc::now();
+        self.write_constitution_file(&item)?;
+        Ok(item)
+    }
+
+    pub fn review_constitution_item(
+        &mut self,
+        id: &str,
+        request: ConstitutionReviewRequest,
+    ) -> Result<ConstitutionItem> {
+        Self::validate_file_id(id)?;
+        let mut item = self.read_constitution_file(&self.constitution_file_path(id))?;
+        item.status = constitution_status_for_action(&request.action);
+        item.updated_at = Utc::now();
+        self.write_constitution_file(&item)?;
+        self.append_trace_event(
+            "constitution-review",
+            TraceEventType::ConstitutionItemReviewed,
+            json!({
+                "constitution_item_id": item.id,
+                "action": request.action,
+                "rationale": request.rationale,
+            }),
+        )?;
+        Ok(item)
+    }
+
+    pub fn list_action_gaps(&self) -> Result<Vec<ActionGap>> {
+        let mut gaps = Vec::new();
+        if !self.action_gaps_path.exists() {
+            return Ok(gaps);
+        }
+
+        for entry in WalkDir::new(&self.action_gaps_path)
+            .min_depth(1)
+            .max_depth(1)
+            .into_iter()
+            .filter_map(|entry| entry.ok())
+        {
+            let path = entry.path();
+            if path.extension().is_some_and(|ext| ext == "json") {
+                gaps.push(self.read_action_gap_file(path)?);
+            }
+        }
+
+        gaps.sort_by(|a, b| {
+            constitution_status_sort_key(&a.status)
+                .cmp(&constitution_status_sort_key(&b.status))
+                .then_with(|| {
+                    b.confidence
+                        .partial_cmp(&a.confidence)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .then_with(|| b.updated_at.cmp(&a.updated_at))
+        });
+        Ok(gaps)
+    }
+
+    pub fn create_action_gap(&self, create: ActionGapCreate) -> Result<ActionGap> {
+        let now = Utc::now();
+        let gap = ActionGap {
+            id: uuid::Uuid::new_v4().to_string(),
+            stated_value: create.stated_value,
+            revealed_behavior: create.revealed_behavior,
+            driver_hypothesis: create.driver_hypothesis,
+            somatic_taste_signal: create.somatic_taste_signal,
+            decision_risk: create.decision_risk,
+            evidence_refs: create.evidence_refs,
+            linked_record_ids: create.linked_record_ids,
+            confidence: create.confidence.clamp(0.0, 1.0),
+            status: create.status,
+            created_at: now,
+            updated_at: now,
+        };
+        self.write_action_gap_file(&gap)?;
+        Ok(gap)
+    }
+
+    pub fn review_action_gap(
+        &mut self,
+        id: &str,
+        request: ConstitutionReviewRequest,
+    ) -> Result<ActionGap> {
+        Self::validate_file_id(id)?;
+        let mut gap = self.read_action_gap_file(&self.action_gap_file_path(id))?;
+        gap.status = constitution_status_for_action(&request.action);
+        gap.updated_at = Utc::now();
+        self.write_action_gap_file(&gap)?;
+        self.append_trace_event(
+            "constitution-review",
+            TraceEventType::ActionGapReviewed,
+            json!({
+                "action_gap_id": gap.id,
+                "action": request.action,
+                "rationale": request.rationale,
+            }),
+        )?;
+        Ok(gap)
+    }
+
+    pub fn get_constitution_setup(&self) -> Result<ConstitutionSetup> {
+        if !self.setup_path.exists() {
+            return Ok(ConstitutionSetup::default());
+        }
+
+        let content = std::fs::read_to_string(&self.setup_path).with_context(|| {
+            format!(
+                "Failed to read constitution setup file: {}",
+                self.setup_path.display()
+            )
+        })?;
+        serde_json::from_str(&content).with_context(|| {
+            format!(
+                "Failed to parse constitution setup file: {}",
+                self.setup_path.display()
+            )
+        })
+    }
+
+    pub fn save_constitution_setup(
+        &mut self,
+        mut setup: ConstitutionSetup,
+    ) -> Result<ConstitutionSetup> {
+        setup.values = clean_setup_entries(setup.values);
+        setup.tastes = clean_setup_entries(setup.tastes);
+        setup.constraints = clean_setup_entries(setup.constraints);
+        setup.somatic_cues = clean_setup_entries(setup.somatic_cues);
+        setup.action_tendencies = clean_setup_entries(setup.action_tendencies);
+        setup.updated_at = Some(Utc::now());
+        self.write_pretty_json(&self.setup_path, &setup)?;
+
+        let event = self.append_trace_event(
+            "constitution-setup",
+            TraceEventType::ConstitutionSetupSaved,
+            json!({
+                "values": setup.values,
+                "tastes": setup.tastes,
+                "constraints": setup.constraints,
+                "somatic_cues": setup.somatic_cues,
+                "action_tendencies": setup.action_tendencies,
+            }),
+        )?;
+        let evidence_ref = EvidenceRef {
+            trace_id: "constitution-setup".to_string(),
+            event_id: event.id,
+            session_id: "constitution-setup".to_string(),
+            tile_id: None,
+            model_id: None,
+            note: Some("Guided Twin setup".to_string()),
+        };
+
+        self.seed_constitution_setup_items(&setup, evidence_ref)?;
+        Ok(setup)
+    }
+
+    pub fn run_constitution_inference(&mut self) -> Result<ConstitutionInferenceSummary> {
+        self.ensure_record_cache()?;
+        let records = self
+            .record_cache
+            .values()
+            .filter(|record| constitution_allows_record(record))
+            .cloned()
+            .collect::<Vec<_>>();
+        let decisions = self.list_decision_episodes()?;
+        let existing_items = self.list_constitution_items()?;
+        let existing_gaps = self.list_action_gaps()?;
+        let mut item_keys = existing_items
+            .iter()
+            .map(|item| constitution_key(&item.dimension, &item.claim))
+            .collect::<HashSet<_>>();
+        let mut gap_keys = existing_gaps
+            .iter()
+            .map(|gap| action_gap_key(&gap.stated_value, &gap.revealed_behavior))
+            .collect::<HashSet<_>>();
+
+        let mut created_constitution_items = 0_usize;
+        let mut created_action_gaps = 0_usize;
+
+        for record in &records {
+            let dimension = infer_constitution_dimension(&record.content, &record.kind);
+            let claim = record.content.trim().to_string();
+            if claim.is_empty() {
+                continue;
+            }
+            let key = constitution_key(&dimension, &claim);
+            if item_keys.insert(key) {
+                self.create_constitution_item(ConstitutionItemCreate {
+                    claim,
+                    dimension,
+                    scope: vec!["general".to_string()],
+                    priority: record.confidence,
+                    confidence: record.confidence,
+                    status: ConstitutionStatus::Candidate,
+                    evidence_refs: record.evidence_refs.clone(),
+                    tensions: Vec::new(),
+                    linked_record_ids: vec![record.id.clone()],
+                    source: Some("constitution_inference".to_string()),
+                })?;
+                created_constitution_items += 1;
+            }
+
+            if let Some((stated_value, revealed_behavior)) = split_action_gap_claim(&record.content)
+            {
+                let key = action_gap_key(&stated_value, &revealed_behavior);
+                if gap_keys.insert(key) {
+                    self.create_action_gap(ActionGapCreate {
+                        stated_value,
+                        revealed_behavior,
+                        driver_hypothesis: Some(
+                            "Inferred from a contradiction-style user record".to_string(),
+                        ),
+                        somatic_taste_signal: None,
+                        decision_risk:
+                            "The user's endorsed intent may diverge from what they repeatedly do."
+                                .to_string(),
+                        evidence_refs: record.evidence_refs.clone(),
+                        linked_record_ids: vec![record.id.clone()],
+                        confidence: record.confidence,
+                        status: ConstitutionStatus::Candidate,
+                    })?;
+                    created_action_gaps += 1;
+                }
+            }
+        }
+
+        for decision in &decisions {
+            let Some(initial_leaning) = decision.initial_leaning.as_ref() else {
+                continue;
+            };
+            let Some(chosen_option) = decision.chosen_option.as_ref() else {
+                continue;
+            };
+            if initial_leaning
+                .trim()
+                .eq_ignore_ascii_case(chosen_option.trim())
+            {
+                continue;
+            }
+            let stated_value = format!("Initial leaning: {}", initial_leaning.trim());
+            let revealed_behavior = format!("Chosen option: {}", chosen_option.trim());
+            let key = action_gap_key(&stated_value, &revealed_behavior);
+            if gap_keys.insert(key) {
+                self.create_action_gap(ActionGapCreate {
+                    stated_value,
+                    revealed_behavior,
+                    driver_hypothesis: Some("Inferred from a decision where final action diverged from initial leaning.".to_string()),
+                    somatic_taste_signal: decision.primitive_assessment.somatic_signal.clone(),
+                    decision_risk: "Grafyn should check whether future similar decisions repeat this gap.".to_string(),
+                    evidence_refs: self.decision_evidence_refs(&decision.id)?,
+                    linked_record_ids: Vec::new(),
+                    confidence: 0.68,
+                    status: ConstitutionStatus::Candidate,
+                })?;
+                created_action_gaps += 1;
+            }
+        }
+
+        let summary = ConstitutionInferenceSummary {
+            scanned_records: records.len(),
+            scanned_decisions: decisions.len(),
+            created_constitution_items,
+            created_action_gaps,
+            generated_at: Utc::now(),
+        };
+        self.append_trace_event(
+            "constitution-inference",
+            TraceEventType::ConstitutionInferenceRun,
+            serde_json::to_value(&summary)?,
+        )?;
+        Ok(summary)
+    }
+
+    pub fn select_constitution_context(
+        &self,
+        query: &str,
+    ) -> Result<(Vec<ConstitutionItem>, Vec<ActionGap>)> {
+        let query_terms = lexical_terms(query);
+        let mut items = self
+            .list_constitution_items()?
+            .into_iter()
+            .filter(|item| constitution_context_allowed(&item.status))
+            .map(|item| (constitution_item_relevance(&item, &query_terms), item))
+            .filter(|(score, item)| *score > 0 || item.status == ConstitutionStatus::Active)
+            .collect::<Vec<_>>();
+        items.sort_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then_with(|| {
+                    b.1.priority
+                        .partial_cmp(&a.1.priority)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .then_with(|| b.1.updated_at.cmp(&a.1.updated_at))
+        });
+
+        let mut gaps = self
+            .list_action_gaps()?
+            .into_iter()
+            .filter(|gap| constitution_context_allowed(&gap.status))
+            .map(|gap| (action_gap_relevance(&gap, &query_terms), gap))
+            .filter(|(score, gap)| *score > 0 || gap.status == ConstitutionStatus::Active)
+            .collect::<Vec<_>>();
+        gaps.sort_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then_with(|| {
+                    b.1.confidence
+                        .partial_cmp(&a.1.confidence)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .then_with(|| b.1.updated_at.cmp(&a.1.updated_at))
+        });
+
+        Ok((
+            items.into_iter().take(8).map(|(_, item)| item).collect(),
+            gaps.into_iter().take(4).map(|(_, gap)| gap).collect(),
+        ))
+    }
+
     pub fn export_bundle(&mut self, request: TwinExportRequest) -> Result<ExportBundle> {
         self.ensure_record_cache()?;
 
@@ -470,6 +1475,9 @@ impl TwinStore {
         let train_path = output_dir.join("train.jsonl");
         let eval_path = output_dir.join("eval.jsonl");
         let holdout_path = output_dir.join("holdout.jsonl");
+        let benchmark_path = output_dir.join("decision_mirror_benchmark.jsonl");
+        let constitution_path = output_dir.join("constitution_items.jsonl");
+        let action_gaps_path = output_dir.join("action_gaps.jsonl");
         let manifest_path = output_dir.join("manifest.json");
 
         let mut records: Vec<UserRecord> = self.record_cache.values().cloned().collect();
@@ -515,6 +1523,39 @@ impl TwinStore {
         self.write_jsonl_file(&train_path, &train_lines)?;
         self.write_jsonl_file(&eval_path, &eval_lines)?;
         self.write_jsonl_file(&holdout_path, &holdout_lines)?;
+        let decision_mirror_config = self.get_decision_mirror_config()?;
+        let benchmark_lines = self
+            .list_decision_episodes_with_reflections()?
+            .into_iter()
+            .map(|entry| {
+                serde_json::to_string(&json!({
+                    "variant": "decision_mirror",
+                    "baseline_variants": [
+                        "generic_llm",
+                        "persona_prompt",
+                        "vault_only_rag",
+                        "twin_rag",
+                        "decision_mirror"
+                    ],
+                    "config": decision_mirror_config.clone(),
+                    "episode": entry.episode,
+                    "reflection_cards": entry.reflection_cards,
+                }))
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        self.write_jsonl_file(&benchmark_path, &benchmark_lines)?;
+        let constitution_lines = self
+            .list_constitution_items()?
+            .into_iter()
+            .map(|item| serde_json::to_string(&item))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        self.write_jsonl_file(&constitution_path, &constitution_lines)?;
+        let action_gap_lines = self
+            .list_action_gaps()?
+            .into_iter()
+            .map(|gap| serde_json::to_string(&gap))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        self.write_jsonl_file(&action_gaps_path, &action_gap_lines)?;
 
         let manifest = serde_json::json!({
             "generated_at": Utc::now(),
@@ -534,6 +1575,18 @@ impl TwinStore {
                 "rejected_user_records": {
                     "path": rejected_path.display().to_string(),
                     "count": rejected_lines.len(),
+                },
+                "decision_mirror_benchmark": {
+                    "path": benchmark_path.display().to_string(),
+                    "count": benchmark_lines.len(),
+                },
+                "constitution_items": {
+                    "path": constitution_path.display().to_string(),
+                    "count": constitution_lines.len(),
+                },
+                "action_gaps": {
+                    "path": action_gaps_path.display().to_string(),
+                    "count": action_gap_lines.len(),
                 },
             },
             "excluded_counts": {
@@ -555,6 +1608,18 @@ impl TwinStore {
             rejected_user_records: ExportFileSummary {
                 path: rejected_path.display().to_string(),
                 count: rejected_lines.len(),
+            },
+            decision_mirror_benchmark: ExportFileSummary {
+                path: benchmark_path.display().to_string(),
+                count: benchmark_lines.len(),
+            },
+            constitution_items: ExportFileSummary {
+                path: constitution_path.display().to_string(),
+                count: constitution_lines.len(),
+            },
+            action_gaps: ExportFileSummary {
+                path: action_gaps_path.display().to_string(),
+                count: action_gap_lines.len(),
             },
             train: ExportFileSummary {
                 path: train_path.display().to_string(),
@@ -711,6 +1776,23 @@ impl TwinStore {
         self.records_path.join(format!("{}.json", record_id))
     }
 
+    fn decision_file_path(&self, decision_id: &str) -> PathBuf {
+        self.decisions_path.join(format!("{}.json", decision_id))
+    }
+
+    fn reflection_file_path(&self, reflection_id: &str) -> PathBuf {
+        self.reflections_path
+            .join(format!("{}.json", reflection_id))
+    }
+
+    fn constitution_file_path(&self, item_id: &str) -> PathBuf {
+        self.constitution_path.join(format!("{}.json", item_id))
+    }
+
+    fn action_gap_file_path(&self, gap_id: &str) -> PathBuf {
+        self.action_gaps_path.join(format!("{}.json", gap_id))
+    }
+
     fn read_trace_file(&self, path: &Path) -> Result<SessionTrace> {
         let content = std::fs::read_to_string(path)
             .with_context(|| format!("Failed to read trace file: {}", path.display()))?;
@@ -725,6 +1807,57 @@ impl TwinStore {
             .with_context(|| format!("Failed to parse record file: {}", path.display()))
     }
 
+    fn read_decision_file(&self, path: &Path) -> Result<DecisionEpisode> {
+        let content = std::fs::read_to_string(path)
+            .with_context(|| format!("Failed to read decision file: {}", path.display()))?;
+        serde_json::from_str(&content)
+            .with_context(|| format!("Failed to parse decision file: {}", path.display()))
+    }
+
+    fn read_reflection_file(&self, path: &Path) -> Result<ReflectionCard> {
+        let content = std::fs::read_to_string(path)
+            .with_context(|| format!("Failed to read reflection file: {}", path.display()))?;
+        serde_json::from_str(&content)
+            .with_context(|| format!("Failed to parse reflection file: {}", path.display()))
+    }
+
+    fn read_constitution_file(&self, path: &Path) -> Result<ConstitutionItem> {
+        let content = std::fs::read_to_string(path)
+            .with_context(|| format!("Failed to read constitution file: {}", path.display()))?;
+        serde_json::from_str(&content)
+            .with_context(|| format!("Failed to parse constitution file: {}", path.display()))
+    }
+
+    fn read_action_gap_file(&self, path: &Path) -> Result<ActionGap> {
+        let content = std::fs::read_to_string(path)
+            .with_context(|| format!("Failed to read action gap file: {}", path.display()))?;
+        serde_json::from_str(&content)
+            .with_context(|| format!("Failed to parse action gap file: {}", path.display()))
+    }
+
+    fn read_memory_digest_file(&self) -> Result<Vec<MemoryDigestItem>> {
+        if !self.digest_path.exists() {
+            return Ok(Vec::new());
+        }
+
+        let content = std::fs::read_to_string(&self.digest_path).with_context(|| {
+            format!(
+                "Failed to read memory digest file: {}",
+                self.digest_path.display()
+            )
+        })?;
+        serde_json::from_str(&content).with_context(|| {
+            format!(
+                "Failed to parse memory digest file: {}",
+                self.digest_path.display()
+            )
+        })
+    }
+
+    fn write_decision_mirror_config_file(&self, config: &DecisionMirrorConfig) -> Result<()> {
+        self.write_pretty_json(&self.decision_mirror_config_path, config)
+    }
+
     fn write_trace_file(&self, trace: &SessionTrace) -> Result<()> {
         let path = self.trace_file_path(&trace.session_id);
         self.write_pretty_json(&path, trace)
@@ -733,6 +1866,161 @@ impl TwinStore {
     fn write_record_file(&self, record: &UserRecord) -> Result<()> {
         let path = self.record_file_path(&record.id);
         self.write_pretty_json(&path, record)
+    }
+
+    fn write_decision_file(&self, episode: &DecisionEpisode) -> Result<()> {
+        let path = self.decision_file_path(&episode.id);
+        self.write_pretty_json(&path, episode)
+    }
+
+    fn write_reflection_file(&self, card: &ReflectionCard) -> Result<()> {
+        let path = self.reflection_file_path(&card.id);
+        self.write_pretty_json(&path, card)
+    }
+
+    fn write_constitution_file(&self, item: &ConstitutionItem) -> Result<()> {
+        let path = self.constitution_file_path(&item.id);
+        self.write_pretty_json(&path, item)
+    }
+
+    fn write_action_gap_file(&self, gap: &ActionGap) -> Result<()> {
+        let path = self.action_gap_file_path(&gap.id);
+        self.write_pretty_json(&path, gap)
+    }
+
+    fn write_memory_digest_file(&self, items: &[MemoryDigestItem]) -> Result<()> {
+        self.write_pretty_json(&self.digest_path, &items)
+    }
+
+    fn list_reflection_cards(&self) -> Result<Vec<ReflectionCard>> {
+        let mut cards = Vec::new();
+        if !self.reflections_path.exists() {
+            return Ok(cards);
+        }
+
+        for entry in WalkDir::new(&self.reflections_path)
+            .min_depth(1)
+            .max_depth(1)
+            .into_iter()
+            .filter_map(|entry| entry.ok())
+        {
+            let path = entry.path();
+            if path.extension().is_some_and(|ext| ext == "json") {
+                cards.push(self.read_reflection_file(path)?);
+            }
+        }
+
+        cards.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        Ok(cards)
+    }
+
+    fn seed_constitution_setup_items(
+        &self,
+        setup: &ConstitutionSetup,
+        evidence_ref: EvidenceRef,
+    ) -> Result<()> {
+        let existing_keys = self
+            .list_constitution_items()?
+            .into_iter()
+            .map(|item| constitution_key(&item.dimension, &item.claim))
+            .collect::<HashSet<_>>();
+        let mut created_keys = existing_keys;
+
+        let groups: &[(&str, &[String])] = &[
+            ("values", &setup.values),
+            ("taste", &setup.tastes),
+            ("constraints", &setup.constraints),
+            ("somatic", &setup.somatic_cues),
+            ("action_tendency", &setup.action_tendencies),
+        ];
+
+        for (dimension, entries) in groups {
+            for entry in entries.iter().filter(|entry| !entry.trim().is_empty()) {
+                let claim = entry.trim().to_string();
+                let key = constitution_key(dimension, &claim);
+                if !created_keys.insert(key) {
+                    continue;
+                }
+                self.create_constitution_item(ConstitutionItemCreate {
+                    claim,
+                    dimension: (*dimension).to_string(),
+                    scope: vec!["setup".to_string()],
+                    priority: 0.9,
+                    confidence: 0.9,
+                    status: ConstitutionStatus::Active,
+                    evidence_refs: vec![evidence_ref.clone()],
+                    tensions: Vec::new(),
+                    linked_record_ids: Vec::new(),
+                    source: Some("guided_setup".to_string()),
+                })?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn decision_evidence_refs(&self, decision_id: &str) -> Result<Vec<EvidenceRef>> {
+        Self::validate_file_id(decision_id)?;
+        let mut refs = Vec::new();
+        for entry in WalkDir::new(&self.traces_path)
+            .min_depth(1)
+            .max_depth(1)
+            .into_iter()
+            .filter_map(|entry| entry.ok())
+        {
+            let path = entry.path();
+            if !path.extension().is_some_and(|ext| ext == "json") {
+                continue;
+            }
+            let trace = self.read_trace_file(path)?;
+            for event in trace.events {
+                let event_decision_id =
+                    payload_string(&event.payload, &["decision_episode_id"]).unwrap_or_default();
+                if event_decision_id != decision_id {
+                    continue;
+                }
+                refs.push(EvidenceRef {
+                    trace_id: trace.id.clone(),
+                    event_id: event.id.clone(),
+                    session_id: trace.session_id.clone(),
+                    tile_id: extract_event_tile_id(&event.payload),
+                    model_id: extract_event_model_id(&event.payload),
+                    note: Some("Decision episode evidence".to_string()),
+                });
+            }
+        }
+        refs.sort_by(|a, b| a.event_id.cmp(&b.event_id));
+        Ok(refs)
+    }
+
+    fn decision_feedback_events(&self, episode: &DecisionEpisode) -> Result<Vec<TraceEvent>> {
+        Self::validate_file_id(&episode.session_id)?;
+        let path = self.trace_file_path(&episode.session_id);
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+
+        let trace = self.read_trace_file(&path)?;
+        let mut events = trace
+            .events
+            .into_iter()
+            .filter(|event| {
+                matches!(
+                    event.event_type,
+                    TraceEventType::FeedbackRecorded
+                        | TraceEventType::RankingRecorded
+                        | TraceEventType::InsightCaptured
+                )
+            })
+            .filter(|event| {
+                payload_string(&event.payload, &["decision_episode_id"])
+                    .is_some_and(|id| id == episode.id)
+                    || extract_event_tile_id(&event.payload)
+                        .is_some_and(|tile_id| tile_id == episode.tile_id)
+            })
+            .collect::<Vec<_>>();
+        events.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        Ok(events)
     }
 
     fn write_jsonl_file(&self, path: &Path, lines: &[String]) -> Result<()> {
@@ -762,6 +2050,488 @@ impl TwinStore {
 
         Ok(())
     }
+}
+
+fn clean_setup_entries(entries: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    entries
+        .into_iter()
+        .map(|entry| entry.trim().to_string())
+        .filter(|entry| !entry.is_empty())
+        .filter(|entry| seen.insert(entry.to_lowercase()))
+        .collect()
+}
+
+fn clamp_decision_mirror_weights(mut weights: DecisionMirrorWeights) -> DecisionMirrorWeights {
+    weights.notes_weight = clamp_weight(weights.notes_weight);
+    weights.approved_records_weight = clamp_weight(weights.approved_records_weight);
+    weights.candidate_records_weight = clamp_weight(weights.candidate_records_weight);
+    weights.constitution_weight = clamp_weight(weights.constitution_weight);
+    weights.action_gaps_weight = clamp_weight(weights.action_gaps_weight);
+    weights.recency_weight = clamp_weight(weights.recency_weight);
+    weights.evidence_count_weight = clamp_weight(weights.evidence_count_weight);
+    weights.outcome_history_weight = clamp_weight(weights.outcome_history_weight);
+    weights.contradiction_weight = clamp_weight(weights.contradiction_weight);
+    weights.breadth_weight = clamp_weight(weights.breadth_weight);
+    weights.depth_weight = clamp_weight(weights.depth_weight);
+    weights.evidence_grounding_weight = clamp_weight(weights.evidence_grounding_weight);
+    weights.blind_spot_weight = clamp_weight(weights.blind_spot_weight);
+    weights.counter_position_weight = clamp_weight(weights.counter_position_weight);
+    weights.actionability_weight = clamp_weight(weights.actionability_weight);
+    weights.uncertainty_weight = clamp_weight(weights.uncertainty_weight);
+    weights.privacy_weight = clamp_weight(weights.privacy_weight);
+    weights.unsupported_penalty_weight = clamp_weight(weights.unsupported_penalty_weight);
+    weights
+}
+
+fn clamp_weight(weight: f32) -> f32 {
+    if weight.is_finite() {
+        weight.clamp(0.0, 3.0)
+    } else {
+        1.0
+    }
+}
+
+fn constitution_key(dimension: &str, claim: &str) -> String {
+    format!(
+        "{}::{}",
+        dimension.trim().to_lowercase(),
+        normalize_key_text(claim)
+    )
+}
+
+fn action_gap_key(stated_value: &str, revealed_behavior: &str) -> String {
+    format!(
+        "{}::{}",
+        normalize_key_text(stated_value),
+        normalize_key_text(revealed_behavior)
+    )
+}
+
+fn normalize_key_text(text: &str) -> String {
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+fn constitution_allows_record(record: &UserRecord) -> bool {
+    !matches!(
+        record.promotion_state,
+        PromotionState::Rejected | PromotionState::Private | PromotionState::NoTrain
+    ) && record.kind != UserRecordKind::Fact
+}
+
+fn constitution_context_allowed(status: &ConstitutionStatus) -> bool {
+    matches!(
+        status,
+        ConstitutionStatus::Active | ConstitutionStatus::Candidate | ConstitutionStatus::Softened
+    )
+}
+
+fn constitution_status_for_action(action: &MemoryDigestAction) -> ConstitutionStatus {
+    match action {
+        MemoryDigestAction::Keep => ConstitutionStatus::Active,
+        MemoryDigestAction::Soften => ConstitutionStatus::Softened,
+        MemoryDigestAction::NotMe => ConstitutionStatus::NotMe,
+        MemoryDigestAction::Private => ConstitutionStatus::Private,
+        MemoryDigestAction::NoTrain => ConstitutionStatus::NoTrain,
+        MemoryDigestAction::Reject => ConstitutionStatus::Rejected,
+    }
+}
+
+fn constitution_status_sort_key(status: &ConstitutionStatus) -> u8 {
+    match status {
+        ConstitutionStatus::Active => 0,
+        ConstitutionStatus::Candidate => 1,
+        ConstitutionStatus::Softened => 2,
+        ConstitutionStatus::NotMe => 3,
+        ConstitutionStatus::Private => 4,
+        ConstitutionStatus::NoTrain => 5,
+        ConstitutionStatus::Rejected => 6,
+    }
+}
+
+fn promotion_state_label(state: &PromotionState) -> &'static str {
+    match state {
+        PromotionState::Candidate => "Candidate",
+        PromotionState::AutoPromoted => "Auto-promoted",
+        PromotionState::Endorsed => "Endorsed",
+        PromotionState::Rejected => "Rejected",
+        PromotionState::Private => "Private",
+        PromotionState::NoTrain => "No-train",
+    }
+}
+
+fn infer_constitution_dimension(content: &str, kind: &UserRecordKind) -> String {
+    let lower = content.to_lowercase();
+    if text_contains_any(&lower, &["taste", "aesthetic", "style", "design", "feel"]) {
+        "taste".to_string()
+    } else if text_contains_any(
+        &lower,
+        &["constraint", "deadline", "budget", "time", "cost"],
+    ) {
+        "constraints".to_string()
+    } else if text_contains_any(&lower, &["somatic", "gut", "body", "energy", "fatigue"]) {
+        "somatic".to_string()
+    } else if text_contains_any(&lower, &["value", "principle", "mission", "care about"]) {
+        "values".to_string()
+    } else {
+        match kind {
+            UserRecordKind::Preference => "preferences".to_string(),
+            UserRecordKind::ReasoningPattern => "reasoning".to_string(),
+            UserRecordKind::Fact => "facts".to_string(),
+        }
+    }
+}
+
+fn split_action_gap_claim(content: &str) -> Option<(String, String)> {
+    let lowered = content.to_lowercase();
+    for separator in [" but ", " however ", " yet ", " although "] {
+        if let Some(index) = lowered.find(separator) {
+            let left = content[..index].trim();
+            let right = content[index + separator.len()..].trim();
+            if left.len() >= 8 && right.len() >= 8 {
+                return Some((left.to_string(), right.to_string()));
+            }
+        }
+    }
+    None
+}
+
+fn constitution_item_relevance(item: &ConstitutionItem, query_terms: &HashSet<String>) -> usize {
+    if query_terms.is_empty() {
+        return 0;
+    }
+    let mut haystack = format!("{} {} {}", item.claim, item.dimension, item.scope.join(" "));
+    for tension in &item.tensions {
+        haystack.push(' ');
+        haystack.push_str(tension);
+    }
+    let item_terms = lexical_terms(&haystack);
+    query_terms.intersection(&item_terms).count()
+}
+
+fn action_gap_relevance(gap: &ActionGap, query_terms: &HashSet<String>) -> usize {
+    if query_terms.is_empty() {
+        return 0;
+    }
+    let mut haystack = format!(
+        "{} {} {}",
+        gap.stated_value, gap.revealed_behavior, gap.decision_risk
+    );
+    if let Some(driver) = &gap.driver_hypothesis {
+        haystack.push(' ');
+        haystack.push_str(driver);
+    }
+    if let Some(signal) = &gap.somatic_taste_signal {
+        haystack.push(' ');
+        haystack.push_str(signal);
+    }
+    let gap_terms = lexical_terms(&haystack);
+    query_terms.intersection(&gap_terms).count()
+}
+
+fn memory_digest_trigger(record: &UserRecord) -> Option<&'static str> {
+    if record.kind == UserRecordKind::Fact {
+        return None;
+    }
+
+    match record.promotion_state {
+        PromotionState::Rejected | PromotionState::Private | PromotionState::NoTrain => None,
+        PromotionState::AutoPromoted
+            if record.evidence_refs.len() >= AUTO_PROMOTE_SUPPORT_COUNT =>
+        {
+            Some("3+ evidence points support this durable pattern")
+        }
+        PromotionState::Candidate if record.evidence_refs.len() >= AUTO_PROMOTE_SUPPORT_COUNT => {
+            Some("candidate pattern has enough evidence for review")
+        }
+        PromotionState::Candidate
+            if record.confidence >= AUTO_PROMOTE_CONFIDENCE && !record.evidence_refs.is_empty() =>
+        {
+            Some("high-confidence candidate pattern needs review")
+        }
+        PromotionState::Endorsed if stale_for_review(record) => {
+            Some("endorsed pattern may be stale")
+        }
+        PromotionState::AutoPromoted => None,
+        PromotionState::Endorsed => None,
+        PromotionState::Candidate => None,
+    }
+}
+
+fn memory_digest_cluster_key(record: &UserRecord) -> String {
+    if let Some(signal_family) = record
+        .metadata
+        .get("signal_family")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    {
+        return format!("{:?}::{}", record.kind, signal_family.trim().to_lowercase());
+    }
+
+    let mut terms = lexical_terms(&record.content)
+        .into_iter()
+        .collect::<Vec<_>>();
+    terms.sort();
+    terms.truncate(6);
+    if terms.is_empty() {
+        format!("{:?}::{}", record.kind, normalize_key_text(&record.content))
+    } else {
+        format!("{:?}::{}", record.kind, terms.join("-"))
+    }
+}
+
+fn stable_digest_id(records: &[UserRecord]) -> String {
+    let mut ids = records
+        .iter()
+        .map(|record| record.id.as_str())
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    let mut hasher = DefaultHasher::new();
+    ids.hash(&mut hasher);
+    format!("digest-cluster-{:x}", hasher.finish())
+}
+
+fn stale_for_review(record: &UserRecord) -> bool {
+    Utc::now()
+        .signed_duration_since(record.updated_at)
+        .num_days()
+        >= 90
+}
+
+fn digest_state_sort_key(state: &MemoryDigestState) -> u8 {
+    match state {
+        MemoryDigestState::Pending => 0,
+        MemoryDigestState::Softened => 1,
+        MemoryDigestState::Kept => 2,
+        MemoryDigestState::NotMe => 3,
+        MemoryDigestState::Private => 4,
+        MemoryDigestState::NoTrain => 5,
+        MemoryDigestState::Rejected => 6,
+    }
+}
+
+fn memory_digest_state_for_action(action: &MemoryDigestAction) -> MemoryDigestState {
+    match action {
+        MemoryDigestAction::Keep => MemoryDigestState::Kept,
+        MemoryDigestAction::Soften => MemoryDigestState::Softened,
+        MemoryDigestAction::NotMe => MemoryDigestState::NotMe,
+        MemoryDigestAction::Private => MemoryDigestState::Private,
+        MemoryDigestAction::NoTrain => MemoryDigestState::NoTrain,
+        MemoryDigestAction::Reject => MemoryDigestState::Rejected,
+    }
+}
+
+fn score_reflection_card(
+    content: &str,
+    cited_note_ids: &[String],
+    cited_user_record_ids: &[String],
+    cited_constitution_item_ids: &[String],
+    cited_action_gap_ids: &[String],
+    config: &DecisionMirrorConfig,
+) -> ReflectionScores {
+    let lower = content.to_lowercase();
+    let section_checks: &[&[&str]] = &[
+        &["decision frame", "actual decision"],
+        &["reasoning pattern", "likely reasoning", "default pattern"],
+        &["evidence", "vault", "record"],
+        &["blind spot", "missing", "underweighting"],
+        &["counter-position", "counter position", "counterargument"],
+        &["recommendation", "would do next"],
+        &["confidence", "uncertain", "would change my mind"],
+        &["next action", "smallest", "follow-up"],
+    ];
+    let present_sections = section_checks
+        .iter()
+        .filter(|aliases| aliases.iter().any(|alias| lower.contains(alias)))
+        .count();
+    let breadth_score = present_sections as f32 / section_checks.len() as f32;
+
+    let word_count = content.split_whitespace().count() as f32;
+    let depth_score = ((word_count / 450.0).min(1.0) * 0.5)
+        + (phrase_score(
+            &lower,
+            &[
+                "because",
+                "tradeoff",
+                "evidence",
+                "alternative",
+                "would change",
+                "unsupported",
+            ],
+        ) * 0.5);
+
+    let evidence_grounding_score = if !cited_note_ids.is_empty()
+        || !cited_user_record_ids.is_empty()
+        || !cited_constitution_item_ids.is_empty()
+        || !cited_action_gap_ids.is_empty()
+    {
+        1.0
+    } else if lower.contains("evidence")
+        || lower.contains("note")
+        || lower.contains("record")
+        || lower.contains("based on")
+    {
+        0.5
+    } else {
+        0.0
+    };
+
+    let blind_spot_score = phrase_score(
+        &lower,
+        &[
+            "blind spot",
+            "missing",
+            "underweight",
+            "bias",
+            "avoid",
+            "overfit",
+        ],
+    );
+    let actionability_score = phrase_score(
+        &lower,
+        &["next action", "smallest", "experiment", "step", "by "],
+    );
+    let counterargument_score = phrase_score(
+        &lower,
+        &[
+            "counter",
+            "strongest argument",
+            "against",
+            "alternative frame",
+        ],
+    );
+    let uncertainty_score = phrase_score(
+        &lower,
+        &[
+            "hypothesis",
+            "may",
+            "seem",
+            "confidence",
+            "uncertain",
+            "would change",
+        ],
+    );
+    let privacy_score = 1.0;
+    let unsupported_claim_count = unsupported_self_claim_count(
+        &lower,
+        evidence_grounding_score,
+        cited_note_ids,
+        cited_user_record_ids,
+        cited_constitution_item_ids,
+        cited_action_gap_ids,
+    );
+    let (overall_score, weighted_breakdown) = weighted_reflection_score(
+        config,
+        &[
+            ("breadth", breadth_score),
+            ("depth", depth_score.min(1.0)),
+            ("evidence_grounding", evidence_grounding_score),
+            ("blind_spot", blind_spot_score),
+            ("counter_position", counterargument_score),
+            ("actionability", actionability_score),
+            ("uncertainty", uncertainty_score),
+            ("privacy", privacy_score),
+        ],
+        unsupported_claim_count,
+    );
+
+    ReflectionScores {
+        breadth_score,
+        depth_score: depth_score.min(1.0),
+        evidence_grounding_score,
+        blind_spot_score,
+        actionability_score,
+        counterargument_score,
+        uncertainty_score,
+        privacy_score,
+        unsupported_claim_count,
+        overall_score,
+        weighted_breakdown,
+    }
+}
+
+fn weighted_reflection_score(
+    config: &DecisionMirrorConfig,
+    scores: &[(&str, f32)],
+    unsupported_claim_count: u32,
+) -> (f32, HashMap<String, f32>) {
+    let weights = &config.weights;
+    let weight_for = |key: &str| match key {
+        "breadth" => weights.breadth_weight,
+        "depth" => weights.depth_weight,
+        "evidence_grounding" => weights.evidence_grounding_weight,
+        "blind_spot" => weights.blind_spot_weight,
+        "counter_position" => weights.counter_position_weight,
+        "actionability" => weights.actionability_weight,
+        "uncertainty" => weights.uncertainty_weight,
+        "privacy" => weights.privacy_weight,
+        _ => 1.0,
+    };
+
+    let mut weighted_breakdown = HashMap::new();
+    let mut weighted_sum = 0.0_f32;
+    let mut weight_sum = 0.0_f32;
+    for (key, score) in scores {
+        let weight = clamp_weight(weight_for(key));
+        let contribution = score.clamp(0.0, 1.0) * weight;
+        weighted_breakdown.insert((*key).to_string(), contribution);
+        weighted_sum += contribution;
+        weight_sum += weight;
+    }
+
+    let unsupported_penalty =
+        (unsupported_claim_count.min(5) as f32 / 5.0) * weights.unsupported_penalty_weight;
+    weighted_breakdown.insert("unsupported_penalty".to_string(), -unsupported_penalty);
+
+    if weight_sum <= 0.0 {
+        return (0.0, weighted_breakdown);
+    }
+
+    let overall = ((weighted_sum - unsupported_penalty) / weight_sum).clamp(0.0, 1.0);
+    (overall, weighted_breakdown)
+}
+
+fn phrase_score(content: &str, phrases: &[&str]) -> f32 {
+    let hits = phrases
+        .iter()
+        .filter(|phrase| content.contains(**phrase))
+        .count();
+    (hits as f32 / phrases.len().max(1) as f32).min(1.0)
+}
+
+fn unsupported_self_claim_count(
+    lower: &str,
+    evidence_grounding_score: f32,
+    cited_note_ids: &[String],
+    cited_user_record_ids: &[String],
+    cited_constitution_item_ids: &[String],
+    cited_action_gap_ids: &[String],
+) -> u32 {
+    let has_structural_evidence = !cited_note_ids.is_empty()
+        || !cited_user_record_ids.is_empty()
+        || !cited_constitution_item_ids.is_empty()
+        || !cited_action_gap_ids.is_empty()
+        || evidence_grounding_score >= 0.5;
+    if has_structural_evidence {
+        return 0;
+    }
+
+    [
+        "you seem",
+        "you may",
+        "you often",
+        "you tend",
+        "your likely",
+        "based on your",
+        "you prefer",
+        "you avoid",
+    ]
+    .iter()
+    .map(|needle| lower.matches(needle).count() as u32)
+    .sum()
 }
 
 #[derive(Debug, Clone)]
@@ -1497,6 +3267,298 @@ mod tests {
             .export_bundle(TwinExportRequest::default())
             .expect("endorsed export should succeed");
         assert_eq!(bundle.included_records, 1);
+    }
+
+    #[test]
+    fn decision_episode_and_reflection_card_persist_with_scores() {
+        let temp_dir = tempdir().expect("temp dir should be created");
+        let mut store = TwinStore::new(temp_dir.path().to_path_buf());
+
+        let episode = store
+            .record_decision_episode(DecisionEpisodeCreate {
+                id: "decision-1".to_string(),
+                session_id: "session-1".to_string(),
+                tile_id: "tile-1".to_string(),
+                decision: "Should Grafyn build Decision Mirror first?".to_string(),
+                options: vec!["Decision Mirror".to_string(), "Topology".to_string()],
+                stakes: Some("Product direction".to_string()),
+                initial_leaning: Some("Decision Mirror".to_string()),
+                review_date: Some("2026-05-15".to_string()),
+                primitive_assessment: PrimitiveDecisionAssessment {
+                    stakes: Some("high".to_string()),
+                    reversibility: Some("medium".to_string()),
+                    time_horizon: Some("weeks".to_string()),
+                    uncertainty: Some("medium".to_string()),
+                    agency: Some("high".to_string()),
+                    value_tension: Some("ambition vs proof".to_string()),
+                    constraint_pressure: None,
+                    taste_aesthetic_pull: None,
+                    somatic_signal: None,
+                    action_gap_risk: None,
+                    outcome_feedback: None,
+                },
+            })
+            .expect("decision episode should persist");
+
+        let card = store
+            .record_reflection_card(ReflectionCardCreate {
+                decision_episode_id: episode.id.clone(),
+                session_id: episode.session_id.clone(),
+                tile_id: episode.tile_id.clone(),
+                model_id: "openai/gpt-4".to_string(),
+                content: [
+                    "## Decision Frame",
+                    "You seem pulled toward ambitious topology.",
+                    "## Likely Reasoning Pattern",
+                    "You tend to prefer large architecture.",
+                    "## Recommendation",
+                    "Build the smaller proof first.",
+                ]
+                .join("\n"),
+                cited_note_ids: Vec::new(),
+                cited_user_record_ids: Vec::new(),
+                cited_constitution_item_ids: Vec::new(),
+                cited_action_gap_ids: Vec::new(),
+                evidence_packet: None,
+            })
+            .expect("reflection card should persist");
+
+        assert_eq!(card.decision_episode_id, "decision-1");
+        assert!(card.scores.unsupported_claim_count > 0);
+        assert!(card.scores.overall_score <= 1.0);
+        assert_eq!(card.evidence_packet.selected_sources.len(), 0);
+        assert_eq!(
+            card.evidence_packet
+                .config_snapshot
+                .as_ref()
+                .expect("config snapshot should persist")
+                .preset,
+            DecisionMirrorPreset::Balanced
+        );
+        store
+            .append_trace_event(
+                &episode.session_id,
+                TraceEventType::FeedbackRecorded,
+                json!({
+                    "feedback_type": "reject",
+                    "response": {
+                        "tile_id": episode.tile_id.clone(),
+                        "model_id": "openai/gpt-4",
+                    },
+                    "rationale": "Decision Mirror reflection marked Not Me",
+                }),
+            )
+            .expect("feedback event should persist");
+
+        let decision_rows = store
+            .list_decision_episodes_with_reflections()
+            .expect("decision rows should list with traces");
+        assert_eq!(decision_rows[0].reflection_cards.len(), 1);
+        assert_eq!(decision_rows[0].feedback_events.len(), 1);
+        assert_eq!(
+            decision_rows[0].feedback_events[0]
+                .payload
+                .get("feedback_type")
+                .and_then(|value| value.as_str()),
+            Some("reject")
+        );
+        let episodes = store
+            .list_decision_episodes()
+            .expect("episodes should list");
+        assert_eq!(episodes.len(), 1);
+
+        let legacy_card: ReflectionCard = serde_json::from_str(
+            r#"{
+                "id": "legacy-card",
+                "decision_episode_id": "decision-1",
+                "session_id": "session-1",
+                "tile_id": "tile-1",
+                "model_id": "openai/gpt-4",
+                "content": "legacy reflection",
+                "scores": { "overall_score": 0.5 },
+                "created_at": "2026-05-08T00:00:00Z"
+            }"#,
+        )
+        .expect("legacy reflection cards should deserialize");
+        assert!(legacy_card.evidence_packet.config_snapshot.is_none());
+    }
+
+    #[test]
+    fn memory_digest_caps_review_items_and_updates_record_state() {
+        let temp_dir = tempdir().expect("temp dir should be created");
+        let mut store = TwinStore::new(temp_dir.path().to_path_buf());
+
+        let mut record_ids = Vec::new();
+        for index in 0..6 {
+            let record = store
+                .create_user_record(UserRecordCreate {
+                    kind: UserRecordKind::ReasoningPattern,
+                    content: format!("Pattern {} benefits from evidence gates.", index),
+                    origin: RecordOrigin::Inferred,
+                    evidence_refs: vec![
+                        EvidenceRef {
+                            trace_id: "session-1".to_string(),
+                            event_id: format!("event-{}-1", index),
+                            session_id: "session-1".to_string(),
+                            tile_id: Some(format!("tile-{}", index)),
+                            model_id: None,
+                            note: None,
+                        },
+                        EvidenceRef {
+                            trace_id: "session-1".to_string(),
+                            event_id: format!("event-{}-2", index),
+                            session_id: "session-1".to_string(),
+                            tile_id: Some(format!("tile-{}", index)),
+                            model_id: None,
+                            note: None,
+                        },
+                        EvidenceRef {
+                            trace_id: "session-1".to_string(),
+                            event_id: format!("event-{}-3", index),
+                            session_id: "session-1".to_string(),
+                            tile_id: Some(format!("tile-{}", index)),
+                            model_id: None,
+                            note: None,
+                        },
+                    ],
+                    confidence: 0.82,
+                    promotion_state: Some(PromotionState::Candidate),
+                    valid_from: None,
+                    valid_until: None,
+                    links: Vec::new(),
+                    metadata: HashMap::from([(
+                        "signal_family".to_string(),
+                        serde_json::json!(format!("evidence_gate_family_{}", index)),
+                    )]),
+                })
+                .expect("record should be created");
+            record_ids.push(record.id);
+        }
+
+        let digest = store.list_memory_digest().expect("digest should list");
+        assert_eq!(digest.len(), 5);
+        assert!(digest.iter().all(|item| item.evidence_count == 3));
+
+        let reviewed = store
+            .review_memory_digest_item(
+                &digest[0].id,
+                MemoryDigestReviewRequest {
+                    action: MemoryDigestAction::NoTrain,
+                    rationale: Some("Do not use this in twin context".to_string()),
+                },
+            )
+            .expect("digest item should update");
+        assert_eq!(reviewed.state, MemoryDigestState::NoTrain);
+
+        let linked_record = store
+            .get_user_record(&reviewed.record_ids[0])
+            .expect("linked record should still exist");
+        assert_eq!(linked_record.promotion_state, PromotionState::NoTrain);
+
+        let (approved, candidates) = store
+            .select_context_records("evidence gates")
+            .expect("context records should select");
+        assert!(!approved
+            .iter()
+            .any(|record| record.id == reviewed.record_ids[0]));
+        assert!(!candidates
+            .iter()
+            .any(|record| record.id == reviewed.record_ids[0]));
+        assert_eq!(record_ids.len(), 6);
+    }
+
+    #[test]
+    fn memory_digest_clusters_related_records() {
+        let temp_dir = tempdir().expect("temp dir should be created");
+        let mut store = TwinStore::new(temp_dir.path().to_path_buf());
+
+        for index in 0..3 {
+            store
+                .create_user_record(UserRecordCreate {
+                    kind: UserRecordKind::ReasoningPattern,
+                    content: format!(
+                        "Pattern {} says the user benefits from hard evidence gates before scaling.",
+                        index
+                    ),
+                    origin: RecordOrigin::Inferred,
+                    evidence_refs: vec![
+                        EvidenceRef {
+                            trace_id: "session-1".to_string(),
+                            event_id: format!("cluster-event-{}-1", index),
+                            session_id: "session-1".to_string(),
+                            tile_id: Some(format!("cluster-tile-{}", index)),
+                            model_id: None,
+                            note: None,
+                        },
+                        EvidenceRef {
+                            trace_id: "session-1".to_string(),
+                            event_id: format!("cluster-event-{}-2", index),
+                            session_id: "session-1".to_string(),
+                            tile_id: Some(format!("cluster-tile-{}", index)),
+                            model_id: None,
+                            note: None,
+                        },
+                        EvidenceRef {
+                            trace_id: "session-1".to_string(),
+                            event_id: format!("cluster-event-{}-3", index),
+                            session_id: "session-1".to_string(),
+                            tile_id: Some(format!("cluster-tile-{}", index)),
+                            model_id: None,
+                            note: None,
+                        },
+                    ],
+                    confidence: 0.84,
+                    promotion_state: Some(PromotionState::Candidate),
+                    valid_from: None,
+                    valid_until: None,
+                    links: Vec::new(),
+                    metadata: HashMap::from([(
+                        "signal_family".to_string(),
+                        serde_json::json!("evidence_gates"),
+                    )]),
+                })
+                .expect("record should be created");
+        }
+
+        let digest = store.list_memory_digest().expect("digest should list");
+        assert_eq!(digest.len(), 1);
+        assert_eq!(digest[0].record_ids.len(), 3);
+        assert_eq!(digest[0].evidence_count, 9);
+        assert!(digest[0].trigger_reason.contains("clustered"));
+    }
+
+    #[test]
+    fn decision_mirror_config_presets_persist() {
+        let temp_dir = tempdir().expect("temp dir should be created");
+        let store = TwinStore::new(temp_dir.path().to_path_buf());
+
+        let default_config = store
+            .get_decision_mirror_config()
+            .expect("default config should load");
+        assert_eq!(default_config.preset, DecisionMirrorPreset::Balanced);
+
+        let updated = store
+            .update_decision_mirror_config(DecisionMirrorConfigUpdate {
+                preset: Some(DecisionMirrorPreset::EvidenceStrict),
+                weights: None,
+                advanced_enabled: Some(true),
+            })
+            .expect("config should update");
+        assert_eq!(updated.preset, DecisionMirrorPreset::EvidenceStrict);
+        assert!(
+            updated.weights.evidence_grounding_weight
+                > default_config.weights.evidence_grounding_weight
+        );
+
+        let persisted = store
+            .get_decision_mirror_config()
+            .expect("persisted config should load");
+        assert_eq!(persisted.preset, DecisionMirrorPreset::EvidenceStrict);
+
+        let reset = store
+            .reset_decision_mirror_config()
+            .expect("config should reset");
+        assert_eq!(reset.preset, DecisionMirrorPreset::Balanced);
     }
 
     #[test]

@@ -33,16 +33,81 @@
       </div>
 
       <div class="dialog-body">
+        <div class="form-group prompt-type-group">
+          <label>Type</label>
+          <div class="segmented-control">
+            <button
+              type="button"
+              :class="{ active: promptType === 'standard' }"
+              @click="setPromptType('standard')"
+            >
+              Prompt
+            </button>
+            <button
+              type="button"
+              :class="{ active: promptType === 'decision' }"
+              @click="setPromptType('decision')"
+            >
+              Decision
+            </button>
+          </div>
+        </div>
+
         <div class="form-group">
-          <label for="prompt">Prompt</label>
+          <label for="prompt">{{ promptLabel }}</label>
           <textarea
             id="prompt"
             v-model="prompt"
-            placeholder="Enter your prompt..."
+            :placeholder="promptPlaceholder"
             rows="4"
             class="prompt-input"
             @keydown.ctrl.enter="handleSubmit"
           />
+        </div>
+
+        <div
+          v-if="promptType === 'decision'"
+          class="decision-fields"
+        >
+          <div class="form-group">
+            <label for="decisionOptions">Options</label>
+            <textarea
+              id="decisionOptions"
+              v-model="decisionOptionsText"
+              placeholder="One option per line"
+              rows="3"
+              class="system-input"
+            />
+          </div>
+          <div class="form-group">
+            <label for="decisionStakes">Stakes</label>
+            <input
+              id="decisionStakes"
+              v-model="decisionStakes"
+              type="text"
+              class="text-input"
+              placeholder="What changes if this goes right or wrong?"
+            >
+          </div>
+          <div class="form-group">
+            <label for="decisionLeaning">Initial Leaning</label>
+            <input
+              id="decisionLeaning"
+              v-model="decisionInitialLeaning"
+              type="text"
+              class="text-input"
+              placeholder="Optional current leaning"
+            >
+          </div>
+          <div class="form-group">
+            <label for="decisionReviewDate">Follow-up</label>
+            <input
+              id="decisionReviewDate"
+              v-model="decisionReviewDate"
+              type="date"
+              class="text-input"
+            >
+          </div>
         </div>
 
         <div class="form-group checkbox-group">
@@ -204,7 +269,7 @@
           :disabled="!canSubmit"
           @click="handleSubmit"
         >
-          Send to {{ selectedModels.length }} Model{{ selectedModels.length !== 1 ? 's' : '' }}
+          {{ submitLabel }}
         </button>
       </div>
     </div>
@@ -212,7 +277,7 @@
 </template>
 
 <script setup>
-import { ref, computed } from 'vue'
+import { ref, computed, watch } from 'vue'
 import ModelSelector from './ModelSelector.vue'
 import ContextBudgetDisplay from './ContextBudgetDisplay.vue'
 import GIcon from '@/components/ui/GIcon.vue'
@@ -252,6 +317,11 @@ const temperature = ref(0.7)
 const showAdvanced = ref(false)
 const contextMode = ref('knowledge_search')  // Default to knowledge search for note lookup
 const twinAnswerMode = ref('advisor')
+const promptType = ref('standard')
+const decisionOptionsText = ref('')
+const decisionStakes = ref('')
+const decisionInitialLeaning = ref('')
+const decisionReviewDate = ref('')
 
 const searchDetection = computed(() => detectWebSearch(prompt.value))
 const resolvedWebSearch = computed(() => (
@@ -298,6 +368,34 @@ const canSubmit = computed(() => {
   return prompt.value.trim().length > 0 && selectedModels.value.length > 0
 })
 
+const promptLabel = computed(() => promptType.value === 'decision' ? 'Decision' : 'Prompt')
+
+const promptPlaceholder = computed(() => promptType.value === 'decision'
+  ? 'What decision are you making?'
+  : 'Enter your prompt...')
+
+const decisionOptions = computed(() => decisionOptionsText.value
+  .split('\n')
+  .map(option => option.trim())
+  .filter(Boolean))
+
+const decisionMetadata = computed(() => {
+  if (promptType.value !== 'decision') return null
+
+  return {
+    decision: prompt.value.trim(),
+    options: decisionOptions.value,
+    stakes: decisionStakes.value.trim() || null,
+    initial_leaning: decisionInitialLeaning.value.trim() || null,
+    review_date: decisionReviewDate.value || null
+  }
+})
+
+const submitLabel = computed(() => {
+  const subject = promptType.value === 'decision' ? 'Create Reflection Card' : 'Send'
+  return `${subject} (${selectedModels.value.length} model${selectedModels.value.length !== 1 ? 's' : ''})`
+})
+
 // Token counting for context budget
 const estimatedTokens = computed(() => {
   // Estimate tokens: ~4 characters per token for English text
@@ -337,11 +435,25 @@ const maxContextTokens = computed(() => {
 const currentTokens = computed(() => estimatedTokens.value)
 
 // Methods
+function setPromptType(type) {
+  promptType.value = type
+}
+
+watch(promptType, (type) => {
+  if (type === 'decision') {
+    contextMode.value = 'twin'
+    twinAnswerMode.value = 'advisor'
+    temperature.value = Math.min(temperature.value, 0.5)
+  }
+})
+
 function handleSubmit() {
   if (!canSubmit.value) return
 
   emit('submit', {
     prompt: prompt.value.trim(),
+    promptType: promptType.value,
+    decisionMetadata: decisionMetadata.value,
     models: selectedModels.value,
     systemPrompt: showSystemPrompt.value ? systemPrompt.value.trim() : null,
     temperature: temperature.value,
@@ -472,7 +584,8 @@ function handleSubmit() {
 }
 
 .prompt-input,
-.system-input {
+.system-input,
+.text-input {
   width: 100%;
   padding: var(--spacing-sm);
   background: var(--bg-tertiary);
@@ -481,11 +594,16 @@ function handleSubmit() {
   color: var(--text-primary);
   font-size: 0.875rem;
   font-family: inherit;
+}
+
+.prompt-input,
+.system-input {
   resize: vertical;
 }
 
 .prompt-input:focus,
-.system-input:focus {
+.system-input:focus,
+.text-input:focus {
   border-color: var(--accent-primary);
   outline: none;
   box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent-primary) 30%, transparent);
@@ -493,6 +611,20 @@ function handleSubmit() {
 
 .prompt-input {
   min-height: 100px;
+}
+
+.decision-fields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--spacing-md);
+  padding: var(--spacing-md);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--bg-tertiary) 70%, transparent);
+}
+
+.decision-fields .form-group:first-child {
+  grid-column: 1 / -1;
 }
 
 .advanced-toggle {

@@ -1,9 +1,12 @@
 use crate::models::canvas::{CanvasSession, ModelResponse, PromptTile};
 use crate::models::twin::{
-    CanvasFeedbackRequest, CanvasFeedbackResult, CanvasFeedbackType, CanvasResponseRef,
-    EvidenceRef, PromotionState, RecordOrigin, ResolvedEvidenceRef, SessionTrace, TraceEvent,
-    TraceEventType, TwinExportRequest, TwinInferenceRunSummary, TwinReviewRecord, UserRecord,
-    UserRecordCreate, UserRecordKind, UserRecordUpdate,
+    ActionGap, CanvasFeedbackRequest, CanvasFeedbackResult, CanvasFeedbackType, CanvasResponseRef,
+    ConstitutionInferenceSummary, ConstitutionItem, ConstitutionItemCreate, ConstitutionItemUpdate,
+    ConstitutionReviewRequest, ConstitutionSetup, DecisionEpisode, DecisionEpisodeWithReflections,
+    DecisionMirrorConfig, DecisionMirrorConfigUpdate, DecisionOutcomeUpdate, EvidenceRef,
+    MemoryDigestItem, MemoryDigestReviewRequest, PromotionState, RecordOrigin, ResolvedEvidenceRef,
+    SessionTrace, TraceEvent, TraceEventType, TwinExportRequest, TwinInferenceRunSummary,
+    TwinReviewRecord, UserRecord, UserRecordCreate, UserRecordKind, UserRecordUpdate,
 };
 use crate::AppState;
 use serde_json::json;
@@ -105,6 +108,175 @@ pub async fn export_twin_data(
     let mut store = state.twin_store.write().await;
     store
         .export_bundle(request)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn list_decision_episodes(
+    state: State<'_, AppState>,
+) -> Result<Vec<DecisionEpisodeWithReflections>, String> {
+    let store = state.twin_store.read().await;
+    store
+        .list_decision_episodes_with_reflections()
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn update_decision_outcome(
+    id: String,
+    update: DecisionOutcomeUpdate,
+    state: State<'_, AppState>,
+) -> Result<DecisionEpisode, String> {
+    let mut store = state.twin_store.write().await;
+    store
+        .update_decision_outcome(&id, update)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn get_decision_mirror_config(
+    state: State<'_, AppState>,
+) -> Result<DecisionMirrorConfig, String> {
+    let store = state.twin_store.read().await;
+    store
+        .get_decision_mirror_config()
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn update_decision_mirror_config(
+    update: DecisionMirrorConfigUpdate,
+    state: State<'_, AppState>,
+) -> Result<DecisionMirrorConfig, String> {
+    let store = state.twin_store.read().await;
+    store
+        .update_decision_mirror_config(update)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn reset_decision_mirror_config(
+    state: State<'_, AppState>,
+) -> Result<DecisionMirrorConfig, String> {
+    let store = state.twin_store.read().await;
+    store
+        .reset_decision_mirror_config()
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn list_memory_digest(
+    state: State<'_, AppState>,
+) -> Result<Vec<MemoryDigestItem>, String> {
+    let mut store = state.twin_store.write().await;
+    store
+        .list_memory_digest()
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn review_memory_digest_item(
+    id: String,
+    request: MemoryDigestReviewRequest,
+    state: State<'_, AppState>,
+) -> Result<MemoryDigestItem, String> {
+    let mut store = state.twin_store.write().await;
+    store
+        .review_memory_digest_item(&id, request)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn list_constitution_items(
+    state: State<'_, AppState>,
+) -> Result<Vec<ConstitutionItem>, String> {
+    let store = state.twin_store.read().await;
+    store
+        .list_constitution_items()
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn create_constitution_item(
+    item: ConstitutionItemCreate,
+    state: State<'_, AppState>,
+) -> Result<ConstitutionItem, String> {
+    let store = state.twin_store.read().await;
+    store
+        .create_constitution_item(item)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn update_constitution_item(
+    id: String,
+    update: ConstitutionItemUpdate,
+    state: State<'_, AppState>,
+) -> Result<ConstitutionItem, String> {
+    let store = state.twin_store.read().await;
+    store
+        .update_constitution_item(&id, update)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn review_constitution_item(
+    id: String,
+    request: ConstitutionReviewRequest,
+    state: State<'_, AppState>,
+) -> Result<ConstitutionItem, String> {
+    let mut store = state.twin_store.write().await;
+    store
+        .review_constitution_item(&id, request)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn list_action_gaps(state: State<'_, AppState>) -> Result<Vec<ActionGap>, String> {
+    let store = state.twin_store.read().await;
+    store.list_action_gaps().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn review_action_gap(
+    id: String,
+    request: ConstitutionReviewRequest,
+    state: State<'_, AppState>,
+) -> Result<ActionGap, String> {
+    let mut store = state.twin_store.write().await;
+    store
+        .review_action_gap(&id, request)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn get_constitution_setup(
+    state: State<'_, AppState>,
+) -> Result<ConstitutionSetup, String> {
+    let store = state.twin_store.read().await;
+    store
+        .get_constitution_setup()
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn save_constitution_setup(
+    setup: ConstitutionSetup,
+    state: State<'_, AppState>,
+) -> Result<ConstitutionSetup, String> {
+    let mut store = state.twin_store.write().await;
+    store
+        .save_constitution_setup(setup)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn run_constitution_inference(
+    state: State<'_, AppState>,
+) -> Result<ConstitutionInferenceSummary, String> {
+    let mut store = state.twin_store.write().await;
+    store
+        .run_constitution_inference()
         .map_err(|error| error.to_string())
 }
 

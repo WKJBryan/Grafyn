@@ -155,6 +155,94 @@ describe('Canvas Store', () => {
     }))
   })
 
+  it('sendPrompt includes Decision Mirror type and metadata', async () => {
+    let streamHandler
+    listenMock.mockImplementation(async (_eventName, handler) => {
+      streamHandler = handler
+      return unlistenMock
+    })
+
+    const sendPromptSpy = vi.spyOn(apiClient.canvas, 'sendPrompt').mockImplementation(async () => {
+      streamHandler({
+        payload: {
+          session_id: 'session-1',
+          type: 'complete',
+          tile_id: 'tile-1',
+          model_id: 'openai/gpt-4'
+        }
+      })
+      return 'tile-1'
+    })
+
+    const store = useCanvasStore()
+    store.currentSession = {
+      id: 'session-1',
+      prompt_tiles: [],
+      debates: []
+    }
+
+    const decisionMetadata = {
+      decision: 'Should we build Decision Mirror?',
+      options: ['Decision Mirror', 'Topology'],
+      stakes: 'Product direction'
+    }
+
+    await store.sendPrompt(
+      'Should we build Decision Mirror?',
+      ['openai/gpt-4'],
+      null,
+      0.4,
+      null,
+      null,
+      null,
+      'twin',
+      'advisor',
+      false,
+      5,
+      'decision',
+      decisionMetadata
+    )
+
+    expect(sendPromptSpy).toHaveBeenCalledWith('session-1', expect.objectContaining({
+      prompt_type: 'decision',
+      decision_metadata: decisionMetadata,
+      context_mode: 'twin',
+      twin_answer_mode: 'advisor'
+    }))
+  })
+
+  it('wraps Decision Mirror digest and outcome twin APIs', async () => {
+    vi.spyOn(apiClient.twin, 'listMemoryDigest').mockResolvedValue([{ id: 'digest-1' }])
+    vi.spyOn(apiClient.twin, 'reviewMemoryDigestItem').mockResolvedValue({ id: 'digest-1', state: 'kept' })
+    vi.spyOn(apiClient.twin, 'listDecisionEpisodes').mockResolvedValue([{ id: 'decision-1' }])
+    vi.spyOn(apiClient.twin, 'updateDecisionOutcome').mockResolvedValue({ id: 'decision-1', outcome: 'shipped' })
+    vi.spyOn(apiClient.twin, 'getDecisionMirrorConfig').mockResolvedValue({ preset: 'balanced' })
+    vi.spyOn(apiClient.twin, 'updateDecisionMirrorConfig').mockResolvedValue({ preset: 'evidence_strict' })
+    vi.spyOn(apiClient.twin, 'resetDecisionMirrorConfig').mockResolvedValue({ preset: 'balanced' })
+
+    const store = useCanvasStore()
+
+    await expect(store.listMemoryDigest()).resolves.toEqual([{ id: 'digest-1' }])
+    await store.reviewMemoryDigestItem('digest-1', 'keep')
+    expect(apiClient.twin.reviewMemoryDigestItem).toHaveBeenCalledWith('digest-1', {
+      action: 'keep',
+      rationale: null
+    })
+
+    await expect(store.listDecisionEpisodes()).resolves.toEqual([{ id: 'decision-1' }])
+    await store.updateDecisionOutcome('decision-1', { outcome: 'shipped' })
+    expect(apiClient.twin.updateDecisionOutcome).toHaveBeenCalledWith('decision-1', {
+      outcome: 'shipped'
+    })
+
+    await expect(store.getDecisionMirrorConfig()).resolves.toEqual({ preset: 'balanced' })
+    await store.updateDecisionMirrorConfig({ preset: 'evidence_strict' })
+    expect(apiClient.twin.updateDecisionMirrorConfig).toHaveBeenCalledWith({
+      preset: 'evidence_strict'
+    })
+    await expect(store.resetDecisionMirrorConfig()).resolves.toEqual({ preset: 'balanced' })
+  })
+
   it('regenerateResponse stores the backend error text on response.error_message', async () => {
     let streamHandler
     listenMock.mockImplementation(async (_eventName, handler) => {
