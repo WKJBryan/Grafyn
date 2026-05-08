@@ -403,7 +403,6 @@ jobs:
           tagName: ${{ needs.prepare-release.outputs.tag_name || '' }}
           releaseDraft: true
           releaseBody: ${{ needs.prepare-release.outputs.release_notes || '' }}
-          uploadUpdaterJson: false
           updaterJsonPreferNsis: true
 
       - name: Collect release artifacts

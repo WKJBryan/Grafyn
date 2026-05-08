@@ -125,4 +125,3 @@ jobs:
           projectPath: frontend
           tauriScript: npx tauri
           args: ${{ steps.tauri_args.outputs.args }}
-          uploadUpdaterJson: false
