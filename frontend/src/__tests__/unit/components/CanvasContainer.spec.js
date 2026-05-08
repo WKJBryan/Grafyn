@@ -42,6 +42,10 @@ const { store, getOpenRouterStatus, getStatus, getSettings, updateSettings, toas
     recordCorrectionFeedback: vi.fn().mockResolvedValue(),
     recordSelectionRanking: vi.fn().mockResolvedValue(),
     captureInsight: vi.fn().mockResolvedValue(),
+    listMemoryDigest: vi.fn().mockResolvedValue([]),
+    reviewMemoryDigestItem: vi.fn().mockResolvedValue(),
+    listDecisionEpisodes: vi.fn().mockResolvedValue([]),
+    updateDecisionOutcome: vi.fn().mockResolvedValue(),
     exportTwinData: vi.fn().mockResolvedValue({
       approved_user_records: { count: 1 },
       candidate_user_records: { count: 0 },
@@ -153,6 +157,23 @@ function mountContainer() {
                 contextMode: 'knowledge_search',
                 webSearch: false
               })" />
+              <button class="decision-submit-stub" @click="$emit('submit', {
+                prompt: 'Should we build Decision Mirror?',
+                promptType: 'decision',
+                decisionMetadata: {
+                  decision: 'Should we build Decision Mirror?',
+                  options: ['Decision Mirror', 'Topology'],
+                  stakes: 'Product direction',
+                  initial_leaning: 'Decision Mirror',
+                  review_date: '2026-05-15'
+                },
+                models: ['openai/gpt-4o'],
+                systemPrompt: null,
+                temperature: 0.4,
+                contextMode: 'twin',
+                twinAnswerMode: 'advisor',
+                webSearch: false
+              })" />
             </div>
           `
         }
@@ -229,6 +250,7 @@ describe('CanvasContainer', () => {
     store.promptTiles = []
     store.debates = []
     store.availableModels = [{ id: 'openai/gpt-4o', name: 'GPT-4o', context_length: 128000 }]
+    store.listMemoryDigest.mockResolvedValue([])
     getSettings.mockResolvedValue({ smart_web_search: true, canvas_model_presets: [] })
     getStatus.mockResolvedValue({ smart_web_search: true })
     updateSettings.mockResolvedValue({})
@@ -268,6 +290,58 @@ describe('CanvasContainer', () => {
     expect(store.sendPrompt).not.toHaveBeenCalled()
     expect(store.branchFromResponse).not.toHaveBeenCalled()
     expect(wrapper.text()).toContain('OpenRouter API Key Required')
+  })
+
+  it('passes Decision Mirror metadata through the Canvas submit path', async () => {
+    getOpenRouterStatus.mockResolvedValue({ has_key: true, is_configured: true })
+
+    const wrapper = mountContainer()
+    await flushPromises()
+    await wrapper.find('[data-guide="canvas-prompt-btn"]').trigger('click')
+    await flushPromises()
+    await wrapper.find('.decision-submit-stub').trigger('click')
+    await flushPromises()
+
+    expect(store.sendPrompt).toHaveBeenCalledWith(
+      'Should we build Decision Mirror?',
+      ['openai/gpt-4o'],
+      null,
+      0.4,
+      null,
+      null,
+      null,
+      'twin',
+      'advisor',
+      false,
+      undefined,
+      'decision',
+      {
+        decision: 'Should we build Decision Mirror?',
+        options: ['Decision Mirror', 'Topology'],
+        stakes: 'Product direction',
+        initial_leaning: 'Decision Mirror',
+        review_date: '2026-05-15'
+      }
+    )
+  })
+
+  it('does not surface memory digest review inside Canvas', async () => {
+    getOpenRouterStatus.mockResolvedValue({ has_key: true, is_configured: true })
+    store.listMemoryDigest.mockResolvedValue([
+      {
+        id: 'digest-record-1',
+        pattern: 'User benefits from hard go/no-go gates before scaling.',
+        evidence_count: 3,
+        confidence: 0.82,
+        trigger_reason: '3+ evidence points support this durable pattern'
+      }
+    ])
+
+    const wrapper = mountContainer()
+    await flushPromises()
+
+    expect(wrapper.text()).not.toContain('Review 1')
+    expect(wrapper.text()).not.toContain('User benefits from hard go/no-go gates before scaling.')
   })
 
   it('passes prompt tile web-search state through to response nodes', async () => {

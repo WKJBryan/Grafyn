@@ -79,10 +79,33 @@ pub struct TileContextNote {
     pub pinned: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptType {
+    #[default]
+    Standard,
+    Decision,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct DecisionPromptMetadata {
+    pub decision: String,
+    #[serde(default)]
+    pub options: Vec<String>,
+    #[serde(default)]
+    pub stakes: Option<String>,
+    #[serde(default)]
+    pub initial_leaning: Option<String>,
+    #[serde(default)]
+    pub review_date: Option<String>,
+}
+
 /// A tile on the canvas containing a prompt and model responses
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PromptTile {
     pub id: String,
+    #[serde(default)]
+    pub prompt_type: PromptType,
     pub prompt: String,
     #[serde(default)]
     pub system_prompt: Option<String>,
@@ -108,6 +131,10 @@ pub struct PromptTile {
     #[serde(default)]
     pub twin_context_policy: Option<String>,
     #[serde(default)]
+    pub decision_metadata: Option<DecisionPromptMetadata>,
+    #[serde(default)]
+    pub decision_episode_id: Option<String>,
+    #[serde(default)]
     pub web_search: bool,
     #[serde(default = "default_web_search_max_results")]
     pub web_search_max_results: u32,
@@ -117,6 +144,7 @@ impl Default for PromptTile {
     fn default() -> Self {
         Self {
             id: uuid::Uuid::new_v4().to_string(),
+            prompt_type: PromptType::default(),
             prompt: String::new(),
             system_prompt: None,
             models: Vec::new(),
@@ -131,6 +159,8 @@ impl Default for PromptTile {
             candidate_twin_records: Vec::new(),
             twin_answer_mode: TwinAnswerMode::default(),
             twin_context_policy: None,
+            decision_metadata: None,
+            decision_episode_id: None,
             web_search: false,
             web_search_max_results: default_web_search_max_results(),
         }
@@ -340,6 +370,8 @@ impl From<&CanvasSession> for SessionMeta {
 pub struct PromptRequest {
     pub prompt: String,
     #[serde(default)]
+    pub prompt_type: PromptType,
+    #[serde(default)]
     pub system_prompt: Option<String>,
     pub models: Vec<String>,
     #[serde(default)]
@@ -350,6 +382,8 @@ pub struct PromptRequest {
     pub twin_answer_mode: TwinAnswerMode,
     #[serde(default)]
     pub twin_context_policy: Option<String>,
+    #[serde(default)]
+    pub decision_metadata: Option<DecisionPromptMetadata>,
     #[serde(default)]
     pub parent_tile_id: Option<String>,
     #[serde(default)]
@@ -401,6 +435,7 @@ mod tests {
 
         assert_eq!(request.web_search_max_results, 5);
         assert_eq!(request.max_tokens, None);
+        assert_eq!(request.prompt_type, PromptType::Standard);
     }
 
     #[test]
@@ -422,7 +457,32 @@ mod tests {
 
         assert_eq!(tile.web_search_max_results, 5);
         assert_eq!(tile.twin_answer_mode, TwinAnswerMode::Advisor);
+        assert_eq!(tile.prompt_type, PromptType::Standard);
         assert!(tile.approved_twin_records.is_empty());
+    }
+
+    #[test]
+    fn decision_prompt_request_deserializes_metadata() {
+        let request: PromptRequest = serde_json::from_value(json!({
+            "prompt": "Should I build Decision Mirror first?",
+            "prompt_type": "decision",
+            "models": ["openai/gpt-4"],
+            "decision_metadata": {
+                "decision": "Should I build Decision Mirror first?",
+                "options": ["Decision Mirror", "Topology"],
+                "stakes": "Product direction",
+                "initial_leaning": "Decision Mirror",
+                "review_date": "2026-05-15"
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(request.prompt_type, PromptType::Decision);
+        let metadata = request
+            .decision_metadata
+            .expect("decision metadata should deserialize");
+        assert_eq!(metadata.options.len(), 2);
+        assert_eq!(metadata.review_date.as_deref(), Some("2026-05-15"));
     }
 
     #[test]

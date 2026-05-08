@@ -60,12 +60,38 @@ describe('PromptDialog', () => {
     await wrapper.find('.model-selector-stub').trigger('click')
     await wrapper.find('#prompt').setValue('Simulate my likely response')
     await wrapper.find('#contextMode').setValue('twin')
-    await wrapper.findAll('.segmented-control button')[1].trigger('click')
+    await wrapper.findAll('.segmented-control button').find(button => button.text() === 'Simulation').trigger('click')
     await wrapper.find('.btn-primary').trigger('click')
 
     expect(wrapper.emitted('submit')[0][0]).toMatchObject({
       contextMode: 'twin',
       twinAnswerMode: 'simulation'
+    })
+  })
+
+  it('sets Decision mode to Twin Advisor and emits decision metadata', async () => {
+    const wrapper = mountDialog()
+
+    await wrapper.find('.model-selector-stub').trigger('click')
+    await wrapper.findAll('.segmented-control button').find(button => button.text() === 'Decision').trigger('click')
+    await wrapper.find('#prompt').setValue('Should Grafyn build Decision Mirror first?')
+    await wrapper.find('#decisionOptions').setValue('Decision Mirror\nTopology')
+    await wrapper.find('#decisionStakes').setValue('Product direction')
+    await wrapper.find('#decisionLeaning').setValue('Decision Mirror')
+    await wrapper.find('#decisionReviewDate').setValue('2026-05-15')
+    await wrapper.find('.btn-primary').trigger('click')
+
+    expect(wrapper.emitted('submit')[0][0]).toMatchObject({
+      promptType: 'decision',
+      contextMode: 'twin',
+      twinAnswerMode: 'advisor',
+      decisionMetadata: {
+        decision: 'Should Grafyn build Decision Mirror first?',
+        options: ['Decision Mirror', 'Topology'],
+        stakes: 'Product direction',
+        initial_leaning: 'Decision Mirror',
+        review_date: '2026-05-15'
+      }
     })
   })
 

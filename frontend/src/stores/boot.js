@@ -1,6 +1,6 @@
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
-import { boot as bootApi, isDesktopApp } from '@/api/client'
+import { boot as bootApi } from '@/api/client'
 
 const BOOT_POLL_INTERVAL_MS = 2000
 const BOOT_WATCHDOG_INTERVAL_MS = 1000
@@ -196,7 +196,7 @@ export const useBootStore = defineStore('boot', () => {
     initialized.value = true
 
     try {
-      if (isDesktopApp() && !listening.value) {
+      if (!listening.value) {
         const { listen } = await import('@tauri-apps/api/event')
         unlisten = await listen('boot-status', (event) => {
           setStatus(event.payload)

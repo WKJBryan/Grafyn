@@ -141,6 +141,25 @@ describe('Canvas Nodes', () => {
     expect(wrapper.emitted('show-add-model-dialog')).toEqual([[{ tileId: 'prompt-1' }]])
   })
 
+  it('labels decision prompt tiles', () => {
+    const wrapper = mountAttached(PromptNode, {
+      props: {
+        tile: {
+          id: 'decision-1',
+          prompt_type: 'decision',
+          prompt: 'Should we build Decision Mirror?',
+          decision_metadata: { review_date: '2026-05-15' },
+          responses: { 'openai/gpt-4': { status: 'completed' } },
+          created_at: new Date().toISOString(),
+          position: { x: 15, y: 25, width: 200, height: 120 }
+        }
+      }
+    })
+
+    expect(wrapper.find('.decision-badge').text()).toBe('Decision')
+    expect(wrapper.text()).toContain('2026-05-15')
+  })
+
   it('enforces minimum size when resizing prompt nodes', () => {
     const wrapper = mountAttached(PromptNode, {
       props: {
@@ -352,6 +371,38 @@ describe('Canvas Nodes', () => {
     expect(badge.text()).toContain('Web')
     expect(badge.attributes('title')).toBe('Live web search used for this prompt')
     expect(wrapper.find('.complete-indicator').exists()).toBe(true)
+  })
+
+  it('renders decision reflection feedback buttons and emits one-click feedback', async () => {
+    const wrapper = mountAttached(LLMNode, {
+      props: {
+        tileId: 'tile-1',
+        modelId: 'openai/gpt-4',
+        promptType: 'decision',
+        decisionEpisodeId: 'decision-1',
+        response: {
+          status: 'completed',
+          content: '## Decision Frame\nBuild Decision Mirror first.',
+          model_name: 'GPT-4',
+          color: '#7c5cff',
+          position: { x: 0, y: 0, width: 280, height: 200 }
+        },
+        isStreaming: false,
+        availableModels: []
+      }
+    })
+
+    expect(wrapper.find('.reflection-badge').text()).toBe('Reflection')
+    expect(wrapper.find('.decision-feedback-bar').exists()).toBe(true)
+    expect(wrapper.find('.open-twin-link').attributes('href')).toBe('/twin?decision=decision-1&trace=1')
+
+    await wrapper.findAll('.decision-feedback-bar button').find(button => button.text() === 'Useful').trigger('click')
+
+    expect(wrapper.emitted('decision-feedback')).toEqual([[{
+      tileId: 'tile-1',
+      modelId: 'openai/gpt-4',
+      action: 'useful'
+    }]])
   })
 
   it('does not show a web-search badge for note-only response nodes', () => {

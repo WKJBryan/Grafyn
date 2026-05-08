@@ -2,20 +2,35 @@ import { describe, expect, it, beforeEach, vi } from 'vitest'
 import { mount, flushPromises } from '@vue/test-utils'
 import TwinReviewView from '@/views/TwinReviewView.vue'
 
-const { getReview, runInference, resolveEvidence, setPromotion } = vi.hoisted(() => ({
+const api = vi.hoisted(() => ({
   getReview: vi.fn(),
   runInference: vi.fn(),
   resolveEvidence: vi.fn(),
-  setPromotion: vi.fn()
+  setPromotion: vi.fn(),
+  listMemoryDigest: vi.fn(),
+  reviewMemoryDigestItem: vi.fn(),
+  listConstitutionItems: vi.fn(),
+  reviewConstitutionItem: vi.fn(),
+  listActionGaps: vi.fn(),
+  reviewActionGap: vi.fn(),
+  listDecisionEpisodes: vi.fn(),
+  updateDecisionOutcome: vi.fn(),
+  getConstitutionSetup: vi.fn(),
+  saveConstitutionSetup: vi.fn(),
+  runConstitutionInference: vi.fn(),
+  getDecisionMirrorConfig: vi.fn(),
+  updateDecisionMirrorConfig: vi.fn(),
+  resetDecisionMirrorConfig: vi.fn(),
+  exportData: vi.fn()
+}))
+const routeState = vi.hoisted(() => ({ query: {} }))
+
+vi.mock('vue-router', () => ({
+  useRoute: () => routeState
 }))
 
 vi.mock('@/api/client', () => ({
-  twin: {
-    getReview,
-    runInference,
-    resolveEvidence,
-    setPromotion
-  }
+  twin: api
 }))
 
 function mountView() {
@@ -34,7 +49,9 @@ function mountView() {
 describe('TwinReviewView', () => {
   beforeEach(() => {
     vi.clearAllMocks()
-    getReview.mockResolvedValue([
+    routeState.query = {}
+    localStorage.clear()
+    api.getReview.mockResolvedValue([
       {
         record: {
           id: 'record-1',
@@ -46,28 +63,142 @@ describe('TwinReviewView', () => {
           metadata: { signal_family: 'explicit_feedback' }
         },
         evidence_count: 2,
-        latest_evidence: {
-          summary: 'accept feedback recorded'
-        }
-      },
-      {
-        record: {
-          id: 'record-2',
-          kind: 'reasoning_pattern',
-          content: 'Compares multiple model outputs.',
-          confidence: 0.9,
-          origin: 'inferred',
-          promotion_state: 'auto_promoted',
-          metadata: { signal_family: 'model_selection' }
-        },
-        evidence_count: 3,
-        latest_evidence: {
-          summary: 'response ranking recorded'
-        }
+        latest_evidence: { summary: 'accept feedback recorded' }
       }
     ])
-    runInference.mockResolvedValue({ created_records: 1, updated_records: 1 })
-    resolveEvidence.mockResolvedValue([
+    api.listMemoryDigest.mockResolvedValue([
+      {
+        id: 'digest-1',
+        pattern: 'User benefits from hard go/no-go gates before scaling.',
+        evidence_count: 3,
+        confidence: 0.82,
+        state: 'pending',
+        trigger_reason: '3+ evidence points'
+      }
+    ])
+    api.listConstitutionItems.mockResolvedValue([
+      {
+        id: 'constitution-1',
+        claim: 'Validate single-user value before topology.',
+        dimension: 'values',
+        confidence: 0.86,
+        priority: 0.9,
+        status: 'candidate',
+        evidence_refs: [{ event_id: 'evt-1' }],
+        scope: ['research']
+      }
+    ])
+    api.listActionGaps.mockResolvedValue([
+      {
+        id: 'gap-1',
+        stated_value: 'Validate first',
+        revealed_behavior: 'Jumps to topology',
+        driver_hypothesis: 'Architecture novelty pull',
+        somatic_taste_signal: 'Excitement',
+        decision_risk: 'May overbuild before proof',
+        confidence: 0.7,
+        status: 'candidate',
+        evidence_refs: [{ event_id: 'evt-2' }]
+      }
+    ])
+    api.listDecisionEpisodes.mockResolvedValue([
+      {
+        episode: {
+          id: 'decision-1',
+          decision: 'Build the Twin Constitution?',
+          options: ['yes', 'later'],
+          review_date: '2026-05-15',
+          primitive_assessment: {
+            stakes: 'high',
+            action_gap_risk: 'medium'
+          }
+        },
+        reflection_cards: [
+          {
+            id: 'card-1',
+            content: '## Decision Frame\nBuild the workspace first.',
+            scores: {
+              breadth_score: 0.8,
+              depth_score: 0.7,
+              evidence_grounding_score: 0.9,
+              blind_spot_score: 0.75,
+              actionability_score: 0.8,
+              counterargument_score: 0.7,
+              uncertainty_score: 0.65,
+              privacy_score: 1,
+              unsupported_claim_count: 1,
+              overall_score: 0.82
+            },
+            evidence_packet: {
+              selected_sources: [
+                {
+                  source_type: 'constitution_item',
+                  id: 'constitution-1',
+                  label: 'Validate single-user value before topology.',
+                  weight: 1.35,
+                  reason: 'Selected because the decision is about product sequencing.'
+                },
+                {
+                  source_type: 'action_gap',
+                  id: 'gap-1',
+                  label: 'May overbuild before proof',
+                  weight: 1.25,
+                  reason: 'Selected as a follow-through risk.'
+                }
+              ],
+              excluded_private_count: 1,
+              excluded_rejected_count: 2,
+              excluded_no_train_count: 1,
+              config_snapshot: {
+                preset: 'evidence_strict',
+                advanced_enabled: false,
+                weights: { constitution_weight: 1.35 }
+              }
+            }
+          }
+        ],
+        feedback_events: [
+          {
+            id: 'feedback-1',
+            event_type: 'feedback_recorded',
+            created_at: '2026-05-08T00:00:00Z',
+            payload: {
+              feedback_type: 'reject',
+              rationale: 'Decision Mirror reflection marked Not Me'
+            }
+          }
+        ]
+      }
+    ])
+    api.getConstitutionSetup.mockResolvedValue({
+      values: ['evidence-backed work'],
+      tastes: ['clean UX'],
+      constraints: [],
+      somatic_cues: [],
+      action_tendencies: []
+    })
+    api.getDecisionMirrorConfig.mockResolvedValue({
+      preset: 'balanced',
+      advanced_enabled: false,
+      weights: {
+        notes_weight: 1,
+        approved_records_weight: 1,
+        candidate_records_weight: 0.6,
+        constitution_weight: 1.25,
+        action_gaps_weight: 1.2,
+        breadth_weight: 1,
+        depth_weight: 1,
+        evidence_grounding_weight: 1.25,
+        blind_spot_weight: 1,
+        actionability_weight: 1
+      }
+    })
+    api.runInference.mockResolvedValue({ created_records: 1, updated_records: 1 })
+    api.runConstitutionInference.mockResolvedValue({
+      created_constitution_items: 1,
+      created_action_gaps: 1
+    })
+    api.resolveEvidence.mockResolvedValue([
       {
         event_id: 'evt-1',
         event_type: 'feedback_recorded',
@@ -78,44 +209,130 @@ describe('TwinReviewView', () => {
         response_excerpt: 'Changed src/file.rs and ran cargo test.'
       }
     ])
-    setPromotion.mockResolvedValue({})
+    api.setPromotion.mockResolvedValue({})
+    api.reviewConstitutionItem.mockResolvedValue({})
+    api.reviewActionGap.mockResolvedValue({})
+    api.reviewMemoryDigestItem.mockResolvedValue({})
+    api.updateDecisionOutcome.mockResolvedValue({})
+    api.saveConstitutionSetup.mockResolvedValue({})
+    api.updateDecisionMirrorConfig.mockResolvedValue({
+      preset: 'evidence_strict',
+      advanced_enabled: false,
+      weights: { evidence_grounding_weight: 1.8 }
+    })
+    api.resetDecisionMirrorConfig.mockResolvedValue({
+      preset: 'balanced',
+      advanced_enabled: false,
+      weights: { evidence_grounding_weight: 1.25 }
+    })
+    api.exportData.mockResolvedValue({
+      decision_mirror_benchmark: { count: 1 }
+    })
   })
 
-  it('loads review records and filters by state', async () => {
+  it('loads the Twin Workspace overview with constitution, gaps, and decisions', async () => {
     const wrapper = mountView()
     await flushPromises()
 
-    expect(getReview).toHaveBeenCalled()
-    expect(wrapper.text()).toContain('Prefers evidence-backed implementation detail.')
-    expect(wrapper.text()).not.toContain('Compares multiple model outputs.')
-
-    await wrapper.findAll('.state-filter').find(button => button.text().includes('Auto Promoted')).trigger('click')
-    await flushPromises()
-
-    expect(wrapper.text()).toContain('Compares multiple model outputs.')
+    expect(api.listConstitutionItems).toHaveBeenCalled()
+    expect(api.listActionGaps).toHaveBeenCalled()
+    expect(api.listDecisionEpisodes).toHaveBeenCalled()
+    expect(wrapper.text()).toContain('Twin Workspace')
+    expect(wrapper.text()).toContain('Build the Twin Constitution?')
+    expect(wrapper.text()).toContain('May overbuild before proof')
   })
 
-  it('opens the evidence drawer for a record', async () => {
+  it('shows context trace details for a decision reflection card', async () => {
+    routeState.query = { decision: 'decision-1', trace: '1' }
     const wrapper = mountView()
     await flushPromises()
 
+    const trace = wrapper.find('.context-trace-details')
+    expect(trace.exists()).toBe(true)
+    expect(trace.attributes('open')).toBeDefined()
+    expect(wrapper.text()).toContain('Context Trace')
+    expect(wrapper.text()).toContain('Stricter Evidence')
+    expect(wrapper.text()).toContain('Validate single-user value before topology.')
+    expect(wrapper.text()).toContain('Excluded 4')
+    expect(wrapper.text()).toContain('Decision Mirror reflection marked Not Me')
+  })
+
+  it('reviews constitution items from the Constitution tab', async () => {
+    const wrapper = mountView()
+    await flushPromises()
+
+    await wrapper.findAll('.tab-button').find(button => button.text().includes('Constitution')).trigger('click')
+    await flushPromises()
+    await wrapper.findAll('.review-actions button').find(button => button.text() === 'Keep').trigger('click')
+    await flushPromises()
+
+    expect(api.reviewConstitutionItem).toHaveBeenCalledWith('constitution-1', { action: 'keep' })
+  })
+
+  it('opens the evidence drawer for a user record', async () => {
+    const wrapper = mountView()
+    await flushPromises()
+
+    await wrapper.findAll('.tab-button').find(button => button.text().includes('Memory Review')).trigger('click')
+    await flushPromises()
     await wrapper.findAll('button').find(button => button.text() === 'Evidence').trigger('click')
     await flushPromises()
 
-    expect(resolveEvidence).toHaveBeenCalledWith('record-1')
+    expect(api.resolveEvidence).toHaveBeenCalledWith('record-1')
     expect(wrapper.text()).toContain('Implement this with tests.')
     expect(wrapper.text()).toContain('openai/gpt-4o')
   })
 
-  it('rejects a record through setPromotion', async () => {
-    const promptSpy = vi.spyOn(globalThis, 'prompt').mockReturnValue('Not enough support')
+  it('saves setup cards as constitution seed evidence', async () => {
     const wrapper = mountView()
     await flushPromises()
 
-    await wrapper.findAll('button').find(button => button.text() === 'Reject').trigger('click')
+    await wrapper.findAll('.tab-button').find(button => button.text().includes('Setup')).trigger('click')
+    await flushPromises()
+    const textareas = wrapper.findAll('textarea')
+    await textareas[0].setValue('evidence-backed work\nfast feedback')
+    await wrapper.findAll('button').find(button => button.text() === 'Save Setup').trigger('click')
     await flushPromises()
 
-    expect(setPromotion).toHaveBeenCalledWith('record-1', 'rejected', 'Not enough support')
-    promptSpy.mockRestore()
+    expect(api.saveConstitutionSetup).toHaveBeenCalledWith(expect.objectContaining({
+      values: ['evidence-backed work', 'fast feedback']
+    }))
+  })
+
+  it('shows the tutorial, can dismiss it, and reopens the full guide', async () => {
+    const wrapper = mountView()
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('How To Use')
+    await wrapper.findAll('button').find(button => button.text() === 'Dismiss').trigger('click')
+    await flushPromises()
+
+    expect(localStorage.getItem('grafyn.twinWorkspaceTutorial.dismissed')).toBe('true')
+    await wrapper.findAll('.tab-button').find(button => button.text().includes('Guide')).trigger('click')
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('Canvas Buttons')
+    expect(wrapper.text()).toContain('Create Reflection Card')
+    expect(wrapper.text()).toContain('Export Benchmark')
+  })
+
+  it('saves presets and exports the decision benchmark from Config', async () => {
+    const wrapper = mountView()
+    await flushPromises()
+
+    await wrapper.findAll('.tab-button').find(button => button.text().includes('Config')).trigger('click')
+    await flushPromises()
+    await wrapper.find('.config-row select').setValue('evidence_strict')
+    await wrapper.findAll('button').find(button => button.text() === 'Save Config').trigger('click')
+    await flushPromises()
+
+    expect(api.updateDecisionMirrorConfig).toHaveBeenCalledWith({
+      preset: 'evidence_strict',
+      advanced_enabled: false
+    })
+
+    await wrapper.findAll('button').find(button => button.text() === 'Export Benchmark').trigger('click')
+    await flushPromises()
+    expect(api.exportData).toHaveBeenCalledWith({ bundle_name: 'decision-mirror-benchmark' })
   })
 })

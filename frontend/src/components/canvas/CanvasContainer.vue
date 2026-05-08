@@ -218,6 +218,8 @@
           :tile-id="node.tileId"
           :model-id="node.modelId"
           :response="node.response"
+          :prompt-type="node.promptType"
+          :decision-episode-id="node.decisionEpisodeId"
           :web-search="node.webSearch"
           :is-streaming="streamingModels.has(node.modelId)"
           :selected="selectedNodes.includes(`llm:${node.tileId}:${node.modelId}`)"
@@ -229,6 +231,7 @@
           @regenerate="handleRegenerate"
           @follow-up="handleFollowUp"
           @think-harder="handleThinkHarder"
+          @decision-feedback="handleDecisionFeedback"
         />
 
         <!-- Debate Nodes -->
@@ -488,6 +491,8 @@ const llmNodes = computed(() => {
         tileId: tile.id,
         modelId,
         response,
+        promptType: tile.prompt_type || 'standard',
+        decisionEpisodeId: tile.decision_episode_id || null,
         webSearch: Boolean(tile.web_search)
       })
     }
@@ -892,6 +897,53 @@ async function handleThinkHarder({ tileId, modelId, webSearch }) {
   }
 }
 
+async function handleDecisionFeedback({ tileId, modelId, action }) {
+  const responseNode = getResponseNode(tileId, modelId)
+  const label = responseNode?.response?.model_name || modelId
+
+  try {
+    if (action === 'useful') {
+      await canvasStore.recordPreferenceFeedback(
+        tileId,
+        modelId,
+        'accept',
+        'Decision Mirror reflection marked useful'
+      )
+      showCanvasMessage('success', `Marked ${label} useful`, 2000)
+    } else if (action === 'not_me') {
+      await canvasStore.recordPreferenceFeedback(
+        tileId,
+        modelId,
+        'reject',
+        'Decision Mirror reflection marked Not Me'
+      )
+      showCanvasMessage('success', `Recorded Not Me for ${label}`, 2000)
+    } else if (action === 'save_insight') {
+      const content = responseNode?.response?.content?.trim()
+      await canvasStore.captureInsight('reasoning_pattern', content || 'Decision Mirror reflection saved as insight', {
+        rationale: 'Saved from Decision Mirror one-click feedback',
+        response: {
+          tile_id: tileId,
+          model_id: modelId
+        },
+        confidence: 0.75
+      })
+      showCanvasMessage('success', 'Saved reflection insight', 2000)
+    } else if (action === 'reject_pattern') {
+      await canvasStore.recordPreferenceFeedback(
+        tileId,
+        modelId,
+        'reject',
+        'Decision Mirror pattern rejected'
+      )
+      showCanvasMessage('success', `Rejected pattern from ${label}`, 2000)
+    }
+  } catch (err) {
+    console.error('Failed to record decision feedback:', err)
+    showCanvasMessage('error', err.message || 'Failed to record decision feedback')
+  }
+}
+
 // Handle add model dialog submit
 async function handleAddModelDialogSubmit(newModelIds) {
   if (!addModelContext.value || newModelIds.length === 0) return
@@ -1253,6 +1305,8 @@ async function handleNewPromptClick() {
 
 async function handlePromptSubmit({
   prompt,
+  promptType = 'standard',
+  decisionMetadata = null,
   models,
   systemPrompt,
   temperature,
@@ -1289,7 +1343,10 @@ async function handlePromptSubmit({
         maxTokens,
         contextMode || 'knowledge_search',
         twinAnswerMode || 'advisor',
-        webSearch || false
+        webSearch || false,
+        undefined,
+        promptType,
+        decisionMetadata
       )
       branchContext.value = null
     } else {
@@ -1304,7 +1361,10 @@ async function handlePromptSubmit({
         null,
         contextMode || 'knowledge_search',
         twinAnswerMode || 'advisor',
-        webSearch || false
+        webSearch || false,
+        undefined,
+        promptType,
+        decisionMetadata
       )
     }
   } catch (err) {
@@ -1745,6 +1805,24 @@ async function handleAutoArrange() {
 
 .twin-actions-menu {
   min-width: 220px;
+}
+
+.close-btn {
+  width: 30px;
+  height: 30px;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.close-btn:hover {
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
 }
 
 .zoom-level {

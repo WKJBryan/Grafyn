@@ -2,11 +2,15 @@ use crate::commands::sync_chunk_index_for_note;
 use crate::models::canvas::{
     AddModelsRequest, AvailableModel, CanvasSession, CanvasStreamEvent, CanvasViewport,
     ContextMode, Debate, DebateContinueRequest, DebateResponse, DebateRound, DebateStartRequest,
-    LLMNodePositionUpdate, ModelResponse, PromptRequest, PromptTile, ResponseStatus, SessionCreate,
-    SessionMeta, SessionUpdate, TileContextNote, TilePosition, TilePositionUpdate, TwinAnswerMode,
+    DecisionPromptMetadata, LLMNodePositionUpdate, ModelResponse, PromptRequest, PromptTile,
+    PromptType, ResponseStatus, SessionCreate, SessionMeta, SessionUpdate, TileContextNote,
+    TilePosition, TilePositionUpdate, TwinAnswerMode,
 };
 use crate::models::note::{ChunkResult, NoteCreate, NoteStatus};
-use crate::models::twin::{TraceEventType, TwinContextRecord};
+use crate::models::twin::{
+    ActionGap, ConstitutionItem, DecisionEpisodeCreate, PrimitiveDecisionAssessment,
+    ReflectionCardCreate, TraceEventType, TwinContextRecord,
+};
 use crate::services::openrouter::ChatMessage;
 use crate::services::retrieval::RetrievalResult;
 use crate::services::twin_store::TwinStore;
@@ -52,6 +56,8 @@ struct ResolvedPromptContext {
     context_notes: Vec<TileContextNote>,
     approved_twin_records: Vec<TwinContextRecord>,
     candidate_twin_records: Vec<TwinContextRecord>,
+    constitution_items: Vec<ConstitutionItem>,
+    action_gaps: Vec<ActionGap>,
     system_prompt: Option<String>,
 }
 
@@ -186,6 +192,11 @@ pub async fn send_prompt(
         store.get_session(&session_id).map_err(|e| e.to_string())?
     };
     let resolved_context = resolve_prompt_context(state.inner(), &session, &request).await?;
+    let decision_episode_id = if request.prompt_type == PromptType::Decision {
+        Some(uuid::Uuid::new_v4().to_string())
+    } else {
+        None
+    };
 
     // Compute LLM node positions (offset from prompt tile)
     let prompt_pos = request.position.clone().unwrap_or_default();
@@ -220,6 +231,7 @@ pub async fn send_prompt(
     // Create the tile (with context notes attached)
     let tile = PromptTile {
         id: tile_id.clone(),
+        prompt_type: request.prompt_type.clone(),
         prompt: request.prompt.clone(),
         system_prompt: request.system_prompt.clone(),
         models: request.models.clone(),
@@ -234,6 +246,8 @@ pub async fn send_prompt(
         candidate_twin_records: resolved_context.candidate_twin_records.clone(),
         twin_answer_mode: request.twin_answer_mode.clone(),
         twin_context_policy: request.twin_context_policy.clone(),
+        decision_metadata: request.decision_metadata.clone(),
+        decision_episode_id: decision_episode_id.clone(),
         web_search: request.web_search,
         web_search_max_results: request.web_search_max_results,
     };
@@ -246,12 +260,38 @@ pub async fn send_prompt(
             .map_err(|e| e.to_string())?;
     }
 
+    if let Some(decision_episode_id) = decision_episode_id.clone() {
+        let decision_metadata = request.decision_metadata.clone().unwrap_or_default();
+        let decision = if decision_metadata.decision.trim().is_empty() {
+            request.prompt.clone()
+        } else {
+            decision_metadata.decision
+        };
+        let mut twin_store = state.twin_store.write().await;
+        twin_store
+            .record_decision_episode(DecisionEpisodeCreate {
+                id: decision_episode_id,
+                session_id: session_id.clone(),
+                tile_id: tile_id.clone(),
+                decision,
+                options: decision_metadata.options,
+                stakes: decision_metadata.stakes,
+                initial_leaning: decision_metadata.initial_leaning,
+                review_date: decision_metadata.review_date,
+                primitive_assessment: PrimitiveDecisionAssessment::default(),
+            })
+            .map_err(|error| error.to_string())?;
+    }
+
     append_canvas_trace(
         state.twin_store.clone(),
         &session_id,
         TraceEventType::PromptSubmitted,
         json!({
             "tile_id": tile.id.clone(),
+            "prompt_type": tile.prompt_type.clone(),
+            "decision_episode_id": tile.decision_episode_id.clone(),
+            "decision_metadata": tile.decision_metadata.clone(),
             "prompt": tile.prompt.clone(),
             "models": tile.models.clone(),
             "context_mode": tile.context_mode.clone(),
@@ -261,6 +301,8 @@ pub async fn send_prompt(
             "twin_answer_mode": tile.twin_answer_mode.clone(),
             "approved_twin_record_ids": tile.approved_twin_records.iter().map(|record| record.id.clone()).collect::<Vec<_>>(),
             "candidate_twin_record_ids": tile.candidate_twin_records.iter().map(|record| record.id.clone()).collect::<Vec<_>>(),
+            "constitution_item_ids": resolved_context.constitution_items.iter().map(|item| item.id.clone()).collect::<Vec<_>>(),
+            "action_gap_ids": resolved_context.action_gaps.iter().map(|gap| gap.id.clone()).collect::<Vec<_>>(),
             "web_search": tile.web_search,
             "web_search_max_results": tile.web_search_max_results,
         }),
@@ -301,6 +343,28 @@ pub async fn send_prompt(
     let web_search_max_results = request.web_search_max_results;
     let tile_id_clone = tile_id.clone();
     let session_id_clone = session_id.clone();
+    let decision_episode_id_for_reflection = tile.decision_episode_id.clone();
+    let reflection_note_ids = tile
+        .context_notes
+        .iter()
+        .map(|note| note.id.clone())
+        .collect::<Vec<_>>();
+    let reflection_user_record_ids = tile
+        .approved_twin_records
+        .iter()
+        .chain(tile.candidate_twin_records.iter())
+        .map(|record| record.id.clone())
+        .collect::<Vec<_>>();
+    let reflection_constitution_item_ids = resolved_context
+        .constitution_items
+        .iter()
+        .map(|item| item.id.clone())
+        .collect::<Vec<_>>();
+    let reflection_action_gap_ids = resolved_context
+        .action_gaps
+        .iter()
+        .map(|gap| gap.id.clone())
+        .collect::<Vec<_>>();
 
     // Spawn async task for streaming (doesn't block the IPC response)
     tauri::async_runtime::spawn(async move {
@@ -427,6 +491,28 @@ pub async fn send_prompt(
             &results,
         )
         .await;
+
+        if let Some(decision_episode_id) = decision_episode_id_for_reflection {
+            let mut twin_store = twin_store_arc.write().await;
+            for (model_id, content, status, _) in &results {
+                if *status != ResponseStatus::Completed || content.trim().is_empty() {
+                    continue;
+                }
+
+                let _ = twin_store.record_reflection_card(ReflectionCardCreate {
+                    decision_episode_id: decision_episode_id.clone(),
+                    session_id: session_id_clone.clone(),
+                    tile_id: tile_id_clone.clone(),
+                    model_id: model_id.clone(),
+                    content: content.clone(),
+                    cited_note_ids: reflection_note_ids.clone(),
+                    cited_user_record_ids: reflection_user_record_ids.clone(),
+                    cited_constitution_item_ids: reflection_constitution_item_ids.clone(),
+                    cited_action_gap_ids: reflection_action_gap_ids.clone(),
+                    evidence_packet: None,
+                });
+            }
+        }
 
         // Emit session saved after all models complete
         let _ = window.emit(
@@ -1601,12 +1687,14 @@ fn prompt_request_from_tile(
 ) -> PromptRequest {
     PromptRequest {
         prompt: tile.prompt.clone(),
+        prompt_type: tile.prompt_type.clone(),
         system_prompt: tile.system_prompt.clone(),
         models,
         position: None,
         context_mode: tile.context_mode.clone(),
         twin_answer_mode: tile.twin_answer_mode.clone(),
         twin_context_policy: tile.twin_context_policy.clone(),
+        decision_metadata: tile.decision_metadata.clone(),
         parent_tile_id: tile.parent_tile_id.clone(),
         parent_model_id: tile.parent_model_id.clone(),
         temperature,
@@ -1866,6 +1954,8 @@ async fn resolve_prompt_context(
                 context_notes: Vec::new(),
                 approved_twin_records: Vec::new(),
                 candidate_twin_records: Vec::new(),
+                constitution_items: Vec::new(),
+                action_gaps: Vec::new(),
                 system_prompt: request.system_prompt.clone(),
             });
         }
@@ -1951,6 +2041,8 @@ async fn resolve_prompt_context(
                 context_notes,
                 approved_twin_records: Vec::new(),
                 candidate_twin_records: Vec::new(),
+                constitution_items: Vec::new(),
+                action_gaps: Vec::new(),
                 system_prompt: Some(system_prompt),
             })
         } else {
@@ -1970,6 +2062,8 @@ async fn resolve_prompt_context(
             context_notes: Vec::new(),
             approved_twin_records: Vec::new(),
             candidate_twin_records: Vec::new(),
+            constitution_items: Vec::new(),
+            action_gaps: Vec::new(),
             system_prompt: request.system_prompt.clone(),
         })
     }
@@ -2064,18 +2158,32 @@ async fn resolve_twin_prompt_context(
         }
     }
 
-    let (approved_twin_records, candidate_twin_records) = {
+    let constitution_query =
+        decision_context_query(&request.prompt, request.decision_metadata.as_ref());
+    let (approved_twin_records, candidate_twin_records, constitution_items, action_gaps) = {
         let mut twin_store = state.twin_store.write().await;
-        twin_store
+        let (approved, candidate) = twin_store
             .select_context_records(&request.prompt)
-            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())?;
+        let (constitution_items, action_gaps) = if request.prompt_type == PromptType::Decision {
+            twin_store
+                .select_constitution_context(&constitution_query)
+                .map_err(|error| error.to_string())?
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        (approved, candidate, constitution_items, action_gaps)
     };
 
     let twin_prompt = build_twin_context_prompt(
         &note_contexts,
         &approved_twin_records,
         &candidate_twin_records,
+        &constitution_items,
+        &action_gaps,
         &request.twin_answer_mode,
+        &request.prompt_type,
+        request.decision_metadata.as_ref(),
     );
     let system_prompt = match &request.system_prompt {
         Some(user_sp) if !user_sp.is_empty() => format!("{}\n\n{}", twin_prompt, user_sp),
@@ -2087,6 +2195,8 @@ async fn resolve_twin_prompt_context(
         context_notes,
         approved_twin_records,
         candidate_twin_records,
+        constitution_items,
+        action_gaps,
         system_prompt: Some(system_prompt),
     })
 }
@@ -2134,6 +2244,8 @@ async fn resolve_note_level_context(
         context_notes,
         approved_twin_records: Vec::new(),
         candidate_twin_records: Vec::new(),
+        constitution_items: Vec::new(),
+        action_gaps: Vec::new(),
         system_prompt: Some(system_prompt),
     })
 }
@@ -2378,7 +2490,11 @@ fn build_twin_context_prompt(
     notes: &[(String, String, String)],
     approved_records: &[TwinContextRecord],
     candidate_records: &[TwinContextRecord],
+    constitution_items: &[ConstitutionItem],
+    action_gaps: &[ActionGap],
     answer_mode: &TwinAnswerMode,
+    prompt_type: &PromptType,
+    decision_metadata: Option<&DecisionPromptMetadata>,
 ) -> String {
     let mut prompt = String::from(
         "You are Grafyn's native RAG twin mode. Use only the provided vault notes and user-reviewed twin records as personal context. \
@@ -2415,6 +2531,32 @@ fn build_twin_context_prompt(
         prompt.push('\n');
     }
 
+    if prompt_type == &PromptType::Decision {
+        prompt.push_str("## Active Constitutional Slice\n\n");
+        if constitution_items.is_empty() {
+            prompt.push_str("No relevant constitution items were selected for this decision.\n\n");
+        } else {
+            prompt.push_str("These are evidence-backed principles or hypotheses. Distinguish values, taste, somatic cues, constraints, and unsupported hypotheses.\n");
+            for item in constitution_items {
+                prompt.push_str(&format_constitution_item(item));
+            }
+            prompt.push('\n');
+        }
+
+        prompt.push_str("## Action Gap Risks\n\n");
+        if action_gaps.is_empty() {
+            prompt.push_str(
+                "No relevant stated-intention vs revealed-behavior gaps were selected.\n\n",
+            );
+        } else {
+            prompt.push_str("Use these as risk checks, not accusations. Ask whether the same gap could affect this decision.\n");
+            for gap in action_gaps {
+                prompt.push_str(&format_action_gap(gap));
+            }
+            prompt.push('\n');
+        }
+    }
+
     prompt.push_str("## Instructions\n\n");
     match answer_mode {
         TwinAnswerMode::Advisor => prompt.push_str(
@@ -2425,6 +2567,56 @@ fn build_twin_context_prompt(
             "Answer as a likely-user-style simulation for reflection. Label the response as a simulation, not the user's actual view. \
              Use approved records as stronger style and preference evidence; mention candidate influence as tentative when relevant.\n",
         ),
+    }
+
+    if prompt_type == &PromptType::Decision {
+        prompt.push_str(
+            "\n## Decision Mirror Structure\n\n\
+             This is a Decision Mirror session. Return a compact Markdown Reflection Card using these exact headings:\n\
+             1. Decision Frame\n\
+             2. Likely Reasoning Pattern\n\
+             3. Evidence From Grafyn\n\
+             4. Blind Spot Hypothesis\n\
+             5. Counter-Position\n\
+             6. Recommendation\n\
+             7. Confidence\n\
+             8. Next Action\n\
+             9. Constitution Check\n\
+             10. Action Gap Risk\n\
+             11. Feedback Request\n\n\
+             Treat every self-model claim as a hypothesis, not identity. Say where the claim is grounded in vault notes, approved records, or tentative records. \
+             If a claim is useful but weakly supported, label it as unsupported or low-confidence. Do not claim to know what the user would do. \
+             In Constitution Check, separate stated values, revealed behavior, taste, somatic signal, and constraints. In Action Gap Risk, state whether past intention-action gaps could change the next step.\n",
+        );
+
+        if let Some(metadata) = decision_metadata {
+            prompt.push_str("\n## Decision Metadata\n\n");
+            prompt.push_str(&format!("Decision: {}\n", metadata.decision));
+            if !metadata.options.is_empty() {
+                prompt.push_str("Options:\n");
+                for option in &metadata.options {
+                    prompt.push_str(&format!("- {}\n", option));
+                }
+            }
+            if let Some(stakes) = metadata.stakes.as_deref().filter(|value| !value.is_empty()) {
+                prompt.push_str(&format!("Stakes: {}\n", stakes));
+            }
+            if let Some(leaning) = metadata
+                .initial_leaning
+                .as_deref()
+                .filter(|value| !value.is_empty())
+            {
+                prompt.push_str(&format!("Initial leaning: {}\n", leaning));
+            }
+            if let Some(review_date) = metadata
+                .review_date
+                .as_deref()
+                .filter(|value| !value.is_empty())
+            {
+                prompt.push_str(&format!("Follow-up review date: {}\n", review_date));
+            }
+            prompt.push('\n');
+        }
     }
 
     prompt
@@ -2439,6 +2631,50 @@ fn format_twin_record(record: &TwinContextRecord) -> String {
         record.evidence_count,
         record.content
     )
+}
+
+fn format_constitution_item(item: &ConstitutionItem) -> String {
+    format!(
+        "- [id {}; dimension {}; status {:?}; confidence {:.2}; priority {:.2}; evidence {}] {}\n",
+        item.id,
+        item.dimension,
+        item.status,
+        item.confidence,
+        item.priority,
+        item.evidence_refs.len(),
+        item.claim
+    )
+}
+
+fn format_action_gap(gap: &ActionGap) -> String {
+    format!(
+        "- [id {}; status {:?}; confidence {:.2}; evidence {}] Stated: {} | Revealed: {} | Risk: {}\n",
+        gap.id,
+        gap.status,
+        gap.confidence,
+        gap.evidence_refs.len(),
+        gap.stated_value,
+        gap.revealed_behavior,
+        gap.decision_risk
+    )
+}
+
+fn decision_context_query(
+    prompt: &str,
+    decision_metadata: Option<&DecisionPromptMetadata>,
+) -> String {
+    let mut parts = vec![prompt.to_string()];
+    if let Some(metadata) = decision_metadata {
+        parts.push(metadata.decision.clone());
+        parts.extend(metadata.options.clone());
+        if let Some(stakes) = &metadata.stakes {
+            parts.push(stakes.clone());
+        }
+        if let Some(leaning) = &metadata.initial_leaning {
+            parts.push(leaning.clone());
+        }
+    }
+    parts.join("\n")
 }
 
 #[cfg(test)]
@@ -2473,6 +2709,7 @@ mod tests {
 
         PromptTile {
             id: id.to_string(),
+            prompt_type: PromptType::Standard,
             prompt: prompt.to_string(),
             system_prompt: None,
             models: vec![model_id.to_string()],
@@ -2487,6 +2724,8 @@ mod tests {
             candidate_twin_records: Vec::new(),
             twin_answer_mode: TwinAnswerMode::default(),
             twin_context_policy: None,
+            decision_metadata: None,
+            decision_episode_id: None,
             web_search: false,
             web_search_max_results: 5,
         }
@@ -2516,12 +2755,14 @@ mod tests {
     ) -> PromptRequest {
         PromptRequest {
             prompt: prompt.to_string(),
+            prompt_type: PromptType::Standard,
             system_prompt: None,
             models: vec!["openai/gpt-4".to_string()],
             position: None,
             context_mode,
             twin_answer_mode: TwinAnswerMode::default(),
             twin_context_policy: None,
+            decision_metadata: None,
             parent_tile_id: Some(parent_tile_id.to_string()),
             parent_model_id: Some(parent_model_id.to_string()),
             temperature: 0.7,
@@ -2667,7 +2908,11 @@ mod tests {
             )],
             &approved,
             &candidates,
+            &[],
+            &[],
             &TwinAnswerMode::Advisor,
+            &PromptType::Standard,
+            None,
         );
 
         assert!(prompt.contains("## Relevant Vault Notes"));
@@ -2679,10 +2924,47 @@ mod tests {
 
     #[test]
     fn twin_context_prompt_labels_simulation_mode() {
-        let prompt = build_twin_context_prompt(&[], &[], &[], &TwinAnswerMode::Simulation);
+        let prompt = build_twin_context_prompt(
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &TwinAnswerMode::Simulation,
+            &PromptType::Standard,
+            None,
+        );
 
         assert!(prompt.contains("likely-user-style simulation"));
         assert!(prompt.contains("not the user's actual view"));
+    }
+
+    #[test]
+    fn decision_twin_prompt_uses_reflection_card_structure() {
+        let metadata = DecisionPromptMetadata {
+            decision: "Should Grafyn build Decision Mirror first?".into(),
+            options: vec!["Decision Mirror".into(), "Topology layer".into()],
+            stakes: Some("Product direction".into()),
+            initial_leaning: Some("Decision Mirror first".into()),
+            review_date: Some("2026-05-15".into()),
+        };
+
+        let prompt = build_twin_context_prompt(
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &TwinAnswerMode::Advisor,
+            &PromptType::Decision,
+            Some(&metadata),
+        );
+
+        assert!(prompt.contains("Decision Mirror session"));
+        assert!(prompt.contains("Reflection Card"));
+        assert!(prompt.contains("Blind Spot Hypothesis"));
+        assert!(prompt.contains("Decision: Should Grafyn build Decision Mirror first?"));
+        assert!(prompt.contains("Topology layer"));
     }
 
     #[test]

@@ -1,7 +1,7 @@
 <template>
   <div
     class="llm-node"
-    :class="{ dragging: isDragging, resizing: isResizing, streaming: isStreaming, selected, error: hasError }"
+    :class="{ dragging: isDragging, resizing: isResizing, streaming: isStreaming, selected, error: hasError, 'reflection-card-node': isDecisionMirror }"
     :style="nodeStyle"
     @mousedown="handleMouseDown"
   >
@@ -11,6 +11,12 @@
     >
       <span class="model-badge">{{ modelName }}</span>
       <div class="header-right">
+        <span
+          v-if="isDecisionMirror"
+          class="reflection-badge"
+        >
+          Reflection
+        </span>
         <span
           v-if="webSearch"
           class="web-search-badge"
@@ -80,6 +86,32 @@
       </div>
     </div>
     
+    <div
+      v-if="isDecisionMirror && isCompleted"
+      class="decision-feedback-bar"
+    >
+      <a
+        v-if="decisionEpisodeId"
+        class="open-twin-link"
+        :href="`/twin?decision=${encodeURIComponent(decisionEpisodeId)}&trace=1`"
+        @click.stop
+      >
+        Open in Twin
+      </a>
+      <button @click.stop="emitDecisionFeedback('useful')">
+        Useful
+      </button>
+      <button @click.stop="emitDecisionFeedback('not_me')">
+        Not Me
+      </button>
+      <button @click.stop="emitDecisionFeedback('save_insight')">
+        Save Insight
+      </button>
+      <button @click.stop="emitDecisionFeedback('reject_pattern')">
+        Reject Pattern
+      </button>
+    </div>
+
     <div
       v-if="!isStreaming"
       class="node-footer"
@@ -395,6 +427,14 @@ const props = defineProps({
     type: Object,
     required: true
   },
+  promptType: {
+    type: String,
+    default: 'standard'
+  },
+  decisionEpisodeId: {
+    type: String,
+    default: null
+  },
   webSearch: {
     type: Boolean,
     default: false
@@ -413,7 +453,7 @@ const props = defineProps({
   }
 })
 
-const emit = defineEmits(['drag', 'branch', 'select', 'delete', 'regenerate', 'follow-up', 'think-harder'])
+const emit = defineEmits(['drag', 'branch', 'select', 'delete', 'regenerate', 'follow-up', 'think-harder', 'decision-feedback'])
 
 // Refs
 const contentRef = ref(null)
@@ -447,6 +487,7 @@ const modelName = computed(() => {
 
 const isCompleted = computed(() => props.response.status === 'completed')
 const hasError = computed(() => props.response.status === 'error')
+const isDecisionMirror = computed(() => props.promptType === 'decision')
 
 const nodeStyle = computed(() => ({
   left: `${props.response.position.x}px`,
@@ -513,6 +554,7 @@ function handleMouseDown(e) {
       e.target.closest('.think-harder-overlay') ||
       e.target.closest('.node-content') ||
       e.target.closest('.resize-handle') ||
+      e.target.closest('a') ||
       e.target.closest('button')) {
     return
   }
@@ -636,6 +678,14 @@ function submitThinkHarder() {
   showThinkHarder.value = false
 }
 
+function emitDecisionFeedback(action) {
+  emit('decision-feedback', {
+    tileId: props.tileId,
+    modelId: props.modelId,
+    action
+  })
+}
+
 function submitFollowup() {
   if (!followupPrompt.value.trim()) return
 
@@ -706,6 +756,10 @@ onBeforeUnmount(() => {
   border-color: var(--accent-red);
 }
 
+.llm-node.reflection-card-node {
+  border-color: var(--accent-cyan);
+}
+
 @keyframes streamingPulse {
   0%, 100% { box-shadow: 0 4px 16px color-mix(in srgb, var(--accent-cyan) 20%, transparent); }
   50% { box-shadow: 0 4px 24px color-mix(in srgb, var(--accent-cyan) 40%, transparent); }
@@ -754,6 +808,19 @@ onBeforeUnmount(() => {
   letter-spacing: 0.04em;
   line-height: 1;
   text-transform: uppercase;
+}
+
+.reflection-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 6px;
+  border-radius: var(--radius-sm);
+  border: 1px solid color-mix(in srgb, var(--accent-cyan) 35%, transparent);
+  background: color-mix(in srgb, var(--accent-cyan) 14%, transparent);
+  color: var(--accent-cyan);
+  font-size: 0.625rem;
+  font-weight: 700;
+  line-height: 1;
 }
 
 .web-search-icon {
@@ -861,6 +928,48 @@ onBeforeUnmount(() => {
   padding: var(--spacing-xs) var(--spacing-sm);
   border-top: 1px solid var(--border-subtle);
   background: transparent;
+}
+
+.decision-feedback-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: var(--spacing-xs) var(--spacing-sm);
+  border-top: 1px solid var(--border-subtle);
+  background: color-mix(in srgb, var(--accent-cyan) 8%, transparent);
+}
+
+.decision-feedback-bar button {
+  min-height: 26px;
+  padding: 3px 7px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 0.6875rem;
+  cursor: pointer;
+}
+
+.decision-feedback-bar button:hover {
+  border-color: var(--accent-cyan);
+  color: var(--accent-cyan);
+  background: color-mix(in srgb, var(--accent-cyan) 10%, transparent);
+}
+
+.open-twin-link {
+  min-height: 26px;
+  padding: 3px 7px;
+  border: 1px solid color-mix(in srgb, var(--accent-cyan) 45%, var(--border-subtle));
+  border-radius: var(--radius-sm);
+  color: var(--accent-cyan);
+  font-size: 0.6875rem;
+  font-weight: 700;
+  line-height: 18px;
+  text-decoration: none;
+}
+
+.open-twin-link:hover {
+  background: color-mix(in srgb, var(--accent-cyan) 12%, transparent);
 }
 
 .branch-btn, .think-harder-btn, .select-btn, .delete-btn {

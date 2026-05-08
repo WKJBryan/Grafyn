@@ -12,7 +12,7 @@
  * - MCP API methods (getStatus, getConfigSnippet)
  * - Memory API methods (recall, contradictions, extract)
  * - Zettelkasten API methods (discoverLinks, applyLinks, createLink, getLinkTypes)
- * - isDesktopApp always returns true
+ * - isDesktopApp detects the Tauri IPC bridge
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest'
@@ -44,7 +44,11 @@ describe('API Client (Tauri)', () => {
   })
 
   describe('isDesktopApp', () => {
-    it('always returns true', () => {
+    it('detects the Tauri IPC bridge', () => {
+      delete window.__TAURI_IPC__
+      expect(isDesktopApp()).toBe(false)
+
+      window.__TAURI_IPC__ = vi.fn()
       expect(isDesktopApp()).toBe(true)
     })
   })
@@ -291,6 +295,78 @@ describe('API Client (Tauri)', () => {
       mockInvoke.mockResolvedValue({ train: { count: 1 }, eval: { count: 1 }, holdout: { count: 0 } })
       await twin.exportData(request)
       expect(mockInvoke).toHaveBeenCalledWith('export_twin_data', { request })
+    })
+
+    it('Decision Mirror APIs invoke their twin commands', async () => {
+      mockInvoke.mockResolvedValue([])
+      await twin.listDecisionEpisodes()
+      expect(mockInvoke).toHaveBeenLastCalledWith('list_decision_episodes', {})
+
+      await twin.updateDecisionOutcome('decision-1', { outcome: 'shipped' })
+      expect(mockInvoke).toHaveBeenLastCalledWith('update_decision_outcome', {
+        id: 'decision-1',
+        update: { outcome: 'shipped' }
+      })
+
+      await twin.getDecisionMirrorConfig()
+      expect(mockInvoke).toHaveBeenLastCalledWith('get_decision_mirror_config', {})
+
+      await twin.updateDecisionMirrorConfig({ preset: 'evidence_strict' })
+      expect(mockInvoke).toHaveBeenLastCalledWith('update_decision_mirror_config', {
+        update: { preset: 'evidence_strict' }
+      })
+
+      await twin.resetDecisionMirrorConfig()
+      expect(mockInvoke).toHaveBeenLastCalledWith('reset_decision_mirror_config', {})
+
+      await twin.listMemoryDigest()
+      expect(mockInvoke).toHaveBeenLastCalledWith('list_memory_digest', {})
+
+      await twin.reviewMemoryDigestItem('digest-1', { action: 'keep' })
+      expect(mockInvoke).toHaveBeenLastCalledWith('review_memory_digest_item', {
+        id: 'digest-1',
+        request: { action: 'keep' }
+      })
+
+      await twin.listConstitutionItems()
+      expect(mockInvoke).toHaveBeenLastCalledWith('list_constitution_items', {})
+
+      await twin.createConstitutionItem({ claim: 'Validate first', dimension: 'values' })
+      expect(mockInvoke).toHaveBeenLastCalledWith('create_constitution_item', {
+        item: { claim: 'Validate first', dimension: 'values' }
+      })
+
+      await twin.updateConstitutionItem('constitution-1', { confidence: 0.9 })
+      expect(mockInvoke).toHaveBeenLastCalledWith('update_constitution_item', {
+        id: 'constitution-1',
+        update: { confidence: 0.9 }
+      })
+
+      await twin.reviewConstitutionItem('constitution-1', { action: 'soften' })
+      expect(mockInvoke).toHaveBeenLastCalledWith('review_constitution_item', {
+        id: 'constitution-1',
+        request: { action: 'soften' }
+      })
+
+      await twin.listActionGaps()
+      expect(mockInvoke).toHaveBeenLastCalledWith('list_action_gaps', {})
+
+      await twin.reviewActionGap('gap-1', { action: 'not_me' })
+      expect(mockInvoke).toHaveBeenLastCalledWith('review_action_gap', {
+        id: 'gap-1',
+        request: { action: 'not_me' }
+      })
+
+      await twin.getConstitutionSetup()
+      expect(mockInvoke).toHaveBeenLastCalledWith('get_constitution_setup', {})
+
+      await twin.saveConstitutionSetup({ values: ['proof'] })
+      expect(mockInvoke).toHaveBeenLastCalledWith('save_constitution_setup', {
+        setup: { values: ['proof'] }
+      })
+
+      await twin.runConstitutionInference()
+      expect(mockInvoke).toHaveBeenLastCalledWith('run_constitution_inference', {})
     })
   })
 
