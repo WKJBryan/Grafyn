@@ -74,10 +74,13 @@
             <textarea
               id="decisionOptions"
               v-model="decisionOptionsText"
-              placeholder="One option per line"
+              placeholder="A) Accept the grant&#10;B) Negotiate the scope&#10;C) Decline the grant"
               rows="3"
               class="system-input"
             />
+            <span class="field-hint">
+              The concrete choices the Twin should compare before recommending.
+            </span>
           </div>
           <div class="form-group">
             <label for="decisionStakes">Stakes</label>
@@ -88,6 +91,9 @@
               class="text-input"
               placeholder="What changes if this goes right or wrong?"
             >
+            <span class="field-hint">
+              What is materially at risk, gained, delayed, or protected.
+            </span>
           </div>
           <div class="form-group">
             <label for="decisionLeaning">Initial Leaning</label>
@@ -98,19 +104,28 @@
               class="text-input"
               placeholder="Optional current leaning"
             >
+            <span class="field-hint">
+              Your starting bias, so the Twin can test it instead of blindly echoing it.
+            </span>
           </div>
           <div class="form-group">
-            <label for="decisionReviewDate">Follow-up</label>
+            <label for="decisionReviewDate">Review Date</label>
             <input
               id="decisionReviewDate"
               v-model="decisionReviewDate"
               type="date"
               class="text-input"
             >
+            <span class="field-hint">
+              When to revisit the outcome or check if the decision held up.
+            </span>
           </div>
         </div>
 
-        <div class="form-group checkbox-group">
+        <div
+          v-if="allowSystemPrompt"
+          class="form-group checkbox-group"
+        >
           <label class="checkbox-label">
             <input
               v-model="showSystemPrompt"
@@ -127,7 +142,10 @@
           />
         </div>
 
-        <div class="form-group">
+        <div
+          v-if="!usingLocalTwinRuntime"
+          class="form-group"
+        >
           <ModelSelector
             v-model="selectedModels"
             :models="models"
@@ -136,6 +154,52 @@
             @update-preset="emit('update-preset', $event)"
             @delete-preset="emit('delete-preset', $event)"
           />
+        </div>
+        <div
+          v-else
+          class="form-group local-model-panel"
+          :class="{ error: !configuredOllamaModel }"
+        >
+          <label>Local Model</label>
+          <span v-if="configuredOllamaModel">{{ configuredOllamaModel }}</span>
+          <span v-else>Select an Ollama model in Settings before using Private Local.</span>
+        </div>
+
+        <div class="thinking-config">
+          <div class="form-group">
+            <label for="temperature">Temperature: {{ temperature }}</label>
+            <input
+              id="temperature"
+              v-model.number="temperature"
+              type="range"
+              min="0"
+              max="2"
+              step="0.1"
+              class="slider"
+            >
+          </div>
+
+          <div class="form-group">
+            <label for="reasoningEffort">Thinking level: {{ reasoningEffortLabel }}</label>
+            <input
+              id="reasoningEffort"
+              v-model.number="reasoningEffortIndex"
+              type="range"
+              min="0"
+              :max="reasoningEffortOptions.length - 1"
+              step="1"
+              class="slider"
+            >
+            <div class="reasoning-scale">
+              <span
+                v-for="option in reasoningEffortOptions"
+                :key="option.value"
+              >{{ option.label }}</span>
+            </div>
+            <p class="reasoning-hint">
+              Higher reasoning may cost more and only affects models/providers that support reasoning.
+            </p>
+          </div>
         </div>
 
         <!-- Context Mode Selector (always visible) -->
@@ -198,7 +262,34 @@
             {{ twinModeHints[twinAnswerMode] }}
           </span>
           <span class="context-mode-hint">
-            Selected vault notes and twin records may be sent to the chosen model runtime.
+            Selected vault notes and twin records use the Twin Runtime selected below.
+          </span>
+        </div>
+
+        <div
+          v-if="isTwinSensitivePrompt"
+          class="form-group twin-runtime-group"
+        >
+          <label>Context Runtime</label>
+          <div class="runtime-toggle">
+            <button
+              type="button"
+              :class="{ active: selectedTwinProvider === 'ollama' }"
+              @click="selectedTwinProvider = 'ollama'"
+            >
+              Private Local
+            </button>
+            <button
+              type="button"
+              :class="{ active: selectedTwinProvider === 'openrouter' }"
+              :disabled="promptType === 'decision' || contextMode !== 'none'"
+              @click="selectedTwinProvider = 'openrouter'"
+            >
+              API / OpenRouter
+            </button>
+          </div>
+          <span class="context-mode-hint">
+            {{ twinRuntimeHint }}
           </span>
         </div>
 
@@ -215,10 +306,11 @@
         </div>
 
         <div
+          v-if="selectedModels.length > 0"
           class="advanced-toggle"
           @click="showAdvanced = !showAdvanced"
         >
-          <span>Advanced Options</span>
+          <span>Context Budget</span>
           <GIcon
             name="chevron-down"
             :size="14"
@@ -228,22 +320,9 @@
         </div>
 
         <div
-          v-if="showAdvanced"
+          v-if="showAdvanced && selectedModels.length > 0"
           class="advanced-options"
         >
-          <div class="form-group">
-            <label for="temperature">Temperature: {{ temperature }}</label>
-            <input
-              id="temperature"
-              v-model.number="temperature"
-              type="range"
-              min="0"
-              max="2"
-              step="0.1"
-              class="slider"
-            >
-          </div>
-
           <!-- Context Budget Display -->
           <div
             v-if="selectedModels.length > 0"
@@ -303,6 +382,14 @@ const props = defineProps({
   openRouterConfigured: {
     type: Boolean,
     default: true
+  },
+  twinLlmProvider: {
+    type: String,
+    default: 'openrouter'
+  },
+  ollamaModel: {
+    type: String,
+    default: ''
   }
 })
 
@@ -314,9 +401,11 @@ const systemPrompt = ref('')
 const showSystemPrompt = ref(false)
 const selectedModels = ref([])
 const temperature = ref(0.7)
+const reasoningEffortIndex = ref(0)
 const showAdvanced = ref(false)
-const contextMode = ref('knowledge_search')  // Default to knowledge search for note lookup
+const contextMode = ref('none')
 const twinAnswerMode = ref('advisor')
+const selectedTwinProvider = ref(props.twinLlmProvider === 'ollama' ? 'ollama' : 'openrouter')
 const promptType = ref('standard')
 const decisionOptionsText = ref('')
 const decisionStakes = ref('')
@@ -324,12 +413,20 @@ const decisionInitialLeaning = ref('')
 const decisionReviewDate = ref('')
 
 const searchDetection = computed(() => detectWebSearch(prompt.value))
+const isTwinSensitivePrompt = computed(() => promptType.value === 'decision' || contextMode.value !== 'none')
+const usingLocalTwinRuntime = computed(() => isTwinSensitivePrompt.value && selectedTwinProvider.value === 'ollama')
+const configuredOllamaModel = computed(() => props.ollamaModel.trim())
 const resolvedWebSearch = computed(() => (
+  !usingLocalTwinRuntime.value &&
   props.openRouterConfigured &&
   props.smartWebSearch &&
   searchDetection.value.shouldSearch
 ))
 const webSearchHint = computed(() => {
+  if (usingLocalTwinRuntime.value) {
+    return 'Live web search is off for local twin prompts so twin context stays with the local Ollama runtime.'
+  }
+
   if (!props.openRouterConfigured) {
     return 'Live web search is off because OpenRouter is not configured.'
   }
@@ -349,13 +446,21 @@ const webSearchHint = computed(() => {
   return 'This prompt looks self-contained, so live web search will stay off.'
 })
 
+const twinRuntimeHint = computed(() => {
+  if (selectedTwinProvider.value === 'ollama') {
+    return 'Private Local sends twin prompt/context only to the configured Ollama runtime on this machine and fails closed if setup is missing.'
+  }
+
+  return 'API / OpenRouter is available only when Context Mode is None, so vault content is not sent out.'
+})
+
 // Context mode descriptions
 const contextModeHints = {
   none: 'No additional context - just your prompt',
-  knowledge_search: 'Retrieves relevant notes (+ pinned notes) from your vault as LLM context. This does not search the live web.',
+  knowledge_search: 'Retrieves relevant notes (+ pinned notes) from your vault. Requires Private Local.',
   twin: 'Retrieves relevant notes plus approved user records and relevant candidate records from Twin Review.',
-  full_history: 'Include all conversation turns from the parent chain',
-  compact: 'Include recent turns + summary of older context to save tokens'
+  full_history: 'Include all conversation turns from the parent chain. Requires Private Local.',
+  compact: 'Include recent turns + summary of older context to save tokens. Requires Private Local.'
 }
 
 const twinModeHints = {
@@ -363,9 +468,21 @@ const twinModeHints = {
   simulation: 'Simulation mode is labeled as likely-user-style reflection, not the user actual view.'
 }
 
+const reasoningEffortOptions = [
+  { label: 'None', value: 'none' },
+  { label: 'Minimal', value: 'minimal' },
+  { label: 'Low', value: 'low' },
+  { label: 'Medium', value: 'medium' },
+  { label: 'High', value: 'high' },
+  { label: 'XHigh', value: 'xhigh' }
+]
+
 // Computed
 const canSubmit = computed(() => {
-  return prompt.value.trim().length > 0 && selectedModels.value.length > 0
+  if (!prompt.value.trim()) return false
+  if (isTwinSensitivePrompt.value && !usingLocalTwinRuntime.value) return false
+  if (usingLocalTwinRuntime.value) return Boolean(configuredOllamaModel.value)
+  return selectedModels.value.length > 0
 })
 
 const promptLabel = computed(() => promptType.value === 'decision' ? 'Decision' : 'Prompt')
@@ -373,6 +490,8 @@ const promptLabel = computed(() => promptType.value === 'decision' ? 'Decision' 
 const promptPlaceholder = computed(() => promptType.value === 'decision'
   ? 'What decision are you making?'
   : 'Enter your prompt...')
+
+const allowSystemPrompt = computed(() => promptType.value === 'standard')
 
 const decisionOptions = computed(() => decisionOptionsText.value
   .split('\n')
@@ -393,7 +512,8 @@ const decisionMetadata = computed(() => {
 
 const submitLabel = computed(() => {
   const subject = promptType.value === 'decision' ? 'Create Reflection Card' : 'Send'
-  return `${subject} (${selectedModels.value.length} model${selectedModels.value.length !== 1 ? 's' : ''})`
+  const modelCount = usingLocalTwinRuntime.value ? (configuredOllamaModel.value ? 1 : 0) : selectedModels.value.length
+  return `${subject} (${modelCount} model${modelCount !== 1 ? 's' : ''})`
 })
 
 // Token counting for context budget
@@ -426,6 +546,7 @@ const estimatedTokens = computed(() => {
 const maxContextTokens = computed(() => {
   // Get the first selected model's context limit
   const firstModelId = selectedModels.value[0]
+  if (usingLocalTwinRuntime.value) return 4096
   if (!firstModelId) return 4096
   
   const model = props.models.find(m => m.id === firstModelId)
@@ -433,17 +554,25 @@ const maxContextTokens = computed(() => {
 })
 
 const currentTokens = computed(() => estimatedTokens.value)
+const reasoningEffort = computed(() => reasoningEffortOptions[reasoningEffortIndex.value]?.value || 'none')
+const reasoningEffortLabel = computed(() => reasoningEffortOptions[reasoningEffortIndex.value]?.label || 'None')
 
 // Methods
 function setPromptType(type) {
   promptType.value = type
 }
 
+watch(() => props.twinLlmProvider, (provider) => {
+  selectedTwinProvider.value = provider === 'ollama' ? 'ollama' : 'openrouter'
+})
+
 watch(promptType, (type) => {
   if (type === 'decision') {
     contextMode.value = 'twin'
     twinAnswerMode.value = 'advisor'
     temperature.value = Math.min(temperature.value, 0.5)
+    showSystemPrompt.value = false
+    systemPrompt.value = ''
   }
 })
 
@@ -454,11 +583,13 @@ function handleSubmit() {
     prompt: prompt.value.trim(),
     promptType: promptType.value,
     decisionMetadata: decisionMetadata.value,
-    models: selectedModels.value,
-    systemPrompt: showSystemPrompt.value ? systemPrompt.value.trim() : null,
+    models: usingLocalTwinRuntime.value ? [configuredOllamaModel.value] : selectedModels.value,
+    systemPrompt: allowSystemPrompt.value && showSystemPrompt.value ? systemPrompt.value.trim() : null,
     temperature: temperature.value,
+    reasoningEffort: reasoningEffort.value,
     contextMode: contextMode.value,
     twinAnswerMode: twinAnswerMode.value,
+    twinLlmProvider: isTwinSensitivePrompt.value ? selectedTwinProvider.value : null,
     webSearch: resolvedWebSearch.value
   })
 }
@@ -627,6 +758,43 @@ function handleSubmit() {
   grid-column: 1 / -1;
 }
 
+.field-hint {
+  display: block;
+  font-size: 0.72rem;
+  line-height: 1.35;
+  color: var(--text-muted);
+}
+
+.thinking-config {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-md);
+  padding: var(--spacing-md);
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+}
+
+.local-model-panel {
+  padding: var(--spacing-sm);
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+}
+
+.local-model-panel span {
+  color: var(--text-primary);
+  font-size: 0.875rem;
+}
+
+.local-model-panel.error {
+  border-color: var(--color-error, #ef4444);
+}
+
+.local-model-panel.error span {
+  color: var(--color-error, #ef4444);
+}
+
 .advanced-toggle {
   display: flex;
   align-items: center;
@@ -658,6 +826,22 @@ function handleSubmit() {
 .slider {
   width: 100%;
   accent-color: var(--accent-primary);
+}
+
+.reasoning-scale {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: var(--spacing-xs);
+  font-size: 0.7rem;
+  color: var(--text-muted);
+  text-align: center;
+}
+
+.reasoning-hint {
+  margin: 0;
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  line-height: 1.35;
 }
 
 .dialog-footer {
@@ -695,7 +879,8 @@ function handleSubmit() {
   color: var(--text-muted);
 }
 
-.segmented-control {
+.segmented-control,
+.runtime-toggle {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 2px;
@@ -705,7 +890,8 @@ function handleSubmit() {
   border-radius: var(--radius-sm);
 }
 
-.segmented-control button {
+.segmented-control button,
+.runtime-toggle button {
   border: none;
   border-radius: calc(var(--radius-sm) - 2px);
   background: transparent;
@@ -716,9 +902,15 @@ function handleSubmit() {
   min-height: 32px;
 }
 
-.segmented-control button.active {
+.segmented-control button.active,
+.runtime-toggle button.active {
   background: var(--accent-primary);
   color: white;
+}
+
+.runtime-toggle button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
 }
 
 .web-search-hint {

@@ -2,6 +2,7 @@ pub mod chatgpt;
 pub mod claude;
 pub mod gemini;
 pub mod grok;
+pub mod transcript;
 
 use crate::models::import::ParsedConversation;
 use anyhow::{Context, Result};
@@ -21,9 +22,12 @@ pub fn parse_content(content: &str) -> Result<Vec<ParsedConversation>> {
     if gemini::can_parse(content) {
         return gemini::parse(content).context("Gemini parser failed");
     }
+    if transcript::can_parse(content) {
+        return transcript::parse(content).context("Transcript parser failed");
+    }
 
     Err(anyhow::anyhow!(
-        "Could not detect conversation format. Supported: ChatGPT, Claude, Grok, Gemini"
+        "Could not detect conversation format. Supported: ChatGPT, Claude, Grok, Gemini, labeled transcript"
     ))
 }
 
@@ -40,6 +44,9 @@ pub fn detect_platform(content: &str) -> Option<&'static str> {
     }
     if gemini::can_parse(content) {
         return Some("gemini");
+    }
+    if transcript::can_parse(content) {
+        return Some("interview");
     }
     None
 }
@@ -66,6 +73,7 @@ pub fn format_as_markdown(conv: &ParsedConversation) -> String {
         let role_label = match msg.role.as_str() {
             "user" => "User",
             "assistant" => "Assistant",
+            "interviewee" => "Interviewee",
             "system" => "System",
             _ => "Unknown",
         };
@@ -153,6 +161,34 @@ mod tests {
     fn test_detect_unknown() {
         let content = r#"{"random": "data"}"#;
         assert_eq!(detect_platform(content), None);
+    }
+
+    #[test]
+    fn test_detect_labeled_interview_transcript() {
+        let content = "Interviewer: How do you decide what to trust?\nParticipant: I need to see a real demo first.";
+        assert_eq!(detect_platform(content), Some("interview"));
+        let parsed = parse_content(content).expect("transcript should parse");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].platform, "interview");
+        assert_eq!(parsed[0].messages[0].role, "user");
+        assert_eq!(parsed[0].messages[1].role, "interviewee");
+    }
+
+    #[test]
+    fn test_detect_expert_labeled_interview_transcript() {
+        let content =
+            "Interviewer: How do you decide what to trust?\nExpert: I need to see a real demo first.";
+        assert_eq!(detect_platform(content), Some("interview"));
+        let parsed = parse_content(content).expect("expert transcript should parse");
+        assert_eq!(parsed[0].messages[0].role, "user");
+        assert_eq!(parsed[0].messages[1].role, "interviewee");
+    }
+
+    #[test]
+    fn test_unlabeled_transcript_does_not_parse_for_extraction() {
+        let content = "How do you decide what to trust?\nI need to see a real demo first.";
+        assert_eq!(detect_platform(content), None);
+        assert!(parse_content(content).is_err());
     }
 
     #[test]

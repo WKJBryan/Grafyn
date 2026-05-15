@@ -9,7 +9,7 @@ use models::boot::BootStatus;
 use services::{
     canvas_store::CanvasStore, chunk_index::ChunkIndex, feedback::FeedbackService,
     graph_index::GraphIndex, knowledge_store::KnowledgeStore, link_discovery::LinkDiscoveryService,
-    markdown_migration::MarkdownMigrationService, memory::MemoryService,
+    markdown_migration::MarkdownMigrationService, memory::MemoryService, ollama::OllamaService,
     openrouter::OpenRouterService, priority::PriorityScoringService, retrieval::RetrievalService,
     search::SearchService, settings::SettingsService, twin_store::TwinStore,
     vault_optimizer::VaultOptimizerService,
@@ -27,6 +27,7 @@ pub struct AppState {
     pub search_service: Arc<RwLock<SearchService>>,
     pub canvas_store: Arc<RwLock<CanvasStore>>,
     pub openrouter: Arc<RwLock<OpenRouterService>>,
+    pub ollama: Arc<RwLock<OllamaService>>,
     pub feedback_service: Arc<RwLock<FeedbackService>>,
     pub settings_service: Arc<RwLock<SettingsService>>,
     pub priority_service: Arc<RwLock<PriorityScoringService>>,
@@ -120,7 +121,7 @@ fn main() {
             };
 
             let canvas_store = CanvasStore::new(data_path.join("canvas"));
-            let twin_store = TwinStore::new(data_path.join("twin"));
+            let twin_store = TwinStore::new(settings_service.get().effective_twin_data_path());
 
             // Get OpenRouter API key from settings, fall back to environment
             let api_key = settings_service
@@ -129,6 +130,7 @@ fn main() {
                 .or_else(|| std::env::var("OPENROUTER_API_KEY").ok())
                 .unwrap_or_default();
             let openrouter = OpenRouterService::new(api_key);
+            let ollama = OllamaService::new(settings_service.get().ollama_base_url.clone());
 
             // Initialize priority scoring service
             let priority_service = PriorityScoringService::new(data_path.clone());
@@ -151,6 +153,7 @@ fn main() {
                 search_service: Arc::new(RwLock::new(search_service)),
                 canvas_store: Arc::new(RwLock::new(canvas_store)),
                 openrouter: Arc::new(RwLock::new(openrouter)),
+                ollama: Arc::new(RwLock::new(ollama)),
                 feedback_service: Arc::new(RwLock::new(feedback_service)),
                 settings_service: Arc::new(RwLock::new(settings_service)),
                 priority_service: Arc::new(RwLock::new(priority_service)),
@@ -268,6 +271,8 @@ fn main() {
             commands::settings::pick_vault_folder,
             commands::settings::validate_openrouter_key,
             commands::settings::get_openrouter_status,
+            commands::settings::get_ollama_status,
+            commands::settings::list_ollama_models,
             // Migration + optimizer commands
             commands::migration::preview_markdown_migration,
             commands::migration::apply_markdown_migration,

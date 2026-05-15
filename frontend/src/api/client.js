@@ -183,6 +183,10 @@ export const settings = {
   validateOpenRouterKey: (apiKey) => invoke('validate_openrouter_key', { apiKey }),
 
   getOpenRouterStatus: () => invoke('get_openrouter_status', {}),
+
+  getOllamaStatus: () => invoke('get_ollama_status', {}),
+
+  listOllamaModels: () => invoke('list_ollama_models', {}),
 }
 
 export const migration = {

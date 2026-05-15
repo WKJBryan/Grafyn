@@ -313,6 +313,8 @@
       :branch-context="branchContext"
       :smart-web-search="smartWebSearch"
       :open-router-configured="hasApiKey"
+      :twin-llm-provider="twinLlmProvider"
+      :ollama-model="ollamaModel"
       @submit="handlePromptSubmit"
       @cancel="closeBranchDialog"
       @create-preset="handleCreatePreset"
@@ -455,6 +457,8 @@ const twinActionsDropdown = ref(null)
 const showApiKeyRequired = ref(false)  // Show API key required dialog
 const hasApiKey = ref(true)  // Assume true initially, check on mount
 const smartWebSearch = ref(true)  // Smart web search auto-detection (loaded from settings)
+const twinLlmProvider = ref('openrouter')
+const ollamaModel = ref('')
 const canvasModelPresets = ref([])
 
 // D3 zoom
@@ -1178,6 +1182,8 @@ async function refreshOpenRouterStatus() {
   ])
   hasApiKey.value = status?.is_configured || false
   smartWebSearch.value = settingsData?.smart_web_search ?? true
+  twinLlmProvider.value = settingsData?.twin_llm_provider || 'openrouter'
+  ollamaModel.value = settingsData?.ollama_model || ''
   return hasApiKey.value
 }
 
@@ -1185,6 +1191,8 @@ async function loadCanvasPreferences() {
   try {
     const settingsData = await settingsApi.get()
     smartWebSearch.value = settingsData?.smart_web_search ?? true
+    twinLlmProvider.value = settingsData?.twin_llm_provider || 'openrouter'
+    ollamaModel.value = settingsData?.ollama_model || ''
     canvasModelPresets.value = Array.isArray(settingsData?.canvas_model_presets)
       ? settingsData.canvas_model_presets
       : []
@@ -1290,14 +1298,9 @@ function collapseDebate(debateId) {
 async function handleNewPromptClick() {
   if (isDesktopApp()) {
     try {
-      if (!(await refreshOpenRouterStatus())) {
-        showApiKeyRequired.value = true
-        return
-      }
+      await refreshOpenRouterStatus()
     } catch (err) {
       console.error('Failed to refresh OpenRouter status:', err)
-      showApiKeyRequired.value = true
-      return
     }
   }
   showPromptDialog.value = true
@@ -1313,9 +1316,14 @@ async function handlePromptSubmit({
   maxTokens = null,
   contextMode,
   twinAnswerMode = 'advisor',
-  webSearch
+  webSearch,
+  reasoningEffort = 'none',
+  twinLlmProvider: selectedTwinLlmProvider = null
 }) {
-  if (isDesktopApp()) {
+  const usesLocalTwinRuntime = (promptType === 'decision' || contextMode === 'twin') &&
+    selectedTwinLlmProvider === 'ollama'
+
+  if (isDesktopApp() && !usesLocalTwinRuntime) {
     try {
       if (!(await refreshOpenRouterStatus())) {
         showApiKeyRequired.value = true
@@ -1341,12 +1349,14 @@ async function handlePromptSubmit({
         systemPrompt,
         temperature,
         maxTokens,
-        contextMode || 'knowledge_search',
+        contextMode || 'none',
         twinAnswerMode || 'advisor',
         webSearch || false,
         undefined,
         promptType,
-        decisionMetadata
+        decisionMetadata,
+        reasoningEffort,
+        selectedTwinLlmProvider
       )
       branchContext.value = null
     } else {
@@ -1359,12 +1369,14 @@ async function handlePromptSubmit({
         maxTokens,
         null,
         null,
-        contextMode || 'knowledge_search',
+        contextMode || 'none',
         twinAnswerMode || 'advisor',
         webSearch || false,
         undefined,
         promptType,
-        decisionMetadata
+        decisionMetadata,
+        reasoningEffort,
+        selectedTwinLlmProvider
       )
     }
   } catch (err) {
@@ -1378,7 +1390,7 @@ async function handlePromptSubmit({
 }
 
 // Handle branch from LLM node
-function handleLLMBranch(tileId, modelId, prompt, contextMode = 'knowledge_search', selectedModels = null) {
+function handleLLMBranch(tileId, modelId, prompt, contextMode = 'none', selectedModels = null) {
   // Get parent context
   const parentInfo = canvasStore.getParentResponseContent(tileId, modelId)
   branchContext.value = {
@@ -1391,6 +1403,7 @@ function handleLLMBranch(tileId, modelId, prompt, contextMode = 'knowledge_searc
   if (prompt) {
     // Use selected models if provided, otherwise fall back to parent model
     const models = selectedModels && selectedModels.length > 0 ? selectedModels : [modelId]
+    const parentTile = canvasStore.currentSession?.prompt_tiles?.find(tile => tile.id === tileId)
     handlePromptSubmit({
       prompt,
       models,
@@ -1398,7 +1411,8 @@ function handleLLMBranch(tileId, modelId, prompt, contextMode = 'knowledge_searc
       temperature: 0.7,
       maxTokens: null,
       contextMode,
-      webSearch: false
+      webSearch: false,
+      reasoningEffort: parentTile?.reasoning_effort || 'none'
     })
   } else {
     showPromptDialog.value = true

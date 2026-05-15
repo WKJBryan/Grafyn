@@ -84,7 +84,12 @@ describe('TwinReviewView', () => {
         confidence: 0.86,
         priority: 0.9,
         status: 'candidate',
-        evidence_refs: [{ event_id: 'evt-1' }],
+        source: 'behavior_inference',
+        evidence_refs: [{
+          event_id: 'evt-1',
+          source_type: 'behavior',
+          source_label: 'Prompt submitted'
+        }],
         scope: ['research']
       }
     ])
@@ -196,7 +201,17 @@ describe('TwinReviewView', () => {
     api.runInference.mockResolvedValue({ created_records: 1, updated_records: 1 })
     api.runConstitutionInference.mockResolvedValue({
       created_constitution_items: 1,
-      created_action_gaps: 1
+      created_action_gaps: 1,
+      scanned_behavior_events: 6,
+      scanned_notes: 3,
+      scanned_interviews: 1,
+      auto_active_items: 1,
+      review_candidate_items: 2,
+      extracted_research_findings: 1,
+      pruned_stale_constitution_items: 3,
+      pruned_stale_records: 2,
+      updated_setup_entries: 5,
+      skipped_domain_claims: 4
     })
     api.resolveEvidence.mockResolvedValue([
       {
@@ -267,6 +282,28 @@ describe('TwinReviewView', () => {
     await flushPromises()
 
     expect(api.reviewConstitutionItem).toHaveBeenCalledWith('constitution-1', { action: 'keep' })
+  })
+
+  it('shows constitution source labels and expanded inference summary', async () => {
+    const wrapper = mountView()
+    await flushPromises()
+
+    await wrapper.findAll('.tab-button').find(button => button.text().includes('Constitution')).trigger('click')
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('Behavior Inference')
+    expect(wrapper.text()).toContain('Prompt submitted')
+
+    await wrapper.findAll('button').find(button => button.text() === 'Run Constitution').trigger('click')
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('1 active')
+    expect(wrapper.text()).toContain('6 behavior events')
+    expect(wrapper.text()).toContain('1 interviews')
+    expect(wrapper.text()).toContain('1 findings')
+    expect(wrapper.text()).toContain('3 stale items removed')
+    expect(wrapper.text()).toContain('2 stale records removed')
+    expect(wrapper.text()).toContain('5 setup entries')
   })
 
   it('opens the evidence drawer for a user record', async () => {

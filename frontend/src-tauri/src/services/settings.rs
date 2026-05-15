@@ -154,6 +154,27 @@ impl SettingsService {
             };
         }
 
+        if let Some(twin_llm_provider) = update.twin_llm_provider {
+            self.settings.twin_llm_provider =
+                match twin_llm_provider.trim().to_ascii_lowercase().as_str() {
+                    "ollama" => "ollama".to_string(),
+                    _ => "openrouter".to_string(),
+                };
+        }
+
+        if let Some(ollama_base_url) = update.ollama_base_url {
+            let trimmed = ollama_base_url.trim().trim_end_matches('/').to_string();
+            self.settings.ollama_base_url = if trimmed.is_empty() {
+                "http://localhost:11434".to_string()
+            } else {
+                trimmed
+            };
+        }
+
+        if let Some(ollama_model) = update.ollama_model {
+            self.settings.ollama_model = ollama_model.trim().to_string();
+        }
+
         if let Some(smart_web_search) = update.smart_web_search {
             self.settings.smart_web_search = smart_web_search;
         }
@@ -379,6 +400,9 @@ mod tests {
                 theme: None,
                 mcp_enabled: None,
                 llm_model: None,
+                twin_llm_provider: None,
+                ollama_base_url: None,
+                ollama_model: None,
                 smart_web_search: None,
                 background_link_discovery_enabled: None,
                 background_link_discovery_llm_enabled: None,

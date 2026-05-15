@@ -430,6 +430,18 @@ describe('API Client (Tauri)', () => {
       await settings.validateOpenRouterKey('sk-123')
       expect(mockInvoke).toHaveBeenCalledWith('validate_openrouter_key', { apiKey: 'sk-123' })
     })
+
+    it('getOllamaStatus() invokes get_ollama_status', async () => {
+      mockInvoke.mockResolvedValue({ available: true })
+      await settings.getOllamaStatus()
+      expect(mockInvoke).toHaveBeenCalledWith('get_ollama_status', {})
+    })
+
+    it('listOllamaModels() invokes list_ollama_models', async () => {
+      mockInvoke.mockResolvedValue([])
+      await settings.listOllamaModels()
+      expect(mockInvoke).toHaveBeenCalledWith('list_ollama_models', {})
+    })
   })
 
   // ============================================================================

@@ -21,8 +21,6 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 #[cfg(feature = "tauri-app")]
-use crate::services::openrouter::ChatMessage;
-#[cfg(feature = "tauri-app")]
 use crate::AppState;
 
 const MAX_LOCAL_CANDIDATES: usize = 40;
@@ -167,7 +165,9 @@ pub struct LocalCandidateSignals {
 pub struct RankedLinkCandidate {
     pub candidate: ZettelLinkCandidate,
     pub local_score: f64,
+    #[allow(dead_code)]
     pub summary: String,
+    #[allow(dead_code)]
     pub snippet: String,
 }
 
@@ -1002,44 +1002,6 @@ pub fn parse_llm_rerank_response(response: &str) -> Vec<LlmCandidateUpdate> {
         .collect()
 }
 
-pub fn apply_llm_updates(
-    candidates: Vec<RankedLinkCandidate>,
-    updates: &[LlmCandidateUpdate],
-) -> Vec<RankedLinkCandidate> {
-    let update_map = updates
-        .iter()
-        .map(|update| (update.target_id.clone(), update))
-        .collect::<HashMap<_, _>>();
-
-    let mut merged = candidates
-        .into_iter()
-        .map(|mut candidate| {
-            if let Some(update) = update_map.get(&candidate.candidate.target_id) {
-                candidate.candidate.link_type = update.link_type.clone();
-                candidate.candidate.confidence = update.confidence;
-                if !update.reason.is_empty() {
-                    candidate.candidate.reason = update.reason.clone();
-                }
-                candidate.local_score = (candidate.local_score * 0.55) + (update.confidence * 0.45);
-            }
-            candidate
-        })
-        .collect::<Vec<_>>();
-
-    merged.sort_by(|a, b| {
-        b.candidate
-            .confidence
-            .partial_cmp(&a.candidate.confidence)
-            .unwrap_or(Ordering::Equal)
-            .then_with(|| {
-                b.local_score
-                    .partial_cmp(&a.local_score)
-                    .unwrap_or(Ordering::Equal)
-            })
-    });
-    merged
-}
-
 pub fn build_profile(
     note: &Note,
     title_to_id: &HashMap<String, String>,
@@ -1616,110 +1578,20 @@ fn build_second_hop_counts(
 
 #[cfg(feature = "tauri-app")]
 async fn rerank_with_llm(
-    state: &AppState,
-    source_profile: &LinkDiscoveryProfile,
+    _state: &AppState,
+    _source_profile: &LinkDiscoveryProfile,
     candidates: Vec<RankedLinkCandidate>,
-    bucket: &str,
-    limit: usize,
+    _bucket: &str,
+    _limit: usize,
 ) -> Vec<RankedLinkCandidate> {
     if candidates.is_empty() {
         return candidates;
     }
 
-    let is_configured = {
-        let openrouter = state.openrouter.read().await;
-        openrouter.is_configured()
-    };
-    if !is_configured {
-        return candidates;
-    }
-
-    let shortlist = candidates.iter().take(limit).cloned().collect::<Vec<_>>();
-    let candidate_context = shortlist
-        .iter()
-        .map(|candidate| {
-            format!(
-                "- id: {}\n  title: {}\n  summary: {}\n  evidence: score {:.2}; {}\n  snippet: {}",
-                candidate.candidate.target_id,
-                candidate.candidate.target_title,
-                candidate.summary,
-                candidate.local_score,
-                candidate.candidate.reason,
-                truncate_text(candidate.snippet.trim(), 180)
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    let prompt = format!(
-        "You are reviewing potential knowledge-graph links for a note.\n\
-SOURCE NOTE:\n- title: {}\n- summary: {}\n\n\
-Evaluate the following {} candidates. Select only the candidates worth keeping.\n\
-Return ONLY a JSON array with objects:\n\
-[{{\"id\":\"candidate-id\",\"type\":\"related\",\"confidence\":0.0,\"reason\":\"brief reason\"}}]\n\
-Use confidence from 0.0 to 1.0. Types must be one of: related, supports, contradicts, expands, questions, answers, example, part_of.\n\n\
-CANDIDATES:\n{}",
-        source_profile.title,
-        source_profile.summary,
-        bucket,
-        candidate_context
+    log::info!(
+        "Skipping LLM link discovery rerank because vault summaries/snippets must not be sent to OpenRouter"
     );
-
-    let model = {
-        let settings = state.settings_service.read().await;
-        settings.get().llm_model.clone()
-    };
-    let messages = vec![ChatMessage {
-        role: "user".to_string(),
-        content: prompt,
-    }];
-
-    let response = {
-        let openrouter = state.openrouter.read().await;
-        match openrouter
-            .chat(&model, messages, None, Some(0.1), Some(900), false, 5)
-            .await
-        {
-            Ok(response) => response,
-            Err(error) => {
-                log::warn!("LLM link discovery rerank failed: {}", error);
-                return candidates;
-            }
-        }
-    };
-
-    let updates = parse_llm_rerank_response(&response);
-    if updates.is_empty() {
-        return candidates;
-    }
-
-    let updated_shortlist = apply_llm_updates(shortlist, &updates);
-    let updated_map = updated_shortlist
-        .into_iter()
-        .map(|candidate| (candidate.candidate.target_id.clone(), candidate))
-        .collect::<HashMap<_, _>>();
-
-    let mut merged = candidates
-        .into_iter()
-        .map(|candidate| {
-            updated_map
-                .get(&candidate.candidate.target_id)
-                .cloned()
-                .unwrap_or(candidate)
-        })
-        .collect::<Vec<_>>();
-    merged.sort_by(|a, b| {
-        b.candidate
-            .confidence
-            .partial_cmp(&a.candidate.confidence)
-            .unwrap_or(Ordering::Equal)
-            .then_with(|| {
-                b.local_score
-                    .partial_cmp(&a.local_score)
-                    .unwrap_or(Ordering::Equal)
-            })
-    });
-    merged
+    candidates
 }
 
 #[cfg(test)]

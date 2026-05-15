@@ -7,6 +7,7 @@ use crate::models::canvas::{
     TilePosition, TilePositionUpdate, TwinAnswerMode,
 };
 use crate::models::note::{ChunkResult, NoteCreate, NoteStatus};
+use crate::models::settings::UserSettings;
 use crate::models::twin::{
     ActionGap, ConstitutionItem, DecisionEpisodeCreate, PrimitiveDecisionAssessment,
     ReflectionCardCreate, TraceEventType, TwinContextRecord,
@@ -62,6 +63,18 @@ struct ResolvedPromptContext {
 }
 
 type StreamedResponseUpdate = (String, String, ResponseStatus, Option<String>);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ModelRoute {
+    provider: ModelProviderRoute,
+    model_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ModelProviderRoute {
+    OpenRouter,
+    Ollama,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RetrievalDecisionReason {
@@ -182,11 +195,21 @@ pub async fn get_available_models(
 pub async fn send_prompt(
     window: tauri::Window,
     session_id: String,
-    request: PromptRequest,
+    mut request: PromptRequest,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
     let tile_id = uuid::Uuid::new_v4().to_string();
     let now = Utc::now();
+    let model_route = {
+        let settings = state.settings_service.read().await;
+        resolve_model_route(
+            &request.prompt_type,
+            &request.context_mode,
+            request.twin_llm_provider.as_deref(),
+            settings.get(),
+        )?
+    };
+    request.models = effective_model_ids(&model_route, &request.models);
     let session = {
         let mut store = state.canvas_store.write().await;
         store.get_session(&session_id).map_err(|e| e.to_string())?
@@ -246,10 +269,12 @@ pub async fn send_prompt(
         candidate_twin_records: resolved_context.candidate_twin_records.clone(),
         twin_answer_mode: request.twin_answer_mode.clone(),
         twin_context_policy: request.twin_context_policy.clone(),
+        twin_llm_provider: request.twin_llm_provider.clone(),
         decision_metadata: request.decision_metadata.clone(),
         decision_episode_id: decision_episode_id.clone(),
         web_search: request.web_search,
         web_search_max_results: request.web_search_max_results,
+        reasoning_effort: request.reasoning_effort.clone(),
     };
 
     // Save tile to session
@@ -332,15 +357,17 @@ pub async fn send_prompt(
 
     // Clone what we need for the spawned task
     let openrouter_arc = state.openrouter.clone();
+    let ollama_arc = state.ollama.clone();
     let canvas_store_arc = state.canvas_store.clone();
     let twin_store_arc = state.twin_store.clone();
     let models = request.models.clone();
     let messages = resolved_context.messages.clone();
     let system_prompt = resolved_context.system_prompt.clone();
     let temperature = request.temperature;
-    let max_tokens = request.max_tokens;
     let web_search = request.web_search;
     let web_search_max_results = request.web_search_max_results;
+    let reasoning_effort = request.reasoning_effort.clone();
+    let provider_route = model_route.provider.clone();
     let tile_id_clone = tile_id.clone();
     let session_id_clone = session_id.clone();
     let decision_episode_id_for_reflection = tile.decision_episode_id.clone();
@@ -374,29 +401,61 @@ pub async fn send_prompt(
         for model_id in models {
             let messages = messages.clone();
             let system_prompt = system_prompt.clone();
+            let reasoning_effort = reasoning_effort.clone();
+            let provider_route = provider_route.clone();
             let openrouter_arc = openrouter_arc.clone();
+            let ollama_arc = ollama_arc.clone();
             let window = window.clone();
             let session_id = session_id_clone.clone();
             let tile_id = tile_id_clone.clone();
 
             join_set.spawn(async move {
-                let openrouter = openrouter_arc.read().await;
-                let stream_result = openrouter
-                    .chat_stream(
-                        &model_id,
-                        messages,
-                        system_prompt.as_deref(),
-                        Some(temperature),
-                        max_tokens,
-                        web_search,
-                        web_search_max_results,
-                    )
-                    .await;
-                drop(openrouter);
+                let stream_result = match provider_route {
+                    ModelProviderRoute::Ollama => {
+                        let ollama = ollama_arc.read().await;
+                        let result = ollama
+                            .chat_stream(
+                                &model_id,
+                                messages,
+                                system_prompt.as_deref(),
+                                Some(temperature),
+                            )
+                            .await;
+                        drop(ollama);
+                        result.map(|stream| {
+                            Box::pin(stream)
+                                as std::pin::Pin<
+                                    Box<dyn futures::Stream<Item = anyhow::Result<String>> + Send>,
+                                >
+                        })
+                    }
+                    ModelProviderRoute::OpenRouter => {
+                        let openrouter = openrouter_arc.read().await;
+                        let result = openrouter
+                            .chat_stream(
+                                &model_id,
+                                messages,
+                                system_prompt.as_deref(),
+                                Some(temperature),
+                                None,
+                                Some(reasoning_effort.as_str()),
+                                web_search,
+                                web_search_max_results,
+                            )
+                            .await;
+                        drop(openrouter);
+                        result.map(|stream| {
+                            Box::pin(stream)
+                                as std::pin::Pin<
+                                    Box<dyn futures::Stream<Item = anyhow::Result<String>> + Send>,
+                                >
+                        })
+                    }
+                };
 
                 match stream_result {
                     Ok(stream) => {
-                        let mut stream = Box::pin(stream);
+                        let mut stream = stream;
                         let mut full_content = String::new();
 
                         loop {
@@ -748,7 +807,7 @@ pub async fn export_to_note(
 pub async fn start_debate(
     window: tauri::Window,
     session_id: String,
-    request: DebateStartRequest,
+    mut request: DebateStartRequest,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
     let debate_id = uuid::Uuid::new_v4().to_string();
@@ -760,6 +819,27 @@ pub async fn start_debate(
     drop(store);
 
     let mut source_content = String::new();
+    let (source_has_vault_context, source_twin_provider) =
+        source_tile_context_provider(&session, &request.source_tile_ids);
+    let model_route = {
+        let settings = state.settings_service.read().await;
+        if source_has_vault_context {
+            resolve_model_route(
+                &PromptType::Decision,
+                &ContextMode::Twin,
+                source_twin_provider.as_deref(),
+                settings.get(),
+            )?
+        } else {
+            resolve_model_route(
+                &PromptType::Standard,
+                &ContextMode::KnowledgeSearch,
+                None,
+                settings.get(),
+            )?
+        }
+    };
+    request.participating_models = effective_model_ids(&model_route, &request.participating_models);
     for tile_id in &request.source_tile_ids {
         if let Some(tile) = session.prompt_tiles.iter().find(|t| &t.id == tile_id) {
             source_content.push_str(&format!("Prompt: {}\n", tile.prompt));
@@ -798,6 +878,7 @@ pub async fn start_debate(
             height: 300.0,
         },
         debate_mode: request.debate_mode.clone(),
+        reasoning_effort: request.reasoning_effort.clone(),
         created_at: now,
     };
 
@@ -834,9 +915,12 @@ pub async fn start_debate(
 
     // Spawn async task for debate streaming
     let openrouter_arc = state.openrouter.clone();
+    let ollama_arc = state.ollama.clone();
     let canvas_store_arc = state.canvas_store.clone();
     let models = request.participating_models.clone();
     let max_rounds = request.max_rounds;
+    let reasoning_effort = request.reasoning_effort.clone();
+    let provider_route = model_route.provider.clone();
     let debate_id_clone = debate_id.clone();
     let session_id_clone = session_id.clone();
 
@@ -883,20 +967,61 @@ pub async fn start_debate(
                     content: context.clone(),
                 }];
                 let openrouter_arc = openrouter_arc.clone();
+                let ollama_arc = ollama_arc.clone();
                 let window = window.clone();
                 let session_id = session_id_clone.clone();
                 let debate_id = debate_id_clone.clone();
+                let reasoning_effort = reasoning_effort.clone();
+                let provider_route = provider_route.clone();
 
                 join_set.spawn(async move {
-                    let openrouter = openrouter_arc.read().await;
-                    let stream_result = openrouter
-                        .chat_stream(&model_id, messages, None, Some(0.7), Some(1024), false, 5)
-                        .await;
-                    drop(openrouter);
+                    let stream_result = match provider_route {
+                        ModelProviderRoute::Ollama => {
+                            let ollama = ollama_arc.read().await;
+                            let result = ollama
+                                .chat_stream(&model_id, messages, None, Some(0.7))
+                                .await;
+                            drop(ollama);
+                            result.map(|stream| {
+                                Box::pin(stream)
+                                    as std::pin::Pin<
+                                        Box<
+                                            dyn futures::Stream<Item = anyhow::Result<String>>
+                                                + Send,
+                                        >,
+                                    >
+                            })
+                        }
+                        ModelProviderRoute::OpenRouter => {
+                            let openrouter = openrouter_arc.read().await;
+                            let result = openrouter
+                                .chat_stream(
+                                    &model_id,
+                                    messages,
+                                    None,
+                                    Some(0.7),
+                                    None,
+                                    Some(reasoning_effort.as_str()),
+                                    false,
+                                    5,
+                                )
+                                .await;
+                            drop(openrouter);
+                            result.map(|stream| {
+                                Box::pin(stream)
+                                    as std::pin::Pin<
+                                        Box<
+                                            dyn futures::Stream<Item = anyhow::Result<String>>
+                                                + Send,
+                                        >,
+                                    >
+                            })
+                        }
+                    };
 
                     match stream_result {
                         Ok(stream) => {
-                            let mut stream = Box::pin(stream);
+                            let mut stream = stream;
                             let mut full_content = String::new();
 
                             loop {
@@ -1068,6 +1193,26 @@ pub async fn continue_debate(
         .find(|d| d.id == debate_id)
         .ok_or_else(|| "Debate not found".to_string())?
         .clone();
+    let (source_has_vault_context, source_twin_provider) =
+        source_tile_context_provider(&session, &debate.source_tile_ids);
+    let model_route = {
+        let settings = state.settings_service.read().await;
+        if source_has_vault_context {
+            resolve_model_route(
+                &PromptType::Decision,
+                &ContextMode::Twin,
+                source_twin_provider.as_deref(),
+                settings.get(),
+            )?
+        } else {
+            resolve_model_route(
+                &PromptType::Standard,
+                &ContextMode::KnowledgeSearch,
+                None,
+                settings.get(),
+            )?
+        }
+    };
 
     append_canvas_trace(
         state.twin_store.clone(),
@@ -1082,8 +1227,11 @@ pub async fn continue_debate(
     .await;
 
     let openrouter_arc = state.openrouter.clone();
+    let ollama_arc = state.ollama.clone();
     let canvas_store_arc = state.canvas_store.clone();
-    let models = debate.participating_models.clone();
+    let models = effective_model_ids(&model_route, &debate.participating_models);
+    let reasoning_effort = request.reasoning_effort.clone();
+    let provider_route = model_route.provider.clone();
 
     tauri::async_runtime::spawn(async move {
         let mut debate_state = debate;
@@ -1122,20 +1270,55 @@ pub async fn continue_debate(
                 content: context.clone(),
             }];
             let openrouter_arc = openrouter_arc.clone();
+            let ollama_arc = ollama_arc.clone();
             let window = window.clone();
             let session_id = session_id.clone();
             let debate_id = debate_id.clone();
+            let reasoning_effort = reasoning_effort.clone();
+            let provider_route = provider_route.clone();
 
             join_set.spawn(async move {
-                let openrouter = openrouter_arc.read().await;
-                let stream_result = openrouter
-                    .chat_stream(&model_id, messages, None, Some(0.7), Some(1024), false, 5)
-                    .await;
-                drop(openrouter);
+                let stream_result = match provider_route {
+                    ModelProviderRoute::Ollama => {
+                        let ollama = ollama_arc.read().await;
+                        let result = ollama
+                            .chat_stream(&model_id, messages, None, Some(0.7))
+                            .await;
+                        drop(ollama);
+                        result.map(|stream| {
+                            Box::pin(stream)
+                                as std::pin::Pin<
+                                    Box<dyn futures::Stream<Item = anyhow::Result<String>> + Send>,
+                                >
+                        })
+                    }
+                    ModelProviderRoute::OpenRouter => {
+                        let openrouter = openrouter_arc.read().await;
+                        let result = openrouter
+                            .chat_stream(
+                                &model_id,
+                                messages,
+                                None,
+                                Some(0.7),
+                                None,
+                                Some(reasoning_effort.as_str()),
+                                false,
+                                5,
+                            )
+                            .await;
+                        drop(openrouter);
+                        result.map(|stream| {
+                            Box::pin(stream)
+                                as std::pin::Pin<
+                                    Box<dyn futures::Stream<Item = anyhow::Result<String>> + Send>,
+                                >
+                        })
+                    }
+                };
 
                 match stream_result {
                     Ok(stream) => {
-                        let mut stream = Box::pin(stream);
+                        let mut stream = stream;
                         let mut full_content = String::new();
 
                         loop {
@@ -1298,8 +1481,17 @@ pub async fn add_models_to_tile(
         .find(|t| t.id == tile_id)
         .ok_or_else(|| "Tile not found".to_string())?
         .clone();
-    let model_ids = request.model_ids.clone();
-    let prompt_request = prompt_request_from_tile(&tile, model_ids.clone(), 0.7, None);
+    let model_route = {
+        let settings = state.settings_service.read().await;
+        resolve_model_route(
+            &tile.prompt_type,
+            &tile.context_mode,
+            tile.twin_llm_provider.as_deref(),
+            settings.get(),
+        )?
+    };
+    let model_ids = effective_model_ids(&model_route, &request.model_ids);
+    let prompt_request = prompt_request_from_tile(&tile, model_ids.clone(), 0.7);
     let resolved_context = resolve_prompt_context(state.inner(), &session, &prompt_request).await?;
 
     let now = Utc::now();
@@ -1315,7 +1507,7 @@ pub async fn add_models_to_tile(
         let mut store = state.canvas_store.write().await;
         let mut session = store.get_session(&session_id).map_err(|e| e.to_string())?;
         if let Some(t) = session.prompt_tiles.iter_mut().find(|t| t.id == tile_id) {
-            for (i, model_id) in request.model_ids.iter().enumerate() {
+            for (i, model_id) in model_ids.iter().enumerate() {
                 let model_name = model_id.split('/').last().unwrap_or(model_id).to_string();
                 let llm_y = prompt_pos.y + ((existing_count + i) as f64) * LLM_NODE_Y_STEP;
                 let response = ModelResponse {
@@ -1355,12 +1547,15 @@ pub async fn add_models_to_tile(
 
     // Spawn streaming task
     let openrouter_arc = state.openrouter.clone();
+    let ollama_arc = state.ollama.clone();
     let canvas_store_arc = state.canvas_store.clone();
     let twin_store_arc = state.twin_store.clone();
     let messages = resolved_context.messages.clone();
     let system_prompt = resolved_context.system_prompt.clone();
     let web_search = prompt_request.web_search;
     let web_search_max_results = prompt_request.web_search_max_results;
+    let reasoning_effort = prompt_request.reasoning_effort.clone();
+    let provider_route = model_route.provider.clone();
 
     tauri::async_runtime::spawn(async move {
         // Stream all new models concurrently using JoinSet
@@ -1373,25 +1568,52 @@ pub async fn add_models_to_tile(
             let window = window.clone();
             let session_id = session_id.clone();
             let tile_id = tile_id.clone();
+            let reasoning_effort = reasoning_effort.clone();
+            let provider_route = provider_route.clone();
+            let ollama_arc = ollama_arc.clone();
 
             join_set.spawn(async move {
-                let openrouter = openrouter_arc.read().await;
-                let stream_result = openrouter
-                    .chat_stream(
-                        &model_id,
-                        messages,
-                        system_prompt.as_deref(),
-                        Some(0.7),
-                        None,
-                        web_search,
-                        web_search_max_results,
-                    )
-                    .await;
-                drop(openrouter);
+                let stream_result = match provider_route {
+                    ModelProviderRoute::Ollama => {
+                        let ollama = ollama_arc.read().await;
+                        let result = ollama
+                            .chat_stream(&model_id, messages, system_prompt.as_deref(), Some(0.7))
+                            .await;
+                        drop(ollama);
+                        result.map(|stream| {
+                            Box::pin(stream)
+                                as std::pin::Pin<
+                                    Box<dyn futures::Stream<Item = anyhow::Result<String>> + Send>,
+                                >
+                        })
+                    }
+                    ModelProviderRoute::OpenRouter => {
+                        let openrouter = openrouter_arc.read().await;
+                        let result = openrouter
+                            .chat_stream(
+                                &model_id,
+                                messages,
+                                system_prompt.as_deref(),
+                                Some(0.7),
+                                None,
+                                Some(reasoning_effort.as_str()),
+                                web_search,
+                                web_search_max_results,
+                            )
+                            .await;
+                        drop(openrouter);
+                        result.map(|stream| {
+                            Box::pin(stream)
+                                as std::pin::Pin<
+                                    Box<dyn futures::Stream<Item = anyhow::Result<String>> + Send>,
+                                >
+                        })
+                    }
+                };
 
                 match stream_result {
                     Ok(stream) => {
-                        let mut stream = Box::pin(stream);
+                        let mut stream = stream;
                         let mut full_content = String::new();
 
                         loop {
@@ -1526,11 +1748,25 @@ pub async fn regenerate_response(
         .find(|t| t.id == tile_id)
         .ok_or_else(|| "Tile not found".to_string())?;
 
-    if !tile.responses.contains_key(&model_id) {
+    let model_route = {
+        let settings = state.settings_service.read().await;
+        resolve_model_route(
+            &tile.prompt_type,
+            &tile.context_mode,
+            tile.twin_llm_provider.as_deref(),
+            settings.get(),
+        )?
+    };
+    let effective_model_id = effective_model_ids(&model_route, std::slice::from_ref(&model_id))
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| model_id.clone());
+
+    if !tile.responses.contains_key(&effective_model_id) {
         return Err("Response not found".to_string());
     }
 
-    let request = prompt_request_from_tile(tile, vec![model_id.clone()], 0.7, None);
+    let request = prompt_request_from_tile(tile, vec![effective_model_id.clone()], 0.7);
     let resolved_context = resolve_prompt_context(state.inner(), &session, &request).await?;
 
     // Reset response to streaming
@@ -1539,7 +1775,7 @@ pub async fn regenerate_response(
         let _ = store.update_tile_response(
             &session_id,
             &tile_id,
-            &model_id,
+            &effective_model_id,
             "",
             ResponseStatus::Streaming,
             None,
@@ -1547,31 +1783,59 @@ pub async fn regenerate_response(
     }
 
     let openrouter_arc = state.openrouter.clone();
+    let ollama_arc = state.ollama.clone();
     let canvas_store_arc = state.canvas_store.clone();
     let twin_store_arc = state.twin_store.clone();
     let messages = resolved_context.messages.clone();
     let system_prompt = resolved_context.system_prompt.clone();
     let web_search = request.web_search;
     let web_search_max_results = request.web_search_max_results;
+    let reasoning_effort = request.reasoning_effort.clone();
+    let provider_route = model_route.provider.clone();
 
     tauri::async_runtime::spawn(async move {
-        let openrouter = openrouter_arc.read().await;
-        let stream_result = openrouter
-            .chat_stream(
-                &model_id,
-                messages,
-                system_prompt.as_deref(),
-                Some(0.7),
-                None,
-                web_search,
-                web_search_max_results,
-            )
-            .await;
-        drop(openrouter);
+        let model_id = effective_model_id;
+        let stream_result = match provider_route {
+            ModelProviderRoute::Ollama => {
+                let ollama = ollama_arc.read().await;
+                let result = ollama
+                    .chat_stream(&model_id, messages, system_prompt.as_deref(), Some(0.7))
+                    .await;
+                drop(ollama);
+                result.map(|stream| {
+                    Box::pin(stream)
+                        as std::pin::Pin<
+                            Box<dyn futures::Stream<Item = anyhow::Result<String>> + Send>,
+                        >
+                })
+            }
+            ModelProviderRoute::OpenRouter => {
+                let openrouter = openrouter_arc.read().await;
+                let result = openrouter
+                    .chat_stream(
+                        &model_id,
+                        messages,
+                        system_prompt.as_deref(),
+                        Some(0.7),
+                        None,
+                        Some(reasoning_effort.as_str()),
+                        web_search,
+                        web_search_max_results,
+                    )
+                    .await;
+                drop(openrouter);
+                result.map(|stream| {
+                    Box::pin(stream)
+                        as std::pin::Pin<
+                            Box<dyn futures::Stream<Item = anyhow::Result<String>> + Send>,
+                        >
+                })
+            }
+        };
 
         match stream_result {
             Ok(stream) => {
-                let mut stream = Box::pin(stream);
+                let mut stream = stream;
                 let mut full_content = String::new();
                 let mut final_error: Option<String> = None;
 
@@ -1683,7 +1947,6 @@ fn prompt_request_from_tile(
     tile: &PromptTile,
     models: Vec<String>,
     temperature: f64,
-    max_tokens: Option<u32>,
 ) -> PromptRequest {
     PromptRequest {
         prompt: tile.prompt.clone(),
@@ -1694,13 +1957,88 @@ fn prompt_request_from_tile(
         context_mode: tile.context_mode.clone(),
         twin_answer_mode: tile.twin_answer_mode.clone(),
         twin_context_policy: tile.twin_context_policy.clone(),
+        twin_llm_provider: tile.twin_llm_provider.clone(),
         decision_metadata: tile.decision_metadata.clone(),
         parent_tile_id: tile.parent_tile_id.clone(),
         parent_model_id: tile.parent_model_id.clone(),
         temperature,
-        max_tokens,
+        max_tokens: None,
         web_search: tile.web_search,
         web_search_max_results: tile.web_search_max_results,
+        reasoning_effort: tile.reasoning_effort.clone(),
+    }
+}
+
+fn resolve_model_route(
+    prompt_type: &PromptType,
+    context_mode: &ContextMode,
+    twin_provider_override: Option<&str>,
+    settings: &UserSettings,
+) -> Result<ModelRoute, String> {
+    let twin_provider = twin_provider_override
+        .map(|provider| provider.trim().to_ascii_lowercase())
+        .filter(|provider| provider == "ollama" || provider == "openrouter")
+        .unwrap_or_else(|| settings.twin_llm_provider.to_ascii_lowercase());
+
+    if is_vault_context_prompt(prompt_type, context_mode) && twin_provider != "ollama" {
+        return Err(
+            "Vault, history, and twin context require Private Local Ollama. Set Context Mode to None before using OpenRouter/API."
+                .to_string(),
+        );
+    }
+
+    if is_vault_context_prompt(prompt_type, context_mode) && twin_provider == "ollama" {
+        let model = settings.ollama_model.trim();
+        if model.is_empty() {
+            return Err(
+                "Select an Ollama model for local vault/twin responses before sending vault context"
+                    .to_string(),
+            );
+        }
+
+        return Ok(ModelRoute {
+            provider: ModelProviderRoute::Ollama,
+            model_ids: vec![model.to_string()],
+        });
+    }
+
+    Ok(ModelRoute {
+        provider: ModelProviderRoute::OpenRouter,
+        model_ids: Vec::new(),
+    })
+}
+
+fn source_tile_context_provider(
+    session: &CanvasSession,
+    source_tile_ids: &[String],
+) -> (bool, Option<String>) {
+    for tile_id in source_tile_ids {
+        if let Some(tile) = session.prompt_tiles.iter().find(|tile| &tile.id == tile_id) {
+            if is_vault_context_prompt(&tile.prompt_type, &tile.context_mode) {
+                return (true, tile.twin_llm_provider.clone());
+            }
+        }
+    }
+
+    (false, None)
+}
+
+fn is_vault_context_prompt(prompt_type: &PromptType, context_mode: &ContextMode) -> bool {
+    prompt_type == &PromptType::Decision
+        || matches!(
+            context_mode,
+            ContextMode::KnowledgeSearch
+                | ContextMode::Semantic
+                | ContextMode::Twin
+                | ContextMode::FullHistory
+                | ContextMode::Compact
+        )
+}
+
+fn effective_model_ids(route: &ModelRoute, requested_model_ids: &[String]) -> Vec<String> {
+    match route.provider {
+        ModelProviderRoute::Ollama => route.model_ids.clone(),
+        ModelProviderRoute::OpenRouter => requested_model_ids.to_vec(),
     }
 }
 
@@ -2165,13 +2503,9 @@ async fn resolve_twin_prompt_context(
         let (approved, candidate) = twin_store
             .select_context_records(&request.prompt)
             .map_err(|error| error.to_string())?;
-        let (constitution_items, action_gaps) = if request.prompt_type == PromptType::Decision {
-            twin_store
-                .select_constitution_context(&constitution_query)
-                .map_err(|error| error.to_string())?
-        } else {
-            (Vec::new(), Vec::new())
-        };
+        let (constitution_items, action_gaps) = twin_store
+            .select_constitution_context(&constitution_query)
+            .map_err(|error| error.to_string())?;
         (approved, candidate, constitution_items, action_gaps)
     };
 
@@ -2497,13 +2831,57 @@ fn build_twin_context_prompt(
     decision_metadata: Option<&DecisionPromptMetadata>,
 ) -> String {
     let mut prompt = String::from(
-        "You are Grafyn's native RAG twin mode. Use only the provided vault notes and user-reviewed twin records as personal context. \
-         Do not claim to be the user. Keep uncertainty visible, and do not treat tentative candidate records as facts.\n\n",
+        "## Twin Operating Contract\n\n\
+         You are Grafyn's native RAG twin mode. Use only the provided Constitution, action gaps, vault evidence, and user-reviewed twin records as context. \
+         Do not claim to be the user. Keep uncertainty visible. Do not use evidence to justify a preselected answer; use evidence to constrain the answer before choosing. \
+         Use interviewee answers as evidence about the interviewee, institution, product, or research context. \
+         Use interviewer questions and follow-ups as evidence about the user's reasoning pattern. \
+         Keep these roles separate.\n\n",
     );
 
-    prompt.push_str("## Relevant Vault Notes\n\n");
+    let reviewed_constitution = constitution_items
+        .iter()
+        .filter(|item| {
+            matches!(
+                item.status,
+                crate::models::twin::ConstitutionStatus::Active
+                    | crate::models::twin::ConstitutionStatus::Softened
+            )
+        })
+        .collect::<Vec<_>>();
+    let candidate_constitution = constitution_items
+        .iter()
+        .filter(|item| item.status == crate::models::twin::ConstitutionStatus::Candidate)
+        .collect::<Vec<_>>();
+
+    prompt.push_str("## Reviewed Constitution\n\n");
+    if reviewed_constitution.is_empty() {
+        prompt.push_str("No reviewed Constitution items were selected for this prompt.\n\n");
+    } else {
+        prompt.push_str("These are the governing principles for the answer. Apply them before weighing evidence.\n");
+        for item in reviewed_constitution {
+            prompt.push_str(&format_constitution_item(item));
+        }
+        prompt.push('\n');
+    }
+
+    prompt.push_str("## Action Gap Risks\n\n");
+    if action_gaps.is_empty() {
+        prompt
+            .push_str("No relevant stated-intention vs revealed-behavior gaps were selected.\n\n");
+    } else {
+        prompt.push_str("Use these as risk checks, not accusations. Ask whether the same gap could affect this answer.\n");
+        for gap in action_gaps {
+            prompt.push_str(&format_action_gap(gap));
+        }
+        prompt.push('\n');
+    }
+
+    prompt.push_str("## Relevant Evidence\n\n");
     if notes.is_empty() {
-        prompt.push_str("No relevant vault notes were selected for this prompt.\n\n");
+        prompt.push_str(
+            "No relevant vault notes or graph evidence were selected for this prompt.\n\n",
+        );
     } else {
         for (id, title, content) in notes {
             prompt.push_str(&format!("### {} (id: {})\n{}\n\n", title, id, content));
@@ -2531,43 +2909,30 @@ fn build_twin_context_prompt(
         prompt.push('\n');
     }
 
-    if prompt_type == &PromptType::Decision {
-        prompt.push_str("## Active Constitutional Slice\n\n");
-        if constitution_items.is_empty() {
-            prompt.push_str("No relevant constitution items were selected for this decision.\n\n");
-        } else {
-            prompt.push_str("These are evidence-backed principles or hypotheses. Distinguish values, taste, somatic cues, constraints, and unsupported hypotheses.\n");
-            for item in constitution_items {
-                prompt.push_str(&format_constitution_item(item));
-            }
-            prompt.push('\n');
+    if !candidate_constitution.is_empty() {
+        prompt.push_str("## Candidate Constitution Hypotheses\n\n");
+        prompt.push_str("These are unreviewed Constitution hypotheses. Use them only as tentative context and label their influence.\n");
+        for item in candidate_constitution {
+            prompt.push_str(&format_constitution_item(item));
         }
-
-        prompt.push_str("## Action Gap Risks\n\n");
-        if action_gaps.is_empty() {
-            prompt.push_str(
-                "No relevant stated-intention vs revealed-behavior gaps were selected.\n\n",
-            );
-        } else {
-            prompt.push_str("Use these as risk checks, not accusations. Ask whether the same gap could affect this decision.\n");
-            for gap in action_gaps {
-                prompt.push_str(&format_action_gap(gap));
-            }
-            prompt.push('\n');
-        }
+        prompt.push('\n');
     }
 
-    prompt.push_str("## Instructions\n\n");
+    prompt.push_str("## Answer Instructions\n\n");
     match answer_mode {
         TwinAnswerMode::Advisor => prompt.push_str(
             "Answer as a decision-support assistant for the user. Use approved records as stable personalization. \
-             Use candidate records only as tentative context. Separate what is grounded in notes/records from your recommendation.\n",
+             Use candidate records only as tentative context. Separate what is grounded in Constitution, evidence, records, and your recommendation.\n",
         ),
         TwinAnswerMode::Simulation => prompt.push_str(
             "Answer as a likely-user-style simulation for reflection. Label the response as a simulation, not the user's actual view. \
              Use approved records as stronger style and preference evidence; mention candidate influence as tentative when relevant.\n",
         ),
     }
+    prompt.push_str(
+        "When the user asks for a choice or recommendation, include: Recommended option, Constitution principles used, Supporting evidence, Uncertainty, and What would change the recommendation. \
+         Cite Constitution item ids and note titles where they affect the answer.\n",
+    );
 
     if prompt_type == &PromptType::Decision {
         prompt.push_str(
@@ -2586,7 +2951,8 @@ fn build_twin_context_prompt(
              11. Feedback Request\n\n\
              Treat every self-model claim as a hypothesis, not identity. Say where the claim is grounded in vault notes, approved records, or tentative records. \
              If a claim is useful but weakly supported, label it as unsupported or low-confidence. Do not claim to know what the user would do. \
-             In Constitution Check, separate stated values, revealed behavior, taste, somatic signal, and constraints. In Action Gap Risk, state whether past intention-action gaps could change the next step.\n",
+             In Constitution Check, separate stated values, revealed behavior, taste, somatic signal, and constraints. In Action Gap Risk, state whether past intention-action gaps could change the next step. \
+             Recommendation must be derived after the Constitution Check and Evidence From Grafyn sections, not before them.\n",
         );
 
         if let Some(metadata) = decision_metadata {
@@ -2634,16 +3000,45 @@ fn format_twin_record(record: &TwinContextRecord) -> String {
 }
 
 fn format_constitution_item(item: &ConstitutionItem) -> String {
+    let source_labels = constitution_source_labels(item);
     format!(
-        "- [id {}; dimension {}; status {:?}; confidence {:.2}; priority {:.2}; evidence {}] {}\n",
+        "- [id {}; dimension {}; status {:?}; confidence {:.2}; priority {:.2}; evidence {}; sources: {}] {}\n",
         item.id,
         item.dimension,
         item.status,
         item.confidence,
         item.priority,
         item.evidence_refs.len(),
+        source_labels,
         item.claim
     )
+}
+
+fn constitution_source_labels(item: &ConstitutionItem) -> String {
+    let mut labels = item
+        .evidence_refs
+        .iter()
+        .flat_map(|evidence| {
+            [
+                evidence.source_type.as_deref(),
+                evidence.source_label.as_deref(),
+                evidence.speaker_role.as_deref(),
+            ]
+        })
+        .flatten()
+        .map(str::trim)
+        .filter(|label| !label.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    labels.sort();
+    labels.dedup();
+    if labels.is_empty() {
+        item.source
+            .clone()
+            .unwrap_or_else(|| "unspecified".to_string())
+    } else {
+        labels.join(", ")
+    }
 }
 
 fn format_action_gap(gap: &ActionGap) -> String {
@@ -2724,10 +3119,12 @@ mod tests {
             candidate_twin_records: Vec::new(),
             twin_answer_mode: TwinAnswerMode::default(),
             twin_context_policy: None,
+            twin_llm_provider: None,
             decision_metadata: None,
             decision_episode_id: None,
             web_search: false,
             web_search_max_results: 5,
+            reasoning_effort: "none".to_string(),
         }
     }
 
@@ -2762,6 +3159,7 @@ mod tests {
             context_mode,
             twin_answer_mode: TwinAnswerMode::default(),
             twin_context_policy: None,
+            twin_llm_provider: None,
             decision_metadata: None,
             parent_tile_id: Some(parent_tile_id.to_string()),
             parent_model_id: Some(parent_model_id.to_string()),
@@ -2769,6 +3167,7 @@ mod tests {
             max_tokens: None,
             web_search: false,
             web_search_max_results: 5,
+            reasoning_effort: "none".to_string(),
         }
     }
 
@@ -2796,6 +3195,58 @@ mod tests {
             score,
             snippet: snippet.to_string(),
             relevance_reasons: reasons.iter().map(|reason| reason.to_string()).collect(),
+        }
+    }
+
+    fn build_constitution_item(
+        id: &str,
+        claim: &str,
+        status: crate::models::twin::ConstitutionStatus,
+        source_type: &str,
+    ) -> ConstitutionItem {
+        ConstitutionItem {
+            id: id.to_string(),
+            claim: claim.to_string(),
+            dimension: "values".to_string(),
+            scope: vec!["general".to_string()],
+            priority: 0.8,
+            confidence: 0.82,
+            status,
+            evidence_refs: vec![crate::models::twin::EvidenceRef {
+                trace_id: format!("trace-{}", id),
+                event_id: format!("event-{}", id),
+                session_id: "session-1".to_string(),
+                tile_id: None,
+                model_id: None,
+                note: Some("Evidence note".to_string()),
+                source_type: Some(source_type.to_string()),
+                source_id: Some(format!("source-{}", id)),
+                source_label: Some("Interview question".to_string()),
+                excerpt: Some("Can you give a concrete example?".to_string()),
+                speaker_role: Some("user".to_string()),
+            }],
+            tensions: Vec::new(),
+            linked_record_ids: Vec::new(),
+            source: Some("interview_behavior_inference".to_string()),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    fn build_action_gap(id: &str) -> ActionGap {
+        ActionGap {
+            id: id.to_string(),
+            stated_value: "Protect mission alignment".to_string(),
+            revealed_behavior: "Accepts attractive adjacent projects".to_string(),
+            driver_hypothesis: Some("Funding pressure".to_string()),
+            somatic_taste_signal: Some("Prestige pull".to_string()),
+            decision_risk: "May divert faculty from core mission work".to_string(),
+            evidence_refs: Vec::new(),
+            linked_record_ids: Vec::new(),
+            confidence: 0.72,
+            status: crate::models::twin::ConstitutionStatus::Active,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
         }
     }
 
@@ -2899,26 +3350,73 @@ mod tests {
             evidence_count: 1,
             source_label: Some("candidate".into()),
         }];
+        let constitution = vec![
+            build_constitution_item(
+                "constitution-active",
+                "Prefer mission alignment before opportunistic funding.",
+                crate::models::twin::ConstitutionStatus::Active,
+                "interview-question",
+            ),
+            build_constitution_item(
+                "constitution-candidate",
+                "May prefer negotiation before rejection.",
+                crate::models::twin::ConstitutionStatus::Candidate,
+                "behavior",
+            ),
+            build_constitution_item(
+                "constitution-rejected",
+                "Rejected claims must not leak.",
+                crate::models::twin::ConstitutionStatus::Rejected,
+                "note",
+            ),
+            build_constitution_item(
+                "constitution-not-me",
+                "Not-me claims must not leak.",
+                crate::models::twin::ConstitutionStatus::NotMe,
+                "note",
+            ),
+            build_constitution_item(
+                "constitution-no-train",
+                "No-train claims must not leak.",
+                crate::models::twin::ConstitutionStatus::NoTrain,
+                "note",
+            ),
+        ];
+        let gaps = vec![build_action_gap("gap-1")];
 
         let prompt = build_twin_context_prompt(
             &[(
                 "note-1".into(),
                 "Decision Notes".into(),
-                "Use tests.".into(),
+                "### Message 2: Interviewee\nExpert says accept grants when partnerships are strategic.".into(),
             )],
             &approved,
             &candidates,
-            &[],
-            &[],
+            &constitution,
+            &gaps,
             &TwinAnswerMode::Advisor,
             &PromptType::Standard,
             None,
         );
 
-        assert!(prompt.contains("## Relevant Vault Notes"));
+        assert!(prompt.contains("## Twin Operating Contract"));
+        assert!(prompt.contains("## Reviewed Constitution"));
+        assert!(prompt.contains("Prefer mission alignment before opportunistic funding."));
+        assert!(prompt.contains("Interview question"));
+        assert!(prompt.contains("## Action Gap Risks"));
+        assert!(prompt.contains("May divert faculty from core mission work"));
+        assert!(prompt.contains("## Relevant Evidence"));
+        assert!(prompt.contains("Expert says accept grants when partnerships are strategic."));
         assert!(prompt.contains("## Approved User Records"));
         assert!(prompt.contains("## Tentative Candidate Records"));
-        assert!(prompt.contains("unreviewed hypotheses"));
+        assert!(prompt.contains("Candidate Constitution Hypotheses"));
+        assert!(prompt.contains("May prefer negotiation before rejection."));
+        assert!(!prompt.contains("Rejected claims must not leak."));
+        assert!(!prompt.contains("Not-me claims must not leak."));
+        assert!(!prompt.contains("No-train claims must not leak."));
+        assert!(prompt.contains("Use interviewee answers as evidence about the interviewee"));
+        assert!(prompt.contains("Do not use evidence to justify a preselected answer"));
+        assert!(prompt.contains("Recommended option"));
         assert!(prompt.contains("decision-support assistant"));
     }
 
@@ -2937,6 +3435,7 @@ mod tests {
 
         assert!(prompt.contains("likely-user-style simulation"));
         assert!(prompt.contains("not the user's actual view"));
+        assert!(prompt.contains("## Reviewed Constitution"));
     }
 
     #[test]
@@ -2963,6 +3462,7 @@ mod tests {
         assert!(prompt.contains("Decision Mirror session"));
         assert!(prompt.contains("Reflection Card"));
         assert!(prompt.contains("Blind Spot Hypothesis"));
+        assert!(prompt.contains("Recommendation must be derived after the Constitution Check and Evidence From Grafyn sections"));
         assert!(prompt.contains("Decision: Should Grafyn build Decision Mirror first?"));
         assert!(prompt.contains("Topology layer"));
     }
@@ -3136,16 +3636,17 @@ mod tests {
         let tile = PromptTile {
             web_search: true,
             web_search_max_results: 8,
+            reasoning_effort: "high".to_string(),
             ..build_tile("tile-1", "Prompt", "openai/gpt-4", "Response", None, None)
         };
 
-        let request =
-            prompt_request_from_tile(&tile, vec!["openai/gpt-4".to_string()], 0.3, Some(4096));
+        let request = prompt_request_from_tile(&tile, vec!["openai/gpt-4".to_string()], 0.3);
 
         assert!(request.web_search);
         assert_eq!(request.web_search_max_results, 8);
         assert_eq!(request.temperature, 0.3);
-        assert_eq!(request.max_tokens, Some(4096));
+        assert_eq!(request.max_tokens, None);
+        assert_eq!(request.reasoning_effort, "high");
     }
 
     #[test]
@@ -3154,10 +3655,11 @@ mod tests {
             context_mode: ContextMode::Twin,
             twin_answer_mode: TwinAnswerMode::Simulation,
             twin_context_policy: Some("approved_plus_relevant_candidates".to_string()),
+            twin_llm_provider: Some("ollama".to_string()),
             ..build_tile("tile-1", "Prompt", "openai/gpt-4", "Response", None, None)
         };
 
-        let request = prompt_request_from_tile(&tile, vec!["openai/gpt-4".to_string()], 0.7, None);
+        let request = prompt_request_from_tile(&tile, vec!["openai/gpt-4".to_string()], 0.7);
 
         assert_eq!(request.context_mode, ContextMode::Twin);
         assert_eq!(request.twin_answer_mode, TwinAnswerMode::Simulation);
@@ -3165,6 +3667,67 @@ mod tests {
             request.twin_context_policy.as_deref(),
             Some("approved_plus_relevant_candidates")
         );
+        assert_eq!(request.twin_llm_provider.as_deref(), Some("ollama"));
+    }
+
+    #[test]
+    fn model_route_uses_ollama_for_all_vault_context_when_configured() {
+        let mut settings = crate::models::settings::UserSettings::default();
+        settings.twin_llm_provider = "ollama".to_string();
+        settings.ollama_model = "llama3.1:8b".to_string();
+
+        let decision_route = resolve_model_route(
+            &PromptType::Decision,
+            &ContextMode::KnowledgeSearch,
+            None,
+            &settings,
+        )
+        .unwrap();
+        let twin_route =
+            resolve_model_route(&PromptType::Standard, &ContextMode::Twin, None, &settings)
+                .unwrap();
+        let normal_route =
+            resolve_model_route(&PromptType::Standard, &ContextMode::None, None, &settings)
+                .unwrap();
+
+        assert_eq!(decision_route.provider, ModelProviderRoute::Ollama);
+        assert_eq!(decision_route.model_ids, vec!["llama3.1:8b".to_string()]);
+        assert_eq!(twin_route.provider, ModelProviderRoute::Ollama);
+        assert_eq!(normal_route.provider, ModelProviderRoute::OpenRouter);
+        assert!(normal_route.model_ids.is_empty());
+    }
+
+    #[test]
+    fn model_route_blocks_openrouter_for_vault_context_override() {
+        let mut settings = crate::models::settings::UserSettings::default();
+        settings.twin_llm_provider = "ollama".to_string();
+        settings.ollama_model = "llama3.1:8b".to_string();
+
+        let error = resolve_model_route(
+            &PromptType::Decision,
+            &ContextMode::Twin,
+            Some("openrouter"),
+            &settings,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("require Private Local Ollama"));
+    }
+
+    #[test]
+    fn model_route_fails_closed_when_local_twin_model_is_missing() {
+        let mut settings = crate::models::settings::UserSettings::default();
+        settings.twin_llm_provider = "ollama".to_string();
+
+        let error = resolve_model_route(
+            &PromptType::Decision,
+            &ContextMode::KnowledgeSearch,
+            None,
+            &settings,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("Select an Ollama model"));
     }
 
     #[test]

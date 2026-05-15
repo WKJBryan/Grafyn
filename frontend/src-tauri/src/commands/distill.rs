@@ -384,6 +384,7 @@ async fn extract_candidates_llm(
             Some(system),
             Some(0.3),
             Some(4096),
+            None,
             false,
             5,
         )
@@ -755,16 +756,10 @@ pub async fn distill_note(
     // 2. Determine extraction strategy
     let use_llm = match request.extraction_mode {
         ExtractionMode::Llm => {
-            let openrouter_configured = {
-                let or = state.openrouter.read().await;
-                or.is_configured()
-            };
-            if !openrouter_configured {
-                return Err(
-                    "LLM extraction requested but OpenRouter API key not configured".into(),
-                );
-            }
-            true
+            return Err(
+                "LLM extraction is disabled because it would send vault note content to OpenRouter. Use algorithm extraction or a local-only extractor."
+                    .into(),
+            );
         }
         ExtractionMode::Algorithm => false,
     };

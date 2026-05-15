@@ -146,7 +146,7 @@ function mountContainer() {
         AddModelDialog: { template: '<div />' },
         PinnedNotesPanel: { template: '<div />' },
         PromptDialog: {
-          props: ['models', 'presets', 'branchContext', 'smartWebSearch', 'openRouterConfigured'],
+          props: ['models', 'presets', 'branchContext', 'smartWebSearch', 'openRouterConfigured', 'twinLlmProvider', 'ollamaModel'],
           template: `
             <div class="prompt-dialog-stub">
               <button class="submit-stub" @click="$emit('submit', {
@@ -172,6 +172,7 @@ function mountContainer() {
                 temperature: 0.4,
                 contextMode: 'twin',
                 twinAnswerMode: 'advisor',
+                twinLlmProvider: 'ollama',
                 webSearch: false
               })" />
             </div>
@@ -257,7 +258,7 @@ describe('CanvasContainer', () => {
     toastSuccess.mockReset()
   })
 
-  it('opens the API key required dialog when the prompt button is clicked without a configured key', async () => {
+  it('opens the prompt dialog without an API key so users can choose a local twin runtime', async () => {
     getOpenRouterStatus.mockResolvedValue({ has_key: false, is_configured: false })
 
     const wrapper = mountContainer()
@@ -265,13 +266,11 @@ describe('CanvasContainer', () => {
     await wrapper.find('[data-guide="canvas-prompt-btn"]').trigger('click')
     await flushPromises()
 
-    expect(wrapper.text()).toContain('OpenRouter API Key Required')
-    expect(wrapper.find('.prompt-dialog-stub').exists()).toBe(false)
-    expect(wrapper.text()).not.toContain('Open Settings')
-    expect(wrapper.text()).toContain('Close')
+    expect(wrapper.find('.prompt-dialog-stub').exists()).toBe(true)
+    expect(wrapper.text()).not.toContain('OpenRouter API Key Required')
   })
 
-  it('blocks submit if OpenRouter becomes unavailable after the dialog opens', async () => {
+  it('blocks API submit if OpenRouter becomes unavailable after the dialog opens', async () => {
     getOpenRouterStatus
       .mockResolvedValueOnce({ has_key: true, is_configured: true })
       .mockResolvedValueOnce({ has_key: true, is_configured: true })
@@ -290,6 +289,21 @@ describe('CanvasContainer', () => {
     expect(store.sendPrompt).not.toHaveBeenCalled()
     expect(store.branchFromResponse).not.toHaveBeenCalled()
     expect(wrapper.text()).toContain('OpenRouter API Key Required')
+  })
+
+  it('allows a local twin submit without an OpenRouter key', async () => {
+    getOpenRouterStatus.mockResolvedValue({ has_key: false, is_configured: false })
+    getStatus.mockResolvedValue({ smart_web_search: true, twin_llm_provider: 'ollama', ollama_model: 'llama3.1:8b' })
+
+    const wrapper = mountContainer()
+    await flushPromises()
+    await wrapper.find('[data-guide="canvas-prompt-btn"]').trigger('click')
+    await flushPromises()
+    await wrapper.find('.decision-submit-stub').trigger('click')
+    await flushPromises()
+
+    expect(store.sendPrompt).toHaveBeenCalled()
+    expect(wrapper.text()).not.toContain('OpenRouter API Key Required')
   })
 
   it('passes Decision Mirror metadata through the Canvas submit path', async () => {
@@ -321,7 +335,9 @@ describe('CanvasContainer', () => {
         stakes: 'Product direction',
         initial_leaning: 'Decision Mirror',
         review_date: '2026-05-15'
-      }
+      },
+      'none',
+      'ollama'
     )
   })
 

@@ -274,9 +274,13 @@ pub async fn save_constitution_setup(
 pub async fn run_constitution_inference(
     state: State<'_, AppState>,
 ) -> Result<ConstitutionInferenceSummary, String> {
+    let notes = {
+        let store = state.knowledge_store.read().await;
+        store.list_full_notes().map_err(|error| error.to_string())?
+    };
     let mut store = state.twin_store.write().await;
     store
-        .run_constitution_inference()
+        .run_constitution_inference_with_notes(&notes)
         .map_err(|error| error.to_string())
 }
 
@@ -421,6 +425,11 @@ fn build_record_from_feedback(
             tile_id: Some(response_ref.tile_id.clone()),
             model_id: Some(response_ref.model_id.clone()),
             note: request.rationale.clone(),
+            source_type: Some("behavior".to_string()),
+            source_id: Some(trace_event.id.clone()),
+            source_label: Some("Canvas feedback".to_string()),
+            excerpt: request.rationale.clone(),
+            speaker_role: Some("user".to_string()),
         });
     } else if let Some(first_ranked) = request.ranked_responses.first() {
         evidence_refs.push(EvidenceRef {
@@ -430,6 +439,11 @@ fn build_record_from_feedback(
             tile_id: Some(first_ranked.tile_id.clone()),
             model_id: Some(first_ranked.model_id.clone()),
             note: request.rationale.clone(),
+            source_type: Some("behavior".to_string()),
+            source_id: Some(trace_event.id.clone()),
+            source_label: Some("Canvas ranking".to_string()),
+            excerpt: request.rationale.clone(),
+            speaker_role: Some("user".to_string()),
         });
     } else {
         evidence_refs.push(EvidenceRef {
@@ -439,6 +453,11 @@ fn build_record_from_feedback(
             tile_id: None,
             model_id: None,
             note: request.rationale.clone(),
+            source_type: Some("behavior".to_string()),
+            source_id: Some(trace_event.id.clone()),
+            source_label: Some("Canvas feedback".to_string()),
+            excerpt: request.rationale.clone(),
+            speaker_role: Some("user".to_string()),
         });
     }
 

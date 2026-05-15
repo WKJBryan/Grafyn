@@ -185,8 +185,18 @@
               <span class="status-pill">{{ statusLabel(item.status) }}</span>
               <span>{{ formatPercent(item.confidence) }} confidence</span>
               <span>{{ item.evidence_refs?.length || 0 }} evidence</span>
+              <span>{{ constitutionSourceLabel(item) }}</span>
             </div>
             <p>{{ item.claim }}</p>
+            <div
+              v-if="constitutionEvidenceLabels(item).length"
+              class="source-row"
+            >
+              <span
+                v-for="label in constitutionEvidenceLabels(item)"
+                :key="`${item.id}-${label}`"
+              >{{ label }}</span>
+            </div>
             <div
               v-if="item.scope?.length"
               class="tag-row"
@@ -936,7 +946,7 @@ async function runConstitutionInference() {
   try {
     const summary = await twin.runConstitutionInference()
     await loadWorkspace()
-    showMessage('success', `Constitution: ${summary.created_constitution_items} items, ${summary.created_action_gaps} gaps`, 3500)
+    showMessage('success', constitutionRunSummary(summary), 4500)
   } catch (err) {
     showMessage('error', err.message || 'Failed to run constitution inference')
   } finally {
@@ -1152,12 +1162,50 @@ function presetLabel(value) {
 function sourceTypeLabel(value) {
   const labels = {
     note: 'Note',
+    behavior: 'Behavior',
+    'interview-question': 'Interview Question',
+    'interview-answer': 'Interview Answer',
+    decision: 'Decision',
+    setup: 'Setup',
     approved_record: 'Approved Record',
     candidate_record: 'Candidate Record',
     constitution_item: 'Constitution',
     action_gap: 'Action Gap'
   }
   return labels[value] || statusLabel(value)
+}
+
+function constitutionSourceLabel(item) {
+  if (item.source) return sourceTypeLabel(item.source)
+  const first = item.evidence_refs?.[0]
+  return sourceTypeLabel(first?.source_type || 'evidence')
+}
+
+function constitutionEvidenceLabels(item) {
+  const labels = new Set()
+  for (const ref of item.evidence_refs || []) {
+    if (ref.source_type) labels.add(sourceTypeLabel(ref.source_type))
+    if (ref.source_label) labels.add(ref.source_label)
+  }
+  return [...labels].slice(0, 4)
+}
+
+function constitutionRunSummary(summary = {}) {
+  const parts = [
+    `${summary.created_constitution_items || 0} items`,
+    `${summary.created_action_gaps || 0} gaps`
+  ]
+  if (summary.auto_active_items) parts.push(`${summary.auto_active_items} active`)
+  if (summary.review_candidate_items) parts.push(`${summary.review_candidate_items} review`)
+  if (summary.scanned_behavior_events) parts.push(`${summary.scanned_behavior_events} behavior events`)
+  if (summary.scanned_notes) parts.push(`${summary.scanned_notes} notes`)
+  if (summary.scanned_interviews) parts.push(`${summary.scanned_interviews} interviews`)
+  if (summary.extracted_research_findings) parts.push(`${summary.extracted_research_findings} findings`)
+  if (summary.pruned_stale_constitution_items) parts.push(`${summary.pruned_stale_constitution_items} stale items removed`)
+  if (summary.pruned_stale_records) parts.push(`${summary.pruned_stale_records} stale records removed`)
+  if (summary.updated_setup_entries) parts.push(`${summary.updated_setup_entries} setup entries`)
+  if (summary.skipped_domain_claims) parts.push(`${summary.skipped_domain_claims} skipped`)
+  return `Constitution: ${parts.join(' / ')}`
 }
 
 function scoreRows(scores = {}) {
@@ -1424,7 +1472,8 @@ function showMessage(type, text, duration = 3500) {
 }
 
 .status-pill,
-.tag-row span {
+.tag-row span,
+.source-row span {
   display: inline-flex;
   align-items: center;
   min-height: 22px;
@@ -1435,7 +1484,8 @@ function showMessage(type, text, duration = 3500) {
   font-size: 0.6875rem;
 }
 
-.tag-row {
+.tag-row,
+.source-row {
   display: flex;
   flex-wrap: wrap;
   gap: 4px;

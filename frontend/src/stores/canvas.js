@@ -4,6 +4,7 @@ import { canvas as canvasApi, twin as twinApi } from '@/api/client'
 
 export const DEFAULT_WEB_SEARCH_MAX_RESULTS = 5
 export const THINK_HARDER_WEB_SEARCH_MAX_RESULTS = 8
+export const REASONING_EFFORTS = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh']
 export const THINK_HARDER_PROMPT = 'Think harder and improve your previous answer.'
 export const THINK_HARDER_SYSTEM_PROMPT = [
   'You are revisiting your immediately previous answer.',
@@ -62,6 +63,21 @@ export const useCanvasStore = defineStore('canvas', () => {
     }
   }
 
+  function normalizeReasoningEffort(reasoningEffort) {
+    return REASONING_EFFORTS.includes(reasoningEffort) ? reasoningEffort : 'none'
+  }
+
+  function compareReasoningEffort(left, right) {
+    return REASONING_EFFORTS.indexOf(normalizeReasoningEffort(left)) -
+      REASONING_EFFORTS.indexOf(normalizeReasoningEffort(right))
+  }
+
+  function maxReasoningEffort(efforts) {
+    return efforts.reduce((max, effort) => (
+      compareReasoningEffort(effort, max) > 0 ? normalizeReasoningEffort(effort) : max
+    ), 'none')
+  }
+
   function normalizeSession(session) {
     if (!session?.prompt_tiles) return session
 
@@ -70,6 +86,7 @@ export const useCanvasStore = defineStore('canvas', () => {
       prompt_tiles: session.prompt_tiles.map(tile => ({
         ...tile,
         prompt_type: tile.prompt_type || 'standard',
+        reasoning_effort: normalizeReasoningEffort(tile.reasoning_effort),
         decision_metadata: tile.decision_metadata || null,
         decision_episode_id: tile.decision_episode_id || null,
         responses: Object.fromEntries(
@@ -78,6 +95,10 @@ export const useCanvasStore = defineStore('canvas', () => {
             normalizeResponse(response)
           ])
         )
+      })),
+      debates: (session.debates || []).map(debate => ({
+        ...debate,
+        reasoning_effort: normalizeReasoningEffort(debate.reasoning_effort)
       }))
     }
   }
@@ -241,12 +262,14 @@ export const useCanvasStore = defineStore('canvas', () => {
     maxTokens = null,
     parentTileId = null,
     parentModelId = null,
-    contextMode = 'knowledge_search',
+    contextMode = 'none',
     twinAnswerMode = 'advisor',
     webSearch = false,
     webSearchMaxResults = DEFAULT_WEB_SEARCH_MAX_RESULTS,
     promptType = 'standard',
-    decisionMetadata = null
+    decisionMetadata = null,
+    reasoningEffort = 'none',
+    twinLlmProvider = null
   ) {
     if (!currentSession.value) {
       throw new Error('No active session')
@@ -288,13 +311,12 @@ export const useCanvasStore = defineStore('canvas', () => {
         context_mode: contextMode,
         twin_answer_mode: twinAnswerMode,
         twin_context_policy: contextMode === 'twin' ? 'approved_plus_relevant_candidates' : null,
+        twin_llm_provider: twinLlmProvider,
         decision_metadata: decisionMetadata,
+        reasoning_effort: normalizeReasoningEffort(reasoningEffort),
         position,
         web_search: webSearch,
         web_search_max_results: webSearchMaxResults
-      }
-      if (maxTokens != null) {
-        request.max_tokens = maxTokens
       }
 
       // Set up event listener BEFORE calling invoke
@@ -603,11 +625,15 @@ export const useCanvasStore = defineStore('canvas', () => {
     participatingModels.forEach(m => addStreaming(m))
 
     try {
+      const reasoningEffort = maxReasoningEffort(
+        tileIds.map(tileId => currentSession.value.prompt_tiles.find(tile => tile.id === tileId)?.reasoning_effort)
+      )
       const request = {
         source_tile_ids: tileIds,
         participating_models: participatingModels,
         debate_mode: mode,
-        max_rounds: maxRounds
+        max_rounds: maxRounds,
+        reasoning_effort: reasoningEffort
       }
 
       let debateCompleteResolve
@@ -699,7 +725,10 @@ export const useCanvasStore = defineStore('canvas', () => {
     participatingModels.forEach(m => addStreaming(m))
 
     try {
-      const request = { prompt }
+      const request = {
+        prompt,
+        reasoning_effort: normalizeReasoningEffort(debate.reasoning_effort)
+      }
 
       let debateCompleteResolve
       const debateCompletePromise = new Promise(resolve => { debateCompleteResolve = resolve })
@@ -958,12 +987,14 @@ export const useCanvasStore = defineStore('canvas', () => {
     systemPrompt = null,
     temperature = 0.7,
     maxTokens = null,
-    contextMode = 'knowledge_search',
+    contextMode = 'none',
     twinAnswerMode = 'advisor',
     webSearch = false,
     webSearchMaxResults = DEFAULT_WEB_SEARCH_MAX_RESULTS,
     promptType = 'standard',
-    decisionMetadata = null
+    decisionMetadata = null,
+    reasoningEffort = 'none',
+    twinLlmProvider = null
   ) {
     return sendPrompt(
       newPrompt,
@@ -978,7 +1009,9 @@ export const useCanvasStore = defineStore('canvas', () => {
       webSearch,
       webSearchMaxResults,
       promptType,
-      decisionMetadata
+      decisionMetadata,
+      reasoningEffort,
+      twinLlmProvider
     )
   }
 
@@ -988,6 +1021,9 @@ export const useCanvasStore = defineStore('canvas', () => {
       ? THINK_HARDER_WEB_SEARCH_MAX_RESULTS
       : DEFAULT_WEB_SEARCH_MAX_RESULTS
 
+    const parentTile = currentSession.value?.prompt_tiles.find(tile => tile.id === parentTileId)
+    const reasoningEffort = maxReasoningEffort([parentTile?.reasoning_effort, 'high'])
+
     return branchFromResponse(
       parentTileId,
       parentModelId,
@@ -995,11 +1031,14 @@ export const useCanvasStore = defineStore('canvas', () => {
       [parentModelId],
       THINK_HARDER_SYSTEM_PROMPT,
       0.3,
-      4096,
+      null,
       'full_history',
       'advisor',
       webSearch,
-      webSearchMaxResults
+      webSearchMaxResults,
+      'standard',
+      null,
+      reasoningEffort
     )
   }
 

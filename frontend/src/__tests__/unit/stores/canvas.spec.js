@@ -17,7 +17,7 @@ describe('Canvas Store', () => {
     listenMock.mockResolvedValue(unlistenMock)
   })
 
-  it('thinkHarderFromResponse creates a same-model full-history request with deeper defaults', async () => {
+  it('thinkHarderFromResponse creates a same-model full-history request with deeper defaults and no max token cap', async () => {
     let streamHandler
     listenMock.mockImplementation(async (_eventName, handler) => {
       streamHandler = handler
@@ -43,6 +43,7 @@ describe('Canvas Store', () => {
         {
           id: 'tile-1',
           prompt: 'Fast answer prompt',
+          reasoning_effort: 'minimal',
           responses: {
             'openai/gpt-4': {
               content: 'Fast answer',
@@ -64,14 +65,15 @@ describe('Canvas Store', () => {
       parent_model_id: 'openai/gpt-4',
       context_mode: 'full_history',
       temperature: 0.3,
-      max_tokens: 4096,
+      reasoning_effort: 'high',
       web_search: true,
       web_search_max_results: THINK_HARDER_WEB_SEARCH_MAX_RESULTS,
       system_prompt: expect.stringContaining('Verify factual claims')
     }))
+    expect(sendPromptSpy.mock.calls[0][1]).not.toHaveProperty('max_tokens')
   })
 
-  it('sendPrompt omits max_tokens for normal prompts', async () => {
+  it('sendPrompt includes reasoning effort and omits max_tokens for normal prompts', async () => {
     let streamHandler
     listenMock.mockImplementation(async (_eventName, handler) => {
       streamHandler = handler
@@ -97,17 +99,117 @@ describe('Canvas Store', () => {
       debates: []
     }
 
-    await store.sendPrompt('Hello', ['openai/gpt-4'])
+    await store.sendPrompt(
+      'Hello',
+      ['openai/gpt-4'],
+      null,
+      0.7,
+      null,
+      null,
+      null,
+      'knowledge_search',
+      'advisor',
+      false,
+      5,
+      'standard',
+      null,
+      'medium'
+    )
 
     expect(sendPromptSpy).toHaveBeenCalledWith('session-1', expect.objectContaining({
       prompt: 'Hello',
       models: ['openai/gpt-4'],
       temperature: 0.7,
+      reasoning_effort: 'medium',
       context_mode: 'knowledge_search',
       web_search: false,
       web_search_max_results: 5
     }))
     expect(sendPromptSpy.mock.calls[0][1]).not.toHaveProperty('max_tokens')
+  })
+
+  it('startDebate inherits the highest source tile reasoning effort', async () => {
+    let streamHandler
+    listenMock.mockImplementation(async (_eventName, handler) => {
+      streamHandler = handler
+      return unlistenMock
+    })
+    vi.spyOn(apiClient.canvas, 'get').mockResolvedValue({
+      id: 'session-1',
+      prompt_tiles: [],
+      debates: [{ id: 'debate-1', reasoning_effort: 'high' }]
+    })
+
+    const startDebateSpy = vi.spyOn(apiClient.canvas, 'startDebate').mockImplementation(async () => {
+      streamHandler({
+        payload: {
+          session_id: 'session-1',
+          type: 'debate_complete',
+          debate_id: 'debate-1'
+        }
+      })
+      return 'debate-1'
+    })
+
+    const store = useCanvasStore()
+    store.currentSession = {
+      id: 'session-1',
+      prompt_tiles: [
+        { id: 'tile-low', reasoning_effort: 'low', responses: {} },
+        { id: 'tile-high', reasoning_effort: 'high', responses: {} }
+      ],
+      debates: []
+    }
+
+    await store.startDebate(['tile-low', 'tile-high'], ['openai/gpt-4'], 'auto', 3)
+
+    expect(startDebateSpy).toHaveBeenCalledWith('session-1', expect.objectContaining({
+      source_tile_ids: ['tile-low', 'tile-high'],
+      reasoning_effort: 'high'
+    }))
+  })
+
+  it('continueDebate reuses stored debate reasoning effort', async () => {
+    let streamHandler
+    listenMock.mockImplementation(async (_eventName, handler) => {
+      streamHandler = handler
+      return unlistenMock
+    })
+    vi.spyOn(apiClient.canvas, 'get').mockResolvedValue({
+      id: 'session-1',
+      prompt_tiles: [],
+      debates: [{ id: 'debate-1', reasoning_effort: 'xhigh' }]
+    })
+
+    const continueDebateSpy = vi.spyOn(apiClient.canvas, 'continueDebate').mockImplementation(async () => {
+      streamHandler({
+        payload: {
+          session_id: 'session-1',
+          type: 'debate_complete',
+          debate_id: 'debate-1'
+        }
+      })
+    })
+
+    const store = useCanvasStore()
+    store.currentSession = {
+      id: 'session-1',
+      prompt_tiles: [],
+      debates: [
+        {
+          id: 'debate-1',
+          participating_models: ['openai/gpt-4'],
+          reasoning_effort: 'xhigh'
+        }
+      ]
+    }
+
+    await store.continueDebate('debate-1', 'Continue')
+
+    expect(continueDebateSpy).toHaveBeenCalledWith('session-1', 'debate-1', {
+      prompt: 'Continue',
+      reasoning_effort: 'xhigh'
+    })
   })
 
   it('sendPrompt includes twin answer mode and context policy for Twin Mode', async () => {
@@ -151,7 +253,58 @@ describe('Canvas Store', () => {
     expect(sendPromptSpy).toHaveBeenCalledWith('session-1', expect.objectContaining({
       context_mode: 'twin',
       twin_answer_mode: 'simulation',
-      twin_context_policy: 'approved_plus_relevant_candidates'
+      twin_context_policy: 'approved_plus_relevant_candidates',
+      twin_llm_provider: null
+    }))
+  })
+
+  it('sendPrompt includes prompt-level twin provider override', async () => {
+    let streamHandler
+    listenMock.mockImplementation(async (_eventName, handler) => {
+      streamHandler = handler
+      return unlistenMock
+    })
+
+    const sendPromptSpy = vi.spyOn(apiClient.canvas, 'sendPrompt').mockImplementation(async () => {
+      streamHandler({
+        payload: {
+          session_id: 'session-1',
+          type: 'complete',
+          tile_id: 'tile-1',
+          model_id: 'openai/gpt-4'
+        }
+      })
+      return 'tile-1'
+    })
+
+    const store = useCanvasStore()
+    store.currentSession = {
+      id: 'session-1',
+      prompt_tiles: [],
+      debates: []
+    }
+
+    await store.sendPrompt(
+      'What would my twin consider?',
+      ['openai/gpt-4'],
+      null,
+      0.7,
+      null,
+      null,
+      null,
+      'twin',
+      'advisor',
+      false,
+      5,
+      'standard',
+      null,
+      'none',
+      'ollama'
+    )
+
+    expect(sendPromptSpy).toHaveBeenCalledWith('session-1', expect.objectContaining({
+      context_mode: 'twin',
+      twin_llm_provider: 'ollama'
     }))
   })
 

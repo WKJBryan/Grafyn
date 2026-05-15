@@ -7,6 +7,7 @@ pub mod knowledge_store;
 pub mod link_discovery;
 pub mod markdown_migration;
 pub mod memory;
+pub mod ollama;
 pub mod openrouter;
 pub mod priority;
 pub mod retrieval;

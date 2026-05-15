@@ -105,6 +105,16 @@ pub struct EvidenceRef {
     pub model_id: Option<String>,
     #[serde(default)]
     pub note: Option<String>,
+    #[serde(default)]
+    pub source_type: Option<String>,
+    #[serde(default)]
+    pub source_id: Option<String>,
+    #[serde(default)]
+    pub source_label: Option<String>,
+    #[serde(default)]
+    pub excerpt: Option<String>,
+    #[serde(default)]
+    pub speaker_role: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -229,6 +239,16 @@ pub struct ResolvedEvidenceRef {
     pub response_excerpt: Option<String>,
     #[serde(default)]
     pub model_name: Option<String>,
+    #[serde(default)]
+    pub source_type: Option<String>,
+    #[serde(default)]
+    pub source_id: Option<String>,
+    #[serde(default)]
+    pub source_label: Option<String>,
+    #[serde(default)]
+    pub excerpt: Option<String>,
+    #[serde(default)]
+    pub speaker_role: Option<String>,
     pub payload: serde_json::Value,
 }
 
@@ -787,6 +807,26 @@ pub struct ConstitutionInferenceSummary {
     pub scanned_decisions: usize,
     pub created_constitution_items: usize,
     pub created_action_gaps: usize,
+    #[serde(default)]
+    pub scanned_behavior_events: usize,
+    #[serde(default)]
+    pub scanned_notes: usize,
+    #[serde(default)]
+    pub scanned_interviews: usize,
+    #[serde(default)]
+    pub auto_active_items: usize,
+    #[serde(default)]
+    pub review_candidate_items: usize,
+    #[serde(default)]
+    pub skipped_domain_claims: usize,
+    #[serde(default)]
+    pub extracted_research_findings: usize,
+    #[serde(default)]
+    pub pruned_stale_constitution_items: usize,
+    #[serde(default)]
+    pub pruned_stale_records: usize,
+    #[serde(default)]
+    pub updated_setup_entries: usize,
     pub generated_at: DateTime<Utc>,
 }
 
