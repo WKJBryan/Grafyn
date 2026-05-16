@@ -126,7 +126,9 @@
 
           <div class="preview-lists">
             <div class="list-card">
-              <div class="list-title">Topic Hubs</div>
+              <div class="list-title">
+                Topic Hubs
+              </div>
               <div
                 v-if="preview.topic_candidates.length === 0"
                 class="subtle"
@@ -147,7 +149,9 @@
             </div>
 
             <div class="list-card">
-              <div class="list-title">Write Candidates</div>
+              <div class="list-title">
+                Write Candidates
+              </div>
               <div
                 v-if="writeCandidates.length === 0"
                 class="subtle"

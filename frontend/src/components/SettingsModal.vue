@@ -210,6 +210,90 @@
           </div>
         </div>
 
+        <div
+          v-if="!isSetup"
+          class="setting-section"
+        >
+          <label class="setting-label">
+            <span class="label-icon">🪞</span>
+            Digital Twin Model
+          </label>
+          <p class="setting-description">
+            Local Ollama keeps Decision Mirror and twin context on this machine. OpenRouter remains available for non-twin canvas, distillation, and discovery features.
+          </p>
+          <div class="provider-options">
+            <label
+              class="provider-option"
+              :class="{ active: twinLlmProvider === 'openrouter' }"
+            >
+              <input
+                v-model="twinLlmProvider"
+                type="radio"
+                value="openrouter"
+              >
+              <span>OpenRouter</span>
+            </label>
+            <label
+              class="provider-option"
+              :class="{ active: twinLlmProvider === 'ollama' }"
+            >
+              <input
+                v-model="twinLlmProvider"
+                type="radio"
+                value="ollama"
+              >
+              <span>Local Ollama</span>
+            </label>
+          </div>
+          <div
+            v-if="twinLlmProvider === 'ollama'"
+            class="ollama-settings"
+          >
+            <label class="optimizer-field">
+              <span>Ollama URL</span>
+              <input
+                v-model="ollamaBaseUrl"
+                type="text"
+                class="ollama-base-url-input"
+              >
+            </label>
+            <div class="ollama-model-row">
+              <label class="optimizer-field ollama-model-field">
+                <span>Ollama Model</span>
+                <select
+                  v-model="ollamaModel"
+                  class="ollama-model-select"
+                >
+                  <option value="">
+                    Select a local model
+                  </option>
+                  <option
+                    v-for="model in availableOllamaModels"
+                    :key="model.id"
+                    :value="model.id"
+                  >
+                    {{ model.name }}
+                  </option>
+                </select>
+              </label>
+              <button
+                class="action-btn action-btn-secondary check-ollama-btn"
+                :disabled="ollamaLoading"
+                @click="loadOllamaModels"
+              >
+                {{ ollamaLoading ? 'Checking...' : 'Check Ollama' }}
+              </button>
+            </div>
+            <p
+              v-if="ollamaStatusMessage"
+              class="setting-hint"
+              :class="{ warning: ollamaStatusWarning }"
+            >
+              {{ ollamaStatusMessage }}
+            </p>
+          </div>
+        </div>
+
         <!-- Theme Section (non-setup only) -->
         <div
           v-if="!isSetup"
@@ -530,6 +614,9 @@ const editingOpenRouterKey = ref(false)
 const theme = ref('system')
 const savedTheme = ref('system')
 const llmModel = ref('anthropic/claude-3.5-haiku')
+const twinLlmProvider = ref('openrouter')
+const ollamaBaseUrl = ref('http://localhost:11434')
+const ollamaModel = ref('')
 const smartWebSearch = ref(true)
 const backgroundLinkDiscoveryEnabled = ref(true)
 const backgroundLinkDiscoveryLlmEnabled = ref(false)
@@ -550,6 +637,10 @@ const modelsLoading = ref(false)
 const modelSearchQuery = ref('')
 const showModelDropdown = ref(false)
 const highlightedModelIndex = ref(0)
+const availableOllamaModels = ref([])
+const ollamaLoading = ref(false)
+const ollamaStatusMessage = ref('')
+const ollamaStatusWarning = ref(false)
 
 const filteredModels = computed(() => {
   if (!availableModels.value.length) return []
@@ -667,6 +758,9 @@ const loadCurrentSettings = async () => {
       theme.value = currentSettings.theme || 'system'
       savedTheme.value = theme.value
       llmModel.value = currentSettings.llm_model || 'anthropic/claude-3.5-haiku'
+      twinLlmProvider.value = currentSettings.twin_llm_provider || 'openrouter'
+      ollamaBaseUrl.value = currentSettings.ollama_base_url || 'http://localhost:11434'
+      ollamaModel.value = currentSettings.ollama_model || ''
       smartWebSearch.value = currentSettings.smart_web_search ?? true
       backgroundLinkDiscoveryEnabled.value =
         currentSettings.background_link_discovery_enabled ?? true
@@ -700,6 +794,9 @@ const loadCurrentSettings = async () => {
       // Set display text for current model
       const current = availableModels.value.find(m => m.id === llmModel.value)
       modelSearchQuery.value = current ? `${current.name} (${current.provider})` : llmModel.value
+    }
+    if (twinLlmProvider.value === 'ollama') {
+      await loadOllamaModels()
     }
   } catch (e) {
     console.error('Failed to load settings:', e)
@@ -740,6 +837,31 @@ const loadAvailableModels = async () => {
     availableModels.value = []
   } finally {
     modelsLoading.value = false
+  }
+}
+
+const loadOllamaModels = async () => {
+  ollamaLoading.value = true
+  ollamaStatusMessage.value = ''
+  ollamaStatusWarning.value = false
+  try {
+    const models = await settingsApi.listOllamaModels()
+    availableOllamaModels.value = models || []
+    if (availableOllamaModels.value.length === 0) {
+      ollamaStatusMessage.value = 'Ollama is reachable, but no local models were found.'
+      ollamaStatusWarning.value = true
+    } else {
+      ollamaStatusMessage.value = `Found ${availableOllamaModels.value.length} local model${availableOllamaModels.value.length === 1 ? '' : 's'}.`
+      if (!ollamaModel.value && availableOllamaModels.value.length === 1) {
+        ollamaModel.value = availableOllamaModels.value[0].id
+      }
+    }
+  } catch (e) {
+    availableOllamaModels.value = []
+    ollamaStatusMessage.value = e.message || 'Ollama is not reachable.'
+    ollamaStatusWarning.value = true
+  } finally {
+    ollamaLoading.value = false
   }
 }
 
@@ -793,6 +915,9 @@ const saveSettings = async () => {
       vault_path: vaultPath.value || null,
       theme: theme.value,
       llm_model: llmModel.value || null,
+      twin_llm_provider: twinLlmProvider.value,
+      ollama_base_url: ollamaBaseUrl.value || 'http://localhost:11434',
+      ollama_model: ollamaModel.value || '',
       smart_web_search: smartWebSearch.value,
       background_link_discovery_enabled: backgroundLinkDiscoveryEnabled.value,
       background_link_discovery_llm_enabled: backgroundLinkDiscoveryLlmEnabled.value,
@@ -1108,6 +1233,12 @@ onMounted(() => {
   gap: 8px;
 }
 
+.provider-options {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
 .theme-option {
   flex: 1;
   padding: 10px;
@@ -1130,6 +1261,51 @@ onMounted(() => {
 
 .theme-option input {
   display: none;
+}
+
+.provider-option {
+  flex: 1;
+  padding: 10px;
+  border: 1px solid var(--border-color, #e0e0e0);
+  border-radius: 8px;
+  text-align: center;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.provider-option:hover {
+  border-color: var(--accent-color, #7c3aed);
+}
+
+.provider-option.active {
+  background: var(--accent-color, #7c3aed);
+  color: white;
+  border-color: var(--accent-color, #7c3aed);
+}
+
+.provider-option input {
+  display: none;
+}
+
+.ollama-settings {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.ollama-model-row {
+  display: flex;
+  align-items: flex-end;
+  gap: 12px;
+}
+
+.ollama-model-field {
+  flex: 1;
+}
+
+.check-ollama-btn {
+  margin-top: 0;
+  white-space: nowrap;
 }
 
 .model-combobox {

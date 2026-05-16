@@ -35,11 +35,11 @@ describe('PromptDialog', () => {
     const wrapper = mountDialog()
 
     expect(wrapper.text()).toContain('Vault Notes (relevant notes)')
-    expect(wrapper.find('.context-mode-hint').text()).toContain('This does not search the live web')
+    expect(wrapper.find('#contextMode option[value="knowledge_search"]').text()).toContain('Vault Notes')
   })
 
   it('shows Twin context mode and emits advisor mode by default', async () => {
-    const wrapper = mountDialog()
+    const wrapper = mountDialog({ twinLlmProvider: 'ollama', ollamaModel: 'llama3.1:8b' })
 
     await wrapper.find('.model-selector-stub').trigger('click')
     await wrapper.find('#prompt').setValue('What should my twin consider?')
@@ -50,12 +50,50 @@ describe('PromptDialog', () => {
     expect(wrapper.text()).toContain('Twin Answer Mode')
     expect(wrapper.emitted('submit')[0][0]).toMatchObject({
       contextMode: 'twin',
-      twinAnswerMode: 'advisor'
+      twinAnswerMode: 'advisor',
+      twinLlmProvider: 'ollama'
     })
   })
 
+  it('lets twin prompts choose Private Local runtime and disables live web search', async () => {
+    const wrapper = mountDialog({
+      twinLlmProvider: 'openrouter',
+      ollamaModel: 'llama3.1:8b',
+      smartWebSearch: true,
+      openRouterConfigured: true
+    })
+
+    await wrapper.find('.model-selector-stub').trigger('click')
+    await wrapper.find('#prompt').setValue('Use my twin records and latest context')
+    await wrapper.find('#contextMode').setValue('twin')
+    await wrapper.findAll('.runtime-toggle button').find(button => button.text() === 'Private Local').trigger('click')
+    await wrapper.find('.btn-primary').trigger('click')
+
+    expect(wrapper.text()).toContain('Context Runtime')
+    expect(wrapper.find('.web-search-hint').text()).toContain('local Ollama runtime')
+    expect(wrapper.emitted('submit')[0][0]).toMatchObject({
+      contextMode: 'twin',
+      twinLlmProvider: 'ollama',
+      models: ['llama3.1:8b'],
+      webSearch: false
+    })
+  })
+
+  it('blocks Private Local twin prompts when no Ollama model is configured', async () => {
+    const wrapper = mountDialog({
+      twinLlmProvider: 'ollama',
+      ollamaModel: ''
+    })
+
+    await wrapper.find('#prompt').setValue('Use my twin records')
+    await wrapper.find('#contextMode').setValue('twin')
+
+    expect(wrapper.text()).toContain('Select an Ollama model in Settings')
+    expect(wrapper.find('.btn-primary').attributes('disabled')).toBeDefined()
+  })
+
   it('emits simulation mode when selected', async () => {
-    const wrapper = mountDialog()
+    const wrapper = mountDialog({ twinLlmProvider: 'ollama', ollamaModel: 'llama3.1:8b' })
 
     await wrapper.find('.model-selector-stub').trigger('click')
     await wrapper.find('#prompt').setValue('Simulate my likely response')
@@ -70,7 +108,7 @@ describe('PromptDialog', () => {
   })
 
   it('sets Decision mode to Twin Advisor and emits decision metadata', async () => {
-    const wrapper = mountDialog()
+    const wrapper = mountDialog({ twinLlmProvider: 'ollama', ollamaModel: 'llama3.1:8b' })
 
     await wrapper.find('.model-selector-stub').trigger('click')
     await wrapper.findAll('.segmented-control button').find(button => button.text() === 'Decision').trigger('click')
@@ -85,6 +123,8 @@ describe('PromptDialog', () => {
       promptType: 'decision',
       contextMode: 'twin',
       twinAnswerMode: 'advisor',
+      twinLlmProvider: 'ollama',
+      systemPrompt: null,
       decisionMetadata: {
         decision: 'Should Grafyn build Decision Mirror first?',
         options: ['Decision Mirror', 'Topology'],
@@ -93,6 +133,37 @@ describe('PromptDialog', () => {
         review_date: '2026-05-15'
       }
     })
+    expect(wrapper.text()).not.toContain('Add system prompt')
+    expect(wrapper.text()).toContain('The concrete choices the Twin should compare')
+    expect(wrapper.text()).toContain('What is materially at risk')
+    expect(wrapper.text()).toContain('Your starting bias')
+    expect(wrapper.text()).toContain('When to revisit the outcome')
+  })
+
+  it('places thinking config above context mode for prompt and decision flows', async () => {
+    const wrapper = mountDialog()
+
+    expect(wrapper.html().indexOf('Thinking level')).toBeLessThan(wrapper.html().indexOf('Context Mode'))
+
+    await wrapper.findAll('.segmented-control button').find(button => button.text() === 'Decision').trigger('click')
+    expect(wrapper.html().indexOf('Thinking level')).toBeLessThan(wrapper.html().indexOf('Context Mode'))
+  })
+
+  it('clears custom system prompt when switching into Decision mode', async () => {
+    const wrapper = mountDialog({ twinLlmProvider: 'ollama', ollamaModel: 'llama3.1:8b' })
+
+    await wrapper.find('.model-selector-stub').trigger('click')
+    await wrapper.find('input[type="checkbox"]').setValue(true)
+    await wrapper.find('textarea.system-input').setValue('Use this custom system prompt')
+    await wrapper.findAll('.segmented-control button').find(button => button.text() === 'Decision').trigger('click')
+    await wrapper.find('#prompt').setValue('Accept or decline the grant?')
+    await wrapper.find('.btn-primary').trigger('click')
+
+    expect(wrapper.emitted('submit')[0][0]).toMatchObject({
+      promptType: 'decision',
+      systemPrompt: null
+    })
+    expect(wrapper.text()).not.toContain('Add system prompt')
   })
 
   it('submits web search enabled for freshness-sensitive prompts when Canvas auto-search is on', async () => {
@@ -164,5 +235,24 @@ describe('PromptDialog', () => {
     expect(wrapper.emitted('create-preset')).toEqual([
       [{ name: 'Fast trio', modelIds: ['openai/gpt-4o'] }]
     ])
+  })
+
+  it('emits default and selected reasoning effort from thinking config', async () => {
+    const wrapper = mountDialog()
+
+    await wrapper.find('.model-selector-stub').trigger('click')
+    await wrapper.find('#prompt').setValue('Reason through this plan')
+
+    expect(wrapper.find('.reasoning-hint').text()).toContain('Higher reasoning may cost more')
+    await wrapper.find('.btn-primary').trigger('click')
+    expect(wrapper.emitted('submit')[0][0]).toMatchObject({
+      reasoningEffort: 'none'
+    })
+
+    await wrapper.find('#reasoningEffort').setValue('4')
+    await wrapper.find('.btn-primary').trigger('click')
+    expect(wrapper.emitted('submit')[1][0]).toMatchObject({
+      reasoningEffort: 'high'
+    })
   })
 })

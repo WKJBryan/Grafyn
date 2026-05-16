@@ -101,6 +101,7 @@ impl OpenRouterService {
         system_prompt: Option<&str>,
         temperature: Option<f64>,
         max_tokens: Option<u32>,
+        reasoning_effort: Option<&str>,
         web_search: bool,
         web_search_max_results: u32,
     ) -> Result<String> {
@@ -120,6 +121,7 @@ impl OpenRouterService {
         all_messages.extend(messages);
 
         let plugins = build_web_plugins(web_search, web_search_max_results);
+        let reasoning = build_reasoning(reasoning_effort);
 
         let request = ChatRequest {
             model: model.to_string(),
@@ -127,6 +129,7 @@ impl OpenRouterService {
             stream: Some(false),
             temperature,
             max_tokens,
+            reasoning,
             plugins,
         };
 
@@ -167,6 +170,7 @@ impl OpenRouterService {
         system_prompt: Option<&str>,
         temperature: Option<f64>,
         max_tokens: Option<u32>,
+        reasoning_effort: Option<&str>,
         web_search: bool,
         web_search_max_results: u32,
     ) -> Result<impl futures::Stream<Item = Result<String>>> {
@@ -186,6 +190,7 @@ impl OpenRouterService {
         all_messages.extend(messages);
 
         let plugins = build_web_plugins(web_search, web_search_max_results);
+        let reasoning = build_reasoning(reasoning_effort);
 
         let request = ChatRequest {
             model: model.to_string(),
@@ -193,6 +198,7 @@ impl OpenRouterService {
             stream: Some(true),
             temperature,
             max_tokens,
+            reasoning,
             plugins,
         };
 
@@ -269,6 +275,17 @@ fn build_web_plugins(web_search: bool, web_search_max_results: u32) -> Option<Ve
         id: "web".to_string(),
         max_results: Some(web_search_max_results),
     }])
+}
+
+fn build_reasoning(reasoning_effort: Option<&str>) -> Option<ReasoningRequest> {
+    match reasoning_effort {
+        Some(effort @ ("minimal" | "low" | "medium" | "high" | "xhigh")) => {
+            Some(ReasoningRequest {
+                effort: effort.to_string(),
+            })
+        }
+        _ => None,
+    }
 }
 
 /// Parse SSE chunk to extract content
@@ -384,7 +401,14 @@ struct ChatRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning: Option<ReasoningRequest>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     plugins: Option<Vec<WebPlugin>>,
+}
+
+#[derive(Debug, Serialize)]
+struct ReasoningRequest {
+    effort: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -436,4 +460,32 @@ struct ModelInfo {
 struct PricingInfo {
     prompt: String,
     completion: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chat_request_serializes_reasoning_effort_without_max_tokens() {
+        let request = ChatRequest {
+            model: "openai/gpt-5".to_string(),
+            messages: vec![ChatMessage {
+                role: "user".to_string(),
+                content: "Think carefully".to_string(),
+            }],
+            stream: Some(true),
+            temperature: Some(0.7),
+            max_tokens: None,
+            reasoning: Some(ReasoningRequest {
+                effort: "high".to_string(),
+            }),
+            plugins: None,
+        };
+
+        let value = serde_json::to_value(request).unwrap();
+
+        assert_eq!(value["reasoning"]["effort"], "high");
+        assert!(value.get("max_tokens").is_none());
+    }
 }

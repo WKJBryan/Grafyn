@@ -1,7 +1,9 @@
 //! Tauri commands for user settings management
 
 use crate::commands::rebuild_all_indexes;
+use crate::models::canvas::AvailableModel;
 use crate::models::settings::{SettingsStatus, SettingsUpdate, UserSettings};
+use crate::services::ollama::OllamaStatus;
 use crate::AppState;
 use tauri::State;
 
@@ -39,6 +41,11 @@ pub async fn update_settings(
     } else {
         None
     };
+    let new_twin_path = if vault_path_changed {
+        Some(settings.get().effective_twin_data_path())
+    } else {
+        None
+    };
     drop(settings); // Release settings lock before acquiring others
 
     // Sync OpenRouter service if API key was updated
@@ -46,6 +53,12 @@ pub async fn update_settings(
         let mut openrouter = state.openrouter.write().await;
         openrouter.set_api_key(api_key);
         log::info!("OpenRouter API key updated from settings");
+    }
+
+    {
+        let settings = state.settings_service.read().await;
+        let mut ollama = state.ollama.write().await;
+        ollama.set_base_url(settings.get().ollama_base_url.clone());
     }
 
     // Sync KnowledgeStore, SearchService, and GraphIndex if vault path changed
@@ -57,6 +70,10 @@ pub async fn update_settings(
         }
 
         rebuild_all_indexes(state.inner()).await?;
+        if let Some(new_twin_path) = new_twin_path {
+            let mut twin_store = state.twin_store.write().await;
+            *twin_store = crate::services::twin_store::TwinStore::new(new_twin_path);
+        }
         log::info!("Services rebuilt for new vault path");
     }
 
@@ -122,6 +139,28 @@ pub async fn get_openrouter_status(state: State<'_, AppState>) -> Result<OpenRou
         has_key,
         is_configured,
     })
+}
+
+#[tauri::command]
+pub async fn get_ollama_status(state: State<'_, AppState>) -> Result<OllamaStatus, String> {
+    let selected_model = {
+        let settings = state.settings_service.read().await;
+        settings.get().ollama_model.clone()
+    };
+    let ollama = state.ollama.read().await;
+    ollama
+        .status(Some(&selected_model))
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn list_ollama_models(state: State<'_, AppState>) -> Result<Vec<AvailableModel>, String> {
+    let ollama = state.ollama.read().await;
+    ollama
+        .list_models()
+        .await
+        .map_err(|error| error.to_string())
 }
 
 #[derive(serde::Serialize)]

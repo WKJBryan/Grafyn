@@ -42,6 +42,18 @@ pub struct UserSettings {
     #[serde(default = "default_llm_model")]
     pub llm_model: String,
 
+    /// Provider used only for digital-twin-sensitive prompts
+    #[serde(default = "default_twin_llm_provider")]
+    pub twin_llm_provider: String,
+
+    /// Base URL for the local Ollama runtime
+    #[serde(default = "default_ollama_base_url")]
+    pub ollama_base_url: String,
+
+    /// Installed Ollama model name for twin-sensitive prompts
+    #[serde(default)]
+    pub ollama_model: String,
+
     /// Whether smart web search auto-detection is enabled in canvas
     #[serde(default = "default_smart_web_search")]
     pub smart_web_search: bool,
@@ -95,6 +107,14 @@ pub fn default_llm_model() -> String {
     "anthropic/claude-3.5-haiku".to_string()
 }
 
+fn default_twin_llm_provider() -> String {
+    "openrouter".to_string()
+}
+
+fn default_ollama_base_url() -> String {
+    "http://localhost:11434".to_string()
+}
+
 fn default_smart_web_search() -> bool {
     true
 }
@@ -136,6 +156,9 @@ impl Default for UserSettings {
             theme: default_theme(),
             mcp_enabled: false,
             llm_model: default_llm_model(),
+            twin_llm_provider: default_twin_llm_provider(),
+            ollama_base_url: default_ollama_base_url(),
+            ollama_model: String::new(),
             smart_web_search: true,
             background_link_discovery_enabled: default_background_link_discovery_enabled(),
             background_link_discovery_llm_enabled: false,
@@ -190,6 +213,26 @@ impl UserSettings {
             .join("Grafyn")
             .join("data")
     }
+
+    pub fn effective_twin_data_path(&self) -> std::path::PathBuf {
+        twin_data_path_for_vault(&self.effective_data_path(), &self.effective_vault_path())
+    }
+}
+
+pub fn twin_data_path_for_vault(
+    data_path: &std::path::Path,
+    vault_path: &std::path::Path,
+) -> std::path::PathBuf {
+    let normalized = vault_path
+        .to_string_lossy()
+        .replace('\\', "/")
+        .to_ascii_lowercase();
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in normalized.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    data_path.join("twin").join(format!("{:016x}", hash))
 }
 
 /// Settings update request from frontend
@@ -201,6 +244,9 @@ pub struct SettingsUpdate {
     pub theme: Option<String>,
     pub mcp_enabled: Option<bool>,
     pub llm_model: Option<String>,
+    pub twin_llm_provider: Option<String>,
+    pub ollama_base_url: Option<String>,
+    pub ollama_model: Option<String>,
     pub smart_web_search: Option<bool>,
     pub background_link_discovery_enabled: Option<bool>,
     pub background_link_discovery_llm_enabled: Option<bool>,
@@ -224,6 +270,9 @@ pub struct SettingsStatus {
     pub theme: String,
     pub mcp_enabled: bool,
     pub llm_model: String,
+    pub twin_llm_provider: String,
+    pub ollama_base_url: String,
+    pub ollama_model: String,
     pub smart_web_search: bool,
     pub background_link_discovery_enabled: bool,
     pub background_link_discovery_llm_enabled: bool,
@@ -247,6 +296,9 @@ impl From<&UserSettings> for SettingsStatus {
             theme: settings.theme.clone(),
             mcp_enabled: settings.mcp_enabled,
             llm_model: settings.llm_model.clone(),
+            twin_llm_provider: settings.twin_llm_provider.clone(),
+            ollama_base_url: settings.ollama_base_url.clone(),
+            ollama_model: settings.ollama_model.clone(),
             smart_web_search: settings.smart_web_search,
             background_link_discovery_enabled: settings.background_link_discovery_enabled,
             background_link_discovery_llm_enabled: settings.background_link_discovery_llm_enabled,
@@ -275,6 +327,9 @@ mod tests {
     fn default_settings_start_with_empty_canvas_presets() {
         let settings = UserSettings::default();
         assert!(settings.canvas_model_presets.is_empty());
+        assert_eq!(settings.twin_llm_provider, "openrouter");
+        assert_eq!(settings.ollama_base_url, "http://localhost:11434");
+        assert!(settings.ollama_model.is_empty());
         assert!(settings.background_link_discovery_enabled);
         assert!(!settings.background_link_discovery_llm_enabled);
         assert!(settings.background_vault_optimizer_enabled);
@@ -307,5 +362,24 @@ mod tests {
         assert!(settings.background_vault_optimizer_enabled);
         assert!(!settings.background_vault_optimizer_llm_enabled);
         assert_eq!(settings.background_vault_optimizer_budget_monthly, 0);
+        assert_eq!(settings.twin_llm_provider, "openrouter");
+        assert_eq!(settings.ollama_base_url, "http://localhost:11434");
+        assert!(settings.ollama_model.is_empty());
+    }
+
+    #[test]
+    fn twin_data_path_is_scoped_by_vault_path() {
+        let data_path = std::path::PathBuf::from("C:/Users/bryan/AppData/Local/Grafyn/data");
+        let first = twin_data_path_for_vault(&data_path, std::path::Path::new("C:/Vault/A"));
+        let same_case_changed =
+            twin_data_path_for_vault(&data_path, std::path::Path::new("c:/vault/a"));
+        let second = twin_data_path_for_vault(&data_path, std::path::Path::new("C:/Vault/B"));
+
+        assert_eq!(first, same_case_changed);
+        assert_ne!(first, second);
+        assert_eq!(
+            first.parent().map(std::path::Path::to_path_buf),
+            Some(data_path.join("twin"))
+        );
     }
 }

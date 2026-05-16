@@ -2,12 +2,14 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { mount, flushPromises } from '@vue/test-utils'
 import SettingsModal from '@/components/SettingsModal.vue'
 
-const { settingsGet, settingsStatus, settingsUpdate, pickVaultFolder, validateOpenRouterKey, getModels, getMcpStatus, optimizerStatus, themeStore, toast, routerPush } = vi.hoisted(() => ({
+const { settingsGet, settingsStatus, settingsUpdate, pickVaultFolder, validateOpenRouterKey, getOllamaStatus, listOllamaModels, getModels, getMcpStatus, optimizerStatus, themeStore, toast, routerPush } = vi.hoisted(() => ({
   settingsGet: vi.fn(),
   settingsStatus: vi.fn(),
   settingsUpdate: vi.fn(),
   pickVaultFolder: vi.fn(),
   validateOpenRouterKey: vi.fn(),
+  getOllamaStatus: vi.fn(),
+  listOllamaModels: vi.fn(),
   getModels: vi.fn(),
   getMcpStatus: vi.fn(),
   optimizerStatus: vi.fn(),
@@ -27,7 +29,9 @@ vi.mock('@/api/client', () => ({
     getOpenRouterStatus: settingsStatus,
     update: settingsUpdate,
     pickVaultFolder,
-    validateOpenRouterKey
+    validateOpenRouterKey,
+    getOllamaStatus,
+    listOllamaModels
   },
   mcp: {
     getStatus: getMcpStatus
@@ -62,11 +66,23 @@ describe('SettingsModal', () => {
       vault_path: 'C:\\Vault',
       theme: 'system',
       llm_model: 'openai/gpt-4o',
+      twin_llm_provider: 'openrouter',
+      ollama_base_url: 'http://localhost:11434',
+      ollama_model: '',
       smart_web_search: true,
       background_link_discovery_enabled: true,
       background_link_discovery_llm_enabled: false
     })
     settingsStatus.mockResolvedValue({ has_key: true })
+    getOllamaStatus.mockResolvedValue({
+      available: true,
+      base_url: 'http://localhost:11434',
+      model_count: 1,
+      selected_model_available: true
+    })
+    listOllamaModels.mockResolvedValue([
+      { id: 'llama3.1:8b', name: 'llama3.1:8b', provider: 'Ollama' }
+    ])
     getModels.mockResolvedValue([])
     getMcpStatus.mockResolvedValue({ available: false, config_snippet: '' })
     optimizerStatus.mockResolvedValue({ queue_size: 0, inbox_count: 0, rollback_rate: 0 })
@@ -172,6 +188,43 @@ describe('SettingsModal', () => {
     expect(settingsUpdate).toHaveBeenCalledWith(expect.objectContaining({
       background_link_discovery_enabled: true,
       background_link_discovery_llm_enabled: true
+    }))
+  })
+
+  it('shows and saves the local Ollama digital twin model settings', async () => {
+    settingsGet.mockResolvedValue({
+      vault_path: 'C:\\Vault',
+      theme: 'system',
+      llm_model: 'openai/gpt-4o',
+      twin_llm_provider: 'ollama',
+      ollama_base_url: 'http://localhost:11434',
+      ollama_model: 'llama3.1:8b',
+      smart_web_search: true,
+      background_link_discovery_enabled: true,
+      background_link_discovery_llm_enabled: false
+    })
+
+    const wrapper = mount(SettingsModal, {
+      props: {
+        modelValue: true,
+        isSetup: false
+      }
+    })
+
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('Digital Twin Model')
+    expect(wrapper.text()).toContain('Local Ollama')
+    expect(wrapper.text()).toContain('keeps Decision Mirror and twin context on this machine')
+    expect(wrapper.find('.ollama-base-url-input').element.value).toBe('http://localhost:11434')
+    expect(wrapper.find('.ollama-model-select').element.value).toBe('llama3.1:8b')
+
+    await wrapper.find('.save-btn').trigger('click')
+
+    expect(settingsUpdate).toHaveBeenCalledWith(expect.objectContaining({
+      twin_llm_provider: 'ollama',
+      ollama_base_url: 'http://localhost:11434',
+      ollama_model: 'llama3.1:8b'
     }))
   })
 })

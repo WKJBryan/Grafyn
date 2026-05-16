@@ -1,16 +1,18 @@
+use crate::models::note::Note;
 use crate::models::twin::{
     ActionGap, ActionGapCreate, ConstitutionInferenceSummary, ConstitutionItem,
     ConstitutionItemCreate, ConstitutionItemUpdate, ConstitutionReviewRequest, ConstitutionSetup,
     ConstitutionStatus, DecisionEpisode, DecisionEpisodeCreate, DecisionEpisodeWithReflections,
     DecisionEvidencePacket, DecisionEvidenceSource, DecisionMirrorConfig,
-    DecisionMirrorConfigUpdate, DecisionMirrorPreset, DecisionMirrorWeights, DecisionOutcomeUpdate,
-    EvidenceRef, ExportBundle, ExportFileSummary, MemoryDigestAction, MemoryDigestItem,
-    MemoryDigestReviewRequest, MemoryDigestState, PrimitiveDecisionAssessment, PromotionState,
-    RecordOrigin, ReflectionCard, ReflectionCardCreate, ReflectionScores, ResolvedEvidenceRef,
-    SessionTrace, TraceEvent, TraceEventType, TwinContextRecord, TwinExportRequest,
-    TwinInferenceRunSummary, TwinReviewRecord, UserRecord, UserRecordCreate, UserRecordKind,
-    UserRecordUpdate,
+    DecisionMirrorConfigUpdate, DecisionMirrorWeights, DecisionOutcomeUpdate, EvidenceRef,
+    ExportBundle, ExportFileSummary, MemoryDigestAction, MemoryDigestItem,
+    MemoryDigestReviewRequest, MemoryDigestState, PromotionState, RecordOrigin, ReflectionCard,
+    ReflectionCardCreate, ReflectionScores, ResolvedEvidenceRef, SessionTrace, TraceEvent,
+    TraceEventType, TwinContextRecord, TwinExportRequest, TwinInferenceRunSummary,
+    TwinReviewRecord, UserRecord, UserRecordCreate, UserRecordKind, UserRecordUpdate,
 };
+#[cfg(test)]
+use crate::models::twin::{DecisionMirrorPreset, PrimitiveDecisionAssessment};
 use anyhow::{Context, Result};
 use chrono::Utc;
 use serde::Serialize;
@@ -1275,6 +1277,11 @@ impl TwinStore {
             tile_id: None,
             model_id: None,
             note: Some("Guided Twin setup".to_string()),
+            source_type: Some("setup".to_string()),
+            source_id: Some("constitution-setup".to_string()),
+            source_label: Some("Guided Twin setup".to_string()),
+            excerpt: None,
+            speaker_role: None,
         };
 
         self.seed_constitution_setup_items(&setup, evidence_ref)?;
@@ -1282,6 +1289,27 @@ impl TwinStore {
     }
 
     pub fn run_constitution_inference(&mut self) -> Result<ConstitutionInferenceSummary> {
+        self.run_constitution_inference_with_notes(&[])
+    }
+
+    pub fn run_constitution_inference_with_notes(
+        &mut self,
+        notes: &[Note],
+    ) -> Result<ConstitutionInferenceSummary> {
+        self.ensure_record_cache()?;
+        let current_note_ids = notes
+            .iter()
+            .map(|note| note.id.clone())
+            .collect::<HashSet<_>>();
+        let pruned_stale_records = self.prune_stale_note_records(&current_note_ids)?;
+        let distilled_setup = distill_constitution_setup_from_notes(notes);
+        let updated_setup_entries = constitution_setup_entry_count(&distilled_setup);
+        let pruned_stale_constitution_items = self
+            .prune_stale_note_constitution_items(&current_note_ids)?
+            + self.prune_stale_setup_constitution_items(&distilled_setup)?;
+        if updated_setup_entries > 0 || self.setup_path.exists() {
+            self.write_auto_constitution_setup(distilled_setup.clone())?;
+        }
         self.ensure_record_cache()?;
         let records = self
             .record_cache
@@ -1289,6 +1317,12 @@ impl TwinStore {
             .filter(|record| constitution_allows_record(record))
             .cloned()
             .collect::<Vec<_>>();
+        let traces = self.list_session_traces()?;
+        let scanned_behavior_events = traces
+            .iter()
+            .flat_map(|trace| trace.events.iter())
+            .filter(|event| behavior_event_for_constitution(&event.event_type))
+            .count();
         let decisions = self.list_decision_episodes()?;
         let existing_items = self.list_constitution_items()?;
         let existing_gaps = self.list_action_gaps()?;
@@ -1303,6 +1337,10 @@ impl TwinStore {
 
         let mut created_constitution_items = 0_usize;
         let mut created_action_gaps = 0_usize;
+        let mut auto_active_items = 0_usize;
+        let mut review_candidate_items = 0_usize;
+        let mut skipped_domain_claims = 0_usize;
+        let mut extracted_research_findings = 0_usize;
 
         for record in &records {
             let dimension = infer_constitution_dimension(&record.content, &record.kind);
@@ -1312,17 +1350,28 @@ impl TwinStore {
             }
             let key = constitution_key(&dimension, &claim);
             if item_keys.insert(key) {
+                let status = constitution_status_from_record(record);
+                if status == ConstitutionStatus::Active {
+                    auto_active_items += 1;
+                } else if status == ConstitutionStatus::Candidate {
+                    review_candidate_items += 1;
+                }
+                let source = if record.origin == RecordOrigin::Inferred {
+                    "behavior_inference"
+                } else {
+                    "constitution_inference"
+                };
                 self.create_constitution_item(ConstitutionItemCreate {
                     claim,
                     dimension,
                     scope: vec!["general".to_string()],
                     priority: record.confidence,
                     confidence: record.confidence,
-                    status: ConstitutionStatus::Candidate,
+                    status,
                     evidence_refs: record.evidence_refs.clone(),
                     tensions: Vec::new(),
                     linked_record_ids: vec![record.id.clone()],
-                    source: Some("constitution_inference".to_string()),
+                    source: Some(source.to_string()),
                 })?;
                 created_constitution_items += 1;
             }
@@ -1383,11 +1432,103 @@ impl TwinStore {
             }
         }
 
+        for note in notes {
+            if note_is_interview(note) {
+                match extract_interview_note_evidence(note) {
+                    InterviewExtraction::Unlabeled => {
+                        skipped_domain_claims += 1;
+                    }
+                    InterviewExtraction::Labeled {
+                        interviewer_turns,
+                        interviewee_turns,
+                    } => {
+                        for turn in interviewer_turns {
+                            if let Some((dimension, claim)) =
+                                constitution_claim_from_interviewer_turn(&turn.content)
+                            {
+                                let key = constitution_key(&dimension, &claim);
+                                if item_keys.insert(key) {
+                                    self.create_constitution_item(ConstitutionItemCreate {
+                                        claim,
+                                        dimension,
+                                        scope: vec!["interview".to_string()],
+                                        priority: 0.62,
+                                        confidence: 0.62,
+                                        status: ConstitutionStatus::Candidate,
+                                        evidence_refs: vec![note_evidence_ref(
+                                            note,
+                                            "interview-question",
+                                            "Interviewer question",
+                                            Some("user"),
+                                            &turn.content,
+                                        )],
+                                        tensions: Vec::new(),
+                                        linked_record_ids: Vec::new(),
+                                        source: Some("interview_behavior_inference".to_string()),
+                                    })?;
+                                    created_constitution_items += 1;
+                                    review_candidate_items += 1;
+                                }
+                            }
+                        }
+                        for turn in interviewee_turns {
+                            if !looks_like_research_finding(&turn.content) {
+                                skipped_domain_claims += 1;
+                                continue;
+                            }
+                            if self.create_interview_research_record(note, &turn.content)? {
+                                extracted_research_findings += 1;
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
+
+            if let Some((dimension, claim)) = constitution_claim_from_note(note) {
+                let key = constitution_key(&dimension, &claim);
+                if item_keys.insert(key) {
+                    self.create_constitution_item(ConstitutionItemCreate {
+                        claim,
+                        dimension,
+                        scope: vec!["note".to_string()],
+                        priority: 0.58,
+                        confidence: 0.58,
+                        status: ConstitutionStatus::Candidate,
+                        evidence_refs: vec![note_evidence_ref(
+                            note,
+                            "note",
+                            "Vault note",
+                            Some("user"),
+                            &note.content,
+                        )],
+                        tensions: Vec::new(),
+                        linked_record_ids: Vec::new(),
+                        source: Some("note_inference".to_string()),
+                    })?;
+                    created_constitution_items += 1;
+                    review_candidate_items += 1;
+                }
+            } else {
+                skipped_domain_claims += 1;
+            }
+        }
+
         let summary = ConstitutionInferenceSummary {
             scanned_records: records.len(),
             scanned_decisions: decisions.len(),
             created_constitution_items,
             created_action_gaps,
+            scanned_behavior_events,
+            scanned_notes: notes.len(),
+            scanned_interviews: notes.iter().filter(|note| note_is_interview(note)).count(),
+            auto_active_items,
+            review_candidate_items,
+            skipped_domain_claims,
+            extracted_research_findings,
+            pruned_stale_constitution_items,
+            pruned_stale_records,
+            updated_setup_entries,
             generated_at: Utc::now(),
         };
         self.append_trace_event(
@@ -1396,6 +1537,137 @@ impl TwinStore {
             serde_json::to_value(&summary)?,
         )?;
         Ok(summary)
+    }
+
+    fn create_interview_research_record(&mut self, note: &Note, content: &str) -> Result<bool> {
+        self.ensure_record_cache()?;
+        let finding = format!("Interview finding: {}", excerpt(content.trim()));
+        let existing = self.record_cache.values().any(|record| {
+            record.kind == UserRecordKind::Fact
+                && record.content == finding
+                && record.metadata.get("source_type").and_then(Value::as_str)
+                    == Some("interview_answer")
+        });
+        if existing {
+            return Ok(false);
+        }
+
+        self.create_user_record(UserRecordCreate {
+            kind: UserRecordKind::Fact,
+            content: finding,
+            evidence_refs: vec![note_evidence_ref(
+                note,
+                "interview-answer",
+                "Interviewee answer",
+                Some("interviewee"),
+                content,
+            )],
+            confidence: 0.66,
+            origin: RecordOrigin::Inferred,
+            promotion_state: Some(PromotionState::Candidate),
+            valid_from: None,
+            valid_until: None,
+            links: Vec::new(),
+            metadata: HashMap::from([
+                ("source_type".to_string(), json!("interview_answer")),
+                ("source_note_id".to_string(), json!(note.id.clone())),
+            ]),
+        })?;
+        Ok(true)
+    }
+
+    fn write_auto_constitution_setup(&self, mut setup: ConstitutionSetup) -> Result<()> {
+        setup.values = clean_setup_entries(setup.values);
+        setup.tastes = clean_setup_entries(setup.tastes);
+        setup.constraints = clean_setup_entries(setup.constraints);
+        setup.somatic_cues = clean_setup_entries(setup.somatic_cues);
+        setup.action_tendencies = clean_setup_entries(setup.action_tendencies);
+        setup.updated_at = Some(Utc::now());
+        self.write_pretty_json(&self.setup_path, &setup)
+    }
+
+    fn prune_stale_note_records(&mut self, current_note_ids: &HashSet<String>) -> Result<usize> {
+        self.ensure_record_cache()?;
+        let stale_ids = self
+            .record_cache
+            .values()
+            .filter(|record| record_is_vault_derived(record))
+            .filter(|record| {
+                record
+                    .metadata
+                    .get("source_note_id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|source_note_id| !current_note_ids.contains(source_note_id))
+            })
+            .map(|record| record.id.clone())
+            .collect::<Vec<_>>();
+
+        for id in &stale_ids {
+            self.record_cache.remove(id);
+            let path = self.records_path.join(format!("{}.json", id));
+            if path.exists() {
+                std::fs::remove_file(&path).with_context(|| {
+                    format!("Failed to remove stale Twin record: {}", path.display())
+                })?;
+            }
+        }
+
+        Ok(stale_ids.len())
+    }
+
+    fn prune_stale_note_constitution_items(
+        &self,
+        current_note_ids: &HashSet<String>,
+    ) -> Result<usize> {
+        let stale_items = self
+            .list_constitution_items()?
+            .into_iter()
+            .filter(|item| constitution_item_is_vault_derived(item))
+            .filter(|item| {
+                item.evidence_refs
+                    .iter()
+                    .filter_map(|evidence| evidence.source_id.as_deref())
+                    .any(|source_id| !current_note_ids.contains(source_id))
+            })
+            .collect::<Vec<_>>();
+
+        for item in &stale_items {
+            let path = self.constitution_path.join(format!("{}.json", item.id));
+            if path.exists() {
+                std::fs::remove_file(&path).with_context(|| {
+                    format!(
+                        "Failed to remove stale Constitution item: {}",
+                        path.display()
+                    )
+                })?;
+            }
+        }
+
+        Ok(stale_items.len())
+    }
+
+    fn prune_stale_setup_constitution_items(&self, setup: &ConstitutionSetup) -> Result<usize> {
+        let setup_claims = constitution_setup_claims(setup);
+        let stale_items = self
+            .list_constitution_items()?
+            .into_iter()
+            .filter(|item| item.source.as_deref() == Some("guided_setup"))
+            .filter(|item| !setup_claims.contains(item.claim.trim()))
+            .collect::<Vec<_>>();
+
+        for item in &stale_items {
+            let path = self.constitution_path.join(format!("{}.json", item.id));
+            if path.exists() {
+                std::fs::remove_file(&path).with_context(|| {
+                    format!(
+                        "Failed to remove stale setup Constitution item: {}",
+                        path.display()
+                    )
+                })?;
+            }
+        }
+
+        Ok(stale_items.len())
     }
 
     pub fn select_constitution_context(
@@ -1986,6 +2258,11 @@ impl TwinStore {
                     tile_id: extract_event_tile_id(&event.payload),
                     model_id: extract_event_model_id(&event.payload),
                     note: Some("Decision episode evidence".to_string()),
+                    source_type: Some("decision".to_string()),
+                    source_id: Some(decision_id.to_string()),
+                    source_label: Some("Decision episode evidence".to_string()),
+                    excerpt: None,
+                    speaker_role: None,
                 });
             }
         }
@@ -2122,6 +2399,34 @@ fn constitution_allows_record(record: &UserRecord) -> bool {
     ) && record.kind != UserRecordKind::Fact
 }
 
+fn behavior_event_for_constitution(event_type: &TraceEventType) -> bool {
+    matches!(
+        event_type,
+        TraceEventType::PromptSubmitted
+            | TraceEventType::FeedbackRecorded
+            | TraceEventType::RankingRecorded
+            | TraceEventType::InsightCaptured
+            | TraceEventType::DebateStarted
+            | TraceEventType::DebateContinued
+            | TraceEventType::NoteExported
+            | TraceEventType::NoteCanonicalPromoted
+            | TraceEventType::DecisionEpisodeCreated
+            | TraceEventType::OutcomeFollowUpRecorded
+    )
+}
+
+fn constitution_status_from_record(record: &UserRecord) -> ConstitutionStatus {
+    let support_count = record.evidence_refs.len();
+    match record.promotion_state {
+        PromotionState::AutoPromoted | PromotionState::Endorsed
+            if support_count >= AUTO_PROMOTE_SUPPORT_COUNT =>
+        {
+            ConstitutionStatus::Active
+        }
+        _ => ConstitutionStatus::Candidate,
+    }
+}
+
 fn constitution_context_allowed(status: &ConstitutionStatus) -> bool {
     matches!(
         status,
@@ -2183,6 +2488,417 @@ fn infer_constitution_dimension(content: &str, kind: &UserRecordKind) -> String 
             UserRecordKind::Fact => "facts".to_string(),
         }
     }
+}
+
+fn note_is_interview(note: &Note) -> bool {
+    note.properties
+        .get("source_type")
+        .or_else(|| note.properties.get("source"))
+        .and_then(Value::as_str)
+        .is_some_and(|value| value.eq_ignore_ascii_case("interview"))
+        || note
+            .tags
+            .iter()
+            .any(|tag| tag.eq_ignore_ascii_case("interview"))
+}
+
+#[derive(Debug, Clone)]
+struct InterviewTurn {
+    role: String,
+    content: String,
+}
+
+enum InterviewExtraction {
+    Unlabeled,
+    Labeled {
+        interviewer_turns: Vec<InterviewTurn>,
+        interviewee_turns: Vec<InterviewTurn>,
+    },
+}
+
+fn extract_interview_note_evidence(note: &Note) -> InterviewExtraction {
+    let turns = extract_markdown_interview_turns(&note.content)
+        .or_else(|| extract_colon_labeled_interview_turns(&note.content));
+    let Some(turns) = turns else {
+        return InterviewExtraction::Unlabeled;
+    };
+    let interviewer_turns = turns
+        .iter()
+        .filter(|turn| turn.role == "user")
+        .cloned()
+        .collect::<Vec<_>>();
+    let interviewee_turns = turns
+        .into_iter()
+        .filter(|turn| turn.role == "interviewee")
+        .collect::<Vec<_>>();
+    if interviewer_turns.is_empty() || interviewee_turns.is_empty() {
+        return InterviewExtraction::Unlabeled;
+    }
+    InterviewExtraction::Labeled {
+        interviewer_turns,
+        interviewee_turns,
+    }
+}
+
+fn extract_markdown_interview_turns(content: &str) -> Option<Vec<InterviewTurn>> {
+    let mut turns = Vec::new();
+    let mut current_role: Option<String> = None;
+    let mut current_content = String::new();
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if let Some(role) = markdown_message_role(trimmed) {
+            flush_interview_turn(&mut turns, &mut current_role, &mut current_content);
+            current_role = Some(role);
+            continue;
+        }
+        if current_role.is_some() {
+            current_content.push_str(line);
+            current_content.push('\n');
+        }
+    }
+    flush_interview_turn(&mut turns, &mut current_role, &mut current_content);
+    if turns.len() >= 2 {
+        Some(turns)
+    } else {
+        None
+    }
+}
+
+fn markdown_message_role(line: &str) -> Option<String> {
+    let lower = line.to_lowercase();
+    if !(lower.starts_with("### message") || lower.starts_with("## message")) {
+        return None;
+    }
+    if lower.contains("interviewee") || lower.contains("participant") {
+        Some("interviewee".to_string())
+    } else if lower.contains("user")
+        || lower.contains("interviewer")
+        || lower.contains("researcher")
+    {
+        Some("user".to_string())
+    } else {
+        None
+    }
+}
+
+fn extract_colon_labeled_interview_turns(content: &str) -> Option<Vec<InterviewTurn>> {
+    let mut turns = Vec::new();
+    for line in content.lines() {
+        let Some((speaker, body)) = line.split_once(':') else {
+            continue;
+        };
+        let speaker = speaker.trim().to_lowercase();
+        let role = match speaker.as_str() {
+            "interviewer" | "researcher" | "moderator" | "facilitator" | "me" | "user" => "user",
+            "interviewee" | "participant" | "respondent" | "customer" | "student" | "teacher" => {
+                "interviewee"
+            }
+            _ => continue,
+        };
+        let content = body.trim();
+        if !content.is_empty() {
+            turns.push(InterviewTurn {
+                role: role.to_string(),
+                content: content.to_string(),
+            });
+        }
+    }
+    if turns.len() >= 2 {
+        Some(turns)
+    } else {
+        None
+    }
+}
+
+fn flush_interview_turn(
+    turns: &mut Vec<InterviewTurn>,
+    current_role: &mut Option<String>,
+    current_content: &mut String,
+) {
+    let Some(role) = current_role.take() else {
+        return;
+    };
+    let content = current_content.trim().to_string();
+    current_content.clear();
+    if content.is_empty() {
+        return;
+    }
+    turns.push(InterviewTurn { role, content });
+}
+
+fn constitution_claim_from_interviewer_turn(content: &str) -> Option<(String, String)> {
+    let lower = content.to_lowercase();
+    if text_contains_any(
+        &lower,
+        &[
+            "concrete example",
+            "compare",
+            "why",
+            "how do you",
+            "what makes",
+            "walk me through",
+        ],
+    ) {
+        return Some((
+            "reasoning".to_string(),
+            "Uses interview questions to probe for concrete examples and comparisons before treating claims as useful.".to_string(),
+        ));
+    }
+    None
+}
+
+fn looks_like_research_finding(content: &str) -> bool {
+    content.split_whitespace().count() >= 8
+        && text_contains_any(
+            content,
+            &[
+                "need", "want", "trust", "frustrat", "prefer", "hard", "easy", "useful", "demo",
+                "workflow",
+            ],
+        )
+}
+
+fn constitution_claim_from_note(note: &Note) -> Option<(String, String)> {
+    if note.is_topic_hub() {
+        return None;
+    }
+    let content = note.content.trim();
+    if content.len() < 24 {
+        return None;
+    }
+    let lower = content.to_lowercase();
+    if !text_contains_any(
+        &lower,
+        &[
+            "i prefer",
+            "i need",
+            "i value",
+            "my reasoning",
+            "works for me",
+            "not me",
+            "i reject",
+            "i decide",
+        ],
+    ) {
+        return None;
+    }
+    if text_contains_any(&lower, &["prefer"]) {
+        Some((
+            "preferences".to_string(),
+            format!("Note-backed preference: {}", excerpt(content)),
+        ))
+    } else {
+        Some((
+            "reasoning".to_string(),
+            format!("Note-backed reasoning pattern: {}", excerpt(content)),
+        ))
+    }
+}
+
+fn note_evidence_ref(
+    note: &Note,
+    source_type: &str,
+    source_label: &str,
+    speaker_role: Option<&str>,
+    content: &str,
+) -> EvidenceRef {
+    EvidenceRef {
+        trace_id: format!("note-{}", note.id),
+        event_id: note.id.clone(),
+        session_id: "vault-note".to_string(),
+        tile_id: None,
+        model_id: None,
+        note: Some(note.title.clone()),
+        source_type: Some(source_type.to_string()),
+        source_id: Some(note.id.clone()),
+        source_label: Some(source_label.to_string()),
+        excerpt: Some(excerpt(content.trim())),
+        speaker_role: speaker_role.map(ToOwned::to_owned),
+    }
+}
+
+fn distill_constitution_setup_from_notes(notes: &[Note]) -> ConstitutionSetup {
+    let mut setup = ConstitutionSetup::default();
+    let mut saw_interview_question = false;
+    let mut saw_values_question = false;
+    let mut saw_tradeoff_question = false;
+    let mut saw_risk_question = false;
+    let mut saw_concrete_question = false;
+    let mut saw_followup_question = false;
+    let mut saw_user_note_preference = false;
+    let mut interviewer_question_count = 0_usize;
+
+    for note in notes {
+        if note.is_topic_hub() {
+            continue;
+        }
+
+        if note_is_interview(note) {
+            if let InterviewExtraction::Labeled {
+                interviewer_turns, ..
+            } = extract_interview_note_evidence(note)
+            {
+                for turn in interviewer_turns {
+                    let lower = turn.content.to_lowercase();
+                    if turn.content.split_whitespace().count() < 5 {
+                        continue;
+                    }
+                    saw_interview_question = true;
+                    interviewer_question_count += 1;
+                    if text_contains_any(&lower, &["value", "cultural", "drives your decision"]) {
+                        saw_values_question = true;
+                    }
+                    if text_contains_any(&lower, &["trade off", "trade-off", "balance"]) {
+                        saw_tradeoff_question = true;
+                    }
+                    if text_contains_any(&lower, &["risk", "comfortable taking", "actively avoid"])
+                    {
+                        saw_risk_question = true;
+                    }
+                    if text_contains_any(
+                        &lower,
+                        &[
+                            "example",
+                            "walk us through",
+                            "walk through",
+                            "concrete",
+                            "top two",
+                        ],
+                    ) {
+                        saw_concrete_question = true;
+                    }
+                    if text_contains_any(
+                        &lower,
+                        &["following up", "if i understand", "drill", "how would"],
+                    ) {
+                        saw_followup_question = true;
+                    }
+                }
+            }
+            continue;
+        }
+
+        if let Some((dimension, claim)) = constitution_claim_from_note(note) {
+            saw_user_note_preference = true;
+            match dimension.as_str() {
+                "preferences" => push_unique(&mut setup.tastes, claim),
+                "constraints" => push_unique(&mut setup.constraints, claim),
+                "action_tendency" => push_unique(&mut setup.action_tendencies, claim),
+                _ => push_unique(&mut setup.values, claim),
+            }
+        }
+    }
+
+    if saw_interview_question {
+        push_unique(
+            &mut setup.constraints,
+            "Keeps interviewee answers as research evidence rather than treating them as the user's own Constitution.".to_string(),
+        );
+        push_unique(
+            &mut setup.constraints,
+            "Requires speaker-labelled evidence before extracting Constitution or research findings.".to_string(),
+        );
+    }
+    if saw_values_question {
+        push_unique(
+            &mut setup.values,
+            "Probes for the values and cultural assumptions behind decisions, not only the visible decision outcome.".to_string(),
+        );
+    }
+    if saw_tradeoff_question {
+        push_unique(
+            &mut setup.values,
+            "Treats important choices as tradeoffs between innovation, stability, impact, and institutional responsibility.".to_string(),
+        );
+    }
+    if saw_risk_question {
+        push_unique(
+            &mut setup.constraints,
+            "Separates acceptable experiments from risks that harm people, courses, or institutional trust.".to_string(),
+        );
+    }
+    if saw_concrete_question {
+        push_unique(
+            &mut setup.tastes,
+            "Prefers concrete walkthroughs, examples, and decision stories over abstract positioning.".to_string(),
+        );
+    }
+    if saw_followup_question || (interviewer_question_count > 1 && saw_concrete_question) {
+        push_unique(
+            &mut setup.action_tendencies,
+            "Uses follow-up questions to move from broad narrative into specific decisions, assumptions, criteria, and consequences.".to_string(),
+        );
+    }
+    if saw_user_note_preference {
+        push_unique(
+            &mut setup.action_tendencies,
+            "Turns user-authored note evidence into reviewable Constitution candidates instead of accepting it silently.".to_string(),
+        );
+    }
+
+    setup
+}
+
+fn constitution_setup_entry_count(setup: &ConstitutionSetup) -> usize {
+    setup.values.len()
+        + setup.tastes.len()
+        + setup.constraints.len()
+        + setup.somatic_cues.len()
+        + setup.action_tendencies.len()
+}
+
+fn constitution_setup_claims(setup: &ConstitutionSetup) -> HashSet<String> {
+    setup
+        .values
+        .iter()
+        .chain(setup.tastes.iter())
+        .chain(setup.constraints.iter())
+        .chain(setup.somatic_cues.iter())
+        .chain(setup.action_tendencies.iter())
+        .map(|entry| entry.trim().to_string())
+        .filter(|entry| !entry.is_empty())
+        .collect()
+}
+
+fn push_unique(entries: &mut Vec<String>, entry: String) {
+    let normalized = entry.trim();
+    if normalized.is_empty() {
+        return;
+    }
+    if !entries
+        .iter()
+        .any(|existing| existing.eq_ignore_ascii_case(normalized))
+    {
+        entries.push(normalized.to_string());
+    }
+}
+
+fn constitution_item_is_vault_derived(item: &ConstitutionItem) -> bool {
+    matches!(
+        item.source.as_deref(),
+        Some("note_inference")
+            | Some("interview_behavior_inference")
+            | Some("interview_research_inference")
+    ) || item.evidence_refs.iter().any(|evidence| {
+        matches!(
+            evidence.source_type.as_deref(),
+            Some("note") | Some("interview-question") | Some("interview-answer")
+        )
+    })
+}
+
+fn record_is_vault_derived(record: &UserRecord) -> bool {
+    record.metadata.get("source_note_id").is_some()
+        || matches!(
+            record.metadata.get("source_type").and_then(Value::as_str),
+            Some("interview_answer") | Some("note")
+        )
+        || record.evidence_refs.iter().any(|evidence| {
+            matches!(
+                evidence.source_type.as_deref(),
+                Some("note") | Some("interview-question") | Some("interview-answer")
+            )
+        })
 }
 
 fn split_action_gap_claim(content: &str) -> Option<(String, String)> {
@@ -2565,6 +3281,11 @@ impl SignalAccumulator {
             tile_id: extract_event_tile_id(&event.payload),
             model_id: extract_event_model_id(&event.payload),
             note: evidence_note(event),
+            source_type: Some("behavior".to_string()),
+            source_id: Some(event.id.clone()),
+            source_label: evidence_note(event),
+            excerpt: Some(excerpt(&event_text(event))),
+            speaker_role: None,
         });
     }
 }
@@ -3021,6 +3742,11 @@ fn resolve_event_evidence(
         prompt_excerpt,
         response_excerpt,
         model_name,
+        source_type: evidence_ref.source_type.clone(),
+        source_id: evidence_ref.source_id.clone(),
+        source_label: evidence_ref.source_label.clone(),
+        excerpt: evidence_ref.excerpt.clone(),
+        speaker_role: evidence_ref.speaker_role.clone(),
         payload: event.payload.clone(),
     }
 }
@@ -3223,10 +3949,39 @@ fn excerpt(content: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::note::{Note, NoteStatus};
     use crate::models::twin::{
         default_record_confidence, PromotionState, RecordLink, RecordLinkType, UserRecordKind,
     };
     use tempfile::tempdir;
+
+    fn test_note(id: &str, title: &str, content: &str, source_type: Option<&str>) -> Note {
+        let now = Utc::now();
+        let mut properties = HashMap::new();
+        if let Some(source_type) = source_type {
+            properties.insert(
+                "source_type".to_string(),
+                Value::String(source_type.to_string()),
+            );
+        }
+        Note {
+            id: id.to_string(),
+            title: title.to_string(),
+            content: content.to_string(),
+            relative_path: format!("{}.md", id),
+            aliases: Vec::new(),
+            status: NoteStatus::Evidence,
+            tags: Vec::new(),
+            created_at: now,
+            updated_at: now,
+            schema_version: crate::models::note::CURRENT_NOTE_SCHEMA_VERSION,
+            migration_source: None,
+            optimizer_managed: false,
+            wikilinks: Vec::new(),
+            parsed_links: Vec::new(),
+            properties,
+        }
+    }
 
     #[test]
     fn synthetic_records_require_endorsement_for_export() {
@@ -3403,6 +4158,11 @@ mod tests {
                             tile_id: Some(format!("tile-{}", index)),
                             model_id: None,
                             note: None,
+                            source_type: Some("behavior".to_string()),
+                            source_id: None,
+                            source_label: None,
+                            excerpt: None,
+                            speaker_role: None,
                         },
                         EvidenceRef {
                             trace_id: "session-1".to_string(),
@@ -3411,6 +4171,11 @@ mod tests {
                             tile_id: Some(format!("tile-{}", index)),
                             model_id: None,
                             note: None,
+                            source_type: Some("behavior".to_string()),
+                            source_id: None,
+                            source_label: None,
+                            excerpt: None,
+                            speaker_role: None,
                         },
                         EvidenceRef {
                             trace_id: "session-1".to_string(),
@@ -3419,6 +4184,11 @@ mod tests {
                             tile_id: Some(format!("tile-{}", index)),
                             model_id: None,
                             note: None,
+                            source_type: Some("behavior".to_string()),
+                            source_id: None,
+                            source_label: None,
+                            excerpt: None,
+                            speaker_role: None,
                         },
                     ],
                     confidence: 0.82,
@@ -3489,6 +4259,11 @@ mod tests {
                             tile_id: Some(format!("cluster-tile-{}", index)),
                             model_id: None,
                             note: None,
+                            source_type: Some("behavior".to_string()),
+                            source_id: None,
+                            source_label: None,
+                            excerpt: None,
+                            speaker_role: None,
                         },
                         EvidenceRef {
                             trace_id: "session-1".to_string(),
@@ -3497,6 +4272,11 @@ mod tests {
                             tile_id: Some(format!("cluster-tile-{}", index)),
                             model_id: None,
                             note: None,
+                            source_type: Some("behavior".to_string()),
+                            source_id: None,
+                            source_label: None,
+                            excerpt: None,
+                            speaker_role: None,
                         },
                         EvidenceRef {
                             trace_id: "session-1".to_string(),
@@ -3505,6 +4285,11 @@ mod tests {
                             tile_id: Some(format!("cluster-tile-{}", index)),
                             model_id: None,
                             note: None,
+                            source_type: Some("behavior".to_string()),
+                            source_id: None,
+                            source_label: None,
+                            excerpt: None,
+                            speaker_role: None,
                         },
                     ],
                     confidence: 0.84,
@@ -3736,6 +4521,233 @@ mod tests {
     }
 
     #[test]
+    fn constitution_inference_uses_repeated_behavior_as_primary_evidence() {
+        let temp_dir = tempdir().expect("temp dir should be created");
+        let mut store = TwinStore::new(temp_dir.path().to_path_buf());
+
+        for index in 0..3 {
+            store
+                .append_trace_event(
+                    "session-1",
+                    TraceEventType::PromptSubmitted,
+                    serde_json::json!({
+                        "tile_id": format!("tile-{}", index),
+                        "prompt": "Please implement this with exact files, commands, and tests.",
+                        "models": ["openai/gpt-4o"],
+                    }),
+                )
+                .expect("trace event should append");
+        }
+
+        store
+            .run_twin_inference()
+            .expect("record inference should run");
+        let summary = store
+            .run_constitution_inference_with_notes(&[])
+            .expect("constitution inference should run");
+        let items = store
+            .list_constitution_items()
+            .expect("constitution should list");
+        let item = items
+            .iter()
+            .find(|item| item.claim.contains("concrete implementation details"))
+            .expect("behavior-derived constitution item should exist");
+
+        assert_eq!(summary.scanned_behavior_events, 3);
+        assert_eq!(summary.auto_active_items, 1);
+        assert_eq!(item.status, ConstitutionStatus::Active);
+        assert_eq!(item.source.as_deref(), Some("behavior_inference"));
+        assert!(item
+            .evidence_refs
+            .iter()
+            .all(|evidence| evidence.source_type.as_deref() == Some("behavior")));
+    }
+
+    #[test]
+    fn interviewee_answers_become_research_findings_not_personal_constitution() {
+        let temp_dir = tempdir().expect("temp dir should be created");
+        let mut store = TwinStore::new(temp_dir.path().to_path_buf());
+        let notes = vec![test_note(
+            "interview-1",
+            "Interview: onboarding",
+            "### Message 1: User\n\nHow do you decide whether an AI workflow is useful?\n\n### Message 2: Interviewee\n\nI need to see a working demo before I trust the system.\n\n### Message 3: User\n\nCan you give a concrete example and compare it with your current workflow?",
+            Some("interview"),
+        )];
+
+        let summary = store
+            .run_constitution_inference_with_notes(&notes)
+            .expect("constitution inference should run");
+        let items = store
+            .list_constitution_items()
+            .expect("constitution should list");
+        let records = store.list_user_records().expect("records should list");
+
+        assert_eq!(summary.scanned_interviews, 1);
+        assert_eq!(summary.extracted_research_findings, 1);
+        assert!(items
+            .iter()
+            .any(|item| item.claim.contains("concrete examples")));
+        assert!(!items
+            .iter()
+            .any(|item| item.claim.contains("working demo before I trust")));
+        assert!(records.iter().any(|record| {
+            record.kind == UserRecordKind::Fact
+                && record.content.contains("working demo before I trust")
+                && record.metadata.get("source_type").and_then(Value::as_str)
+                    == Some("interview_answer")
+        }));
+    }
+
+    #[test]
+    fn unlabeled_interview_notes_import_but_do_not_extract() {
+        let temp_dir = tempdir().expect("temp dir should be created");
+        let mut store = TwinStore::new(temp_dir.path().to_path_buf());
+        let notes = vec![test_note(
+            "interview-2",
+            "Unlabeled interview",
+            "How do you decide whether an AI workflow is useful?\nI need a working demo.",
+            Some("interview"),
+        )];
+
+        let summary = store
+            .run_constitution_inference_with_notes(&notes)
+            .expect("constitution inference should run");
+
+        assert_eq!(summary.scanned_interviews, 1);
+        assert_eq!(summary.extracted_research_findings, 0);
+        assert_eq!(summary.skipped_domain_claims, 1);
+        assert!(store
+            .list_constitution_items()
+            .expect("constitution should list")
+            .is_empty());
+    }
+
+    #[test]
+    fn constitution_inference_prunes_stale_vault_derived_items_and_records() {
+        let temp_dir = tempdir().expect("temp dir should be created");
+        let mut store = TwinStore::new(temp_dir.path().to_path_buf());
+
+        store
+            .create_constitution_item(ConstitutionItemCreate {
+                claim: "Old note-backed claim".to_string(),
+                dimension: "reasoning".to_string(),
+                scope: vec!["note".to_string()],
+                priority: 0.58,
+                confidence: 0.58,
+                status: ConstitutionStatus::Candidate,
+                evidence_refs: vec![EvidenceRef {
+                    trace_id: "note-old-note".to_string(),
+                    event_id: "old-note".to_string(),
+                    session_id: "vault-note".to_string(),
+                    tile_id: None,
+                    model_id: None,
+                    note: Some("Old note".to_string()),
+                    source_type: Some("note".to_string()),
+                    source_id: Some("old-note".to_string()),
+                    source_label: Some("Vault note".to_string()),
+                    excerpt: Some("old evidence".to_string()),
+                    speaker_role: Some("user".to_string()),
+                }],
+                tensions: Vec::new(),
+                linked_record_ids: Vec::new(),
+                source: Some("note_inference".to_string()),
+            })
+            .expect("old constitution item should be created");
+        store
+            .create_user_record(UserRecordCreate {
+                kind: UserRecordKind::Fact,
+                content: "Interview finding: old vault finding".to_string(),
+                origin: RecordOrigin::Inferred,
+                evidence_refs: Vec::new(),
+                confidence: 0.66,
+                promotion_state: Some(PromotionState::Candidate),
+                valid_from: None,
+                valid_until: None,
+                links: Vec::new(),
+                metadata: HashMap::from([
+                    ("source_type".to_string(), json!("interview_answer")),
+                    ("source_note_id".to_string(), json!("old-note")),
+                ]),
+            })
+            .expect("old record should be created");
+        store
+            .create_constitution_item(ConstitutionItemCreate {
+                claim: "Old guided setup claim".to_string(),
+                dimension: "values".to_string(),
+                scope: vec!["setup".to_string()],
+                priority: 0.9,
+                confidence: 0.9,
+                status: ConstitutionStatus::Active,
+                evidence_refs: Vec::new(),
+                tensions: Vec::new(),
+                linked_record_ids: Vec::new(),
+                source: Some("guided_setup".to_string()),
+            })
+            .expect("old setup constitution item should be created");
+
+        let current_notes = vec![test_note(
+            "current-interview",
+            "Current interview",
+            "### Message 1: User\n\nCan you give a concrete example of how you make tradeoffs?\n\n### Message 2: Interviewee\n\nI compare impact and risk before deciding.",
+            Some("interview"),
+        )];
+        let summary = store
+            .run_constitution_inference_with_notes(&current_notes)
+            .expect("constitution inference should run");
+
+        assert_eq!(summary.pruned_stale_constitution_items, 2);
+        assert_eq!(summary.pruned_stale_records, 1);
+        assert!(store
+            .list_constitution_items()
+            .expect("constitution should list")
+            .iter()
+            .all(|item| !item.claim.contains("Old note-backed claim")
+                && !item.claim.contains("Old guided setup claim")));
+        assert!(store
+            .list_user_records()
+            .expect("records should list")
+            .iter()
+            .all(|record| !record.content.contains("old vault finding")));
+    }
+
+    #[test]
+    fn constitution_inference_rewrites_setup_from_current_interview_questions() {
+        let temp_dir = tempdir().expect("temp dir should be created");
+        let mut store = TwinStore::new(temp_dir.path().to_path_buf());
+        let notes = vec![test_note(
+            "interview-setup",
+            "Interview: strategy",
+            "### Message 1: User\n\nWhat are some personal values or cultural values that drive your decisions?\n\n### Message 2: Interviewee\n\nI want work to make something better and different.\n\n### Message 3: User\n\nCan you walk us through a concrete example and how you balance innovation and stability?",
+            Some("interview"),
+        )];
+
+        let summary = store
+            .run_constitution_inference_with_notes(&notes)
+            .expect("constitution inference should run");
+        let setup = store
+            .get_constitution_setup()
+            .expect("setup should load after inference");
+
+        assert!(summary.updated_setup_entries >= 4);
+        assert!(setup
+            .values
+            .iter()
+            .any(|entry| entry.contains("values and cultural assumptions")));
+        assert!(setup
+            .tastes
+            .iter()
+            .any(|entry| entry.contains("concrete walkthroughs")));
+        assert!(setup
+            .constraints
+            .iter()
+            .any(|entry| entry.contains("interviewee answers as research evidence")));
+        assert!(setup
+            .action_tendencies
+            .iter()
+            .any(|entry| entry.contains("follow-up questions")));
+    }
+
+    #[test]
     fn export_separates_approved_candidate_and_rejected_records() {
         let temp_dir = tempdir().expect("temp dir should be created");
         let mut store = TwinStore::new(temp_dir.path().to_path_buf());
@@ -3916,6 +4928,11 @@ mod tests {
                     tile_id: Some("tile-1".to_string()),
                     model_id: Some("openai/gpt-4o".to_string()),
                     note: None,
+                    source_type: Some("behavior".to_string()),
+                    source_id: None,
+                    source_label: None,
+                    excerpt: None,
+                    speaker_role: None,
                 }],
                 confidence: 0.8,
                 promotion_state: Some(PromotionState::Candidate),

@@ -21,7 +21,7 @@
         {{ loading ? 'Reading file...' : 'Choose Export File' }}
       </button>
       <p class="help-text">
-        Supported formats: ChatGPT conversations.json, Claude .dms/JSON, Grok export, Gemini export
+        Supported formats: ChatGPT conversations.json, Claude .dms/JSON, Grok export, Gemini export, labeled .md/.txt/.docx interview transcripts
       </p>
       <p
         v-if="error"
@@ -375,7 +375,11 @@ async function handlePickFile() {
 
   const selected = await open({
     multiple: false,
-    filters: [{ name: 'JSON', extensions: ['json', 'dms'] }],
+    filters: [
+      { name: 'Supported imports', extensions: ['json', 'dms', 'md', 'txt', 'docx'] },
+      { name: 'JSON', extensions: ['json', 'dms'] },
+      { name: 'Transcripts', extensions: ['md', 'txt', 'docx'] }
+    ],
   })
 
   if (!selected) return

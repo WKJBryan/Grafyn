@@ -131,6 +131,8 @@ pub struct PromptTile {
     #[serde(default)]
     pub twin_context_policy: Option<String>,
     #[serde(default)]
+    pub twin_llm_provider: Option<String>,
+    #[serde(default)]
     pub decision_metadata: Option<DecisionPromptMetadata>,
     #[serde(default)]
     pub decision_episode_id: Option<String>,
@@ -138,6 +140,8 @@ pub struct PromptTile {
     pub web_search: bool,
     #[serde(default = "default_web_search_max_results")]
     pub web_search_max_results: u32,
+    #[serde(default = "default_reasoning_effort")]
+    pub reasoning_effort: String,
 }
 
 impl Default for PromptTile {
@@ -159,10 +163,12 @@ impl Default for PromptTile {
             candidate_twin_records: Vec::new(),
             twin_answer_mode: TwinAnswerMode::default(),
             twin_context_policy: None,
+            twin_llm_provider: None,
             decision_metadata: None,
             decision_episode_id: None,
             web_search: false,
             web_search_max_results: default_web_search_max_results(),
+            reasoning_effort: default_reasoning_effort(),
         }
     }
 }
@@ -192,10 +198,10 @@ impl Default for TilePosition {
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ContextMode {
+    #[default]
     None,
     FullHistory,
     Compact,
-    #[default]
     KnowledgeSearch,
     Twin,
     /// Legacy alias for KnowledgeSearch — accept "semantic" from old saved sessions
@@ -276,6 +282,8 @@ pub struct Debate {
     pub position: TilePosition,
     #[serde(default)]
     pub debate_mode: String,
+    #[serde(default = "default_reasoning_effort")]
+    pub reasoning_effort: String,
     pub created_at: DateTime<Utc>,
 }
 
@@ -293,6 +301,7 @@ impl Default for Debate {
             status: "active".to_string(),
             position: TilePosition::default(),
             debate_mode: "auto".to_string(),
+            reasoning_effort: default_reasoning_effort(),
             created_at: Utc::now(),
         }
     }
@@ -383,6 +392,8 @@ pub struct PromptRequest {
     #[serde(default)]
     pub twin_context_policy: Option<String>,
     #[serde(default)]
+    pub twin_llm_provider: Option<String>,
+    #[serde(default)]
     pub decision_metadata: Option<DecisionPromptMetadata>,
     #[serde(default)]
     pub parent_tile_id: Option<String>,
@@ -396,6 +407,8 @@ pub struct PromptRequest {
     pub web_search: bool,
     #[serde(default = "default_web_search_max_results")]
     pub web_search_max_results: u32,
+    #[serde(default = "default_reasoning_effort")]
+    pub reasoning_effort: String,
 }
 
 fn default_temperature() -> f64 {
@@ -404,6 +417,10 @@ fn default_temperature() -> f64 {
 
 fn default_web_search_max_results() -> u32 {
     5
+}
+
+fn default_reasoning_effort() -> String {
+    "none".to_string()
 }
 
 /// Available LLM model information
@@ -436,6 +453,8 @@ mod tests {
         assert_eq!(request.web_search_max_results, 5);
         assert_eq!(request.max_tokens, None);
         assert_eq!(request.prompt_type, PromptType::Standard);
+        assert_eq!(request.context_mode, ContextMode::None);
+        assert_eq!(request.reasoning_effort, "none");
     }
 
     #[test]
@@ -458,6 +477,7 @@ mod tests {
         assert_eq!(tile.web_search_max_results, 5);
         assert_eq!(tile.twin_answer_mode, TwinAnswerMode::Advisor);
         assert_eq!(tile.prompt_type, PromptType::Standard);
+        assert_eq!(tile.reasoning_effort, "none");
         assert!(tile.approved_twin_records.is_empty());
     }
 
@@ -601,6 +621,8 @@ pub struct DebateStartRequest {
     pub debate_mode: String,
     #[serde(default = "default_max_rounds")]
     pub max_rounds: u32,
+    #[serde(default = "default_reasoning_effort")]
+    pub reasoning_effort: String,
 }
 
 fn default_debate_mode() -> String {
@@ -615,6 +637,8 @@ fn default_max_rounds() -> u32 {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DebateContinueRequest {
     pub prompt: String,
+    #[serde(default = "default_reasoning_effort")]
+    pub reasoning_effort: String,
 }
 
 /// Request to add models to an existing tile
