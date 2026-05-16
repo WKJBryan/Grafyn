@@ -541,8 +541,12 @@
           <span>{{ eventLabel(item.event_type) }}</span>
           <span>{{ formatDate(item.created_at) }}</span>
         </div>
-        <p v-if="item.prompt_excerpt">{{ item.prompt_excerpt }}</p>
-        <p v-if="item.response_excerpt">{{ item.response_excerpt }}</p>
+        <p v-if="item.prompt_excerpt">
+          {{ item.prompt_excerpt }}
+        </p>
+        <p v-if="item.response_excerpt">
+          {{ item.response_excerpt }}
+        </p>
         <small>{{ item.session_id }} <span v-if="item.model_id">/ {{ item.model_id }}</span></small>
       </article>
     </aside>

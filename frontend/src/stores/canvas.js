@@ -259,7 +259,7 @@ export const useCanvasStore = defineStore('canvas', () => {
     models,
     systemPrompt = null,
     temperature = 0.7,
-    maxTokens = null,
+    _maxTokens = null,
     parentTileId = null,
     parentModelId = null,
     contextMode = 'none',

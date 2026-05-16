@@ -87,7 +87,9 @@
               :key="hub.hub_id"
               class="topic-hub-item"
             >
-              <div class="topic-hub-title">{{ hub.hub_title }}</div>
+              <div class="topic-hub-title">
+                {{ hub.hub_title }}
+              </div>
               <div class="topic-hub-meta">
                 <span class="topic-key">{{ hub.topic_key }}</span>
                 <span class="topic-source">{{ hub.membership_source || 'auto' }}</span>

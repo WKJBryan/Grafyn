@@ -2,7 +2,9 @@
   <div class="optimizer-panel">
     <div class="panel-header">
       <div>
-        <div class="section-title">Vault Optimizer</div>
+        <div class="section-title">
+          Vault Optimizer
+        </div>
         <div class="panel-subtitle">
           {{ status?.enabled ? `${status.edit_mode.replace('_', ' ')} mode` : 'Paused' }}
           <span v-if="status"> · {{ status.llm_enabled ? 'LLM enabled' : 'Local only' }}</span>
@@ -49,8 +51,12 @@
       >
         <div class="item-copy">
           <strong>{{ entry.title || entry.note_id }}</strong>
-          <div class="item-reason">{{ entry.reason }}</div>
-          <div class="item-diff">{{ entry.diff_preview }}</div>
+          <div class="item-reason">
+            {{ entry.reason }}
+          </div>
+          <div class="item-diff">
+            {{ entry.diff_preview }}
+          </div>
         </div>
         <button
           v-if="entry.change_id"
