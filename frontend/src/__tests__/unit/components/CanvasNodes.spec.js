@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 import PromptNode from '@/components/canvas/PromptNode.vue'
 import LLMNode from '@/components/canvas/LLMNode.vue'
 import DebateNode from '@/components/canvas/DebateNode.vue'
+import ModelResponseCard from '@/components/canvas/ModelResponseCard.vue'
 
 const mountedWrappers = []
 
@@ -97,6 +98,62 @@ describe('Canvas Nodes', () => {
     expect(debateWrapper.find('.resize-handle').exists()).toBe(true)
   })
 
+  it('keeps prompt tile text selectable instead of starting a move drag', () => {
+    const wrapper = mountAttached(PromptNode, {
+      props: {
+        tile: {
+          id: 'prompt-1',
+          prompt: 'Copy this prompt text from the canvas tile.',
+          responses: { 'openai/gpt-4': { status: 'completed' } },
+          created_at: new Date().toISOString(),
+          position: { x: 15, y: 25, width: 200, height: 120 }
+        }
+      }
+    })
+
+    const content = wrapper.find('.node-content')
+    expect(content.attributes('data-selectable-text')).toBe('true')
+
+    mouse(wrapper.find('.prompt-text').element, 'mousedown', { clientX: 10, clientY: 10, button: 0 })
+    mouse(document, 'mousemove', { clientX: 60, clientY: 40, button: 0 })
+    mouse(document, 'mouseup', { clientX: 60, clientY: 40, button: 0 })
+
+    expect(wrapper.emitted('drag')).toBeUndefined()
+  })
+
+  it('marks response tile body text as selectable', () => {
+    const wrapper = mountAttached(LLMNode, {
+      props: {
+        tileId: 'tile-1',
+        modelId: 'openai/gpt-4',
+        response: {
+          status: 'completed',
+          content: 'Copy this response from the canvas tile.',
+          model_name: 'GPT-4',
+          color: '#7c5cff',
+          position: { x: 0, y: 0, width: 280, height: 200 }
+        },
+        availableModels: []
+      }
+    })
+
+    expect(wrapper.find('.node-content').attributes('data-selectable-text')).toBe('true')
+  })
+
+  it('marks legacy model response cards as selectable', () => {
+    const wrapper = mountAttached(ModelResponseCard, {
+      props: {
+        response: {
+          status: 'completed',
+          content: 'Copy text from a compact response card.',
+          model_name: 'GPT-4'
+        }
+      }
+    })
+
+    expect(wrapper.find('.response-content').attributes('data-selectable-text')).toBe('true')
+  })
+
   it('resizes prompt nodes and keeps x/y fixed when dragging from the resize handle', () => {
     const wrapper = mountAttached(PromptNode, {
       props: {
@@ -158,6 +215,46 @@ describe('Canvas Nodes', () => {
 
     expect(wrapper.find('.decision-badge').text()).toBe('Decision')
     expect(wrapper.text()).toContain('2026-05-15')
+  })
+
+  it('shows root lineage separately from prompt context mode', () => {
+    const wrapper = mountAttached(PromptNode, {
+      props: {
+        tile: {
+          id: 'prompt-root',
+          prompt: 'Root decision prompt',
+          context_mode: 'twin',
+          responses: { 'openai/gpt-4': { status: 'completed' } },
+          created_at: new Date().toISOString(),
+          position: { x: 15, y: 25, width: 220, height: 120 }
+        }
+      }
+    })
+
+    expect(wrapper.find('.lineage-badge').text()).toBe('Root')
+    expect(wrapper.find('.context-mode-badge').text()).toBe('Context: Twin')
+  })
+
+  it('shows branch lineage with parent ids independently from context mode', () => {
+    const wrapper = mountAttached(PromptNode, {
+      props: {
+        tile: {
+          id: 'prompt-branch',
+          prompt: 'Branch prompt',
+          parent_tile_id: 'parent-tile',
+          parent_model_id: 'openai/gpt-4',
+          context_mode: 'full_history',
+          responses: { 'openai/gpt-4': { status: 'completed' } },
+          created_at: new Date().toISOString(),
+          position: { x: 15, y: 25, width: 220, height: 120 }
+        }
+      }
+    })
+
+    expect(wrapper.find('.lineage-badge').text()).toBe('Branch')
+    expect(wrapper.find('.lineage-badge').attributes('title')).toContain('parent-tile')
+    expect(wrapper.find('.lineage-badge').attributes('title')).toContain('openai/gpt-4')
+    expect(wrapper.find('.context-mode-badge').text()).toBe('Context: Full History')
   })
 
   it('enforces minimum size when resizing prompt nodes', () => {

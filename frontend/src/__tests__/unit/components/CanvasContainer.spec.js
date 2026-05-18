@@ -140,7 +140,12 @@ function mountContainer() {
         PromptNode: { template: '<div />' },
         LLMNode: {
           props: ['tileId', 'modelId', 'response', 'webSearch'],
-          template: '<button class="llm-node-stub" :data-tile-id="tileId" :data-model-id="modelId" :data-web-search="String(webSearch)" @click="$emit(\'select\', { tileId, modelId })" />'
+          template: `
+            <div>
+              <button class="llm-node-stub" :data-tile-id="tileId" :data-model-id="modelId" :data-web-search="String(webSearch)" @click="$emit('select', { tileId, modelId })" />
+              <button class="branch-stub" @click="$emit('branch', tileId, modelId)" />
+            </div>
+          `
         },
         DebateNode: { template: '<div />' },
         AddModelDialog: { template: '<div />' },
@@ -338,6 +343,112 @@ describe('CanvasContainer', () => {
       },
       'none',
       'ollama'
+    )
+  })
+
+  it('opens a new prompt as a root even after a branch dialog was opened', async () => {
+    getOpenRouterStatus.mockResolvedValue({ has_key: true, is_configured: true })
+    store.getParentResponseContent.mockReturnValue({
+      prompt: 'Parent prompt',
+      model: 'openai/gpt-4o',
+      content: 'Parent answer'
+    })
+    store.promptTiles = [
+      {
+        id: 'parent-tile',
+        prompt: 'Parent prompt',
+        web_search: false,
+        responses: {
+          'openai/gpt-4o': {
+            status: 'completed',
+            content: 'Parent answer',
+            model_name: 'GPT-4o',
+            color: '#7c5cff',
+            position: { x: 320, y: 40, width: 280, height: 200 }
+          }
+        },
+        position: { x: 40, y: 40, width: 200, height: 120 }
+      }
+    ]
+
+    const wrapper = mountContainer()
+    await flushPromises()
+    await wrapper.find('.branch-stub').trigger('click')
+    await flushPromises()
+    await wrapper.find('[data-guide="canvas-prompt-btn"]').trigger('click')
+    await flushPromises()
+    await wrapper.find('.submit-stub').trigger('click')
+    await flushPromises()
+
+    expect(store.branchFromResponse).not.toHaveBeenCalled()
+    expect(store.sendPrompt).toHaveBeenCalledWith(
+      'hello',
+      ['openai/gpt-4o'],
+      null,
+      0.7,
+      null,
+      null,
+      null,
+      'knowledge_search',
+      'advisor',
+      false,
+      undefined,
+      'standard',
+      null,
+      'none',
+      null
+    )
+  })
+
+  it('submits an explicit branch with the selected parent response ids', async () => {
+    getOpenRouterStatus.mockResolvedValue({ has_key: true, is_configured: true })
+    store.getParentResponseContent.mockReturnValue({
+      prompt: 'Parent prompt',
+      model: 'openai/gpt-4o',
+      content: 'Parent answer'
+    })
+    store.promptTiles = [
+      {
+        id: 'parent-tile',
+        prompt: 'Parent prompt',
+        web_search: false,
+        responses: {
+          'openai/gpt-4o': {
+            status: 'completed',
+            content: 'Parent answer',
+            model_name: 'GPT-4o',
+            color: '#7c5cff',
+            position: { x: 320, y: 40, width: 280, height: 200 }
+          }
+        },
+        position: { x: 40, y: 40, width: 200, height: 120 }
+      }
+    ]
+
+    const wrapper = mountContainer()
+    await flushPromises()
+    await wrapper.find('.branch-stub').trigger('click')
+    await flushPromises()
+    await wrapper.find('.submit-stub').trigger('click')
+    await flushPromises()
+
+    expect(store.sendPrompt).not.toHaveBeenCalled()
+    expect(store.branchFromResponse).toHaveBeenCalledWith(
+      'parent-tile',
+      'openai/gpt-4o',
+      'hello',
+      ['openai/gpt-4o'],
+      null,
+      0.7,
+      null,
+      'knowledge_search',
+      'advisor',
+      false,
+      undefined,
+      'standard',
+      null,
+      'none',
+      null
     )
   })
 

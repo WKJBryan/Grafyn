@@ -12,7 +12,11 @@
           :size="14"
           class="prompt-icon"
         />
-        <span class="prompt-text">{{ truncatedPrompt }}</span>
+        <span
+          class="prompt-text"
+          data-selectable-text="true"
+          @mousedown.stop
+        >{{ truncatedPrompt }}</span>
       </div>
       <div class="tile-actions">
         <button
@@ -418,6 +422,8 @@ onBeforeUnmount(() => {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  cursor: text;
+  user-select: text;
 }
 
 .tile-actions {

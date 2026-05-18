@@ -37,6 +37,8 @@
     <div
       ref="contentRef"
       class="response-content"
+      data-selectable-text="true"
+      @mousedown.stop
     >
       <div
         v-if="response.status === 'pending'"
@@ -221,6 +223,12 @@ watch(() => props.response.content, () => {
   overflow-y: auto;
   font-size: 0.8125rem;
   line-height: 1.5;
+  cursor: text;
+  user-select: text;
+}
+
+.response-content :deep(*) {
+  user-select: text;
 }
 
 .loading-state {

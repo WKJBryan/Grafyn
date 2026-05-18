@@ -1296,6 +1296,7 @@ function collapseDebate(debateId) {
 
 // Handle "+ New Prompt" click - check API key first
 async function handleNewPromptClick() {
+  branchContext.value = null
   if (isDesktopApp()) {
     try {
       await refreshOpenRouterStatus()
@@ -1337,13 +1338,14 @@ async function handlePromptSubmit({
   }
 
   showPromptDialog.value = false
+  const activeBranchContext = branchContext.value
 
   try {
-    if (branchContext.value) {
+    if (activeBranchContext) {
       // Branching from a tile
       await canvasStore.branchFromResponse(
-        branchContext.value.parentTileId,
-        branchContext.value.parentModelId,
+        activeBranchContext.parentTileId,
+        activeBranchContext.parentModelId,
         prompt,
         models,
         systemPrompt,
@@ -1358,7 +1360,6 @@ async function handlePromptSubmit({
         reasoningEffort,
         selectedTwinLlmProvider
       )
-      branchContext.value = null
     } else {
       // Regular prompt
       await canvasStore.sendPrompt(
@@ -1386,6 +1387,10 @@ async function handlePromptSubmit({
       text: err.message || 'Failed to send prompt'
     }
     setTimeout(() => { saveMessage.value = null }, 5000)
+  } finally {
+    if (activeBranchContext) {
+      branchContext.value = null
+    }
   }
 }
 

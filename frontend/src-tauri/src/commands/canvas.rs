@@ -3171,6 +3171,28 @@ mod tests {
         }
     }
 
+    fn build_root_request(prompt: &str, context_mode: ContextMode) -> PromptRequest {
+        PromptRequest {
+            prompt: prompt.to_string(),
+            prompt_type: PromptType::Standard,
+            system_prompt: None,
+            models: vec!["openai/gpt-4".to_string()],
+            position: None,
+            context_mode,
+            twin_answer_mode: TwinAnswerMode::default(),
+            twin_context_policy: None,
+            twin_llm_provider: None,
+            decision_metadata: None,
+            parent_tile_id: None,
+            parent_model_id: None,
+            temperature: 0.7,
+            max_tokens: None,
+            web_search: false,
+            web_search_max_results: 5,
+            reasoning_effort: "none".to_string(),
+        }
+    }
+
     fn build_retrieval_result(
         id: &str,
         title: &str,
@@ -3547,6 +3569,35 @@ mod tests {
         assert_eq!(messages[2].content, "Branch prompt");
         assert_eq!(messages[3].content, "Branch response");
         assert_eq!(messages[4].content, "Final prompt");
+    }
+
+    #[test]
+    fn test_root_prompt_without_parent_ids_ignores_unrelated_canvas_tiles() {
+        let session = build_session(vec![
+            build_tile(
+                "tile-1",
+                "Unrelated root prompt",
+                "openai/gpt-4",
+                "Unrelated root response",
+                None,
+                None,
+            ),
+            build_tile(
+                "tile-2",
+                "Unrelated branch prompt",
+                "openai/gpt-4",
+                "Unrelated branch response",
+                Some("tile-1"),
+                Some("openai/gpt-4"),
+            ),
+        ]);
+        let request = build_root_request("Fresh root prompt", ContextMode::None);
+
+        let messages = build_canvas_messages(&session, &request).unwrap();
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, "user");
+        assert_eq!(messages[0].content, "Fresh root prompt");
     }
 
     #[test]
