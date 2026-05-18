@@ -53,6 +53,8 @@
     <div
       ref="contentRef"
       class="node-content"
+      data-selectable-text="true"
+      @mousedown.stop
       @wheel.stop
     >
       <div
@@ -855,6 +857,12 @@ onBeforeUnmount(() => {
   font-size: 0.8125rem;
   line-height: 1.5;
   color: var(--text-primary);
+  cursor: text;
+  user-select: text;
+}
+
+.node-content :deep(*) {
+  user-select: text;
 }
 
 .node-content :deep(p) {

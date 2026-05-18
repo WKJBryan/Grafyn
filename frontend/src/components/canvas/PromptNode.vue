@@ -32,7 +32,11 @@
       </div>
     </div>
 
-    <div class="node-content">
+    <div
+      class="node-content"
+      data-selectable-text="true"
+      @mousedown.stop
+    >
       <p
         class="prompt-text"
         :title="tile.prompt"
@@ -88,6 +92,22 @@
         </span>
       </div>
     </div>
+
+    <div class="lineage-summary">
+      <span
+        class="lineage-badge"
+        :class="{ branch: hasParentLink }"
+        :title="lineageTitle"
+      >
+        {{ lineageLabel }}
+      </span>
+      <span
+        class="context-mode-badge"
+        :title="contextModeTitle"
+      >
+        Context: {{ contextModeLabel }}
+      </span>
+    </div>
     
     <div class="node-footer">
       <span class="model-count">→ {{ modelCount }} model{{ modelCount !== 1 ? 's' : '' }}</span>
@@ -132,7 +152,7 @@
 
     <!-- Branch indicator if this is a child prompt -->
     <div
-      v-if="tile.parent_tile_id"
+      v-if="hasParentLink"
       class="branch-indicator"
     >
       <GIcon
@@ -183,6 +203,14 @@ const hasCompletedResponse = computed(() =>
 const approvedTwinRecords = computed(() => props.tile.approved_twin_records || [])
 const candidateTwinRecords = computed(() => props.tile.candidate_twin_records || [])
 const isDecision = computed(() => props.tile.prompt_type === 'decision')
+const hasParentLink = computed(() => Boolean(props.tile.parent_tile_id && props.tile.parent_model_id))
+const lineageLabel = computed(() => hasParentLink.value ? 'Branch' : 'Root')
+const lineageTitle = computed(() => {
+  if (!hasParentLink.value) return 'Root prompt: no canvas parent response'
+  return `Branch from ${props.tile.parent_tile_id} / ${props.tile.parent_model_id}`
+})
+const contextModeLabel = computed(() => formatContextMode(props.tile.context_mode || 'none'))
+const contextModeTitle = computed(() => `Prompt context mode: ${contextModeLabel.value}`)
 
 const truncatedPrompt = computed(() => {
   const prompt = props.tile.prompt
@@ -208,10 +236,27 @@ function truncateRecord(content) {
   return content.length > 44 ? `${content.slice(0, 44)}...` : content
 }
 
+function formatContextMode(mode) {
+  const labels = {
+    none: 'None',
+    semantic: 'Semantic',
+    knowledge_search: 'Knowledge Search',
+    full_history: 'Full History',
+    compact: 'Compact',
+    twin: 'Twin'
+  }
+  return labels[mode] || mode
+    .split('_')
+    .filter(Boolean)
+    .map(part => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(' ')
+}
+
 function handleMouseDown(e) {
   // Ignore clicks on interactive elements
   if (
     e.target.closest('.node-actions') ||
+    e.target.closest('.node-content') ||
     e.target.closest('.delete-btn') ||
     e.target.closest('.add-model-btn') ||
     e.target.closest('.resize-handle')
@@ -403,6 +448,8 @@ onBeforeUnmount(() => {
   flex: 1;
   padding: var(--spacing-sm);
   min-height: 40px;
+  cursor: text;
+  user-select: text;
 }
 
 .prompt-text {
@@ -412,6 +459,7 @@ onBeforeUnmount(() => {
   margin: 0;
   word-wrap: break-word;
   overflow-wrap: break-word;
+  user-select: text;
 }
 
 .context-summary {
@@ -457,6 +505,41 @@ onBeforeUnmount(() => {
 
 .context-chip.candidate {
   background: color-mix(in srgb, var(--accent-yellow) 12%, transparent);
+}
+
+.lineage-summary {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 0 var(--spacing-sm) var(--spacing-xs);
+}
+
+.lineage-badge,
+.context-mode-badge {
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  color: var(--text-secondary);
+  font-size: 0.625rem;
+  font-weight: 700;
+  line-height: 1;
+  padding: 3px 6px;
+  white-space: nowrap;
+}
+
+.lineage-badge {
+  background: color-mix(in srgb, var(--accent-green) 12%, transparent);
+  color: var(--accent-green);
+}
+
+.lineage-badge.branch {
+  background: color-mix(in srgb, var(--accent-primary) 12%, transparent);
+  color: var(--accent-primary);
+}
+
+.context-mode-badge {
+  background: color-mix(in srgb, var(--accent-cyan) 10%, transparent);
+  color: var(--text-muted);
 }
 
 .node-footer {
