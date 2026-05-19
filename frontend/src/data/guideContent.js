@@ -182,14 +182,14 @@ export const guideCategories = [
   },
   {
     id: 'import',
-    title: 'Import Conversations',
+    title: 'Import Content',
     icon: '\u{1F4E5}',
     route: '/import',
     steps: [
       {
         id: 'import-file',
-        title: 'Import from AI Platforms',
-        content: 'Import conversations from ChatGPT, Claude, Grok, or Gemini. Select a JSON export file to preview and choose which conversations to import as evidence notes.',
+        title: 'Import Evidence',
+        content: 'Import conversations, Markdown, TXT, DOCX, PDF, or labeled transcripts. Select a file to preview and choose which content items to import as evidence notes.',
         anchor: '[data-guide="import-file-btn"]',
         sinceVersion: '0.1.0',
       },

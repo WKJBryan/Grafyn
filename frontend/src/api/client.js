@@ -282,8 +282,8 @@ export const retrieval = {
 export const importApi = {
   preview: (filePath) => invoke('preview_import', { filePath }),
 
-  apply: (filePath, conversationIds = []) =>
-    invoke('apply_import', { filePath, conversationIds }),
+  apply: (filePath, contentIds = []) =>
+    invoke('apply_import', { filePath, conversationIds: contentIds }),
 
   getSupportedFormats: () => invoke('get_supported_formats', {}),
 }

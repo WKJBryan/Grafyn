@@ -1,7 +1,9 @@
 pub mod chatgpt;
 pub mod claude;
+pub mod document;
 pub mod gemini;
 pub mod grok;
+pub mod semantic_links;
 pub mod transcript;
 
 use crate::models::import::ParsedConversation;
@@ -250,5 +252,107 @@ mod tests {
         assert!(md.contains("### Message 2: Assistant (gpt-4)"));
         assert!(md.contains("Hello"));
         assert!(md.contains("Hi there!"));
+    }
+
+    #[test]
+    fn document_import_splits_docx_source_pages_and_adds_structural_wikilinks() {
+        let content = "\
+https://www.sutd.edu.sg/media-releases-listing/sutd-pivots-50m-investment-worlds-first-design-ai-university/
+SUTD Pivots Towards Artificial Intelligence With $50M Investment, Becoming World's First Design AI University
+A total of $50 million worth of Design AI initiatives will be rolled out.
+AI should be viewed as a partner rather than a tool.
+https://www.sutd.edu.sg/about/design-ai/
+SUTD is the world's first Design AI university.
+Design AI expands human-machine collaboration across education and research.";
+
+        let batch = document::parse_document_text("1. About SUTD Design AI.docx", "docx", content)
+            .expect("document should parse");
+
+        assert_eq!(batch.items.len(), 3);
+        assert_eq!(batch.items[0].content_kind, "document_index");
+        assert!(batch.items[0].content.contains("[[SUTD Pivots Towards Artificial Intelligence With $50M Investment, Becoming World's First Design AI University]]"));
+        assert!(batch.items[0]
+            .content
+            .contains("[[SUTD is the world's first Design AI university.]]"));
+        assert_eq!(batch.items[1].content_kind, "document_section");
+        assert!(batch.items[1]
+            .content
+            .contains("Part of: [[1. About SUTD Design AI]]"));
+        assert!(batch.items[1]
+            .content
+            .contains("Next: [[SUTD is the world's first Design AI university.]]"));
+        assert_eq!(
+            batch.items[1].metadata.get("source_url").and_then(|v| v.as_str()),
+            Some("https://www.sutd.edu.sg/media-releases-listing/sutd-pivots-50m-investment-worlds-first-design-ai-university/")
+        );
+    }
+
+    #[test]
+    fn document_import_uses_pdf_headings_and_excludes_sources_tail() {
+        let content = "\
+Mr. Poon King Wang: A Decade of Professional Perspectives (2015-2025)
+Decision-Making Style
+Mr. Poon makes interdisciplinary and data-informed decisions.
+Core Values and Priorities
+He values human dignity and lifelong learning.
+Evolution of Thinking (2015-2025)
+His thinking evolved from smart cities to Design AI.
+Perspective on Artificial Intelligence (AI)
+AI should augment people and preserve trust.
+Views on the Future of Work
+Work will change through task redesign and reskilling.
+Views on the Future of Education
+Education should integrate AI as a co-creator.
+Sources:
+Helping Workers Weather Crisis and
+Disruption: A Task Approach for Designing a New Future of Work";
+
+        let batch = document::parse_document_text("Poon perspectives.pdf", "pdf", content)
+            .expect("pdf text should parse");
+        let titles = batch
+            .items
+            .iter()
+            .map(|item| item.title.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(titles.contains(&"Decision-Making Style"));
+        assert!(titles.contains(&"Core Values and Priorities"));
+        assert!(titles.contains(&"Evolution of Thinking (2015-2025)"));
+        assert!(titles.contains(&"Perspective on Artificial Intelligence (AI)"));
+        assert!(titles.contains(&"Views on the Future of Work"));
+        assert!(titles.contains(&"Views on the Future of Education"));
+        assert!(!titles.contains(&"Helping Workers Weather Crisis and"));
+    }
+
+    #[test]
+    fn semantic_link_response_keeps_only_exact_known_titles() {
+        let allowed = vec![
+            "SUTD Pivots Towards Artificial Intelligence".to_string(),
+            "Perspective on Artificial Intelligence (AI)".to_string(),
+        ];
+        let raw = r#"{
+            "links": [
+                {
+                    "from_title": "SUTD Pivots Towards Artificial Intelligence",
+                    "to_title": "Perspective on Artificial Intelligence (AI)",
+                    "reason": "Both describe AI as a partner."
+                },
+                {
+                    "from_title": "Made Up",
+                    "to_title": "Perspective on Artificial Intelligence (AI)",
+                    "reason": "Invalid endpoint."
+                }
+            ],
+            "concerns": []
+        }"#;
+
+        let parsed = semantic_links::parse_semantic_link_response(raw, &allowed)
+            .expect("valid JSON should parse");
+
+        assert_eq!(parsed.links.len(), 1);
+        assert_eq!(
+            parsed.links[0].from_title,
+            "SUTD Pivots Towards Artificial Intelligence"
+        );
     }
 }

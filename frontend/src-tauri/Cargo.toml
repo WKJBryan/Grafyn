@@ -45,6 +45,8 @@ notify = "6.1"
 serde_yaml = "0.9"
 zip = "0.6"
 quick-xml = "0.39"
+pdf-extract = "0.7"
+lopdf = "0.34"
 
 # Search
 tantivy = "0.22"

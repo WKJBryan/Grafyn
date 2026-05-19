@@ -19,8 +19,11 @@ use rmcp::{tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
+use std::io::{Cursor, Read};
+use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use zip::ZipArchive;
 
 /// Shared state for the MCP server, holding all services needed by tools.
 #[derive(Clone)]
@@ -147,10 +150,10 @@ fn default_token_budget() -> usize {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ImportParams {
     #[schemars(
-        description = "Absolute path to a conversation export file (JSON or DMS). Supports ChatGPT, Claude, Grok, and Gemini formats."
+        description = "Absolute path to a content file. Supports ChatGPT, Claude, Grok, Gemini, Markdown, TXT, DOCX, PDF, and labeled transcripts."
     )]
     pub file_path: String,
-    #[schemars(description = "IDs of specific conversations to import. Empty array imports all.")]
+    #[schemars(description = "IDs of specific content items to import. Empty array imports all.")]
     #[serde(default)]
     pub conversation_ids: Vec<String>,
 }
@@ -198,6 +201,90 @@ fn json_result<T: Serialize>(data: &T) -> Result<CallToolResult, McpError> {
 
 fn err_result(msg: String) -> Result<CallToolResult, McpError> {
     Ok(CallToolResult::success(vec![Content::text(msg)]))
+}
+
+fn read_mcp_import_content(file_path: &str) -> Result<String, String> {
+    let extension = Path::new(file_path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    if extension == "docx" {
+        let bytes = std::fs::read(file_path).map_err(|e| e.to_string())?;
+        return extract_mcp_docx_text(&bytes);
+    }
+
+    if extension == "pdf" {
+        let text = pdf_extract::extract_text(file_path).map_err(|e| e.to_string())?;
+        let text = text.trim().to_string();
+        return if text.is_empty() {
+            Err("PDF did not contain readable text".to_string())
+        } else {
+            Ok(text)
+        };
+    }
+
+    std::fs::read_to_string(file_path).map_err(|e| e.to_string())
+}
+
+fn extract_mcp_docx_text(bytes: &[u8]) -> Result<String, String> {
+    let cursor = Cursor::new(bytes);
+    let mut archive =
+        ZipArchive::new(cursor).map_err(|e| format!("Failed to open DOCX archive: {}", e))?;
+    let mut document = archive
+        .by_name("word/document.xml")
+        .map_err(|e| format!("Failed to find DOCX document text: {}", e))?;
+    let mut xml = String::new();
+    document
+        .read_to_string(&mut xml)
+        .map_err(|e| format!("Failed to read DOCX document text: {}", e))?;
+
+    let mut reader = quick_xml::Reader::from_str(&xml);
+    reader.config_mut().trim_text(false);
+    let mut text = String::new();
+    let mut in_text_run = false;
+
+    loop {
+        match reader.read_event() {
+            Ok(quick_xml::events::Event::Start(event)) => match event.name().as_ref() {
+                b"w:t" => in_text_run = true,
+                b"w:tab" => text.push('\t'),
+                b"w:br" => text.push('\n'),
+                _ => {}
+            },
+            Ok(quick_xml::events::Event::Empty(event)) => match event.name().as_ref() {
+                b"w:tab" => text.push('\t'),
+                b"w:br" => text.push('\n'),
+                _ => {}
+            },
+            Ok(quick_xml::events::Event::Text(event)) if in_text_run => {
+                let decoded = event
+                    .xml_content()
+                    .map_err(|e| format!("Failed to decode DOCX text: {}", e))?;
+                text.push_str(&decoded);
+            }
+            Ok(quick_xml::events::Event::End(event)) => match event.name().as_ref() {
+                b"w:t" => in_text_run = false,
+                b"w:p" => {
+                    if !text.ends_with('\n') {
+                        text.push('\n');
+                    }
+                }
+                _ => {}
+            },
+            Ok(quick_xml::events::Event::Eof) => break,
+            Err(e) => return Err(format!("Failed to parse DOCX document text: {}", e)),
+            _ => {}
+        }
+    }
+
+    let content = text.trim().to_string();
+    if content.is_empty() {
+        Err("DOCX did not contain readable text".to_string())
+    } else {
+        Ok(content)
+    }
 }
 
 // ── Tool implementations ─────────────────────────────────────────────────────
@@ -471,57 +558,43 @@ impl GrafynMcpServer {
     }
 
     #[tool(
-        description = "Import conversations from ChatGPT, Claude, Grok, or Gemini export files as evidence notes. Auto-detects format. Returns created note IDs."
+        description = "Import conversations, documents, or transcripts as evidence notes. Auto-detects known chat exports and splits documents into linked section notes. Returns created note IDs."
     )]
     async fn import_conversation(
         &self,
         Parameters(params): Parameters<ImportParams>,
     ) -> Result<CallToolResult, McpError> {
-        // Read the file
-        let content = match std::fs::read_to_string(&params.file_path) {
+        let content = match read_mcp_import_content(&params.file_path) {
             Ok(c) => c,
             Err(e) => return err_result(format!("Failed to read file: {}", e)),
         };
 
-        // Auto-detect and parse
-        let platform = import::detect_platform(&content).unwrap_or("unknown");
-        let all_conversations = match import::parse_content(&content) {
-            Ok(c) => c,
-            Err(e) => return err_result(format!("Failed to parse: {}", e)),
-        };
+        let path = Path::new(&params.file_path);
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(&params.file_path);
+        let extension = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or_default();
 
-        // Filter to selected conversations
-        let to_import = if params.conversation_ids.is_empty() {
-            all_conversations
-        } else {
-            all_conversations
-                .into_iter()
-                .filter(|c| params.conversation_ids.contains(&c.id))
-                .collect()
-        };
-
-        let mut created_ids = Vec::new();
-        let mut errors = Vec::new();
-
-        for conv in &to_import {
-            let markdown = import::format_as_markdown(conv);
-            let mut tags = conv.suggested_tags.clone();
-            if !tags.contains(&"import".to_string()) {
-                tags.push("import".to_string());
-            }
-            tags.truncate(5);
-
-            let note_create = NoteCreate {
-                title: conv.title.clone(),
-                content: markdown,
-                relative_path: None,
-                aliases: Vec::new(),
-                status: NoteStatus::Evidence,
-                tags,
-                schema_version: CURRENT_NOTE_SCHEMA_VERSION,
-                migration_source: Some("mcp-import".into()),
-                optimizer_managed: false,
-                properties: {
+        let (platform, items) = if let Some(platform) = import::detect_platform(&content) {
+            let all_conversations = match import::parse_content(&content) {
+                Ok(c) => c,
+                Err(e) => return err_result(format!("Failed to parse: {}", e)),
+            };
+            let to_import = if params.conversation_ids.is_empty() {
+                all_conversations
+            } else {
+                all_conversations
+                    .into_iter()
+                    .filter(|c| params.conversation_ids.contains(&c.id))
+                    .collect()
+            };
+            let items = to_import
+                .iter()
+                .map(|conv| {
                     let mut props = std::collections::HashMap::new();
                     props.insert(
                         "source".into(),
@@ -535,8 +608,64 @@ impl GrafynMcpServer {
                         "created_via".into(),
                         serde_json::Value::String("mcp-import".into()),
                     );
-                    props
-                },
+                    let mut tags = conv.suggested_tags.clone();
+                    if !tags.contains(&"import".to_string()) {
+                        tags.push("import".to_string());
+                    }
+                    tags.truncate(5);
+                    (
+                        conv.title.clone(),
+                        import::format_as_markdown(conv),
+                        tags,
+                        props,
+                    )
+                })
+                .collect::<Vec<_>>();
+            (platform.to_string(), items)
+        } else {
+            let batch = match import::document::parse_document_text(file_name, extension, &content)
+            {
+                Ok(batch) => batch,
+                Err(e) => return err_result(format!("Failed to parse content: {}", e)),
+            };
+            let to_import = if params.conversation_ids.is_empty() {
+                batch.items
+            } else {
+                batch
+                    .items
+                    .into_iter()
+                    .filter(|item| params.conversation_ids.contains(&item.id))
+                    .collect()
+            };
+            let items = to_import
+                .into_iter()
+                .map(|item| {
+                    let mut props = item.metadata;
+                    props.insert(
+                        "source_id".into(),
+                        serde_json::Value::String(item.id.clone()),
+                    );
+                    (item.title, item.content, item.suggested_tags, props)
+                })
+                .collect::<Vec<_>>();
+            ("document".to_string(), items)
+        };
+
+        let mut created_ids = Vec::new();
+        let mut errors = Vec::new();
+
+        for (title, content, tags, properties) in items {
+            let note_create = NoteCreate {
+                title: title.clone(),
+                content,
+                relative_path: None,
+                aliases: Vec::new(),
+                status: NoteStatus::Evidence,
+                tags,
+                schema_version: CURRENT_NOTE_SCHEMA_VERSION,
+                migration_source: Some("mcp-import".into()),
+                optimizer_managed: false,
+                properties,
             };
 
             let mut ks = self.knowledge_store.write().await;
@@ -558,7 +687,7 @@ impl GrafynMcpServer {
                     created_ids.push(note.id);
                 }
                 Err(e) => {
-                    errors.push(format!("Failed to create '{}': {}", conv.title, e));
+                    errors.push(format!("Failed to create '{}': {}", title, e));
                 }
             }
         }
