@@ -1,49 +1,83 @@
 use crate::commands::sync_chunk_index_for_notes;
-use crate::models::import::{ImportPreview, ImportResult};
+use crate::models::import::{
+    ConversationMetadata, ImportLinkSuggestion, ImportPreview, ImportResult, ParsedConversation,
+    ParsedMessage,
+};
 use crate::models::note::{NoteCreate, NoteStatus};
-use crate::services::import;
+use crate::services::import::{self, document, semantic_links};
 use crate::AppState;
+use chrono::Utc;
 use quick_xml::events::Event;
 use quick_xml::Reader;
+use serde_json::Value;
 use std::io::{Cursor, Read};
 use std::path::Path;
 use tauri::State;
 use zip::ZipArchive;
 
-/// Preview conversations in an import file (auto-detects format).
+enum ParsedImport {
+    Conversations {
+        platform: String,
+        conversations: Vec<ParsedConversation>,
+    },
+    Document(document::DocumentImportBatch),
+}
+
+/// Preview content in an import file (auto-detects format).
 #[tauri::command]
 pub async fn preview_import(
     file_path: String,
     _state: State<'_, AppState>,
 ) -> Result<ImportPreview, String> {
-    let content = read_import_content(&file_path).await?;
-
-    let platform = import::detect_platform(&content)
-        .ok_or_else(|| "Could not detect conversation format".to_string())?;
-
-    let conversations = import::parse_content(&content).map_err(|e| e.to_string())?;
+    let parsed = parse_import_file(&file_path).await?;
+    let (platform, conversations) = match parsed {
+        ParsedImport::Conversations {
+            platform,
+            conversations,
+        } => (platform, conversations),
+        ParsedImport::Document(batch) => (
+            "document".to_string(),
+            batch
+                .items
+                .iter()
+                .map(document_item_to_preview)
+                .collect::<Vec<_>>(),
+        ),
+    };
 
     let total = conversations.len();
 
     Ok(ImportPreview {
+        items: conversations.clone(),
         conversations,
-        platform: platform.to_string(),
+        platform,
         total_conversations: total,
+        total_items: total,
     })
 }
 
-/// Import selected conversations as container notes (evidence status).
+/// Import selected content as evidence notes.
 #[tauri::command]
 pub async fn apply_import(
     file_path: String,
     conversation_ids: Vec<String>,
     state: State<'_, AppState>,
 ) -> Result<ImportResult, String> {
-    let content = read_import_content(&file_path).await?;
+    match parse_import_file(&file_path).await? {
+        ParsedImport::Conversations { conversations, .. } => {
+            apply_conversation_import(conversations, conversation_ids, state).await
+        }
+        ParsedImport::Document(batch) => {
+            apply_document_import(batch, conversation_ids, state).await
+        }
+    }
+}
 
-    let all_conversations = import::parse_content(&content).map_err(|e| e.to_string())?;
-
-    // Filter to selected conversations (empty = import all)
+async fn apply_conversation_import(
+    all_conversations: Vec<ParsedConversation>,
+    conversation_ids: Vec<String>,
+    state: State<'_, AppState>,
+) -> Result<ImportResult, String> {
     let to_import: Vec<_> = if conversation_ids.is_empty() {
         all_conversations
     } else {
@@ -172,8 +206,147 @@ pub async fn apply_import(
         skipped,
         note_ids,
         errors,
+        semantic_link_suggestions: Vec::new(),
+        semantic_link_error: None,
         message,
     })
+}
+
+async fn apply_document_import(
+    batch: document::DocumentImportBatch,
+    selected_ids: Vec<String>,
+    state: State<'_, AppState>,
+) -> Result<ImportResult, String> {
+    let to_import = if selected_ids.is_empty() {
+        batch.items
+    } else {
+        batch
+            .items
+            .into_iter()
+            .filter(|item| selected_ids.contains(&item.id))
+            .collect::<Vec<_>>()
+    };
+
+    let mut note_ids = Vec::new();
+    let mut created_notes = Vec::new();
+    let mut errors = Vec::new();
+    let mut skipped = 0;
+    let mut imported_section_titles = Vec::new();
+    let mut section_inputs = Vec::new();
+
+    for item in &to_import {
+        let mut properties = item.metadata.clone();
+        properties.insert("source_id".into(), Value::String(item.id.clone()));
+
+        let note_create = NoteCreate {
+            title: item.title.clone(),
+            content: item.content.clone(),
+            relative_path: None,
+            aliases: Vec::new(),
+            status: NoteStatus::Evidence,
+            tags: item.suggested_tags.clone(),
+            schema_version: crate::models::note::CURRENT_NOTE_SCHEMA_VERSION,
+            migration_source: Some("content_import".to_string()),
+            optimizer_managed: false,
+            properties,
+        };
+
+        let created = {
+            let mut store = state.knowledge_store.write().await;
+            match store.create_note(note_create) {
+                Ok(note) => note,
+                Err(e) => {
+                    errors.push(format!("Failed to create '{}': {}", item.title, e));
+                    skipped += 1;
+                    continue;
+                }
+            }
+        };
+
+        {
+            let mut search = state.search_service.write().await;
+            if let Err(e) = search.index_note(&created) {
+                log::error!("Failed to index imported note '{}': {}", created.id, e);
+            }
+            if let Err(e) = search.commit() {
+                log::error!("Failed to commit after indexing '{}': {}", created.id, e);
+            }
+        }
+
+        {
+            let mut graph = state.graph_index.write().await;
+            graph.update_note(&created);
+        }
+
+        if item.content_kind == "document_section" {
+            imported_section_titles.push(item.title.clone());
+            section_inputs.push((item.title.clone(), item.content.clone()));
+        }
+
+        note_ids.push(created.id.clone());
+        created_notes.push(created);
+    }
+
+    sync_chunk_index_for_notes(state.inner(), &created_notes).await;
+
+    let (semantic_link_suggestions, semantic_link_error) =
+        suggest_import_links_if_available(state.inner(), section_inputs).await;
+
+    let imported = note_ids.len();
+    let section_count = imported_section_titles.len();
+    let message = format!(
+        "Imported {} content item{} as evidence notes ({} section note{})",
+        imported,
+        if imported == 1 { "" } else { "s" },
+        section_count,
+        if section_count == 1 { "" } else { "s" }
+    );
+
+    Ok(ImportResult {
+        imported,
+        skipped,
+        note_ids,
+        errors,
+        semantic_link_suggestions,
+        semantic_link_error,
+        message,
+    })
+}
+
+async fn suggest_import_links_if_available(
+    state: &AppState,
+    section_inputs: Vec<(String, String)>,
+) -> (Vec<ImportLinkSuggestion>, Option<String>) {
+    if section_inputs.len() < 2 {
+        return (Vec::new(), None);
+    }
+
+    let base_url = {
+        let settings = state.settings_service.read().await;
+        settings.get().ollama_base_url.clone()
+    };
+
+    match semantic_links::suggest_semantic_links(
+        &base_url,
+        semantic_links::DEFAULT_IMPORT_LINK_MODEL,
+        &section_inputs,
+    )
+    .await
+    {
+        Ok(response) => (
+            response
+                .links
+                .into_iter()
+                .map(|link| ImportLinkSuggestion {
+                    from_title: link.from_title,
+                    to_title: link.to_title,
+                    reason: link.reason,
+                })
+                .collect(),
+            None,
+        ),
+        Err(e) => (Vec::new(), Some(e.to_string())),
+    }
 }
 
 /// Get list of supported import formats.
@@ -186,7 +359,40 @@ pub async fn get_supported_formats() -> Vec<String> {
         "gemini".to_string(),
         "interview_transcript".to_string(),
         "interview_docx".to_string(),
+        "markdown".to_string(),
+        "txt".to_string(),
+        "docx".to_string(),
+        "pdf".to_string(),
     ]
+}
+
+async fn parse_import_file(file_path: &str) -> Result<ParsedImport, String> {
+    let content = read_import_content(file_path).await?;
+    if let Some(platform) = import::detect_platform(&content) {
+        let conversations = import::parse_content(&content).map_err(|e| e.to_string())?;
+        return Ok(ParsedImport::Conversations {
+            platform: platform.to_string(),
+            conversations,
+        });
+    }
+
+    let path = Path::new(file_path);
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(file_path);
+    let extension = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or_default();
+    let batch = if extension.eq_ignore_ascii_case("pdf") {
+        let outline_titles = extract_pdf_outline_titles(file_path).await;
+        document::parse_pdf_document_text(file_name, &content, &outline_titles)
+    } else {
+        document::parse_document_text(file_name, extension, &content)
+    }
+    .map_err(|e| format!("Could not import content: {}", e))?;
+    Ok(ParsedImport::Document(batch))
 }
 
 async fn read_import_content(file_path: &str) -> Result<String, String> {
@@ -203,9 +409,70 @@ async fn read_import_content(file_path: &str) -> Result<String, String> {
         return extract_docx_text(&bytes);
     }
 
+    if extension == "pdf" {
+        let bytes = tokio::fs::read(file_path)
+            .await
+            .map_err(|e| format!("Failed to read file: {}", e))?;
+        return pdf_extract::extract_text_from_mem(&bytes)
+            .map(|text| text.trim().to_string())
+            .map_err(|e| format!("Failed to extract text from PDF: {}", e))
+            .and_then(|text| {
+                if text.is_empty() {
+                    Err("PDF did not contain readable text".to_string())
+                } else {
+                    Ok(text)
+                }
+            });
+    }
+
     tokio::fs::read_to_string(file_path)
         .await
         .map_err(|e| format!("Failed to read file: {}", e))
+}
+
+fn document_item_to_preview(item: &document::DocumentImportItem) -> ParsedConversation {
+    ParsedConversation {
+        id: item.id.clone(),
+        title: item.title.clone(),
+        platform: "document".to_string(),
+        messages: vec![ParsedMessage {
+            index: 0,
+            role: if item.content_kind == "document_index" {
+                "system".to_string()
+            } else {
+                "source".to_string()
+            },
+            content: item.content.clone(),
+            timestamp: None,
+            model: None,
+        }],
+        metadata: ConversationMetadata {
+            platform: "document".to_string(),
+            created_at: Some(Utc::now()),
+            updated_at: None,
+            message_count: 1,
+            model_info: vec![item.content_kind.clone()],
+        },
+        suggested_tags: item.suggested_tags.clone(),
+    }
+}
+
+async fn extract_pdf_outline_titles(file_path: &str) -> Vec<String> {
+    let Ok(bytes) = tokio::fs::read(file_path).await else {
+        return Vec::new();
+    };
+    let Ok(pdf) = lopdf::Document::load_mem(&bytes) else {
+        return Vec::new();
+    };
+    let Ok(toc) = pdf.get_toc() else {
+        return Vec::new();
+    };
+
+    toc.toc
+        .into_iter()
+        .map(|entry| entry.title.trim().to_string())
+        .filter(|title| !title.is_empty())
+        .collect()
 }
 
 fn extract_docx_text(bytes: &[u8]) -> Result<String, String> {

@@ -44,6 +44,18 @@ pub struct ImportPreview {
     pub conversations: Vec<ParsedConversation>,
     pub platform: String,
     pub total_conversations: usize,
+    #[serde(default)]
+    pub items: Vec<ParsedConversation>,
+    #[serde(default)]
+    pub total_items: usize,
+}
+
+/// Reviewable semantic wikilink suggestion from local import linking.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImportLinkSuggestion {
+    pub from_title: String,
+    pub to_title: String,
+    pub reason: String,
 }
 
 /// Result of applying an import
@@ -54,5 +66,9 @@ pub struct ImportResult {
     pub note_ids: Vec<String>,
     #[serde(default)]
     pub errors: Vec<String>,
+    #[serde(default)]
+    pub semantic_link_suggestions: Vec<ImportLinkSuggestion>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub semantic_link_error: Option<String>,
     pub message: String,
 }

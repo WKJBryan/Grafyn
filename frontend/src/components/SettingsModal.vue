@@ -518,13 +518,13 @@
             Import
           </label>
           <p class="setting-description">
-            Import conversations from ChatGPT, Claude, Grok, and Gemini into your knowledge base.
+            Import conversations, documents, and transcripts into your knowledge base.
           </p>
           <button
             class="action-btn"
             @click="goToImport"
           >
-            Import LLM Conversations
+            Import Content
           </button>
         </div>
 

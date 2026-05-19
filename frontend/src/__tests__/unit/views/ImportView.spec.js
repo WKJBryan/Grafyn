@@ -49,10 +49,24 @@ describe('ImportView', () => {
     api.importApi.preview.mockResolvedValue({
       platform: 'interview',
       total_conversations: 1,
+      total_items: 1,
       conversations: [
         {
           id: 'interview-1',
           title: 'Interview Transcript',
+          messages: [
+            { role: 'user', content: 'How do you decide?' },
+            { role: 'interviewee', content: 'I need a demo.' }
+          ],
+          metadata: {},
+          suggested_tags: ['interview', 'evidence']
+        }
+      ],
+      items: [
+        {
+          id: 'interview-1',
+          title: 'Interview Transcript',
+          platform: 'interview',
           messages: [
             { role: 'user', content: 'How do you decide?' },
             { role: 'interviewee', content: 'I need a demo.' }
@@ -67,20 +81,22 @@ describe('ImportView', () => {
       skipped: 0,
       note_ids: ['note-1'],
       errors: [],
-      message: 'Imported 1 conversation as evidence notes'
+      semantic_link_suggestions: [],
+      message: 'Imported 1 content item as evidence notes'
     })
   })
 
   it('previews and imports labeled interview transcripts', async () => {
     const wrapper = mountView()
 
-    expect(wrapper.text()).toContain('labeled .md/.txt/.docx interview transcripts')
+    expect(wrapper.text()).toContain('Import Content')
+    expect(wrapper.text()).toContain('Markdown, TXT, DOCX, PDF')
     await wrapper.find('[data-guide="import-file-btn"]').trigger('click')
     await flushPromises()
 
     expect(dialog.open).toHaveBeenCalledWith(expect.objectContaining({
       filters: expect.arrayContaining([
-        expect.objectContaining({ extensions: expect.arrayContaining(['md', 'txt', 'docx']) })
+        expect.objectContaining({ extensions: expect.arrayContaining(['md', 'txt', 'docx', 'pdf']) })
       ])
     }))
     expect(api.importApi.preview).toHaveBeenCalledWith('C:/tmp/interview.md')
@@ -91,6 +107,61 @@ describe('ImportView', () => {
     await flushPromises()
 
     expect(api.importApi.apply).toHaveBeenCalledWith('C:/tmp/interview.md', ['interview-1'])
-    expect(wrapper.text()).toContain('Imported 1 conversation as evidence notes')
+    expect(wrapper.text()).toContain('Imported 1 content item as evidence notes')
+  })
+
+  it('shows review-only semantic wikilink suggestions after document import', async () => {
+    api.importApi.preview.mockResolvedValue({
+      platform: 'document',
+      total_items: 2,
+      total_conversations: 2,
+      items: [
+        {
+          id: 'doc-parent',
+          title: 'Example Document',
+          platform: 'document',
+          messages: [{ role: 'system', content: '# Example Document' }],
+          metadata: { model_info: ['document_index'] },
+          suggested_tags: ['document']
+        },
+        {
+          id: 'doc-section',
+          title: 'Decision-Making Style',
+          platform: 'document',
+          messages: [{ role: 'source', content: 'Part of: [[Example Document]]' }],
+          metadata: { model_info: ['document_section'] },
+          suggested_tags: ['document']
+        }
+      ],
+      conversations: []
+    })
+    api.importApi.apply.mockResolvedValue({
+      imported: 2,
+      skipped: 0,
+      note_ids: ['note-parent', 'note-section'],
+      errors: [],
+      semantic_link_suggestions: [
+        {
+          from_title: 'Decision-Making Style',
+          to_title: 'Example Document',
+          reason: 'Section frames the document topic.'
+        }
+      ],
+      message: 'Imported 2 content items as evidence notes (1 section note)'
+    })
+
+    const wrapper = mountView()
+    await wrapper.find('[data-guide="import-file-btn"]').trigger('click')
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('2 content items found')
+    expect(wrapper.text()).toContain('Decision-Making Style')
+
+    await wrapper.findAll('button').find(button => button.text().includes('Import 2 Selected')).trigger('click')
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('Semantic Wikilink Suggestions')
+    expect(wrapper.text()).toContain('[[Decision-Making Style]]')
+    expect(wrapper.text()).toContain('[[Example Document]]')
   })
 })

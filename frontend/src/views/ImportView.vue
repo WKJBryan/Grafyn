@@ -1,9 +1,9 @@
 <template>
   <div class="import-view">
     <div class="import-header">
-      <h1>Import Conversations</h1>
+      <h1>Import Content</h1>
       <p class="subtitle">
-        Import conversations from ChatGPT, Claude, Grok, or Gemini as evidence notes
+        Import conversations, documents, and transcripts as evidence notes
       </p>
     </div>
 
@@ -21,7 +21,7 @@
         {{ loading ? 'Reading file...' : 'Choose Export File' }}
       </button>
       <p class="help-text">
-        Supported formats: ChatGPT conversations.json, Claude .dms/JSON, Grok export, Gemini export, labeled .md/.txt/.docx interview transcripts
+        Supported formats: ChatGPT conversations.json, Claude .dms/JSON, Grok export, Gemini export, Markdown, TXT, DOCX, PDF, and labeled interview transcripts
       </p>
       <p
         v-if="error"
@@ -39,7 +39,7 @@
       <div class="preview-header">
         <div class="preview-info">
           <span class="platform-badge">{{ preview.platform }}</span>
-          <span>{{ preview.total_conversations }} conversation{{ preview.total_conversations === 1 ? '' : 's' }} found</span>
+          <span>{{ totalContentItems }} content item{{ totalContentItems === 1 ? '' : 's' }} found</span>
         </div>
         <div class="preview-actions">
           <button
@@ -75,31 +75,31 @@
 
       <div class="conversation-list">
         <label
-          v-for="conv in preview.conversations"
-          :key="conv.id"
+          v-for="item in contentItems"
+          :key="item.id"
           class="conversation-item"
         >
           <input
             v-model="selectedIds"
             type="checkbox"
-            :value="conv.id"
+            :value="item.id"
           >
           <div class="conv-details">
             <div class="conv-title">
-              {{ conv.title }}
+              {{ item.title }}
             </div>
             <div class="conv-meta">
-              {{ conv.messages.length }} messages
-              <span v-if="conv.metadata.model_info?.length">
-                &middot; {{ conv.metadata.model_info.join(', ') }}
+              {{ itemCountLabel(item) }}
+              <span v-if="item.metadata.model_info?.length">
+                &middot; {{ item.metadata.model_info.join(', ') }}
               </span>
-              <span v-if="conv.metadata.created_at">
-                &middot; {{ formatDate(conv.metadata.created_at) }}
+              <span v-if="item.metadata.created_at">
+                &middot; {{ formatDate(item.metadata.created_at) }}
               </span>
             </div>
             <div class="conv-tags">
               <span
-                v-for="tag in conv.suggested_tags"
+                v-for="tag in item.suggested_tags"
                 :key="tag"
                 class="tag"
               >{{ tag }}</span>
@@ -129,6 +129,33 @@
           {{ err }}
         </p>
       </div>
+      <div
+        v-if="result.semantic_link_suggestions?.length"
+        class="semantic-section"
+      >
+        <div class="semantic-title">
+          Semantic Wikilink Suggestions
+        </div>
+        <div
+          v-for="(link, i) in result.semantic_link_suggestions"
+          :key="`${link.from_title}-${link.to_title}-${i}`"
+          class="semantic-row"
+        >
+          <span>[[{{ link.from_title }}]]</span>
+          <span class="semantic-arrow">-&gt;</span>
+          <span>[[{{ link.to_title }}]]</span>
+          <span
+            v-if="link.reason"
+            class="semantic-reason"
+          >{{ link.reason }}</span>
+        </div>
+      </div>
+      <p
+        v-if="result.semantic_link_error"
+        class="help-text"
+      >
+        Semantic wikilink suggestions skipped: {{ result.semantic_link_error }}
+      </p>
       <div class="result-actions">
         <button
           v-if="!discoveryStarted && result.note_ids?.length"
@@ -319,6 +346,9 @@ const selectedIds = ref([])
 const result = ref(null)
 const filePath = ref(null)
 
+const contentItems = computed(() => preview.value?.items || preview.value?.conversations || [])
+const totalContentItems = computed(() => preview.value?.total_items || preview.value?.total_conversations || contentItems.value.length)
+
 // Link discovery state
 const discoveryState = reactive(new Map())
 const discoveryStarted = ref(false)
@@ -376,9 +406,9 @@ async function handlePickFile() {
   const selected = await open({
     multiple: false,
     filters: [
-      { name: 'Supported imports', extensions: ['json', 'dms', 'md', 'txt', 'docx'] },
+      { name: 'Supported imports', extensions: ['json', 'dms', 'md', 'txt', 'docx', 'pdf'] },
       { name: 'JSON', extensions: ['json', 'dms'] },
-      { name: 'Transcripts', extensions: ['md', 'txt', 'docx'] }
+      { name: 'Documents', extensions: ['md', 'txt', 'docx', 'pdf'] }
     ],
   })
 
@@ -389,8 +419,7 @@ async function handlePickFile() {
 
   try {
     preview.value = await importApi.preview(selected)
-    // Auto-select all conversations
-    selectedIds.value = preview.value.conversations.map(c => c.id)
+    selectedIds.value = contentItems.value.map(c => c.id)
   } catch (e) {
     error.value = e.message || e.toString() || 'Failed to parse file'
   } finally {
@@ -416,7 +445,7 @@ async function handleImport() {
 
 function selectAll() {
   if (preview.value) {
-    selectedIds.value = preview.value.conversations.map(c => c.id)
+    selectedIds.value = contentItems.value.map(c => c.id)
   }
 }
 
@@ -549,6 +578,12 @@ function formatDate(dateStr) {
   } catch {
     return dateStr
   }
+}
+
+function itemCountLabel(item) {
+  const count = item.messages?.length || 1
+  if (item.platform === 'document') return count === 1 ? '1 content block' : `${count} content blocks`
+  return `${count} message${count === 1 ? '' : 's'}`
 }
 </script>
 
@@ -720,6 +755,39 @@ function formatDate(dateStr) {
   display: flex;
   gap: var(--spacing-sm);
   flex-wrap: wrap;
+}
+
+.semantic-section {
+  margin-top: var(--spacing-md);
+  padding-top: var(--spacing-md);
+  border-top: 1px solid var(--border);
+}
+
+.semantic-title {
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin-bottom: var(--spacing-sm);
+}
+
+.semantic-row {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-xs);
+  color: var(--text-secondary);
+  font-size: 0.82rem;
+  padding: 3px 0;
+}
+
+.semantic-arrow {
+  color: var(--text-muted);
+}
+
+.semantic-reason {
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* Discovery Section */
