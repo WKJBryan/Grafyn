@@ -2037,7 +2037,13 @@ fn is_vault_context_prompt(prompt_type: &PromptType, context_mode: &ContextMode)
 
 fn effective_model_ids(route: &ModelRoute, requested_model_ids: &[String]) -> Vec<String> {
     match route.provider {
-        ModelProviderRoute::Ollama => route.model_ids.clone(),
+        ModelProviderRoute::Ollama => {
+            if requested_model_ids.is_empty() {
+                route.model_ids.clone()
+            } else {
+                requested_model_ids.to_vec()
+            }
+        }
         ModelProviderRoute::OpenRouter => requested_model_ids.to_vec(),
     }
 }
@@ -2922,38 +2928,48 @@ fn build_twin_context_prompt(
     match answer_mode {
         TwinAnswerMode::Advisor => prompt.push_str(
             "Answer as a decision-support assistant for the user. Use approved records as stable personalization. \
-             Use candidate records only as tentative context. Separate what is grounded in Constitution, evidence, records, and your recommendation.\n",
+             Use candidate records only as tentative context. Separate what is grounded in Constitution, evidence, records, and your recommendation. \
+             When the user asks for a choice or recommendation, include: Recommended option, Constitution principles used, Supporting evidence, Uncertainty, and What would change the recommendation. \
+             Cite Constitution item ids and note titles where they affect the answer.\n",
         ),
         TwinAnswerMode::Simulation => prompt.push_str(
             "Answer as a likely-user-style simulation for reflection. Label the response as a simulation, not the user's actual view. \
-             Use approved records as stronger style and preference evidence; mention candidate influence as tentative when relevant.\n",
+             Use approved records as stronger style and preference evidence; mention candidate influence as tentative when relevant. \
+             Write as a natural twin-style reflection, not a report. Lead with the likely reasoning or judgment, show the tradeoff logic, and ask sharp reflective questions when useful. \
+             Use light citations or brief source mentions only where they help; avoid turning the answer into an evidence workflow.\n",
         ),
     }
-    prompt.push_str(
-        "When the user asks for a choice or recommendation, include: Recommended option, Constitution principles used, Supporting evidence, Uncertainty, and What would change the recommendation. \
-         Cite Constitution item ids and note titles where they affect the answer.\n",
-    );
 
     if prompt_type == &PromptType::Decision {
-        prompt.push_str(
-            "\n## Decision Mirror Structure\n\n\
-             This is a Decision Mirror session. Return a compact Markdown Reflection Card using these exact headings:\n\
-             1. Decision Frame\n\
-             2. Likely Reasoning Pattern\n\
-             3. Evidence From Grafyn\n\
-             4. Blind Spot Hypothesis\n\
-             5. Counter-Position\n\
-             6. Recommendation\n\
-             7. Confidence\n\
-             8. Next Action\n\
-             9. Constitution Check\n\
-             10. Action Gap Risk\n\
-             11. Feedback Request\n\n\
-             Treat every self-model claim as a hypothesis, not identity. Say where the claim is grounded in vault notes, approved records, or tentative records. \
-             If a claim is useful but weakly supported, label it as unsupported or low-confidence. Do not claim to know what the user would do. \
-             In Constitution Check, separate stated values, revealed behavior, taste, somatic signal, and constraints. In Action Gap Risk, state whether past intention-action gaps could change the next step. \
-             Recommendation must be derived after the Constitution Check and Evidence From Grafyn sections, not before them.\n",
-        );
+        match answer_mode {
+            TwinAnswerMode::Advisor => prompt.push_str(
+                "\n## Decision Mirror Structure\n\n\
+                 This is a Decision Mirror session. Return a compact Markdown Reflection Card using these exact headings:\n\
+                 1. Decision Frame\n\
+                 2. Likely Reasoning Pattern\n\
+                 3. Evidence From Grafyn\n\
+                 4. Blind Spot Hypothesis\n\
+                 5. Counter-Position\n\
+                 6. Recommendation\n\
+                 7. Confidence\n\
+                 8. Next Action\n\
+                 9. Constitution Check\n\
+                 10. Action Gap Risk\n\
+                 11. Feedback Request\n\n\
+                 Treat every self-model claim as a hypothesis, not identity. Say where the claim is grounded in vault notes, approved records, or tentative records. \
+                 If a claim is useful but weakly supported, label it as unsupported or low-confidence. Do not claim to know what the user would do. \
+                 In Constitution Check, separate stated values, revealed behavior, taste, somatic signal, and constraints. In Action Gap Risk, state whether past intention-action gaps could change the next step. \
+                 Recommendation must be derived after the Constitution Check and Evidence From Grafyn sections, not before them.\n",
+            ),
+            TwinAnswerMode::Simulation => prompt.push_str(
+                "\n## Decision Mirror Simulation Style\n\n\
+                 This is a Decision Mirror simulation session. Do not return numbered headings or a card template. \
+                 Return a natural twin-style reflection that feels like the reasoning pattern thinking through the decision. \
+                 Prefer concise paragraphs over sections. Start with the likely judgment or hesitation, then explain the filters, tradeoffs, and next question. \
+                 Keep light citations or parenthetical source mentions where helpful, but keep evidence backstage. \
+                 Treat every self-model claim as a hypothesis, not identity. If a useful claim is weakly supported, say so briefly. Do not claim to know what the user would do.\n",
+            ),
+        }
 
         if let Some(metadata) = decision_metadata {
             prompt.push_str("\n## Decision Metadata\n\n");
@@ -3461,7 +3477,7 @@ mod tests {
     }
 
     #[test]
-    fn decision_twin_prompt_uses_reflection_card_structure() {
+    fn decision_advisor_prompt_uses_reflection_card_structure() {
         let metadata = DecisionPromptMetadata {
             decision: "Should Grafyn build Decision Mirror first?".into(),
             options: vec!["Decision Mirror".into(), "Topology layer".into()],
@@ -3487,6 +3503,36 @@ mod tests {
         assert!(prompt.contains("Recommendation must be derived after the Constitution Check and Evidence From Grafyn sections"));
         assert!(prompt.contains("Decision: Should Grafyn build Decision Mirror first?"));
         assert!(prompt.contains("Topology layer"));
+    }
+
+    #[test]
+    fn decision_simulation_prompt_uses_natural_reflection_instructions() {
+        let metadata = DecisionPromptMetadata {
+            decision: "Should Grafyn build Decision Mirror first?".into(),
+            options: vec!["Decision Mirror".into(), "Topology layer".into()],
+            stakes: Some("Product direction".into()),
+            initial_leaning: Some("Decision Mirror first".into()),
+            review_date: Some("2026-05-15".into()),
+        };
+
+        let prompt = build_twin_context_prompt(
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &TwinAnswerMode::Simulation,
+            &PromptType::Decision,
+            Some(&metadata),
+        );
+
+        assert!(!prompt.contains("Reflection Card"));
+        assert!(!prompt.contains("Evidence From Grafyn"));
+        assert!(!prompt.contains("Blind Spot Hypothesis"));
+        assert!(prompt.contains("natural twin-style reflection"));
+        assert!(prompt.contains("light citations"));
+        assert!(prompt.contains("not the user's actual view"));
+        assert!(prompt.contains("Decision: Should Grafyn build Decision Mirror first?"));
     }
 
     #[test]
@@ -3746,6 +3792,30 @@ mod tests {
         assert_eq!(twin_route.provider, ModelProviderRoute::Ollama);
         assert_eq!(normal_route.provider, ModelProviderRoute::OpenRouter);
         assert!(normal_route.model_ids.is_empty());
+    }
+
+    #[test]
+    fn effective_model_ids_honors_requested_ollama_models() {
+        let route = ModelRoute {
+            provider: ModelProviderRoute::Ollama,
+            model_ids: vec!["llama3.1:8b".to_string()],
+        };
+
+        let effective = effective_model_ids(&route, &["qwen3:14b".to_string()]);
+
+        assert_eq!(effective, vec!["qwen3:14b".to_string()]);
+    }
+
+    #[test]
+    fn effective_model_ids_falls_back_to_configured_ollama_model() {
+        let route = ModelRoute {
+            provider: ModelProviderRoute::Ollama,
+            model_ids: vec!["llama3.1:8b".to_string()],
+        };
+
+        let effective = effective_model_ids(&route, &[]);
+
+        assert_eq!(effective, vec!["llama3.1:8b".to_string()]);
     }
 
     #[test]

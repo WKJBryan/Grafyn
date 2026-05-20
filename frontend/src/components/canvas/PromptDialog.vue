@@ -404,7 +404,7 @@ const temperature = ref(0.7)
 const reasoningEffortIndex = ref(0)
 const showAdvanced = ref(false)
 const contextMode = ref('none')
-const twinAnswerMode = ref('advisor')
+const twinAnswerMode = ref('simulation')
 const selectedTwinProvider = ref(props.twinLlmProvider === 'ollama' ? 'ollama' : 'openrouter')
 const promptType = ref('standard')
 const decisionOptionsText = ref('')
@@ -464,8 +464,8 @@ const contextModeHints = {
 }
 
 const twinModeHints = {
-  advisor: 'Decision-support mode uses reviewed memory to help the user reason.',
-  simulation: 'Simulation mode is labeled as likely-user-style reflection, not the user actual view.'
+  advisor: 'Structured Reflection Card for decision support, evidence review, and debugging.',
+  simulation: 'Natural twin-style reflection with light grounding, not the user actual view.'
 }
 
 const reasoningEffortOptions = [
@@ -511,7 +511,9 @@ const decisionMetadata = computed(() => {
 })
 
 const submitLabel = computed(() => {
-  const subject = promptType.value === 'decision' ? 'Create Reflection Card' : 'Send'
+  const subject = promptType.value === 'decision'
+    ? (twinAnswerMode.value === 'advisor' ? 'Create Reflection Card' : 'Run Decision Mirror')
+    : 'Send'
   const modelCount = usingLocalTwinRuntime.value ? (configuredOllamaModel.value ? 1 : 0) : selectedModels.value.length
   return `${subject} (${modelCount} model${modelCount !== 1 ? 's' : ''})`
 })
@@ -569,7 +571,7 @@ watch(() => props.twinLlmProvider, (provider) => {
 watch(promptType, (type) => {
   if (type === 'decision') {
     contextMode.value = 'twin'
-    twinAnswerMode.value = 'advisor'
+    twinAnswerMode.value = 'simulation'
     temperature.value = Math.min(temperature.value, 0.5)
     showSystemPrompt.value = false
     systemPrompt.value = ''

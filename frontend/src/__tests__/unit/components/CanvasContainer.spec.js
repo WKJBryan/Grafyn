@@ -2,7 +2,7 @@ import { describe, expect, it, beforeEach, vi } from 'vitest'
 import { mount, flushPromises } from '@vue/test-utils'
 import CanvasContainer from '@/components/canvas/CanvasContainer.vue'
 
-const { store, getOpenRouterStatus, getStatus, getSettings, updateSettings, toastSuccess } = vi.hoisted(() => ({
+const { store, getOpenRouterStatus, getStatus, getSettings, updateSettings, listOllamaModels, toastSuccess } = vi.hoisted(() => ({
   store: {
     currentSession: {
       id: 'session-1',
@@ -56,6 +56,7 @@ const { store, getOpenRouterStatus, getStatus, getSettings, updateSettings, toas
   getStatus: vi.fn(),
   getSettings: vi.fn(),
   updateSettings: vi.fn(),
+  listOllamaModels: vi.fn(),
   toastSuccess: vi.fn()
 }))
 
@@ -68,7 +69,8 @@ vi.mock('@/api/client', () => ({
     get: getSettings,
     getOpenRouterStatus,
     getStatus,
-    update: updateSettings
+    update: updateSettings,
+    listOllamaModels
   },
   isDesktopApp: () => true
 }))
@@ -176,7 +178,7 @@ function mountContainer() {
                 systemPrompt: null,
                 temperature: 0.4,
                 contextMode: 'twin',
-                twinAnswerMode: 'advisor',
+                twinAnswerMode: 'simulation',
                 twinLlmProvider: 'ollama',
                 webSearch: false
               })" />
@@ -229,7 +231,13 @@ function mountContainerWithAddModelPromptStub() {
         DebateNode: { template: '<div />' },
         AddModelDialog: {
           props: ['models', 'existingModelIds'],
-          template: '<div class="add-model-dialog-stub">{{ existingModelIds.join(\',\') }}</div>'
+          template: `
+            <div class="add-model-dialog-stub">
+              <span class="existing-models">{{ existingModelIds.join(',') }}</span>
+              <span class="available-models">{{ models.map(model => model.id).join(',') }}</span>
+              <button class="add-local-model-submit" @click="$emit('submit', ['qwen3:14b'])" />
+            </div>
+          `
         },
         PinnedNotesPanel: { template: '<div />' },
         PromptDialog: { template: '<div />' }
@@ -260,6 +268,10 @@ describe('CanvasContainer', () => {
     getSettings.mockResolvedValue({ smart_web_search: true, canvas_model_presets: [] })
     getStatus.mockResolvedValue({ smart_web_search: true })
     updateSettings.mockResolvedValue({})
+    listOllamaModels.mockResolvedValue([
+      { id: 'llama3.1:8b', name: 'llama3.1:8b', provider: 'Ollama' },
+      { id: 'qwen3:14b', name: 'qwen3:14b', provider: 'Ollama' }
+    ])
     toastSuccess.mockReset()
   })
 
@@ -330,7 +342,7 @@ describe('CanvasContainer', () => {
       null,
       null,
       'twin',
-      'advisor',
+      'simulation',
       false,
       undefined,
       'decision',
@@ -390,7 +402,7 @@ describe('CanvasContainer', () => {
       null,
       null,
       'knowledge_search',
-      'advisor',
+      'simulation',
       false,
       undefined,
       'standard',
@@ -442,7 +454,7 @@ describe('CanvasContainer', () => {
       0.7,
       null,
       'knowledge_search',
-      'advisor',
+      'simulation',
       false,
       undefined,
       'standard',
@@ -550,8 +562,47 @@ describe('CanvasContainer', () => {
 
     const dialog = wrapper.find('.add-model-dialog-stub')
     expect(dialog.exists()).toBe(true)
-    expect(dialog.text()).toContain('openai/gpt-4o')
-    expect(dialog.text()).toContain('anthropic/claude-3.5-sonnet')
+    expect(wrapper.find('.existing-models').text()).toContain('openai/gpt-4o')
+    expect(wrapper.find('.existing-models').text()).toContain('anthropic/claude-3.5-sonnet')
+    expect(wrapper.find('.available-models').text()).toContain('openai/gpt-4o')
+  })
+
+  it('uses installed Ollama models when adding a model to a local twin tile', async () => {
+    getOpenRouterStatus.mockResolvedValue({ has_key: false, is_configured: false })
+    store.promptTiles = [
+      {
+        id: 'tile-1',
+        prompt: 'Use my twin records',
+        prompt_type: 'decision',
+        context_mode: 'twin',
+        twin_llm_provider: 'ollama',
+        web_search: false,
+        responses: {
+          'llama3.1:8b': {
+            status: 'completed',
+            content: 'Answer',
+            model_name: 'llama3.1:8b',
+            position: { x: 320, y: 40, width: 280, height: 200 }
+          }
+        },
+        position: { x: 40, y: 40, width: 200, height: 120 }
+      }
+    ]
+
+    const wrapper = mountContainerWithAddModelPromptStub()
+    await flushPromises()
+    await wrapper.find('.prompt-add-model-stub').trigger('click')
+    await flushPromises()
+
+    expect(listOllamaModels).toHaveBeenCalled()
+    expect(wrapper.find('.existing-models').text()).toContain('llama3.1:8b')
+    expect(wrapper.find('.available-models').text()).toContain('qwen3:14b')
+    expect(wrapper.find('.available-models').text()).not.toContain('openai/gpt-4o')
+
+    await wrapper.find('.add-local-model-submit').trigger('click')
+    await flushPromises()
+
+    expect(store.addModelToTile).toHaveBeenCalledWith('tile-1', ['qwen3:14b'])
   })
 
   it('loads saved presets from settings and passes them into the prompt dialog', async () => {

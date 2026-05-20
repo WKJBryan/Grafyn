@@ -59,4 +59,14 @@ describe('AddModelDialog', () => {
       [['anthropic/claude-3.5-sonnet']]
     ])
   })
+
+  it('shows an empty state when no additional models are available', () => {
+    const wrapper = mountDialog({
+      existingModelIds: ['openai/gpt-4o', 'anthropic/claude-3.5-sonnet']
+    })
+
+    expect(wrapper.text()).toContain('No additional models are available')
+    expect(wrapper.find('.selector-models').exists()).toBe(false)
+    expect(wrapper.find('.btn-primary').attributes('disabled')).toBeDefined()
+  })
 })
