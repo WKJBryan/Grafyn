@@ -38,7 +38,7 @@ describe('PromptDialog', () => {
     expect(wrapper.find('#contextMode option[value="knowledge_search"]').text()).toContain('Vault Notes')
   })
 
-  it('shows Twin context mode and emits advisor mode by default', async () => {
+  it('shows Twin context mode and emits simulation mode by default', async () => {
     const wrapper = mountDialog({ twinLlmProvider: 'ollama', ollamaModel: 'llama3.1:8b' })
 
     await wrapper.find('.model-selector-stub').trigger('click')
@@ -50,7 +50,7 @@ describe('PromptDialog', () => {
     expect(wrapper.text()).toContain('Twin Answer Mode')
     expect(wrapper.emitted('submit')[0][0]).toMatchObject({
       contextMode: 'twin',
-      twinAnswerMode: 'advisor',
+      twinAnswerMode: 'simulation',
       twinLlmProvider: 'ollama'
     })
   })
@@ -107,7 +107,7 @@ describe('PromptDialog', () => {
     })
   })
 
-  it('sets Decision mode to Twin Advisor and emits decision metadata', async () => {
+  it('sets Decision mode to Twin Simulation and emits decision metadata', async () => {
     const wrapper = mountDialog({ twinLlmProvider: 'ollama', ollamaModel: 'llama3.1:8b' })
 
     await wrapper.find('.model-selector-stub').trigger('click')
@@ -122,7 +122,7 @@ describe('PromptDialog', () => {
     expect(wrapper.emitted('submit')[0][0]).toMatchObject({
       promptType: 'decision',
       contextMode: 'twin',
-      twinAnswerMode: 'advisor',
+      twinAnswerMode: 'simulation',
       twinLlmProvider: 'ollama',
       systemPrompt: null,
       decisionMetadata: {
@@ -138,6 +138,22 @@ describe('PromptDialog', () => {
     expect(wrapper.text()).toContain('What is materially at risk')
     expect(wrapper.text()).toContain('Your starting bias')
     expect(wrapper.text()).toContain('When to revisit the outcome')
+    expect(wrapper.text()).toContain('Run Decision Mirror')
+  })
+
+  it('allows Advisor mode to be selected explicitly', async () => {
+    const wrapper = mountDialog({ twinLlmProvider: 'ollama', ollamaModel: 'llama3.1:8b' })
+
+    await wrapper.find('.model-selector-stub').trigger('click')
+    await wrapper.find('#prompt').setValue('Give me the structured card')
+    await wrapper.find('#contextMode').setValue('twin')
+    await wrapper.findAll('.segmented-control button').find(button => button.text() === 'Advisor').trigger('click')
+    await wrapper.find('.btn-primary').trigger('click')
+
+    expect(wrapper.emitted('submit')[0][0]).toMatchObject({
+      contextMode: 'twin',
+      twinAnswerMode: 'advisor'
+    })
   })
 
   it('places thinking config above context mode for prompt and decision flows', async () => {

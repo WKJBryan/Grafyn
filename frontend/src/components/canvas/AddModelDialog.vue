@@ -19,6 +19,7 @@
 
       <div class="dialog-body">
         <ModelSelector
+          v-if="filteredModels.length > 0"
           v-model="selectedModels"
           :models="filteredModels"
           :presets="presets"
@@ -26,6 +27,12 @@
           @update-preset="emit('update-preset', $event)"
           @delete-preset="emit('delete-preset', $event)"
         />
+        <div
+          v-else
+          class="empty-state"
+        >
+          No additional models are available for this prompt.
+        </div>
       </div>
 
       <div class="dialog-footer">
@@ -175,6 +182,16 @@ onBeforeUnmount(() => {
   overflow-y: auto;
   padding: var(--spacing-md);
   min-height: 300px;
+}
+
+.empty-state {
+  min-height: 220px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-muted);
+  text-align: center;
+  font-size: 0.9rem;
 }
 
 .dialog-footer {

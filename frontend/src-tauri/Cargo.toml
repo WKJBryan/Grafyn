@@ -1,6 +1,6 @@
 [package]
 name = "grafyn"
-version = "0.1.12"
+version = "0.1.13"
 description = "Grafyn - Knowledge Management Desktop App"
 authors = ["Bryan"]
 license = "GPL-3.0-only"

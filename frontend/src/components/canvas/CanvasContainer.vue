@@ -325,8 +325,8 @@
     <!-- Add Model Dialog -->
     <AddModelDialog
       v-if="showAddModelDialog"
-      :models="availableModels"
-      :presets="canvasModelPresets"
+      :models="addModelContext?.models || availableModels"
+      :presets="addModelContext?.isLocal ? [] : canvasModelPresets"
       :existing-model-ids="addModelContext?.existingModelIds || []"
       @submit="handleAddModelDialogSubmit"
       @cancel="handleAddModelDialogCancel"
@@ -448,7 +448,7 @@ const saveMessage = ref(null)
 const branchContext = ref(null)  // { parentTileId, parentModelId, parentContent }
 const expandedDebates = ref([])  // IDs of expanded debate nodes
 const showAddModelDialog = ref(false)
-const addModelContext = ref(null)  // { tileId, existingModelIds }
+const addModelContext = ref(null)  // { tileId, existingModelIds, models, isLocal }
 const showArrangeMenu = ref(false)
 const showTwinActionsMenu = ref(false)
 const arranging = ref(false)  // Loading state during arrangement
@@ -868,17 +868,36 @@ async function handleRegenerate({ tileId, modelId }) {
   }
 }
 
+function isLocalContextTile(tile) {
+  return tile?.prompt_type === 'decision' ||
+    tile?.twin_llm_provider === 'ollama' ||
+    ['knowledge_search', 'semantic', 'twin', 'full_history', 'compact'].includes(tile?.context_mode)
+}
+
 // Handle showing the add model dialog
-function handleShowAddModelDialog({ tileId }) {
+async function handleShowAddModelDialog({ tileId }) {
   // Find the tile and get all existing model IDs
   const tile = promptTiles.value.find(t => t.id === tileId)
   if (!tile) return
 
   const existingModelIds = Object.keys(tile.responses || {})
+  const isLocal = isLocalContextTile(tile)
+  let models = availableModels.value
+
+  if (isLocal) {
+    try {
+      models = isDesktopApp() ? await settingsApi.listOllamaModels() : []
+    } catch (err) {
+      console.error('Failed to load Ollama models:', err)
+      models = []
+    }
+  }
 
   addModelContext.value = {
     tileId,
-    existingModelIds
+    existingModelIds,
+    models,
+    isLocal
   }
   showAddModelDialog.value = true
 }
@@ -1316,7 +1335,7 @@ async function handlePromptSubmit({
   temperature,
   maxTokens = null,
   contextMode,
-  twinAnswerMode = 'advisor',
+  twinAnswerMode = 'simulation',
   webSearch,
   reasoningEffort = 'none',
   twinLlmProvider: selectedTwinLlmProvider = null
@@ -1352,7 +1371,7 @@ async function handlePromptSubmit({
         temperature,
         maxTokens,
         contextMode || 'none',
-        twinAnswerMode || 'advisor',
+        twinAnswerMode || 'simulation',
         webSearch || false,
         undefined,
         promptType,
@@ -1371,7 +1390,7 @@ async function handlePromptSubmit({
         null,
         null,
         contextMode || 'none',
-        twinAnswerMode || 'advisor',
+        twinAnswerMode || 'simulation',
         webSearch || false,
         undefined,
         promptType,

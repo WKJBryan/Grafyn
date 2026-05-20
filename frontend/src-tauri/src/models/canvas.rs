@@ -212,8 +212,8 @@ pub enum ContextMode {
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TwinAnswerMode {
-    #[default]
     Advisor,
+    #[default]
     Simulation,
 }
 
@@ -475,7 +475,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(tile.web_search_max_results, 5);
-        assert_eq!(tile.twin_answer_mode, TwinAnswerMode::Advisor);
+        assert_eq!(tile.twin_answer_mode, TwinAnswerMode::Simulation);
         assert_eq!(tile.prompt_type, PromptType::Standard);
         assert_eq!(tile.reasoning_effort, "none");
         assert!(tile.approved_twin_records.is_empty());
