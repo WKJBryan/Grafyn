@@ -301,11 +301,11 @@ function onSessionLoaded(_session) {
   // Could update page title, etc.
 }
 
-function handleSettingsSaved() {
-  // Reload the canvas to pick up the new API key
+function handleSettingsSaved(changes = {}) {
   showSettingsModal.value = false
-  // Reload models with the new API key
-  canvasStore.loadModels()
+  if (changes.modelSourceChanged) {
+    canvasStore.loadModels()
+  }
 }
 
 function formatDate(dateStr) {

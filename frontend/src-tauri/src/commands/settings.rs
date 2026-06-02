@@ -29,10 +29,10 @@ pub async fn update_settings(
 ) -> Result<UserSettings, String> {
     // Capture values before moving update
     let new_api_key = update.openrouter_api_key.clone();
-    let vault_path_changed = update.vault_path.is_some();
 
     // Update settings
     let mut settings = state.settings_service.write().await;
+    let vault_path_changed = vault_path_update_changed(settings.get(), update.vault_path.as_deref());
     let result = settings.update(update).map_err(|e| e.to_string())?;
 
     // Get new vault path while we still hold the lock
@@ -173,4 +173,41 @@ fn redact_sensitive_settings(settings: &UserSettings) -> UserSettings {
     let mut redacted = settings.clone();
     redacted.openrouter_api_key = None;
     redacted
+}
+
+fn vault_path_update_changed(settings: &UserSettings, candidate: Option<&str>) -> bool {
+    let Some(candidate) = candidate else {
+        return false;
+    };
+
+    comparable_path(settings.effective_vault_path())
+        != comparable_path(std::path::PathBuf::from(candidate))
+}
+
+fn comparable_path(path: std::path::PathBuf) -> String {
+    path.to_string_lossy()
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .to_ascii_lowercase()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn same_vault_path_update_is_not_changed() {
+        let mut settings = UserSettings::default();
+        settings.vault_path = Some("C:\\Vault".to_string());
+
+        assert!(!vault_path_update_changed(&settings, Some("C:/Vault")));
+    }
+
+    #[test]
+    fn different_vault_path_update_is_changed() {
+        let mut settings = UserSettings::default();
+        settings.vault_path = Some("C:\\Vault".to_string());
+
+        assert!(vault_path_update_changed(&settings, Some("C:/OtherVault")));
+    }
 }

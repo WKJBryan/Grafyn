@@ -282,7 +282,7 @@
             <button
               type="button"
               :class="{ active: selectedTwinProvider === 'openrouter' }"
-              :disabled="promptType === 'decision' || contextMode !== 'none'"
+              :disabled="!openRouterConfigured"
               @click="selectedTwinProvider = 'openrouter'"
             >
               API / OpenRouter
@@ -451,16 +451,20 @@ const twinRuntimeHint = computed(() => {
     return 'Private Local sends twin prompt/context only to the configured Ollama runtime on this machine and fails closed if setup is missing.'
   }
 
-  return 'API / OpenRouter is available only when Context Mode is None, so vault content is not sent out.'
+  if (!props.openRouterConfigured) {
+    return 'Configure an OpenRouter API key before using API runtime for selected context.'
+  }
+
+  return 'API / OpenRouter sends selected vault/twin context to OpenRouter and the chosen model provider.'
 })
 
 // Context mode descriptions
 const contextModeHints = {
   none: 'No additional context - just your prompt',
-  knowledge_search: 'Retrieves relevant notes (+ pinned notes) from your vault. Requires Private Local.',
+  knowledge_search: 'Retrieves relevant notes (+ pinned notes) from your vault using the selected Context Runtime.',
   twin: 'Retrieves relevant notes plus approved user records and relevant candidate records from Twin Review.',
-  full_history: 'Include all conversation turns from the parent chain. Requires Private Local.',
-  compact: 'Include recent turns + summary of older context to save tokens. Requires Private Local.'
+  full_history: 'Include all conversation turns from the parent chain using the selected Context Runtime.',
+  compact: 'Include recent turns + summary of older context to save tokens using the selected Context Runtime.'
 }
 
 const twinModeHints = {
@@ -480,7 +484,9 @@ const reasoningEffortOptions = [
 // Computed
 const canSubmit = computed(() => {
   if (!prompt.value.trim()) return false
-  if (isTwinSensitivePrompt.value && !usingLocalTwinRuntime.value) return false
+  if (isTwinSensitivePrompt.value && !usingLocalTwinRuntime.value) {
+    return props.openRouterConfigured && selectedModels.value.length > 0
+  }
   if (usingLocalTwinRuntime.value) return Boolean(configuredOllamaModel.value)
   return selectedModels.value.length > 0
 })

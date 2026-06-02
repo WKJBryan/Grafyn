@@ -607,6 +607,7 @@ const STORED_KEY_MASK = 'sk-or-v1-stored-key'
 
 // Form state
 const vaultPath = ref('')
+const originalVaultPath = ref('')
 const openrouterKey = ref('')
 const hasStoredOpenRouterKey = ref(false)
 const openrouterKeyDirty = ref(false)
@@ -752,6 +753,7 @@ const loadCurrentSettings = async () => {
     const currentSettings = await settingsApi.get()
     if (currentSettings) {
       vaultPath.value = currentSettings.vault_path || ''
+      originalVaultPath.value = vaultPath.value
       openrouterKey.value = ''
       openrouterKeyDirty.value = false
       editingOpenRouterKey.value = false
@@ -911,8 +913,9 @@ const saveSettings = async () => {
 
   isSaving.value = true
   try {
+    const vaultPathChanged = props.isSetup || vaultPath.value !== originalVaultPath.value
+    const modelSourceChanged = openrouterKeyDirty.value
     const update = {
-      vault_path: vaultPath.value || null,
       theme: theme.value,
       llm_model: llmModel.value || null,
       twin_llm_provider: twinLlmProvider.value,
@@ -929,6 +932,9 @@ const saveSettings = async () => {
       background_vault_optimizer_program_enabled: backgroundVaultOptimizerProgramEnabled.value,
       vault_optimizer_program_path: vaultOptimizerProgramPath.value,
     }
+    if (vaultPathChanged) {
+      update.vault_path = vaultPath.value || null
+    }
     if (openrouterKeyDirty.value) {
       // Empty string means explicit clear. Missing field means keep existing key.
       update.openrouter_api_key = openrouterKey.value || ''
@@ -944,7 +950,11 @@ const saveSettings = async () => {
       emit('setup-complete')
     } else {
       savedTheme.value = theme.value
-      emit('saved')
+      originalVaultPath.value = vaultPath.value
+      emit('saved', {
+        vaultPathChanged,
+        modelSourceChanged
+      })
     }
 
     isOpen.value = false

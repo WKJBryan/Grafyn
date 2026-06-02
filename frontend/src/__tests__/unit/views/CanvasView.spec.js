@@ -99,6 +99,50 @@ describe('CanvasView', () => {
     expect(wrapper.find('.settings-modal-stub').text()).toContain('true')
   })
 
+  it('does not reload models after unrelated settings saves', async () => {
+    const wrapper = mount(CanvasView, {
+      global: {
+        stubs: {
+          RouterLink: { template: '<a><slot /></a>' },
+          CanvasContainer: { template: '<div class="canvas-container-stub" />' },
+          SettingsModal: {
+            emits: ['saved'],
+            template: '<button class="settings-modal-stub" @click="$emit(\'saved\', { modelSourceChanged: false })" />'
+          },
+          ConfirmDialog: { template: '<div />' }
+        }
+      }
+    })
+
+    await flushPromises()
+    loadModels.mockClear()
+    await wrapper.find('.settings-modal-stub').trigger('click')
+
+    expect(loadModels).not.toHaveBeenCalled()
+  })
+
+  it('reloads models after settings saves that change model source', async () => {
+    const wrapper = mount(CanvasView, {
+      global: {
+        stubs: {
+          RouterLink: { template: '<a><slot /></a>' },
+          CanvasContainer: { template: '<div class="canvas-container-stub" />' },
+          SettingsModal: {
+            emits: ['saved'],
+            template: '<button class="settings-modal-stub" @click="$emit(\'saved\', { modelSourceChanged: true })" />'
+          },
+          ConfirmDialog: { template: '<div />' }
+        }
+      }
+    })
+
+    await flushPromises()
+    loadModels.mockClear()
+    await wrapper.find('.settings-modal-stub').trigger('click')
+
+    expect(loadModels).toHaveBeenCalledTimes(1)
+  })
+
   it('persists the canvas theme toggle into settings', async () => {
     const wrapper = mount(CanvasView, {
       global: {

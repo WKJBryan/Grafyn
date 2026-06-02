@@ -1980,13 +1980,6 @@ fn resolve_model_route(
         .filter(|provider| provider == "ollama" || provider == "openrouter")
         .unwrap_or_else(|| settings.twin_llm_provider.to_ascii_lowercase());
 
-    if is_vault_context_prompt(prompt_type, context_mode) && twin_provider != "ollama" {
-        return Err(
-            "Vault, history, and twin context require Private Local Ollama. Set Context Mode to None before using OpenRouter/API."
-                .to_string(),
-        );
-    }
-
     if is_vault_context_prompt(prompt_type, context_mode) && twin_provider == "ollama" {
         let model = settings.ollama_model.trim();
         if model.is_empty() {
@@ -3819,20 +3812,21 @@ mod tests {
     }
 
     #[test]
-    fn model_route_blocks_openrouter_for_vault_context_override() {
+    fn model_route_allows_openrouter_for_vault_context_override() {
         let mut settings = crate::models::settings::UserSettings::default();
         settings.twin_llm_provider = "ollama".to_string();
         settings.ollama_model = "llama3.1:8b".to_string();
 
-        let error = resolve_model_route(
+        let route = resolve_model_route(
             &PromptType::Decision,
             &ContextMode::Twin,
             Some("openrouter"),
             &settings,
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert!(error.contains("require Private Local Ollama"));
+        assert_eq!(route.provider, ModelProviderRoute::OpenRouter);
+        assert!(route.model_ids.is_empty());
     }
 
     #[test]
