@@ -79,6 +79,30 @@ describe('PromptDialog', () => {
     })
   })
 
+  it('lets twin prompts choose API runtime with selected model context', async () => {
+    const wrapper = mountDialog({
+      twinLlmProvider: 'ollama',
+      ollamaModel: 'llama3.1:8b',
+      smartWebSearch: true,
+      openRouterConfigured: true
+    })
+
+    await wrapper.find('.model-selector-stub').trigger('click')
+    await wrapper.find('#prompt').setValue('Use my twin records with the selected API model')
+    await wrapper.find('#contextMode').setValue('twin')
+    await wrapper.findAll('.runtime-toggle button').find(button => button.text() === 'API / OpenRouter').trigger('click')
+    await wrapper.find('.btn-primary').trigger('click')
+
+    expect(wrapper.findAll('.runtime-toggle button').find(button => button.text() === 'API / OpenRouter').attributes('disabled')).toBeUndefined()
+    expect(wrapper.find('.web-search-hint').text()).not.toContain('local Ollama runtime')
+    expect(wrapper.text()).toContain('sends selected vault/twin context to OpenRouter')
+    expect(wrapper.emitted('submit')[0][0]).toMatchObject({
+      contextMode: 'twin',
+      twinLlmProvider: 'openrouter',
+      models: ['openai/gpt-4o']
+    })
+  })
+
   it('blocks Private Local twin prompts when no Ollama model is configured', async () => {
     const wrapper = mountDialog({
       twinLlmProvider: 'ollama',

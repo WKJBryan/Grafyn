@@ -191,6 +191,26 @@ describe('SettingsModal', () => {
     }))
   })
 
+  it('does not send an unchanged vault path on normal settings saves', async () => {
+    const wrapper = mount(SettingsModal, {
+      props: {
+        modelValue: true,
+        isSetup: false
+      }
+    })
+
+    await flushPromises()
+    await wrapper.find('.save-btn').trigger('click')
+
+    expect(settingsUpdate).toHaveBeenCalledWith(expect.not.objectContaining({
+      vault_path: expect.anything()
+    }))
+    expect(wrapper.emitted('saved')[0][0]).toMatchObject({
+      vaultPathChanged: false,
+      modelSourceChanged: false
+    })
+  })
+
   it('shows and saves the local Ollama digital twin model settings', async () => {
     settingsGet.mockResolvedValue({
       vault_path: 'C:\\Vault',
