@@ -6,7 +6,7 @@ use crate::models::note::{
 };
 use crate::models::settings::UserSettings;
 use crate::services::retrieval::RetrievalResult;
-use crate::services::similarity::{SimilarityProvider, TfIdfProvider};
+use crate::services::similarity::{sparse_cosine, SimilarityProvider, TfIdfProvider};
 use crate::services::yake::{self, YakeConfig, STOPWORDS};
 use chrono::{DateTime, Utc};
 use lazy_static::lazy_static;
@@ -883,7 +883,7 @@ pub fn sample_exploratory_candidates(
                 && !excluded_ids.contains(&profile.note_id)
         })
         .filter_map(|profile| {
-            let term_cosine = cosine_similarity(&source_profile.term_vector, &profile.term_vector);
+            let term_cosine = sparse_cosine(&source_profile.term_vector, &profile.term_vector);
             let candidate_tags = profile
                 .tags
                 .iter()
@@ -1067,29 +1067,6 @@ fn build_reference_index(notes: &[Note]) -> HashMap<String, String> {
         }
     }
     refs
-}
-
-pub fn cosine_similarity(a: &HashMap<String, f64>, b: &HashMap<String, f64>) -> f64 {
-    if a.is_empty() || b.is_empty() {
-        return 0.0;
-    }
-
-    let mut dot_product = 0.0;
-    let mut norm_a = 0.0;
-    for (term, weight_a) in a {
-        norm_a += weight_a * weight_a;
-        if let Some(weight_b) = b.get(term) {
-            dot_product += weight_a * weight_b;
-        }
-    }
-
-    let norm_b = b.values().map(|weight| weight * weight).sum::<f64>();
-    let magnitude = (norm_a * norm_b).sqrt();
-    if magnitude < 1e-10 {
-        0.0
-    } else {
-        dot_product / magnitude
-    }
 }
 
 pub fn title_token_overlap(left: &str, right: &str) -> usize {
@@ -1507,7 +1484,7 @@ fn build_local_ranked_candidates(
             entry.tag_overlap = tag_overlap;
             entry.tag_overlap_ratio = tag_overlap as f64 / tag_union as f64;
             entry.key_term_cosine =
-                cosine_similarity(&source_profile.term_vector, &profile.term_vector);
+                sparse_cosine(&source_profile.term_vector, &profile.term_vector);
             if !source_link_set.is_empty() {
                 let overlap_score =
                     (shared_neighbors as f64 / source_link_set.len() as f64).clamp(0.0, 1.0);
