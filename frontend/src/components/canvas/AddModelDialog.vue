@@ -1,61 +1,58 @@
 <template>
-  <div
-    class="dialog-overlay"
-    @click.self="$emit('cancel')"
+  <BaseModal
+    max-width="500px"
+    @close="$emit('cancel')"
   >
-    <div class="dialog-content">
-      <div class="dialog-header">
-        <h3>Add Models</h3>
-        <button
-          class="close-btn"
-          @click="$emit('cancel')"
-        >
-          <GIcon
-            name="x"
-            :size="14"
-          />
-        </button>
-      </div>
-
-      <div class="dialog-body">
-        <ModelSelector
-          v-if="filteredModels.length > 0"
-          v-model="selectedModels"
-          :models="filteredModels"
-          :presets="presets"
-          @create-preset="emit('create-preset', $event)"
-          @update-preset="emit('update-preset', $event)"
-          @delete-preset="emit('delete-preset', $event)"
+    <template #header>
+      <h3>Add Models</h3>
+      <button
+        class="close-btn"
+        @click="$emit('cancel')"
+      >
+        <GIcon
+          name="x"
+          :size="14"
         />
-        <div
-          v-else
-          class="empty-state"
-        >
-          No additional models are available for this prompt.
-        </div>
-      </div>
+      </button>
+    </template>
 
-      <div class="dialog-footer">
-        <button
-          class="btn btn-secondary"
-          @click="$emit('cancel')"
-        >
-          Cancel
-        </button>
-        <button
-          class="btn btn-primary"
-          :disabled="selectedModels.length === 0"
-          @click="handleSubmit"
-        >
-          Add {{ selectedModels.length }} Model{{ selectedModels.length !== 1 ? 's' : '' }}
-        </button>
-      </div>
+    <ModelSelector
+      v-if="filteredModels.length > 0"
+      v-model="selectedModels"
+      :models="filteredModels"
+      :presets="presets"
+      @create-preset="emit('create-preset', $event)"
+      @update-preset="emit('update-preset', $event)"
+      @delete-preset="emit('delete-preset', $event)"
+    />
+    <div
+      v-else
+      class="empty-state"
+    >
+      No additional models are available for this prompt.
     </div>
-  </div>
+
+    <template #footer>
+      <button
+        class="btn btn-secondary"
+        @click="$emit('cancel')"
+      >
+        Cancel
+      </button>
+      <button
+        class="btn btn-primary"
+        :disabled="selectedModels.length === 0"
+        @click="handleSubmit"
+      >
+        Add {{ selectedModels.length }} Model{{ selectedModels.length !== 1 ? 's' : '' }}
+      </button>
+    </template>
+  </BaseModal>
 </template>
 
 <script setup>
 import { ref, computed, onMounted, onBeforeUnmount } from 'vue'
+import BaseModal from '@/components/BaseModal.vue'
 import ModelSelector from './ModelSelector.vue'
 import GIcon from '@/components/ui/GIcon.vue'
 
@@ -78,7 +75,6 @@ const emit = defineEmits(['submit', 'cancel', 'create-preset', 'update-preset', 
 
 const selectedModels = ref([])
 
-// Filter out models already used in this tile
 const filteredModels = computed(() => {
   return props.models.filter(m => !props.existingModelIds.includes(m.id))
 })
@@ -88,33 +84,34 @@ function handleSubmit() {
   emit('submit', selectedModels.value)
 }
 
-// Handle escape key
 function handleKeydown(e) {
-  if (e.key === 'Escape') {
-    emit('cancel')
-  }
+  if (e.key === 'Escape') emit('cancel')
 }
 
-onMounted(() => {
-  document.addEventListener('keydown', handleKeydown)
-})
-
-onBeforeUnmount(() => {
-  document.removeEventListener('keydown', handleKeydown)
-})
+onMounted(() => document.addEventListener('keydown', handleKeydown))
+onBeforeUnmount(() => document.removeEventListener('keydown', handleKeydown))
 </script>
 
 <style scoped>
-.dialog-overlay {
-  position: fixed;
-  inset: 0;
-  background: rgba(0, 0, 0, 0.6);
-  backdrop-filter: blur(8px);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  z-index: 1000;
+/* Animation overrides — BaseModal provides the overlay/modal structure */
+:deep(.base-modal-overlay) {
   animation: fadeIn 0.15s ease;
+  backdrop-filter: blur(8px);
+}
+
+:deep(.base-modal) {
+  animation: slideUp 0.2s ease;
+  max-height: 80vh;
+}
+
+:deep(.base-modal__header),
+:deep(.base-modal__body),
+:deep(.base-modal__footer) {
+  padding: var(--spacing-md);
+}
+
+:deep(.base-modal__body) {
+  min-height: 300px;
 }
 
 @keyframes fadeIn {
@@ -122,43 +119,9 @@ onBeforeUnmount(() => {
   to { opacity: 1; }
 }
 
-.dialog-content {
-  background: var(--bg-secondary);
-  border: 1px solid var(--border-default);
-  border-radius: var(--radius-lg);
-  box-shadow: var(--shadow-xl);
-  width: 90%;
-  max-width: 500px;
-  max-height: 80vh;
-  display: flex;
-  flex-direction: column;
-  animation: slideUp 0.2s ease;
-}
-
 @keyframes slideUp {
-  from {
-    opacity: 0;
-    transform: translateY(20px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
-}
-
-.dialog-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: var(--spacing-md);
-  border-bottom: 1px solid var(--border-subtle);
-}
-
-.dialog-header h3 {
-  margin: 0;
-  font-size: 1rem;
-  font-weight: 600;
-  color: var(--text-primary);
+  from { opacity: 0; transform: translateY(20px); }
+  to { opacity: 1; transform: translateY(0); }
 }
 
 .close-btn {
@@ -177,13 +140,6 @@ onBeforeUnmount(() => {
   color: var(--text-primary);
 }
 
-.dialog-body {
-  flex: 1;
-  overflow-y: auto;
-  padding: var(--spacing-md);
-  min-height: 300px;
-}
-
 .empty-state {
   min-height: 220px;
   display: flex;
@@ -192,14 +148,6 @@ onBeforeUnmount(() => {
   color: var(--text-muted);
   text-align: center;
   font-size: 0.9rem;
-}
-
-.dialog-footer {
-  display: flex;
-  justify-content: flex-end;
-  gap: var(--spacing-sm);
-  padding: var(--spacing-md);
-  border-top: 1px solid var(--border-subtle);
 }
 
 .btn {

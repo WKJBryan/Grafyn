@@ -1,160 +1,148 @@
 <template>
-  <div
-    class="feedback-modal-overlay"
-    @click.self="$emit('close')"
+  <BaseModal
+    title="Send Feedback"
+    max-width="520px"
+    @close="$emit('close')"
   >
-    <div class="feedback-modal">
-      <div class="modal-header">
-        <h3>Send Feedback</h3>
-        <button
-          class="close-btn"
-          @click="$emit('close')"
+    <!-- Feedback Type Selection -->
+    <div class="type-section">
+      <label class="section-label">Type</label>
+      <div class="type-options">
+        <div
+          v-for="type in feedbackTypes"
+          :key="type.value"
+          class="type-option"
+          :class="{ selected: selectedType === type.value }"
+          @click="selectedType = type.value"
         >
-          ×
-        </button>
-      </div>
-
-      <div class="modal-body">
-        <!-- Feedback Type Selection -->
-        <div class="type-section">
-          <label class="section-label">Type</label>
-          <div class="type-options">
-            <div
-              v-for="type in feedbackTypes"
-              :key="type.value"
-              class="type-option"
-              :class="{ selected: selectedType === type.value }"
-              @click="selectedType = type.value"
-            >
-              <span class="option-icon">{{ type.icon }}</span>
-              <div class="option-text">
-                <span class="option-label">{{ type.label }}</span>
-                <span class="option-desc">{{ type.description }}</span>
-              </div>
-            </div>
+          <span class="option-icon">{{ type.icon }}</span>
+          <div class="option-text">
+            <span class="option-label">{{ type.label }}</span>
+            <span class="option-desc">{{ type.description }}</span>
           </div>
         </div>
-
-        <!-- Title Input -->
-        <div class="input-section">
-          <label class="section-label">Title</label>
-          <input
-            v-model="title"
-            type="text"
-            class="text-input"
-            placeholder="Brief summary of your feedback..."
-            maxlength="200"
-            @input="validateForm"
-          >
-          <span
-            class="char-count"
-            :class="{ error: title.length < 5 || title.length > 200 }"
-          >
-            {{ title.length }}/200
-          </span>
-        </div>
-
-        <!-- Description Input -->
-        <div class="input-section">
-          <label class="section-label">Description</label>
-          <textarea
-            v-model="description"
-            class="textarea-input"
-            placeholder="Please provide details about your feedback, bug, or feature request..."
-            maxlength="10000"
-            rows="6"
-            @input="validateForm"
-          />
-          <span
-            class="char-count"
-            :class="{ error: description.length < 10 || description.length > 10000 }"
-          >
-            {{ description.length }}/10000
-          </span>
-        </div>
-
-        <!-- System Info Opt-in -->
-        <div class="system-info-section">
-          <label class="checkbox-label">
-            <input
-              v-model="includeSystemInfo"
-              type="checkbox"
-              @change="loadSystemInfo"
-            >
-            Include system information
-          </label>
-
-          <div
-            v-if="includeSystemInfo && systemInfo"
-            class="system-info-preview"
-          >
-            <div class="info-item">
-              <span class="info-label">Platform:</span>
-              <span class="info-value">{{ systemInfo.platform }}</span>
-            </div>
-            <div class="info-item">
-              <span class="info-label">App Version:</span>
-              <span class="info-value">{{ systemInfo.app_version }}</span>
-            </div>
-            <div class="info-item">
-              <span class="info-label">Runtime:</span>
-              <span class="info-value">{{ systemInfo.runtime }}</span>
-            </div>
-          </div>
-        </div>
-
-        <!-- Error Message -->
-        <div
-          v-if="errorMessage"
-          class="error-message"
-        >
-          {{ errorMessage }}
-        </div>
-
-        <!-- Success Message -->
-        <div
-          v-if="successMessage"
-          class="success-message"
-        >
-          {{ successMessage }}
-          <a
-            v-if="issueUrl"
-            :href="issueUrl"
-            target="_blank"
-            class="issue-link"
-          >
-            View Issue →
-          </a>
-        </div>
-      </div>
-
-      <div class="modal-footer">
-        <button
-          class="btn btn-ghost"
-          :disabled="isSubmitting"
-          @click="$emit('close')"
-        >
-          {{ submitted ? 'Close' : 'Cancel' }}
-        </button>
-        <button
-          v-if="!submitted"
-          class="btn btn-primary"
-          :disabled="!isValid || isSubmitting"
-          @click="handleSubmit"
-        >
-          <span
-            v-if="isSubmitting"
-            class="loading-spinner"
-          />
-          {{ isSubmitting ? 'Submitting...' : 'Submit Feedback' }}
-        </button>
       </div>
     </div>
-  </div>
+
+    <!-- Title Input -->
+    <div class="input-section">
+      <label class="section-label">Title</label>
+      <input
+        v-model="title"
+        type="text"
+        class="text-input"
+        placeholder="Brief summary of your feedback..."
+        maxlength="200"
+        @input="validateForm"
+      >
+      <span
+        class="char-count"
+        :class="{ error: title.length < 5 || title.length > 200 }"
+      >
+        {{ title.length }}/200
+      </span>
+    </div>
+
+    <!-- Description Input -->
+    <div class="input-section">
+      <label class="section-label">Description</label>
+      <textarea
+        v-model="description"
+        class="textarea-input"
+        placeholder="Please provide details about your feedback, bug, or feature request..."
+        maxlength="10000"
+        rows="6"
+        @input="validateForm"
+      />
+      <span
+        class="char-count"
+        :class="{ error: description.length < 10 || description.length > 10000 }"
+      >
+        {{ description.length }}/10000
+      </span>
+    </div>
+
+    <!-- System Info Opt-in -->
+    <div class="system-info-section">
+      <label class="checkbox-label">
+        <input
+          v-model="includeSystemInfo"
+          type="checkbox"
+          @change="loadSystemInfo"
+        >
+        Include system information
+      </label>
+
+      <div
+        v-if="includeSystemInfo && systemInfo"
+        class="system-info-preview"
+      >
+        <div class="info-item">
+          <span class="info-label">Platform:</span>
+          <span class="info-value">{{ systemInfo.platform }}</span>
+        </div>
+        <div class="info-item">
+          <span class="info-label">App Version:</span>
+          <span class="info-value">{{ systemInfo.app_version }}</span>
+        </div>
+        <div class="info-item">
+          <span class="info-label">Runtime:</span>
+          <span class="info-value">{{ systemInfo.runtime }}</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Error Message -->
+    <div
+      v-if="errorMessage"
+      class="error-message"
+    >
+      {{ errorMessage }}
+    </div>
+
+    <!-- Success Message -->
+    <div
+      v-if="successMessage"
+      class="success-message"
+    >
+      {{ successMessage }}
+      <a
+        v-if="issueUrl"
+        :href="issueUrl"
+        target="_blank"
+        class="issue-link"
+      >
+        View Issue →
+      </a>
+    </div>
+
+    <template #footer>
+      <button
+        class="btn btn-ghost"
+        :disabled="isSubmitting"
+        @click="$emit('close')"
+      >
+        {{ submitted ? 'Close' : 'Cancel' }}
+      </button>
+      <button
+        v-if="!submitted"
+        class="btn btn-primary"
+        :disabled="!isValid || isSubmitting"
+        @click="handleSubmit"
+      >
+        <span
+          v-if="isSubmitting"
+          class="loading-spinner"
+        />
+        {{ isSubmitting ? 'Submitting...' : 'Submit Feedback' }}
+      </button>
+    </template>
+  </BaseModal>
 </template>
 
 <script setup>
 import { ref, computed, onMounted } from 'vue'
+import BaseModal from '@/components/BaseModal.vue'
 import { feedback as feedbackApi, isDesktopApp } from '../api/client'
 
 const emit = defineEmits(['close', 'submitted'])
@@ -259,15 +247,13 @@ onMounted(async () => {
 </script>
 
 <style scoped>
-.feedback-modal-overlay {
-  position: fixed;
-  inset: 0;
-  background: rgba(0, 0, 0, 0.6);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  z-index: 1000;
+/* Animation overrides — BaseModal provides the overlay/modal structure */
+:deep(.base-modal-overlay) {
   animation: fadeIn 0.2s ease;
+}
+
+:deep(.base-modal) {
+  animation: slideUp 0.3s ease;
 }
 
 @keyframes fadeIn {
@@ -275,54 +261,9 @@ onMounted(async () => {
   to { opacity: 1; }
 }
 
-.feedback-modal {
-  background: var(--bg-secondary);
-  border: 1px solid var(--bg-tertiary);
-  border-radius: var(--radius-lg);
-  width: 100%;
-  max-width: 520px;
-  max-height: 90vh;
-  overflow-y: auto;
-  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.4);
-  animation: slideUp 0.3s ease;
-}
-
 @keyframes slideUp {
   from { transform: translateY(20px); opacity: 0; }
   to { transform: translateY(0); opacity: 1; }
-}
-
-.modal-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  padding: var(--spacing-md) var(--spacing-lg);
-  border-bottom: 1px solid var(--bg-tertiary);
-}
-
-.modal-header h3 {
-  margin: 0;
-  font-size: 1.1rem;
-  color: var(--text-primary);
-}
-
-.close-btn {
-  background: none;
-  border: none;
-  font-size: 1.5rem;
-  color: var(--text-muted);
-  cursor: pointer;
-  padding: 0;
-  line-height: 1;
-  transition: color var(--transition-fast);
-}
-
-.close-btn:hover {
-  color: var(--text-primary);
-}
-
-.modal-body {
-  padding: var(--spacing-lg);
 }
 
 .section-label {
@@ -512,14 +453,6 @@ onMounted(async () => {
 
 .issue-link:hover {
   text-decoration: underline;
-}
-
-.modal-footer {
-  display: flex;
-  justify-content: flex-end;
-  gap: var(--spacing-sm);
-  padding: var(--spacing-md) var(--spacing-lg);
-  border-top: 1px solid var(--bg-tertiary);
 }
 
 .btn {
