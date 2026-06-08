@@ -6,7 +6,7 @@ use crate::models::note::{
     ApplyLinksRequest, ApplyLinksResponse, CreateLinkResponse, DiscoverLinksResponse, NoteUpdate,
     RelationType, ZettelLinkCandidate,
 };
-use crate::services::link_discovery::discover_for_note;
+use crate::services::link_discovery::{discover_for_note, DiscoverMode};
 use crate::AppState;
 use std::collections::{HashMap, HashSet};
 use tauri::State;
@@ -160,37 +160,6 @@ fn deduplicate_links(links: Vec<ZettelLinkCandidate>) -> Vec<ZettelLinkCandidate
     seen.into_values().collect()
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DiscoverMode {
-    Manual,
-    Algorithm,
-    Llm,
-}
-
-impl DiscoverMode {
-    fn parse(mode: Option<&str>) -> Self {
-        match mode.unwrap_or("suggested").to_ascii_lowercase().as_str() {
-            "manual" => Self::Manual,
-            "algorithm" => Self::Algorithm,
-            "llm" | "suggested" => Self::Llm,
-            _ => Self::Llm,
-        }
-    }
-
-    #[cfg(test)]
-    fn include_llm(self) -> bool {
-        matches!(self, Self::Llm)
-    }
-}
-
-fn to_service_mode(mode: DiscoverMode) -> crate::services::link_discovery::DiscoverMode {
-    match mode {
-        DiscoverMode::Manual => crate::services::link_discovery::DiscoverMode::Manual,
-        DiscoverMode::Algorithm => crate::services::link_discovery::DiscoverMode::Algorithm,
-        DiscoverMode::Llm => crate::services::link_discovery::DiscoverMode::Llm,
-    }
-}
-
 // ── Tauri commands ───────────────────────────────────────────────────────
 
 /// Discover potential links for a note using multiple strategies
@@ -203,19 +172,12 @@ pub async fn discover_links(
 ) -> Result<DiscoverLinksResponse, String> {
     let discover_mode = DiscoverMode::parse(mode.as_deref());
     let max_links = maxLinks.unwrap_or(10);
-    discover_for_note(
-        state.inner(),
-        &noteId,
-        to_service_mode(discover_mode),
-        max_links,
-        true,
-    )
-    .await
+    discover_for_note(state.inner(), &noteId, discover_mode, max_links, true).await
 }
 
 #[cfg(test)]
 mod tests {
-    use super::DiscoverMode;
+    use crate::services::link_discovery::DiscoverMode;
 
     #[test]
     fn parses_discover_modes() {
