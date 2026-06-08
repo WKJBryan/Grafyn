@@ -1,180 +1,170 @@
 <template>
   <Teleport to="body">
-    <div
+    <BaseModal
       v-if="visible"
-      class="modal-overlay"
-      @click.self="close"
+      title="Configure Custom Atomics"
+      max-width="680px"
+      :close-on-overlay="false"
+      @close="close"
     >
-      <div class="modal-content">
-        <div class="modal-header">
-          <h3>Configure Custom Atomics</h3>
-          <button
-            class="close-btn"
-            @click="close"
-          >
-            &times;
-          </button>
-        </div>
+      <p class="help-text">
+        Define how this conversation should be split into atomic notes.
+        Each atomic note captures one idea or concept.
+      </p>
 
-        <div class="modal-body">
-          <p class="help-text">
-            Define how this conversation should be split into atomic notes.
-            Each atomic note captures one idea or concept.
-          </p>
-
-          <!-- Extraction Boundaries -->
-          <div class="section">
-            <h4>Extraction Boundaries</h4>
-            <div class="radio-group">
-              <label>
-                <input
-                  v-model="extractionMode"
-                  type="radio"
-                  value="auto"
-                >
-                <span>Automatic (Split by topic changes)</span>
-              </label>
-              <label>
-                <input
-                  v-model="extractionMode"
-                  type="radio"
-                  value="headings"
-                >
-                <span>By Headings (Each heading becomes a note)</span>
-              </label>
-              <label>
-                <input
-                  v-model="extractionMode"
-                  type="radio"
-                  value="messages"
-                >
-                <span>By Messages (Each exchange becomes a note)</span>
-              </label>
-            </div>
-          </div>
-
-          <!-- Custom Atomic Notes -->
-          <div class="section">
-            <h4>
-              Atomic Notes
-              <button
-                class="btn btn-sm btn-secondary"
-                @click="addAtomicNote"
-              >
-                + Add Note
-              </button>
-            </h4>
-
-            <div
-              v-if="atomicNotes.length === 0"
-              class="empty-state"
+      <!-- Extraction Boundaries -->
+      <div class="section">
+        <h4>Extraction Boundaries</h4>
+        <div class="radio-group">
+          <label>
+            <input
+              v-model="extractionMode"
+              type="radio"
+              value="auto"
             >
-              <p>No custom atomics defined. Add notes manually or use automatic extraction.</p>
-            </div>
-
-            <div
-              v-for="(note, index) in atomicNotes"
-              :key="index"
-              class="atomic-card"
+            <span>Automatic (Split by topic changes)</span>
+          </label>
+          <label>
+            <input
+              v-model="extractionMode"
+              type="radio"
+              value="headings"
             >
-              <div class="atomic-header">
-                <input
-                  v-model="note.title"
-                  placeholder="Note title"
-                  class="title-input"
-                >
-                <button
-                  class="btn-icon remove-btn"
-                  @click="removeAtomicNote(index)"
-                >
-                  &times;
-                </button>
-              </div>
-
-              <textarea
-                v-model="note.content"
-                placeholder="Note content (markdown supported)"
-                class="content-input"
-                rows="3"
-              />
-
-              <div class="atomic-meta">
-                <input
-                  v-model="note.tagsInput"
-                  placeholder="Tags (comma-separated)"
-                  class="tags-input"
-                >
-                <select
-                  v-model="note.content_type"
-                  class="type-select"
-                >
-                  <option value="">
-                    Auto-detect type
-                  </option>
-                  <option value="concept">
-                    Concept
-                  </option>
-                  <option value="claim">
-                    Claim
-                  </option>
-                  <option value="evidence">
-                    Evidence
-                  </option>
-                  <option value="question">
-                    Question
-                  </option>
-                  <option value="fleche">
-                    Structure
-                  </option>
-                </select>
-              </div>
-            </div>
-          </div>
-
-          <!-- LLM Settings -->
-          <div class="section">
-            <h4>Summarization Settings</h4>
-            <div class="form-row">
-              <label>Detail Level:</label>
-              <select v-model="detailLevel">
-                <option value="brief">
-                  Brief
-                </option>
-                <option value="standard">
-                  Standard
-                </option>
-                <option value="detailed">
-                  Detailed
-                </option>
-              </select>
-            </div>
-          </div>
-        </div>
-
-        <div class="modal-footer">
-          <button
-            class="btn btn-secondary"
-            @click="close"
-          >
-            Cancel
-          </button>
-          <button
-            class="btn btn-primary"
-            @click="apply"
-          >
-            Apply Configuration
-          </button>
+            <span>By Headings (Each heading becomes a note)</span>
+          </label>
+          <label>
+            <input
+              v-model="extractionMode"
+              type="radio"
+              value="messages"
+            >
+            <span>By Messages (Each exchange becomes a note)</span>
+          </label>
         </div>
       </div>
-    </div>
+
+      <!-- Custom Atomic Notes -->
+      <div class="section">
+        <h4>
+          Atomic Notes
+          <button
+            class="btn btn-sm btn-secondary"
+            @click="addAtomicNote"
+          >
+            + Add Note
+          </button>
+        </h4>
+
+        <div
+          v-if="atomicNotes.length === 0"
+          class="empty-state"
+        >
+          <p>No custom atomics defined. Add notes manually or use automatic extraction.</p>
+        </div>
+
+        <div
+          v-for="(note, index) in atomicNotes"
+          :key="index"
+          class="atomic-card"
+        >
+          <div class="atomic-header">
+            <input
+              v-model="note.title"
+              placeholder="Note title"
+              class="title-input"
+            >
+            <button
+              class="btn-icon remove-btn"
+              @click="removeAtomicNote(index)"
+            >
+              &times;
+            </button>
+          </div>
+
+          <textarea
+            v-model="note.content"
+            placeholder="Note content (markdown supported)"
+            class="content-input"
+            rows="3"
+          />
+
+          <div class="atomic-meta">
+            <input
+              v-model="note.tagsInput"
+              placeholder="Tags (comma-separated)"
+              class="tags-input"
+            >
+            <select
+              v-model="note.content_type"
+              class="type-select"
+            >
+              <option value="">
+                Auto-detect type
+              </option>
+              <option value="concept">
+                Concept
+              </option>
+              <option value="claim">
+                Claim
+              </option>
+              <option value="evidence">
+                Evidence
+              </option>
+              <option value="question">
+                Question
+              </option>
+              <option value="fleche">
+                Structure
+              </option>
+            </select>
+          </div>
+        </div>
+      </div>
+
+      <!-- LLM Settings -->
+      <div class="section">
+        <h4>Summarization Settings</h4>
+        <div class="form-row">
+          <label>Detail Level:</label>
+          <select v-model="detailLevel">
+            <option value="brief">
+              Brief
+            </option>
+            <option value="standard">
+              Standard
+            </option>
+            <option value="detailed">
+              Detailed
+            </option>
+          </select>
+        </div>
+      </div>
+
+      <template #footer>
+        <button
+          class="btn btn-secondary"
+          @click="close"
+        >
+          Cancel
+        </button>
+        <button
+          class="btn btn-primary"
+          @click="apply"
+        >
+          Apply Configuration
+        </button>
+      </template>
+    </BaseModal>
   </Teleport>
 </template>
 
 <script>
 import { ref, watch } from 'vue'
+import BaseModal from '@/components/BaseModal.vue'
 
 export default {
   name: 'CustomAtomicsModal',
+  components: { BaseModal },
   props: {
     visible: { type: Boolean, default: false },
     conversationId: { type: String, default: '' },
@@ -251,53 +241,9 @@ export default {
 </script>
 
 <style scoped>
-.modal-overlay {
-  position: fixed;
-  inset: 0;
-  background: rgba(0, 0, 0, 0.5);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  z-index: 1000;
-}
-
-.modal-content {
-  background: var(--bg-primary, #fff);
-  border-radius: 12px;
-  width: 680px;
-  max-width: 90vw;
+/* Animation overrides — BaseModal provides the overlay/modal structure */
+:deep(.base-modal) {
   max-height: 80vh;
-  display: flex;
-  flex-direction: column;
-  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
-}
-
-.modal-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  padding: 16px 20px;
-  border-bottom: 1px solid var(--border-color, #e0e0e0);
-}
-
-.modal-header h3 {
-  margin: 0;
-  font-size: 1.1rem;
-}
-
-.close-btn {
-  background: none;
-  border: none;
-  font-size: 1.5rem;
-  cursor: pointer;
-  color: var(--text-secondary, #666);
-  padding: 0 4px;
-}
-
-.modal-body {
-  padding: 20px;
-  overflow-y: auto;
-  flex: 1;
 }
 
 .help-text {
@@ -431,14 +377,6 @@ export default {
   border-radius: 6px;
   background: var(--bg-primary, #fff);
   color: var(--text-primary, #333);
-}
-
-.modal-footer {
-  display: flex;
-  justify-content: flex-end;
-  gap: 10px;
-  padding: 14px 20px;
-  border-top: 1px solid var(--border-color, #e0e0e0);
 }
 
 .btn {

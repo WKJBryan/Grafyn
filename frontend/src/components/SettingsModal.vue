@@ -1,572 +1,569 @@
 <template>
-  <div
+  <BaseModal
     v-if="isOpen"
-    class="modal-overlay"
-    @click.self="handleClose"
+    max-width="500px"
+    :show-close="false"
+    @close="handleClose"
   >
-    <div class="modal-content settings-modal">
-      <div class="modal-header">
-        <h2>{{ isSetup ? '🚀 Welcome to Grafyn' : '⚙️ Settings' }}</h2>
-        <button
-          v-if="!isSetup"
-          class="close-btn"
-          @click="handleClose"
-        >
-          ×
-        </button>
+    <template #header>
+      <h2>{{ isSetup ? '🚀 Welcome to Grafyn' : '⚙️ Settings' }}</h2>
+      <button
+        v-if="!isSetup"
+        class="close-btn"
+        @click="handleClose"
+      >
+        ×
+      </button>
+    </template>
+
+    <p
+      v-if="isSetup"
+      class="setup-intro"
+    >
+      Let's set up your knowledge base. You can change these settings anytime.
+    </p>
+
+    <div
+      v-if="isSetup"
+      class="setup-steps"
+    >
+      <div
+        class="step"
+        :class="{ active: true, done: vaultPath }"
+      >
+        <span class="step-number">1</span>
+        <span class="step-label">Vault Location</span>
       </div>
-
-      <div class="modal-body">
-        <p
-          v-if="isSetup"
-          class="setup-intro"
-        >
-          Let's set up your knowledge base. You can change these settings anytime.
-        </p>
-
-        <div
-          v-if="isSetup"
-          class="setup-steps"
-        >
-          <div
-            class="step"
-            :class="{ active: true, done: vaultPath }"
-          >
-            <span class="step-number">1</span>
-            <span class="step-label">Vault Location</span>
-          </div>
-          <div
-            class="step-connector"
-            :class="{ done: vaultPath }"
-          />
-          <div
-            class="step"
-            :class="{ active: vaultPath, done: vaultPath && (openrouterKey || hasStoredOpenRouterKey || keyValidationState === 'valid') }"
-          >
-            <span class="step-number">2</span>
-            <span class="step-label">API Key (Optional)</span>
-          </div>
-          <div
-            class="step-connector"
-            :class="{ done: vaultPath }"
-          />
-          <div
-            class="step"
-            :class="{ active: vaultPath }"
-          >
-            <span class="step-number">3</span>
-            <span class="step-label">Complete</span>
-          </div>
-        </div>
-
-        <!-- Vault Path Section (Desktop only) -->
-        <div
-          v-if="isDesktop || isSetup"
-          class="setting-section"
-        >
-          <label class="setting-label">
-            <span class="label-icon">📁</span>
-            Vault Location
-          </label>
-          <p class="setting-description">
-            Choose where to store your notes. You can use an existing Obsidian vault or create a new folder.
-          </p>
-          <div class="vault-picker">
-            <input
-              v-model="vaultPath"
-              type="text"
-              class="vault-input"
-              placeholder="Click 'Browse' to select a folder..."
-              readonly
-            >
-            <button
-              class="browse-btn"
-              :disabled="isLoading"
-              @click="pickVaultFolder"
-            >
-              {{ isLoading ? '...' : 'Browse' }}
-            </button>
-          </div>
-          <p
-            v-if="!vaultPath && isSetup"
-            class="setting-hint warning"
-          >
-            ⚠️ Please select a vault location to continue
-          </p>
-          <button
-            v-if="vaultPath"
-            class="action-btn action-btn-secondary"
-            @click="showMigrationModal = true"
-          >
-            Migrate Markdown Vault
-          </button>
-        </div>
-
-        <!-- OpenRouter API Key Section (Desktop only) -->
-        <div
-          v-if="isDesktop || isSetup"
-          class="setting-section"
-        >
-          <label class="setting-label">
-            <span class="label-icon">🤖</span>
-            OpenRouter API Key
-            <span class="optional-badge">Optional</span>
-          </label>
-          <p class="setting-description">
-            Required for Canvas multi-LLM features. Get a key at
-            <a
-              href="https://openrouter.ai/keys"
-              target="_blank"
-              rel="noopener"
-            >openrouter.ai/keys</a>
-          </p>
-          <div class="api-key-input">
-            <input
-              :value="apiKeyFieldValue"
-              type="password"
-              class="key-input"
-              :placeholder="showStoredKeyMask ? '' : 'sk-or-v1-...'"
-              @focus="handleApiKeyFocus"
-              @input="handleApiKeyInput"
-              @blur="handleApiKeyBlur"
-              @copy.prevent
-              @cut.prevent
-            >
-          </div>
-          <div
-            v-if="keyValidationState"
-            class="validation-status"
-            :class="keyValidationState"
-          >
-            <span v-if="keyValidationState === 'validating'">⏳ Validating...</span>
-            <span v-else-if="keyValidationState === 'valid'">✅ API key is valid</span>
-            <span v-else-if="keyValidationState === 'invalid'">❌ Invalid API key</span>
-          </div>
-          <p
-            v-if="showStoredKeyMask"
-            class="setting-hint"
-          >
-            🔐 An API key is already stored securely. Enter a new key to replace it, or leave this blank to keep it.
-          </p>
-          <p
-            v-else-if="openrouterKeyDirty && !openrouterKey"
-            class="setting-hint warning"
-          >
-            ⚠️ Saving now will remove your stored OpenRouter API key.
-          </p>
-        </div>
-
-        <!-- LLM Model Section (non-setup only, requires API key) -->
-        <div
-          v-if="!isSetup && (openrouterKey || hasStoredOpenRouterKey)"
-          class="setting-section"
-        >
-          <label class="setting-label">
-            <span class="label-icon">🧠</span>
-            LLM Model
-          </label>
-          <p class="setting-description">
-            Model used for note distillation and link discovery. Faster models are cheaper but may produce lower quality results.
-          </p>
-          <div
-            class="model-combobox"
-            role="combobox"
-            :aria-expanded="showModelDropdown"
-          >
-            <input
-              v-model="modelSearchQuery"
-              type="text"
-              class="model-search-input"
-              placeholder="Search models..."
-              :disabled="modelsLoading"
-              @focus="showModelDropdown = true"
-              @input="highlightedModelIndex = 0"
-              @keydown.down.prevent="highlightedModelIndex = Math.min(highlightedModelIndex + 1, filteredModels.length - 1)"
-              @keydown.up.prevent="highlightedModelIndex = Math.max(highlightedModelIndex - 1, 0)"
-              @keydown.enter.prevent="selectHighlightedModel"
-              @keydown.escape="showModelDropdown = false"
-            >
-            <ul
-              v-if="showModelDropdown && filteredModels.length > 0"
-              class="model-dropdown"
-            >
-              <li
-                v-for="(model, index) in filteredModels"
-                :key="model.id"
-                class="model-option"
-                :class="{ highlighted: index === highlightedModelIndex }"
-                @mousedown.prevent="selectModel(model)"
-                @mouseenter="highlightedModelIndex = index"
-              >
-                {{ model.name }} <span class="model-provider">({{ model.provider }})</span>
-              </li>
-            </ul>
-            <div
-              v-if="showModelDropdown && !modelsLoading && filteredModels.length === 0"
-              class="model-dropdown model-no-results"
-            >
-              No models found
-            </div>
-          </div>
-        </div>
-
-        <div
-          v-if="!isSetup"
-          class="setting-section"
-        >
-          <label class="setting-label">
-            <span class="label-icon">🪞</span>
-            Digital Twin Model
-          </label>
-          <p class="setting-description">
-            Local Ollama keeps Decision Mirror and twin context on this machine. OpenRouter remains available for non-twin canvas, distillation, and discovery features.
-          </p>
-          <div class="provider-options">
-            <label
-              class="provider-option"
-              :class="{ active: twinLlmProvider === 'openrouter' }"
-            >
-              <input
-                v-model="twinLlmProvider"
-                type="radio"
-                value="openrouter"
-              >
-              <span>OpenRouter</span>
-            </label>
-            <label
-              class="provider-option"
-              :class="{ active: twinLlmProvider === 'ollama' }"
-            >
-              <input
-                v-model="twinLlmProvider"
-                type="radio"
-                value="ollama"
-              >
-              <span>Local Ollama</span>
-            </label>
-          </div>
-          <div
-            v-if="twinLlmProvider === 'ollama'"
-            class="ollama-settings"
-          >
-            <label class="optimizer-field">
-              <span>Ollama URL</span>
-              <input
-                v-model="ollamaBaseUrl"
-                type="text"
-                class="ollama-base-url-input"
-              >
-            </label>
-            <div class="ollama-model-row">
-              <label class="optimizer-field ollama-model-field">
-                <span>Ollama Model</span>
-                <select
-                  v-model="ollamaModel"
-                  class="ollama-model-select"
-                >
-                  <option value="">
-                    Select a local model
-                  </option>
-                  <option
-                    v-for="model in availableOllamaModels"
-                    :key="model.id"
-                    :value="model.id"
-                  >
-                    {{ model.name }}
-                  </option>
-                </select>
-              </label>
-              <button
-                class="action-btn action-btn-secondary check-ollama-btn"
-                :disabled="ollamaLoading"
-                @click="loadOllamaModels"
-              >
-                {{ ollamaLoading ? 'Checking...' : 'Check Ollama' }}
-              </button>
-            </div>
-            <p
-              v-if="ollamaStatusMessage"
-              class="setting-hint"
-              :class="{ warning: ollamaStatusWarning }"
-            >
-              {{ ollamaStatusMessage }}
-            </p>
-          </div>
-        </div>
-
-        <!-- Theme Section (non-setup only) -->
-        <div
-          v-if="!isSetup"
-          class="setting-section"
-        >
-          <label class="setting-label">
-            <span class="label-icon">🎨</span>
-            Theme
-          </label>
-          <div class="theme-options">
-            <label
-              class="theme-option"
-              :class="{ active: theme === 'system' }"
-            >
-              <input
-                v-model="theme"
-                type="radio"
-                value="system"
-              >
-              <span>System</span>
-            </label>
-            <label
-              class="theme-option"
-              :class="{ active: theme === 'light' }"
-            >
-              <input
-                v-model="theme"
-                type="radio"
-                value="light"
-              >
-              <span>Light</span>
-            </label>
-            <label
-              class="theme-option"
-              :class="{ active: theme === 'dark' }"
-            >
-              <input
-                v-model="theme"
-                type="radio"
-                value="dark"
-              >
-              <span>Dark</span>
-            </label>
-          </div>
-        </div>
-
-        <!-- Canvas Web Search Section (non-setup only, requires API key) -->
-        <div
-          v-if="!isSetup && (openrouterKey || hasStoredOpenRouterKey)"
-          class="setting-section"
-        >
-          <label class="setting-label">
-            <span class="label-icon">🔍</span>
-            Canvas Web Search
-          </label>
-          <p class="setting-description">
-            Turn live web search on by default for normal Canvas prompts (~$0.02/query per model). Disable this if you want Canvas to rely only on your prompt and selected context.
-          </p>
-          <label class="checkbox-label">
-            <input
-              v-model="smartWebSearch"
-              type="checkbox"
-            >
-            <span>{{ smartWebSearch ? 'On by default' : 'Off by default' }}</span>
-          </label>
-        </div>
-
-        <div
-          v-if="!isSetup"
-          class="setting-section"
-        >
-          <label class="setting-label">
-            <span class="label-icon">🔗</span>
-            Link Discovery
-          </label>
-          <p class="setting-description">
-            Keep the link inbox warm in the background. The local discovery pass is cheap; optional LLM reranking spends OpenRouter budget only on higher-priority notes.
-          </p>
-          <label class="checkbox-label">
-            <input
-              v-model="backgroundLinkDiscoveryEnabled"
-              type="checkbox"
-            >
-            <span>{{ backgroundLinkDiscoveryEnabled ? 'Background discovery enabled' : 'Background discovery paused' }}</span>
-          </label>
-          <label class="checkbox-label secondary-checkbox">
-            <input
-              v-model="backgroundLinkDiscoveryLlmEnabled"
-              type="checkbox"
-              :disabled="!backgroundLinkDiscoveryEnabled || !(openrouterKey || hasStoredOpenRouterKey)"
-            >
-            <span>Allow background LLM reranking for high-priority notes</span>
-          </label>
-        </div>
-
-        <div
-          v-if="!isSetup"
-          class="setting-section"
-        >
-          <label class="setting-label">
-            <span class="label-icon">🧭</span>
-            Vault Optimizer
-          </label>
-          <p class="setting-description">
-            Continuously refines aliases, topic hubs, and inferred links inside your vault, while staying within the selected write mode.
-          </p>
-          <label class="checkbox-label">
-            <input
-              v-model="backgroundVaultOptimizerEnabled"
-              type="checkbox"
-            >
-            <span>{{ backgroundVaultOptimizerEnabled ? 'Optimizer enabled' : 'Optimizer paused' }}</span>
-          </label>
-          <label class="checkbox-label secondary-checkbox">
-            <input
-              v-model="backgroundVaultOptimizerLlmEnabled"
-              type="checkbox"
-              :disabled="!backgroundVaultOptimizerEnabled || !(openrouterKey || hasStoredOpenRouterKey)"
-            >
-            <span>Allow optimizer LLM refinement</span>
-          </label>
-          <div class="optimizer-grid">
-            <label class="optimizer-field">
-              <span>Edit Mode</span>
-              <select v-model="backgroundVaultOptimizerEditMode">
-                <option value="sidecar_first">Sidecar First</option>
-                <option value="hybrid">Hybrid</option>
-                <option value="full_rewrite">Full Rewrite</option>
-              </select>
-            </label>
-            <label class="optimizer-field">
-              <span>Monthly LLM Budget</span>
-              <input
-                v-model.number="backgroundVaultOptimizerBudgetMonthly"
-                type="number"
-                min="0"
-              >
-            </label>
-            <label class="optimizer-field">
-              <span>Max Daily Writes</span>
-              <input
-                v-model.number="backgroundVaultOptimizerMaxDailyWrites"
-                type="number"
-                min="1"
-              >
-            </label>
-            <label class="optimizer-field">
-              <span>Program File</span>
-              <input
-                v-model="vaultOptimizerProgramPath"
-                type="text"
-              >
-            </label>
-          </div>
-          <label class="checkbox-label secondary-checkbox">
-            <input
-              v-model="backgroundVaultOptimizerProgramEnabled"
-              type="checkbox"
-            >
-            <span>Use the vault-local optimizer program file</span>
-          </label>
-          <div
-            v-if="optimizerStatus"
-            class="optimizer-status-chip"
-          >
-            Queue {{ optimizerStatus.queue_size }} · Inbox {{ optimizerStatus.inbox_count }} · Rollback rate {{ (optimizerStatus.rollback_rate * 100).toFixed(0) }}%
-          </div>
-        </div>
-
-        <!-- MCP Integration Section (desktop only, non-setup only) -->
-        <div
-          v-if="!isSetup && isDesktop"
-          class="setting-section"
-        >
-          <label class="setting-label">
-            <span class="label-icon">🔌</span>
-            MCP Integration
-            <span class="optional-badge">Advanced</span>
-          </label>
-          <p class="setting-description">
-            Connect Claude Desktop to your knowledge base. The MCP server runs as a native binary
-            launched by Claude Desktop — no configuration needed in Grafyn.
-          </p>
-          <div class="mcp-details">
-            <div class="mcp-info-row">
-              <span class="mcp-info-label">Status:</span>
-              <span
-                class="mcp-status-badge"
-                :class="mcpAvailable ? 'running' : 'stopped'"
-              >
-                {{ mcpAvailable ? 'Binary found' : 'Binary not found' }}
-              </span>
-            </div>
-            <div
-              v-if="configSnippet"
-              class="config-snippet"
-            >
-              <div class="snippet-header">
-                <span>Claude Desktop Config</span>
-                <button
-                  class="copy-btn"
-                  @click="copyConfigSnippet"
-                >
-                  {{ copied ? 'Copied!' : 'Copy' }}
-                </button>
-              </div>
-              <pre class="snippet-code">{{ configSnippet }}</pre>
-            </div>
-            <p class="setting-hint">
-              Paste this into Claude Desktop &rarr; Settings &rarr; Developer &rarr; Edit Config
-            </p>
-          </div>
-        </div>
-
-        <!-- Import Section (non-setup only) -->
-        <div
-          v-if="!isSetup"
-          class="setting-section"
-        >
-          <label class="setting-label">
-            <span class="label-icon">📥</span>
-            Import
-          </label>
-          <p class="setting-description">
-            Import conversations, documents, and transcripts into your knowledge base.
-          </p>
-          <button
-            class="action-btn"
-            @click="goToImport"
-          >
-            Import Content
-          </button>
-        </div>
-
-        <!-- Feedback Section (non-setup only) -->
-        <div
-          v-if="!isSetup"
-          class="setting-section"
-        >
-          <label class="setting-label">
-            <span class="label-icon">💬</span>
-            Feedback
-          </label>
-          <p class="setting-description">
-            Report bugs, request features, or share your thoughts.
-          </p>
-          <button
-            class="action-btn"
-            @click="openFeedback"
-          >
-            Send Feedback
-          </button>
-        </div>
+      <div
+        class="step-connector"
+        :class="{ done: vaultPath }"
+      />
+      <div
+        class="step"
+        :class="{ active: vaultPath, done: vaultPath && (openrouterKey || hasStoredOpenRouterKey || keyValidationState === 'valid') }"
+      >
+        <span class="step-number">2</span>
+        <span class="step-label">API Key (Optional)</span>
       </div>
-
-      <div class="modal-footer">
-        <button
-          v-if="!isSetup"
-          class="cancel-btn"
-          @click="handleClose"
-        >
-          Cancel
-        </button>
-        <button
-          class="save-btn"
-          :disabled="isSetup && !vaultPath || isSaving"
-          @click="saveSettings"
-        >
-          {{ isSaving ? 'Saving...' : isSetup ? 'Complete Setup' : 'Save Settings' }}
-        </button>
+      <div
+        class="step-connector"
+        :class="{ done: vaultPath }"
+      />
+      <div
+        class="step"
+        :class="{ active: vaultPath }"
+      >
+        <span class="step-number">3</span>
+        <span class="step-label">Complete</span>
       </div>
     </div>
-  </div>
+
+    <!-- Vault Path Section (Desktop only) -->
+    <div
+      v-if="isDesktop || isSetup"
+      class="setting-section"
+    >
+      <label class="setting-label">
+        <span class="label-icon">📁</span>
+        Vault Location
+      </label>
+      <p class="setting-description">
+        Choose where to store your notes. You can use an existing Obsidian vault or create a new folder.
+      </p>
+      <div class="vault-picker">
+        <input
+          v-model="vaultPath"
+          type="text"
+          class="vault-input"
+          placeholder="Click 'Browse' to select a folder..."
+          readonly
+        >
+        <button
+          class="browse-btn"
+          :disabled="isLoading"
+          @click="pickVaultFolder"
+        >
+          {{ isLoading ? '...' : 'Browse' }}
+        </button>
+      </div>
+      <p
+        v-if="!vaultPath && isSetup"
+        class="setting-hint warning"
+      >
+        ⚠️ Please select a vault location to continue
+      </p>
+      <button
+        v-if="vaultPath"
+        class="action-btn action-btn-secondary"
+        @click="showMigrationModal = true"
+      >
+        Migrate Markdown Vault
+      </button>
+    </div>
+
+    <!-- OpenRouter API Key Section (Desktop only) -->
+    <div
+      v-if="isDesktop || isSetup"
+      class="setting-section"
+    >
+      <label class="setting-label">
+        <span class="label-icon">🤖</span>
+        OpenRouter API Key
+        <span class="optional-badge">Optional</span>
+      </label>
+      <p class="setting-description">
+        Required for Canvas multi-LLM features. Get a key at
+        <a
+          href="https://openrouter.ai/keys"
+          target="_blank"
+          rel="noopener"
+        >openrouter.ai/keys</a>
+      </p>
+      <div class="api-key-input">
+        <input
+          :value="apiKeyFieldValue"
+          type="password"
+          class="key-input"
+          :placeholder="showStoredKeyMask ? '' : 'sk-or-v1-...'"
+          @focus="handleApiKeyFocus"
+          @input="handleApiKeyInput"
+          @blur="handleApiKeyBlur"
+          @copy.prevent
+          @cut.prevent
+        >
+      </div>
+      <div
+        v-if="keyValidationState"
+        class="validation-status"
+        :class="keyValidationState"
+      >
+        <span v-if="keyValidationState === 'validating'">⏳ Validating...</span>
+        <span v-else-if="keyValidationState === 'valid'">✅ API key is valid</span>
+        <span v-else-if="keyValidationState === 'invalid'">❌ Invalid API key</span>
+      </div>
+      <p
+        v-if="showStoredKeyMask"
+        class="setting-hint"
+      >
+        🔐 An API key is already stored securely. Enter a new key to replace it, or leave this blank to keep it.
+      </p>
+      <p
+        v-else-if="openrouterKeyDirty && !openrouterKey"
+        class="setting-hint warning"
+      >
+        ⚠️ Saving now will remove your stored OpenRouter API key.
+      </p>
+    </div>
+
+    <!-- LLM Model Section (non-setup only, requires API key) -->
+    <div
+      v-if="!isSetup && (openrouterKey || hasStoredOpenRouterKey)"
+      class="setting-section"
+    >
+      <label class="setting-label">
+        <span class="label-icon">🧠</span>
+        LLM Model
+      </label>
+      <p class="setting-description">
+        Model used for note distillation and link discovery. Faster models are cheaper but may produce lower quality results.
+      </p>
+      <div
+        class="model-combobox"
+        role="combobox"
+        :aria-expanded="showModelDropdown"
+      >
+        <input
+          v-model="modelSearchQuery"
+          type="text"
+          class="model-search-input"
+          placeholder="Search models..."
+          :disabled="modelsLoading"
+          @focus="showModelDropdown = true"
+          @input="highlightedModelIndex = 0"
+          @keydown.down.prevent="highlightedModelIndex = Math.min(highlightedModelIndex + 1, filteredModels.length - 1)"
+          @keydown.up.prevent="highlightedModelIndex = Math.max(highlightedModelIndex - 1, 0)"
+          @keydown.enter.prevent="selectHighlightedModel"
+          @keydown.escape="showModelDropdown = false"
+        >
+        <ul
+          v-if="showModelDropdown && filteredModels.length > 0"
+          class="model-dropdown"
+        >
+          <li
+            v-for="(model, index) in filteredModels"
+            :key="model.id"
+            class="model-option"
+            :class="{ highlighted: index === highlightedModelIndex }"
+            @mousedown.prevent="selectModel(model)"
+            @mouseenter="highlightedModelIndex = index"
+          >
+            {{ model.name }} <span class="model-provider">({{ model.provider }})</span>
+          </li>
+        </ul>
+        <div
+          v-if="showModelDropdown && !modelsLoading && filteredModels.length === 0"
+          class="model-dropdown model-no-results"
+        >
+          No models found
+        </div>
+      </div>
+    </div>
+
+    <div
+      v-if="!isSetup"
+      class="setting-section"
+    >
+      <label class="setting-label">
+        <span class="label-icon">🪞</span>
+        Digital Twin Model
+      </label>
+      <p class="setting-description">
+        Local Ollama keeps Decision Mirror and twin context on this machine. OpenRouter remains available for non-twin canvas, distillation, and discovery features.
+      </p>
+      <div class="provider-options">
+        <label
+          class="provider-option"
+          :class="{ active: twinLlmProvider === 'openrouter' }"
+        >
+          <input
+            v-model="twinLlmProvider"
+            type="radio"
+            value="openrouter"
+          >
+          <span>OpenRouter</span>
+        </label>
+        <label
+          class="provider-option"
+          :class="{ active: twinLlmProvider === 'ollama' }"
+        >
+          <input
+            v-model="twinLlmProvider"
+            type="radio"
+            value="ollama"
+          >
+          <span>Local Ollama</span>
+        </label>
+      </div>
+      <div
+        v-if="twinLlmProvider === 'ollama'"
+        class="ollama-settings"
+      >
+        <label class="optimizer-field">
+          <span>Ollama URL</span>
+          <input
+            v-model="ollamaBaseUrl"
+            type="text"
+            class="ollama-base-url-input"
+          >
+        </label>
+        <div class="ollama-model-row">
+          <label class="optimizer-field ollama-model-field">
+            <span>Ollama Model</span>
+            <select
+              v-model="ollamaModel"
+              class="ollama-model-select"
+            >
+              <option value="">
+                Select a local model
+              </option>
+              <option
+                v-for="model in availableOllamaModels"
+                :key="model.id"
+                :value="model.id"
+              >
+                {{ model.name }}
+              </option>
+            </select>
+          </label>
+          <button
+            class="action-btn action-btn-secondary check-ollama-btn"
+            :disabled="ollamaLoading"
+            @click="loadOllamaModels"
+          >
+            {{ ollamaLoading ? 'Checking...' : 'Check Ollama' }}
+          </button>
+        </div>
+        <p
+          v-if="ollamaStatusMessage"
+          class="setting-hint"
+          :class="{ warning: ollamaStatusWarning }"
+        >
+          {{ ollamaStatusMessage }}
+        </p>
+      </div>
+    </div>
+
+    <!-- Theme Section (non-setup only) -->
+    <div
+      v-if="!isSetup"
+      class="setting-section"
+    >
+      <label class="setting-label">
+        <span class="label-icon">🎨</span>
+        Theme
+      </label>
+      <div class="theme-options">
+        <label
+          class="theme-option"
+          :class="{ active: theme === 'system' }"
+        >
+          <input
+            v-model="theme"
+            type="radio"
+            value="system"
+          >
+          <span>System</span>
+        </label>
+        <label
+          class="theme-option"
+          :class="{ active: theme === 'light' }"
+        >
+          <input
+            v-model="theme"
+            type="radio"
+            value="light"
+          >
+          <span>Light</span>
+        </label>
+        <label
+          class="theme-option"
+          :class="{ active: theme === 'dark' }"
+        >
+          <input
+            v-model="theme"
+            type="radio"
+            value="dark"
+          >
+          <span>Dark</span>
+        </label>
+      </div>
+    </div>
+
+    <!-- Canvas Web Search Section (non-setup only, requires API key) -->
+    <div
+      v-if="!isSetup && (openrouterKey || hasStoredOpenRouterKey)"
+      class="setting-section"
+    >
+      <label class="setting-label">
+        <span class="label-icon">🔍</span>
+        Canvas Web Search
+      </label>
+      <p class="setting-description">
+        Turn live web search on by default for normal Canvas prompts (~$0.02/query per model). Disable this if you want Canvas to rely only on your prompt and selected context.
+      </p>
+      <label class="checkbox-label">
+        <input
+          v-model="smartWebSearch"
+          type="checkbox"
+        >
+        <span>{{ smartWebSearch ? 'On by default' : 'Off by default' }}</span>
+      </label>
+    </div>
+
+    <div
+      v-if="!isSetup"
+      class="setting-section"
+    >
+      <label class="setting-label">
+        <span class="label-icon">🔗</span>
+        Link Discovery
+      </label>
+      <p class="setting-description">
+        Keep the link inbox warm in the background. The local discovery pass is cheap; optional LLM reranking spends OpenRouter budget only on higher-priority notes.
+      </p>
+      <label class="checkbox-label">
+        <input
+          v-model="backgroundLinkDiscoveryEnabled"
+          type="checkbox"
+        >
+        <span>{{ backgroundLinkDiscoveryEnabled ? 'Background discovery enabled' : 'Background discovery paused' }}</span>
+      </label>
+      <label class="checkbox-label secondary-checkbox">
+        <input
+          v-model="backgroundLinkDiscoveryLlmEnabled"
+          type="checkbox"
+          :disabled="!backgroundLinkDiscoveryEnabled || !(openrouterKey || hasStoredOpenRouterKey)"
+        >
+        <span>Allow background LLM reranking for high-priority notes</span>
+      </label>
+    </div>
+
+    <div
+      v-if="!isSetup"
+      class="setting-section"
+    >
+      <label class="setting-label">
+        <span class="label-icon">🧭</span>
+        Vault Optimizer
+      </label>
+      <p class="setting-description">
+        Continuously refines aliases, topic hubs, and inferred links inside your vault, while staying within the selected write mode.
+      </p>
+      <label class="checkbox-label">
+        <input
+          v-model="backgroundVaultOptimizerEnabled"
+          type="checkbox"
+        >
+        <span>{{ backgroundVaultOptimizerEnabled ? 'Optimizer enabled' : 'Optimizer paused' }}</span>
+      </label>
+      <label class="checkbox-label secondary-checkbox">
+        <input
+          v-model="backgroundVaultOptimizerLlmEnabled"
+          type="checkbox"
+          :disabled="!backgroundVaultOptimizerEnabled || !(openrouterKey || hasStoredOpenRouterKey)"
+        >
+        <span>Allow optimizer LLM refinement</span>
+      </label>
+      <div class="optimizer-grid">
+        <label class="optimizer-field">
+          <span>Edit Mode</span>
+          <select v-model="backgroundVaultOptimizerEditMode">
+            <option value="sidecar_first">Sidecar First</option>
+            <option value="hybrid">Hybrid</option>
+            <option value="full_rewrite">Full Rewrite</option>
+          </select>
+        </label>
+        <label class="optimizer-field">
+          <span>Monthly LLM Budget</span>
+          <input
+            v-model.number="backgroundVaultOptimizerBudgetMonthly"
+            type="number"
+            min="0"
+          >
+        </label>
+        <label class="optimizer-field">
+          <span>Max Daily Writes</span>
+          <input
+            v-model.number="backgroundVaultOptimizerMaxDailyWrites"
+            type="number"
+            min="1"
+          >
+        </label>
+        <label class="optimizer-field">
+          <span>Program File</span>
+          <input
+            v-model="vaultOptimizerProgramPath"
+            type="text"
+          >
+        </label>
+      </div>
+      <label class="checkbox-label secondary-checkbox">
+        <input
+          v-model="backgroundVaultOptimizerProgramEnabled"
+          type="checkbox"
+        >
+        <span>Use the vault-local optimizer program file</span>
+      </label>
+      <div
+        v-if="optimizerStatus"
+        class="optimizer-status-chip"
+      >
+        Queue {{ optimizerStatus.queue_size }} · Inbox {{ optimizerStatus.inbox_count }} · Rollback rate {{ (optimizerStatus.rollback_rate * 100).toFixed(0) }}%
+      </div>
+    </div>
+
+    <!-- MCP Integration Section (desktop only, non-setup only) -->
+    <div
+      v-if="!isSetup && isDesktop"
+      class="setting-section"
+    >
+      <label class="setting-label">
+        <span class="label-icon">🔌</span>
+        MCP Integration
+        <span class="optional-badge">Advanced</span>
+      </label>
+      <p class="setting-description">
+        Connect Claude Desktop to your knowledge base. The MCP server runs as a native binary
+        launched by Claude Desktop — no configuration needed in Grafyn.
+      </p>
+      <div class="mcp-details">
+        <div class="mcp-info-row">
+          <span class="mcp-info-label">Status:</span>
+          <span
+            class="mcp-status-badge"
+            :class="mcpAvailable ? 'running' : 'stopped'"
+          >
+            {{ mcpAvailable ? 'Binary found' : 'Binary not found' }}
+          </span>
+        </div>
+        <div
+          v-if="configSnippet"
+          class="config-snippet"
+        >
+          <div class="snippet-header">
+            <span>Claude Desktop Config</span>
+            <button
+              class="copy-btn"
+              @click="copyConfigSnippet"
+            >
+              {{ copied ? 'Copied!' : 'Copy' }}
+            </button>
+          </div>
+          <pre class="snippet-code">{{ configSnippet }}</pre>
+        </div>
+        <p class="setting-hint">
+          Paste this into Claude Desktop &rarr; Settings &rarr; Developer &rarr; Edit Config
+        </p>
+      </div>
+    </div>
+
+    <!-- Import Section (non-setup only) -->
+    <div
+      v-if="!isSetup"
+      class="setting-section"
+    >
+      <label class="setting-label">
+        <span class="label-icon">📥</span>
+        Import
+      </label>
+      <p class="setting-description">
+        Import conversations, documents, and transcripts into your knowledge base.
+      </p>
+      <button
+        class="action-btn"
+        @click="goToImport"
+      >
+        Import Content
+      </button>
+    </div>
+
+    <!-- Feedback Section (non-setup only) -->
+    <div
+      v-if="!isSetup"
+      class="setting-section"
+    >
+      <label class="setting-label">
+        <span class="label-icon">💬</span>
+        Feedback
+      </label>
+      <p class="setting-description">
+        Report bugs, request features, or share your thoughts.
+      </p>
+      <button
+        class="action-btn"
+        @click="openFeedback"
+      >
+        Send Feedback
+      </button>
+    </div>
+
+    <template #footer>
+      <button
+        v-if="!isSetup"
+        class="cancel-btn"
+        @click="handleClose"
+      >
+        Cancel
+      </button>
+      <button
+        class="save-btn"
+        :disabled="isSetup && !vaultPath || isSaving"
+        @click="saveSettings"
+      >
+        {{ isSaving ? 'Saving...' : isSetup ? 'Complete Setup' : 'Save Settings' }}
+      </button>
+    </template>
+  </BaseModal>
   <MarkdownMigrationModal
     v-model="showMigrationModal"
     :vault-path="vaultPath"
@@ -580,6 +577,7 @@ import { useRouter } from 'vue-router'
 import { settings as settingsApi, mcp as mcpApi, canvas as canvasApi, optimizer as optimizerApi, isDesktopApp } from '@/api/client'
 import { useToast } from '@/composables/useToast'
 import { useThemeStore } from '@/stores/theme'
+import BaseModal from '@/components/BaseModal.vue'
 import MarkdownMigrationModal from '@/components/MarkdownMigrationModal.vue'
 
 const props = defineProps({
@@ -1009,45 +1007,9 @@ onMounted(() => {
 </script>
 
 <style scoped>
-.modal-overlay {
-  position: fixed;
-  top: 0;
-  left: 0;
-  right: 0;
-  bottom: 0;
-  background: rgba(0, 0, 0, 0.6);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  z-index: 1000;
+/* Animation overrides — BaseModal provides the overlay/modal structure */
+:deep(.base-modal-overlay) {
   backdrop-filter: blur(4px);
-}
-
-.settings-modal {
-  background: var(--bg-primary, #fff);
-  border-radius: 12px;
-  width: 90%;
-  max-width: 500px;
-  max-height: 90vh;
-  overflow: hidden;
-  display: flex;
-  flex-direction: column;
-  box-shadow: 0 20px 50px rgba(0, 0, 0, 0.3);
-}
-
-.modal-header {
-  padding: 20px 24px;
-  border-bottom: 1px solid var(--border-color, #e0e0e0);
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-}
-
-.modal-header h2 {
-  margin: 0;
-  font-size: 1.25rem;
-  font-weight: 600;
-  color: var(--text-primary, #1a1a1a);
 }
 
 .close-btn {
@@ -1062,12 +1024,6 @@ onMounted(() => {
 
 .close-btn:hover {
   color: var(--text-primary, #1a1a1a);
-}
-
-.modal-body {
-  padding: 24px;
-  overflow-y: auto;
-  flex: 1;
 }
 
 .setup-intro {
@@ -1381,14 +1337,6 @@ onMounted(() => {
   text-align: center;
 }
 
-.modal-footer {
-  padding: 16px 24px;
-  border-top: 1px solid var(--border-color, #e0e0e0);
-  display: flex;
-  justify-content: flex-end;
-  gap: 12px;
-}
-
 .cancel-btn {
   padding: 10px 20px;
   background: var(--bg-secondary, #f5f5f5);
@@ -1612,12 +1560,9 @@ onMounted(() => {
   border-color: var(--accent-color, #7c3aed);
 }
 
-/* Dark mode support */
-:root.dark .settings-modal {
-  --bg-primary: #1a1a2e;
-  --bg-secondary: #16213e;
-  --text-primary: #eee;
-  --text-secondary: #aaa;
-  --border-color: #333;
+/* Map legacy var names used throughout this component to design-system tokens */
+:deep(.base-modal) {
+  --border-color: var(--border-default);
+  --accent-color: var(--accent-primary);
 }
 </style>

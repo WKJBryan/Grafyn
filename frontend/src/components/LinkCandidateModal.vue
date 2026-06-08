@@ -1,201 +1,190 @@
 <template>
-  <div
-    class="link-modal-overlay"
-    @click.self="$emit('close')"
+  <BaseModal
+    title="Discover Links"
+    max-width="560px"
+    @close="$emit('close')"
   >
-    <div class="link-modal">
-      <div class="modal-header">
-        <h3>Discover Links</h3>
-        <button
-          class="close-btn"
-          @click="$emit('close')"
-        >
-          ×
-        </button>
-      </div>
-
-      <div class="modal-body">
-        <div
-          v-if="!loading && !error && (cachedAt || isStale)"
-          class="discovery-meta"
-        >
-          <span
-            v-if="source"
-            class="meta-pill"
-          >
-            {{ source === 'cache' ? 'Cached' : 'Fresh' }}
-          </span>
-          <span
-            v-if="isStale"
-            class="meta-pill warning"
-          >
-            Stale
-          </span>
-          <span
-            v-if="cachedAt"
-            class="meta-text"
-          >
-            {{ formatCachedAt(cachedAt) }}
-          </span>
-        </div>
-
-        <!-- Loading -->
-        <div
-          v-if="loading"
-          class="loading-state"
-        >
-          <span class="loading-spinner" />
-          <p>Discovering link candidates...</p>
-        </div>
-
-        <!-- Error -->
-        <div
-          v-else-if="error"
-          class="error-state"
-        >
-          <p>{{ error }}</p>
-          <button
-            class="btn btn-secondary"
-            @click="$emit('retry')"
-          >
-            Retry
-          </button>
-        </div>
-
-        <!-- No results -->
-        <div
-          v-else-if="allCandidates.length === 0 && topicHubCandidates.length === 0"
-          class="empty-state"
-        >
-          <p>No link candidates found for this note.</p>
-        </div>
-
-        <div
-          v-if="!loading && !error && topicHubCandidates.length > 0"
-          class="topic-hub-panel"
-        >
-          <div class="section-header">
-            <h4>Topic Hubs</h4>
-            <span class="section-count">{{ topicHubCandidates.length }}</span>
-          </div>
-          <p class="topic-hub-copy">
-            Topic membership is auto-managed. These hubs shape graph navigation and retrieval, but they are not applied as manual note links.
-          </p>
-          <div class="topic-hub-list">
-            <div
-              v-for="hub in topicHubCandidates"
-              :key="hub.hub_id"
-              class="topic-hub-item"
-            >
-              <div class="topic-hub-title">
-                {{ hub.hub_title }}
-              </div>
-              <div class="topic-hub-meta">
-                <span class="topic-key">{{ hub.topic_key }}</span>
-                <span class="topic-source">{{ hub.membership_source || 'auto' }}</span>
-              </div>
-            </div>
-          </div>
-        </div>
-
-        <!-- Candidate list -->
-        <div
-          v-if="!loading && !error && allCandidates.length > 0"
-          class="candidates-list"
-        >
-          <label class="select-all-row">
-            <input
-              v-model="allSelected"
-              type="checkbox"
-              @change="toggleAll"
-            >
-            <span>Select all ({{ allCandidates.length }} candidates)</span>
-          </label>
-
-          <div
-            v-for="section in sections"
-            :key="section.key"
-            class="candidate-section"
-          >
-            <div class="section-header">
-              <h4>{{ section.title }}</h4>
-              <span class="section-count">{{ section.items.length }}</span>
-            </div>
-
-            <div
-              v-for="candidate in section.items"
-              :key="section.key + '-' + candidate.target_id"
-              class="candidate-item"
-              :class="{ selected: selected.has(candidate.target_id) }"
-            >
-              <label class="candidate-check">
-                <input
-                  type="checkbox"
-                  :checked="selected.has(candidate.target_id)"
-                  @change="toggleCandidate(candidate.target_id)"
-                >
-              </label>
-              <div class="candidate-info">
-                <div class="candidate-header">
-                  <span class="candidate-title">{{ candidate.target_title }}</span>
-                  <span
-                    class="confidence-badge"
-                    :class="confidenceClass(candidate.confidence)"
-                  >
-                    {{ Math.round(candidate.confidence * 100) }}%
-                  </span>
-                </div>
-                <div
-                  v-if="candidate.reason"
-                  class="candidate-reason"
-                >
-                  {{ candidate.reason }}
-                </div>
-                <div class="candidate-actions">
-                  <span
-                    class="link-type-badge"
-                    :class="'type-' + candidate.link_type"
-                  >
-                    {{ candidate.link_type }}
-                  </span>
-                  <button
-                    class="dismiss-btn"
-                    :disabled="dismissing.has(candidate.target_id)"
-                    @click="dismissCandidate(candidate.target_id)"
-                  >
-                    {{ dismissing.has(candidate.target_id) ? 'Dismissing...' : 'Dismiss' }}
-                  </button>
-                </div>
-              </div>
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <div
-        v-if="allCandidates.length > 0"
-        class="modal-footer"
+    <div
+      v-if="!loading && !error && (cachedAt || isStale)"
+      class="discovery-meta"
+    >
+      <span
+        v-if="source"
+        class="meta-pill"
       >
-        <button
-          class="btn btn-ghost"
-          @click="$emit('close')"
+        {{ source === 'cache' ? 'Cached' : 'Fresh' }}
+      </span>
+      <span
+        v-if="isStale"
+        class="meta-pill warning"
+      >
+        Stale
+      </span>
+      <span
+        v-if="cachedAt"
+        class="meta-text"
+      >
+        {{ formatCachedAt(cachedAt) }}
+      </span>
+    </div>
+
+    <!-- Loading -->
+    <div
+      v-if="loading"
+      class="loading-state"
+    >
+      <span class="loading-spinner" />
+      <p>Discovering link candidates...</p>
+    </div>
+
+    <!-- Error -->
+    <div
+      v-else-if="error"
+      class="error-state"
+    >
+      <p>{{ error }}</p>
+      <button
+        class="btn btn-secondary"
+        @click="$emit('retry')"
+      >
+        Retry
+      </button>
+    </div>
+
+    <!-- No results -->
+    <div
+      v-else-if="allCandidates.length === 0 && topicHubCandidates.length === 0"
+      class="empty-state"
+    >
+      <p>No link candidates found for this note.</p>
+    </div>
+
+    <div
+      v-if="!loading && !error && topicHubCandidates.length > 0"
+      class="topic-hub-panel"
+    >
+      <div class="section-header">
+        <h4>Topic Hubs</h4>
+        <span class="section-count">{{ topicHubCandidates.length }}</span>
+      </div>
+      <p class="topic-hub-copy">
+        Topic membership is auto-managed. These hubs shape graph navigation and retrieval, but they are not applied as manual note links.
+      </p>
+      <div class="topic-hub-list">
+        <div
+          v-for="hub in topicHubCandidates"
+          :key="hub.hub_id"
+          class="topic-hub-item"
         >
-          Cancel
-        </button>
-        <button
-          class="btn btn-primary"
-          :disabled="selected.size === 0 || applying"
-          @click="handleApply"
-        >
-          {{ applying ? 'Applying...' : `Apply ${selected.size} Link${selected.size !== 1 ? 's' : ''}` }}
-        </button>
+          <div class="topic-hub-title">
+            {{ hub.hub_title }}
+          </div>
+          <div class="topic-hub-meta">
+            <span class="topic-key">{{ hub.topic_key }}</span>
+            <span class="topic-source">{{ hub.membership_source || 'auto' }}</span>
+          </div>
+        </div>
       </div>
     </div>
-  </div>
+
+    <!-- Candidate list -->
+    <div
+      v-if="!loading && !error && allCandidates.length > 0"
+      class="candidates-list"
+    >
+      <label class="select-all-row">
+        <input
+          v-model="allSelected"
+          type="checkbox"
+          @change="toggleAll"
+        >
+        <span>Select all ({{ allCandidates.length }} candidates)</span>
+      </label>
+
+      <div
+        v-for="section in sections"
+        :key="section.key"
+        class="candidate-section"
+      >
+        <div class="section-header">
+          <h4>{{ section.title }}</h4>
+          <span class="section-count">{{ section.items.length }}</span>
+        </div>
+
+        <div
+          v-for="candidate in section.items"
+          :key="section.key + '-' + candidate.target_id"
+          class="candidate-item"
+          :class="{ selected: selected.has(candidate.target_id) }"
+        >
+          <label class="candidate-check">
+            <input
+              type="checkbox"
+              :checked="selected.has(candidate.target_id)"
+              @change="toggleCandidate(candidate.target_id)"
+            >
+          </label>
+          <div class="candidate-info">
+            <div class="candidate-header">
+              <span class="candidate-title">{{ candidate.target_title }}</span>
+              <span
+                class="confidence-badge"
+                :class="confidenceClass(candidate.confidence)"
+              >
+                {{ Math.round(candidate.confidence * 100) }}%
+              </span>
+            </div>
+            <div
+              v-if="candidate.reason"
+              class="candidate-reason"
+            >
+              {{ candidate.reason }}
+            </div>
+            <div class="candidate-actions">
+              <span
+                class="link-type-badge"
+                :class="'type-' + candidate.link_type"
+              >
+                {{ candidate.link_type }}
+              </span>
+              <button
+                class="dismiss-btn"
+                :disabled="dismissing.has(candidate.target_id)"
+                @click="dismissCandidate(candidate.target_id)"
+              >
+                {{ dismissing.has(candidate.target_id) ? 'Dismissing...' : 'Dismiss' }}
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Conditional footer rendered inside the body slot -->
+    <div
+      v-if="allCandidates.length > 0"
+      class="modal-footer"
+    >
+      <button
+        class="btn btn-ghost"
+        @click="$emit('close')"
+      >
+        Cancel
+      </button>
+      <button
+        class="btn btn-primary"
+        :disabled="selected.size === 0 || applying"
+        @click="handleApply"
+      >
+        {{ applying ? 'Applying...' : `Apply ${selected.size} Link${selected.size !== 1 ? 's' : ''}` }}
+      </button>
+    </div>
+  </BaseModal>
 </template>
 
 <script setup>
 import { ref, computed } from 'vue'
+import BaseModal from '@/components/BaseModal.vue'
 import { zettelkasten } from '@/api/client'
 import { useToast } from '@/composables/useToast'
 
@@ -330,15 +319,14 @@ async function handleApply() {
 </script>
 
 <style scoped>
-.link-modal-overlay {
-  position: fixed;
-  inset: 0;
-  background: rgba(0, 0, 0, 0.6);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  z-index: 1000;
+/* Animation overrides — BaseModal provides the overlay/modal structure */
+:deep(.base-modal-overlay) {
   animation: fadeIn 0.2s ease;
+}
+
+:deep(.base-modal) {
+  animation: slideUp 0.3s ease;
+  max-height: 80vh;
 }
 
 @keyframes fadeIn {
@@ -346,57 +334,9 @@ async function handleApply() {
   to { opacity: 1; }
 }
 
-.link-modal {
-  background: var(--bg-secondary);
-  border: 1px solid var(--bg-tertiary);
-  border-radius: var(--radius-lg);
-  width: 100%;
-  max-width: 560px;
-  max-height: 80vh;
-  display: flex;
-  flex-direction: column;
-  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.4);
-  animation: slideUp 0.3s ease;
-}
-
 @keyframes slideUp {
   from { transform: translateY(20px); opacity: 0; }
   to { transform: translateY(0); opacity: 1; }
-}
-
-.modal-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  padding: var(--spacing-md) var(--spacing-lg);
-  border-bottom: 1px solid var(--bg-tertiary);
-}
-
-.modal-header h3 {
-  margin: 0;
-  font-size: 1.1rem;
-  color: var(--text-primary);
-}
-
-.close-btn {
-  background: none;
-  border: none;
-  font-size: 1.5rem;
-  color: var(--text-muted);
-  cursor: pointer;
-  padding: 0;
-  line-height: 1;
-  transition: color var(--transition-fast);
-}
-
-.close-btn:hover {
-  color: var(--text-primary);
-}
-
-.modal-body {
-  padding: var(--spacing-lg);
-  overflow-y: auto;
-  flex: 1;
 }
 
 .discovery-meta {
@@ -663,11 +603,13 @@ async function handleApply() {
 .type-example { color: #8b5cf6; background: rgba(139, 92, 246, 0.1); }
 .type-part_of { color: #06b6d4; background: rgba(6, 182, 212, 0.1); }
 
+/* Conditional footer rendered inside body slot */
 .modal-footer {
   display: flex;
   justify-content: flex-end;
   gap: var(--spacing-sm);
-  padding: var(--spacing-md) var(--spacing-lg);
+  padding: var(--spacing-md) 0 0;
+  margin-top: var(--spacing-md);
   border-top: 1px solid var(--bg-tertiary);
 }
 

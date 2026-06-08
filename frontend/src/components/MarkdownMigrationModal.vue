@@ -1,190 +1,189 @@
 <template>
-  <div
+  <BaseModal
     v-if="modelValue"
-    class="modal-overlay"
-    @click.self="$emit('update:modelValue', false)"
+    :show-close="false"
+    width="min(960px, calc(100vw - 2rem))"
+    max-width="min(960px, calc(100vw - 2rem))"
+    @close="$emit('update:modelValue', false)"
   >
-    <div class="modal-content migration-modal">
-      <div class="modal-header">
-        <div>
-          <h2>Migrate Markdown Vault</h2>
-          <p class="subtle">
-            Preview-first migration for nested Markdown vaults, sidecar overlays, and Grafyn topic hubs.
-          </p>
-        </div>
-        <button
-          class="close-btn"
-          @click="$emit('update:modelValue', false)"
+    <template #header>
+      <div>
+        <h2>Migrate Markdown Vault</h2>
+        <p class="subtle">
+          Preview-first migration for nested Markdown vaults, sidecar overlays, and Grafyn topic hubs.
+        </p>
+      </div>
+      <button
+        class="close-btn"
+        @click="$emit('update:modelValue', false)"
+      >
+        ×
+      </button>
+    </template>
+
+    <div class="config-grid">
+      <label class="field">
+        <span>Mode</span>
+        <select v-model="mode">
+          <option value="sidecar_first">Sidecar First</option>
+          <option value="hybrid">Hybrid</option>
+          <option value="full_rewrite">Full Rewrite</option>
+        </select>
+      </label>
+
+      <label class="field">
+        <span>Hub Folder</span>
+        <input
+          v-model="hubFolder"
+          type="text"
+          placeholder="_grafyn/hubs"
         >
-          ×
-        </button>
+      </label>
+
+      <label class="field">
+        <span>Program File</span>
+        <input
+          v-model="programPath"
+          type="text"
+          placeholder="_grafyn/program.md"
+        >
+      </label>
+    </div>
+
+    <div class="checkbox-grid">
+      <label class="checkbox-row">
+        <input
+          v-model="startOptimizer"
+          type="checkbox"
+        >
+        <span>Start the background vault optimizer after migration</span>
+      </label>
+      <label class="checkbox-row">
+        <input
+          v-model="enableLlm"
+          type="checkbox"
+          :disabled="!startOptimizer"
+        >
+        <span>Allow optimizer LLM refinement when budget is enabled</span>
+      </label>
+      <label class="checkbox-row">
+        <input
+          v-model="autoInsertLinks"
+          type="checkbox"
+          :disabled="mode === 'sidecar_first'"
+        >
+        <span>Auto-insert exact related-note links in write-enabled modes</span>
+      </label>
+    </div>
+
+    <div class="preview-actions">
+      <button
+        class="btn btn-secondary"
+        :disabled="isScanning || !vaultPath"
+        @click="scanPreview"
+      >
+        {{ isScanning ? 'Scanning...' : 'Scan & Preview' }}
+      </button>
+      <button
+        class="btn btn-primary"
+        :disabled="isApplying || !preview"
+        @click="applyMigration"
+      >
+        {{ isApplying ? 'Applying...' : 'Apply Migration' }}
+      </button>
+      <button
+        v-if="status?.rollback_available && status?.run_id"
+        class="btn btn-ghost"
+        :disabled="isRollingBack"
+        @click="rollbackRun"
+      >
+        {{ isRollingBack ? 'Rolling Back...' : 'Rollback Last Run' }}
+      </button>
+    </div>
+
+    <div
+      v-if="preview"
+      class="preview-card"
+    >
+      <div class="card-header">
+        <div>
+          <strong>Preview</strong>
+          <span class="subtle"> {{ preview.mode.replace('_', ' ') }}</span>
+        </div>
+        <span class="subtle">{{ preview.summary.total_scanned_notes }} notes scanned</span>
       </div>
 
-      <div class="modal-body">
-        <div class="config-grid">
-          <label class="field">
-            <span>Mode</span>
-            <select v-model="mode">
-              <option value="sidecar_first">Sidecar First</option>
-              <option value="hybrid">Hybrid</option>
-              <option value="full_rewrite">Full Rewrite</option>
-            </select>
-          </label>
-
-          <label class="field">
-            <span>Hub Folder</span>
-            <input
-              v-model="hubFolder"
-              type="text"
-              placeholder="_grafyn/hubs"
-            >
-          </label>
-
-          <label class="field">
-            <span>Program File</span>
-            <input
-              v-model="programPath"
-              type="text"
-              placeholder="_grafyn/program.md"
-            >
-          </label>
-        </div>
-
-        <div class="checkbox-grid">
-          <label class="checkbox-row">
-            <input
-              v-model="startOptimizer"
-              type="checkbox"
-            >
-            <span>Start the background vault optimizer after migration</span>
-          </label>
-          <label class="checkbox-row">
-            <input
-              v-model="enableLlm"
-              type="checkbox"
-              :disabled="!startOptimizer"
-            >
-            <span>Allow optimizer LLM refinement when budget is enabled</span>
-          </label>
-          <label class="checkbox-row">
-            <input
-              v-model="autoInsertLinks"
-              type="checkbox"
-              :disabled="mode === 'sidecar_first'"
-            >
-            <span>Auto-insert exact related-note links in write-enabled modes</span>
-          </label>
-        </div>
-
-        <div class="preview-actions">
-          <button
-            class="btn btn-secondary"
-            :disabled="isScanning || !vaultPath"
-            @click="scanPreview"
-          >
-            {{ isScanning ? 'Scanning...' : 'Scan & Preview' }}
-          </button>
-          <button
-            class="btn btn-primary"
-            :disabled="isApplying || !preview"
-            @click="applyMigration"
-          >
-            {{ isApplying ? 'Applying...' : 'Apply Migration' }}
-          </button>
-          <button
-            v-if="status?.rollback_available && status?.run_id"
-            class="btn btn-ghost"
-            :disabled="isRollingBack"
-            @click="rollbackRun"
-          >
-            {{ isRollingBack ? 'Rolling Back...' : 'Rollback Last Run' }}
-          </button>
-        </div>
-
+      <div class="stats-grid">
         <div
-          v-if="preview"
-          class="preview-card"
+          v-for="item in previewItems"
+          :key="item.label"
+          class="stat-card"
         >
-          <div class="card-header">
-            <div>
-              <strong>Preview</strong>
-              <span class="subtle"> {{ preview.mode.replace('_', ' ') }}</span>
-            </div>
-            <span class="subtle">{{ preview.summary.total_scanned_notes }} notes scanned</span>
-          </div>
+          <span class="stat-value">{{ item.value }}</span>
+          <span class="stat-label">{{ item.label }}</span>
+        </div>
+      </div>
 
-          <div class="stats-grid">
-            <div
-              v-for="item in previewItems"
-              :key="item.label"
-              class="stat-card"
+      <div class="preview-lists">
+        <div class="list-card">
+          <div class="list-title">
+            Topic Hubs
+          </div>
+          <div
+            v-if="preview.topic_candidates.length === 0"
+            class="subtle"
+          >
+            No topic-hub candidates found yet.
+          </div>
+          <ul v-else>
+            <li
+              v-for="topic in preview.topic_candidates.slice(0, 8)"
+              :key="topic.topic_key"
             >
-              <span class="stat-value">{{ item.value }}</span>
-              <span class="stat-label">{{ item.label }}</span>
-            </div>
-          </div>
-
-          <div class="preview-lists">
-            <div class="list-card">
-              <div class="list-title">
-                Topic Hubs
-              </div>
-              <div
-                v-if="preview.topic_candidates.length === 0"
-                class="subtle"
-              >
-                No topic-hub candidates found yet.
-              </div>
-              <ul v-else>
-                <li
-                  v-for="topic in preview.topic_candidates.slice(0, 8)"
-                  :key="topic.topic_key"
-                >
-                  {{ topic.display_name }}
-                  <span class="subtle">
-                    {{ topic.reuse_existing_hub_id ? 'reuse existing hub' : `${topic.member_note_ids.length} member notes` }}
-                  </span>
-                </li>
-              </ul>
-            </div>
-
-            <div class="list-card">
-              <div class="list-title">
-                Write Candidates
-              </div>
-              <div
-                v-if="writeCandidates.length === 0"
-                class="subtle"
-              >
-                This run is metadata-only unless you enable a write mode.
-              </div>
-              <ul v-else>
-                <li
-                  v-for="proposal in writeCandidates.slice(0, 8)"
-                  :key="proposal.note_id"
-                >
-                  {{ proposal.title }}
-                  <span class="subtle">confidence {{ proposal.confidence.toFixed(2) }}</span>
-                </li>
-              </ul>
-            </div>
-          </div>
+              {{ topic.display_name }}
+              <span class="subtle">
+                {{ topic.reuse_existing_hub_id ? 'reuse existing hub' : `${topic.member_note_ids.length} member notes` }}
+              </span>
+            </li>
+          </ul>
         </div>
 
-        <div
-          v-if="status && !preview"
-          class="status-card subtle"
-        >
-          Latest run: {{ status.status || 'idle' }}
-          <span v-if="status.summary"> · {{ status.summary.total_scanned_notes }} scanned</span>
+        <div class="list-card">
+          <div class="list-title">
+            Write Candidates
+          </div>
+          <div
+            v-if="writeCandidates.length === 0"
+            class="subtle"
+          >
+            This run is metadata-only unless you enable a write mode.
+          </div>
+          <ul v-else>
+            <li
+              v-for="proposal in writeCandidates.slice(0, 8)"
+              :key="proposal.note_id"
+            >
+              {{ proposal.title }}
+              <span class="subtle">confidence {{ proposal.confidence.toFixed(2) }}</span>
+            </li>
+          </ul>
         </div>
       </div>
     </div>
-  </div>
+
+    <div
+      v-if="status && !preview"
+      class="status-card subtle"
+    >
+      Latest run: {{ status.status || 'idle' }}
+      <span v-if="status.summary"> · {{ status.summary.total_scanned_notes }} scanned</span>
+    </div>
+  </BaseModal>
 </template>
 
 <script setup>
 import { computed, ref, watch } from 'vue'
+import BaseModal from '@/components/BaseModal.vue'
 import { migration as migrationApi } from '@/api/client'
 import { useToast } from '@/composables/useToast'
 
@@ -315,12 +314,24 @@ async function rollbackRun() {
 </script>
 
 <style scoped>
-.migration-modal {
-  width: min(960px, calc(100vw - 2rem));
+/* Animation overrides — BaseModal provides the overlay/modal structure */
+:deep(.base-modal) {
   max-height: 88vh;
-  overflow: hidden;
-  display: flex;
-  flex-direction: column;
+}
+
+.close-btn {
+  background: none;
+  border: none;
+  font-size: 1.5rem;
+  cursor: pointer;
+  color: var(--text-secondary, #666);
+  padding: 0;
+  line-height: 1;
+  flex-shrink: 0;
+}
+
+.close-btn:hover {
+  color: var(--text-primary, #1a1a1a);
 }
 
 .subtle {
@@ -421,6 +432,50 @@ async function rollbackRun() {
 .list-card ul {
   margin: 0;
   padding-left: 1rem;
+}
+
+.btn {
+  padding: 0.5rem 1rem;
+  border-radius: var(--radius-sm);
+  font-size: 0.9rem;
+  font-weight: 500;
+  cursor: pointer;
+  border: none;
+  transition: all 0.15s;
+}
+
+.btn-primary {
+  background: var(--accent-primary, #7c3aed);
+  color: white;
+}
+
+.btn-primary:hover:not(:disabled) {
+  filter: brightness(1.1);
+}
+
+.btn-secondary {
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+  border: 1px solid var(--border-color);
+}
+
+.btn-secondary:hover:not(:disabled) {
+  background: var(--bg-hover);
+}
+
+.btn-ghost {
+  background: transparent;
+  color: var(--text-secondary);
+  border: 1px solid var(--border-color);
+}
+
+.btn-ghost:hover:not(:disabled) {
+  background: var(--bg-hover);
+}
+
+.btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 
 @media (max-width: 720px) {
