@@ -1,3 +1,4 @@
+use crate::commands::run_retrieval;
 use crate::services::retrieval::{RetrievalConfig, RetrievalConfigUpdate, RetrievalResult};
 use crate::AppState;
 use tauri::State;
@@ -12,13 +13,7 @@ pub async fn retrieve_relevant(
 ) -> Result<Vec<RetrievalResult>, String> {
     let limit = limit.unwrap_or(10);
     let context_ids = context_note_ids.unwrap_or_default();
-
-    let search = state.search_service.read().await;
-    let graph = state.graph_index.read().await;
-    let priority = state.priority_service.read().await;
-    let retrieval = state.retrieval_service.read().await;
-
-    retrieval.retrieve(&search, &graph, &priority, &query, limit, &context_ids)
+    run_retrieval(state.inner(), &query, limit, &context_ids).await
 }
 
 /// Get current retrieval configuration

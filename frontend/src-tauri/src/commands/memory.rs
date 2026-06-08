@@ -1,3 +1,4 @@
+use crate::commands::run_retrieval;
 use crate::models::memory::{
     Contradiction, ExtractRequest, ExtractedClaim, RecallRequest, RecallResult,
 };
@@ -10,21 +11,10 @@ pub async fn recall_relevant(
     request: RecallRequest,
     state: State<'_, AppState>,
 ) -> Result<Vec<RecallResult>, String> {
-    let search = state.search_service.read().await;
-    let graph = state.graph_index.read().await;
-    let priority = state.priority_service.read().await;
-    let retrieval = state.retrieval_service.read().await;
+    let results =
+        run_retrieval(state.inner(), &request.query, request.limit, &request.context_note_ids)
+            .await?;
 
-    let results = retrieval.retrieve(
-        &search,
-        &graph,
-        &priority,
-        &request.query,
-        request.limit,
-        &request.context_note_ids,
-    )?;
-
-    // Convert RetrievalResult → RecallResult
     Ok(results
         .into_iter()
         .map(|r| RecallResult {
@@ -33,7 +23,7 @@ pub async fn recall_relevant(
             snippet: r.snippet,
             score: r.score,
             tags: r.note.tags,
-            graph_boost: 0.0, // now integrated into the composite score
+            graph_boost: 0.0,
             total_score: r.score,
         })
         .collect())

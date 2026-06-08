@@ -1,4 +1,4 @@
-use crate::commands::sync_chunk_index_for_note;
+use crate::commands::{run_retrieval, sync_chunk_index_for_note};
 use crate::models::canvas::{
     AddModelsRequest, AvailableModel, CanvasSession, CanvasStreamEvent, CanvasViewport,
     ContextMode, Debate, DebateContinueRequest, DebateResponse, DebateRound, DebateStartRequest,
@@ -2269,15 +2269,10 @@ async fn resolve_prompt_context(
         let pinned_ids = session.pinned_note_ids.clone();
 
         // Quality gate: note-level retrieval to check if vault has relevant content
-        let retrieval_results = {
-            let search = state.search_service.read().await;
-            let graph = state.graph_index.read().await;
-            let priority = state.priority_service.read().await;
-            let retrieval = state.retrieval_service.read().await;
-            retrieval
-                .retrieve(&search, &graph, &priority, &request.prompt, 5, &pinned_ids)
-                .unwrap_or_default()
-        };
+        let retrieval_results =
+            run_retrieval(state, &request.prompt, 5, &pinned_ids)
+                .await
+                .unwrap_or_default();
 
         let retrieval_decision = should_use_retrieved_notes(&request.prompt, &retrieval_results);
         if retrieval_decision != RetrievalDecisionReason::UseRetrievedNotes {
@@ -2413,15 +2408,10 @@ async fn resolve_twin_prompt_context(
     request: &PromptRequest,
 ) -> Result<ResolvedPromptContext, String> {
     let pinned_ids = session.pinned_note_ids.clone();
-    let retrieval_results = {
-        let search = state.search_service.read().await;
-        let graph = state.graph_index.read().await;
-        let priority = state.priority_service.read().await;
-        let retrieval = state.retrieval_service.read().await;
-        retrieval
-            .retrieve(&search, &graph, &priority, &request.prompt, 5, &pinned_ids)
-            .unwrap_or_default()
-    };
+    let retrieval_results =
+        run_retrieval(state, &request.prompt, 5, &pinned_ids)
+            .await
+            .unwrap_or_default();
 
     let should_use_notes = should_use_retrieved_notes(&request.prompt, &retrieval_results)
         == RetrievalDecisionReason::UseRetrievedNotes;
