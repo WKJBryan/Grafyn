@@ -2,9 +2,9 @@
 
 ## Summary
 
-Grafyn's first native twin is a Canvas context mode, not a newly trained model. It combines the existing vault retrieval pipeline with reviewed twin records so a selected model can answer with the user's notes, preferences, reasoning patterns, and explicit negative boundaries in view.
+Grafyn's first native twin is a Canvas context mode, not a newly trained model. It combines a configured Twin Identity, the existing vault retrieval pipeline, reviewed Constitution items, and reviewed twin records so a selected model can answer with the user's notes, preferences, reasoning patterns, and explicit negative boundaries in view.
 
-This milestone ships the usable RAG twin path. It does not add personality tests, a local model runtime, or scratch training.
+This milestone ships the usable RAG twin path with first-person Simulation. It does not add personality tests, a local model runtime, or scratch training.
 
 ## Current Capture Layer
 
@@ -24,6 +24,8 @@ Twin Mode lives inside Canvas as `context_mode: "twin"` and reuses the existing 
 
 Context assembly:
 
+- Require Twin Identity name and role/context before Simulation mode can run.
+- Inject Twin Identity before Constitution so the model has a first-person operating identity before it receives priors and evidence.
 - Retrieve relevant vault notes/chunks through Grafyn's existing retrieval service.
 - Include approved twin records: `endorsed` and `auto_promoted`.
 - Include candidate records only when locally relevant to the prompt.
@@ -32,10 +34,13 @@ Context assembly:
 
 The model receives a system prompt with separated sections:
 
-- `Relevant Vault Notes`
+- `Twin Identity`
+- `Reviewed Constitution`
+- `Action Gap Risks`
+- `Relevant Evidence`
 - `Approved User Records`
 - `Tentative Candidate Records`
-- `Instructions`
+- `Answer Instructions`
 
 Candidate records are labeled as unreviewed hypotheses and must not be treated as facts.
 
@@ -44,14 +49,17 @@ Candidate records are labeled as unreviewed hypotheses and must not be treated a
 Twin Mode supports two answer modes:
 
 - `advisor`: decision-support mode. It uses reviewed memory to help the user reason, while separating grounded evidence from recommendation.
-- `simulation`: likely-user-style reflection. It is explicitly labeled as simulation and must not claim to be the user's actual view.
+- `simulation`: first-person configured twin voice. It says `I am {twin_name}`, reasons from the configured role/context, and continues the documented reasoning pattern using selected evidence and reviewed Constitution.
 
-Advisor is the default because it is more honest for decision support.
+Advisor stays a decision-support assistant. Simulation maximizes mimicry in the model-facing prompt; the app UI and docs disclose that it is a configured twin simulation.
 
 ## UI and Review
 
-Canvas shows the context used for each Twin Mode prompt:
+Twin Mode prompt context includes:
 
+- Twin Identity
+- reviewed Constitution
+- action gaps
 - notes
 - approved twin records
 - tentative candidate twin records
@@ -87,4 +95,4 @@ More realistic later components:
 - a decision-pattern classifier
 - a small adapter on top of a general base model
 
-The v1 twin should therefore be native RAG plus reviewed behavioral records. Scratch-trained personal models remain a research path after the data contract and decision/outcome records are stable.
+The v1 twin should therefore be Twin Identity plus native RAG and reviewed behavioral records. Scratch-trained personal models remain a research path after the data contract and decision/outcome records are stable.

@@ -1,0 +1,72 @@
+<h2>Where should model choice and thinking visibility live?</h2>
+<p class="subtitle">This compares three UI shapes for Decision Mirror / Twin prompts. Click the one that feels closest.</p>
+
+<div class="cards">
+  <div class="card" data-choice="a" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <div class="mockup">
+        <div class="mockup-header">A. One Prompt Dialog</div>
+        <div class="mockup-body">
+          <div class="label">Decision</div>
+          <div class="mock-input">Should I choose X, Y, or something else?</div>
+          <div class="label">Options</div>
+          <div class="placeholder" style="height:52px">A / B / C entered by user</div>
+          <div class="label">Models</div>
+          <div class="placeholder" style="height:64px">Same multi-model dropdown as + Add Models</div>
+          <div class="label">Thinking</div>
+          <div class="placeholder" style="height:40px">Effort slider + “show reasoning summary” toggle</div>
+        </div>
+      </div>
+    </div>
+    <div class="card-body">
+      <h3>Put everything before Run</h3>
+      <p>Best for explicit control. The user chooses all models up front, including local models, then all responses run together.</p>
+    </div>
+  </div>
+
+  <div class="card" data-choice="b" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <div class="mockup">
+        <div class="mockup-header">B. Lean Prompt, Rich Response Cards</div>
+        <div class="mockup-body">
+          <div class="label">Prompt Dialog</div>
+          <div class="placeholder" style="height:54px">Question + options + compact model preset row</div>
+          <div class="label">Response Node</div>
+          <div class="placeholder" style="height:44px">Answer</div>
+          <div class="placeholder" style="height:40px">Why this option / assumptions / uncertainty</div>
+          <div class="placeholder" style="height:34px">Thinking used: High · Sources: 4 · Outside-options considered: Yes</div>
+        </div>
+      </div>
+    </div>
+    <div class="card-body">
+      <h3>Show reasoning after the answer</h3>
+      <p>Best for readability. The dialog stays manageable; each model card exposes a structured reasoning summary and option coverage.</p>
+    </div>
+  </div>
+
+  <div class="card" data-choice="c" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <div class="mockup">
+        <div class="mockup-header">C. Separate Compare Drawer</div>
+        <div class="mockup-body">
+          <div class="label">Prompt Tile</div>
+          <div class="placeholder" style="height:48px">Decision + selected options</div>
+          <div class="label">Compare Drawer</div>
+          <div class="placeholder" style="height:40px">Model dropdown / presets / local models</div>
+          <div class="placeholder" style="height:40px">Reasoning effort per run</div>
+          <div class="placeholder" style="height:46px">Run same prompt on additional models</div>
+        </div>
+      </div>
+    </div>
+    <div class="card-body">
+      <h3>Keep comparison as an add-on workflow</h3>
+      <p>Best for less clutter. Start with one configured model, then use the drawer to add simultaneous comparisons and reasoning visibility.</p>
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <h3>Current diagnosis from the code</h3>
+  <p>The options field is currently treated as decision metadata and copied into the prompt. It asks the model to compare those options, but it does not explicitly ask for “outside option / none of these / reframed option.” That is why the answers tend not to jump outside the list.</p>
+  <p>The “Thinking level” control already exists, but it sends only an OpenRouter reasoning effort setting. The backend stream parser currently keeps normal answer content only, so there is no separate visible thinking or reasoning-summary surface in the response node.</p>
+</div>

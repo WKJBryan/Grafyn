@@ -1251,6 +1251,9 @@ impl TwinStore {
         &mut self,
         mut setup: ConstitutionSetup,
     ) -> Result<ConstitutionSetup> {
+        setup.twin_name = clean_optional_setup_entry(setup.twin_name);
+        setup.twin_role = clean_optional_setup_entry(setup.twin_role);
+        setup.source_boundaries = clean_setup_entries(setup.source_boundaries);
         setup.values = clean_setup_entries(setup.values);
         setup.tastes = clean_setup_entries(setup.tastes);
         setup.constraints = clean_setup_entries(setup.constraints);
@@ -1263,6 +1266,9 @@ impl TwinStore {
             "constitution-setup",
             TraceEventType::ConstitutionSetupSaved,
             json!({
+                "twin_name": setup.twin_name,
+                "twin_role": setup.twin_role,
+                "source_boundaries": setup.source_boundaries,
                 "values": setup.values,
                 "tastes": setup.tastes,
                 "constraints": setup.constraints,
@@ -1577,6 +1583,14 @@ impl TwinStore {
     }
 
     fn write_auto_constitution_setup(&self, mut setup: ConstitutionSetup) -> Result<()> {
+        if let Ok(existing) = self.get_constitution_setup() {
+            setup.twin_name = existing.twin_name;
+            setup.twin_role = existing.twin_role;
+            setup.source_boundaries = existing.source_boundaries;
+        }
+        setup.twin_name = clean_optional_setup_entry(setup.twin_name);
+        setup.twin_role = clean_optional_setup_entry(setup.twin_role);
+        setup.source_boundaries = clean_setup_entries(setup.source_boundaries);
         setup.values = clean_setup_entries(setup.values);
         setup.tastes = clean_setup_entries(setup.tastes);
         setup.constraints = clean_setup_entries(setup.constraints);
@@ -2337,6 +2351,12 @@ fn clean_setup_entries(entries: Vec<String>) -> Vec<String> {
         .filter(|entry| !entry.is_empty())
         .filter(|entry| seen.insert(entry.to_lowercase()))
         .collect()
+}
+
+fn clean_optional_setup_entry(entry: Option<String>) -> Option<String> {
+    entry
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 fn clamp_decision_mirror_weights(mut weights: DecisionMirrorWeights) -> DecisionMirrorWeights {
@@ -4745,6 +4765,97 @@ mod tests {
             .action_tendencies
             .iter()
             .any(|entry| entry.contains("follow-up questions")));
+    }
+
+    #[test]
+    fn constitution_setup_accepts_legacy_json_without_identity() {
+        let setup: ConstitutionSetup = serde_json::from_str(
+            r#"{
+                "values": ["evidence-backed work"],
+                "tastes": ["clean UX"],
+                "constraints": [],
+                "somatic_cues": [],
+                "action_tendencies": []
+            }"#,
+        )
+        .expect("legacy setup should parse");
+
+        assert_eq!(setup.twin_name, None);
+        assert_eq!(setup.twin_role, None);
+        assert!(setup.source_boundaries.is_empty());
+        assert_eq!(setup.values, vec!["evidence-backed work"]);
+    }
+
+    #[test]
+    fn save_constitution_setup_trims_identity_fields() {
+        let temp_dir = tempdir().expect("temp dir should be created");
+        let mut store = TwinStore::new(temp_dir.path().to_path_buf());
+
+        let saved = store
+            .save_constitution_setup(ConstitutionSetup {
+                twin_name: Some("  Alex Chen  ".to_string()),
+                twin_role: Some("  founder deciding from product evidence  ".to_string()),
+                source_boundaries: vec![
+                    "  Use reviewed notes only.  ".to_string(),
+                    "".to_string(),
+                    " Uploaded interviews define domain context. ".to_string(),
+                ],
+                values: vec![" evidence-backed work ".to_string()],
+                ..ConstitutionSetup::default()
+            })
+            .expect("setup should save");
+
+        assert_eq!(saved.twin_name.as_deref(), Some("Alex Chen"));
+        assert_eq!(
+            saved.twin_role.as_deref(),
+            Some("founder deciding from product evidence")
+        );
+        assert_eq!(
+            saved.source_boundaries,
+            vec![
+                "Use reviewed notes only.".to_string(),
+                "Uploaded interviews define domain context.".to_string()
+            ]
+        );
+        assert_eq!(saved.values, vec!["evidence-backed work"]);
+    }
+
+    #[test]
+    fn constitution_inference_preserves_configured_identity() {
+        let temp_dir = tempdir().expect("temp dir should be created");
+        let mut store = TwinStore::new(temp_dir.path().to_path_buf());
+        store
+            .save_constitution_setup(ConstitutionSetup {
+                twin_name: Some("Alex Chen".to_string()),
+                twin_role: Some("founder deciding from product evidence".to_string()),
+                source_boundaries: vec!["Use reviewed notes only.".to_string()],
+                values: vec!["evidence-backed work".to_string()],
+                ..ConstitutionSetup::default()
+            })
+            .expect("identity setup should save");
+
+        let notes = vec![test_note(
+            "interview-setup",
+            "Interview: strategy",
+            "### Message 1: User\n\nCan you walk us through a concrete example and how you balance innovation and stability?",
+            Some("interview"),
+        )];
+        store
+            .run_constitution_inference_with_notes(&notes)
+            .expect("constitution inference should run");
+        let setup = store
+            .get_constitution_setup()
+            .expect("setup should load after inference");
+
+        assert_eq!(setup.twin_name.as_deref(), Some("Alex Chen"));
+        assert_eq!(
+            setup.twin_role.as_deref(),
+            Some("founder deciding from product evidence")
+        );
+        assert_eq!(
+            setup.source_boundaries,
+            vec!["Use reviewed notes only.".to_string()]
+        );
     }
 
     #[test]

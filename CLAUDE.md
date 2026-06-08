@@ -74,7 +74,7 @@ Grafyn is a **desktop-only** app — a single Tauri binary with a Vue frontend a
 └────────────────────────────────────────────────┘
 ```
 
-### Tauri IPC Commands (65 total across 13 modules)
+### Tauri IPC Commands
 
 | Module | Commands | Purpose |
 |--------|----------|---------|
@@ -91,6 +91,7 @@ Grafyn is a **desktop-only** app — a single Tauri binary with a Vue frontend a
 | `commands/retrieval.rs` | `retrieve_relevant`, `get_retrieval_config`, `update_retrieval_config` | Temporal + graph-aware retrieval pipeline |
 | `commands/zettelkasten.rs` | `discover_links`, `apply_links`, `create_link`, `get_link_types` | Zettelkasten link discovery |
 | `commands/import.rs` | `preview_import`, `apply_import`, `get_supported_formats` | Conversation import (ChatGPT, Claude, Grok, Gemini) |
+| `commands/twin.rs` | user records, review, Decision Mirror, Constitution, action gaps, setup, export | Twin evidence store, Twin Workspace, and first-person Simulation setup |
 
 ### Frontend API Client
 
@@ -105,7 +106,7 @@ import { notes, search, graph, canvas, settings, mcp, memory,
 
 **Pinia Stores:** `notes.js`, `canvas.js`, `theme.js`, `boot.js`
 
-**Frontend Routes:** `/` (notes), `/canvas`, `/canvas/:id`, `/import`
+**Frontend Routes:** `/` (notes), `/canvas`, `/canvas/:id`, `/import`, `/twin`
 
 ## Key Concepts
 
@@ -172,6 +173,27 @@ Compare responses from multiple LLM models simultaneously via OpenRouter. Featur
 **Streaming architecture:** Commands return immediately, spawn async tasks, stream via `canvas-stream` Tauri events (`TileCreated`, `ContextNotes`, `Chunk`, `Complete`, `Error`, `SessionSaved`, debate variants). Frontend listens via `@tauri-apps/api/event`.
 
 Streaming commands: `send_prompt`, `start_debate`, `continue_debate`, `add_models_to_tile`, `regenerate_response`
+
+### Twin Identity, Constitution, And Decision Mirror
+
+Twin context mode is a native RAG path, not model-weight training. `frontend/src-tauri/src/commands/canvas.rs` assembles the model-facing prompt through `build_twin_context_prompt()`.
+
+The prompt order is:
+
+1. Twin Operating Contract
+2. Twin Identity
+3. Reviewed Constitution
+4. Action Gap Risks
+5. Relevant Evidence
+6. Approved User Records
+7. Tentative Candidate Records
+8. Answer Instructions
+
+Twin Identity lives in `ConstitutionSetup` and is persisted in `constitution_setup.json` with `twin_name`, `twin_role`, and optional `source_boundaries`. Name and role/context are required before `TwinAnswerMode::Simulation` can run. The backend enforces this in the twin context resolution path so direct IPC calls cannot bypass the setup gate.
+
+Simulation mode uses first-person model-facing instructions such as `I am {twin_name}` and is tuned for mimicry from supplied Knowledge materials, reviewed Constitution, selected evidence, and reviewed twin records. Disclosure that this is a configured twin simulation belongs in the app UI and docs, not inside the Simulation system prompt. Advisor mode remains a decision-support assistant and may use Twin Identity as role/context without speaking as the twin.
+
+Twin Workspace (`/twin`) owns review and setup: user records, memory digest, Constitution items, action gaps, decision episodes/outcomes, Decision Mirror config, and guided setup. `Save Setup` writes guided setup Constitution items for operating priors; the identity fields are setup metadata and should not become normal Constitution items.
 
 **Web search:** When `web_search: true`, OpenRouter's `plugins: [{"id": "web", "max_results": 5}]` is added to the API request (~$0.02/query per model). The `web_search` flag is threaded through the full stack and persisted on `PromptTile` for regenerate/add-model replay.
 

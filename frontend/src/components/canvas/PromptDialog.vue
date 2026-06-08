@@ -261,6 +261,12 @@
           <span class="context-mode-hint">
             {{ twinModeHints[twinAnswerMode] }}
           </span>
+          <span
+            v-if="requiresTwinIdentity && !hasTwinIdentity"
+            class="context-mode-hint identity-warning"
+          >
+            Set up Twin Identity with a name and role before running Simulation.
+          </span>
           <span class="context-mode-hint">
             Selected vault notes and twin records use the Twin Runtime selected below.
           </span>
@@ -390,6 +396,10 @@ const props = defineProps({
   ollamaModel: {
     type: String,
     default: ''
+  },
+  twinIdentity: {
+    type: Object,
+    default: () => ({ name: '', role: '' })
   }
 })
 
@@ -416,6 +426,12 @@ const searchDetection = computed(() => detectWebSearch(prompt.value))
 const isTwinSensitivePrompt = computed(() => promptType.value === 'decision' || contextMode.value !== 'none')
 const usingLocalTwinRuntime = computed(() => isTwinSensitivePrompt.value && selectedTwinProvider.value === 'ollama')
 const configuredOllamaModel = computed(() => props.ollamaModel.trim())
+const hasTwinIdentity = computed(() =>
+  Boolean(props.twinIdentity?.name?.trim() && props.twinIdentity?.role?.trim())
+)
+const requiresTwinIdentity = computed(() =>
+  contextMode.value === 'twin' && twinAnswerMode.value === 'simulation'
+)
 const resolvedWebSearch = computed(() => (
   !usingLocalTwinRuntime.value &&
   props.openRouterConfigured &&
@@ -469,7 +485,7 @@ const contextModeHints = {
 
 const twinModeHints = {
   advisor: 'Structured Reflection Card for decision support, evidence review, and debugging.',
-  simulation: 'Natural twin-style reflection with light grounding, not the user actual view.'
+  simulation: 'First-person configured twin simulation grounded in reviewed identity and evidence.'
 }
 
 const reasoningEffortOptions = [
@@ -484,6 +500,7 @@ const reasoningEffortOptions = [
 // Computed
 const canSubmit = computed(() => {
   if (!prompt.value.trim()) return false
+  if (requiresTwinIdentity.value && !hasTwinIdentity.value) return false
   if (isTwinSensitivePrompt.value && !usingLocalTwinRuntime.value) {
     return props.openRouterConfigured && selectedModels.value.length > 0
   }
@@ -885,6 +902,10 @@ function handleSubmit() {
   margin-top: var(--spacing-xs);
   font-size: 0.75rem;
   color: var(--text-muted);
+}
+
+.identity-warning {
+  color: var(--accent-red);
 }
 
 .segmented-control,

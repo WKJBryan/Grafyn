@@ -25,7 +25,7 @@
   <a href="#developer-guidelines">Guidelines</a>
 </p>
 
-> **Early development** - expect rough edges. Grafyn is currently focused on local evidence capture, knowledge organization, and the first native RAG twin workflow. It is not yet a scratch-trained personal model.
+> **Early development** - expect rough edges. Grafyn is currently focused on local evidence capture, knowledge organization, Twin Identity setup, and the first native RAG twin workflow. It is not yet a scratch-trained personal model.
 
 ---
 
@@ -33,14 +33,14 @@
 
 Grafyn is a desktop-only app for building a local knowledge vault and using it inside a multi-model Canvas. The long-term goal is to become the capture layer for a personal digital twin pipeline: users work inside Grafyn, Grafyn records explicit and passive evidence about their knowledge and reasoning patterns, and later twin systems can use that evidence.
 
-The current app is not claiming to be "you." It captures evidence about you.
+The current app builds an evidence-grounded twin prompt from your configured **Twin Identity**, reviewed Constitution, notes, and user records. Simulation mode is intentionally first-person so the selected model can mimic the configured person's documented reasoning pattern more closely.
 
 The first usable twin mode is a **native RAG twin**:
 
 1. Retrieve relevant notes from your vault.
 2. Retrieve reviewed user records about your thinking and preferences.
 3. Assemble that context into Canvas prompts.
-4. Let the chosen model answer in either advisor mode or explicitly labeled simulation mode.
+4. Let the chosen model answer in either advisor mode or first-person Simulation mode.
 5. Feed your accept/reject/correct/rank feedback back into the evidence loop.
 
 ## Core Features
@@ -87,11 +87,19 @@ The first usable twin mode is a **native RAG twin**:
 Canvas supports a `Twin` context mode with two answer modes:
 
 - **Advisor** - decision-support assistant using your reviewed notes and user records.
-- **Simulation** - explicitly labeled likely-user-style simulation. It is not represented as the actual user.
+- **Simulation** - first-person configured twin voice grounded in Twin Identity, reviewed Constitution, notes, and user records.
+
+Twin Simulation requires a **Twin Identity** in Twin Workspace setup:
+
+- `Name` - who the twin speaks as.
+- `Role / context` - the role or decision context the twin reasons from.
+- `Source boundaries` - optional guidance for which materials define the twin.
 
 Twin context uses:
 
+- Configured Twin Identity.
 - Relevant vault notes and chunks.
+- Reviewed Constitution items: values, taste, constraints, somatic cues, and action tendencies.
 - Approved user records: `endorsed` and `auto_promoted`.
 - Relevant candidate records only when they match the prompt, disclosed separately as tentative.
 
@@ -136,6 +144,8 @@ Grafyn stores what happened and infers specific records such as:
 
 These records are linked to evidence. They are not broad personality labels.
 
+Twin Identity is setup metadata, not an inferred personality label. It defines who the Simulation speaks as; the Constitution defines the operating priors used to reason in that voice.
+
 ### Export Contract
 
 Twin exports separate reviewed records into different JSONL files:
@@ -150,7 +160,7 @@ The export manifest includes matching counts and paths.
 
 Grafyn's data can later support stronger personal models, but those are not v1:
 
-- **RAG twin** - implemented first; no model weights change.
+- **RAG twin with Twin Identity** - implemented first; no model weights change.
 - **Preference/ranking model** - learns what answer shape or decision style you choose.
 - **Local adapters or fine-tuning** - adjusts a capable base model using reviewed examples.
 - **Scratch-trained personal model** - research path only. Prompts alone are not enough; it would require large volumes of personal writing, decisions, outcomes, corrections, and domain evidence.
@@ -264,7 +274,7 @@ Tauri Desktop App
 - Do not silently train on or use records marked `rejected`, `private`, or `no_train`.
 - Candidate records may influence live RAG answers only when relevant and must be disclosed as tentative.
 - Advisor mode is the default for decision support.
-- Simulation mode must be clearly labeled as simulation.
+- Simulation mode requires configured Twin Identity and uses first-person model-facing instructions; disclosure belongs in the app UI and docs, not inside the Simulation system prompt.
 - Scratch-trained personal models are future research, not current product behavior.
 
 ### Hub And Graph Rules

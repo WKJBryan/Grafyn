@@ -788,6 +788,12 @@ pub struct ConstitutionReviewRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ConstitutionSetup {
     #[serde(default)]
+    pub twin_name: Option<String>,
+    #[serde(default)]
+    pub twin_role: Option<String>,
+    #[serde(default)]
+    pub source_boundaries: Vec<String>,
+    #[serde(default)]
     pub values: Vec<String>,
     #[serde(default)]
     pub tastes: Vec<String>,

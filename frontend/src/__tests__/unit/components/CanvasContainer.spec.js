@@ -2,7 +2,7 @@ import { describe, expect, it, beforeEach, vi } from 'vitest'
 import { mount, flushPromises } from '@vue/test-utils'
 import CanvasContainer from '@/components/canvas/CanvasContainer.vue'
 
-const { store, getOpenRouterStatus, getStatus, getSettings, updateSettings, listOllamaModels, toastSuccess } = vi.hoisted(() => ({
+const { store, getOpenRouterStatus, getStatus, getSettings, updateSettings, listOllamaModels, getConstitutionSetup, toastSuccess } = vi.hoisted(() => ({
   store: {
     currentSession: {
       id: 'session-1',
@@ -57,6 +57,7 @@ const { store, getOpenRouterStatus, getStatus, getSettings, updateSettings, list
   getSettings: vi.fn(),
   updateSettings: vi.fn(),
   listOllamaModels: vi.fn(),
+  getConstitutionSetup: vi.fn(),
   toastSuccess: vi.fn()
 }))
 
@@ -71,6 +72,9 @@ vi.mock('@/api/client', () => ({
     getStatus,
     update: updateSettings,
     listOllamaModels
+  },
+  twin: {
+    getConstitutionSetup
   },
   isDesktopApp: () => true
 }))
@@ -153,7 +157,7 @@ function mountContainer() {
         AddModelDialog: { template: '<div />' },
         PinnedNotesPanel: { template: '<div />' },
         PromptDialog: {
-          props: ['models', 'presets', 'branchContext', 'smartWebSearch', 'openRouterConfigured', 'twinLlmProvider', 'ollamaModel'],
+          props: ['models', 'presets', 'branchContext', 'smartWebSearch', 'openRouterConfigured', 'twinLlmProvider', 'ollamaModel', 'twinIdentity'],
           template: `
             <div class="prompt-dialog-stub">
               <button class="submit-stub" @click="$emit('submit', {
@@ -272,6 +276,10 @@ describe('CanvasContainer', () => {
       { id: 'llama3.1:8b', name: 'llama3.1:8b', provider: 'Ollama' },
       { id: 'qwen3:14b', name: 'qwen3:14b', provider: 'Ollama' }
     ])
+    getConstitutionSetup.mockResolvedValue({
+      twin_name: 'Alex Chen',
+      twin_role: 'founder deciding from product evidence'
+    })
     toastSuccess.mockReset()
   })
 
