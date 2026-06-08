@@ -315,6 +315,7 @@
       :open-router-configured="hasApiKey"
       :twin-llm-provider="twinLlmProvider"
       :ollama-model="ollamaModel"
+      :twin-identity="twinIdentity"
       @submit="handlePromptSubmit"
       @cancel="closeBranchDialog"
       @create-preset="handleCreatePreset"
@@ -412,7 +413,7 @@ import { zoom as d3Zoom, zoomIdentity } from 'd3-zoom'
 
 import 'd3-transition'
 import { useCanvasStore } from '@/stores/canvas'
-import { settings as settingsApi, isDesktopApp } from '@/api/client'
+import { settings as settingsApi, twin as twinApi, isDesktopApp } from '@/api/client'
 import { useToast } from '@/composables/useToast'
 import PromptNode from './PromptNode.vue'
 import LLMNode from './LLMNode.vue'
@@ -459,6 +460,7 @@ const hasApiKey = ref(true)  // Assume true initially, check on mount
 const smartWebSearch = ref(true)  // Smart web search auto-detection (loaded from settings)
 const twinLlmProvider = ref('openrouter')
 const ollamaModel = ref('')
+const twinIdentity = ref({ name: '', role: '' })
 const canvasModelPresets = ref([])
 
 // D3 zoom
@@ -746,6 +748,11 @@ onMounted(async () => {
     } catch (e) {
       console.error('Failed to check OpenRouter status:', e)
       hasApiKey.value = false
+    }
+    try {
+      await refreshTwinIdentity()
+    } catch (e) {
+      console.error('Failed to load Twin Identity:', e)
     }
   }
 })
@@ -1206,6 +1213,14 @@ async function refreshOpenRouterStatus() {
   return hasApiKey.value
 }
 
+async function refreshTwinIdentity() {
+  const setup = await twinApi.getConstitutionSetup()
+  twinIdentity.value = {
+    name: setup?.twin_name || '',
+    role: setup?.twin_role || ''
+  }
+}
+
 async function loadCanvasPreferences() {
   try {
     const settingsData = await settingsApi.get()
@@ -1321,6 +1336,11 @@ async function handleNewPromptClick() {
       await refreshOpenRouterStatus()
     } catch (err) {
       console.error('Failed to refresh OpenRouter status:', err)
+    }
+    try {
+      await refreshTwinIdentity()
+    } catch (err) {
+      console.error('Failed to refresh Twin Identity:', err)
     }
   }
   showPromptDialog.value = true

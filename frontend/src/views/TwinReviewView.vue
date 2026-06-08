@@ -356,6 +356,38 @@
         v-else-if="activeTab === 'setup'"
         class="tab-panel setup-grid"
       >
+        <section class="identity-section">
+          <div>
+            <h2>Twin Identity</h2>
+            <span>Name and role are required before Twin Simulation can run.</span>
+          </div>
+          <label class="identity-field">
+            <span>Name</span>
+            <input
+              v-model="setupDraft.twin_name"
+              aria-label="Twin name"
+              type="text"
+              placeholder="Who is this twin?"
+            >
+          </label>
+          <label class="identity-field">
+            <span>Role / context</span>
+            <input
+              v-model="setupDraft.twin_role"
+              aria-label="Twin role"
+              type="text"
+              placeholder="What role should this twin reason from?"
+            >
+          </label>
+          <SetupField
+            v-model="setupDraft.source_boundaries"
+            title="Source Boundaries"
+          />
+        </section>
+        <div class="setup-section-heading">
+          <h2>Operating Priors</h2>
+          <span>Values, taste, constraints, somatic cues, and action tendencies.</span>
+        </div>
         <SetupField
           v-model="setupDraft.values"
           title="Values"
@@ -853,6 +885,9 @@ const exportingBenchmark = ref(false)
 const message = ref(null)
 const showTutorialIntro = ref(localStorage.getItem(tutorialStorageKey) !== 'true')
 const setupDraft = reactive({
+  twin_name: '',
+  twin_role: '',
+  source_boundaries: '',
   values: '',
   tastes: '',
   constraints: '',
@@ -1027,6 +1062,9 @@ async function saveSetup() {
   savingSetup.value = true
   try {
     await twin.saveConstitutionSetup({
+      twin_name: setupDraft.twin_name.trim(),
+      twin_role: setupDraft.twin_role.trim(),
+      source_boundaries: splitLines(setupDraft.source_boundaries),
       values: splitLines(setupDraft.values),
       tastes: splitLines(setupDraft.tastes),
       constraints: splitLines(setupDraft.constraints),
@@ -1097,6 +1135,9 @@ function dismissTutorial() {
 }
 
 function loadSetupDraft(setup) {
+  setupDraft.twin_name = setup?.twin_name || ''
+  setupDraft.twin_role = setup?.twin_role || ''
+  setupDraft.source_boundaries = (setup?.source_boundaries || []).join('\n')
   setupDraft.values = (setup?.values || []).join('\n')
   setupDraft.tastes = (setup?.tastes || []).join('\n')
   setupDraft.constraints = (setup?.constraints || []).join('\n')
@@ -1636,6 +1677,7 @@ function showMessage(type, text, duration = 3500) {
 
 .outcome-row input,
 .config-row select,
+.identity-field input,
 .setup-field textarea,
 .panel-header select {
   border: 1px solid var(--border-subtle);
@@ -1734,6 +1776,51 @@ function showMessage(type, text, duration = 3500) {
   background: var(--bg-secondary);
 }
 
+.identity-section,
+.setup-section-heading {
+  grid-column: 1 / -1;
+}
+
+.identity-section {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--spacing-md);
+}
+
+.identity-section > div {
+  grid-column: 1 / -1;
+}
+
+.identity-section h2,
+.setup-section-heading h2 {
+  margin: 0;
+}
+
+.identity-section span,
+.setup-section-heading span {
+  color: var(--text-secondary);
+}
+
+.identity-field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-xs);
+}
+
+.identity-field span {
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.identity-field input {
+  min-height: 36px;
+  padding: 4px 8px;
+}
+
+.identity-section .setup-field {
+  grid-column: 1 / -1;
+}
+
 .setup-field span {
   font-weight: 600;
 }
@@ -1787,6 +1874,7 @@ function showMessage(type, text, duration = 3500) {
 @media (max-width: 980px) {
   .workspace-header,
   .overview-grid,
+  .identity-section,
   .memory-grid,
   .setup-grid,
   .gap-columns {

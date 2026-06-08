@@ -6,6 +6,7 @@ function mountDialog(props = {}) {
   return mount(PromptDialog, {
     props: {
       models: [{ id: 'openai/gpt-4o', name: 'GPT-4o', context_length: 128000 }],
+      twinIdentity: { name: 'Alex Chen', role: 'founder deciding from product evidence' },
       ...props
     },
     global: {
@@ -114,6 +115,38 @@ describe('PromptDialog', () => {
 
     expect(wrapper.text()).toContain('Select an Ollama model in Settings')
     expect(wrapper.find('.btn-primary').attributes('disabled')).toBeDefined()
+  })
+
+  it('blocks Twin Simulation until identity name and role are configured', async () => {
+    const wrapper = mountDialog({
+      twinLlmProvider: 'ollama',
+      ollamaModel: 'llama3.1:8b',
+      twinIdentity: { name: '', role: '' }
+    })
+
+    await wrapper.find('#prompt').setValue('Simulate my likely response')
+    await wrapper.find('#contextMode').setValue('twin')
+
+    expect(wrapper.text()).toContain('Set up Twin Identity with a name and role before running Simulation')
+    expect(wrapper.find('.btn-primary').attributes('disabled')).toBeDefined()
+  })
+
+  it('allows Twin Simulation after identity name and role are configured', async () => {
+    const wrapper = mountDialog({
+      twinLlmProvider: 'ollama',
+      ollamaModel: 'llama3.1:8b',
+      twinIdentity: { name: 'Alex Chen', role: 'founder deciding from product evidence' }
+    })
+
+    await wrapper.find('.model-selector-stub').trigger('click')
+    await wrapper.find('#prompt').setValue('Simulate my likely response')
+    await wrapper.find('#contextMode').setValue('twin')
+    await wrapper.find('.btn-primary').trigger('click')
+
+    expect(wrapper.emitted('submit')[0][0]).toMatchObject({
+      contextMode: 'twin',
+      twinAnswerMode: 'simulation'
+    })
   })
 
   it('emits simulation mode when selected', async () => {

@@ -176,6 +176,9 @@ describe('TwinReviewView', () => {
       }
     ])
     api.getConstitutionSetup.mockResolvedValue({
+      twin_name: 'Alex Chen',
+      twin_role: 'founder deciding from product evidence',
+      source_boundaries: ['reviewed notes only'],
       values: ['evidence-backed work'],
       tastes: ['clean UX'],
       constraints: [],
@@ -327,11 +330,19 @@ describe('TwinReviewView', () => {
     await wrapper.findAll('.tab-button').find(button => button.text().includes('Setup')).trigger('click')
     await flushPromises()
     const textareas = wrapper.findAll('textarea')
-    await textareas[0].setValue('evidence-backed work\nfast feedback')
+    expect(wrapper.text()).toContain('Twin Identity')
+    expect(wrapper.html().indexOf('Twin Identity')).toBeLessThan(wrapper.html().indexOf('Operating Priors'))
+    await wrapper.find('input[aria-label="Twin name"]').setValue('Alex Chen')
+    await wrapper.find('input[aria-label="Twin role"]').setValue('founder deciding from product evidence')
+    await textareas[0].setValue('reviewed notes only\nuploaded interviews')
+    await textareas[1].setValue('evidence-backed work\nfast feedback')
     await wrapper.findAll('button').find(button => button.text() === 'Save Setup').trigger('click')
     await flushPromises()
 
     expect(api.saveConstitutionSetup).toHaveBeenCalledWith(expect.objectContaining({
+      twin_name: 'Alex Chen',
+      twin_role: 'founder deciding from product evidence',
+      source_boundaries: ['reviewed notes only', 'uploaded interviews'],
       values: ['evidence-backed work', 'fast feedback']
     }))
   })

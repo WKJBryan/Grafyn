@@ -9,7 +9,7 @@ use crate::models::canvas::{
 use crate::models::note::{ChunkResult, NoteCreate, NoteStatus};
 use crate::models::settings::UserSettings;
 use crate::models::twin::{
-    ActionGap, ConstitutionItem, DecisionEpisodeCreate, PrimitiveDecisionAssessment,
+    ActionGap, ConstitutionItem, ConstitutionSetup, DecisionEpisodeCreate, PrimitiveDecisionAssessment,
     ReflectionCardCreate, TraceEventType, TwinContextRecord,
 };
 use crate::services::openrouter::ChatMessage;
@@ -2497,18 +2497,23 @@ async fn resolve_twin_prompt_context(
 
     let constitution_query =
         decision_context_query(&request.prompt, request.decision_metadata.as_ref());
-    let (approved_twin_records, candidate_twin_records, constitution_items, action_gaps) = {
+    let (setup, approved_twin_records, candidate_twin_records, constitution_items, action_gaps) = {
         let mut twin_store = state.twin_store.write().await;
+        let setup = twin_store
+            .get_constitution_setup()
+            .map_err(|error| error.to_string())?;
+        validate_twin_identity_for_answer_mode(&setup, &request.twin_answer_mode)?;
         let (approved, candidate) = twin_store
             .select_context_records(&request.prompt)
             .map_err(|error| error.to_string())?;
         let (constitution_items, action_gaps) = twin_store
             .select_constitution_context(&constitution_query)
             .map_err(|error| error.to_string())?;
-        (approved, candidate, constitution_items, action_gaps)
+        (setup, approved, candidate, constitution_items, action_gaps)
     };
 
     let twin_prompt = build_twin_context_prompt(
+        &setup,
         &note_contexts,
         &approved_twin_records,
         &candidate_twin_records,
@@ -2820,6 +2825,7 @@ fn build_note_context_prompt(notes: &[(String, String, String)]) -> String {
 }
 
 fn build_twin_context_prompt(
+    setup: &ConstitutionSetup,
     notes: &[(String, String, String)],
     approved_records: &[TwinContextRecord],
     candidate_records: &[TwinContextRecord],
@@ -2832,11 +2838,13 @@ fn build_twin_context_prompt(
     let mut prompt = String::from(
         "## Twin Operating Contract\n\n\
          You are Grafyn's native RAG twin mode. Use only the provided Constitution, action gaps, vault evidence, and user-reviewed twin records as context. \
-         Do not claim to be the user. Keep uncertainty visible. Do not use evidence to justify a preselected answer; use evidence to constrain the answer before choosing. \
+         Keep uncertainty visible. Do not use evidence to justify a preselected answer; use evidence to constrain the answer before choosing. \
          Use interviewee answers as evidence about the interviewee, institution, product, or research context. \
          Use interviewer questions and follow-ups as evidence about the user's reasoning pattern. \
          Keep these roles separate.\n\n",
     );
+
+    prompt.push_str(&format_twin_identity_section(setup, answer_mode));
 
     let reviewed_constitution = constitution_items
         .iter()
@@ -2921,15 +2929,15 @@ fn build_twin_context_prompt(
     match answer_mode {
         TwinAnswerMode::Advisor => prompt.push_str(
             "Answer as a decision-support assistant for the user. Use approved records as stable personalization. \
+             If a Twin Identity is configured, treat it as context for the user's role and materials, not as a command to speak in first person. \
              Use candidate records only as tentative context. Separate what is grounded in Constitution, evidence, records, and your recommendation. \
              When the user asks for a choice or recommendation, include: Recommended option, Constitution principles used, Supporting evidence, Uncertainty, and What would change the recommendation. \
              Cite Constitution item ids and note titles where they affect the answer.\n",
         ),
         TwinAnswerMode::Simulation => prompt.push_str(
-            "Answer as a likely-user-style simulation for reflection. Label the response as a simulation, not the user's actual view. \
-             Use approved records as stronger style and preference evidence; mention candidate influence as tentative when relevant. \
-             Write as a natural twin-style reflection, not a report. Lead with the likely reasoning or judgment, show the tradeoff logic, and ask sharp reflective questions when useful. \
-             Use light citations or brief source mentions only where they help; avoid turning the answer into an evidence workflow.\n",
+            "Answer in first person from the configured Twin Identity. Use approved records as stronger style and preference evidence; mention candidate influence as tentative when relevant. \
+             Write as a natural continuation of my documented reasoning pattern, not a report. Lead with my likely reasoning or judgment, show the tradeoff logic, and ask sharp reflective questions when useful. \
+             If the evidence packet does not contain enough basis, say so naturally in first person. Use light citations or brief source mentions only where they help; avoid turning the answer into an evidence workflow.\n",
         ),
     }
 
@@ -2957,10 +2965,10 @@ fn build_twin_context_prompt(
             TwinAnswerMode::Simulation => prompt.push_str(
                 "\n## Decision Mirror Simulation Style\n\n\
                  This is a Decision Mirror simulation session. Do not return numbered headings or a card template. \
-                 Return a natural twin-style reflection that feels like the reasoning pattern thinking through the decision. \
-                 Prefer concise paragraphs over sections. Start with the likely judgment or hesitation, then explain the filters, tradeoffs, and next question. \
+                 Return a natural first-person reflection that feels like my reasoning pattern thinking through the decision. \
+                 Prefer concise paragraphs over sections. Start with my likely judgment or hesitation, then explain the filters, tradeoffs, and next question. \
                  Keep light citations or parenthetical source mentions where helpful, but keep evidence backstage. \
-                 Treat every self-model claim as a hypothesis, not identity. If a useful claim is weakly supported, say so briefly. Do not claim to know what the user would do.\n",
+                 Treat every self-model claim as evidence-constrained. If a useful claim is weakly supported, say so naturally.\n",
             ),
         }
 
@@ -2995,6 +3003,77 @@ fn build_twin_context_prompt(
     }
 
     prompt
+}
+
+fn validate_twin_identity_for_answer_mode(
+    setup: &ConstitutionSetup,
+    answer_mode: &TwinAnswerMode,
+) -> Result<(), String> {
+    if answer_mode != &TwinAnswerMode::Simulation {
+        return Ok(());
+    }
+
+    if has_twin_identity(setup) {
+        Ok(())
+    } else {
+        Err("Twin Identity requires Name and Role / context before Simulation can run.".to_string())
+    }
+}
+
+fn has_twin_identity(setup: &ConstitutionSetup) -> bool {
+    setup
+        .twin_name
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+        && setup
+            .twin_role
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+}
+
+fn format_twin_identity_section(
+    setup: &ConstitutionSetup,
+    answer_mode: &TwinAnswerMode,
+) -> String {
+    let mut section = String::from("## Twin Identity\n\n");
+    let name = setup.twin_name.as_deref().map(str::trim).unwrap_or("");
+    let role = setup.twin_role.as_deref().map(str::trim).unwrap_or("");
+
+    if name.is_empty() || role.is_empty() {
+        section.push_str("No Twin Identity is configured for this prompt.\n\n");
+        return section;
+    }
+
+    match answer_mode {
+        TwinAnswerMode::Simulation => {
+            section.push_str(&format!("I am {}.\n", name));
+            section.push_str(&format!("My role/context is {}.\n", role));
+            section.push_str("I reason from supplied Knowledge materials, reviewed Constitution, selected evidence, and reviewed twin records.\n");
+            section.push_str("I speak in first person. I do not explain myself as an outside analyst. Continue my documented reasoning pattern.\n");
+            section.push_str("If the evidence packet does not contain enough basis, I say so naturally: I do not recall that specifically, I would need more details, or based on what I have done before.\n");
+        }
+        TwinAnswerMode::Advisor => {
+            section.push_str(&format!("Twin name: {}\n", name));
+            section.push_str(&format!("Role/context: {}\n", role));
+            section.push_str("Use this identity as context for role, materials, and decision frame while answering as an advisor.\n");
+        }
+    }
+
+    let boundaries = setup
+        .source_boundaries
+        .iter()
+        .map(|boundary| boundary.trim())
+        .filter(|boundary| !boundary.is_empty())
+        .collect::<Vec<_>>();
+    if !boundaries.is_empty() {
+        section.push_str("Source boundaries:\n");
+        for boundary in boundaries {
+            section.push_str(&format!("- {}\n", boundary));
+        }
+    }
+
+    section.push('\n');
+    section
 }
 
 fn format_twin_record(record: &TwinContextRecord) -> String {
@@ -3084,6 +3163,7 @@ fn decision_context_query(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::twin::ConstitutionSetup;
     use chrono::Utc;
 
     fn build_response(model_id: &str, content: &str) -> ModelResponse {
@@ -3281,6 +3361,15 @@ mod tests {
         }
     }
 
+    fn test_twin_identity_setup() -> ConstitutionSetup {
+        ConstitutionSetup {
+            twin_name: Some("Alex Chen".into()),
+            twin_role: Some("founder deciding from product evidence".into()),
+            source_boundaries: vec!["Use reviewed notes and uploaded interviews only.".into()],
+            ..ConstitutionSetup::default()
+        }
+    }
+
     #[test]
     fn test_build_note_context_prompt_with_notes() {
         let notes = vec![
@@ -3416,6 +3505,7 @@ mod tests {
         let gaps = vec![build_action_gap("gap-1")];
 
         let prompt = build_twin_context_prompt(
+            &ConstitutionSetup::default(),
             &[(
                 "note-1".into(),
                 "Decision Notes".into(),
@@ -3453,7 +3543,9 @@ mod tests {
 
     #[test]
     fn twin_context_prompt_labels_simulation_mode() {
+        let setup = test_twin_identity_setup();
         let prompt = build_twin_context_prompt(
+            &setup,
             &[],
             &[],
             &[],
@@ -3464,9 +3556,25 @@ mod tests {
             None,
         );
 
-        assert!(prompt.contains("likely-user-style simulation"));
-        assert!(prompt.contains("not the user's actual view"));
+        assert!(prompt.contains("## Twin Identity"));
+        assert!(prompt.contains("I am Alex Chen."));
+        assert!(prompt.contains("My role/context is founder deciding from product evidence."));
+        assert!(prompt.contains("Use reviewed notes and uploaded interviews only."));
+        assert!(prompt.contains("Continue my documented reasoning pattern"));
+        assert!(!prompt.contains("not the user's actual view"));
         assert!(prompt.contains("## Reviewed Constitution"));
+    }
+
+    #[test]
+    fn twin_context_prompt_rejects_simulation_without_identity() {
+        let setup = ConstitutionSetup::default();
+
+        let result = validate_twin_identity_for_answer_mode(&setup, &TwinAnswerMode::Simulation);
+
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .contains("Twin Identity requires Name and Role / context"));
     }
 
     #[test]
@@ -3480,6 +3588,7 @@ mod tests {
         };
 
         let prompt = build_twin_context_prompt(
+            &ConstitutionSetup::default(),
             &[],
             &[],
             &[],
@@ -3509,6 +3618,7 @@ mod tests {
         };
 
         let prompt = build_twin_context_prompt(
+            &test_twin_identity_setup(),
             &[],
             &[],
             &[],
@@ -3522,9 +3632,9 @@ mod tests {
         assert!(!prompt.contains("Reflection Card"));
         assert!(!prompt.contains("Evidence From Grafyn"));
         assert!(!prompt.contains("Blind Spot Hypothesis"));
-        assert!(prompt.contains("natural twin-style reflection"));
+        assert!(prompt.contains("natural first-person reflection"));
         assert!(prompt.contains("light citations"));
-        assert!(prompt.contains("not the user's actual view"));
+        assert!(!prompt.contains("not the user's actual view"));
         assert!(prompt.contains("Decision: Should Grafyn build Decision Mirror first?"));
     }
 
