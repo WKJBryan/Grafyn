@@ -40,40 +40,38 @@
       </div>
     </div>
 
-    <div
-      v-if="recentInbox.length"
-      class="optimizer-list"
-    >
-      <div
-        v-for="entry in recentInbox"
-        :key="entry.id"
-        class="optimizer-item"
-      >
-        <div class="item-copy">
-          <strong>{{ entry.title || entry.note_id }}</strong>
-          <div class="item-reason">
-            {{ entry.reason }}
-          </div>
-          <div class="item-diff">
-            {{ entry.diff_preview }}
-          </div>
+    <AsyncListState :empty="!recentInbox.length">
+      <template #empty>
+        <div class="empty-state">
+          No optimizer activity yet.
         </div>
-        <button
-          v-if="entry.change_id"
-          class="rollback-btn"
-          @click="rollback(entry.change_id)"
-        >
-          Rollback
-        </button>
-      </div>
-    </div>
+      </template>
 
-    <div
-      v-else
-      class="empty-state"
-    >
-      No optimizer activity yet.
-    </div>
+      <div class="optimizer-list">
+        <div
+          v-for="entry in recentInbox"
+          :key="entry.id"
+          class="optimizer-item"
+        >
+          <div class="item-copy">
+            <strong>{{ entry.title || entry.note_id }}</strong>
+            <div class="item-reason">
+              {{ entry.reason }}
+            </div>
+            <div class="item-diff">
+              {{ entry.diff_preview }}
+            </div>
+          </div>
+          <button
+            v-if="entry.change_id"
+            class="rollback-btn"
+            @click="rollback(entry.change_id)"
+          >
+            Rollback
+          </button>
+        </div>
+      </div>
+    </AsyncListState>
   </div>
 </template>
 
@@ -81,6 +79,7 @@
 import { onMounted, ref } from 'vue'
 import { optimizer as optimizerApi } from '@/api/client'
 import { useToast } from '@/composables/useToast'
+import AsyncListState from './AsyncListState.vue'
 
 const toast = useToast()
 const status = ref(null)

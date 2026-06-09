@@ -60,7 +60,7 @@ describe('BacklinksPanel', () => {
 
       await nextTick()
 
-      expect(wrapper.find('.panel-header h3').text()).toBe('Backlinks')
+      expect(wrapper.find('.panel-header-base__title').text()).toBe('Backlinks')
     })
 
     it('does not show count badge when no backlinks', async () => {
@@ -73,7 +73,7 @@ describe('BacklinksPanel', () => {
       await nextTick()
       await nextTick() // Wait for loading to finish
 
-      expect(wrapper.find('.backlink-count').exists()).toBe(false)
+      expect(wrapper.find('.panel-header-base__count').exists()).toBe(false)
     })
 
     it('shows count badge when backlinks exist', async () => {
@@ -91,7 +91,7 @@ describe('BacklinksPanel', () => {
       await nextTick()
       await nextTick()
 
-      const badge = wrapper.find('.backlink-count')
+      const badge = wrapper.find('.panel-header-base__count')
       expect(badge.exists()).toBe(true)
       expect(badge.text()).toBe('2')
     })
@@ -113,7 +113,7 @@ describe('BacklinksPanel', () => {
 
       await nextTick()
 
-      expect(wrapper.find('.loading-state').exists()).toBe(true)
+      expect(wrapper.find('.async-list-state__loading').exists()).toBe(true)
       expect(wrapper.text()).toContain('Loading...')
     })
 
@@ -127,7 +127,7 @@ describe('BacklinksPanel', () => {
       await nextTick()
       await nextTick()
 
-      expect(wrapper.find('.loading-state').exists()).toBe(false)
+      expect(wrapper.find('.async-list-state__loading').exists()).toBe(false)
     })
 
     it('does not show backlinks list during loading', async () => {
@@ -142,7 +142,7 @@ describe('BacklinksPanel', () => {
       await nextTick()
 
       expect(wrapper.find('.backlinks-list').exists()).toBe(false)
-      expect(wrapper.find('.empty-state').exists()).toBe(false)
+      expect(wrapper.find('.async-list-state__empty').exists()).toBe(false)
     })
   })
 
@@ -161,7 +161,7 @@ describe('BacklinksPanel', () => {
       await nextTick()
       await nextTick()
 
-      expect(wrapper.find('.empty-state').exists()).toBe(true)
+      expect(wrapper.find('.async-list-state__empty').exists()).toBe(true)
       expect(wrapper.text()).toContain('No backlinks yet')
     })
 
@@ -179,7 +179,7 @@ describe('BacklinksPanel', () => {
       await nextTick()
       await nextTick()
 
-      expect(wrapper.find('.empty-state').exists()).toBe(false)
+      expect(wrapper.find('.async-list-state__empty').exists()).toBe(false)
     })
 
     it('does not show backlinks list when empty', async () => {
@@ -400,7 +400,7 @@ describe('BacklinksPanel', () => {
         'Failed to load backlinks:',
         expect.any(Error)
       )
-      expect(wrapper.find('.empty-state').exists()).toBe(true)
+      expect(wrapper.find('.async-list-state__empty').exists()).toBe(true)
     })
 
     it('clears backlinks on API error', async () => {
@@ -486,7 +486,7 @@ describe('BacklinksPanel', () => {
       await nextTick()
       await nextTick()
 
-      expect(wrapper.find('.loading-state').exists()).toBe(false)
+      expect(wrapper.find('.async-list-state__loading').exists()).toBe(false)
 
       const slowPromise = new Promise((resolve) => {
         setTimeout(() => resolve([]), 100)
@@ -497,12 +497,12 @@ describe('BacklinksPanel', () => {
       await wrapper.setProps({ noteId: 'note-2' })
       await nextTick()
 
-      expect(wrapper.find('.loading-state').exists()).toBe(true)
+      expect(wrapper.find('.async-list-state__loading').exists()).toBe(true)
 
       await slowPromise
       await nextTick()
 
-      expect(wrapper.find('.loading-state').exists()).toBe(false)
+      expect(wrapper.find('.async-list-state__loading').exists()).toBe(false)
     })
   })
 
@@ -595,7 +595,7 @@ describe('BacklinksPanel', () => {
       await nextTick()
 
       expect(wrapper.findAll('.backlink-item')).toHaveLength(100)
-      expect(wrapper.find('.backlink-count').text()).toBe('100')
+      expect(wrapper.find('.panel-header-base__count').text()).toBe('100')
     })
 
     it('handles rapid noteId changes', async () => {
