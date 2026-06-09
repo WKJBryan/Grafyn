@@ -1,66 +1,54 @@
 <template>
   <div class="backlinks-panel">
-    <div class="panel-header">
-      <h3>Backlinks</h3>
-      <span
-        v-if="backlinks.length > 0"
-        class="backlink-count"
-      >
-        {{ backlinks.length }}
-      </span>
-    </div>
+    <PanelHeader
+      title="Backlinks"
+      :count="backlinks.length > 0 ? backlinks.length : null"
+      badge-variant="muted"
+      class="backlinks-panel__header"
+    />
 
-    <div
-      v-if="loading"
-      class="loading-state"
+    <AsyncListState
+      :loading="loading"
+      :empty="backlinks.length === 0"
     >
-      <p class="text-muted">
-        Loading...
-      </p>
-    </div>
-
-    <div
-      v-else-if="backlinks.length === 0"
-      class="empty-state"
-    >
-      <p class="text-muted">
-        No backlinks yet
-      </p>
-    </div>
-
-    <div
-      v-else
-      class="backlinks-list"
-    >
-      <div
-        v-for="backlink in backlinks"
-        :key="backlink.note_id"
-        class="backlink-item card card-hover"
-        @click="$emit('navigate', backlink.note_id)"
-      >
-        <div class="backlink-title">
-          {{ backlink.title }}
+      <template #empty>
+        <div class="async-list-state__empty">
+          <p class="text-muted">
+            No backlinks yet
+          </p>
         </div>
+      </template>
+
+      <div class="backlinks-list">
         <div
-          v-if="backlink.context"
-          class="backlink-context"
+          v-for="backlink in backlinks"
+          :key="backlink.note_id"
+          class="backlink-item card card-hover"
+          @click="$emit('navigate', backlink.note_id)"
         >
-          {{ backlink.context }}
+          <div class="backlink-title">
+            {{ backlink.title }}
+          </div>
+          <div
+            v-if="backlink.context"
+            class="backlink-context"
+          >
+            {{ backlink.context }}
+          </div>
         </div>
       </div>
-    </div>
+    </AsyncListState>
   </div>
 </template>
 
 <script setup>
 import { ref, watch, onMounted } from 'vue'
 import { graph as graphApi } from '../api/client'
+import PanelHeader from './PanelHeader.vue'
+import AsyncListState from './AsyncListState.vue'
 
 const props = defineProps({
-  noteId: {
-    type: String,
-    required: true
-  }
+  noteId: { type: String, required: true }
 })
 
 defineEmits(['navigate'])
@@ -70,11 +58,9 @@ const loading = ref(false)
 
 async function loadBacklinks() {
   if (!props.noteId) return
-  
   loading.value = true
   try {
-    const data = await graphApi.backlinks(props.noteId)
-    backlinks.value = data
+    backlinks.value = await graphApi.backlinks(props.noteId)
   } catch (error) {
     console.error('Failed to load backlinks:', error)
     backlinks.value = []
@@ -83,13 +69,8 @@ async function loadBacklinks() {
   }
 }
 
-onMounted(() => {
-  loadBacklinks()
-})
-
-watch(() => props.noteId, () => {
-  loadBacklinks()
-})
+onMounted(() => loadBacklinks())
+watch(() => props.noteId, () => loadBacklinks())
 </script>
 
 <style scoped>
@@ -100,40 +81,14 @@ watch(() => props.noteId, () => {
   padding: var(--spacing-md);
 }
 
-.panel-header {
-  display: flex;
-  align-items: center;
+.backlinks-panel__header {
   justify-content: space-between;
   margin-bottom: var(--spacing-md);
 }
 
-.panel-header h3 {
-  margin: 0;
+:deep(.panel-header-base__title) {
   font-size: 1rem;
-  font-weight: 600;
-}
-
-.backlink-count {
-  font-size: 0.75rem;
-  color: var(--text-muted);
-  background: var(--bg-tertiary);
-  padding: 2px 8px;
-  border-radius: var(--radius-sm);
-}
-
-.loading-state,
-.empty-state {
-  flex: 1;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  text-align: center;
-}
-
-.loading-state p,
-.empty-state p {
-  margin: 0;
-  font-size: 0.875rem;
+  color: var(--text-primary);
 }
 
 .backlinks-list {

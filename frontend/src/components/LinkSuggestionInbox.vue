@@ -39,111 +39,112 @@
       {{ error }}
     </div>
 
-    <div
-      v-else-if="entries.length === 0"
-      class="inbox-empty"
-    >
-      No pending link suggestions right now.
-    </div>
-
-    <div
+    <AsyncListState
       v-else
-      class="inbox-list"
+      :empty="entries.length === 0"
     >
-      <div
-        v-for="entry in entries"
-        :key="entry.note_id"
-        class="inbox-entry"
-      >
-        <div class="entry-header">
-          <button
-            class="entry-note"
-            @click="$emit('navigate', entry.note_id)"
-          >
-            {{ entry.note_title }}
-          </button>
-          <span class="entry-meta">
-            {{ entry.pending_count }} suggestion{{ entry.pending_count !== 1 ? 's' : '' }}
-          </span>
+      <template #empty>
+        <div class="inbox-empty">
+          No pending link suggestions right now.
         </div>
+      </template>
 
+      <div class="inbox-list">
         <div
-          v-if="entry.links?.length"
-          class="entry-section"
+          v-for="entry in entries"
+          :key="entry.note_id"
+          class="inbox-entry"
         >
-          <div class="entry-section-title">
-            Strong Matches
+          <div class="entry-header">
+            <button
+              class="entry-note"
+              @click="$emit('navigate', entry.note_id)"
+            >
+              {{ entry.note_title }}
+            </button>
+            <span class="entry-meta">
+              {{ entry.pending_count }} suggestion{{ entry.pending_count !== 1 ? 's' : '' }}
+            </span>
           </div>
-          <div
-            v-for="candidate in entry.links"
-            :key="entry.note_id + '-strong-' + candidate.target_id"
-            class="entry-candidate"
-          >
-            <div class="candidate-copy">
-              <div class="candidate-title">
-                {{ candidate.target_title }}
-              </div>
-              <div class="candidate-reason">
-                {{ candidate.reason }}
-              </div>
-            </div>
-            <div class="candidate-controls">
-              <span class="candidate-confidence">{{ Math.round(candidate.confidence * 100) }}%</span>
-              <button
-                class="mini-btn"
-                @click="applySingle(entry.note_id, candidate)"
-              >
-                Apply
-              </button>
-              <button
-                class="mini-btn ghost"
-                @click="dismiss(entry.note_id, candidate.target_id)"
-              >
-                Dismiss
-              </button>
-            </div>
-          </div>
-        </div>
 
-        <div
-          v-if="entry.exploratory_links?.length"
-          class="entry-section"
-        >
-          <div class="entry-section-title">
-            Exploratory
-          </div>
           <div
-            v-for="candidate in entry.exploratory_links"
-            :key="entry.note_id + '-exploratory-' + candidate.target_id"
-            class="entry-candidate"
+            v-if="entry.links?.length"
+            class="entry-section"
           >
-            <div class="candidate-copy">
-              <div class="candidate-title">
-                {{ candidate.target_title }}
+            <div class="entry-section-title">
+              Strong Matches
+            </div>
+            <div
+              v-for="candidate in entry.links"
+              :key="entry.note_id + '-strong-' + candidate.target_id"
+              class="entry-candidate"
+            >
+              <div class="candidate-copy">
+                <div class="candidate-title">
+                  {{ candidate.target_title }}
+                </div>
+                <div class="candidate-reason">
+                  {{ candidate.reason }}
+                </div>
               </div>
-              <div class="candidate-reason">
-                {{ candidate.reason }}
+              <div class="candidate-controls">
+                <span class="candidate-confidence">{{ Math.round(candidate.confidence * 100) }}%</span>
+                <button
+                  class="mini-btn"
+                  @click="applySingle(entry.note_id, candidate)"
+                >
+                  Apply
+                </button>
+                <button
+                  class="mini-btn ghost"
+                  @click="dismiss(entry.note_id, candidate.target_id)"
+                >
+                  Dismiss
+                </button>
               </div>
             </div>
-            <div class="candidate-controls">
-              <span class="candidate-confidence">{{ Math.round(candidate.confidence * 100) }}%</span>
-              <button
-                class="mini-btn"
-                @click="applySingle(entry.note_id, candidate)"
-              >
-                Apply
-              </button>
-              <button
-                class="mini-btn ghost"
-                @click="dismiss(entry.note_id, candidate.target_id)"
-              >
-                Dismiss
-              </button>
+          </div>
+
+          <div
+            v-if="entry.exploratory_links?.length"
+            class="entry-section"
+          >
+            <div class="entry-section-title">
+              Exploratory
+            </div>
+            <div
+              v-for="candidate in entry.exploratory_links"
+              :key="entry.note_id + '-exploratory-' + candidate.target_id"
+              class="entry-candidate"
+            >
+              <div class="candidate-copy">
+                <div class="candidate-title">
+                  {{ candidate.target_title }}
+                </div>
+                <div class="candidate-reason">
+                  {{ candidate.reason }}
+                </div>
+              </div>
+              <div class="candidate-controls">
+                <span class="candidate-confidence">{{ Math.round(candidate.confidence * 100) }}%</span>
+                <button
+                  class="mini-btn"
+                  @click="applySingle(entry.note_id, candidate)"
+                >
+                  Apply
+                </button>
+                <button
+                  class="mini-btn ghost"
+                  @click="dismiss(entry.note_id, candidate.target_id)"
+                >
+                  Dismiss
+                </button>
+              </div>
             </div>
           </div>
         </div>
       </div>
-    </div>
+    </AsyncListState>
   </div>
 </template>
 
@@ -151,6 +152,7 @@
 import { onMounted, onUnmounted, ref } from 'vue'
 import { zettelkasten } from '@/api/client'
 import { useToast } from '@/composables/useToast'
+import AsyncListState from './AsyncListState.vue'
 
 defineEmits(['navigate'])
 const toast = useToast()
