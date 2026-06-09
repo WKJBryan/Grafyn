@@ -1,4 +1,4 @@
-use crate::commands::sync_chunk_index_for_note;
+use crate::commands::{run_retrieval, sync_chunk_index_for_note};
 use crate::models::canvas::{
     AddModelsRequest, AvailableModel, CanvasSession, CanvasStreamEvent, CanvasViewport,
     ContextMode, Debate, DebateContinueRequest, DebateResponse, DebateRound, DebateStartRequest,
@@ -2269,15 +2269,10 @@ async fn resolve_prompt_context(
         let pinned_ids = session.pinned_note_ids.clone();
 
         // Quality gate: note-level retrieval to check if vault has relevant content
-        let retrieval_results = {
-            let search = state.search_service.read().await;
-            let graph = state.graph_index.read().await;
-            let priority = state.priority_service.read().await;
-            let retrieval = state.retrieval_service.read().await;
-            retrieval
-                .retrieve(&search, &graph, &priority, &request.prompt, 5, &pinned_ids)
-                .unwrap_or_default()
-        };
+        let retrieval_results =
+            run_retrieval(state, &request.prompt, 5, &pinned_ids)
+                .await
+                .unwrap_or_default();
 
         let retrieval_decision = should_use_retrieved_notes(&request.prompt, &retrieval_results);
         if retrieval_decision != RetrievalDecisionReason::UseRetrievedNotes {
@@ -2413,15 +2408,10 @@ async fn resolve_twin_prompt_context(
     request: &PromptRequest,
 ) -> Result<ResolvedPromptContext, String> {
     let pinned_ids = session.pinned_note_ids.clone();
-    let retrieval_results = {
-        let search = state.search_service.read().await;
-        let graph = state.graph_index.read().await;
-        let priority = state.priority_service.read().await;
-        let retrieval = state.retrieval_service.read().await;
-        retrieval
-            .retrieve(&search, &graph, &priority, &request.prompt, 5, &pinned_ids)
-            .unwrap_or_default()
-    };
+    let retrieval_results =
+        run_retrieval(state, &request.prompt, 5, &pinned_ids)
+            .await
+            .unwrap_or_default();
 
     let should_use_notes = should_use_retrieved_notes(&request.prompt, &retrieval_results)
         == RetrievalDecisionReason::UseRetrievedNotes;
@@ -2475,20 +2465,17 @@ async fn resolve_twin_prompt_context(
         }
 
         if note_contexts.is_empty() {
-            let store = state.knowledge_store.read().await;
-            for result in &retrieval_results {
-                if let Ok(note) = store.get_note(&result.note.id) {
-                    note_contexts.push((
-                        note.id.clone(),
-                        note.title.clone(),
-                        truncate_note_context_content(&note.content, 1500),
-                    ));
+            note_contexts = fetch_note_contexts(state, &retrieval_results).await;
+            let found_ids: HashSet<&str> =
+                note_contexts.iter().map(|(id, _, _)| id.as_str()).collect();
+            for r in &retrieval_results {
+                if found_ids.contains(r.note.id.as_str()) {
                     context_notes.push(TileContextNote {
-                        id: result.note.id.clone(),
-                        title: result.note.title.clone(),
-                        snippet: result.snippet.clone(),
-                        score: result.score,
-                        pinned: pinned_ids.contains(&result.note.id),
+                        id: r.note.id.clone(),
+                        title: r.note.title.clone(),
+                        snippet: r.snippet.clone(),
+                        score: r.score,
+                        pinned: pinned_ids.contains(&r.note.id),
                     });
                 }
             }
@@ -2539,6 +2526,24 @@ async fn resolve_twin_prompt_context(
     })
 }
 
+/// Fetch full note content for retrieval results, returning (id, title, truncated_content) tuples.
+/// Skips notes that can't be read from the store. Called by both the semantic and twin note-level paths.
+async fn fetch_note_contexts(
+    state: &AppState,
+    results: &[RetrievalResult],
+) -> Vec<(String, String, String)> {
+    let store = state.knowledge_store.read().await;
+    results
+        .iter()
+        .filter_map(|r| {
+            store.get_note(&r.note.id).ok().map(|note| {
+                let truncated = truncate_note_context_content(&note.content, 1500);
+                (note.id.clone(), note.title.clone(), truncated)
+            })
+        })
+        .collect()
+}
+
 /// Fall back to note-level context when chunk retrieval is disabled or returns nothing.
 async fn resolve_note_level_context(
     state: &AppState,
@@ -2547,18 +2552,7 @@ async fn resolve_note_level_context(
     pinned_ids: &[String],
     user_system_prompt: &Option<String>,
 ) -> Result<ResolvedPromptContext, String> {
-    let note_contexts: Vec<(String, String, String)> = {
-        let store = state.knowledge_store.read().await;
-        retrieval_results
-            .iter()
-            .filter_map(|r| {
-                store.get_note(&r.note.id).ok().map(|note| {
-                    let truncated = truncate_note_context_content(&note.content, 1500);
-                    (note.id.clone(), note.title.clone(), truncated)
-                })
-            })
-            .collect()
-    };
+    let note_contexts = fetch_note_contexts(state, retrieval_results).await;
 
     let context_notes: Vec<TileContextNote> = retrieval_results
         .iter()

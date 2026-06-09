@@ -134,6 +134,34 @@ impl SimilarityProvider for TfIdfProvider {
     }
 }
 
+// ── Free functions ───────────────────────────────────────────────────────
+
+/// Cosine similarity between two sparse term-weight maps.
+/// Used by link discovery and any other code that works with HashMap term vectors
+/// rather than SparseTfVector structs.
+pub fn sparse_cosine(a: &HashMap<String, f64>, b: &HashMap<String, f64>) -> f64 {
+    if a.is_empty() || b.is_empty() {
+        return 0.0;
+    }
+
+    let mut dot_product = 0.0;
+    let mut norm_a = 0.0;
+    for (term, weight_a) in a {
+        norm_a += weight_a * weight_a;
+        if let Some(weight_b) = b.get(term) {
+            dot_product += weight_a * weight_b;
+        }
+    }
+
+    let norm_b = b.values().map(|w| w * w).sum::<f64>();
+    let magnitude = (norm_a * norm_b).sqrt();
+    if magnitude < 1e-10 {
+        0.0
+    } else {
+        dot_product / magnitude
+    }
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

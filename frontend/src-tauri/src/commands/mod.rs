@@ -16,8 +16,26 @@ pub mod twin;
 pub mod zettelkasten;
 
 use crate::models::note::Note;
+use crate::services::retrieval::RetrievalResult;
 use crate::AppState;
 use std::collections::HashSet;
+
+/// Shared retrieval helper — acquires the 4 retrieval-pipeline read locks, calls
+/// `retrieval.retrieve()`, and releases all locks before returning. Used by
+/// `retrieve_relevant`, `recall_relevant`, and the canvas context resolvers to
+/// avoid duplicating the same lock sequence in each caller.
+pub(crate) async fn run_retrieval(
+    state: &AppState,
+    query: &str,
+    limit: usize,
+    context_ids: &[String],
+) -> Result<Vec<RetrievalResult>, String> {
+    let search = state.search_service.read().await;
+    let graph = state.graph_index.read().await;
+    let priority = state.priority_service.read().await;
+    let retrieval = state.retrieval_service.read().await;
+    retrieval.retrieve(&search, &graph, &priority, query, limit, context_ids)
+}
 
 pub(crate) async fn sync_chunk_index_for_note(state: &AppState, note: &Note) {
     sync_chunk_index_for_notes(state, std::slice::from_ref(note)).await;
