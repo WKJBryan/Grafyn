@@ -1,6 +1,7 @@
 import { defineStore } from 'pinia'
 import { ref, shallowRef, computed, triggerRef, toRaw } from 'vue'
 import { canvas as canvasApi, twin as twinApi } from '@/api/client'
+import { useAsyncOperation } from '@/composables/useAsyncOperation'
 
 export const DEFAULT_WEB_SEARCH_MAX_RESULTS = 5
 export const THINK_HARDER_WEB_SEARCH_MAX_RESULTS = 8
@@ -21,6 +22,7 @@ export const useCanvasStore = defineStore('canvas', () => {
   const availableModels = ref([])
   const loading = ref(false)
   const error = ref(null)
+  const { run } = useAsyncOperation(loading, error)
   // shallowRef avoids deep reactivity tracking — these update on every streaming chunk,
   // so deep proxying wastes cycles. Use triggerRef() after mutations to notify watchers.
   const streamingModels = shallowRef(new Set())
@@ -177,20 +179,12 @@ export const useCanvasStore = defineStore('canvas', () => {
   }
 
   async function createSession(data = {}) {
-    loading.value = true
-    error.value = null
-    try {
+    return run(async () => {
       const session = normalizeSession(await canvasApi.create(data))
       sessions.value.unshift(session)
       currentSession.value = session
       return session
-    } catch (err) {
-      error.value = err.message || 'Failed to create session'
-      console.error('Failed to create canvas session:', err)
-      throw err
-    } finally {
-      loading.value = false
-    }
+    })
   }
 
   async function updateSession(sessionId, data) {

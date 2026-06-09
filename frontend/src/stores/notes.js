@@ -1,6 +1,7 @@
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
 import { notes as notesApi } from '../api/client'
+import { useAsyncOperation } from '../composables/useAsyncOperation'
 
 export const useNotesStore = defineStore('notes', () => {
   // State
@@ -9,6 +10,7 @@ export const useNotesStore = defineStore('notes', () => {
   const selectedNote = ref(null)
   const loading = ref(false)
   const error = ref(null)
+  const { run } = useAsyncOperation(loading, error)
 
   // Getters
   const selectedNoteComputed = computed(() => {
@@ -30,57 +32,30 @@ export const useNotesStore = defineStore('notes', () => {
 
   // Actions
   async function loadNotes() {
-    loading.value = true
-    error.value = null
-    try {
-      const data = await notesApi.list()
-      notes.value = data
-    } catch (err) {
-      error.value = err.message || 'Failed to load notes'
-      console.error('Failed to load notes:', err)
-      throw err
-    } finally {
-      loading.value = false
-    }
+    return run(async () => {
+      notes.value = await notesApi.list()
+    })
   }
 
   async function loadNote(id) {
-    loading.value = true
-    error.value = null
-    try {
+    return run(async () => {
       const note = await notesApi.get(id)
       selectedNote.value = note
       selectedNoteId.value = id
       return note
-    } catch (err) {
-      error.value = err.message || 'Failed to load note'
-      console.error('Failed to load note:', err)
-      throw err
-    } finally {
-      loading.value = false
-    }
+    })
   }
 
   async function createNote(data) {
-    loading.value = true
-    error.value = null
-    try {
+    return run(async () => {
       const created = await notesApi.create(data)
       notes.value.push(created)
       return created
-    } catch (err) {
-      error.value = err.message || 'Failed to create note'
-      console.error('Failed to create note:', err)
-      throw err
-    } finally {
-      loading.value = false
-    }
+    })
   }
 
   async function updateNote(id, data) {
-    loading.value = true
-    error.value = null
-    try {
+    return run(async () => {
       const updated = await notesApi.update(id, data)
       const index = notes.value.findIndex(note => note.id === id)
       if (index !== -1) {
@@ -90,47 +65,25 @@ export const useNotesStore = defineStore('notes', () => {
         selectedNote.value = updated
       }
       return updated
-    } catch (err) {
-      error.value = err.message || 'Failed to update note'
-      console.error('Failed to update note:', err)
-      throw err
-    } finally {
-      loading.value = false
-    }
+    })
   }
 
   async function deleteNote(id) {
-    loading.value = true
-    error.value = null
-    try {
+    return run(async () => {
       await notesApi.delete(id)
       notes.value = notes.value.filter(note => note.id !== id)
       if (selectedNoteId.value === id) {
         selectedNoteId.value = null
         selectedNote.value = null
       }
-    } catch (err) {
-      error.value = err.message || 'Failed to delete note'
-      console.error('Failed to delete note:', err)
-      throw err
-    } finally {
-      loading.value = false
-    }
+    })
   }
 
   async function reindexNotes() {
-    loading.value = true
-    error.value = null
-    try {
+    return run(async () => {
       await notesApi.reindex()
       await loadNotes()
-    } catch (err) {
-      error.value = err.message || 'Failed to reindex notes'
-      console.error('Failed to reindex notes:', err)
-      throw err
-    } finally {
-      loading.value = false
-    }
+    })
   }
 
   function selectNote(id) {
