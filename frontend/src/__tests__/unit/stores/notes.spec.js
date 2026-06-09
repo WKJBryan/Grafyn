@@ -592,7 +592,7 @@ describe('Notes Store', () => {
 
       await expect(store.loadNotes()).rejects.toBe('String error')
 
-      expect(store.error).toBe('Failed to load notes')
+      expect(store.error).toBe('Operation failed')
     })
 
     it('handles concurrent operations', async () => {
