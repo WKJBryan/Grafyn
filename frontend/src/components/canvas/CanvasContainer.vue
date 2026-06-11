@@ -1221,6 +1221,26 @@ async function refreshTwinIdentity() {
   }
 }
 
+async function saveInlineTwinIdentity(identitySetup) {
+  const existing = await twinApi.getConstitutionSetup()
+  const nextSetup = {
+    ...existing,
+    twin_name: identitySetup.twin_name,
+    twin_role: identitySetup.twin_role,
+    source_boundaries: existing?.source_boundaries || [],
+    values: existing?.values || [],
+    tastes: existing?.tastes || [],
+    constraints: existing?.constraints || [],
+    somatic_cues: existing?.somatic_cues || [],
+    action_tendencies: existing?.action_tendencies || []
+  }
+  await twinApi.saveConstitutionSetup(nextSetup)
+  twinIdentity.value = {
+    name: nextSetup.twin_name || '',
+    role: nextSetup.twin_role || ''
+  }
+}
+
 async function loadCanvasPreferences() {
   try {
     const settingsData = await settingsApi.get()
@@ -1358,7 +1378,8 @@ async function handlePromptSubmit({
   twinAnswerMode = 'simulation',
   webSearch,
   reasoningEffort = 'none',
-  twinLlmProvider: selectedTwinLlmProvider = null
+  twinLlmProvider: selectedTwinLlmProvider = null,
+  twinIdentitySetup = null
 }) {
   const usesLocalTwinRuntime = (promptType === 'decision' || contextMode === 'twin') &&
     selectedTwinLlmProvider === 'ollama'
@@ -1372,6 +1393,20 @@ async function handlePromptSubmit({
     } catch (err) {
       console.error('Failed to refresh OpenRouter status before submit:', err)
       showApiKeyRequired.value = true
+      return
+    }
+  }
+
+  if (twinIdentitySetup) {
+    try {
+      await saveInlineTwinIdentity(twinIdentitySetup)
+    } catch (err) {
+      console.error('Failed to save Twin Identity before submit:', err)
+      saveMessage.value = {
+        type: 'error',
+        text: err.message || 'Failed to save Twin Identity'
+      }
+      setTimeout(() => { saveMessage.value = null }, 5000)
       return
     }
   }

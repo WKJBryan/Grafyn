@@ -117,7 +117,7 @@ describe('PromptDialog', () => {
     expect(wrapper.find('.btn-primary').attributes('disabled')).toBeDefined()
   })
 
-  it('blocks Twin Simulation until identity name and role are configured', async () => {
+  it('asks for Twin Identity inline before running Simulation', async () => {
     const wrapper = mountDialog({
       twinLlmProvider: 'ollama',
       ollamaModel: 'llama3.1:8b',
@@ -127,8 +127,23 @@ describe('PromptDialog', () => {
     await wrapper.find('#prompt').setValue('Simulate my likely response')
     await wrapper.find('#contextMode').setValue('twin')
 
-    expect(wrapper.text()).toContain('Set up Twin Identity with a name and role before running Simulation')
+    expect(wrapper.text()).toContain('Twin Identity')
+    expect(wrapper.text()).toContain('Who should this twin be?')
+    expect(wrapper.text()).toContain('What work or role should this twin reason from?')
     expect(wrapper.find('.btn-primary').attributes('disabled')).toBeDefined()
+
+    await wrapper.find('#inlineTwinName').setValue('Alex Chen')
+    await wrapper.find('#inlineTwinRole').setValue('founder deciding from product evidence')
+    await wrapper.find('.btn-primary').trigger('click')
+
+    expect(wrapper.emitted('submit')[0][0]).toMatchObject({
+      contextMode: 'twin',
+      twinAnswerMode: 'simulation',
+      twinIdentitySetup: {
+        twin_name: 'Alex Chen',
+        twin_role: 'founder deciding from product evidence'
+      }
+    })
   })
 
   it('allows Twin Simulation after identity name and role are configured', async () => {
