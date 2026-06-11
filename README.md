@@ -52,6 +52,7 @@ The first usable twin mode is a **native RAG twin**:
 - Full-text search powered by Tantivy.
 - Backlinks, outgoing links, and graph-aware retrieval.
 - Conversation import from ChatGPT, Claude, Grok, Gemini, and Codex-style exports.
+- Structured vault migration with preview, apply, and rollback.
 
 ### Knowledge Graph And Hub Clustering
 
@@ -72,6 +73,12 @@ The first usable twin mode is a **native RAG twin**:
 - Twin context mode using reviewed user records.
 - Smart web search detection for prompts that need current information.
 - Save Canvas sessions as notes.
+- **Local model support** via Ollama — run Canvas and twin answers on local models alongside OpenRouter cloud models.
+
+### Vault Automation
+
+- **Background link discovery** — scans the vault continuously for potential `[[wikilinks]]` using keyword extraction and similarity, surfaces suggestions in the Link Suggestion inbox.
+- **Vault Optimizer** — background service that queues and applies structural improvements to notes (tag cleanup, sidecar metadata, full rewrites). Budget caps and per-change rollback keep it safe to enable.
 
 ### Twin Capture And Review
 
@@ -164,6 +171,27 @@ Grafyn's data can later support stronger personal models, but those are not v1:
 - **Preference/ranking model** - learns what answer shape or decision style you choose.
 - **Local adapters or fine-tuning** - adjusts a capable base model using reviewed examples.
 - **Scratch-trained personal model** - research path only. Prompts alone are not enough; it would require large volumes of personal writing, decisions, outcomes, corrections, and domain evidence.
+
+## Project Status
+
+| Area | Status |
+|------|--------|
+| Knowledge vault (notes, wikilinks, full-text search) | ✅ Stable |
+| Knowledge graph + topic hub clustering | ✅ Stable |
+| Multi-LLM Canvas with semantic note context | ✅ Stable |
+| Conversation import (ChatGPT, Claude, Grok, Gemini) | ✅ Stable |
+| Native RAG twin (Advisor + Simulation modes) | ✅ Stable |
+| Twin Identity, Constitution, Decision Mirror | ✅ Stable |
+| Twin evidence capture and review dashboard | ✅ Stable |
+| Local model support via Ollama | ✅ Stable |
+| Background link discovery | ✅ Stable |
+| Vault Optimizer (background vault improvements) | ✅ Stable |
+| Structured vault migration (preview/apply/rollback) | ✅ Stable |
+| MCP server (`grafyn-mcp`) for Claude Desktop / Codex Desktop | ✅ Stable |
+| Preference / ranking model from export bundles | 🔲 Not started |
+| Local adapters or fine-tuning from reviewed evidence | 🔲 Not started |
+
+Current version: see [Releases](https://github.com/WKJBryan/Grafyn/releases/latest).
 
 ## Quick Start
 
@@ -260,7 +288,7 @@ Tauri Desktop App
 | Backend | Rust |
 | Search | Tantivy |
 | Graph | petgraph + local graph algorithms |
-| LLM Runtime | OpenRouter via reqwest |
+| LLM Runtime | OpenRouter via reqwest; Ollama for local models |
 | MCP | rmcp over stdio |
 | Storage | Local markdown vault + JSON data files |
 | Updates | Cloudflare R2 + Workers |

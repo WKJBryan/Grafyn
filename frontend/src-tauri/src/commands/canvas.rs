@@ -2930,7 +2930,7 @@ fn build_twin_context_prompt(
         ),
         TwinAnswerMode::Simulation => prompt.push_str(
             "Answer in first person from the configured Twin Identity. Use approved records as stronger style and preference evidence; mention candidate influence as tentative when relevant. \
-             Write as a natural continuation of my documented reasoning pattern, not a report. Lead with my likely reasoning or judgment, show the tradeoff logic, and ask sharp reflective questions when useful. \
+             Write as a natural continuation of my documented reasoning pattern, not a report. Lead with my likely reasoning or judgment, show the tradeoff logic, and do not append questions unless the user's request asks for them. \
              If the evidence packet does not contain enough basis, say so naturally in first person. Use light citations or brief source mentions only where they help; avoid turning the answer into an evidence workflow.\n",
         ),
     }
@@ -2956,14 +2956,7 @@ fn build_twin_context_prompt(
                  In Constitution Check, separate stated values, revealed behavior, taste, somatic signal, and constraints. In Action Gap Risk, state whether past intention-action gaps could change the next step. \
                  Recommendation must be derived after the Constitution Check and Evidence From Grafyn sections, not before them.\n",
             ),
-            TwinAnswerMode::Simulation => prompt.push_str(
-                "\n## Decision Mirror Simulation Style\n\n\
-                 This is a Decision Mirror simulation session. Do not return numbered headings or a card template. \
-                 Return a natural first-person reflection that feels like my reasoning pattern thinking through the decision. \
-                 Prefer concise paragraphs over sections. Start with my likely judgment or hesitation, then explain the filters, tradeoffs, and next question. \
-                 Keep light citations or parenthetical source mentions where helpful, but keep evidence backstage. \
-                 Treat every self-model claim as evidence-constrained. If a useful claim is weakly supported, say so naturally.\n",
-            ),
+            TwinAnswerMode::Simulation => {}
         }
 
         if let Some(metadata) = decision_metadata {
@@ -3555,6 +3548,11 @@ mod tests {
         assert!(prompt.contains("My role/context is founder deciding from product evidence."));
         assert!(prompt.contains("Use reviewed notes and uploaded interviews only."));
         assert!(prompt.contains("Continue my documented reasoning pattern"));
+        assert!(prompt.contains(
+            "do not append questions unless the user's request asks for them"
+        ));
+        assert!(!prompt.contains("reflective questions"));
+        assert!(!prompt.contains("next question"));
         assert!(!prompt.contains("not the user's actual view"));
         assert!(prompt.contains("## Reviewed Constitution"));
     }
@@ -3602,7 +3600,7 @@ mod tests {
     }
 
     #[test]
-    fn decision_simulation_prompt_uses_natural_reflection_instructions() {
+    fn decision_simulation_prompt_uses_base_simulation_without_decision_style_block() {
         let metadata = DecisionPromptMetadata {
             decision: "Should Grafyn build Decision Mirror first?".into(),
             options: vec!["Decision Mirror".into(), "Topology layer".into()],
@@ -3626,8 +3624,13 @@ mod tests {
         assert!(!prompt.contains("Reflection Card"));
         assert!(!prompt.contains("Evidence From Grafyn"));
         assert!(!prompt.contains("Blind Spot Hypothesis"));
-        assert!(prompt.contains("natural first-person reflection"));
-        assert!(prompt.contains("light citations"));
+        assert!(!prompt.contains("Decision Mirror Simulation Style"));
+        assert!(!prompt.contains("Decision Mirror simulation session"));
+        assert!(!prompt.contains("natural first-person reflection"));
+        assert!(!prompt.contains("numbered headings"));
+        assert!(prompt.contains(
+            "do not append questions unless the user's request asks for them"
+        ));
         assert!(!prompt.contains("not the user's actual view"));
         assert!(prompt.contains("Decision: Should Grafyn build Decision Mirror first?"));
     }

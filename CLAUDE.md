@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 | Component | Stack | Entry Point | Port |
 |-----------|-------|-------------|------|
 | **Backend (Rust)** | Tauri, Tantivy, petgraph, reqwest | `frontend/src-tauri/src/main.rs` | N/A |
-| **MCP Server** | rmcp, Tantivy, stdio transport | `frontend/src-tauri/src/mcp.rs` | stdio |
+| **MCP Server** | rmcp, Tantivy, stdio transport | `frontend/src-tauri/src/mcp.rs` (entry) + `mcp_tools.rs` (tool impls) | stdio |
 | **Frontend** | Vue 3, Vite, Pinia, D3.js | `frontend/src/main.js` | 5173 |
 
 ## Development Commands
@@ -25,7 +25,7 @@ npm run format       # Format code
 
 ### Desktop App (Tauri)
 
-**Prerequisites:** See [Tauri v1 prerequisites](https://v1.tauri.app/v1/guides/getting-started/prerequisites). Also need Rust via [rustup](https://rustup.rs/). Generate app icons with `node scripts/generate-icons.cjs`.
+**Prerequisites:** See [Tauri v1 prerequisites](https://v1.tauri.app/v1/guides/getting-started/prerequisites). Also need Rust via [rustup](https://rustup.rs/). Generate app icons with `npm run generate-icons`.
 
 ```bash
 cd frontend
@@ -41,13 +41,21 @@ Environment: `set OPENROUTER_API_KEY=your-key` (Windows) or `export OPENROUTER_A
 ### Testing
 
 ```bash
-# Rust tests
-cd frontend/src-tauri
+# Rust tests — build the MCP sidecar binary first (required by Tauri's externalBin config)
+cd frontend
+npm run prepare:sidecar
+cd src-tauri
 cargo test
+
+# Run a single Rust test
+cargo test test_name            # or: cargo test module::path
 
 # Frontend unit tests
 cd frontend
 npm run test:run
+
+# Run a single frontend test file
+npx vitest run src/__tests__/unit/components/PromptDialog.spec.js
 ```
 
 ## Architecture Overview
@@ -65,8 +73,9 @@ Grafyn is a **desktop-only** app — a single Tauri binary with a Vue frontend a
 │  │            Rust Backend                   │  │
 │  │  Commands → Services → Local Filesystem   │  │
 │  │  (notes, search, graph, canvas, distill,   │  │
-│  │   settings, feedback, mcp, memory,         │  │
-│  │   import, priority, retrieval, zettelkasten)│  │
+│  │   settings, feedback, mcp, memory, import, │  │
+│  │   priority, retrieval, zettelkasten, twin, │  │
+│  │   migration, boot)                          │  │
 │  └──────────────────────────────────────────┘  │
 │  ~/Documents/Grafyn/                          │
 │  ├── vault/  (markdown notes)                   │
@@ -83,22 +92,25 @@ Grafyn is a **desktop-only** app — a single Tauri binary with a Vue frontend a
 | `commands/graph.rs` | `get_backlinks`, `get_outgoing`, `get_neighbors`, `get_unlinked`, `get_full_graph`, `rebuild_graph` | Link graph |
 | `commands/canvas.rs` | `list_sessions`, `get_session`, `create_session`, `update_session`, `delete_session`, `get_available_models`, `send_prompt`, `update_tile_position`, `delete_tile`, `delete_response`, `update_viewport`, `update_llm_node_position`, `auto_arrange`, `export_to_note`, `start_debate`, `continue_debate`, `add_models_to_tile`, `regenerate_response` | Multi-LLM canvas with note context (streaming via `canvas-stream` Tauri events) |
 | `commands/distill.rs` | `distill_note`, `normalize_tags` | LLM + rules-based distillation with dedup and hub creation |
-| `commands/settings.rs` | `get_settings`, `get_settings_status`, `update_settings`, `complete_setup`, `pick_vault_folder`, `validate_openrouter_key`, `get_openrouter_status` | App settings & first-run setup |
+| `commands/settings.rs` | `get_settings`, `get_settings_status`, `update_settings`, `complete_setup`, `pick_vault_folder`, `validate_openrouter_key`, `get_openrouter_status`, `get_ollama_status`, `list_ollama_models` | App settings, first-run setup, Ollama local model status |
 | `commands/feedback.rs` | `submit_feedback`, `get_system_info`, `feedback_status`, `get_pending_feedback`, `retry_pending_feedback`, `clear_pending_feedback` | Feedback with offline queue |
 | `commands/mcp.rs` | `get_mcp_status`, `get_mcp_config_snippet` | MCP config for Claude Desktop |
 | `commands/memory.rs` | `recall_relevant`, `find_contradictions`, `extract_claims` | Memory recall & contradiction detection |
 | `commands/priority.rs` | `get_priority_settings`, `update_priority_settings`, `reset_priority_settings` | Configurable search result ranking |
 | `commands/retrieval.rs` | `retrieve_relevant`, `get_retrieval_config`, `update_retrieval_config` | Temporal + graph-aware retrieval pipeline |
-| `commands/zettelkasten.rs` | `discover_links`, `apply_links`, `create_link`, `get_link_types` | Zettelkasten link discovery |
-| `commands/import.rs` | `preview_import`, `apply_import`, `get_supported_formats` | Conversation import (ChatGPT, Claude, Grok, Gemini) |
-| `commands/twin.rs` | user records, review, Decision Mirror, Constitution, action gaps, setup, export | Twin evidence store, Twin Workspace, and first-person Simulation setup |
+| `commands/zettelkasten.rs` | `discover_links`, `apply_links`, `create_link`, `get_link_types`, `list_link_suggestion_queue`, `dismiss_link_suggestion`, `get_link_discovery_status` | On-demand and background link discovery |
+| `commands/import.rs` | `preview_import`, `apply_import`, `get_supported_formats` | Conversation + document import (chat exports, transcripts, DOCX, PDF) |
+| `commands/twin.rs` | `list_user_records`, `get_user_record`, `create_user_record`, `update_user_record`, `run_twin_inference`, `get_twin_review`, `resolve_user_record_evidence`, `set_user_record_promotion`, `export_twin_data`, `list_decision_episodes`, `update_decision_outcome`, `get/update/reset_decision_mirror_config`, `list/review_memory_digest`, `list/create/update/review_constitution_item`, `list/review_action_gap`, `get/save_constitution_setup`, `run_constitution_inference`, `record_canvas_feedback`, `get_session_trace` | Twin evidence store, Twin Workspace, and first-person Simulation setup |
+| `commands/migration.rs` | `preview_markdown_migration`, `apply_markdown_migration`, `get_markdown_migration_status`, `rollback_markdown_migration`, `get_vault_optimizer_status`, `update_vault_optimizer_settings`, `list_vault_optimizer_decisions`, `get_vault_optimizer_inbox`, `rollback_vault_optimizer_change` | Structured vault migration + background vault optimizer |
+| `commands/boot.rs` | `get_boot_status` | App startup state (index ready, migration status) |
 
 ### Frontend API Client
 
 ```javascript
 // src/api/client.js — all calls go through Tauri IPC
-import { notes, search, graph, canvas, settings, mcp, memory,
-         zettelkasten, feedback, priority, retrieval, importApi, isDesktopApp } from '@/api/client'
+import { boot, notes, search, graph, canvas, settings, mcp, memory,
+         zettelkasten, feedback, priority, retrieval, importApi,
+         migration, optimizer, twin, isDesktopApp } from '@/api/client'
 
 // Every function calls invoke() directly to the Rust backend
 // Canvas streaming uses canvas-stream Tauri events (including ContextNotes for semantic mode)
@@ -195,13 +207,17 @@ Simulation mode uses first-person model-facing instructions such as `I am {twin_
 
 Twin Workspace (`/twin`) owns review and setup: user records, memory digest, Constitution items, action gaps, decision episodes/outcomes, Decision Mirror config, and guided setup. `Save Setup` writes guided setup Constitution items for operating priors; the identity fields are setup metadata and should not become normal Constitution items.
 
+See `TWIN_RAG_SPEC.md` for the full twin RAG specification and `WORKING_GUIDE.md` for release workflow details.
+
+**Twin accuracy evaluation is external by design (owner decision, 2026-06-10):** Do NOT build in-app accuracy scoring, benchmark dashboards, or eval-result UIs. This is a public repo and the owner does not want to impose a specific evaluation format on users. The app's responsibility is **capture + export only**: sealed twin predictions at decision time, decision outcomes, feedback/ranking traces, and the JSONL export bundles (train/eval/holdout splits). Scoring, holdout replay, calibration analysis, and accuracy dashboards live in the owner's external evaluation harness (separate lab environment), consuming the exported data. See `TWIN_ACCURACY_ROADMAP.md`.
+
 **Web search:** When `web_search: true`, OpenRouter's `plugins: [{"id": "web", "max_results": 5}]` is added to the API request (~$0.02/query per model). The `web_search` flag is threaded through the full stack and persisted on `PromptTile` for regenerate/add-model replay.
 
 **Smart web search auto-detection:** Controlled by `UserSettings.smart_web_search` (default: `true`). When enabled, `useWebSearchDetection.js` analyzes prompt text with 5 heuristic rules (temporal markers, explicit search intent, news patterns, freshness queries, comparisons) and suppression rules (code blocks, wikilinks, short prompts). Detection result is shown as a hint in `PromptDialog.vue`. Disable via Settings toggle.
 
-### Conversation Import
+### Conversation & Document Import
 
-Import conversations from ChatGPT, Claude, Grok, or Gemini as evidence notes. Four format parsers with auto-detection via platform-specific JSON keys. Each parser implements `can_parse()` + `parse()`. Imported conversations become evidence-status container notes with provenance metadata (`source`, `source_id`, `created_via`).
+Import external content as evidence notes. Six parsers in `services/import/`: `chatgpt`, `claude`, `grok`, `gemini`, `transcript` (plain transcript/Codex-style exports), and `document` (DOCX/PDF). Conversation formats auto-detect via platform-specific JSON keys; each parser implements `can_parse()` + `parse()`. Document imports split DOCX/PDF files into linked section notes (PDF heading detection, with optional outline titles) and add structural wikilinks. Imported content becomes evidence-status container notes with provenance metadata (`source`, `source_id`, `created_via`). Both conversation and document paths flow through the same `preview_import` → `apply_import` commands.
 
 ### Temporal + Graph-Aware Retrieval
 
@@ -210,6 +226,24 @@ Import conversations from ChatGPT, Claude, Grok, or Gemini as evidence notes. Fo
 **Chunk-level pipeline:** `retrieve_chunks()` searches the `ChunkIndex` (paragraph-level Tantivy index built via TextTiling), applies the same graph/hub/priority boosts via parent note, then greedily fills a token budget. Used by canvas semantic mode for precise context injection.
 
 Configurable via `RetrievalConfig` (persisted in `data/retrieval_config.json`): `graph_hop_depth`, `graph_proximity_weight`, `hub_boost_weight`, `hub_threshold`, `base_search_limit`, `default_token_budget`, `chunk_retrieval_enabled`, `relation_weights`.
+
+### Topic Hub Auto-Management
+
+`services/topic_hub.rs` automatically manages topic hub notes that act as tag-keyed index pages. Called via `sync_topic_hubs()` in `commands/mod.rs`. **This is the gateway to all index rebuilds** — `rebuild_all_indexes()` calls `sync_topic_hubs()` first, so hub state is always consistent before search/graph/chunk/optimizer indexes are rebuilt.
+
+Hub clustering rules: label-propagation over linked note groups; noise filtering suppresses model names, provider names, and transcript artifacts from becoming hubs; minor themes are grouped under a parent hub's `Subtopics` section rather than creating new hubs.
+
+### Background Services
+
+These services run automatically in the background and have dedicated inbox/decision/rollback APIs. Do not re-implement any of these — they already exist.
+
+**`services/link_discovery.rs`** — background link-discovery worker. Distinct from on-demand zettelkasten discovery (`discover_links` command). Uses YAKE keyword extraction (`services/yake.rs`) and TF-IDF cosine similarity (`services/similarity.rs`) to find wikilink candidates without LLM calls. Optional LLM pass controlled by `background_link_discovery_llm_enabled`. Results surface via `list_link_suggestion_queue` / `dismiss_link_suggestion` commands.
+
+**`services/vault_optimizer.rs`** — background vault optimizer. Queued via `enqueue_vault_optimizer_note()` whenever notes are created or migrated. Processes the queue and applies structural improvements in two modes: `sidecar_first` (overlay metadata) or `full_rewrite`. Budget caps and daily write limits prevent runaway LLM spend. Decisions are auditable via `list_vault_optimizer_decisions`; rollbacks are per-change via `rollback_vault_optimizer_change`.
+
+**`services/markdown_migration.rs`** — one-shot structured vault migration. Preview → apply → rollback workflow. `apply_markdown_migration` runs `sync_topic_hubs` and rebuilds all indexes after applying, then enqueues touched notes in the vault optimizer. Rollback restores pre-migration state and rebuilds.
+
+**`services/yake.rs`** / **`services/similarity.rs`** — keyword extraction (YAKE algorithm) and TF-IDF similarity, used by link discovery. Not to be re-implemented as generic utilities.
 
 ### Feedback & Bug Reporting
 
@@ -221,10 +255,15 @@ First-run setup wizard and persistent settings. Manages vault path, OpenRouter A
 
 - **`llm_model`** — configurable LLM model for distillation and link discovery (default: `anthropic/claude-3.5-haiku`), selectable via Settings dropdown when API key is configured
 - **`smart_web_search`** — enables automatic web search detection in canvas prompts (default: `true`). Uses `#[serde(default = "default_smart_web_search")]` for backward-compatible `true` default.
+- **`twin_llm_provider`** — selects the LLM runtime for twin context answers: `"openrouter"` (default) or `"ollama"`. Gates whether `OllamaService` or `OpenRouterService` is used in `build_twin_context_prompt()`.
+- **`ollama_base_url`** / **`ollama_model`** — endpoint and model for local inference. `get_ollama_status` probes the Ollama daemon; `list_ollama_models` enumerates pulled models. Synced via `ollama.set_base_url()` on settings change.
+- **`background_link_discovery_enabled`** / **`background_link_discovery_llm_enabled`** — controls the background link-discovery worker. When enabled, `LinkDiscoveryService` processes notes in the background using YAKE keyword extraction and TF-IDF similarity.
+- **`background_vault_optimizer_enabled`** — controls the `VaultOptimizerService`. When enabled, optimizer processes queued notes and applies structural improvements (sidecar overlay or full rewrite mode). Budget and max daily writes cap LLM costs.
 
 **Runtime sync pattern:** When settings change via `update_settings`, dependent services are updated in-place — no restart required. The pattern (in `commands/settings.rs`): capture changed fields before moving the update, apply settings, then sync each affected service:
 - **OpenRouter API key** → `openrouter.set_api_key()`
-- **Vault path** → `knowledge_store.set_vault_path()` + rebuild search index + rebuild graph index
+- **Ollama base URL** → `ollama.set_base_url()`
+- **Vault path** → `knowledge_store.set_vault_path()` + rebuild search index + rebuild graph index + reinitialize `TwinStore`
 
 ## Configuration
 
@@ -247,17 +286,20 @@ Claude Desktop → launches grafyn-mcp (stdio) → reads/writes vault files
                                               → traverses link graph
 ```
 
-**Architecture:** The `grafyn-mcp` binary is a second `[[bin]]` target in the same `Cargo.toml`, compiled with `--no-default-features --features mcp` (no Tauri). It shares `services/` and `models/` modules with the Tauri app.
+**Architecture:** The `grafyn-mcp` binary is a second `[[bin]]` target in the same `Cargo.toml`, compiled with `--no-default-features --features mcp` (no Tauri). It shares `services/` and `models/` modules with the Tauri app. `mcp.rs` is the thin binary entry point; all tool implementations live in `mcp_tools.rs` (`#[tool_router]` on `GrafynMcpServer`).
 
 **Concurrent access:** The MCP binary tries to acquire the Tantivy writer lock. If the Tauri app holds it, it falls back to read-only search (queries work, index updates are skipped). File I/O to the vault is always safe.
 
 **Building locally:**
 ```bash
-cd frontend/src-tauri
+cd frontend
+npm run prepare:sidecar             # debug build + copy into src-tauri/binaries/
+# or manually:
+cd src-tauri
 cargo build --release --bin grafyn-mcp --no-default-features --features mcp
 ```
 
-**11 MCP tools:** `list_notes`, `get_note`, `create_note`, `update_note`, `delete_note`, `search_notes`, `get_backlinks`, `get_outgoing`, `recall_relevant` (with optional `token_budget` for chunk retrieval), `search_chunks` (paragraph-level search with token budgeting), `import_conversation`
+**11 MCP tools:** `list_notes`, `get_note`, `create_note`, `update_note`, `delete_note`, `search_notes`, `get_backlinks`, `get_outgoing`, `recall_relevant` (with optional `token_budget` for chunk retrieval), `search_chunks` (paragraph-level search with token budgeting), `import_conversation` (also accepts documents and transcripts, splitting them into linked section notes)
 
 **Connecting Claude Desktop:** Add to `claude_desktop_config.json`:
 ```json
@@ -335,11 +377,11 @@ Tauri v1 depends on `libwebkit2gtk-4.0-dev` which **does not exist on Ubuntu 24.
 
 `cargo test` compiles the full crate including `tauri::generate_context!()`. Two prerequisites must exist before running tests:
 
-1. **MCP binary** — Tauri's `externalBin` config expects `binaries/grafyn-mcp-{target-triple}` at compile time.
+1. **MCP binary** — Tauri's `externalBin` config expects `binaries/grafyn-mcp-{target-triple}` at compile time. Use the script that CI uses:
    ```bash
-   cargo build --bin grafyn-mcp --no-default-features --features mcp
-   cp target/debug/grafyn-mcp "binaries/grafyn-mcp-$(rustc -vV | grep host | awk '{print $2}')"
+   cd frontend && npm run prepare:sidecar
    ```
+   (Builds `grafyn-mcp` with `--no-default-features --features mcp` and copies it to `binaries/grafyn-mcp-<host-triple>`. Supports `--release`, `--locked`, `--target <triple>`.)
 2. **Stub dist directory** — `tauri::generate_context!()` panics if `distDir` (configured as `../dist`) doesn't exist.
    ```bash
    mkdir -p ../dist && echo '<html></html>' > ../dist/index.html

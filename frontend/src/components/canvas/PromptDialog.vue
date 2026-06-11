@@ -260,12 +260,30 @@
       <span class="context-mode-hint">
         {{ twinModeHints[twinAnswerMode] }}
       </span>
-      <span
-        v-if="requiresTwinIdentity && !hasTwinIdentity"
-        class="context-mode-hint identity-warning"
+      <div
+        v-if="needsInlineTwinIdentity"
+        class="inline-identity-fields"
       >
-        Set up Twin Identity with a name and role before running Simulation.
-      </span>
+        <strong>Twin Identity</strong>
+        <label for="inlineTwinName">
+          <span>Who should this twin be?</span>
+          <input
+            id="inlineTwinName"
+            v-model="inlineTwinName"
+            type="text"
+            placeholder="Name"
+          >
+        </label>
+        <label for="inlineTwinRole">
+          <span>What work or role should this twin reason from?</span>
+          <input
+            id="inlineTwinRole"
+            v-model="inlineTwinRole"
+            type="text"
+            placeholder="Role / context"
+          >
+        </label>
+      </div>
       <span class="context-mode-hint">
         Selected vault notes and twin records use the Twin Runtime selected below.
       </span>
@@ -419,6 +437,8 @@ const decisionOptionsText = ref('')
 const decisionStakes = ref('')
 const decisionInitialLeaning = ref('')
 const decisionReviewDate = ref('')
+const inlineTwinName = ref('')
+const inlineTwinRole = ref('')
 
 const searchDetection = computed(() => detectWebSearch(prompt.value))
 const isTwinSensitivePrompt = computed(() => promptType.value === 'decision' || contextMode.value !== 'none')
@@ -427,8 +447,14 @@ const configuredOllamaModel = computed(() => props.ollamaModel.trim())
 const hasTwinIdentity = computed(() =>
   Boolean(props.twinIdentity?.name?.trim() && props.twinIdentity?.role?.trim())
 )
+const hasInlineTwinIdentity = computed(() =>
+  Boolean(inlineTwinName.value.trim() && inlineTwinRole.value.trim())
+)
 const requiresTwinIdentity = computed(() =>
   contextMode.value === 'twin' && twinAnswerMode.value === 'simulation'
+)
+const needsInlineTwinIdentity = computed(() =>
+  requiresTwinIdentity.value && !hasTwinIdentity.value
 )
 const resolvedWebSearch = computed(() => (
   !usingLocalTwinRuntime.value &&
@@ -498,7 +524,7 @@ const reasoningEffortOptions = [
 // Computed
 const canSubmit = computed(() => {
   if (!prompt.value.trim()) return false
-  if (requiresTwinIdentity.value && !hasTwinIdentity.value) return false
+  if (needsInlineTwinIdentity.value && !hasInlineTwinIdentity.value) return false
   if (isTwinSensitivePrompt.value && !usingLocalTwinRuntime.value) {
     return props.openRouterConfigured && selectedModels.value.length > 0
   }
@@ -601,6 +627,12 @@ watch(promptType, (type) => {
 
 function handleSubmit() {
   if (!canSubmit.value) return
+  const twinIdentitySetup = needsInlineTwinIdentity.value
+    ? {
+        twin_name: inlineTwinName.value.trim(),
+        twin_role: inlineTwinRole.value.trim()
+      }
+    : null
 
   emit('submit', {
     prompt: prompt.value.trim(),
@@ -613,7 +645,8 @@ function handleSubmit() {
     contextMode: contextMode.value,
     twinAnswerMode: twinAnswerMode.value,
     twinLlmProvider: isTwinSensitivePrompt.value ? selectedTwinProvider.value : null,
-    webSearch: resolvedWebSearch.value
+    webSearch: resolvedWebSearch.value,
+    twinIdentitySetup
   })
 }
 </script>
@@ -713,7 +746,8 @@ function handleSubmit() {
 
 .prompt-input,
 .system-input,
-.text-input {
+.text-input,
+.inline-identity-fields input {
   width: 100%;
   padding: var(--spacing-sm);
   background: var(--bg-tertiary);
@@ -731,7 +765,8 @@ function handleSubmit() {
 
 .prompt-input:focus,
 .system-input:focus,
-.text-input:focus {
+.text-input:focus,
+.inline-identity-fields input:focus {
   border-color: var(--accent-primary);
   outline: none;
   box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent-primary) 30%, transparent);
@@ -870,6 +905,30 @@ function handleSubmit() {
 
 .identity-warning {
   color: var(--accent-red);
+}
+
+.inline-identity-fields {
+  display: grid;
+  gap: var(--spacing-sm);
+  padding: var(--spacing-sm);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--bg-tertiary) 75%, transparent);
+}
+
+.inline-identity-fields strong {
+  color: var(--text-primary);
+  font-size: 0.875rem;
+}
+
+.inline-identity-fields label {
+  display: grid;
+  gap: var(--spacing-xs);
+}
+
+.inline-identity-fields label span {
+  color: var(--text-secondary);
+  font-size: 0.78rem;
 }
 
 .segmented-control,

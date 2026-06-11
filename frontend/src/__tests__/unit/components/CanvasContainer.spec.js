@@ -2,7 +2,7 @@ import { describe, expect, it, beforeEach, vi } from 'vitest'
 import { mount, flushPromises } from '@vue/test-utils'
 import CanvasContainer from '@/components/canvas/CanvasContainer.vue'
 
-const { store, getOpenRouterStatus, getStatus, getSettings, updateSettings, listOllamaModels, getConstitutionSetup, toastSuccess } = vi.hoisted(() => ({
+const { store, getOpenRouterStatus, getStatus, getSettings, updateSettings, listOllamaModels, getConstitutionSetup, saveConstitutionSetup, toastSuccess } = vi.hoisted(() => ({
   store: {
     currentSession: {
       id: 'session-1',
@@ -58,6 +58,7 @@ const { store, getOpenRouterStatus, getStatus, getSettings, updateSettings, list
   updateSettings: vi.fn(),
   listOllamaModels: vi.fn(),
   getConstitutionSetup: vi.fn(),
+  saveConstitutionSetup: vi.fn(),
   toastSuccess: vi.fn()
 }))
 
@@ -74,7 +75,8 @@ vi.mock('@/api/client', () => ({
     listOllamaModels
   },
   twin: {
-    getConstitutionSetup
+    getConstitutionSetup,
+    saveConstitutionSetup
   },
   isDesktopApp: () => true
 }))
@@ -186,6 +188,21 @@ function mountContainer() {
                 twinLlmProvider: 'ollama',
                 webSearch: false
               })" />
+              <button class="identity-submit-stub" @click="$emit('submit', {
+                prompt: 'Simulate my likely response',
+                promptType: 'standard',
+                models: ['llama3.1:8b'],
+                systemPrompt: null,
+                temperature: 0.4,
+                contextMode: 'twin',
+                twinAnswerMode: 'simulation',
+                twinLlmProvider: 'ollama',
+                webSearch: false,
+                twinIdentitySetup: {
+                  twin_name: 'Alex Chen',
+                  twin_role: 'founder deciding from product evidence'
+                }
+              })" />
             </div>
           `
         }
@@ -280,6 +297,7 @@ describe('CanvasContainer', () => {
       twin_name: 'Alex Chen',
       twin_role: 'founder deciding from product evidence'
     })
+    saveConstitutionSetup.mockResolvedValue({})
     toastSuccess.mockReset()
   })
 
@@ -293,6 +311,55 @@ describe('CanvasContainer', () => {
 
     expect(wrapper.find('.prompt-dialog-stub').exists()).toBe(true)
     expect(wrapper.text()).not.toContain('OpenRouter API Key Required')
+  })
+
+  it('saves inline Twin Identity before submitting a simulation prompt', async () => {
+    getOpenRouterStatus.mockResolvedValue({ has_key: true, is_configured: true })
+    getConstitutionSetup.mockResolvedValueOnce({
+      values: ['evidence-backed work'],
+      tastes: [],
+      constraints: [],
+      somatic_cues: [],
+      action_tendencies: []
+    }).mockResolvedValue({
+      twin_name: 'Alex Chen',
+      twin_role: 'founder deciding from product evidence',
+      values: ['evidence-backed work'],
+      tastes: [],
+      constraints: [],
+      somatic_cues: [],
+      action_tendencies: []
+    })
+    const wrapper = mountContainer()
+    await flushPromises()
+
+    await wrapper.find('[data-guide="canvas-prompt-btn"]').trigger('click')
+    await flushPromises()
+    await wrapper.find('.identity-submit-stub').trigger('click')
+    await flushPromises()
+
+    expect(saveConstitutionSetup).toHaveBeenCalledWith(expect.objectContaining({
+      twin_name: 'Alex Chen',
+      twin_role: 'founder deciding from product evidence',
+      values: ['evidence-backed work']
+    }))
+    expect(store.sendPrompt).toHaveBeenCalledWith(
+      'Simulate my likely response',
+      ['llama3.1:8b'],
+      null,
+      0.4,
+      null,
+      null,
+      null,
+      'twin',
+      'simulation',
+      false,
+      undefined,
+      'standard',
+      null,
+      'none',
+      'ollama'
+    )
   })
 
   it('blocks API submit if OpenRouter becomes unavailable after the dialog opens', async () => {
