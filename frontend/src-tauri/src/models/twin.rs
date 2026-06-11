@@ -92,6 +92,7 @@ pub enum TraceEventType {
     ConstitutionInferenceRun,
     TileDeleted,
     ResponseDeleted,
+    TwinPredictionSealed,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -370,8 +371,51 @@ pub struct DecisionEpisode {
     pub missed_something: Option<String>,
     #[serde(default)]
     pub primitive_assessment: PrimitiveDecisionAssessment,
+    #[serde(default)]
+    pub twin_prediction: Option<TwinPrediction>,
+    #[serde(default)]
+    pub prediction_status: Option<String>,
+    #[serde(default)]
+    pub agreement: Option<bool>,
+    #[serde(default)]
+    pub correction_note: Option<String>,
+    #[serde(default)]
+    pub context_version: Option<String>,
+    #[serde(default)]
+    pub outcome_recorded_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+/// Parser output for a twin prediction before it is sealed into storage.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TwinPredictionDraft {
+    pub predicted_option: String,
+    #[serde(default)]
+    pub matched_option_index: Option<usize>,
+    #[serde(default)]
+    pub confidence: Option<f32>,
+    #[serde(default)]
+    pub rationale: Option<String>,
+    pub parse_mode: String,
+}
+
+/// A sealed twin prediction. `sealed_at` is stamped when the prediction is
+/// persisted; it must never be shown through UI, IPC, or export while the
+/// episode's `chosen_option` is unset.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TwinPrediction {
+    pub predicted_option: String,
+    #[serde(default)]
+    pub matched_option_index: Option<usize>,
+    #[serde(default)]
+    pub confidence: Option<f32>,
+    #[serde(default)]
+    pub rationale: Option<String>,
+    pub parse_mode: String,
+    pub model_id: String,
+    pub context_version: String,
+    pub sealed_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -390,6 +434,8 @@ pub struct DecisionEpisodeCreate {
     pub review_date: Option<String>,
     #[serde(default)]
     pub primitive_assessment: PrimitiveDecisionAssessment,
+    #[serde(default)]
+    pub context_version: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -412,6 +458,8 @@ pub struct DecisionOutcomeUpdate {
     pub missed_something: Option<String>,
     #[serde(default)]
     pub primitive_assessment: Option<PrimitiveDecisionAssessment>,
+    #[serde(default)]
+    pub correction_note: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -657,6 +705,8 @@ pub struct DecisionEpisodeWithReflections {
     pub reflection_cards: Vec<ReflectionCard>,
     #[serde(default)]
     pub feedback_events: Vec<TraceEvent>,
+    #[serde(default)]
+    pub prediction_sealed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -912,6 +962,8 @@ pub struct ExportBundle {
     pub decision_mirror_benchmark: ExportFileSummary,
     pub constitution_items: ExportFileSummary,
     pub action_gaps: ExportFileSummary,
+    pub decision_episodes: ExportFileSummary,
+    pub feedback_events: ExportFileSummary,
     pub manifest_path: String,
     pub included_records: usize,
     pub excluded_records: usize,
