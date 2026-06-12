@@ -31,516 +31,561 @@
       </div>
     </header>
 
-    <nav class="workspace-tabs">
-      <button
-        v-for="tab in tabs"
-        :key="tab.id"
-        class="tab-button"
-        :class="{ active: activeTab === tab.id }"
-        @click="activeTab = tab.id"
-      >
-        <span>{{ tab.label }}</span>
-        <strong v-if="tab.count !== null">{{ tab.count }}</strong>
-      </button>
-    </nav>
-
-    <main class="workspace-main">
-      <section
-        v-if="activeTab === 'overview'"
-        class="tab-panel overview-grid"
-      >
-        <article class="metric-tile">
-          <span>Constitution</span>
-          <strong>{{ activeConstitutionCount }}</strong>
-          <small>{{ constitutionItems.length }} total items</small>
-        </article>
-        <article class="metric-tile">
-          <span>Action Gaps</span>
-          <strong>{{ activeActionGapCount }}</strong>
-          <small>{{ actionGaps.length }} total gaps</small>
-        </article>
-        <article class="metric-tile">
-          <span>Decisions</span>
-          <strong>{{ decisions.length }}</strong>
-          <small>{{ pendingFollowUps }} follow-ups pending</small>
-        </article>
-        <article class="metric-tile">
-          <span>Review</span>
-          <strong>{{ pendingReviewCount }}</strong>
-          <small>digest plus candidate records</small>
-        </article>
-
-        <section
-          v-if="showTutorialIntro"
-          class="workspace-band tutorial-intro"
+    <div class="workspace-body">
+      <nav class="workspace-rail">
+        <template
+          v-for="group in navGroups"
+          :key="group.id"
         >
-          <div class="band-header">
-            <h2>How To Use</h2>
-            <div class="header-actions compact">
-              <button
-                class="text-button"
-                @click="activeTab = 'guide'"
-              >
-                Open Guide
-              </button>
-              <button
-                class="text-button"
-                @click="dismissTutorial"
-              >
-                Dismiss
-              </button>
-            </div>
-          </div>
-          <p>
-            Start decisions in Canvas, then use Twin Workspace for review, setup, outcomes,
-            configuration, and benchmark export.
-          </p>
-        </section>
-
-        <section class="workspace-band">
-          <div class="band-header">
-            <h2>Recent Decisions</h2>
-            <button
-              class="text-button"
-              @click="activeTab = 'decisions'"
-            >
-              View all
-            </button>
-          </div>
-          <div
-            v-if="recentDecisions.length === 0"
-            class="empty-panel"
+          <span
+            v-if="group.label"
+            class="rail-label"
+          >{{ group.label }}</span>
+          <button
+            v-for="tab in group.tabs"
+            :key="tab.id"
+            class="tab-button"
+            :class="{ active: activeTab === tab.id }"
+            @click="activeTab = tab.id"
           >
-            No decision episodes yet.
-          </div>
-          <DecisionRow
-            v-for="item in recentDecisions"
-            :key="item.episode.id"
-            :item="item"
-            :highlighted="item.episode.id === routeDecisionId"
-            @update-outcome="updateDecisionOutcome"
-          />
-        </section>
+            <span>{{ tab.label }}</span>
+            <strong v-if="tab.count !== null">{{ tab.count }}</strong>
+          </button>
+        </template>
+      </nav>
 
-        <section class="workspace-band">
-          <div class="band-header">
-            <h2>Current Action Gaps</h2>
+      <main class="workspace-main">
+        <section
+          v-if="activeTab === 'overview'"
+          class="tab-panel"
+        >
+          <div class="overview-stats">
             <button
-              class="text-button"
+              class="metric-tile"
+              @click="activeTab = 'constitution'"
+            >
+              <span>Constitution</span>
+              <strong>{{ activeConstitutionCount }}</strong>
+              <small>{{ constitutionItems.length }} total items</small>
+            </button>
+            <button
+              class="metric-tile"
               @click="activeTab = 'action_gaps'"
             >
-              Review
+              <span>Action Gaps</span>
+              <strong>{{ activeActionGapCount }}</strong>
+              <small>{{ actionGaps.length }} total gaps</small>
+            </button>
+            <button
+              class="metric-tile"
+              @click="activeTab = 'decisions'"
+            >
+              <span>Decisions</span>
+              <strong>{{ decisions.length }}</strong>
+              <small>{{ pendingOutcomeCount }} outcomes pending</small>
+            </button>
+            <button
+              class="metric-tile"
+              @click="activeTab = 'memory'"
+            >
+              <span>Review</span>
+              <strong>{{ pendingReviewCount }}</strong>
+              <small>digest plus candidate records</small>
             </button>
           </div>
+
+          <section
+            v-if="showTutorialIntro"
+            class="workspace-band tutorial-intro"
+          >
+            <div class="band-header">
+              <h2>How To Use</h2>
+              <div class="header-actions compact">
+                <button
+                  class="text-button"
+                  @click="activeTab = 'guide'"
+                >
+                  Open Guide
+                </button>
+                <button
+                  class="text-button"
+                  @click="dismissTutorial"
+                >
+                  Dismiss
+                </button>
+              </div>
+            </div>
+            <p>
+              Start decisions in Canvas, then use Twin Workspace for review, setup, outcomes,
+              configuration, and benchmark export.
+            </p>
+          </section>
+
+          <section class="workspace-band">
+            <div class="band-header">
+              <h2>Recent Decisions</h2>
+              <button
+                class="text-button"
+                @click="activeTab = 'decisions'"
+              >
+                View all
+              </button>
+            </div>
+            <div
+              v-if="recentDecisions.length === 0"
+              class="empty-panel"
+            >
+              No decision episodes yet. Start a Decision in Canvas and it will appear here.
+            </div>
+            <button
+              v-for="item in recentDecisions"
+              :key="item.episode.id"
+              class="compact-row"
+              :class="{ highlighted: item.episode.id === routeDecisionId }"
+              @click="activeTab = 'decisions'"
+            >
+              <span
+                class="row-dot"
+                :class="decisionState(item)"
+              />
+              <span class="row-title">{{ item.episode.decision }}</span>
+              <span class="row-chips">
+                <span
+                  v-for="chip in decisionChips(item)"
+                  :key="chip.id"
+                  class="chip"
+                  :class="chip.cls"
+                >{{ chip.label }}</span>
+              </span>
+            </button>
+          </section>
+
+          <section class="workspace-band">
+            <div class="band-header">
+              <h2>Current Action Gaps</h2>
+              <button
+                class="text-button"
+                @click="activeTab = 'action_gaps'"
+              >
+                Review
+              </button>
+            </div>
+            <div
+              v-if="topActionGaps.length === 0"
+              class="empty-panel"
+            >
+              No action gaps found.
+            </div>
+            <button
+              v-for="gap in topActionGaps"
+              :key="gap.id"
+              class="compact-row"
+              @click="activeTab = 'action_gaps'"
+            >
+              <span class="row-dot is-pending" />
+              <span class="row-title">{{ gap.decision_risk }}</span>
+              <span class="row-chips">
+                <span class="chip">{{ formatPercent(gap.confidence) }}</span>
+              </span>
+            </button>
+          </section>
+        </section>
+
+        <section
+          v-else-if="activeTab === 'constitution'"
+          class="tab-panel"
+        >
+          <div class="panel-header">
+            <div>
+              <h2>Constitution</h2>
+              <span>The value rules the twin reasons from — {{ groupedConstitution.length }} dimensions</span>
+            </div>
+            <button
+              class="btn btn-secondary btn-sm"
+              @click="activeTab = 'setup'"
+            >
+              Setup
+            </button>
+          </div>
+
           <div
-            v-if="topActionGaps.length === 0"
+            v-if="constitutionItems.length === 0"
             class="empty-panel"
           >
-            No action gaps found.
+            No constitution items yet. Run Constitution to infer them from records and decisions.
+          </div>
+          <section
+            v-for="group in groupedConstitution"
+            :key="group.dimension"
+            class="dimension-section"
+          >
+            <h3>{{ dimensionLabel(group.dimension) }}</h3>
+            <article
+              v-for="item in group.items"
+              :key="item.id"
+              class="constitution-card"
+            >
+              <div class="card-topline">
+                <span class="status-pill">{{ statusLabel(item.status) }}</span>
+                <span>{{ formatPercent(item.confidence) }} confidence</span>
+                <span>{{ item.evidence_refs?.length || 0 }} evidence</span>
+                <span>{{ constitutionSourceLabel(item) }}</span>
+              </div>
+              <p>{{ item.claim }}</p>
+              <div
+                v-if="constitutionEvidenceLabels(item).length"
+                class="source-row"
+              >
+                <span
+                  v-for="label in constitutionEvidenceLabels(item)"
+                  :key="`${item.id}-${label}`"
+                >{{ label }}</span>
+              </div>
+              <div
+                v-if="item.scope?.length"
+                class="tag-row"
+              >
+                <span
+                  v-for="scope in item.scope"
+                  :key="scope"
+                >{{ scope }}</span>
+              </div>
+              <ReviewActions
+                @review="action => reviewConstitutionItem(item.id, action)"
+              />
+            </article>
+          </section>
+        </section>
+
+        <section
+          v-else-if="activeTab === 'action_gaps'"
+          class="tab-panel"
+        >
+          <div class="panel-header">
+            <div>
+              <h2>Action Gaps</h2>
+              <span>{{ actionGaps.length }} stated versus revealed patterns</span>
+            </div>
+          </div>
+          <div
+            v-if="actionGaps.length === 0"
+            class="empty-panel"
+          >
+            No action gaps yet.
           </div>
           <ActionGapRow
-            v-for="gap in topActionGaps"
+            v-for="gap in actionGaps"
             :key="gap.id"
             :gap="gap"
             @review="reviewActionGap"
           />
         </section>
-      </section>
 
-      <section
-        v-else-if="activeTab === 'constitution'"
-        class="tab-panel"
-      >
-        <div class="panel-header">
-          <div>
-            <h2>Constitution</h2>
-            <span>{{ groupedConstitution.length }} dimensions</span>
-          </div>
-          <button
-            class="btn btn-secondary btn-sm"
-            @click="activeTab = 'setup'"
-          >
-            Setup
-          </button>
-        </div>
-
-        <div
-          v-if="constitutionItems.length === 0"
-          class="empty-panel"
-        >
-          No constitution items yet.
-        </div>
         <section
-          v-for="group in groupedConstitution"
-          :key="group.dimension"
-          class="dimension-section"
+          v-else-if="activeTab === 'decisions'"
+          class="tab-panel"
         >
-          <h3>{{ dimensionLabel(group.dimension) }}</h3>
-          <article
-            v-for="item in group.items"
-            :key="item.id"
-            class="constitution-card"
-          >
-            <div class="card-topline">
-              <span class="status-pill">{{ statusLabel(item.status) }}</span>
-              <span>{{ formatPercent(item.confidence) }} confidence</span>
-              <span>{{ item.evidence_refs?.length || 0 }} evidence</span>
-              <span>{{ constitutionSourceLabel(item) }}</span>
-            </div>
-            <p>{{ item.claim }}</p>
-            <div
-              v-if="constitutionEvidenceLabels(item).length"
-              class="source-row"
-            >
-              <span
-                v-for="label in constitutionEvidenceLabels(item)"
-                :key="`${item.id}-${label}`"
-              >{{ label }}</span>
-            </div>
-            <div
-              v-if="item.scope?.length"
-              class="tag-row"
-            >
-              <span
-                v-for="scope in item.scope"
-                :key="scope"
-              >{{ scope }}</span>
-            </div>
-            <ReviewActions
-              @review="action => reviewConstitutionItem(item.id, action)"
-            />
-          </article>
-        </section>
-      </section>
-
-      <section
-        v-else-if="activeTab === 'action_gaps'"
-        class="tab-panel"
-      >
-        <div class="panel-header">
-          <div>
-            <h2>Action Gaps</h2>
-            <span>{{ actionGaps.length }} stated versus revealed patterns</span>
-          </div>
-        </div>
-        <div
-          v-if="actionGaps.length === 0"
-          class="empty-panel"
-        >
-          No action gaps yet.
-        </div>
-        <ActionGapRow
-          v-for="gap in actionGaps"
-          :key="gap.id"
-          :gap="gap"
-          @review="reviewActionGap"
-        />
-      </section>
-
-      <section
-        v-else-if="activeTab === 'decisions'"
-        class="tab-panel"
-      >
-        <div class="panel-header">
-          <div>
-            <h2>Decisions</h2>
-            <span>{{ decisions.length }} episodes</span>
-          </div>
-        </div>
-        <div
-          v-if="decisions.length === 0"
-          class="empty-panel"
-        >
-          No decision episodes yet.
-        </div>
-        <DecisionRow
-          v-for="item in decisions"
-          :key="item.episode.id"
-          :item="item"
-          :highlighted="item.episode.id === routeDecisionId"
-          :trace-open="item.episode.id === routeDecisionId && routeTraceRequested"
-          @update-outcome="updateDecisionOutcome"
-        />
-      </section>
-
-      <section
-        v-else-if="activeTab === 'memory'"
-        class="tab-panel memory-grid"
-      >
-        <section class="workspace-band">
-          <div class="panel-header compact">
+          <div class="panel-header">
             <div>
-              <h2>Adaptive Digest</h2>
-              <span>{{ memoryDigestItems.length }} clustered items</span>
+              <h2>Decisions</h2>
+              <span>{{ decisions.length }} episodes — record what you actually chose to reveal each sealed twin prediction</span>
             </div>
           </div>
           <div
-            v-if="memoryDigestItems.length === 0"
+            v-if="decisions.length === 0"
             class="empty-panel"
           >
-            No digest items need review.
+            No decision episodes yet. Start a Decision in Canvas and it will appear here.
           </div>
-          <article
-            v-for="item in memoryDigestItems"
-            :key="item.id"
-            class="digest-card"
-          >
-            <div class="card-topline">
-              <span class="status-pill">{{ statusLabel(item.state) }}</span>
-              <span>{{ item.evidence_count }} evidence</span>
-              <span>{{ item.trigger_reason }}</span>
-            </div>
-            <p>{{ item.pattern }}</p>
-            <small v-if="item.latest_evidence?.summary">{{ item.latest_evidence.summary }}</small>
-            <ReviewActions
-              @review="action => reviewMemoryDigestItem(item.id, action)"
-            />
-          </article>
-        </section>
-
-        <section class="workspace-band">
-          <div class="panel-header compact">
-            <div>
-              <h2>User Records</h2>
-              <span>{{ filteredReviewRecords.length }} shown</span>
-            </div>
-            <select v-model="selectedRecordState">
-              <option
-                v-for="state in recordStates"
-                :key="state"
-                :value="state"
-              >
-                {{ statusLabel(state) }}
-              </option>
-            </select>
-          </div>
-          <div
-            v-if="filteredReviewRecords.length === 0"
-            class="empty-panel"
-          >
-            No records in this state.
-          </div>
-          <article
-            v-for="item in filteredReviewRecords"
-            :key="item.record.id"
-            class="record-card"
-          >
-            <div class="card-topline">
-              <span class="status-pill">{{ kindLabel(item.record.kind) }}</span>
-              <span>{{ statusLabel(item.record.promotion_state) }}</span>
-              <span>{{ item.evidence_count }} evidence</span>
-            </div>
-            <p>{{ item.record.content }}</p>
-            <div class="record-actions">
-              <button @click="openEvidence(item.record.id)">
-                Evidence
-              </button>
-              <button @click="setPromotion(item.record.id, 'endorsed')">
-                Endorse
-              </button>
-              <button @click="setPromotion(item.record.id, 'private')">
-                Private
-              </button>
-              <button @click="setPromotion(item.record.id, 'no_train')">
-                No Train
-              </button>
-              <button @click="setPromotion(item.record.id, 'rejected')">
-                Reject
-              </button>
-            </div>
-          </article>
-        </section>
-      </section>
-
-      <section
-        v-else-if="activeTab === 'setup'"
-        class="tab-panel setup-grid"
-      >
-        <section class="identity-section">
-          <div>
-            <h2>Twin Identity</h2>
-            <span>Name and role are required before Twin Simulation can run.</span>
-          </div>
-          <label class="identity-field">
-            <span>Name</span>
-            <input
-              v-model="setupDraft.twin_name"
-              aria-label="Twin name"
-              type="text"
-              placeholder="Who is this twin?"
-            >
-          </label>
-          <label class="identity-field">
-            <span>Role / context</span>
-            <input
-              v-model="setupDraft.twin_role"
-              aria-label="Twin role"
-              type="text"
-              placeholder="What role should this twin reason from?"
-            >
-          </label>
-          <SetupField
-            v-model="setupDraft.source_boundaries"
-            title="Source Boundaries"
+          <DecisionRow
+            v-for="item in decisions"
+            :key="item.episode.id"
+            :item="item"
+            :highlighted="item.episode.id === routeDecisionId"
+            :trace-open="item.episode.id === routeDecisionId && routeTraceRequested"
+            @update-outcome="updateDecisionOutcome"
           />
         </section>
-        <div class="setup-section-heading">
-          <h2>Operating Priors</h2>
-          <span>Values, taste, constraints, somatic cues, and action tendencies.</span>
-        </div>
-        <SetupField
-          v-model="setupDraft.values"
-          title="Values"
-        />
-        <SetupField
-          v-model="setupDraft.tastes"
-          title="Taste"
-        />
-        <SetupField
-          v-model="setupDraft.constraints"
-          title="Constraints"
-        />
-        <SetupField
-          v-model="setupDraft.somatic_cues"
-          title="Somatic Cues"
-        />
-        <SetupField
-          v-model="setupDraft.action_tendencies"
-          title="Action Tendencies"
-        />
-        <div class="setup-actions">
-          <button
-            class="btn btn-primary"
-            :disabled="savingSetup"
-            @click="saveSetup"
-          >
-            {{ savingSetup ? 'Saving...' : 'Save Setup' }}
-          </button>
-        </div>
-      </section>
 
-      <section
-        v-else-if="activeTab === 'guide'"
-        class="tab-panel guide-panel"
-      >
-        <div class="panel-header">
-          <div>
-            <h2>How To Use</h2>
-            <span>Button guide and short task walkthroughs</span>
-          </div>
-        </div>
-        <section class="workspace-band guide-walkthrough">
-          <h3>Fast Decision Session</h3>
-          <ol>
-            <li>Open Canvas and click <strong>+ New</strong>.</li>
-            <li>Choose <strong>Decision</strong>, then write or paste the decision.</li>
-            <li>Add options, stakes, leaning, and follow-up only when useful.</li>
-            <li>Click <strong>Create Reflection Card</strong>.</li>
-            <li>Use one feedback button if the card is useful or wrong.</li>
-          </ol>
-        </section>
         <section
-          v-for="group in tutorialButtonGroups"
-          :key="group.title"
-          class="workspace-band guide-group"
+          v-else-if="activeTab === 'memory'"
+          class="tab-panel memory-grid"
         >
-          <h3>{{ group.title }}</h3>
-          <dl>
-            <template
-              v-for="item in group.items"
-              :key="item.name"
+          <section class="workspace-band">
+            <div class="panel-header compact">
+              <div>
+                <h2>Adaptive Digest</h2>
+                <span>{{ memoryDigestItems.length }} clustered items</span>
+              </div>
+            </div>
+            <div
+              v-if="memoryDigestItems.length === 0"
+              class="empty-panel"
             >
-              <dt>{{ item.name }}</dt>
-              <dd>{{ item.description }}</dd>
-            </template>
-          </dl>
+              No digest items need review.
+            </div>
+            <article
+              v-for="item in memoryDigestItems"
+              :key="item.id"
+              class="digest-card"
+            >
+              <div class="card-topline">
+                <span class="status-pill">{{ statusLabel(item.state) }}</span>
+                <span>{{ item.evidence_count }} evidence</span>
+                <span>{{ item.trigger_reason }}</span>
+              </div>
+              <p>{{ item.pattern }}</p>
+              <small v-if="item.latest_evidence?.summary">{{ item.latest_evidence.summary }}</small>
+              <ReviewActions
+                @review="action => reviewMemoryDigestItem(item.id, action)"
+              />
+            </article>
+          </section>
+
+          <section class="workspace-band">
+            <div class="panel-header compact">
+              <div>
+                <h2>User Records</h2>
+                <span>{{ filteredReviewRecords.length }} shown</span>
+              </div>
+              <select v-model="selectedRecordState">
+                <option
+                  v-for="state in recordStates"
+                  :key="state"
+                  :value="state"
+                >
+                  {{ statusLabel(state) }}
+                </option>
+              </select>
+            </div>
+            <div
+              v-if="filteredReviewRecords.length === 0"
+              class="empty-panel"
+            >
+              No records in this state.
+            </div>
+            <article
+              v-for="item in filteredReviewRecords"
+              :key="item.record.id"
+              class="record-card"
+            >
+              <div class="card-topline">
+                <span class="status-pill">{{ kindLabel(item.record.kind) }}</span>
+                <span>{{ statusLabel(item.record.promotion_state) }}</span>
+                <span>{{ item.evidence_count }} evidence</span>
+              </div>
+              <p>{{ item.record.content }}</p>
+              <div class="record-actions">
+                <button @click="openEvidence(item.record.id)">
+                  Evidence
+                </button>
+                <button @click="setPromotion(item.record.id, 'endorsed')">
+                  Endorse
+                </button>
+                <button @click="setPromotion(item.record.id, 'private')">
+                  Private
+                </button>
+                <button @click="setPromotion(item.record.id, 'no_train')">
+                  No Train
+                </button>
+                <button @click="setPromotion(item.record.id, 'rejected')">
+                  Reject
+                </button>
+              </div>
+            </article>
+          </section>
         </section>
-      </section>
 
-      <section
-        v-else-if="activeTab === 'config'"
-        class="tab-panel config-panel"
-      >
-        <div class="panel-header">
-          <div>
-            <h2>Decision Mirror Config</h2>
-            <span>Presets change retrieval and scoring weights without hiding raw sub-scores.</span>
-          </div>
-          <button
-            class="btn btn-secondary btn-sm"
-            :disabled="exportingBenchmark"
-            @click="exportDecisionBenchmark"
-          >
-            {{ exportingBenchmark ? 'Exporting...' : 'Export Benchmark' }}
-          </button>
-        </div>
-
-        <section class="workspace-band config-card">
-          <label class="config-row">
-            <span>Preset</span>
-            <select v-model="configDraft.preset">
-              <option
-                v-for="preset in decisionMirrorPresets"
-                :key="preset.value"
-                :value="preset.value"
+        <section
+          v-else-if="activeTab === 'setup'"
+          class="tab-panel setup-grid"
+        >
+          <section class="identity-section">
+            <div>
+              <h2>Twin Identity</h2>
+              <span>Name and role are required before Twin Simulation can run.</span>
+            </div>
+            <label class="identity-field">
+              <span>Name</span>
+              <input
+                v-model="setupDraft.twin_name"
+                aria-label="Twin name"
+                type="text"
+                placeholder="Who is this twin?"
               >
-                {{ preset.label }}
-              </option>
-            </select>
-          </label>
-          <label class="config-toggle">
-            <input
-              v-model="configDraft.advanced_enabled"
-              type="checkbox"
-            >
-            <span>Advanced</span>
-          </label>
-          <div class="config-actions">
+            </label>
+            <label class="identity-field">
+              <span>Role / context</span>
+              <input
+                v-model="setupDraft.twin_role"
+                aria-label="Twin role"
+                type="text"
+                placeholder="What role should this twin reason from?"
+              >
+            </label>
+            <SetupField
+              v-model="setupDraft.source_boundaries"
+              title="Source Boundaries"
+            />
+          </section>
+          <div class="setup-section-heading">
+            <h2>Operating Priors</h2>
+            <span>Values, taste, constraints, somatic cues, and action tendencies.</span>
+          </div>
+          <SetupField
+            v-model="setupDraft.values"
+            title="Values"
+          />
+          <SetupField
+            v-model="setupDraft.tastes"
+            title="Taste"
+          />
+          <SetupField
+            v-model="setupDraft.constraints"
+            title="Constraints"
+          />
+          <SetupField
+            v-model="setupDraft.somatic_cues"
+            title="Somatic Cues"
+          />
+          <SetupField
+            v-model="setupDraft.action_tendencies"
+            title="Action Tendencies"
+          />
+          <div class="setup-actions">
             <button
               class="btn btn-primary"
-              :disabled="savingConfig"
-              @click="saveDecisionMirrorConfig"
+              :disabled="savingSetup"
+              @click="saveSetup"
             >
-              {{ savingConfig ? 'Saving...' : 'Save Config' }}
-            </button>
-            <button
-              class="btn btn-secondary"
-              :disabled="savingConfig"
-              @click="resetDecisionMirrorConfig"
-            >
-              Reset
+              {{ savingSetup ? 'Saving...' : 'Save Setup' }}
             </button>
           </div>
         </section>
 
         <section
-          v-if="configDraft.advanced_enabled"
-          class="workspace-band config-card"
+          v-else-if="activeTab === 'guide'"
+          class="tab-panel guide-panel"
         >
-          <div class="panel-header compact">
+          <div class="panel-header">
             <div>
-              <h2>Advanced Weights</h2>
-              <span>0 ignores the signal, 3 gives it strong priority.</span>
+              <h2>How To Use</h2>
+              <span>Button guide and short task walkthroughs</span>
             </div>
           </div>
-          <label
-            v-for="weight in configWeightRows"
-            :key="weight.key"
-            class="weight-row"
+          <section class="workspace-band guide-walkthrough">
+            <h3>Fast Decision Session</h3>
+            <ol>
+              <li>Open Canvas and click <strong>+ New</strong>.</li>
+              <li>Choose <strong>Decision</strong>, then write or paste the decision.</li>
+              <li>Add options, stakes, leaning, and follow-up only when useful.</li>
+              <li>Click <strong>Create Reflection Card</strong>.</li>
+              <li>Use one feedback button if the card is useful or wrong.</li>
+            </ol>
+          </section>
+          <section
+            v-for="group in tutorialButtonGroups"
+            :key="group.title"
+            class="workspace-band guide-group"
           >
-            <span>{{ weight.label }}</span>
-            <input
-              v-model.number="configDraft.weights[weight.key]"
-              type="range"
-              min="0"
-              max="3"
-              step="0.05"
-            >
-            <strong>{{ formatWeight(configDraft.weights[weight.key]) }}</strong>
-          </label>
+            <h3>{{ group.title }}</h3>
+            <dl>
+              <template
+                v-for="item in group.items"
+                :key="item.name"
+              >
+                <dt>{{ item.name }}</dt>
+                <dd>{{ item.description }}</dd>
+              </template>
+            </dl>
+          </section>
         </section>
-      </section>
-    </main>
+
+        <section
+          v-else-if="activeTab === 'config'"
+          class="tab-panel config-panel"
+        >
+          <div class="panel-header">
+            <div>
+              <h2>Decision Mirror Config</h2>
+              <span>Presets change retrieval and scoring weights without hiding raw sub-scores.</span>
+            </div>
+            <button
+              class="btn btn-secondary btn-sm"
+              :disabled="exportingBenchmark"
+              @click="exportDecisionBenchmark"
+            >
+              {{ exportingBenchmark ? 'Exporting...' : 'Export Benchmark' }}
+            </button>
+          </div>
+
+          <section class="workspace-band config-card">
+            <label class="config-row">
+              <span>Preset</span>
+              <select v-model="configDraft.preset">
+                <option
+                  v-for="preset in decisionMirrorPresets"
+                  :key="preset.value"
+                  :value="preset.value"
+                >
+                  {{ preset.label }}
+                </option>
+              </select>
+            </label>
+            <label class="config-toggle">
+              <input
+                v-model="configDraft.advanced_enabled"
+                type="checkbox"
+              >
+              <span>Advanced</span>
+            </label>
+            <div class="config-actions">
+              <button
+                class="btn btn-primary"
+                :disabled="savingConfig"
+                @click="saveDecisionMirrorConfig"
+              >
+                {{ savingConfig ? 'Saving...' : 'Save Config' }}
+              </button>
+              <button
+                class="btn btn-secondary"
+                :disabled="savingConfig"
+                @click="resetDecisionMirrorConfig"
+              >
+                Reset
+              </button>
+            </div>
+          </section>
+
+          <section
+            v-if="configDraft.advanced_enabled"
+            class="workspace-band config-card"
+          >
+            <div class="panel-header compact">
+              <div>
+                <h2>Advanced Weights</h2>
+                <span>0 ignores the signal, 3 gives it strong priority.</span>
+              </div>
+            </div>
+            <label
+              v-for="weight in configWeightRows"
+              :key="weight.key"
+              class="weight-row"
+            >
+              <span>{{ weight.label }}</span>
+              <input
+                v-model.number="configDraft.weights[weight.key]"
+                type="range"
+                min="0"
+                max="3"
+                step="0.05"
+              >
+              <strong>{{ formatWeight(configDraft.weights[weight.key]) }}</strong>
+            </label>
+          </section>
+        </section>
+      </main>
+    </div>
 
     <aside
       v-if="selectedRecordId"
@@ -598,15 +643,39 @@ import { computed, defineComponent, h, onMounted, reactive, ref } from 'vue'
 import { useRoute } from 'vue-router'
 import { twin } from '@/api/client'
 
-const tabs = computed(() => [
-  { id: 'overview', label: 'Overview', count: null },
-  { id: 'constitution', label: 'Constitution', count: constitutionItems.value.length },
-  { id: 'action_gaps', label: 'Action Gaps', count: actionGaps.value.length },
-  { id: 'decisions', label: 'Decisions', count: decisions.value.length },
-  { id: 'memory', label: 'Memory Review', count: pendingReviewCount.value },
-  { id: 'setup', label: 'Setup', count: null },
-  { id: 'config', label: 'Config', count: null },
-  { id: 'guide', label: 'Guide', count: null }
+const navGroups = computed(() => [
+  {
+    id: 'home',
+    label: null,
+    tabs: [{ id: 'overview', label: 'Overview', count: null }]
+  },
+  {
+    id: 'work',
+    label: 'Work',
+    tabs: [{ id: 'decisions', label: 'Decisions', count: decisions.value.length }]
+  },
+  {
+    id: 'review',
+    label: 'Review',
+    tabs: [
+      { id: 'memory', label: 'Memory Review', count: pendingReviewCount.value },
+      { id: 'constitution', label: 'Constitution', count: constitutionItems.value.length },
+      { id: 'action_gaps', label: 'Action Gaps', count: actionGaps.value.length }
+    ]
+  },
+  {
+    id: 'tune',
+    label: 'Configure',
+    tabs: [
+      { id: 'setup', label: 'Setup', count: null },
+      { id: 'config', label: 'Config', count: null }
+    ]
+  },
+  {
+    id: 'help',
+    label: 'Help',
+    tabs: [{ id: 'guide', label: 'Guide', count: null }]
+  }
 ])
 
 const ReviewActions = defineComponent({
@@ -669,6 +738,7 @@ const DecisionRow = defineComponent({
       correction_note: correctionNote.value.trim() || null
     })
     return () => {
+      const episode = props.item.episode
       const latestCard = props.item.reflection_cards?.[0]
       const trace = latestCard?.evidence_packet || {}
       const selectedSources = trace.selected_sources || []
@@ -677,145 +747,159 @@ const DecisionRow = defineComponent({
         + (trace.excluded_no_train_count || 0)
       const scores = latestCard?.scores || {}
       const feedbackEvents = props.item.feedback_events || []
+      const outcomeField = (label, node) =>
+        h('label', { class: 'outcome-field' }, [h('span', label), node])
 
-      return h('article', { class: ['decision-card', props.highlighted ? 'highlighted' : ''] }, [
-      h('div', { class: 'card-topline' }, [
-        h('span', props.item.episode.review_date || 'No follow-up'),
-        h('span', `${props.item.reflection_cards?.length || 0} cards`),
-        props.item.episode.confidence != null ? h('span', `${Math.round(props.item.episode.confidence * 100)}% confidence`) : null
-      ]),
-      h('h3', props.item.episode.decision),
-      props.item.episode.options?.length
-        ? h('div', { class: 'tag-row' }, props.item.episode.options.map(option => h('span', option)))
-        : null,
-      h('div', { class: 'primitive-grid' }, primitiveFields.map(field =>
-        props.item.episode.primitive_assessment?.[field.key]
-          ? h('span', [h('strong', field.label), ` ${props.item.episode.primitive_assessment[field.key]}`])
-          : null
-      )),
-      props.item.reflection_cards?.[0]
-        ? h('details', { class: 'reflection-details' }, [
-            h('summary', 'Latest Reflection Card'),
-            h('pre', props.item.reflection_cards[0].content)
-          ])
-        : null,
-      latestCard
-        ? h('details', { class: 'context-trace-details', open: props.traceOpen }, [
-            h('summary', 'Context Trace'),
-            h('div', { class: 'trace-metrics' }, [
-              h('span', [h('strong', 'Preset'), ` ${presetLabel(trace.config_snapshot?.preset)}`]),
-              h('span', [h('strong', 'Sources'), ` ${selectedSources.length}`]),
-              h('span', [h('strong', 'Excluded'), ` ${excludedTotal}`]),
-              h('span', [h('strong', 'Unsupported'), ` ${scores.unsupported_claim_count || 0}`])
-            ]),
-            scores.evidence_grounding_score < 0.5
-              ? h('p', { class: 'trace-warning' }, 'Weak evidence signal: treat self-model claims as tentative.')
-              : null,
-            h('section', { class: 'trace-section' }, [
-              h('h4', 'Selected Context'),
-              selectedSources.length
-                ? h('ul', { class: 'trace-source-list' }, selectedSources.map(source =>
-                    h('li', { key: `${source.source_type}-${source.id}` }, [
-                      h('span', sourceTypeLabel(source.source_type)),
-                      h('strong', source.label || source.id),
-                      h('small', `${source.reason || 'Selected for this decision'} · ${formatWeight(source.weight)}`)
-                    ])
-                  ))
-                : h('p', { class: 'muted' }, 'No selected context recorded for this card.')
-            ]),
-            h('section', { class: 'trace-section' }, [
-              h('h4', 'Score Breakdown'),
-              h('div', { class: 'trace-score-grid' }, scoreRows(scores).map(row =>
-                h('span', { key: row.label }, [h('strong', row.label), ` ${row.value}`])
-              ))
-            ]),
-            h('section', { class: 'trace-section' }, [
-              h('h4', 'Feedback Afterward'),
-              feedbackEvents.length
-                ? h('ul', { class: 'trace-feedback-list' }, feedbackEvents.map(event =>
-                    h('li', { key: event.id }, [
-                      h('span', feedbackEventLabel(event)),
-                      h('small', feedbackEventNote(event))
-                    ])
-                  ))
-                : h('p', { class: 'muted' }, 'No correction or one-click feedback recorded yet.')
+      return h('article', {
+        class: [
+          'decision-card',
+          decisionState(props.item),
+          props.highlighted ? 'highlighted' : ''
+        ]
+      }, [
+        h('div', { class: 'card-topline' }, [
+          h('span', episode.review_date || 'No follow-up'),
+          h('span', `${props.item.reflection_cards?.length || 0} cards`),
+          episode.confidence != null ? h('span', `${Math.round(episode.confidence * 100)}% confidence`) : null,
+          h('span', { class: 'topline-chips' }, decisionChips(props.item).map(chip =>
+            h('span', { key: chip.id, class: ['chip', chip.cls] }, chip.label)
+          ))
+        ]),
+        h('h3', episode.decision),
+        episode.options?.length
+          ? h('div', { class: 'tag-row' }, episode.options.map(option => h('span', option)))
+          : null,
+        h('div', { class: 'primitive-grid' }, primitiveFields.map(field =>
+          episode.primitive_assessment?.[field.key]
+            ? h('span', [h('strong', field.label), ` ${episode.primitive_assessment[field.key]}`])
+            : null
+        )),
+        props.item.reflection_cards?.[0]
+          ? h('details', { class: 'reflection-details' }, [
+              h('summary', 'Latest Reflection Card'),
+              h('pre', props.item.reflection_cards[0].content)
             ])
-          ])
-        : null,
-      props.item.prediction_sealed
-        ? h('div', { class: 'prediction-sealed-badge' },
-            'Twin sealed a prediction — record your choice to reveal it')
-        : null,
-      props.item.episode.twin_prediction
-        ? h('div', { class: 'prediction-reveal' }, [
-            h('div', { class: 'prediction-headline' }, [
-              h('strong', 'Twin predicted: '),
-              h('span', props.item.episode.twin_prediction.predicted_option),
-              props.item.episode.twin_prediction.confidence != null
-                ? h('span', { class: 'prediction-confidence' },
-                    ` (${Math.round(props.item.episode.twin_prediction.confidence * 100)}% confident)`)
+          : null,
+        latestCard
+          ? h('details', { class: 'context-trace-details', open: props.traceOpen }, [
+              h('summary', 'Context Trace'),
+              h('div', { class: 'trace-metrics' }, [
+                h('span', [h('strong', 'Preset'), ` ${presetLabel(trace.config_snapshot?.preset)}`]),
+                h('span', [h('strong', 'Sources'), ` ${selectedSources.length}`]),
+                h('span', [h('strong', 'Excluded'), ` ${excludedTotal}`]),
+                h('span', [h('strong', 'Unsupported'), ` ${scores.unsupported_claim_count || 0}`])
+              ]),
+              scores.evidence_grounding_score < 0.5
+                ? h('p', { class: 'trace-warning' }, 'Weak evidence signal: treat self-model claims as tentative.')
                 : null,
-              props.item.episode.agreement === true
-                ? h('span', { class: 'agreement-badge match' }, 'Matched my choice')
-                : null,
-              props.item.episode.agreement === false
-                ? h('span', { class: 'agreement-badge miss' }, 'Missed')
+              h('section', { class: 'trace-section' }, [
+                h('h4', 'Selected Context'),
+                selectedSources.length
+                  ? h('ul', { class: 'trace-source-list' }, selectedSources.map(source =>
+                      h('li', { key: `${source.source_type}-${source.id}` }, [
+                        h('span', sourceTypeLabel(source.source_type)),
+                        h('strong', source.label || source.id),
+                        h('small', `${source.reason || 'Selected for this decision'} · ${formatWeight(source.weight)}`)
+                      ])
+                    ))
+                  : h('p', { class: 'muted' }, 'No selected context recorded for this card.')
+              ]),
+              h('section', { class: 'trace-section' }, [
+                h('h4', 'Score Breakdown'),
+                h('div', { class: 'trace-score-grid' }, scoreRows(scores).map(row =>
+                  h('span', { key: row.label }, [h('strong', row.label), ` ${row.value}`])
+                ))
+              ]),
+              h('section', { class: 'trace-section' }, [
+                h('h4', 'Feedback Afterward'),
+                feedbackEvents.length
+                  ? h('ul', { class: 'trace-feedback-list' }, feedbackEvents.map(event =>
+                      h('li', { key: event.id }, [
+                        h('span', feedbackEventLabel(event)),
+                        h('small', feedbackEventNote(event))
+                      ])
+                    ))
+                  : h('p', { class: 'muted' }, 'No correction or one-click feedback recorded yet.')
+              ])
+            ])
+          : null,
+        props.item.prediction_sealed
+          ? h('div', { class: 'prediction-sealed-badge' },
+              'Twin sealed a prediction — record your choice to reveal it')
+          : null,
+        episode.twin_prediction
+          ? h('div', { class: 'prediction-reveal' }, [
+              h('div', { class: 'prediction-headline' }, [
+                h('strong', 'Twin predicted: '),
+                h('span', episode.twin_prediction.predicted_option),
+                episode.twin_prediction.confidence != null
+                  ? h('span', { class: 'prediction-confidence' },
+                      ` (${Math.round(episode.twin_prediction.confidence * 100)}% confident)`)
+                  : null,
+                episode.agreement === true
+                  ? h('span', { class: 'agreement-badge match' }, 'Matched my choice')
+                  : null,
+                episode.agreement === false
+                  ? h('span', { class: 'agreement-badge miss' }, 'Missed')
+                  : null
+              ]),
+              episode.twin_prediction.rationale
+                ? h('p', { class: 'prediction-rationale' }, episode.twin_prediction.rationale)
                 : null
-            ]),
-            props.item.episode.twin_prediction.rationale
-              ? h('p', { class: 'prediction-rationale' }, props.item.episode.twin_prediction.rationale)
-              : null
-          ])
-        : null,
-      h('div', { class: 'outcome-row' }, [
-        episodeOptions.length
-          ? h('select', {
-              class: 'chosen-option-select',
-              value: chosenSelect.value,
-              onChange: event => { chosenSelect.value = event.target.value }
-            }, [
-              h('option', { value: '' }, 'Chosen option…'),
-              ...episodeOptions.map(option => h('option', { value: option }, option)),
-              h('option', { value: '__other__' }, 'Other…')
             ])
           : null,
-        (!episodeOptions.length || chosenSelect.value === '__other__')
-          ? h('input', {
-              value: chosenOther.value,
-              placeholder: 'Chosen option',
-              onInput: event => { chosenOther.value = event.target.value }
-            })
-          : null,
-        h('input', {
-          value: outcome.value,
-          placeholder: 'Outcome',
-          onInput: event => { outcome.value = event.target.value }
-        }),
-        h('input', {
-          value: lesson.value,
-          placeholder: 'Lesson',
-          onInput: event => { lesson.value = event.target.value }
-        }),
-        h('input', {
-          value: regretScore.value,
-          type: 'number',
-          min: '0',
-          max: '10',
-          placeholder: 'Regret',
-          onInput: event => { regretScore.value = event.target.value }
-        }),
-        h('button', { onClick: save }, 'Save')
-      ]),
-      props.item.episode.agreement === false
-        ? h('div', { class: 'correction-row' }, [
-            h('input', {
-              value: correctionNote.value,
-              placeholder: 'Why was the twin wrong?',
-              onInput: event => { correctionNote.value = event.target.value }
-            })
-          ])
-        : null
-    ])
+        h('details', { class: 'outcome-details', open: !episode.outcome }, [
+          h('summary', episode.outcome ? 'Outcome recorded — edit' : 'Record outcome'),
+          h('div', { class: 'outcome-row' }, [
+            episodeOptions.length
+              ? outcomeField('Chosen option', h('select', {
+                  class: 'chosen-option-select',
+                  value: chosenSelect.value,
+                  onChange: event => { chosenSelect.value = event.target.value }
+                }, [
+                  h('option', { value: '' }, 'Chosen option…'),
+                  ...episodeOptions.map(option => h('option', { value: option }, option)),
+                  h('option', { value: '__other__' }, 'Other…')
+                ]))
+              : null,
+            (!episodeOptions.length || chosenSelect.value === '__other__')
+              ? outcomeField(episodeOptions.length ? 'Other choice' : 'Chosen option', h('input', {
+                  value: chosenOther.value,
+                  placeholder: 'Chosen option',
+                  onInput: event => { chosenOther.value = event.target.value }
+                }))
+              : null,
+            outcomeField('Outcome', h('input', {
+              value: outcome.value,
+              placeholder: 'What actually happened',
+              onInput: event => { outcome.value = event.target.value }
+            })),
+            outcomeField('Lesson', h('input', {
+              value: lesson.value,
+              placeholder: 'What it taught you',
+              onInput: event => { lesson.value = event.target.value }
+            })),
+            outcomeField('Regret (0-10)', h('input', {
+              value: regretScore.value,
+              type: 'number',
+              min: '0',
+              max: '10',
+              placeholder: '0',
+              onInput: event => { regretScore.value = event.target.value }
+            })),
+            h('button', { class: 'btn btn-primary btn-sm save-outcome', onClick: save }, 'Save Outcome')
+          ]),
+          episode.agreement === false
+            ? h('div', { class: 'correction-row' }, [
+                outcomeField('Why was the twin wrong?', h('input', {
+                  value: correctionNote.value,
+                  placeholder: 'Why was the twin wrong?',
+                  onInput: event => { correctionNote.value = event.target.value }
+                }))
+              ])
+            : null
+        ])
+      ])
     }
   }
 })
@@ -973,8 +1057,8 @@ const activeActionGapCount = computed(() =>
 const pendingReviewCount = computed(() =>
   memoryDigestItems.value.length + reviewRecords.value.filter(item => item.record.promotion_state === 'candidate').length
 )
-const pendingFollowUps = computed(() =>
-  decisions.value.filter(item => item.episode.review_date && !item.episode.outcome).length
+const pendingOutcomeCount = computed(() =>
+  decisions.value.filter(item => !item.episode.outcome).length
 )
 const healthSummary = computed(() =>
   `${constitutionItems.value.length} principles / ${actionGaps.value.length} gaps / ${decisions.value.length} decisions`
@@ -1227,6 +1311,23 @@ function splitLines(value) {
     .filter(Boolean)
 }
 
+function decisionState(item) {
+  if (item.prediction_sealed) return 'is-sealed'
+  if (item.episode.agreement === true) return 'is-match'
+  if (item.episode.agreement === false) return 'is-miss'
+  if (!item.episode.outcome) return 'is-pending'
+  return ''
+}
+
+function decisionChips(item) {
+  const chips = []
+  if (item.prediction_sealed) chips.push({ id: 'sealed', label: 'Sealed', cls: 'chip-sealed' })
+  if (item.episode.agreement === true) chips.push({ id: 'match', label: 'Matched', cls: 'chip-match' })
+  if (item.episode.agreement === false) chips.push({ id: 'miss', label: 'Missed', cls: 'chip-miss' })
+  if (!item.episode.outcome) chips.push({ id: 'pending', label: 'Outcome pending', cls: 'chip-pending' })
+  return chips
+}
+
 function actionLabel(action) {
   return {
     keep: 'Keep',
@@ -1362,18 +1463,22 @@ function showMessage(type, text, duration = 3500) {
 
 <style scoped>
 .twin-workspace {
-  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  overflow: hidden;
   background: var(--bg-primary);
   color: var(--text-primary);
 }
 
 .workspace-header {
+  flex: 0 0 auto;
   display: grid;
   grid-template-columns: 1fr auto 1fr;
   align-items: center;
   gap: var(--spacing-md);
-  padding: var(--spacing-md) var(--spacing-lg);
-  border-bottom: 1px solid var(--border-subtle);
+  padding: var(--spacing-sm) var(--spacing-lg);
+  border-bottom: 1px solid var(--border-default);
   background: var(--bg-secondary);
 }
 
@@ -1421,49 +1526,136 @@ function showMessage(type, text, duration = 3500) {
   font-size: 0.75rem;
 }
 
-.workspace-tabs {
+.header-title span {
+  font-family: 'Fira Code', monospace;
+  font-size: 0.7rem;
+  letter-spacing: 0.02em;
+}
+
+/* Body: fixed rail + independently scrolling main pane.
+   #app is overflow:hidden, so this view must own its scrolling. */
+.workspace-body {
+  flex: 1;
   display: flex;
-  gap: 4px;
-  padding: var(--spacing-sm) var(--spacing-lg);
-  border-bottom: 1px solid var(--border-subtle);
-  overflow-x: auto;
+  min-height: 0;
+}
+
+.workspace-rail {
+  flex: 0 0 212px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: var(--spacing-sm) var(--spacing-sm) var(--spacing-lg) 0;
+  overflow-y: auto;
+  border-right: 1px solid var(--border-default);
+  background: var(--bg-secondary);
+}
+
+.rail-label {
+  margin: var(--spacing-md) var(--spacing-sm) 4px var(--spacing-md);
+  font-size: 0.65rem;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--text-muted);
 }
 
 .tab-button {
-  display: inline-flex;
+  display: flex;
   align-items: center;
+  justify-content: space-between;
   gap: 8px;
+  width: 100%;
   min-height: 34px;
-  padding: 0 var(--spacing-sm);
-  border: 1px solid var(--border-subtle);
-  border-radius: var(--radius-sm);
+  padding: 0 var(--spacing-sm) 0 13px;
+  border: none;
+  border-left: 3px solid transparent;
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
   background: transparent;
   color: var(--text-secondary);
+  font-size: 0.85rem;
+  text-align: left;
   cursor: pointer;
+  transition: background var(--transition-fast), color var(--transition-fast);
+}
+
+.tab-button:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
 }
 
 .tab-button.active {
-  border-color: var(--accent-primary);
+  border-left-color: var(--accent-primary);
+  background: color-mix(in srgb, var(--accent-primary) 12%, transparent);
   color: var(--accent-primary);
-  background: color-mix(in srgb, var(--accent-primary) 10%, transparent);
+  font-weight: 600;
+}
+
+.tab-button strong {
+  min-width: 22px;
+  font-family: 'Fira Code', monospace;
+  font-size: 0.7rem;
+  font-weight: 500;
+  text-align: right;
+  color: var(--text-muted);
+}
+
+.tab-button.active strong {
+  color: var(--accent-primary);
 }
 
 .workspace-main {
+  flex: 1;
+  min-width: 0;
+  overflow-y: auto;
   padding: var(--spacing-lg);
 }
 
 .tab-panel {
-  max-width: 1180px;
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-md);
+  max-width: 980px;
   margin: 0 auto;
 }
 
-.overview-grid {
+.overview-stats {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: var(--spacing-md);
 }
 
-.metric-tile,
+.metric-tile {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  padding: var(--spacing-md);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-lg);
+  background: var(--bg-secondary);
+  color: var(--text-secondary);
+  text-align: left;
+  cursor: pointer;
+  transition: border-color var(--transition-fast), box-shadow var(--transition-fast), transform var(--transition-fast);
+}
+
+.metric-tile:hover {
+  border-color: var(--accent-primary);
+  box-shadow: var(--shadow-md);
+  transform: translateY(-1px);
+}
+
+.metric-tile strong {
+  display: block;
+  margin: 4px 0;
+  font-family: 'Fira Code', monospace;
+  font-size: 1.8rem;
+  font-weight: 600;
+  color: var(--text-primary);
+  line-height: 1.1;
+}
+
 .workspace-band,
 .constitution-card,
 .action-gap-card,
@@ -1471,28 +1663,17 @@ function showMessage(type, text, duration = 3500) {
 .digest-card,
 .record-card,
 .evidence-drawer {
-  border: 1px solid var(--border-subtle);
+  border: 1px solid var(--border-default);
   border-radius: var(--radius-md);
   background: var(--bg-secondary);
 }
 
-.metric-tile {
-  padding: var(--spacing-md);
-}
-
-.metric-tile strong {
-  display: block;
-  margin: 6px 0;
-  font-size: 1.7rem;
-}
-
 .workspace-band {
-  grid-column: span 2;
   padding: var(--spacing-md);
 }
 
 .tutorial-intro {
-  grid-column: span 4;
+  border-left: 3px solid var(--accent-primary);
 }
 
 .band-header,
@@ -1505,8 +1686,8 @@ function showMessage(type, text, duration = 3500) {
   gap: var(--spacing-sm);
 }
 
-.panel-header {
-  margin-bottom: var(--spacing-md);
+.band-header {
+  margin-bottom: var(--spacing-sm);
 }
 
 .panel-header h2,
@@ -1523,9 +1704,8 @@ function showMessage(type, text, duration = 3500) {
 .text-button,
 .record-actions button,
 .review-actions button,
-.outcome-row button,
 .drawer-header button {
-  border: 1px solid var(--border-subtle);
+  border: 1px solid var(--border-default);
   border-radius: var(--radius-sm);
   background: transparent;
   color: var(--text-secondary);
@@ -1539,14 +1719,112 @@ function showMessage(type, text, duration = 3500) {
 
 .empty-panel {
   padding: var(--spacing-lg);
-  border: 1px dashed var(--border-subtle);
+  border: 1px dashed var(--border-default);
   border-radius: var(--radius-md);
   color: var(--text-muted);
   text-align: center;
 }
 
-.dimension-section {
-  margin-bottom: var(--spacing-lg);
+/* Compact triage rows on the overview */
+.compact-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 8px 10px;
+  margin-bottom: 6px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-primary);
+  text-align: left;
+  cursor: pointer;
+  transition: border-color var(--transition-fast), background var(--transition-fast);
+}
+
+.compact-row:hover {
+  border-color: var(--accent-primary);
+  background: var(--bg-hover);
+}
+
+.compact-row.highlighted {
+  border-color: var(--accent-cyan);
+}
+
+.row-dot {
+  flex: 0 0 8px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text-muted);
+}
+
+.row-dot.is-sealed {
+  background: var(--accent-primary);
+}
+
+.row-dot.is-pending {
+  background: var(--accent-warning);
+}
+
+.row-dot.is-match {
+  background: var(--accent-green);
+}
+
+.row-dot.is-miss {
+  background: var(--accent-red);
+}
+
+.row-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.85rem;
+}
+
+.row-chips,
+.topline-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 8px;
+  border: 1px solid var(--border-default);
+  border-radius: 999px;
+  font-size: 0.68rem;
+  font-weight: 600;
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.chip-sealed {
+  border-style: dashed;
+  border-color: color-mix(in srgb, var(--accent-primary) 55%, transparent);
+  color: var(--accent-primary);
+}
+
+.chip-pending {
+  border-color: color-mix(in srgb, var(--accent-warning) 55%, transparent);
+  background: color-mix(in srgb, var(--accent-warning) 10%, transparent);
+  color: var(--accent-warning);
+}
+
+.chip-match {
+  border-color: color-mix(in srgb, var(--accent-green) 55%, transparent);
+  background: color-mix(in srgb, var(--accent-green) 10%, transparent);
+  color: var(--accent-green);
+}
+
+.chip-miss {
+  border-color: color-mix(in srgb, var(--accent-red) 55%, transparent);
+  background: color-mix(in srgb, var(--accent-red) 10%, transparent);
+  color: var(--accent-red);
 }
 
 .dimension-section h3 {
@@ -1564,9 +1842,35 @@ function showMessage(type, text, duration = 3500) {
   margin-bottom: var(--spacing-sm);
 }
 
+/* Decision cards carry their state on the left edge */
+.decision-card {
+  border-left: 3px solid var(--border-strong);
+}
+
+.decision-card.is-sealed {
+  border-left-color: var(--accent-primary);
+}
+
+.decision-card.is-pending {
+  border-left-color: var(--accent-warning);
+}
+
+.decision-card.is-match {
+  border-left-color: var(--accent-green);
+}
+
+.decision-card.is-miss {
+  border-left-color: var(--accent-red);
+}
+
 .decision-card.highlighted {
   border-color: var(--accent-cyan);
   box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent-cyan) 18%, transparent);
+}
+
+.decision-card h3 {
+  font-size: 0.95rem;
+  line-height: 1.4;
 }
 
 .constitution-card p,
@@ -1578,6 +1882,15 @@ function showMessage(type, text, duration = 3500) {
   margin: var(--spacing-sm) 0;
 }
 
+.card-topline {
+  flex-wrap: wrap;
+  justify-content: flex-start;
+}
+
+.card-topline .topline-chips {
+  margin-left: auto;
+}
+
 .status-pill,
 .tag-row span,
 .source-row span {
@@ -1585,7 +1898,7 @@ function showMessage(type, text, duration = 3500) {
   align-items: center;
   min-height: 22px;
   padding: 0 7px;
-  border: 1px solid var(--border-subtle);
+  border: 1px solid var(--border-default);
   border-radius: var(--radius-sm);
   color: var(--text-secondary);
   font-size: 0.6875rem;
@@ -1599,8 +1912,7 @@ function showMessage(type, text, duration = 3500) {
 }
 
 .review-actions,
-.record-actions,
-.outcome-row {
+.record-actions {
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
@@ -1609,17 +1921,17 @@ function showMessage(type, text, duration = 3500) {
 
 .prediction-sealed-badge {
   margin-top: var(--spacing-sm);
-  padding: 4px 8px;
-  border: 1px dashed var(--border-subtle);
+  padding: 6px 10px;
+  border: 1px dashed color-mix(in srgb, var(--accent-primary) 45%, transparent);
   border-radius: var(--radius-sm);
-  color: var(--text-secondary);
+  color: var(--accent-primary);
   font-size: 0.8rem;
 }
 
 .prediction-reveal {
   margin-top: var(--spacing-sm);
   padding: var(--spacing-sm);
-  border: 1px solid var(--border-subtle);
+  border: 1px solid var(--border-default);
   border-radius: var(--radius-sm);
   background: color-mix(in srgb, var(--bg-tertiary) 75%, transparent);
 }
@@ -1658,25 +1970,14 @@ function showMessage(type, text, duration = 3500) {
   color: var(--accent-red, #ef4444);
 }
 
-.correction-row {
-  margin-top: 6px;
-}
-
-.correction-row input,
-.chosen-option-select {
-  min-height: 28px;
-}
-
 .review-actions button,
-.record-actions button,
-.outcome-row button {
+.record-actions button {
   min-height: 28px;
   padding: 4px 8px;
 }
 
 .review-actions button:hover,
-.record-actions button:hover,
-.outcome-row button:hover {
+.record-actions button:hover {
   border-color: var(--accent-primary);
   color: var(--accent-primary);
 }
@@ -1717,7 +2018,8 @@ function showMessage(type, text, duration = 3500) {
 }
 
 .context-trace-details summary,
-.reflection-details summary {
+.reflection-details summary,
+.outcome-details summary {
   cursor: pointer;
   font-weight: 700;
 }
@@ -1797,38 +2099,82 @@ function showMessage(type, text, duration = 3500) {
   color: var(--text-secondary);
 }
 
-.outcome-row input,
+/* Outcome recording: labeled form, open until an outcome exists */
+.outcome-details {
+  margin-top: var(--spacing-sm);
+  padding-top: var(--spacing-sm);
+  border-top: 1px dashed var(--border-default);
+}
+
+.outcome-details summary {
+  font-size: 0.8rem;
+  color: var(--text-secondary);
+}
+
+.outcome-row {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  align-items: end;
+  margin-top: var(--spacing-sm);
+}
+
+.outcome-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.outcome-field > span {
+  font-size: 0.68rem;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.outcome-field input,
+.outcome-field select,
 .config-row select,
 .identity-field input,
 .setup-field textarea,
 .panel-header select {
-  border: 1px solid var(--border-subtle);
+  border: 1px solid var(--border-default);
   border-radius: var(--radius-sm);
   background: var(--bg-primary);
   color: var(--text-primary);
 }
 
-.outcome-row input {
-  min-height: 30px;
+.outcome-field input,
+.outcome-field select {
+  min-height: 32px;
   padding: 4px 8px;
 }
 
-.memory-grid,
+.outcome-row .save-outcome {
+  grid-column: 1 / -1;
+  justify-self: start;
+}
+
+.correction-row {
+  margin-top: 10px;
+}
+
+.memory-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-items: start;
+}
+
 .setup-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: var(--spacing-md);
 }
 
 .guide-panel,
 .config-panel {
-  display: grid;
-  gap: var(--spacing-md);
-}
-
-.guide-panel .workspace-band,
-.config-panel .workspace-band {
-  grid-column: auto;
+  display: flex;
+  flex-direction: column;
 }
 
 .guide-walkthrough ol {
@@ -1871,6 +2217,14 @@ function showMessage(type, text, duration = 3500) {
   padding: 4px 8px;
 }
 
+.config-toggle {
+  margin-top: var(--spacing-sm);
+}
+
+.config-actions {
+  margin-top: var(--spacing-sm);
+}
+
 .weight-row {
   margin-top: var(--spacing-sm);
 }
@@ -1886,6 +2240,8 @@ function showMessage(type, text, duration = 3500) {
 .weight-row strong {
   min-width: 44px;
   text-align: right;
+  font-family: 'Fira Code', monospace;
+  font-weight: 500;
 }
 
 .setup-field {
@@ -1893,7 +2249,7 @@ function showMessage(type, text, duration = 3500) {
   flex-direction: column;
   gap: var(--spacing-xs);
   padding: var(--spacing-md);
-  border: 1px solid var(--border-subtle);
+  border: 1px solid var(--border-default);
   border-radius: var(--radius-md);
   background: var(--bg-secondary);
 }
@@ -1907,6 +2263,11 @@ function showMessage(type, text, duration = 3500) {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: var(--spacing-md);
+  padding: var(--spacing-md);
+  border: 1px solid var(--border-default);
+  border-left: 3px solid var(--accent-primary);
+  border-radius: var(--radius-md);
+  background: var(--bg-secondary);
 }
 
 .identity-section > div {
@@ -1941,6 +2302,9 @@ function showMessage(type, text, duration = 3500) {
 
 .identity-section .setup-field {
   grid-column: 1 / -1;
+  padding: 0;
+  border: none;
+  background: transparent;
 }
 
 .setup-field span {
@@ -1953,18 +2317,20 @@ function showMessage(type, text, duration = 3500) {
 }
 
 .setup-actions {
+  grid-column: 1 / -1;
   display: flex;
   align-items: flex-start;
 }
 
 .evidence-drawer {
   position: fixed;
-  top: 96px;
+  top: 72px;
   right: var(--spacing-lg);
   width: min(420px, calc(100vw - 32px));
-  max-height: calc(100vh - 128px);
+  max-height: calc(100vh - 104px);
   overflow: auto;
   padding: var(--spacing-md);
+  background: var(--bg-elevated, var(--bg-secondary));
   box-shadow: var(--shadow-xl);
   z-index: 40;
 }
@@ -1981,8 +2347,9 @@ function showMessage(type, text, duration = 3500) {
   padding: var(--spacing-sm) var(--spacing-md);
   border-radius: var(--radius-sm);
   background: var(--bg-secondary);
-  border: 1px solid var(--border-subtle);
+  border: 1px solid var(--border-default);
   box-shadow: var(--shadow-lg);
+  z-index: 50;
 }
 
 .save-toast.success {
@@ -1995,16 +2362,44 @@ function showMessage(type, text, duration = 3500) {
 
 @media (max-width: 980px) {
   .workspace-header,
-  .overview-grid,
+  .overview-stats,
   .identity-section,
   .memory-grid,
   .setup-grid,
-  .gap-columns {
+  .gap-columns,
+  .outcome-row {
     grid-template-columns: 1fr;
   }
 
-  .workspace-band {
-    grid-column: span 1;
+  .workspace-body {
+    flex-direction: column;
+  }
+
+  .workspace-rail {
+    flex: 0 0 auto;
+    flex-direction: row;
+    align-items: center;
+    overflow-x: auto;
+    overflow-y: hidden;
+    padding: var(--spacing-xs) var(--spacing-sm);
+    border-right: none;
+    border-bottom: 1px solid var(--border-default);
+  }
+
+  .rail-label {
+    display: none;
+  }
+
+  .tab-button {
+    width: auto;
+    flex: 0 0 auto;
+    border-left: none;
+    border-bottom: 3px solid transparent;
+    border-radius: var(--radius-sm) var(--radius-sm) 0 0;
+  }
+
+  .tab-button.active {
+    border-bottom-color: var(--accent-primary);
   }
 
   .header-title {

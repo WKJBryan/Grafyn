@@ -52,6 +52,11 @@ async function mountWithDecisions(items) {
   twin.listDecisionEpisodes.mockResolvedValue(items)
   const wrapper = mount(TwinReviewView)
   await flushPromises()
+  // Full decision cards live on the Decisions tab; the overview shows compact rows.
+  await wrapper.findAll('.tab-button')
+    .find(button => button.text().includes('Decisions'))
+    .trigger('click')
+  await flushPromises()
   return wrapper
 }
 
