@@ -8,8 +8,9 @@ use crate::models::twin::{
     ExportBundle, ExportFileSummary, MemoryDigestAction, MemoryDigestItem,
     MemoryDigestReviewRequest, MemoryDigestState, PromotionState, RecordOrigin, ReflectionCard,
     ReflectionCardCreate, ReflectionScores, ResolvedEvidenceRef, SessionTrace, TraceEvent,
-    TraceEventType, TwinContextRecord, TwinExportRequest, TwinInferenceRunSummary,
-    TwinReviewRecord, UserRecord, UserRecordCreate, UserRecordKind, UserRecordUpdate,
+    TraceEventType, TwinContextRecord, TwinExportRequest, TwinInferenceRunSummary, TwinPrediction,
+    TwinPredictionDraft, TwinReviewRecord, UserRecord, UserRecordCreate, UserRecordKind,
+    UserRecordUpdate,
 };
 #[cfg(test)]
 use crate::models::twin::{DecisionMirrorPreset, PrimitiveDecisionAssessment};
@@ -31,6 +32,8 @@ const AUTO_PROMOTE_CONFIDENCE: f32 = 0.75;
 const AUTO_PROMOTE_SUPPORT_COUNT: usize = 3;
 const EXCERPT_MAX_CHARS: usize = 220;
 const MAX_TWIN_CANDIDATE_CONTEXT_RECORDS: usize = 8;
+const MAX_TWIN_APPROVED_CONTEXT_RECORDS: usize = 12;
+const MAX_TWIN_APPROVED_FALLBACK_RECORDS: usize = 3;
 const MAX_MEMORY_DIGEST_ITEMS: usize = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -426,12 +429,18 @@ impl TwinStore {
 
         let query_terms = lexical_terms(query);
         let mut approved = Vec::new();
+        let mut approved_fallback = Vec::new();
         let mut candidates = Vec::new();
 
         for record in self.record_cache.values() {
             match record.promotion_state {
                 PromotionState::Endorsed | PromotionState::AutoPromoted => {
-                    approved.push(twin_context_record(record, "approved"));
+                    let relevance = twin_record_relevance(record, &query_terms);
+                    if relevance > 0 {
+                        approved.push((relevance, twin_context_record(record, "approved")));
+                    } else {
+                        approved_fallback.push(twin_context_record(record, "approved"));
+                    }
                 }
                 PromotionState::Candidate => {
                     let relevance = twin_record_relevance(record, &query_terms);
@@ -448,11 +457,34 @@ impl TwinStore {
         }
 
         approved.sort_by(|a, b| {
-            b.confidence
-                .partial_cmp(&a.confidence)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| b.evidence_count.cmp(&a.evidence_count))
+            b.0.cmp(&a.0).then_with(|| {
+                b.1.confidence
+                    .partial_cmp(&a.1.confidence)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| b.1.evidence_count.cmp(&a.1.evidence_count))
+            })
         });
+
+        let approved: Vec<TwinContextRecord> = if approved.is_empty() {
+            // Never assemble an empty behavioral context just because the
+            // query shares no keywords with any approved record.
+            approved_fallback.sort_by(|a, b| {
+                b.confidence
+                    .partial_cmp(&a.confidence)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| b.evidence_count.cmp(&a.evidence_count))
+            });
+            approved_fallback
+                .into_iter()
+                .take(MAX_TWIN_APPROVED_FALLBACK_RECORDS)
+                .collect()
+        } else {
+            approved
+                .into_iter()
+                .take(MAX_TWIN_APPROVED_CONTEXT_RECORDS)
+                .map(|(_, record)| record)
+                .collect()
+        };
 
         candidates.sort_by(|a, b| {
             b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)).then_with(|| {
@@ -526,6 +558,13 @@ impl TwinStore {
         Self::validate_file_id(&create.tile_id)?;
 
         let now = Utc::now();
+        // A prediction is only attempted when there are at least two options
+        // to choose between; record why one will not arrive otherwise.
+        let prediction_status = if create.options.len() >= 2 {
+            Some("requested".to_string())
+        } else {
+            None
+        };
         let episode = DecisionEpisode {
             id: create.id,
             session_id: create.session_id,
@@ -543,6 +582,12 @@ impl TwinStore {
             lesson: None,
             missed_something: None,
             primitive_assessment: create.primitive_assessment,
+            twin_prediction: None,
+            prediction_status,
+            agreement: None,
+            correction_note: None,
+            context_version: create.context_version,
+            outcome_recorded_at: None,
             created_at: now,
             updated_at: now,
         };
@@ -588,6 +633,64 @@ impl TwinStore {
         Ok(episodes)
     }
 
+    /// Select past decided episodes as verbatim behavioral cases for twin
+    /// context. Correction notes (recorded when a sealed prediction missed)
+    /// break ties between equally relevant cases but never outrank a more
+    /// relevant case.
+    pub fn select_decision_cases(
+        &self,
+        query: &str,
+        exclude_episode_id: Option<&str>,
+        max: usize,
+    ) -> Result<Vec<DecisionEpisode>> {
+        if max == 0 {
+            return Ok(Vec::new());
+        }
+
+        let query_terms = lexical_terms(query);
+        let mut scored = Vec::new();
+        let mut fallback = Vec::new();
+
+        for episode in self.list_decision_episodes()? {
+            if episode.chosen_option.is_none() {
+                continue;
+            }
+            if exclude_episode_id.is_some_and(|id| id == episode.id) {
+                continue;
+            }
+            let score = decision_case_relevance(&episode, &query_terms);
+            if score > 0 {
+                scored.push((score, episode));
+            } else {
+                fallback.push(episode);
+            }
+        }
+
+        if scored.is_empty() {
+            // No keyword overlap at all: include the most recent decided
+            // cases rather than an empty behavioral context.
+            fallback.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+            fallback.truncate(max.min(2));
+            return Ok(fallback);
+        }
+
+        scored.sort_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then_with(|| {
+                    b.1.correction_note
+                        .is_some()
+                        .cmp(&a.1.correction_note.is_some())
+                })
+                .then_with(|| b.1.updated_at.cmp(&a.1.updated_at))
+        });
+
+        Ok(scored
+            .into_iter()
+            .take(max)
+            .map(|(_, episode)| episode)
+            .collect())
+    }
+
     pub fn update_decision_outcome(
         &mut self,
         id: &str,
@@ -601,7 +704,13 @@ impl TwinStore {
             episode.selected_response = Some(selected_response);
         }
         if let Some(chosen_option) = update.chosen_option {
-            episode.chosen_option = Some(chosen_option);
+            // Canonicalize label/case variants ("b", "Option 2", extra
+            // whitespace) against the recorded options; unmatched free text
+            // is kept as-is (legacy and "other" outcomes stay recordable).
+            let canonical = match_option_index(&chosen_option, &episode.options)
+                .map(|index| episode.options[index].clone())
+                .unwrap_or(chosen_option);
+            episode.chosen_option = Some(canonical);
         }
         if let Some(confidence) = update.confidence {
             episode.confidence = Some(confidence.clamp(0.0, 1.0));
@@ -624,6 +733,26 @@ impl TwinStore {
         if let Some(primitive_assessment) = update.primitive_assessment {
             episode.primitive_assessment = primitive_assessment;
         }
+        if let Some(correction_note) = update.correction_note {
+            episode.correction_note = Some(correction_note);
+        }
+
+        if episode.outcome_recorded_at.is_none()
+            && (episode.chosen_option.is_some() || episode.outcome.is_some())
+        {
+            episode.outcome_recorded_at = Some(Utc::now());
+        }
+
+        // Agreement is recomputed whenever both sides exist, so a corrected
+        // chosen_option keeps the stored agreement current. Only predictions
+        // sealed before the outcome was first recorded count.
+        if let (Some(chosen), Some(prediction)) = (&episode.chosen_option, &episode.twin_prediction)
+        {
+            let recorded_at = episode.outcome_recorded_at.unwrap_or_else(Utc::now);
+            if prediction.sealed_at <= recorded_at {
+                episode.agreement = Some(compute_agreement(prediction, chosen, &episode.options));
+            }
+        }
 
         episode.updated_at = Utc::now();
         self.write_decision_file(&episode)?;
@@ -642,10 +771,97 @@ impl TwinStore {
                 "lesson": episode.lesson,
                 "missed_something": episode.missed_something,
                 "primitive_assessment": episode.primitive_assessment,
+                "agreement": episode.agreement,
+                "correction_note": episode.correction_note,
+                "prediction_context_version": episode
+                    .twin_prediction
+                    .as_ref()
+                    .map(|prediction| prediction.context_version.clone()),
             }),
         )?;
 
         Ok(episode)
+    }
+
+    /// Seal a twin prediction onto an episode. Refuses (as a logged no-op
+    /// returning the unchanged episode) when the outcome is already recorded
+    /// or a prediction already exists, so `sealed_at` always precedes the
+    /// outcome structurally. The trace payload never contains the predicted
+    /// option — the trace viewer must not leak a sealed prediction.
+    pub fn attach_twin_prediction(
+        &mut self,
+        episode_id: &str,
+        draft: TwinPredictionDraft,
+        model_id: &str,
+        context_version: &str,
+    ) -> Result<DecisionEpisode> {
+        Self::validate_file_id(episode_id)?;
+        let path = self.decision_file_path(episode_id);
+        let mut episode = self.read_decision_file(&path)?;
+
+        if episode.chosen_option.is_some() {
+            log::warn!(
+                "Twin prediction for episode {} arrived after the outcome was recorded; discarding",
+                episode_id
+            );
+            episode.prediction_status = Some("outcome_recorded_first".to_string());
+            episode.updated_at = Utc::now();
+            self.write_decision_file(&episode)?;
+            return Ok(episode);
+        }
+        if episode.twin_prediction.is_some() {
+            log::warn!(
+                "Episode {} already has a sealed twin prediction; ignoring duplicate",
+                episode_id
+            );
+            return Ok(episode);
+        }
+
+        let prediction = TwinPrediction {
+            predicted_option: draft.predicted_option,
+            matched_option_index: draft.matched_option_index,
+            confidence: draft.confidence,
+            rationale: draft.rationale,
+            parse_mode: draft.parse_mode.clone(),
+            model_id: model_id.to_string(),
+            context_version: context_version.to_string(),
+            sealed_at: Utc::now(),
+        };
+        let sealed_at = prediction.sealed_at;
+        episode.twin_prediction = Some(prediction);
+        episode.prediction_status = Some("sealed".to_string());
+        episode.updated_at = Utc::now();
+        self.write_decision_file(&episode)?;
+
+        self.append_trace_event(
+            &episode.session_id,
+            TraceEventType::TwinPredictionSealed,
+            json!({
+                "decision_episode_id": episode.id,
+                "tile_id": episode.tile_id,
+                "model_id": model_id,
+                "context_version": context_version,
+                "parse_mode": draft.parse_mode,
+                "sealed_at": sealed_at,
+            }),
+        )?;
+
+        Ok(episode)
+    }
+
+    /// Record that the hidden prediction call failed, so exported episodes
+    /// distinguish "no prediction because the call failed" from "agreed to
+    /// not predict" — silent gaps would inflate measured accuracy.
+    pub fn mark_twin_prediction_failed(&mut self, episode_id: &str) -> Result<()> {
+        Self::validate_file_id(episode_id)?;
+        let path = self.decision_file_path(episode_id);
+        let mut episode = self.read_decision_file(&path)?;
+        if episode.twin_prediction.is_some() || episode.chosen_option.is_some() {
+            return Ok(());
+        }
+        episode.prediction_status = Some("failed".to_string());
+        episode.updated_at = Utc::now();
+        self.write_decision_file(&episode)
     }
 
     pub fn record_reflection_card(
@@ -1029,14 +1245,22 @@ impl TwinStore {
         let mut episodes = self
             .list_decision_episodes()?
             .into_iter()
-            .map(|episode| {
+            .map(|mut episode| {
                 let mut reflection_cards = cards_by_episode.remove(&episode.id).unwrap_or_default();
                 reflection_cards.sort_by(|a, b| b.created_at.cmp(&a.created_at));
                 let feedback_events = self.decision_feedback_events(&episode).unwrap_or_default();
+                // A sealed prediction must never cross IPC before the outcome
+                // is recorded; the UI only learns that one exists.
+                let prediction_sealed =
+                    episode.twin_prediction.is_some() && episode.chosen_option.is_none();
+                if prediction_sealed {
+                    episode.twin_prediction = None;
+                }
                 DecisionEpisodeWithReflections {
                     episode,
                     reflection_cards,
                     feedback_events,
+                    prediction_sealed,
                 }
             })
             .collect::<Vec<_>>();
@@ -1764,6 +1988,8 @@ impl TwinStore {
         let benchmark_path = output_dir.join("decision_mirror_benchmark.jsonl");
         let constitution_path = output_dir.join("constitution_items.jsonl");
         let action_gaps_path = output_dir.join("action_gaps.jsonl");
+        let decision_episodes_path = output_dir.join("decision_episodes.jsonl");
+        let feedback_events_path = output_dir.join("feedback_events.jsonl");
         let manifest_path = output_dir.join("manifest.json");
 
         let mut records: Vec<UserRecord> = self.record_cache.values().cloned().collect();
@@ -1843,7 +2069,86 @@ impl TwinStore {
             .collect::<std::result::Result<Vec<_>, _>>()?;
         self.write_jsonl_file(&action_gaps_path, &action_gap_lines)?;
 
+        // Decision episodes with sealed-prediction integrity: while an
+        // episode has no recorded choice, its prediction exports as a
+        // non-revealing stub so the bet cannot leak through an early export.
+        let decision_episode_lines = self
+            .list_decision_episodes()?
+            .into_iter()
+            .map(|episode| {
+                let still_sealed =
+                    episode.twin_prediction.is_some() && episode.chosen_option.is_none();
+                let mut value = serde_json::to_value(&episode)?;
+                if still_sealed {
+                    if let Some(object) = value.as_object_mut() {
+                        let stub = episode.twin_prediction.as_ref().map(|prediction| {
+                            serde_json::json!({
+                                "sealed": true,
+                                "sealed_at": prediction.sealed_at,
+                                "model_id": prediction.model_id,
+                                "context_version": prediction.context_version,
+                                "parse_mode": prediction.parse_mode,
+                            })
+                        });
+                        object.insert("twin_prediction".to_string(), stub.unwrap_or(Value::Null));
+                    }
+                }
+                serde_json::to_string(&value).map_err(anyhow::Error::from)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.write_jsonl_file(&decision_episodes_path, &decision_episode_lines)?;
+
+        // Ranking / Matches-Me / insight raw material. Privacy rule: skip
+        // events that are evidence for records now marked Rejected, Private,
+        // or NoTrain.
+        let excluded_event_ids: HashSet<String> = self
+            .record_cache
+            .values()
+            .filter(|record| {
+                matches!(
+                    record.promotion_state,
+                    PromotionState::Rejected | PromotionState::Private | PromotionState::NoTrain
+                )
+            })
+            .flat_map(|record| {
+                record
+                    .evidence_refs
+                    .iter()
+                    .map(|evidence| evidence.event_id.clone())
+            })
+            .collect();
+        let feedback_event_lines = self
+            .list_session_traces()?
+            .into_iter()
+            .flat_map(|trace| {
+                let session_id = trace.session_id.clone();
+                let trace_id = trace.id.clone();
+                trace
+                    .events
+                    .into_iter()
+                    .filter(|event| {
+                        matches!(
+                            event.event_type,
+                            TraceEventType::FeedbackRecorded
+                                | TraceEventType::RankingRecorded
+                                | TraceEventType::InsightCaptured
+                        ) && !excluded_event_ids.contains(&event.id)
+                    })
+                    .map(move |event| {
+                        serde_json::to_string(&serde_json::json!({
+                            "session_id": session_id,
+                            "trace_id": trace_id,
+                            "event": event,
+                        }))
+                        .map_err(anyhow::Error::from)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.write_jsonl_file(&feedback_events_path, &feedback_event_lines)?;
+
         let manifest = serde_json::json!({
+            "bundle_schema_version": 2,
             "generated_at": Utc::now(),
             "root_path": self.root_path.display().to_string(),
             "eval_percentage": eval_percentage,
@@ -1873,6 +2178,14 @@ impl TwinStore {
                 "action_gaps": {
                     "path": action_gaps_path.display().to_string(),
                     "count": action_gap_lines.len(),
+                },
+                "decision_episodes": {
+                    "path": decision_episodes_path.display().to_string(),
+                    "count": decision_episode_lines.len(),
+                },
+                "feedback_events": {
+                    "path": feedback_events_path.display().to_string(),
+                    "count": feedback_event_lines.len(),
                 },
             },
             "excluded_counts": {
@@ -1906,6 +2219,14 @@ impl TwinStore {
             action_gaps: ExportFileSummary {
                 path: action_gaps_path.display().to_string(),
                 count: action_gap_lines.len(),
+            },
+            decision_episodes: ExportFileSummary {
+                path: decision_episodes_path.display().to_string(),
+                count: decision_episode_lines.len(),
+            },
+            feedback_events: ExportFileSummary {
+                path: feedback_events_path.display().to_string(),
+                count: feedback_event_lines.len(),
             },
             train: ExportFileSummary {
                 path: train_path.display().to_string(),
@@ -3680,6 +4001,199 @@ fn twin_record_relevance(record: &UserRecord, query_terms: &HashSet<String>) -> 
     query_terms.intersection(&record_terms).count()
 }
 
+const PREDICTION_OPTION_MAX_CHARS: usize = 500;
+const PREDICTION_RATIONALE_MAX_CHARS: usize = 2000;
+
+/// Normalize an option string for comparison: trim, strip wrapping quotes,
+/// lowercase, collapse whitespace. Label forms ("Option 2", "B") are handled
+/// separately by `match_option_index` so meaningful digits survive.
+pub fn normalize_option(text: &str) -> String {
+    text.trim()
+        .trim_matches(|c: char| c == '"' || c == '\'' || c == '`')
+        .to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        text.to_string()
+    } else {
+        text.chars().take(max_chars).collect()
+    }
+}
+
+fn match_option_index(text: &str, options: &[String]) -> Option<usize> {
+    let normalized = normalize_option(text);
+    if normalized.is_empty() {
+        return None;
+    }
+
+    // Label forms: "option 2" / "choice b" / bare "2" / bare "b".
+    let label = ["option", "choice"]
+        .iter()
+        .find_map(|prefix| normalized.strip_prefix(prefix))
+        .map(str::trim)
+        .unwrap_or(&normalized)
+        .trim_matches(|c: char| c == '.' || c == ')' || c == ':' || c.is_whitespace());
+    if label.len() == 1 {
+        if let Some(letter) = label.chars().next() {
+            if letter.is_ascii_lowercase() {
+                let index = (letter as usize) - ('a' as usize);
+                if index < options.len() {
+                    return Some(index);
+                }
+            }
+        }
+    }
+    // Bare number labels: humans count from 1.
+    if let Ok(number) = label.parse::<usize>() {
+        if (1..=options.len()).contains(&number) {
+            return Some(number - 1);
+        }
+    }
+
+    options
+        .iter()
+        .position(|option| normalize_option(option) == normalized)
+}
+
+fn sanitize_confidence(raw: Option<f64>) -> Option<f32> {
+    let value = raw?;
+    if !value.is_finite() {
+        return None;
+    }
+    let value = if value > 2.0 && value <= 100.0 {
+        // Percent-style answer ("73" meaning 73%).
+        value / 100.0
+    } else {
+        // Near-misses like 1.2 are over-confident, not percentages.
+        value
+    };
+    Some(value.clamp(0.0, 1.0) as f32)
+}
+
+/// Parse the raw model output of a sealed-prediction call into a draft.
+/// Fallback chain: fenced/embedded strict JSON -> normalized string match
+/// against `options` -> raw text (manual adjudication later).
+pub fn parse_twin_prediction(raw: &str, options: &[String]) -> TwinPredictionDraft {
+    #[derive(serde::Deserialize)]
+    struct ParsedPrediction {
+        predicted_option: Option<String>,
+        option_index: Option<Value>,
+        confidence: Option<f64>,
+        rationale: Option<String>,
+    }
+
+    let json_slice = raw
+        .find('{')
+        .and_then(|start| raw.rfind('}').map(|end| &raw[start..=end]));
+
+    if let Some(slice) = json_slice {
+        if let Ok(parsed) = serde_json::from_str::<ParsedPrediction>(slice) {
+            let text = parsed.predicted_option.unwrap_or_default();
+            let text_index = match_option_index(&text, options);
+            let field_index = parsed.option_index.as_ref().and_then(|value| match value {
+                Value::Number(number) => number.as_u64().map(|n| n as usize),
+                Value::String(text) => text.trim().parse::<usize>().ok(),
+                _ => None,
+            });
+            // The prompt displays a 1-based option list, so prefer the
+            // 1-based reading; tolerate 0-based answers, and let the option
+            // text disambiguate when both readings are valid.
+            let field_index = field_index.and_then(|index| {
+                let one_based = index.checked_sub(1).filter(|i| *i < options.len());
+                let zero_based = Some(index).filter(|i| *i < options.len());
+                match (one_based, zero_based) {
+                    (Some(ob), Some(zb)) => match text_index {
+                        Some(text_idx) if text_idx == zb => Some(zb),
+                        _ => Some(ob),
+                    },
+                    (Some(ob), None) => Some(ob),
+                    (None, Some(zb)) => Some(zb),
+                    (None, None) => None,
+                }
+            });
+            // The option text is what the model actually said; a conflicting
+            // numeric index loses.
+            let matched_option_index = match (text_index, field_index) {
+                (Some(text_idx), _) => Some(text_idx),
+                (None, Some(field_idx)) if text.is_empty() => Some(field_idx),
+                _ => None,
+            };
+            let predicted_option = if text.is_empty() {
+                matched_option_index
+                    .map(|index| options[index].clone())
+                    .unwrap_or_else(|| truncate_chars(raw.trim(), PREDICTION_OPTION_MAX_CHARS))
+            } else {
+                truncate_chars(&text, PREDICTION_OPTION_MAX_CHARS)
+            };
+            return TwinPredictionDraft {
+                predicted_option,
+                matched_option_index,
+                confidence: sanitize_confidence(parsed.confidence),
+                rationale: parsed
+                    .rationale
+                    .map(|text| truncate_chars(&text, PREDICTION_RATIONALE_MAX_CHARS)),
+                parse_mode: "json".to_string(),
+            };
+        }
+    }
+
+    if let Some(index) = match_option_index(raw, options) {
+        return TwinPredictionDraft {
+            predicted_option: options[index].clone(),
+            matched_option_index: Some(index),
+            confidence: None,
+            rationale: None,
+            parse_mode: "string_match".to_string(),
+        };
+    }
+
+    TwinPredictionDraft {
+        predicted_option: truncate_chars(raw.trim(), PREDICTION_OPTION_MAX_CHARS),
+        matched_option_index: None,
+        confidence: None,
+        rationale: None,
+        parse_mode: "raw".to_string(),
+    }
+}
+
+fn compute_agreement(prediction: &TwinPrediction, chosen: &str, options: &[String]) -> bool {
+    let chosen_index = match_option_index(chosen, options);
+    match (prediction.matched_option_index, chosen_index) {
+        (Some(predicted), Some(chosen)) => predicted == chosen,
+        _ => normalize_option(&prediction.predicted_option) == normalize_option(chosen),
+    }
+}
+
+fn decision_case_relevance(episode: &DecisionEpisode, query_terms: &HashSet<String>) -> usize {
+    if query_terms.is_empty() {
+        return 0;
+    }
+
+    let mut haystack = episode.decision.clone();
+    haystack.push(' ');
+    haystack.push_str(&episode.options.join(" "));
+    for text in [
+        episode.chosen_option.as_deref(),
+        episode.initial_leaning.as_deref(),
+        episode.lesson.as_deref(),
+        episode.outcome.as_deref(),
+        episode.correction_note.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        haystack.push(' ');
+        haystack.push_str(text);
+    }
+
+    let episode_terms = lexical_terms(&haystack);
+    query_terms.intersection(&episode_terms).count()
+}
+
 fn lexical_terms(text: &str) -> HashSet<String> {
     const STOPWORDS: &[&str] = &[
         "a", "an", "and", "are", "as", "at", "be", "by", "can", "do", "for", "from", "how", "i",
@@ -4072,6 +4586,7 @@ mod tests {
                     action_gap_risk: None,
                     outcome_feedback: None,
                 },
+                context_version: None,
             })
             .expect("decision episode should persist");
 
@@ -5145,5 +5660,630 @@ mod tests {
         assert_eq!(trace.events.len(), 1);
         assert_eq!(trace.events[0].id, event.id);
         assert_eq!(trace.events[0].event_type, TraceEventType::PromptSubmitted);
+    }
+
+    #[test]
+    fn decision_episode_old_json_loads_with_default_prediction_fields() {
+        let temp_dir = tempdir().expect("temp dir should be created");
+        let store = TwinStore::new(temp_dir.path().to_path_buf());
+
+        let old_json = r#"{
+            "id": "legacy-episode",
+            "session_id": "session-1",
+            "tile_id": "tile-1",
+            "decision": "Ship now or wait?",
+            "options": ["Ship now", "Wait"],
+            "chosen_option": "Ship now",
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z"
+        }"#;
+        std::fs::create_dir_all(&store.decisions_path).expect("decisions dir");
+        std::fs::write(store.decisions_path.join("legacy-episode.json"), old_json)
+            .expect("legacy episode should write");
+
+        let episodes = store
+            .list_decision_episodes()
+            .expect("legacy episode should deserialize");
+        assert_eq!(episodes.len(), 1);
+        let episode = &episodes[0];
+        assert!(episode.twin_prediction.is_none());
+        assert!(episode.prediction_status.is_none());
+        assert!(episode.agreement.is_none());
+        assert!(episode.correction_note.is_none());
+        assert!(episode.context_version.is_none());
+        assert!(episode.outcome_recorded_at.is_none());
+    }
+
+    #[test]
+    fn sealed_prediction_redacted_from_reflections_until_outcome() {
+        let temp_dir = tempdir().expect("temp dir should be created");
+        let mut store = TwinStore::new(temp_dir.path().to_path_buf());
+
+        let episode = store
+            .record_decision_episode(DecisionEpisodeCreate {
+                id: "decision-sealed".to_string(),
+                session_id: "session-1".to_string(),
+                tile_id: "tile-1".to_string(),
+                decision: "Take the Denver job?".to_string(),
+                options: vec!["Take it".to_string(), "Stay".to_string()],
+                stakes: None,
+                initial_leaning: None,
+                review_date: None,
+                primitive_assessment: PrimitiveDecisionAssessment::default(),
+                context_version: Some("ctx-test".to_string()),
+            })
+            .expect("decision episode should persist");
+        assert_eq!(episode.prediction_status.as_deref(), Some("requested"));
+
+        let mut sealed = episode.clone();
+        sealed.twin_prediction = Some(TwinPrediction {
+            predicted_option: "Stay".to_string(),
+            matched_option_index: Some(1),
+            confidence: Some(0.7),
+            rationale: Some("Family proximity outweighs salary here.".to_string()),
+            parse_mode: "json".to_string(),
+            model_id: "test/model".to_string(),
+            context_version: "ctx-test".to_string(),
+            sealed_at: Utc::now(),
+        });
+        sealed.prediction_status = Some("sealed".to_string());
+        store
+            .write_decision_file(&sealed)
+            .expect("sealed episode should write");
+
+        let listed = store
+            .list_decision_episodes_with_reflections()
+            .expect("episodes should list");
+        let item = listed
+            .iter()
+            .find(|item| item.episode.id == "decision-sealed")
+            .expect("episode should be listed");
+        assert!(item.prediction_sealed);
+        assert!(item.episode.twin_prediction.is_none());
+
+        store
+            .update_decision_outcome(
+                "decision-sealed",
+                DecisionOutcomeUpdate {
+                    chosen_option: Some("Stay".to_string()),
+                    ..DecisionOutcomeUpdate::default()
+                },
+            )
+            .expect("outcome should record");
+
+        let listed = store
+            .list_decision_episodes_with_reflections()
+            .expect("episodes should list after outcome");
+        let item = listed
+            .iter()
+            .find(|item| item.episode.id == "decision-sealed")
+            .expect("episode should be listed after outcome");
+        assert!(!item.prediction_sealed);
+        let prediction = item
+            .episode
+            .twin_prediction
+            .as_ref()
+            .expect("prediction should be revealed after outcome");
+        assert_eq!(prediction.predicted_option, "Stay");
+    }
+
+    fn endorsed_record(store: &mut TwinStore, content: &str, confidence: f32) -> UserRecord {
+        store
+            .create_user_record(UserRecordCreate {
+                kind: UserRecordKind::Preference,
+                content: content.to_string(),
+                origin: RecordOrigin::User,
+                evidence_refs: Vec::new(),
+                confidence,
+                promotion_state: Some(PromotionState::Endorsed),
+                valid_from: None,
+                valid_until: None,
+                links: Vec::new(),
+                metadata: HashMap::new(),
+            })
+            .expect("record should be created")
+    }
+
+    fn decided_episode(
+        store: &mut TwinStore,
+        id: &str,
+        decision: &str,
+        chosen: &str,
+        correction_note: Option<&str>,
+    ) -> DecisionEpisode {
+        let episode = store
+            .record_decision_episode(DecisionEpisodeCreate {
+                id: id.to_string(),
+                session_id: "session-1".to_string(),
+                tile_id: format!("tile-{id}"),
+                decision: decision.to_string(),
+                options: vec!["Option A".to_string(), "Option B".to_string()],
+                stakes: None,
+                initial_leaning: None,
+                review_date: None,
+                primitive_assessment: PrimitiveDecisionAssessment::default(),
+                context_version: None,
+            })
+            .expect("episode should persist");
+        let mut decided = episode.clone();
+        decided.chosen_option = Some(chosen.to_string());
+        decided.correction_note = correction_note.map(|note| note.to_string());
+        store
+            .write_decision_file(&decided)
+            .expect("decided episode should write");
+        decided
+    }
+
+    #[test]
+    fn approved_records_are_relevance_gated_with_confidence_fallback() {
+        let temp_dir = tempdir().expect("temp dir should be created");
+        let mut store = TwinStore::new(temp_dir.path().to_path_buf());
+
+        endorsed_record(
+            &mut store,
+            "Prefers remote work over relocation for salary",
+            0.6,
+        );
+        endorsed_record(&mut store, "Enjoys woodworking podcasts on weekends", 0.9);
+
+        let (approved, _) = store
+            .select_context_records("Should I accept the relocation offer for more salary?")
+            .expect("selection should succeed");
+        assert_eq!(approved.len(), 1);
+        assert!(approved[0].content.contains("relocation"));
+
+        // No keyword overlap at all: fall back to top-confidence records
+        // instead of an empty behavioral context.
+        let (fallback, _) = store
+            .select_context_records("zzz qqq xyzzy")
+            .expect("fallback selection should succeed");
+        assert!(!fallback.is_empty());
+        assert!(fallback.len() <= MAX_TWIN_APPROVED_FALLBACK_RECORDS);
+        assert!(fallback[0].content.contains("woodworking"));
+    }
+
+    #[test]
+    fn decision_cases_rank_relevance_above_correction_notes() {
+        let temp_dir = tempdir().expect("temp dir should be created");
+        let mut store = TwinStore::new(temp_dir.path().to_path_buf());
+
+        decided_episode(
+            &mut store,
+            "case-relevant",
+            "Accept the Denver relocation offer with higher salary?",
+            "Option B",
+            None,
+        );
+        decided_episode(
+            &mut store,
+            "case-correction",
+            "Buy the relocation boxes early?",
+            "Option A",
+            Some("Twin guessed wrong here"),
+        );
+        // Undecided episode must never appear as a case.
+        store
+            .record_decision_episode(DecisionEpisodeCreate {
+                id: "case-undecided".to_string(),
+                session_id: "session-1".to_string(),
+                tile_id: "tile-undecided".to_string(),
+                decision: "Relocation salary salary salary?".to_string(),
+                options: vec!["A".to_string(), "B".to_string()],
+                stakes: None,
+                initial_leaning: None,
+                review_date: None,
+                primitive_assessment: PrimitiveDecisionAssessment::default(),
+                context_version: None,
+            })
+            .expect("undecided episode should persist");
+
+        let cases = store
+            .select_decision_cases("Denver relocation salary decision", None, 5)
+            .expect("cases should select");
+        assert_eq!(cases.len(), 2);
+        // The strongly relevant case outranks the weakly relevant one even
+        // though the weak one carries a correction note.
+        assert_eq!(cases[0].id, "case-relevant");
+        assert_eq!(cases[1].id, "case-correction");
+        assert!(cases.iter().all(|case| case.id != "case-undecided"));
+
+        let excluded = store
+            .select_decision_cases(
+                "Denver relocation salary decision",
+                Some("case-relevant"),
+                5,
+            )
+            .expect("exclusion should apply");
+        assert!(excluded.iter().all(|case| case.id != "case-relevant"));
+
+        // Zero overlap: most recent decided cases, capped at two.
+        let recent = store
+            .select_decision_cases("zzz qqq xyzzy", None, 5)
+            .expect("fallback should select");
+        assert!(!recent.is_empty());
+        assert!(recent.len() <= 2);
+        assert!(recent.iter().all(|case| case.chosen_option.is_some()));
+    }
+
+    fn prediction_options() -> Vec<String> {
+        vec![
+            "Take the Denver job".to_string(),
+            "Stay in Austin".to_string(),
+        ]
+    }
+
+    #[test]
+    fn parse_twin_prediction_strict_json() {
+        let raw = r#"{"predicted_option": "Stay in Austin", "option_index": 2, "confidence": 0.8, "rationale": "Family proximity wins."}"#;
+        let draft = parse_twin_prediction(raw, &prediction_options());
+        assert_eq!(draft.parse_mode, "json");
+        assert_eq!(draft.matched_option_index, Some(1));
+        assert_eq!(draft.predicted_option, "Stay in Austin");
+        assert_eq!(draft.confidence, Some(0.8));
+        assert_eq!(draft.rationale.as_deref(), Some("Family proximity wins."));
+    }
+
+    #[test]
+    fn parse_twin_prediction_fenced_json_with_language_tag() {
+        let raw = "```json\n{\"predicted_option\": \"Take the Denver job\", \"option_index\": 1, \"confidence\": 0.6, \"rationale\": \"Growth.\"}\n```";
+        let draft = parse_twin_prediction(raw, &prediction_options());
+        assert_eq!(draft.parse_mode, "json");
+        assert_eq!(draft.matched_option_index, Some(0));
+    }
+
+    #[test]
+    fn parse_twin_prediction_index_as_string_and_one_based() {
+        let raw = r#"{"option_index": "1", "confidence": 0.5}"#;
+        let draft = parse_twin_prediction(raw, &prediction_options());
+        // 1-based reading preferred: "1" means the first listed option.
+        assert_eq!(draft.matched_option_index, Some(0));
+        assert_eq!(draft.predicted_option, "Take the Denver job");
+    }
+
+    #[test]
+    fn parse_twin_prediction_text_beats_conflicting_index() {
+        let raw = r#"{"predicted_option": "Stay in Austin", "option_index": 1, "confidence": 0.9}"#;
+        let draft = parse_twin_prediction(raw, &prediction_options());
+        // The option text is what the model said; the conflicting index loses.
+        assert_eq!(draft.matched_option_index, Some(1));
+    }
+
+    #[test]
+    fn parse_twin_prediction_out_of_range_index_with_valid_text() {
+        let raw = r#"{"predicted_option": "Stay in Austin", "option_index": 9}"#;
+        let draft = parse_twin_prediction(raw, &prediction_options());
+        assert_eq!(draft.matched_option_index, Some(1));
+    }
+
+    #[test]
+    fn parse_twin_prediction_bare_text_and_labels() {
+        let options = prediction_options();
+        let bare = parse_twin_prediction("  Stay in Austin\n", &options);
+        assert_eq!(bare.parse_mode, "string_match");
+        assert_eq!(bare.matched_option_index, Some(1));
+
+        let letter = parse_twin_prediction("B", &options);
+        assert_eq!(letter.matched_option_index, Some(1));
+
+        let labeled = parse_twin_prediction("Option 2", &options);
+        assert_eq!(labeled.matched_option_index, Some(1));
+    }
+
+    #[test]
+    fn parse_twin_prediction_garbage_falls_to_raw() {
+        let long_garbage = "I think there are many considerations here ".repeat(40);
+        let draft = parse_twin_prediction(&long_garbage, &prediction_options());
+        assert_eq!(draft.parse_mode, "raw");
+        assert!(draft.matched_option_index.is_none());
+        assert!(draft.predicted_option.chars().count() <= 500);
+    }
+
+    #[test]
+    fn parse_twin_prediction_sanitizes_confidence() {
+        let options = prediction_options();
+        let percent = parse_twin_prediction(
+            r#"{"predicted_option": "Stay in Austin", "confidence": 73}"#,
+            &options,
+        );
+        assert_eq!(percent.confidence, Some(0.73));
+
+        let overshoot = parse_twin_prediction(
+            r#"{"predicted_option": "Stay in Austin", "confidence": 1.2}"#,
+            &options,
+        );
+        assert_eq!(overshoot.confidence, Some(1.0));
+
+        let negative = parse_twin_prediction(
+            r#"{"predicted_option": "Stay in Austin", "confidence": -0.1}"#,
+            &options,
+        );
+        assert_eq!(negative.confidence, Some(0.0));
+
+        let null = parse_twin_prediction(
+            r#"{"predicted_option": "Stay in Austin", "confidence": null}"#,
+            &options,
+        );
+        assert!(null.confidence.is_none());
+    }
+
+    #[test]
+    fn attach_twin_prediction_refuses_after_outcome_and_duplicates() {
+        let temp_dir = tempdir().expect("temp dir should be created");
+        let mut store = TwinStore::new(temp_dir.path().to_path_buf());
+
+        let episode = store
+            .record_decision_episode(DecisionEpisodeCreate {
+                id: "decision-attach".to_string(),
+                session_id: "session-1".to_string(),
+                tile_id: "tile-1".to_string(),
+                decision: "Take the Denver job?".to_string(),
+                options: prediction_options(),
+                stakes: None,
+                initial_leaning: None,
+                review_date: None,
+                primitive_assessment: PrimitiveDecisionAssessment::default(),
+                context_version: Some("ctx-test".to_string()),
+            })
+            .expect("episode should persist");
+
+        let draft = parse_twin_prediction("Stay in Austin", &prediction_options());
+        let sealed = store
+            .attach_twin_prediction(&episode.id, draft.clone(), "test/model", "ctx-test")
+            .expect("first attach should seal");
+        assert_eq!(sealed.prediction_status.as_deref(), Some("sealed"));
+        let first_sealed_at = sealed.twin_prediction.as_ref().unwrap().sealed_at;
+
+        // Duplicate attach is a no-op.
+        let duplicate = store
+            .attach_twin_prediction(&episode.id, draft.clone(), "other/model", "ctx-test")
+            .expect("duplicate attach should not error");
+        assert_eq!(
+            duplicate.twin_prediction.as_ref().unwrap().sealed_at,
+            first_sealed_at
+        );
+        assert_eq!(
+            duplicate.twin_prediction.as_ref().unwrap().model_id,
+            "test/model"
+        );
+
+        // Outcome-first race: attach after the choice is recorded.
+        let late_episode = store
+            .record_decision_episode(DecisionEpisodeCreate {
+                id: "decision-late".to_string(),
+                session_id: "session-1".to_string(),
+                tile_id: "tile-2".to_string(),
+                decision: "Take the Denver job?".to_string(),
+                options: prediction_options(),
+                stakes: None,
+                initial_leaning: None,
+                review_date: None,
+                primitive_assessment: PrimitiveDecisionAssessment::default(),
+                context_version: None,
+            })
+            .expect("episode should persist");
+        store
+            .update_decision_outcome(
+                &late_episode.id,
+                DecisionOutcomeUpdate {
+                    chosen_option: Some("Stay in Austin".to_string()),
+                    ..DecisionOutcomeUpdate::default()
+                },
+            )
+            .expect("outcome should record");
+        let refused = store
+            .attach_twin_prediction(&late_episode.id, draft, "test/model", "ctx-test")
+            .expect("late attach should not error");
+        assert!(refused.twin_prediction.is_none());
+        assert_eq!(
+            refused.prediction_status.as_deref(),
+            Some("outcome_recorded_first")
+        );
+    }
+
+    #[test]
+    fn outcome_computes_agreement_and_canonicalizes_choice() {
+        let temp_dir = tempdir().expect("temp dir should be created");
+        let mut store = TwinStore::new(temp_dir.path().to_path_buf());
+
+        let episode = store
+            .record_decision_episode(DecisionEpisodeCreate {
+                id: "decision-agree".to_string(),
+                session_id: "session-1".to_string(),
+                tile_id: "tile-1".to_string(),
+                decision: "Take the Denver job?".to_string(),
+                options: prediction_options(),
+                stakes: None,
+                initial_leaning: None,
+                review_date: None,
+                primitive_assessment: PrimitiveDecisionAssessment::default(),
+                context_version: Some("ctx-test".to_string()),
+            })
+            .expect("episode should persist");
+        let draft = parse_twin_prediction("Stay in Austin", &prediction_options());
+        store
+            .attach_twin_prediction(&episode.id, draft, "test/model", "ctx-test")
+            .expect("prediction should seal");
+
+        // Label + case variant resolves to the canonical option text and
+        // agreement computes via index comparison.
+        let updated = store
+            .update_decision_outcome(
+                &episode.id,
+                DecisionOutcomeUpdate {
+                    chosen_option: Some("option 2".to_string()),
+                    correction_note: None,
+                    ..DecisionOutcomeUpdate::default()
+                },
+            )
+            .expect("outcome should record");
+        assert_eq!(updated.chosen_option.as_deref(), Some("Stay in Austin"));
+        assert_eq!(updated.agreement, Some(true));
+        assert!(updated.outcome_recorded_at.is_some());
+
+        // Editing the choice recomputes agreement and accepts a correction
+        // note; outcome_recorded_at is not reset.
+        let first_recorded_at = updated.outcome_recorded_at;
+        let edited = store
+            .update_decision_outcome(
+                &episode.id,
+                DecisionOutcomeUpdate {
+                    chosen_option: Some("  TAKE the denver JOB ".to_string()),
+                    correction_note: Some("Twin overweighted family proximity.".to_string()),
+                    ..DecisionOutcomeUpdate::default()
+                },
+            )
+            .expect("edited outcome should record");
+        assert_eq!(edited.chosen_option.as_deref(), Some("Take the Denver job"));
+        assert_eq!(edited.agreement, Some(false));
+        assert_eq!(
+            edited.correction_note.as_deref(),
+            Some("Twin overweighted family proximity.")
+        );
+        assert_eq!(edited.outcome_recorded_at, first_recorded_at);
+    }
+
+    #[test]
+    fn outcome_without_prediction_records_no_agreement_and_keeps_free_text() {
+        let temp_dir = tempdir().expect("temp dir should be created");
+        let mut store = TwinStore::new(temp_dir.path().to_path_buf());
+
+        let episode = store
+            .record_decision_episode(DecisionEpisodeCreate {
+                id: "decision-free".to_string(),
+                session_id: "session-1".to_string(),
+                tile_id: "tile-1".to_string(),
+                decision: "Take the Denver job?".to_string(),
+                options: prediction_options(),
+                stakes: None,
+                initial_leaning: None,
+                review_date: None,
+                primitive_assessment: PrimitiveDecisionAssessment::default(),
+                context_version: None,
+            })
+            .expect("episode should persist");
+
+        let updated = store
+            .update_decision_outcome(
+                &episode.id,
+                DecisionOutcomeUpdate {
+                    chosen_option: Some("Negotiated a remote arrangement instead".to_string()),
+                    ..DecisionOutcomeUpdate::default()
+                },
+            )
+            .expect("outcome should record");
+        // Free text that matches no option is preserved verbatim.
+        assert_eq!(
+            updated.chosen_option.as_deref(),
+            Some("Negotiated a remote arrangement instead")
+        );
+        assert!(updated.agreement.is_none());
+    }
+
+    #[test]
+    fn export_redacts_sealed_predictions_and_filters_private_feedback_events() {
+        let temp_dir = tempdir().expect("temp dir should be created");
+        let mut store = TwinStore::new(temp_dir.path().to_path_buf());
+
+        for (id, record_outcome) in [("episode-sealed", false), ("episode-revealed", true)] {
+            store
+                .record_decision_episode(DecisionEpisodeCreate {
+                    id: id.to_string(),
+                    session_id: "session-1".to_string(),
+                    tile_id: format!("tile-{id}"),
+                    decision: "Take the Denver job?".to_string(),
+                    options: prediction_options(),
+                    stakes: None,
+                    initial_leaning: None,
+                    review_date: None,
+                    primitive_assessment: PrimitiveDecisionAssessment::default(),
+                    context_version: Some("ctx-test".to_string()),
+                })
+                .expect("episode should persist");
+            let draft = parse_twin_prediction("Stay in Austin", &prediction_options());
+            store
+                .attach_twin_prediction(id, draft, "test/model", "ctx-test")
+                .expect("prediction should seal");
+            if record_outcome {
+                store
+                    .update_decision_outcome(
+                        id,
+                        DecisionOutcomeUpdate {
+                            chosen_option: Some("Stay in Austin".to_string()),
+                            ..DecisionOutcomeUpdate::default()
+                        },
+                    )
+                    .expect("outcome should record");
+            }
+        }
+
+        // One feedback event tied to a record later marked Private, one free.
+        let private_event = store
+            .append_trace_event(
+                "session-1",
+                TraceEventType::FeedbackRecorded,
+                json!({"rationale": "extremely sensitive rationale"}),
+            )
+            .expect("event should append");
+        let exportable_event = store
+            .append_trace_event(
+                "session-1",
+                TraceEventType::RankingRecorded,
+                json!({"ranking": ["a", "b"]}),
+            )
+            .expect("event should append");
+        store
+            .create_user_record(UserRecordCreate {
+                kind: UserRecordKind::Preference,
+                content: "Private claim".to_string(),
+                origin: RecordOrigin::User,
+                evidence_refs: vec![EvidenceRef {
+                    trace_id: "session-1".to_string(),
+                    event_id: private_event.id.clone(),
+                    session_id: "session-1".to_string(),
+                    tile_id: None,
+                    model_id: None,
+                    note: None,
+                    source_type: None,
+                    source_id: None,
+                    source_label: None,
+                    excerpt: None,
+                    speaker_role: None,
+                }],
+                confidence: default_record_confidence(),
+                promotion_state: Some(PromotionState::Private),
+                valid_from: None,
+                valid_until: None,
+                links: Vec::new(),
+                metadata: HashMap::new(),
+            })
+            .expect("private record should be created");
+
+        let bundle = store
+            .export_bundle(TwinExportRequest::default())
+            .expect("export should succeed");
+        assert_eq!(bundle.decision_episodes.count, 2);
+
+        let episodes_content = std::fs::read_to_string(&bundle.decision_episodes.path)
+            .expect("decision episodes file should read");
+        let sealed_line = episodes_content
+            .lines()
+            .find(|line| line.contains("episode-sealed"))
+            .expect("sealed episode should export");
+        assert!(sealed_line.contains("\"sealed\":true"));
+        assert!(!sealed_line.contains("predicted_option"));
+        assert!(!sealed_line.contains("rationale"));
+        let revealed_line = episodes_content
+            .lines()
+            .find(|line| line.contains("episode-revealed"))
+            .expect("revealed episode should export");
+        assert!(revealed_line.contains("predicted_option"));
+        assert!(revealed_line.contains("\"agreement\":true"));
+        assert!(revealed_line.contains("ctx-test"));
+
+        let feedback_content = std::fs::read_to_string(&bundle.feedback_events.path)
+            .expect("feedback events file should read");
+        assert!(!feedback_content.contains("extremely sensitive rationale"));
+        assert!(!feedback_content.contains(&private_event.id));
+        assert!(feedback_content.contains(&exportable_event.id));
     }
 }

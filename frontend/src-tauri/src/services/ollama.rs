@@ -81,6 +81,71 @@ impl OllamaService {
         })
     }
 
+    /// Non-streaming completion. Used for hidden calls (e.g. sealed twin
+    /// predictions) where nothing renders incrementally; visible canvas
+    /// responses keep using `chat_stream`.
+    pub async fn chat(
+        &self,
+        model: &str,
+        messages: Vec<ChatMessage>,
+        system_prompt: Option<&str>,
+        temperature: Option<f64>,
+    ) -> Result<String> {
+        if model.trim().is_empty() {
+            return Err(anyhow::anyhow!(
+                "Select an Ollama model for local vault/twin responses before sending vault context"
+            ));
+        }
+
+        let mut all_messages = Vec::new();
+        if let Some(system) = system_prompt {
+            all_messages.push(ChatMessage {
+                role: "system".to_string(),
+                content: system.to_string(),
+            });
+        }
+        all_messages.extend(messages);
+
+        let request = OllamaChatRequest {
+            model: model.to_string(),
+            messages: all_messages,
+            stream: false,
+            options: temperature.map(|temperature| OllamaOptions { temperature }),
+        };
+
+        let response = self
+            .client
+            .post(format!("{}/api/chat", self.base_url))
+            .json(&request)
+            .timeout(Duration::from_secs(60))
+            .send()
+            .await
+            .context("Failed to reach Ollama. Is Ollama running locally?")?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let error_text = response.text().await.unwrap_or_default();
+            return Err(anyhow::anyhow!(
+                "Ollama API error ({}): {}",
+                status,
+                error_text
+            ));
+        }
+
+        let parsed: OllamaChatResponse = response
+            .json()
+            .await
+            .context("Failed to parse Ollama chat response")?;
+        if let Some(error) = parsed.error {
+            return Err(anyhow::anyhow!("Ollama error: {}", error));
+        }
+
+        Ok(parsed
+            .message
+            .map(|message| message.content)
+            .unwrap_or_default())
+    }
+
     pub async fn chat_stream(
         &self,
         model: &str,
@@ -222,6 +287,12 @@ impl OllamaModelDetails {
 }
 
 #[derive(Debug, Deserialize)]
+struct OllamaChatResponse {
+    message: Option<ChatMessage>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct OllamaStreamLine {
     message: Option<ChatMessage>,
     #[serde(default)]
@@ -287,5 +358,37 @@ mod tests {
         assert_eq!(value["stream"], true);
         assert_eq!(value["messages"][0]["role"], "system");
         assert_eq!(value["messages"][1]["content"], "What should I do?");
+    }
+
+    #[test]
+    fn non_streaming_chat_request_serializes_stream_false() {
+        let request = OllamaChatRequest {
+            model: "llama3.1:8b".to_string(),
+            messages: vec![ChatMessage {
+                role: "user".to_string(),
+                content: "Which option do I choose?".to_string(),
+            }],
+            stream: false,
+            options: Some(OllamaOptions { temperature: 0.2 }),
+        };
+
+        let value = serde_json::to_value(request).unwrap();
+
+        assert_eq!(value["stream"], false);
+        assert_eq!(value["options"]["temperature"], 0.2);
+    }
+
+    #[test]
+    fn chat_response_parses_message_and_error() {
+        let ok: OllamaChatResponse = serde_json::from_str(
+            r#"{"message": {"role": "assistant", "content": "Wait a sprint"}, "done": true}"#,
+        )
+        .unwrap();
+        assert_eq!(ok.message.unwrap().content, "Wait a sprint");
+        assert!(ok.error.is_none());
+
+        let err: OllamaChatResponse =
+            serde_json::from_str(r#"{"error": "model not found"}"#).unwrap();
+        assert_eq!(err.error.as_deref(), Some("model not found"));
     }
 }

@@ -650,13 +650,23 @@ const DecisionRow = defineComponent({
   },
   emits: ['update-outcome'],
   setup(props, { emit }) {
+    const episodeOptions = props.item.episode.options || []
+    const savedChoice = props.item.episode.chosen_option || ''
+    const choiceInList = savedChoice && episodeOptions.includes(savedChoice)
     const outcome = ref(props.item.episode.outcome || '')
     const lesson = ref(props.item.episode.lesson || '')
     const regretScore = ref(props.item.episode.regret_score ?? '')
+    const chosenSelect = ref(choiceInList ? savedChoice : (savedChoice ? '__other__' : ''))
+    const chosenOther = ref(choiceInList ? '' : savedChoice)
+    const correctionNote = ref(props.item.episode.correction_note || '')
+    const resolvedChoice = () =>
+      chosenSelect.value === '__other__' ? chosenOther.value.trim() : chosenSelect.value
     const save = () => emit('update-outcome', props.item.episode.id, {
       outcome: outcome.value || null,
       lesson: lesson.value || null,
-      regret_score: regretScore.value === '' ? null : Number(regretScore.value)
+      regret_score: regretScore.value === '' ? null : Number(regretScore.value),
+      chosen_option: resolvedChoice() || null,
+      correction_note: correctionNote.value.trim() || null
     })
     return () => {
       const latestCard = props.item.reflection_cards?.[0]
@@ -732,7 +742,50 @@ const DecisionRow = defineComponent({
             ])
           ])
         : null,
+      props.item.prediction_sealed
+        ? h('div', { class: 'prediction-sealed-badge' },
+            'Twin sealed a prediction — record your choice to reveal it')
+        : null,
+      props.item.episode.twin_prediction
+        ? h('div', { class: 'prediction-reveal' }, [
+            h('div', { class: 'prediction-headline' }, [
+              h('strong', 'Twin predicted: '),
+              h('span', props.item.episode.twin_prediction.predicted_option),
+              props.item.episode.twin_prediction.confidence != null
+                ? h('span', { class: 'prediction-confidence' },
+                    ` (${Math.round(props.item.episode.twin_prediction.confidence * 100)}% confident)`)
+                : null,
+              props.item.episode.agreement === true
+                ? h('span', { class: 'agreement-badge match' }, 'Matched my choice')
+                : null,
+              props.item.episode.agreement === false
+                ? h('span', { class: 'agreement-badge miss' }, 'Missed')
+                : null
+            ]),
+            props.item.episode.twin_prediction.rationale
+              ? h('p', { class: 'prediction-rationale' }, props.item.episode.twin_prediction.rationale)
+              : null
+          ])
+        : null,
       h('div', { class: 'outcome-row' }, [
+        episodeOptions.length
+          ? h('select', {
+              class: 'chosen-option-select',
+              value: chosenSelect.value,
+              onChange: event => { chosenSelect.value = event.target.value }
+            }, [
+              h('option', { value: '' }, 'Chosen option…'),
+              ...episodeOptions.map(option => h('option', { value: option }, option)),
+              h('option', { value: '__other__' }, 'Other…')
+            ])
+          : null,
+        (!episodeOptions.length || chosenSelect.value === '__other__')
+          ? h('input', {
+              value: chosenOther.value,
+              placeholder: 'Chosen option',
+              onInput: event => { chosenOther.value = event.target.value }
+            })
+          : null,
         h('input', {
           value: outcome.value,
           placeholder: 'Outcome',
@@ -752,7 +805,16 @@ const DecisionRow = defineComponent({
           onInput: event => { regretScore.value = event.target.value }
         }),
         h('button', { onClick: save }, 'Save')
-      ])
+      ]),
+      props.item.episode.agreement === false
+        ? h('div', { class: 'correction-row' }, [
+            h('input', {
+              value: correctionNote.value,
+              placeholder: 'Why was the twin wrong?',
+              onInput: event => { correctionNote.value = event.target.value }
+            })
+          ])
+        : null
     ])
     }
   }
@@ -1543,6 +1605,66 @@ function showMessage(type, text, duration = 3500) {
   flex-wrap: wrap;
   gap: 6px;
   margin-top: var(--spacing-sm);
+}
+
+.prediction-sealed-badge {
+  margin-top: var(--spacing-sm);
+  padding: 4px 8px;
+  border: 1px dashed var(--border-subtle);
+  border-radius: var(--radius-sm);
+  color: var(--text-secondary);
+  font-size: 0.8rem;
+}
+
+.prediction-reveal {
+  margin-top: var(--spacing-sm);
+  padding: var(--spacing-sm);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--bg-tertiary) 75%, transparent);
+}
+
+.prediction-headline {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.85rem;
+}
+
+.prediction-confidence {
+  color: var(--text-secondary);
+}
+
+.prediction-rationale {
+  margin: 6px 0 0;
+  color: var(--text-secondary);
+  font-size: 0.8rem;
+}
+
+.agreement-badge {
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 0.72rem;
+}
+
+.agreement-badge.match {
+  background: color-mix(in srgb, var(--accent-green, #22c55e) 18%, transparent);
+  color: var(--accent-green, #22c55e);
+}
+
+.agreement-badge.miss {
+  background: color-mix(in srgb, var(--accent-red, #ef4444) 18%, transparent);
+  color: var(--accent-red, #ef4444);
+}
+
+.correction-row {
+  margin-top: 6px;
+}
+
+.correction-row input,
+.chosen-option-select {
+  min-height: 28px;
 }
 
 .review-actions button,
