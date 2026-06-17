@@ -7,7 +7,7 @@
   },
   "package": {
     "productName": "Grafyn",
-    "version": "0.1.15"
+    "version": "0.2.0"
   },
   "tauri": {
     "allowlist": {
@@ -104,7 +104,7 @@
         "fullscreen": false,
         "height": 800,
         "resizable": true,
-        "title": "Grafyn v0.1.15",
+        "title": "Grafyn v0.2.0",
         "width": 1200,
         "minWidth": 800,
         "minHeight": 600,

@@ -28,16 +28,21 @@ export default defineConfig({
   build: {
     // Tauri uses Chromium on Windows and WebKit on macOS/Linux
     target: process.env.TAURI_PLATFORM === 'windows' ? 'chrome105' : 'safari13',
-    // Don't minify for debug builds
-    minify: !process.env.TAURI_DEBUG ? 'esbuild' : false,
+    // Don't minify for debug builds. vite 8 bundles with Rolldown and keeps
+    // esbuild out of the default tree, so use the built-in (oxc) minifier
+    // rather than 'esbuild' (which would pull a still-flagged esbuild back in).
+    minify: !process.env.TAURI_DEBUG,
     // Produce sourcemaps for debug builds
     sourcemap: !!process.env.TAURI_DEBUG,
     rollupOptions: {
       output: {
-        manualChunks: {
-          'vendor': ['vue', 'vue-router', 'pinia'],
-          'markdown': ['marked'],
-        }
+        // vite 8 bundles with Rolldown, which only accepts the function form of
+        // manualChunks (the object map form is Rollup-only and throws).
+        manualChunks(id) {
+          if (!id.includes('node_modules')) return
+          if (/[\\/]node_modules[\\/](vue|vue-router|pinia)[\\/]/.test(id)) return 'vendor'
+          if (/[\\/]node_modules[\\/]marked[\\/]/.test(id)) return 'markdown'
+        },
       }
     },
   },
