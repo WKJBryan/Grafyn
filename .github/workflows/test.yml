@@ -22,14 +22,14 @@ jobs:
     name: Release Preflight
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Set up Node.js
         uses: actions/setup-node@v6
         with:
           node-version: '20'
 
-      - uses: dtolnay/rust-toolchain@1.93.1
+      - uses: dtolnay/rust-toolchain@1.100.0
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -43,9 +43,9 @@ jobs:
     name: Rust Tests
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
-      - uses: dtolnay/rust-toolchain@1.93.1
+      - uses: dtolnay/rust-toolchain@1.100.0
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -75,7 +75,7 @@ jobs:
       run:
         working-directory: frontend
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Set up Node.js
         uses: actions/setup-node@v6
@@ -96,9 +96,9 @@ jobs:
     name: Lint & Format Check
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
-      - uses: dtolnay/rust-toolchain@1.93.1
+      - uses: dtolnay/rust-toolchain@1.100.0
         with:
           components: clippy
 
@@ -133,7 +133,7 @@ jobs:
     name: Security Scan
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Set up Node.js
         uses: actions/setup-node@v6
@@ -150,7 +150,7 @@ jobs:
     name: Build Check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Set up Node.js
         uses: actions/setup-node@v6
