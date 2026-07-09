@@ -8,7 +8,7 @@ use crate::models::note::{
     PROP_INFERRED_LINK_IDS, PROP_TOPIC_ALIASES, PROP_TOPIC_KEY,
 };
 use crate::services::atomic_io::write_atomic;
-use crate::services::knowledge_store::{alias_candidates, KnowledgeStore};
+use crate::services::knowledge_store::KnowledgeStore;
 use crate::services::topic_hub::normalize_topic_key;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -602,23 +602,24 @@ impl MarkdownMigrationService {
                 continue;
             }
 
-            // `note.aliases` is *always* the union of the raw frontmatter aliases plus
-            // recomputed candidates (see `KnowledgeStore::read_note_file`), whether or
-            // not that union has ever been persisted to disk. That makes `!aliases
-            // .is_empty()` a broken proxy for "already backfilled": for a note whose
-            // title matches its filename (a single word, e.g. "Foo" / "foo.md"),
-            // `alias_candidates` always returns zero candidates, so `aliases` stays
-            // empty forever and the old check `!note.aliases.is_empty()` could never
-            // be satisfied — the note was rewritten (and `updated_at` bumped) on every
-            // single boot. Recompute the candidates directly: if there are none, there
-            // is nothing this pass could ever add via aliases, so that requirement is
-            // vacuously satisfied instead of blocking the skip forever.
-            let file_stem = Path::new(&note.relative_path)
-                .file_stem()
-                .and_then(|value| value.to_str())
-                .unwrap_or(note.relative_path.as_str());
-            let has_alias_candidates = !alias_candidates(&note.title, file_stem).is_empty();
-
+            // Aliases deliberately play NO part in the skip decision. `note.aliases`
+            // as loaded is *always* the union of the raw frontmatter aliases plus
+            // freshly recomputed `alias_candidates(title, file_stem)` (see
+            // `KnowledgeStore::read_note_file`), whether or not that union has ever
+            // been persisted. Two consequences:
+            //   1. Any alias this pass could persist is already present in
+            //      `note.aliases` in memory, so `aliases: Some(note.aliases.clone())`
+            //      below writes exactly what a reload would recompute anyway —
+            //      alias state can never be the thing that makes a write necessary.
+            //   2. The old skip requirement `!note.aliases.is_empty()` was therefore
+            //      a broken proxy: for a note whose title matches its filename
+            //      (single word, e.g. "Foo" / "foo.md") `alias_candidates` is empty
+            //      forever, the requirement could never be met, and the note was
+            //      rewritten (bumping `updated_at`) on every single boot.
+            // The skip decision instead checks the fields this pass actually exists
+            // to converge: schema version, migration provenance, and the
+            // optimizer_managed flag (which can drift if a note becomes a topic hub
+            // after it was first processed).
             let target_migration_source = note
                 .migration_source
                 .clone()
@@ -627,22 +628,9 @@ impl MarkdownMigrationService {
 
             let already_processed = note.schema_version >= CURRENT_NOTE_SCHEMA_VERSION
                 && note.migration_source.is_some()
-                && (!has_alias_candidates || !note.aliases.is_empty());
+                && note.optimizer_managed == target_optimizer_managed;
 
             if already_processed {
-                continue;
-            }
-
-            // Belt-and-suspenders: only write if the computed update would actually
-            // change something on disk. This keeps a fully up-to-date vault at zero
-            // writes per boot (guarding against the O(N^2) `refresh_cache` cost of a
-            // spurious `update_note` call on every note, every launch) even if the
-            // `already_processed` heuristic above is ever wrong for some edge case.
-            let would_change = note.schema_version < CURRENT_NOTE_SCHEMA_VERSION
-                || note.migration_source.is_none()
-                || note.optimizer_managed != target_optimizer_managed;
-
-            if !would_change {
                 continue;
             }
 
@@ -1448,6 +1436,76 @@ mod tests {
         let after = snapshot(&note_path);
         assert_eq!(before.1, after.1, "content must be untouched");
         assert_eq!(before.0, after.0, "mtime must be untouched");
+    }
+
+    #[test]
+    fn backfill_updates_stale_optimizer_managed_flag_then_settles() {
+        // A note that is otherwise fully processed (schema current, migration_source
+        // recorded) but whose persisted `optimizer_managed: false` is stale relative
+        // to `is_topic_hub()` (e.g. it later gained the `hub` tag) must be updated by
+        // backfill — with `updated_at` preserved — and a second run must do nothing.
+        let vault_dir = tempdir().expect("vault tempdir");
+        let data_dir = tempdir().expect("data tempdir");
+        let mut store = KnowledgeStore::new(
+            vault_dir.path().to_path_buf(),
+            data_dir.path().to_path_buf(),
+        );
+
+        let note = store
+            .create_note(NoteCreate {
+                title: "Foo".to_string(),
+                content: "Hub-tagged body.".to_string(),
+                relative_path: None,
+                aliases: Vec::new(),
+                status: Default::default(),
+                tags: vec!["hub".to_string()],
+                schema_version: CURRENT_NOTE_SCHEMA_VERSION,
+                migration_source: Some("markdown_migration".to_string()),
+                optimizer_managed: false,
+                properties: HashMap::new(),
+            })
+            .expect("note should be created");
+        assert!(
+            note.is_topic_hub() && !note.optimizer_managed,
+            "precondition: note must be a hub with a stale optimizer_managed flag"
+        );
+        let original_updated_at = note.updated_at;
+        let note_path = vault_dir.path().join(&note.relative_path);
+
+        let service = MarkdownMigrationService::new(data_dir.path().to_path_buf());
+        let first_pass = service
+            .backfill_legacy_grafyn_notes(&mut store)
+            .expect("first backfill pass should succeed");
+        assert!(
+            first_pass.contains(&note.id),
+            "backfill must catch optimizer_managed drift on an otherwise-processed note, got: {first_pass:?}"
+        );
+
+        let reloaded = store.get_note(&note.id).expect("note should reload");
+        assert!(
+            reloaded.optimizer_managed,
+            "optimizer_managed must be corrected to match is_topic_hub()"
+        );
+        assert_eq!(
+            reloaded.updated_at, original_updated_at,
+            "administrative backfill write must preserve updated_at"
+        );
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let after_first = snapshot(&note_path);
+
+        let second_pass = service
+            .backfill_legacy_grafyn_notes(&mut store)
+            .expect("second backfill pass should succeed");
+        assert!(
+            second_pass.is_empty(),
+            "second pass must be a no-op once the drift is fixed, got: {second_pass:?}"
+        );
+        let after_second = snapshot(&note_path);
+        assert_eq!(
+            after_first, after_second,
+            "second pass must not touch the file"
+        );
     }
 
     #[test]

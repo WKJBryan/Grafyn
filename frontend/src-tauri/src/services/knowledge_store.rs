@@ -925,7 +925,7 @@ fn humanize_filename(value: &str) -> String {
         .join(" ")
 }
 
-pub(crate) fn alias_candidates(title: &str, file_stem: &str) -> Vec<String> {
+fn alias_candidates(title: &str, file_stem: &str) -> Vec<String> {
     let mut candidates = Vec::new();
     let humanized = humanize_filename(file_stem);
     if !humanized.trim().is_empty() && !humanized.eq_ignore_ascii_case(title.trim()) {
