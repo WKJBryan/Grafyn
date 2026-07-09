@@ -1,3 +1,15 @@
+//! Canonical lock order: `knowledge_store` before `vault_optimizer`, always.
+//!
+//! The background vault-optimizer worker (`main.rs::start_vault_optimizer_worker`)
+//! acquires `state.knowledge_store.write()` then `state.vault_optimizer.write()`.
+//! Every other call site that needs both locks (e.g.
+//! `commands::migration::rollback_vault_optimizer_change`) must acquire them in
+//! the same order. Acquiring them in reverse order risks an ABBA deadlock: the
+//! worker fires every 30s, so a caller that takes `vault_optimizer` first and
+//! blocks on `knowledge_store` can cross with the worker holding
+//! `knowledge_store` and blocking on `vault_optimizer`, wedging both locks
+//! (and every command that touches either) until the app restarts.
+
 pub mod boot;
 pub mod canvas;
 pub mod distill;

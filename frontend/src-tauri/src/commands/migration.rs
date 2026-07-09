@@ -185,12 +185,91 @@ pub async fn rollback_vault_optimizer_change(
     state: State<'_, AppState>,
 ) -> Result<VaultOptimizerRollbackResult, String> {
     let result = {
-        let mut optimizer = state.vault_optimizer.write().await;
+        // Lock order: knowledge_store before vault_optimizer (see commands/mod.rs
+        // doc comment) — must match the background worker in main.rs to avoid
+        // an ABBA deadlock.
         let mut store = state.knowledge_store.write().await;
+        let mut optimizer = state.vault_optimizer.write().await;
         optimizer
             .rollback_change(&change_id, &mut store)
             .map_err(|error| error.to_string())?
     };
     crate::commands::rebuild_all_indexes(state.inner()).await?;
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::services::knowledge_store::KnowledgeStore;
+    use crate::services::vault_optimizer::VaultOptimizerService;
+    use std::sync::Arc;
+    use tempfile::tempdir;
+    use tokio::sync::RwLock;
+    use tokio::time::{timeout, Duration};
+
+    /// Regression guard for the ABBA deadlock fixed here: races the
+    /// background worker's acquisition order (`knowledge_store` then
+    /// `vault_optimizer`, mirroring `main.rs::start_vault_optimizer_worker`)
+    /// against `rollback_vault_optimizer_change`'s (now-matching) order,
+    /// using the real service types over real tempdir-backed stores.
+    ///
+    /// Honesty note: since both sides now share the canonical order, this
+    /// cannot reproduce the original ABBA deadlock (that's the point of the
+    /// fix) — it exists to catch a *future* regression. If either call site's
+    /// acquisition order drifts back out of sync, two tasks racing for the
+    /// same pair of locks in opposite order can wedge each other, and this
+    /// test will hang past the 5s timeout and fail instead of passing
+    /// silently. Requires the multi-thread runtime plus a `yield_now`
+    /// between the two acquisitions in each task to force real interleaving
+    /// — without both, an uncontended `.write().await` never actually
+    /// suspends and the two spawned tasks just run to completion in
+    /// sequence, masking the race. (Verified manually during development:
+    /// temporarily reversing one side's order — with this same
+    /// multi-thread + yield_now setup — reliably made this test time out;
+    /// without the yield_now, even the inverted order passed spuriously.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lock_order_matches_worker_and_never_deadlocks() {
+        let vault_dir = tempdir().expect("vault tempdir should be created");
+        let data_dir = tempdir().expect("data tempdir should be created");
+
+        let knowledge_store = Arc::new(RwLock::new(KnowledgeStore::new(
+            vault_dir.path().to_path_buf(),
+            data_dir.path().to_path_buf(),
+        )));
+        let vault_optimizer = Arc::new(RwLock::new(VaultOptimizerService::new(
+            data_dir.path().to_path_buf(),
+        )));
+
+        let result = timeout(Duration::from_secs(5), async {
+            for _ in 0..100 {
+                let ks_a = knowledge_store.clone();
+                let vo_a = vault_optimizer.clone();
+                let worker_side = tokio::spawn(async move {
+                    // Mirrors main.rs::start_vault_optimizer_worker's order.
+                    let _store = ks_a.write().await;
+                    tokio::task::yield_now().await;
+                    let _optimizer = vo_a.write().await;
+                });
+
+                let ks_b = knowledge_store.clone();
+                let vo_b = vault_optimizer.clone();
+                let rollback_side = tokio::spawn(async move {
+                    // Mirrors rollback_vault_optimizer_change's (fixed) order.
+                    let _store = ks_b.write().await;
+                    tokio::task::yield_now().await;
+                    let _optimizer = vo_b.write().await;
+                });
+
+                let (a, b) = tokio::join!(worker_side, rollback_side);
+                a.expect("worker-side task panicked");
+                b.expect("rollback-side task panicked");
+            }
+        })
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "lock acquisitions did not complete within 5s — lock order regressed to ABBA"
+        );
+    }
 }
