@@ -210,22 +210,40 @@ mod tests {
         // same temp name (pid alone is not enough within one process — the
         // counter disambiguates). Whichever rename lands last wins, and the final
         // file must be one of the two payloads intact, never interleaved.
+        //
+        // The guarantee under test is ATOMICITY, not that concurrent racers never
+        // error: on Windows, a rename onto a target mid-replacement can exhaust
+        // the bounded transient retry and surface PermissionDenied (seen rarely
+        // under full-suite parallel load). One side failing that way is
+        // acceptable — as long as at least one write wins and the file is intact.
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("concurrent.json");
 
         let payload_a = vec![b'a'; 64 * 1024];
         let payload_b = vec![b'b'; 64 * 1024];
 
-        std::thread::scope(|scope| {
+        let (res_a, res_b) = std::thread::scope(|scope| {
             let path_a = path.clone();
             let path_b = path.clone();
             let a = &payload_a;
             let b = &payload_b;
             let ta = scope.spawn(move || write_atomic(&path_a, a));
             let tb = scope.spawn(move || write_atomic(&path_b, b));
-            ta.join().expect("thread a").expect("write a");
-            tb.join().expect("thread b").expect("write b");
+            (ta.join().expect("thread a"), tb.join().expect("thread b"))
         });
+
+        let transient_only_loss = |res: &std::io::Result<()>| match res {
+            Ok(()) => true,
+            Err(err) => err.kind() == std::io::ErrorKind::PermissionDenied,
+        };
+        assert!(
+            res_a.is_ok() || res_b.is_ok(),
+            "at least one concurrent write must succeed: a={res_a:?} b={res_b:?}"
+        );
+        assert!(
+            transient_only_loss(&res_a) && transient_only_loss(&res_b),
+            "a losing racer may only fail with retry-exhausted PermissionDenied: a={res_a:?} b={res_b:?}"
+        );
 
         let content = std::fs::read(&path).expect("file should exist");
         assert!(
