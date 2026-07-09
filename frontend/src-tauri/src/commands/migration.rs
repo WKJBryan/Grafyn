@@ -207,26 +207,29 @@ mod tests {
     use tokio::sync::RwLock;
     use tokio::time::{timeout, Duration};
 
-    /// Regression guard for the ABBA deadlock fixed here: races the
-    /// background worker's acquisition order (`knowledge_store` then
-    /// `vault_optimizer`, mirroring `main.rs::start_vault_optimizer_worker`)
-    /// against `rollback_vault_optimizer_change`'s (now-matching) order,
-    /// using the real service types over real tempdir-backed stores.
+    /// Demonstrates that the canonical `knowledge_store` → `vault_optimizer`
+    /// lock order (see the doc comment in `commands/mod.rs`) is deadlock-free
+    /// under contention: two concurrent tasks repeatedly acquire both locks
+    /// in that shared order, using the real service types over real
+    /// tempdir-backed stores.
     ///
-    /// Honesty note: since both sides now share the canonical order, this
-    /// cannot reproduce the original ABBA deadlock (that's the point of the
-    /// fix) — it exists to catch a *future* regression. If either call site's
-    /// acquisition order drifts back out of sync, two tasks racing for the
-    /// same pair of locks in opposite order can wedge each other, and this
-    /// test will hang past the 5s timeout and fail instead of passing
-    /// silently. Requires the multi-thread runtime plus a `yield_now`
-    /// between the two acquisitions in each task to force real interleaving
+    /// Scope note — what this does NOT guard: both tasks below hand-inline
+    /// the acquisition pattern; they do not drive the actual production call
+    /// sites (`main.rs::start_vault_optimizer_worker` and
+    /// `rollback_vault_optimizer_change` above). If a production call site's
+    /// order drifts back to `vault_optimizer` → `knowledge_store`, this test
+    /// still passes. The production sites are kept in sync by the
+    /// canonical-order doc comment in `commands/mod.rs` plus code review,
+    /// not by this test.
+    ///
+    /// Mechanics: the multi-thread runtime plus a `yield_now` between the
+    /// two acquisitions in each task are required to force real interleaving
     /// — without both, an uncontended `.write().await` never actually
     /// suspends and the two spawned tasks just run to completion in
-    /// sequence, masking the race. (Verified manually during development:
-    /// temporarily reversing one side's order — with this same
-    /// multi-thread + yield_now setup — reliably made this test time out;
-    /// without the yield_now, even the inverted order passed spuriously.)
+    /// sequence, masking any contention. (Verified during development: with
+    /// this setup, inverting one task's inlined order reliably made the test
+    /// time out; without the yield_now, even the inverted order passed
+    /// spuriously.)
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn lock_order_matches_worker_and_never_deadlocks() {
         let vault_dir = tempdir().expect("vault tempdir should be created");
