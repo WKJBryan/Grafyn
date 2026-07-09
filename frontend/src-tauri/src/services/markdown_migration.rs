@@ -484,13 +484,26 @@ impl MarkdownMigrationService {
                     continue;
                 }
             }
-            if let Err(error) = std::fs::copy(&backup_path, &target_path) {
-                failures.push(format!(
-                    "failed to restore '{}' -> '{}': {}",
-                    backup_path.display(),
-                    target_path.display(),
-                    error
-                ));
+            // Restore via read + atomic write (temp file + rename) so a crash
+            // mid-restore can never leave the very note being rescued truncated.
+            match std::fs::read(&backup_path) {
+                Ok(bytes) => {
+                    if let Err(error) = write_atomic(&target_path, &bytes) {
+                        failures.push(format!(
+                            "failed to restore '{}' -> '{}': {}",
+                            backup_path.display(),
+                            target_path.display(),
+                            error
+                        ));
+                    }
+                }
+                Err(error) => {
+                    failures.push(format!(
+                        "failed to read backup '{}': {}",
+                        backup_path.display(),
+                        error
+                    ));
+                }
             }
         }
 
