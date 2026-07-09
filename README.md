@@ -331,7 +331,13 @@ npm run prepare:sidecar
 # Rust tests
 cd frontend/src-tauri
 cargo test
+
+# E2E (Playwright) — manual only, not run in CI
+npm run tauri:dev        # in one terminal, leave running (provides the Tauri IPC backend)
+cd frontend && npm run e2e   # in another terminal
 ```
+
+The `e2e/` Playwright suite is **not** wired into CI. Its specs call `invoke()` for note CRUD, canvas, etc., which needs a live Tauri IPC backend; a plain Vite dev server in a headless CI browser has no IPC handler, so the app's boot sequence gets stuck in a `failed` phase and most interactive specs time out (confirmed by a manual run — only the static-layout tests pass). CI cannot cheaply provide the built/dev Tauri desktop app, so the suite is run manually via `npm run tauri:dev` + `npm run e2e`. See `e2e/README.md` for details.
 
 Known test noise:
 
