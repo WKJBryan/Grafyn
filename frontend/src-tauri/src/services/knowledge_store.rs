@@ -939,8 +939,24 @@ mod tests {
     #[test]
     fn validate_note_id_rejects_reserved_device_stems_case_insensitively() {
         for candidate in [
-            "con", "CON", "con.md", "CON.backup", "prn", "PRN.md", "aux", "AUX", "nul",
-            "NUL.md", "com1", "COM1.md", "com9", "COM9", "lpt1", "LPT1.md", "lpt9", "LPT9",
+            "con",
+            "CON",
+            "con.md",
+            "CON.backup",
+            "prn",
+            "PRN.md",
+            "aux",
+            "AUX",
+            "nul",
+            "NUL.md",
+            "com1",
+            "COM1.md",
+            "com9",
+            "COM9",
+            "lpt1",
+            "LPT1.md",
+            "lpt9",
+            "LPT9",
         ] {
             assert!(
                 KnowledgeStore::validate_note_id(candidate).is_err(),
