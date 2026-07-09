@@ -729,9 +729,12 @@ const RESERVED_WINDOWS_STEMS: &[&str] = &[
 /// Returns true if `component` (an id or a single path segment, with or
 /// without an extension) is a Windows-reserved device name. The reserved
 /// stem is the text before the *first* dot, matched case-insensitively, so
-/// `con.backup.md` is still reserved.
+/// `con.backup.md` is still reserved. Windows additionally strips trailing
+/// spaces and dots before device-name resolution (`con .md` still reaches
+/// the CON device), so the stem is trimmed of those before comparison.
 fn is_reserved_windows_component(component: &str) -> bool {
     let stem = component.split('.').next().unwrap_or(component);
+    let stem = stem.trim_end_matches([' ', '.']);
     RESERVED_WINDOWS_STEMS
         .iter()
         .any(|reserved| stem.eq_ignore_ascii_case(reserved))
@@ -957,6 +960,13 @@ mod tests {
             "LPT1.md",
             "lpt9",
             "LPT9",
+            // Windows strips trailing spaces and dots before device-name
+            // resolution, so these variants still reach the device.
+            "con ",
+            "con .md",
+            "CON. .md",
+            "nul.",
+            "aux . .md",
         ] {
             assert!(
                 KnowledgeStore::validate_note_id(candidate).is_err(),
@@ -975,6 +985,9 @@ mod tests {
             "project-plan-2026",
             "console-notes",
             "company",
+            // Trailing space on a non-reserved stem must stay accepted:
+            // trimmed stem is "console", which is not a device name.
+            "console ",
         ] {
             assert!(
                 KnowledgeStore::validate_note_id(candidate).is_ok(),
@@ -1013,6 +1026,11 @@ mod tests {
             "con.backup.md",
             "sub/CON/note.md",
             "sub/prn.md/note.md",
+            // Trailing spaces/dots are stripped by Windows before device-name
+            // resolution, so these still reach the device.
+            "con .md",
+            "sub/CON. .md",
+            "sub/nul ./note.md",
         ] {
             assert!(
                 normalize_note_relative_path(candidate).is_err(),
@@ -1029,6 +1047,7 @@ mod tests {
             "folder/my.note.v2.md",
             "notes/2026/plan.md",
             "console-notes.md",
+            "folder/console .md",
         ] {
             assert!(
                 normalize_note_relative_path(candidate).is_ok(),
