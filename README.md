@@ -69,7 +69,7 @@ The first usable twin mode is a **native RAG twin**:
 - Stream responses in parallel.
 - Branch from model responses.
 - Debate mode for model critique and synthesis.
-- Semantic note context from the vault.
+- Graph-aware note context from the vault (Tantivy keyword search + link-graph boosts, not embedding-based retrieval).
 - Twin context mode using reviewed user records.
 - Smart web search detection for prompts that need current information.
 - Save Canvas sessions as notes.
@@ -178,11 +178,11 @@ Grafyn's data can later support stronger personal models, but those are not v1:
 |------|--------|
 | Knowledge vault (notes, wikilinks, full-text search) | ✅ Stable |
 | Knowledge graph + topic hub clustering | ✅ Stable |
-| Multi-LLM Canvas with semantic note context | ✅ Stable |
+| Multi-LLM Canvas with graph-aware note context | ✅ Stable |
 | Conversation import (ChatGPT, Claude, Grok, Gemini) | ✅ Stable |
-| Native RAG twin (Advisor + Simulation modes) | ✅ Stable |
-| Twin Identity, Constitution, Decision Mirror | ✅ Stable |
-| Twin evidence capture and review dashboard | ✅ Stable |
+| Native RAG twin (Advisor + Simulation modes) | 🧪 Experimental |
+| Twin Identity, Constitution, Decision Mirror | 🧪 Experimental |
+| Twin evidence capture and review dashboard | 🧪 Experimental |
 | Local model support via Ollama | ✅ Stable |
 | Background link discovery | ✅ Stable |
 | Vault Optimizer (background vault improvements) | ✅ Stable |
@@ -190,6 +190,8 @@ Grafyn's data can later support stronger personal models, but those are not v1:
 | MCP server (`grafyn-mcp`) for Claude Desktop / Codex Desktop | ✅ Stable |
 | Preference / ranking model from export bundles | 🔲 Not started |
 | Local adapters or fine-tuning from reviewed evidence | 🔲 Not started |
+
+Twin data capture and export are dependable today; the accuracy machinery that would make twin answers trustworthy — semantic (embedding-based) retrieval, temporal validity, and calibrated confidence — is roadmap work tracked in [TWIN_ACCURACY_ROADMAP.md](TWIN_ACCURACY_ROADMAP.md).
 
 Current version: see [Releases](https://github.com/WKJBryan/Grafyn/releases/latest).
 
