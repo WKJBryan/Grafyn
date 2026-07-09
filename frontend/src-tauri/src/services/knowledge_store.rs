@@ -1177,7 +1177,8 @@ mod tests {
     /// which yaml-rust2 rejects ("tab cannot be used as indentation"). This is not
     /// well-formed YAML, so `YamlLoader::load_from_str` errors and the gray_matter
     /// engine falls back to `Pod::Null`, which then fails to deserialize into
-    /// `NoteFrontmatter` (a required `title` field is missing).
+    /// `NoteFrontmatter` (a non-map `Pod` is an invalid type for the struct,
+    /// regardless of field defaults).
     const MALFORMED_FRONTMATTER_NOTE: &str = "---\ntitle: Original Title\ntags:\n\t- alpha\nstatus: canonical\n---\n\nOriginal body content.";
 
     #[test]
