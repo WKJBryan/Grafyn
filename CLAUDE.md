@@ -83,42 +83,41 @@ Grafyn is a **desktop-only** app — a single Tauri binary with a Vue frontend a
 └────────────────────────────────────────────────┘
 ```
 
+### Repo Hygiene (root-level gotchas)
+
+- Root `pyproject.toml`, `.python-version`, `uv.lock`, and `.venv/` are **dead artifacts of the deleted Python backend** — nothing in the app uses Python. Do not conclude a Python backend exists from them.
+- Root `package-lock.json` is an empty orphaned stub (there is no root `package.json`).
+- `e2e/` is a committed Playwright suite (6 specs) **not wired to any CI workflow or npm script** — manual-only via `cd e2e && npm test`.
+
 ### Tauri IPC Commands
 
-| Module | Commands | Purpose |
-|--------|----------|---------|
-| `commands/notes.rs` | `list_notes`, `get_note`, `create_note`, `update_note`, `delete_note` | Note CRUD |
-| `commands/search.rs` | `search_notes`, `find_similar`, `reindex` | Full-text search (graph-aware similarity) |
-| `commands/graph.rs` | `get_backlinks`, `get_outgoing`, `get_neighbors`, `get_unlinked`, `get_full_graph`, `rebuild_graph` | Link graph |
-| `commands/canvas.rs` | `list_sessions`, `get_session`, `create_session`, `update_session`, `delete_session`, `get_available_models`, `send_prompt`, `update_tile_position`, `delete_tile`, `delete_response`, `update_viewport`, `update_llm_node_position`, `auto_arrange`, `export_to_note`, `start_debate`, `continue_debate`, `add_models_to_tile`, `regenerate_response` | Multi-LLM canvas with note context (streaming via `canvas-stream` Tauri events) |
-| `commands/distill.rs` | `distill_note`, `normalize_tags` | LLM + rules-based distillation with dedup and hub creation |
-| `commands/settings.rs` | `get_settings`, `get_settings_status`, `update_settings`, `complete_setup`, `pick_vault_folder`, `validate_openrouter_key`, `get_openrouter_status`, `get_ollama_status`, `list_ollama_models` | App settings, first-run setup, Ollama local model status |
-| `commands/feedback.rs` | `submit_feedback`, `get_system_info`, `feedback_status`, `get_pending_feedback`, `retry_pending_feedback`, `clear_pending_feedback` | Feedback with offline queue |
-| `commands/mcp.rs` | `get_mcp_status`, `get_mcp_config_snippet` | MCP config for Claude Desktop |
-| `commands/memory.rs` | `recall_relevant`, `find_contradictions`, `extract_claims` | Memory recall & contradiction detection |
-| `commands/priority.rs` | `get_priority_settings`, `update_priority_settings`, `reset_priority_settings` | Configurable search result ranking |
-| `commands/retrieval.rs` | `retrieve_relevant`, `get_retrieval_config`, `update_retrieval_config` | Temporal + graph-aware retrieval pipeline |
-| `commands/zettelkasten.rs` | `discover_links`, `apply_links`, `create_link`, `get_link_types`, `list_link_suggestion_queue`, `dismiss_link_suggestion`, `get_link_discovery_status` | On-demand and background link discovery |
-| `commands/import.rs` | `preview_import`, `apply_import`, `get_supported_formats` | Conversation + document import (chat exports, transcripts, DOCX, PDF) |
-| `commands/twin.rs` | `list_user_records`, `get_user_record`, `create_user_record`, `update_user_record`, `run_twin_inference`, `get_twin_review`, `resolve_user_record_evidence`, `set_user_record_promotion`, `export_twin_data`, `list_decision_episodes`, `update_decision_outcome`, `get/update/reset_decision_mirror_config`, `list/review_memory_digest`, `list/create/update/review_constitution_item`, `list/review_action_gap`, `get/save_constitution_setup`, `run_constitution_inference`, `record_canvas_feedback`, `get_session_trace` | Twin evidence store, Twin Workspace, and first-person Simulation setup |
-| `commands/migration.rs` | `preview_markdown_migration`, `apply_markdown_migration`, `get_markdown_migration_status`, `rollback_markdown_migration`, `get_vault_optimizer_status`, `update_vault_optimizer_settings`, `list_vault_optimizer_decisions`, `get_vault_optimizer_inbox`, `rollback_vault_optimizer_change` | Structured vault migration + background vault optimizer |
-| `commands/boot.rs` | `get_boot_status` | App startup state (index ready, migration status) |
+16 modules in `frontend/src-tauri/src/commands/`. Enumerate exact command names with `grep -rn "#\[tauri::command\]" -A1 src/commands/` — purposes only below, to avoid drift.
 
-### Frontend API Client
+| Module | Purpose |
+|--------|---------|
+| `notes.rs` | Note CRUD |
+| `search.rs` | Full-text search, find-similar, reindex |
+| `graph.rs` | Link graph: backlinks, outgoing, neighbors, unlinked, full graph, rebuild |
+| `canvas.rs` | Multi-LLM canvas (18 commands) with note context; streaming via `canvas-stream` Tauri events |
+| `distill.rs` | LLM + rules-based distillation, tag normalization |
+| `settings.rs` | Settings, first-run setup, OpenRouter key validation, Ollama status/models |
+| `feedback.rs` | Feedback with offline queue |
+| `mcp.rs` | MCP status + config snippet for Claude Desktop |
+| `memory.rs` | Memory recall, contradiction detection, claim extraction |
+| `priority.rs` | Configurable search-result ranking |
+| `retrieval.rs` | Temporal + graph-aware retrieval pipeline + config |
+| `zettelkasten.rs` | On-demand link discovery + background suggestion queue |
+| `import.rs` | Conversation + document import (`preview_import` → `apply_import`) |
+| `twin.rs` | 27 commands: user records, review, inference, Decision Mirror, Constitution, action gaps, setup, export, memory digest, session trace. Naming quirks: list commands are plural (`list_constitution_items`, `list_action_gaps`) and the digest review command is `review_memory_digest_item` |
+| `migration.rs` | Markdown migration (preview/apply/rollback) + vault optimizer admin (status/settings/decisions/inbox/rollback) |
+| `boot.rs` | App startup state (index ready, migration status) |
 
-```javascript
-// src/api/client.js — all calls go through Tauri IPC
-import { boot, notes, search, graph, canvas, settings, mcp, memory,
-         zettelkasten, feedback, priority, retrieval, importApi,
-         migration, optimizer, twin, isDesktopApp } from '@/api/client'
+### Frontend
 
-// Every function calls invoke() directly to the Rust backend
-// Canvas streaming uses canvas-stream Tauri events (including ContextNotes for semantic mode)
-```
-
-**Pinia Stores:** `notes.js`, `canvas.js`, `theme.js`, `boot.js`
-
-**Frontend Routes:** `/` (notes), `/canvas`, `/canvas/:id`, `/import`, `/twin`
+- `src/api/client.js` — all backend calls go through Tauri `invoke()`; exports one namespace per command module plus `optimizer` and `isDesktopApp`
+- **Pinia stores (4):** `notes.js`, `canvas.js`, `theme.js`, `boot.js` — there is no twin store; twin UI state lives in `TwinReviewView.vue` and `stores/canvas.js`
+- **Routes:** `/` (notes), `/canvas`, `/canvas/:id`, `/import`, `/twin` (component: `TwinReviewView.vue`), plus catch-all → `NotFoundView.vue`
+- **Tests:** `src/__tests__/{unit,integration,fixtures}/` + `setup.js` (Vitest)
 
 ## Key Concepts
 
@@ -217,7 +216,7 @@ See `TWIN_RAG_SPEC.md` for the full twin RAG specification and `WORKING_GUIDE.md
 
 ### Conversation & Document Import
 
-Import external content as evidence notes. Six parsers in `services/import/`: `chatgpt`, `claude`, `grok`, `gemini`, `transcript` (plain transcript/Codex-style exports), and `document` (DOCX/PDF). Conversation formats auto-detect via platform-specific JSON keys; each parser implements `can_parse()` + `parse()`. Document imports split DOCX/PDF files into linked section notes (PDF heading detection, with optional outline titles) and add structural wikilinks. Imported content becomes evidence-status container notes with provenance metadata (`source`, `source_id`, `created_via`). Both conversation and document paths flow through the same `preview_import` → `apply_import` commands.
+Import external content as evidence notes. Six parsers in `services/import/`: `chatgpt`, `claude`, `grok`, `gemini`, `transcript` (plain transcript/Codex-style exports), and `document` (DOCX/PDF). A seventh module, `services/import/semantic_links.rs`, runs an optional LLM semantic-link-suggestion pass over imports (own default model constant `DEFAULT_IMPORT_LINK_MODEL`). Conversation formats auto-detect via platform-specific JSON keys; each parser implements `can_parse()` + `parse()`. Document imports split DOCX/PDF files into linked section notes (PDF heading detection, with optional outline titles) and add structural wikilinks. Imported content becomes evidence-status container notes with provenance metadata (`source`, `source_id`, `created_via`). Both conversation and document paths flow through the same `preview_import` → `apply_import` commands.
 
 ### Temporal + Graph-Aware Retrieval
 
@@ -259,6 +258,8 @@ First-run setup wizard and persistent settings. Manages vault path, OpenRouter A
 - **`ollama_base_url`** / **`ollama_model`** — endpoint and model for local inference. `get_ollama_status` probes the Ollama daemon; `list_ollama_models` enumerates pulled models. Synced via `ollama.set_base_url()` on settings change.
 - **`background_link_discovery_enabled`** / **`background_link_discovery_llm_enabled`** — controls the background link-discovery worker. When enabled, `LinkDiscoveryService` processes notes in the background using YAKE keyword extraction and TF-IDF similarity.
 - **`background_vault_optimizer_enabled`** — controls the `VaultOptimizerService`. When enabled, optimizer processes queued notes and applies structural improvements (sidecar overlay or full rewrite mode). Budget and max daily writes cap LLM costs.
+- **Vault optimizer sub-settings** (all on `UserSettings`): `background_vault_optimizer_llm_enabled`, `_budget_monthly`, `_max_daily_writes`, `_edit_mode`, `_program_enabled`, and `vault_optimizer_program_path` — the last two enable a **vault-local `program.md` policy file** that steers optimizer behavior per-vault.
+- **`canvas_model_presets`** — saved canvas model combinations (`CanvasModelPreset` struct in `models/settings.rs`).
 
 **Runtime sync pattern:** When settings change via `update_settings`, dependent services are updated in-place — no restart required. The pattern (in `commands/settings.rs`): capture changed fields before moving the update, apply settings, then sync each affected service:
 - **OpenRouter API key** → `openrouter.set_api_key()`
@@ -301,52 +302,21 @@ cargo build --release --bin grafyn-mcp --no-default-features --features mcp
 
 **11 MCP tools:** `list_notes`, `get_note`, `create_note`, `update_note`, `delete_note`, `search_notes`, `get_backlinks`, `get_outgoing`, `recall_relevant` (with optional `token_budget` for chunk retrieval), `search_chunks` (paragraph-level search with token budgeting), `import_conversation` (also accepts documents and transcripts, splitting them into linked section notes)
 
-**Connecting Claude Desktop:** Add to `claude_desktop_config.json`:
-```json
-{
-  "mcpServers": {
-    "grafyn": {
-      "command": "path/to/grafyn-mcp",
-      "args": ["--vault", "path/to/vault", "--data", "path/to/data"]
-    }
-  }
-}
-```
-The Grafyn Settings UI shows this config snippet with the correct paths pre-filled.
+**Connecting Claude Desktop:** the Grafyn Settings UI generates the `claude_desktop_config.json` snippet (server key `grafyn`, args `--vault <path> --data <path>`) with correct paths pre-filled.
 
 ## CI/CD
 
 ### Test Pipeline
 
-`.github/workflows/test.yml` — runs on push to main and PRs:
-
-| Job | Purpose |
-|-----|---------|
-| `release-preflight` | Validates version alignment + Cargo.lock against all 4 release targets |
-| `rust-tests` | `cargo test` on ubuntu-22.04 with Swatinem/rust-cache |
-| `frontend-tests` | `npm run test:run` (Vitest) |
-| `lint` | `npm run lint` + `cargo clippy -D warnings` |
-| `security` | `npm audit --audit-level=high` |
-| `build` | `npm run build` (Vite production build) |
-| `test-summary` | Aggregates job results into GitHub Actions summary |
+`.github/workflows/test.yml` — runs on push to main and PRs. Jobs: `release-preflight` (version + Cargo.lock alignment), `rust-tests` (ubuntu-22.04), `frontend-tests` (Vitest), `lint` (eslint + `cargo clippy -D warnings`), `security` (`npm audit --audit-level=high`), `build` (Vite), `test-summary`. Clippy and npm audit **block** PRs.
 
 ### Release Pipeline
 
 `.github/workflows/release.yml` — triggered by `v*` tags. Also supports `workflow_dispatch` with `dry_run` for debugging builds without publishing.
 
 ```
-prepare-release → build (4-job matrix) → verify-release-assets → publish-release → upload-to-r2 → cleanup-draft → build-summary
+prepare-release → build (4-platform matrix: MCP binary + tauri-action) → verify-release-assets → publish-release → upload-to-r2 (Cloudflare R2 + updater endpoint verify) → cleanup-draft → build-summary
 ```
-
-| Job | Purpose |
-|-----|---------|
-| `prepare-release` | Creates/reuses draft release, validates tag matches manifests, generates release notes |
-| `build` | 4-platform matrix: builds MCP binary + `tauri-action` (with `releaseId`) |
-| `verify-release-assets` | Downloads draft assets, regenerates `latest.json`, validates completeness |
-| `publish-release` | Marks draft → published after all builds + verification pass |
-| `upload-to-r2` | Downloads release assets, generates final `latest.json`, uploads to Cloudflare R2 with retry, verifies updater endpoint |
-| `cleanup-draft` | Deletes failed draft releases (only if workflow created a new draft and build/verify failed) |
-| `build-summary` | Writes build status table to GitHub Actions summary |
 
 **Required secrets:** `TAURI_PRIVATE_KEY`, `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`, `FEEDBACK_REPO`, `FEEDBACK_TOKEN`
 
@@ -435,3 +405,11 @@ From `frontend/`:
 **Build output:** `frontend/src-tauri/target/release/bundle/` (NSIS `.exe`, DMG, DEB, or AppImage)
 
 **Data location:** `~/Documents/Grafyn/` (`vault/` for notes, `data/` for indexes)
+
+## Working conventions (added 2026-07-02 from session-friction audit)
+
+- **CI: never poll PR checks in a loop.** After opening a PR, run `gh pr merge <PR> --auto --squash` once — GitHub merges automatically when checks pass. If a watch is genuinely needed, use `gh pr checks <PR> --watch` in the background, not repeated status checks.
+- **Shell discipline (Windows).** The Bash tool is POSIX-only; the PowerShell tool is PS-only. Never PS cmdlets (`Select-Object`, `Select-String`) in bash, never bash idioms (`tail`, `$VAR=$(...)`, heredocs) in PowerShell. Windows paths in bash need forward slashes or quoting — unquoted backslashes get stripped.
+- **Read before editing.** Always Read a file in-session before Edit/Write; "File has not been read yet" failures were the most repeated tool error in this repo's sessions.
+- **Discussion-first.** When the user is exploring a design ("lets chat more", strategic questions), discuss — do not start implementing until explicitly told to build. Tool-use rejections are usually redirects back to discussion, not vetoes.
+- **Local models:** before benchmarking a new Ollama tag, smoke-test it first (prompt-echo check, choice-extraction check, max-token truncation check) — these three failure modes consumed entire past sessions.
