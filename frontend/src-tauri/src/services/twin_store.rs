@@ -17,6 +17,7 @@ use crate::models::twin::{DecisionMirrorPreset, PrimitiveDecisionAssessment};
 use crate::services::atomic_io::write_atomic;
 use anyhow::{Context, Result};
 use chrono::Utc;
+use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::hash_map::DefaultHasher;
@@ -24,6 +25,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
 
 const DEFAULT_EVAL_PERCENTAGE: u8 = 10;
@@ -626,7 +628,11 @@ impl TwinStore {
         {
             let path = entry.path();
             if path.extension().is_some_and(|ext| ext == "json") {
-                episodes.push(self.read_decision_file(path)?);
+                if let Some(episode) =
+                    load_or_quarantine::<DecisionEpisode>(path, "decision episode")
+                {
+                    episodes.push(episode);
+                }
             }
         }
 
@@ -1283,7 +1289,11 @@ impl TwinStore {
         {
             let path = entry.path();
             if path.extension().is_some_and(|ext| ext == "json") {
-                items.push(self.read_constitution_file(path)?);
+                if let Some(item) =
+                    load_or_quarantine::<ConstitutionItem>(path, "constitution item")
+                {
+                    items.push(item);
+                }
             }
         }
 
@@ -1394,7 +1404,9 @@ impl TwinStore {
         {
             let path = entry.path();
             if path.extension().is_some_and(|ext| ext == "json") {
-                gaps.push(self.read_action_gap_file(path)?);
+                if let Some(gap) = load_or_quarantine::<ActionGap>(path, "action gap") {
+                    gaps.push(gap);
+                }
             }
         }
 
@@ -2256,8 +2268,9 @@ impl TwinStore {
         {
             let path = entry.path();
             if path.extension().is_some_and(|ext| ext == "json") {
-                let trace = self.read_trace_file(path)?;
-                self.trace_cache.insert(trace.session_id.clone(), trace);
+                if let Some(trace) = load_or_quarantine::<SessionTrace>(path, "trace") {
+                    self.trace_cache.insert(trace.session_id.clone(), trace);
+                }
             }
         }
 
@@ -2320,8 +2333,9 @@ impl TwinStore {
         {
             let path = entry.path();
             if path.extension().is_some_and(|ext| ext == "json") {
-                let record = self.read_record_file(path)?;
-                self.record_cache.insert(record.id.clone(), record);
+                if let Some(record) = load_or_quarantine::<UserRecord>(path, "record") {
+                    self.record_cache.insert(record.id.clone(), record);
+                }
             }
         }
 
@@ -2422,13 +2436,6 @@ impl TwinStore {
             .with_context(|| format!("Failed to parse decision file: {}", path.display()))
     }
 
-    fn read_reflection_file(&self, path: &Path) -> Result<ReflectionCard> {
-        let content = std::fs::read_to_string(path)
-            .with_context(|| format!("Failed to read reflection file: {}", path.display()))?;
-        serde_json::from_str(&content)
-            .with_context(|| format!("Failed to parse reflection file: {}", path.display()))
-    }
-
     fn read_constitution_file(&self, path: &Path) -> Result<ConstitutionItem> {
         let content = std::fs::read_to_string(path)
             .with_context(|| format!("Failed to read constitution file: {}", path.display()))?;
@@ -2514,7 +2521,9 @@ impl TwinStore {
         {
             let path = entry.path();
             if path.extension().is_some_and(|ext| ext == "json") {
-                cards.push(self.read_reflection_file(path)?);
+                if let Some(card) = load_or_quarantine::<ReflectionCard>(path, "reflection card") {
+                    cards.push(card);
+                }
             }
         }
 
@@ -2662,6 +2671,93 @@ impl TwinStore {
         }
 
         Ok(())
+    }
+}
+
+/// Outcome of attempting to load a single JSON file within a per-file directory listing.
+enum FileLoadOutcome<T> {
+    Loaded(T),
+    /// The file couldn't be read (permissions, transient lock, etc). This is not
+    /// necessarily corruption — the file may be fine — so it must not be quarantined.
+    ReadFailed(anyhow::Error),
+    /// The file was read successfully but its content didn't parse as JSON. This is
+    /// genuine corruption (truncated write, hand-edit gone wrong) and should be
+    /// quarantined so it never bricks the listing again.
+    ParseFailed(anyhow::Error),
+}
+
+fn load_json_file<T: DeserializeOwned>(path: &Path) -> FileLoadOutcome<T> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(e) => return FileLoadOutcome::ReadFailed(anyhow::Error::new(e)),
+    };
+    match serde_json::from_str::<T>(&content) {
+        Ok(value) => FileLoadOutcome::Loaded(value),
+        Err(e) => FileLoadOutcome::ParseFailed(anyhow::Error::new(e)),
+    }
+}
+
+/// Rename a corrupt file to `{name}.corrupt-{unix-timestamp}` in the same directory so
+/// the bytes aren't lost. Best-effort: if the rename itself fails, log and leave the
+/// file in place (it's still skipped for this pass by the caller).
+fn quarantine_corrupt_file(path: &Path) {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
+        log::error!(
+            "Cannot quarantine file with non-UTF8 name: {}",
+            path.display()
+        );
+        return;
+    };
+    let quarantine_path = path.with_file_name(format!("{file_name}.corrupt-{timestamp}"));
+
+    match std::fs::rename(path, &quarantine_path) {
+        Ok(()) => log::error!(
+            "Quarantined corrupt file {} to {}",
+            path.display(),
+            quarantine_path.display()
+        ),
+        Err(e) => log::error!(
+            "Failed to quarantine corrupt file {} to {}: {}",
+            path.display(),
+            quarantine_path.display(),
+            e
+        ),
+    }
+}
+
+/// Load a single JSON file within a per-file directory-listing loop (record cache fill,
+/// session-trace listing, decision episodes, constitution items, action gaps, reflection
+/// cards). Instead of `?`-propagating and letting one bad file brick the whole listing,
+/// this skips the offending file and returns `None`:
+/// - a parse failure quarantines the file (renamed + logged) so it's never retried, and
+/// - a read failure is skipped without quarantine, since it may be transient/permissions
+///   and the file itself could be perfectly fine.
+fn load_or_quarantine<T: DeserializeOwned>(path: &Path, kind: &str) -> Option<T> {
+    match load_json_file::<T>(path) {
+        FileLoadOutcome::Loaded(value) => Some(value),
+        FileLoadOutcome::ReadFailed(e) => {
+            log::error!(
+                "Skipping unreadable {} file {}: {}",
+                kind,
+                path.display(),
+                e
+            );
+            None
+        }
+        FileLoadOutcome::ParseFailed(e) => {
+            log::error!(
+                "Skipping corrupt {} file {}: {} — quarantining",
+                kind,
+                path.display(),
+                e
+            );
+            quarantine_corrupt_file(path);
+            None
+        }
     }
 }
 
@@ -4075,6 +4171,20 @@ fn sanitize_confidence(raw: Option<f64>) -> Option<f32> {
     Some(value.clamp(0.0, 1.0) as f32)
 }
 
+/// Extract the first balanced `{...}` span from `raw`, for best-effort JSON parsing of
+/// model output. Returns `None` if there's no opening brace, no closing brace, or the
+/// closing brace appears before the opening one (e.g. truncated/malformed model output
+/// like `"Option A} — but {incomplete"`) — guarding this instead of blindly slicing
+/// `&raw[start..=end]` is what prevents a panic on malformed input.
+fn extract_json_slice(raw: &str) -> Option<&str> {
+    let start = raw.find('{')?;
+    let end = raw.rfind('}')?;
+    if start > end {
+        return None;
+    }
+    Some(&raw[start..=end])
+}
+
 /// Parse the raw model output of a sealed-prediction call into a draft.
 /// Fallback chain: fenced/embedded strict JSON -> normalized string match
 /// against `options` -> raw text (manual adjudication later).
@@ -4087,9 +4197,7 @@ pub fn parse_twin_prediction(raw: &str, options: &[String]) -> TwinPredictionDra
         rationale: Option<String>,
     }
 
-    let json_slice = raw
-        .find('{')
-        .and_then(|start| raw.rfind('}').map(|end| &raw[start..=end]));
+    let json_slice = extract_json_slice(raw);
 
     if let Some(slice) = json_slice {
         if let Ok(parsed) = serde_json::from_str::<ParsedPrediction>(slice) {
@@ -6006,6 +6114,33 @@ mod tests {
     }
 
     #[test]
+    fn parse_twin_prediction_reversed_braces_does_not_panic() {
+        // The closing brace appears BEFORE the opening one, so `raw.find('{')` finds a
+        // start index greater than `raw.rfind('}')`'s end index. Slicing `&raw[start..=end]`
+        // without checking `start <= end` panics — which previously crashed the spawned
+        // sealed-prediction task, silently skipping both `attach_twin_prediction` and
+        // `mark_twin_prediction_failed`.
+        let raw = "Option A} — but {incomplete";
+        let draft = parse_twin_prediction(raw, &prediction_options());
+        // No panic reaching here is the primary assertion. The malformed brace pair is
+        // simply not treated as JSON, so it falls through the same fallback chain as any
+        // other non-JSON text.
+        assert_ne!(draft.parse_mode, "json");
+    }
+
+    #[test]
+    fn extract_json_slice_rejects_reversed_braces() {
+        assert_eq!(extract_json_slice("Option A} — but {incomplete"), None);
+        assert_eq!(extract_json_slice("no braces here"), None);
+        assert_eq!(extract_json_slice("only open {"), None);
+        assert_eq!(extract_json_slice("only close }"), None);
+        assert_eq!(
+            extract_json_slice(r#"prefix {"a": 1} suffix"#),
+            Some(r#"{"a": 1}"#)
+        );
+    }
+
+    #[test]
     fn parse_twin_prediction_sanitizes_confidence() {
         let options = prediction_options();
         let percent = parse_twin_prediction(
@@ -6312,5 +6447,299 @@ mod tests {
         assert!(!feedback_content.contains("extremely sensitive rationale"));
         assert!(!feedback_content.contains(&private_event.id));
         assert!(feedback_content.contains(&exportable_event.id));
+    }
+
+    /// Corrupt-file quarantine sweep (Task 1.5): a directory listing must never brick
+    /// entirely because of one unparsable file. Covers the two sites named in the audit
+    /// (`ensure_record_cache`, `list_session_traces`) plus every sibling loop found with
+    /// the same `?`-propagate-on-per-file-parse-failure pattern (`list_decision_episodes`,
+    /// `list_constitution_items`, `list_action_gaps`, `list_reflection_cards`).
+    mod corrupt_file_quarantine {
+        use super::*;
+
+        /// Return the `.corrupt-*` sibling files in `dir`, if any.
+        fn quarantined_siblings(dir: &Path) -> Vec<std::path::PathBuf> {
+            std::fs::read_dir(dir)
+                .expect("read dir")
+                .filter_map(|entry| entry.ok())
+                .map(|entry| entry.path())
+                .filter(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|n| n.contains(".corrupt-"))
+                        .unwrap_or(false)
+                })
+                .collect()
+        }
+
+        #[test]
+        fn load_or_quarantine_skips_unreadable_file_without_quarantining() {
+            let temp_dir = tempdir().expect("temp dir should be created");
+            // A directory standing in for a file triggers a genuine read error (not a
+            // parse error) deterministically, without relying on OS permission quirks.
+            let bogus_path = temp_dir.path().join("not-a-file.json");
+            std::fs::create_dir(&bogus_path).expect("create directory standing in for a file");
+
+            let result = load_or_quarantine::<UserRecord>(&bogus_path, "record");
+            assert!(result.is_none());
+            assert!(
+                bogus_path.exists(),
+                "a read failure may be transient (permissions, AV lock) — the path must be left untouched"
+            );
+            assert!(quarantined_siblings(temp_dir.path()).is_empty());
+        }
+
+        #[test]
+        fn list_user_records_quarantines_corrupt_record_and_returns_healthy_ones() {
+            let temp_dir = tempdir().expect("temp dir should be created");
+            let mut store = TwinStore::new(temp_dir.path().to_path_buf());
+
+            for i in 0..2 {
+                let record = UserRecord {
+                    id: format!("record-{i}"),
+                    kind: UserRecordKind::Preference,
+                    content: format!("Healthy record {i}"),
+                    evidence_refs: Vec::new(),
+                    confidence: default_record_confidence(),
+                    origin: RecordOrigin::User,
+                    promotion_state: PromotionState::default_for_origin(&RecordOrigin::User),
+                    created_at: Utc::now(),
+                    updated_at: Utc::now(),
+                    valid_from: None,
+                    valid_until: None,
+                    links: Vec::new(),
+                    metadata: HashMap::new(),
+                };
+                store
+                    .write_record_file(&record)
+                    .expect("healthy record should write");
+            }
+
+            let corrupt_path = store.records_path.join("truncated-record.json");
+            std::fs::write(&corrupt_path, b"{ \"id\": \"broken\", \"content\": \"trunc")
+                .expect("seed truncated record file");
+
+            let records = store
+                .list_user_records()
+                .expect("one corrupt file must not brick the listing");
+
+            assert_eq!(records.len(), 2, "both healthy records should still load");
+            assert!(
+                !corrupt_path.exists(),
+                "corrupt file should be moved out of place"
+            );
+            assert_eq!(quarantined_siblings(&store.records_path).len(), 1);
+        }
+
+        #[test]
+        fn list_session_traces_quarantines_corrupt_trace_and_returns_healthy_ones() {
+            let temp_dir = tempdir().expect("temp dir should be created");
+            let mut store = TwinStore::new(temp_dir.path().to_path_buf());
+
+            store
+                .append_trace_event(
+                    "session-a",
+                    TraceEventType::RankingRecorded,
+                    json!({"ranking": ["a"]}),
+                )
+                .expect("trace a should append");
+            store
+                .append_trace_event(
+                    "session-b",
+                    TraceEventType::RankingRecorded,
+                    json!({"ranking": ["b"]}),
+                )
+                .expect("trace b should append");
+
+            let corrupt_path = store.traces_path.join("truncated-trace.json");
+            std::fs::write(
+                &corrupt_path,
+                b"{ \"session_id\": \"broken\", \"events\": [",
+            )
+            .expect("seed truncated trace file");
+
+            let traces = store
+                .list_session_traces()
+                .expect("one corrupt file must not brick the listing");
+
+            assert_eq!(traces.len(), 2, "both healthy traces should still load");
+            assert!(
+                !corrupt_path.exists(),
+                "corrupt file should be moved out of place"
+            );
+            assert_eq!(quarantined_siblings(&store.traces_path).len(), 1);
+        }
+
+        #[test]
+        fn list_decision_episodes_quarantines_corrupt_episode_and_returns_healthy_ones() {
+            let temp_dir = tempdir().expect("temp dir should be created");
+            let mut store = TwinStore::new(temp_dir.path().to_path_buf());
+
+            for i in 0..2 {
+                store
+                    .record_decision_episode(DecisionEpisodeCreate {
+                        id: format!("decision-{i}"),
+                        session_id: "session-1".to_string(),
+                        tile_id: "tile-1".to_string(),
+                        decision: format!("Decision {i}"),
+                        options: vec!["A".to_string(), "B".to_string()],
+                        stakes: None,
+                        initial_leaning: None,
+                        review_date: None,
+                        primitive_assessment: PrimitiveDecisionAssessment::default(),
+                        context_version: None,
+                    })
+                    .expect("healthy decision episode should persist");
+            }
+
+            let corrupt_path = store.decisions_path.join("truncated-decision.json");
+            std::fs::write(
+                &corrupt_path,
+                b"{ \"id\": \"broken\", \"decision\": \"trunc",
+            )
+            .expect("seed truncated decision file");
+
+            let episodes = store
+                .list_decision_episodes()
+                .expect("one corrupt file must not brick the listing");
+
+            assert_eq!(episodes.len(), 2, "both healthy episodes should still load");
+            assert!(
+                !corrupt_path.exists(),
+                "corrupt file should be moved out of place"
+            );
+            assert_eq!(quarantined_siblings(&store.decisions_path).len(), 1);
+        }
+
+        #[test]
+        fn list_constitution_items_quarantines_corrupt_item_and_returns_healthy_ones() {
+            let temp_dir = tempdir().expect("temp dir should be created");
+            let store = TwinStore::new(temp_dir.path().to_path_buf());
+
+            for i in 0..2 {
+                store
+                    .create_constitution_item(ConstitutionItemCreate {
+                        claim: format!("Claim {i}"),
+                        dimension: "general".to_string(),
+                        scope: Vec::new(),
+                        priority: default_record_confidence(),
+                        confidence: default_record_confidence(),
+                        status: ConstitutionStatus::Candidate,
+                        evidence_refs: Vec::new(),
+                        tensions: Vec::new(),
+                        linked_record_ids: Vec::new(),
+                        source: None,
+                    })
+                    .expect("healthy constitution item should persist");
+            }
+
+            let corrupt_path = store.constitution_path.join("truncated-item.json");
+            std::fs::write(&corrupt_path, b"{ \"id\": \"broken\", \"claim\": \"trunc")
+                .expect("seed truncated constitution item file");
+
+            let items = store
+                .list_constitution_items()
+                .expect("one corrupt file must not brick the listing");
+
+            assert_eq!(items.len(), 2, "both healthy items should still load");
+            assert!(
+                !corrupt_path.exists(),
+                "corrupt file should be moved out of place"
+            );
+            assert_eq!(quarantined_siblings(&store.constitution_path).len(), 1);
+        }
+
+        #[test]
+        fn list_action_gaps_quarantines_corrupt_gap_and_returns_healthy_ones() {
+            let temp_dir = tempdir().expect("temp dir should be created");
+            let store = TwinStore::new(temp_dir.path().to_path_buf());
+
+            for i in 0..2 {
+                store
+                    .create_action_gap(ActionGapCreate {
+                        stated_value: format!("Stated {i}"),
+                        revealed_behavior: format!("Revealed {i}"),
+                        driver_hypothesis: None,
+                        somatic_taste_signal: None,
+                        decision_risk: "Some risk".to_string(),
+                        evidence_refs: Vec::new(),
+                        linked_record_ids: Vec::new(),
+                        confidence: default_record_confidence(),
+                        status: ConstitutionStatus::Candidate,
+                    })
+                    .expect("healthy action gap should persist");
+            }
+
+            let corrupt_path = store.action_gaps_path.join("truncated-gap.json");
+            std::fs::write(
+                &corrupt_path,
+                b"{ \"id\": \"broken\", \"stated_value\": \"trunc",
+            )
+            .expect("seed truncated action gap file");
+
+            let gaps = store
+                .list_action_gaps()
+                .expect("one corrupt file must not brick the listing");
+
+            assert_eq!(gaps.len(), 2, "both healthy gaps should still load");
+            assert!(
+                !corrupt_path.exists(),
+                "corrupt file should be moved out of place"
+            );
+            assert_eq!(quarantined_siblings(&store.action_gaps_path).len(), 1);
+        }
+
+        #[test]
+        fn list_reflection_cards_quarantines_corrupt_card_and_returns_healthy_ones() {
+            let temp_dir = tempdir().expect("temp dir should be created");
+            let mut store = TwinStore::new(temp_dir.path().to_path_buf());
+
+            let episode = store
+                .record_decision_episode(DecisionEpisodeCreate {
+                    id: "decision-1".to_string(),
+                    session_id: "session-1".to_string(),
+                    tile_id: "tile-1".to_string(),
+                    decision: "Should Grafyn build Decision Mirror first?".to_string(),
+                    options: vec!["Decision Mirror".to_string(), "Topology".to_string()],
+                    stakes: None,
+                    initial_leaning: None,
+                    review_date: None,
+                    primitive_assessment: PrimitiveDecisionAssessment::default(),
+                    context_version: None,
+                })
+                .expect("decision episode should persist");
+
+            for i in 0..2 {
+                store
+                    .record_reflection_card(ReflectionCardCreate {
+                        decision_episode_id: episode.id.clone(),
+                        session_id: episode.session_id.clone(),
+                        tile_id: episode.tile_id.clone(),
+                        model_id: "openai/gpt-4".to_string(),
+                        content: format!("## Reflection {i}\nSome content here."),
+                        cited_note_ids: Vec::new(),
+                        cited_user_record_ids: Vec::new(),
+                        cited_constitution_item_ids: Vec::new(),
+                        cited_action_gap_ids: Vec::new(),
+                        evidence_packet: None,
+                    })
+                    .expect("healthy reflection card should persist");
+            }
+
+            let corrupt_path = store.reflections_path.join("truncated-card.json");
+            std::fs::write(&corrupt_path, b"{ \"id\": \"broken\", \"content\": \"trunc")
+                .expect("seed truncated reflection card file");
+
+            let cards = store
+                .list_reflection_cards()
+                .expect("one corrupt file must not brick the listing");
+
+            assert_eq!(cards.len(), 2, "both healthy cards should still load");
+            assert!(
+                !corrupt_path.exists(),
+                "corrupt file should be moved out of place"
+            );
+            assert_eq!(quarantined_siblings(&store.reflections_path).len(), 1);
+        }
     }
 }
