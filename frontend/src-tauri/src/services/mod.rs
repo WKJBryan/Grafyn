@@ -1,3 +1,4 @@
+pub mod atomic_io;
 pub mod canvas_store;
 pub mod chunk_index;
 pub mod feedback;

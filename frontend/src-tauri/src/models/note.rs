@@ -100,6 +100,21 @@ pub struct Note {
     /// Additional frontmatter properties
     #[serde(default)]
     pub properties: HashMap<String, serde_json::Value>,
+    /// Raw frontmatter block preserved verbatim when the on-disk YAML failed to
+    /// deserialize into `NoteFrontmatter` (e.g. malformed/corrupt YAML). Never part
+    /// of the public API surface (skipped in both directions), so it does not change
+    /// any JSON responses sent to the frontend or MCP clients.
+    ///
+    /// Preserve/clear rule: set on read whenever frontmatter parsing fails (see
+    /// `KnowledgeStore::read_note_file`). `write_note_file` re-emits this block
+    /// byte-for-byte instead of serializing the (defaulted) `NoteFrontmatter` struct
+    /// for as long as it is `Some`. `update_note` clears it the moment the caller
+    /// explicitly edits a frontmatter-backed field (title/aliases/status/tags/
+    /// schema_version/migration_source/optimizer_managed/properties) — a conscious
+    /// edit is allowed to replace the unparsable original. A content-only update
+    /// leaves it untouched, so the original frontmatter survives verbatim.
+    #[serde(skip)]
+    pub frontmatter_raw_fallback: Option<String>,
 }
 
 pub const PROP_IS_TOPIC_HUB: &str = "is_topic_hub";
@@ -129,6 +144,7 @@ impl Default for Note {
             wikilinks: Vec::new(),
             parsed_links: Vec::new(),
             properties: HashMap::new(),
+            frontmatter_raw_fallback: None,
         }
     }
 }
@@ -360,6 +376,13 @@ pub struct NoteUpdate {
 pub struct NoteFrontmatter {
     #[serde(default)]
     pub note_id: Option<String>,
+    /// Defaulted so valid frontmatter without `title:` (the norm for Obsidian and
+    /// imported vaults) deserializes successfully instead of being treated as a
+    /// parse failure (which would fallback-freeze the note — see
+    /// `Note::frontmatter_raw_fallback`). An empty title is handled downstream:
+    /// `KnowledgeStore::read_note_file` falls back to the first H1 heading, then
+    /// to the humanized filename.
+    #[serde(default)]
     pub title: String,
     #[serde(default)]
     pub aliases: Vec<String>,

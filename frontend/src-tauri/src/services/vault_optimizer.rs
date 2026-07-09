@@ -7,6 +7,7 @@ use crate::models::note::{
     PROP_TOPIC_KEY,
 };
 use crate::models::settings::UserSettings;
+use crate::services::atomic_io::write_atomic;
 use crate::services::knowledge_store::KnowledgeStore;
 use crate::services::topic_hub::normalize_topic_key;
 use anyhow::{Context, Result};
@@ -240,6 +241,21 @@ impl VaultOptimizerService {
             return Ok(());
         }
 
+        // The note's original frontmatter failed to parse and is preserved verbatim
+        // (see `Note::frontmatter_raw_fallback`). `full_rewrite` mode would explicitly
+        // set frontmatter-backed fields via `update_note`, clearing the fallback and
+        // permanently destroying the unparsable original on write. Skip optimizing it
+        // entirely until a human/editor fixes the YAML.
+        if note.frontmatter_raw_fallback.is_some() {
+            log::warn!(
+                "Skipping vault optimizer run for note '{}': original frontmatter is unparsable and preserved verbatim",
+                note.id
+            );
+            self.state.last_run_at = Some(Utc::now());
+            self.persist_state()?;
+            return Ok(());
+        }
+
         let proposal = build_optimizer_proposal(&note, store)?;
         if proposal.is_empty() {
             self.state.last_run_at = Some(Utc::now());
@@ -341,7 +357,10 @@ impl VaultOptimizerService {
 
     fn persist_state(&self) -> Result<()> {
         std::fs::create_dir_all(&self.optimizer_dir)?;
-        std::fs::write(&self.queue_path, serde_json::to_string_pretty(&self.state)?)?;
+        write_atomic(
+            &self.queue_path,
+            serde_json::to_string_pretty(&self.state)?.as_bytes(),
+        )?;
         Ok(())
     }
 
@@ -356,9 +375,9 @@ impl VaultOptimizerService {
     fn push_decision(&self, decision: VaultOptimizerDecision) -> Result<()> {
         let mut decisions = self.load_decisions()?;
         decisions.push(decision);
-        std::fs::write(
+        write_atomic(
             &self.decisions_path,
-            serde_json::to_string_pretty(&decisions)?,
+            serde_json::to_string_pretty(&decisions)?.as_bytes(),
         )?;
         Ok(())
     }
@@ -376,15 +395,18 @@ impl VaultOptimizerService {
     fn push_inbox(&self, entry: VaultOptimizerInboxEntry) -> Result<()> {
         let mut inbox = self.load_inbox()?;
         inbox.push(entry);
-        std::fs::write(&self.inbox_path, serde_json::to_string_pretty(&inbox)?)?;
+        write_atomic(
+            &self.inbox_path,
+            serde_json::to_string_pretty(&inbox)?.as_bytes(),
+        )?;
         Ok(())
     }
 
     fn write_change(&self, change: &OptimizerChange) -> Result<()> {
         std::fs::create_dir_all(&self.changes_dir)?;
-        std::fs::write(
-            self.changes_dir.join(format!("{}.json", change.change_id)),
-            serde_json::to_string_pretty(change)?,
+        write_atomic(
+            &self.changes_dir.join(format!("{}.json", change.change_id)),
+            serde_json::to_string_pretty(change)?.as_bytes(),
         )?;
         Ok(())
     }
@@ -531,4 +553,47 @@ fn read_overlay_value(store: &KnowledgeStore, note_id: &str) -> Option<Value> {
     std::fs::read_to_string(path)
         .ok()
         .and_then(|content| serde_json::from_str::<Value>(&content).ok())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::note::NoteStatus;
+    use crate::services::atomic_io::assert_no_tmp_siblings;
+    use tempfile::tempdir;
+
+    fn make_note(id: &str, title: &str) -> Note {
+        let now = Utc::now();
+        Note {
+            id: id.to_string(),
+            title: title.to_string(),
+            content: format!("Content of {}", title),
+            relative_path: format!("{}.md", id),
+            aliases: Vec::new(),
+            status: NoteStatus::Draft,
+            tags: Vec::new(),
+            created_at: now,
+            updated_at: now,
+            schema_version: crate::models::note::CURRENT_NOTE_SCHEMA_VERSION,
+            migration_source: None,
+            optimizer_managed: false,
+            wikilinks: Vec::new(),
+            parsed_links: Vec::new(),
+            properties: HashMap::new(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn queue_state_writes_are_atomic_with_no_tmp_litter() {
+        let data_dir = tempdir().expect("temp dir should be created");
+        let mut service = VaultOptimizerService::new(data_dir.path().to_path_buf());
+
+        service.bootstrap(&[make_note("note-1", "Optimizer Adoption")]);
+
+        let persisted =
+            std::fs::read_to_string(&service.queue_path).expect("queue.json should exist");
+        assert!(persisted.contains("note-1"));
+        assert_no_tmp_siblings(&service.optimizer_dir);
+    }
 }

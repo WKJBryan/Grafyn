@@ -312,6 +312,7 @@ mod tests {
             wikilinks: vec![],
             parsed_links: vec![],
             properties: HashMap::new(),
+            ..Default::default()
         }
     }
 

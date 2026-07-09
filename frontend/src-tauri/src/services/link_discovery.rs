@@ -5,6 +5,7 @@ use crate::models::note::{
     ChunkResult, DiscoverLinksResponse, Note, TopicHubCandidate, ZettelLinkCandidate,
 };
 use crate::models::settings::UserSettings;
+use crate::services::atomic_io::write_atomic;
 use crate::services::retrieval::RetrievalResult;
 use crate::services::similarity::{sparse_cosine, SimilarityProvider, TfIdfProvider};
 use crate::services::yake::{self, YakeConfig, STOPWORDS};
@@ -755,7 +756,7 @@ impl LinkDiscoveryService {
         if let Some(record) = self.stored_notes.get(note_id) {
             let path = self.note_file_path(note_id);
             if let Ok(contents) = serde_json::to_string_pretty(record) {
-                let _ = std::fs::write(path, contents);
+                let _ = write_atomic(&path, contents.as_bytes());
             }
         }
     }
@@ -772,7 +773,7 @@ impl LinkDiscoveryService {
         }
 
         if let Ok(contents) = serde_json::to_string_pretty(&state) {
-            let _ = std::fs::write(&self.queue_path, contents);
+            let _ = write_atomic(&self.queue_path, contents.as_bytes());
         }
     }
 
@@ -1601,7 +1602,35 @@ mod tests {
                 })
                 .collect(),
             properties: HashMap::new(),
+            ..Default::default()
         }
+    }
+
+    #[test]
+    fn note_record_and_queue_writes_are_atomic_with_no_tmp_litter() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let mut service = LinkDiscoveryService::new(dir.path().to_path_buf());
+
+        let note = make_note(
+            "atomic-note",
+            "Atomic Adoption",
+            "Content about atomic writes.",
+            &["adoption"],
+            &[],
+        );
+        service.sync_note(&note);
+
+        let record_file = service.notes_dir.join("atomic-note.json");
+        let persisted =
+            std::fs::read_to_string(&record_file).expect("note record file should exist");
+        assert!(persisted.contains("atomic-note"));
+        crate::services::atomic_io::assert_no_tmp_siblings(&service.notes_dir);
+
+        let queue = std::fs::read_to_string(&service.queue_path).expect("queue.json should exist");
+        assert!(queue.contains("atomic-note"));
+        crate::services::atomic_io::assert_no_tmp_siblings(
+            service.queue_path.parent().expect("queue parent dir"),
+        );
     }
 
     #[test]

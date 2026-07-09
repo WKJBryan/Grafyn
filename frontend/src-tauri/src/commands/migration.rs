@@ -99,16 +99,24 @@ pub async fn rollback_markdown_migration(
     run_id: String,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    {
+    // Rollback can fail after having already restored some files to disk. If we
+    // `?`-return before rebuilding, the search/graph/chunk indexes stay pointed at
+    // the pre-rollback state and disagree with the (partially) restored files. So:
+    // capture the rollback result, ALWAYS rebuild the indexes to match whatever is
+    // now on disk, then propagate the original rollback error (a rebuild error is
+    // only surfaced when the rollback itself succeeded).
+    let rollback_result = {
         let service = state.markdown_migration.read().await;
         let mut store = state.knowledge_store.write().await;
         service
             .rollback(&run_id, &mut store)
-            .map_err(|error| error.to_string())?;
-    }
+            .map_err(|error| error.to_string())
+    };
 
-    crate::commands::rebuild_all_indexes(state.inner()).await?;
-    Ok(())
+    let rebuild_result = crate::commands::rebuild_all_indexes(state.inner()).await;
+
+    rollback_result?;
+    rebuild_result.map(|_| ())
 }
 
 #[tauri::command]
@@ -185,12 +193,94 @@ pub async fn rollback_vault_optimizer_change(
     state: State<'_, AppState>,
 ) -> Result<VaultOptimizerRollbackResult, String> {
     let result = {
-        let mut optimizer = state.vault_optimizer.write().await;
+        // Lock order: knowledge_store before vault_optimizer (see commands/mod.rs
+        // doc comment) — must match the background worker in main.rs to avoid
+        // an ABBA deadlock.
         let mut store = state.knowledge_store.write().await;
+        let mut optimizer = state.vault_optimizer.write().await;
         optimizer
             .rollback_change(&change_id, &mut store)
             .map_err(|error| error.to_string())?
     };
     crate::commands::rebuild_all_indexes(state.inner()).await?;
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::services::knowledge_store::KnowledgeStore;
+    use crate::services::vault_optimizer::VaultOptimizerService;
+    use std::sync::Arc;
+    use tempfile::tempdir;
+    use tokio::sync::RwLock;
+    use tokio::time::{timeout, Duration};
+
+    /// Demonstrates that the canonical `knowledge_store` → `vault_optimizer`
+    /// lock order (see the doc comment in `commands/mod.rs`) is deadlock-free
+    /// under contention: two concurrent tasks repeatedly acquire both locks
+    /// in that shared order, using the real service types over real
+    /// tempdir-backed stores.
+    ///
+    /// Scope note — what this does NOT guard: both tasks below hand-inline
+    /// the acquisition pattern; they do not drive the actual production call
+    /// sites (`main.rs::start_vault_optimizer_worker` and
+    /// `rollback_vault_optimizer_change` above). If a production call site's
+    /// order drifts back to `vault_optimizer` → `knowledge_store`, this test
+    /// still passes. The production sites are kept in sync by the
+    /// canonical-order doc comment in `commands/mod.rs` plus code review,
+    /// not by this test.
+    ///
+    /// Mechanics: the multi-thread runtime plus a `yield_now` between the
+    /// two acquisitions in each task are required to force real interleaving
+    /// — without both, an uncontended `.write().await` never actually
+    /// suspends and the two spawned tasks just run to completion in
+    /// sequence, masking any contention. (Verified during development: with
+    /// this setup, inverting one task's inlined order reliably made the test
+    /// time out; without the yield_now, even the inverted order passed
+    /// spuriously.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lock_order_matches_worker_and_never_deadlocks() {
+        let vault_dir = tempdir().expect("vault tempdir should be created");
+        let data_dir = tempdir().expect("data tempdir should be created");
+
+        let knowledge_store = Arc::new(RwLock::new(KnowledgeStore::new(
+            vault_dir.path().to_path_buf(),
+            data_dir.path().to_path_buf(),
+        )));
+        let vault_optimizer = Arc::new(RwLock::new(VaultOptimizerService::new(
+            data_dir.path().to_path_buf(),
+        )));
+
+        let result = timeout(Duration::from_secs(5), async {
+            for _ in 0..100 {
+                let ks_a = knowledge_store.clone();
+                let vo_a = vault_optimizer.clone();
+                let worker_side = tokio::spawn(async move {
+                    // Mirrors main.rs::start_vault_optimizer_worker's order.
+                    let _store = ks_a.write().await;
+                    tokio::task::yield_now().await;
+                    let _optimizer = vo_a.write().await;
+                });
+
+                let ks_b = knowledge_store.clone();
+                let vo_b = vault_optimizer.clone();
+                let rollback_side = tokio::spawn(async move {
+                    // Mirrors rollback_vault_optimizer_change's (fixed) order.
+                    let _store = ks_b.write().await;
+                    tokio::task::yield_now().await;
+                    let _optimizer = vo_b.write().await;
+                });
+
+                let (a, b) = tokio::join!(worker_side, rollback_side);
+                a.expect("worker-side task panicked");
+                b.expect("rollback-side task panicked");
+            }
+        })
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "lock acquisitions did not complete within 5s — lock order regressed to ABBA"
+        );
+    }
 }

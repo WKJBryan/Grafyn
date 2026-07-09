@@ -2,6 +2,7 @@ use crate::models::canvas::{
     CanvasSession, CanvasViewport, Debate, LLMNodePositionUpdate, PromptTile, SessionCreate,
     SessionMeta, SessionUpdate, TilePosition, TilePositionUpdate,
 };
+use crate::services::atomic_io::write_atomic;
 use anyhow::{Context, Result};
 use chrono::Utc;
 use std::collections::{HashMap, HashSet};
@@ -503,7 +504,7 @@ impl CanvasStore {
         let path = self.session_path(&session.id);
         let content = serde_json::to_string_pretty(session)?;
 
-        std::fs::write(&path, content)
+        write_atomic(&path, content.as_bytes())
             .with_context(|| format!("Failed to write session: {:?}", path))?;
 
         Ok(())
@@ -514,7 +515,27 @@ impl CanvasStore {
 mod tests {
     use super::*;
     use crate::models::canvas::{Debate, ModelResponse, PromptTile, ResponseStatus, SessionCreate};
+    use crate::services::atomic_io::assert_no_tmp_siblings;
     use tempfile::tempdir;
+
+    #[test]
+    fn session_writes_are_atomic_with_no_tmp_litter() {
+        let temp_dir = tempdir().expect("temp dir should be created");
+        let mut store = CanvasStore::new(temp_dir.path().to_path_buf());
+
+        let session = store
+            .create_session(SessionCreate {
+                title: "Atomic Session".to_string(),
+                description: Some("adoption test".to_string()),
+                tags: Vec::new(),
+            })
+            .expect("session should be created");
+
+        let session_file = temp_dir.path().join(format!("{}.json", session.id));
+        let persisted = std::fs::read_to_string(&session_file).expect("session file should exist");
+        assert!(persisted.contains("Atomic Session"));
+        assert_no_tmp_siblings(temp_dir.path());
+    }
 
     fn build_response(model_id: &str) -> ModelResponse {
         ModelResponse {

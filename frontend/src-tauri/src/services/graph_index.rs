@@ -716,6 +716,7 @@ mod tests {
                 })
                 .collect(),
             properties: HashMap::new(),
+            ..Default::default()
         }
     }
 
