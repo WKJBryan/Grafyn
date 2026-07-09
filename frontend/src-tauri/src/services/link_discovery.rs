@@ -1606,6 +1606,33 @@ mod tests {
     }
 
     #[test]
+    fn note_record_and_queue_writes_are_atomic_with_no_tmp_litter() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let mut service = LinkDiscoveryService::new(dir.path().to_path_buf());
+
+        let note = make_note(
+            "atomic-note",
+            "Atomic Adoption",
+            "Content about atomic writes.",
+            &["adoption"],
+            &[],
+        );
+        service.sync_note(&note);
+
+        let record_file = service.notes_dir.join("atomic-note.json");
+        let persisted =
+            std::fs::read_to_string(&record_file).expect("note record file should exist");
+        assert!(persisted.contains("atomic-note"));
+        crate::services::atomic_io::assert_no_tmp_siblings(&service.notes_dir);
+
+        let queue = std::fs::read_to_string(&service.queue_path).expect("queue.json should exist");
+        assert!(queue.contains("atomic-note"));
+        crate::services::atomic_io::assert_no_tmp_siblings(
+            service.queue_path.parent().expect("queue parent dir"),
+        );
+    }
+
+    #[test]
     fn build_profile_extracts_summary_terms_and_links() {
         let note = make_note(
             "n1",

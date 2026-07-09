@@ -1,8 +1,12 @@
 //! Atomic file writes: write to a same-directory temp file, fsync, then rename over the
 //! target. On NTFS/ext4 (same volume) `rename` is atomic, so readers never observe a
-//! partially-written file — even if the process is killed or the machine loses power
-//! mid-write, the target is either the old complete content or the new complete content,
-//! never a truncated mix of both.
+//! partially-written file: if the writing process is interrupted, the target is either
+//! the old complete content or the new complete content, never a truncated mix of both.
+//!
+//! Durability note: the temp file's contents are fsynced (`File::sync_all`) before the
+//! rename, but the parent directory entry is not fsynced afterwards. After a power loss
+//! the rename itself may not have reached disk (the old content survives), but the
+//! target is never left truncated.
 
 use std::io::Write;
 use std::path::Path;
@@ -43,6 +47,30 @@ pub fn write_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     }
 
     result
+}
+
+/// Test helper: assert that `dir` contains no `*.tmp-*` litter from `write_atomic`.
+/// Used by per-store adoption tests to prove each store's public write API leaves
+/// no temp files behind.
+#[cfg(test)]
+pub fn assert_no_tmp_siblings(dir: &Path) {
+    let leftovers: Vec<_> = std::fs::read_dir(dir)
+        .expect("read_dir for tmp-sibling check")
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.contains(".tmp-"))
+                .unwrap_or(false)
+        })
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "expected no *.tmp-* files in {}, found: {:?}",
+        dir.display(),
+        leftovers
+    );
 }
 
 #[cfg(test)]
@@ -106,34 +134,55 @@ mod tests {
 
     #[test]
     fn no_tmp_file_left_behind_after_rename_failure() {
-        // Force the rename to fail by pointing the "target" at a directory that
-        // doesn't exist (so `rename` errors), and confirm the temp file created
-        // alongside it is cleaned up rather than left as litter.
+        // Make the target path an existing non-empty DIRECTORY. Creating the temp
+        // file next to it (same parent) succeeds, but renaming a file over a
+        // non-empty directory fails on Windows and Unix alike — so this exercises
+        // the rename-failure cleanup path specifically, not File::create failure.
         let dir = tempdir().expect("tempdir");
-        let missing_dir = dir.path().join("does-not-exist");
-        let path = missing_dir.join("target.json");
+        let path = dir.path().join("target.json");
+        std::fs::create_dir(&path).expect("create target as directory");
+        std::fs::write(path.join("occupant.txt"), b"x").expect("make directory non-empty");
 
         let result = write_atomic(&path, b"payload");
-        assert!(result.is_err(), "write should fail: target dir is missing");
+        assert!(
+            result.is_err(),
+            "write should fail: cannot rename over a non-empty directory"
+        );
 
-        // No tmp file should be left in the (nonexistent) directory, and creating
-        // the temp file itself should have failed cleanly rather than partially.
-        assert!(!missing_dir.exists() || tmp_siblings(&path).is_empty());
+        assert!(
+            tmp_siblings(&path).is_empty(),
+            "expected the temp file to be cleaned up after rename failure"
+        );
     }
 
     #[test]
-    fn concurrent_writes_use_distinct_temp_names() {
-        // Two overlapping writes to the same path must not collide on the same
-        // temp file name (pid alone is not enough within a single process/thread
-        // pool), so we assert the counter disambiguates them.
+    fn concurrent_writes_leave_one_intact_payload() {
+        // Two threads racing to write the same target must not collide on the
+        // same temp name (pid alone is not enough within one process — the
+        // counter disambiguates). Whichever rename lands last wins, and the final
+        // file must be one of the two payloads intact, never interleaved.
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("concurrent.json");
 
-        write_atomic(&path, b"first").expect("first write");
-        write_atomic(&path, b"second").expect("second write");
+        let payload_a = vec![b'a'; 64 * 1024];
+        let payload_b = vec![b'b'; 64 * 1024];
 
-        let content = std::fs::read_to_string(&path).expect("file should exist");
-        assert_eq!(content, "second");
+        std::thread::scope(|scope| {
+            let path_a = path.clone();
+            let path_b = path.clone();
+            let a = &payload_a;
+            let b = &payload_b;
+            let ta = scope.spawn(move || write_atomic(&path_a, a));
+            let tb = scope.spawn(move || write_atomic(&path_b, b));
+            ta.join().expect("thread a").expect("write a");
+            tb.join().expect("thread b").expect("write b");
+        });
+
+        let content = std::fs::read(&path).expect("file should exist");
+        assert!(
+            content == payload_a || content == payload_b,
+            "final content must be exactly one payload, intact"
+        );
         assert!(tmp_siblings(&path).is_empty());
     }
 }

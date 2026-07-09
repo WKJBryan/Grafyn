@@ -288,3 +288,35 @@ struct WorkerFeedbackResponse {
     number: u64,
     html_url: String,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::feedback::FeedbackType;
+    use crate::services::atomic_io::assert_no_tmp_siblings;
+    use tempfile::tempdir;
+
+    #[test]
+    fn queued_feedback_writes_are_atomic_with_no_tmp_litter() {
+        let dir = tempdir().expect("temp dir should be created");
+        let service = FeedbackService::new(dir.path().to_path_buf());
+
+        // `submit` (the public entry point) requires network access; `queue_feedback`
+        // is the persistence choke point that both offline submission and failed
+        // retries funnel through, so we exercise it directly.
+        service
+            .queue_feedback(FeedbackCreate {
+                title: "Atomic feedback adoption".to_string(),
+                description: "Ensure queued feedback survives temp+rename.".to_string(),
+                feedback_type: FeedbackType::Bug,
+                include_system_info: false,
+                system_info: None,
+            })
+            .expect("feedback should queue");
+
+        let pending = service.get_pending().expect("pending should load");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].feedback.title, "Atomic feedback adoption");
+        assert_no_tmp_siblings(dir.path());
+    }
+}

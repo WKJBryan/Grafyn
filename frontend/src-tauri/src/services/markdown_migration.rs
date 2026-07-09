@@ -839,3 +839,35 @@ fn default_program_file_contents(hub_folder: &str, program_path: &str) -> String
         hub_folder, program_path
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::services::atomic_io::assert_no_tmp_siblings;
+    use tempfile::tempdir;
+
+    #[test]
+    fn preview_writes_are_atomic_with_no_tmp_litter() {
+        let vault_dir = tempdir().expect("vault tempdir");
+        let data_dir = tempdir().expect("data tempdir");
+        std::fs::write(
+            vault_dir.path().join("sample.md"),
+            "---\ntitle: Sample\n---\n\nSample content.",
+        )
+        .expect("seed vault note");
+
+        let service = MarkdownMigrationService::new(data_dir.path().to_path_buf());
+        let preview = service
+            .preview(
+                vault_dir.path().to_path_buf(),
+                MarkdownMigrationRequest::default(),
+            )
+            .expect("preview should succeed");
+
+        let run_dir = service.runs_dir.join(&preview.preview_id);
+        let persisted = std::fs::read_to_string(run_dir.join("preview.json"))
+            .expect("preview.json should exist");
+        assert!(persisted.contains(&preview.preview_id));
+        assert_no_tmp_siblings(&run_dir);
+    }
+}

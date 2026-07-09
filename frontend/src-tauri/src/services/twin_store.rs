@@ -4519,6 +4519,32 @@ mod tests {
     }
 
     #[test]
+    fn user_record_writes_are_atomic_with_no_tmp_litter() {
+        let temp_dir = tempdir().expect("temp dir should be created");
+        let mut store = TwinStore::new(temp_dir.path().to_path_buf());
+
+        let record = store
+            .create_user_record(UserRecordCreate {
+                kind: UserRecordKind::Preference,
+                content: "Prefers atomic writes".to_string(),
+                origin: RecordOrigin::User,
+                evidence_refs: Vec::new(),
+                confidence: default_record_confidence(),
+                promotion_state: None,
+                valid_from: None,
+                valid_until: None,
+                links: Vec::new(),
+                metadata: HashMap::new(),
+            })
+            .expect("record should be created");
+
+        let record_file = store.records_path.join(format!("{}.json", record.id));
+        let persisted = std::fs::read_to_string(&record_file).expect("record file should exist");
+        assert!(persisted.contains("Prefers atomic writes"));
+        crate::services::atomic_io::assert_no_tmp_siblings(&store.records_path);
+    }
+
+    #[test]
     fn synthetic_records_require_endorsement_for_export() {
         let temp_dir = tempdir().expect("temp dir should be created");
         let mut store = TwinStore::new(temp_dir.path().to_path_buf());

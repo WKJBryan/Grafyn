@@ -427,4 +427,44 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(temp_dir);
     }
+
+    #[test]
+    fn settings_writes_are_atomic_with_no_tmp_litter() {
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let config_path = temp_dir.path().join("settings.json");
+
+        let mut service = SettingsService {
+            config_path: config_path.clone(),
+            settings: UserSettings::default(),
+        };
+
+        service
+            .update(SettingsUpdate {
+                vault_path: None,
+                openrouter_api_key: None,
+                setup_completed: None,
+                theme: Some("dark".to_string()),
+                mcp_enabled: None,
+                llm_model: None,
+                twin_llm_provider: None,
+                ollama_base_url: None,
+                ollama_model: None,
+                smart_web_search: None,
+                background_link_discovery_enabled: None,
+                background_link_discovery_llm_enabled: None,
+                background_vault_optimizer_enabled: None,
+                background_vault_optimizer_llm_enabled: None,
+                background_vault_optimizer_budget_monthly: None,
+                background_vault_optimizer_max_daily_writes: None,
+                background_vault_optimizer_edit_mode: None,
+                background_vault_optimizer_program_enabled: None,
+                vault_optimizer_program_path: None,
+                canvas_model_presets: None,
+            })
+            .expect("settings update should succeed");
+
+        let persisted = std::fs::read_to_string(&config_path).expect("settings file should exist");
+        assert!(persisted.contains("\"theme\": \"dark\""));
+        crate::services::atomic_io::assert_no_tmp_siblings(temp_dir.path());
+    }
 }

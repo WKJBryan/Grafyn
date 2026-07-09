@@ -515,7 +515,27 @@ impl CanvasStore {
 mod tests {
     use super::*;
     use crate::models::canvas::{Debate, ModelResponse, PromptTile, ResponseStatus, SessionCreate};
+    use crate::services::atomic_io::assert_no_tmp_siblings;
     use tempfile::tempdir;
+
+    #[test]
+    fn session_writes_are_atomic_with_no_tmp_litter() {
+        let temp_dir = tempdir().expect("temp dir should be created");
+        let mut store = CanvasStore::new(temp_dir.path().to_path_buf());
+
+        let session = store
+            .create_session(SessionCreate {
+                title: "Atomic Session".to_string(),
+                description: Some("adoption test".to_string()),
+                tags: Vec::new(),
+            })
+            .expect("session should be created");
+
+        let session_file = temp_dir.path().join(format!("{}.json", session.id));
+        let persisted = std::fs::read_to_string(&session_file).expect("session file should exist");
+        assert!(persisted.contains("Atomic Session"));
+        assert_no_tmp_siblings(temp_dir.path());
+    }
 
     fn build_response(model_id: &str) -> ModelResponse {
         ModelResponse {

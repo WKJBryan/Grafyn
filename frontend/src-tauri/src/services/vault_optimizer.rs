@@ -539,3 +539,45 @@ fn read_overlay_value(store: &KnowledgeStore, note_id: &str) -> Option<Value> {
         .ok()
         .and_then(|content| serde_json::from_str::<Value>(&content).ok())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::note::NoteStatus;
+    use crate::services::atomic_io::assert_no_tmp_siblings;
+    use tempfile::tempdir;
+
+    fn make_note(id: &str, title: &str) -> Note {
+        let now = Utc::now();
+        Note {
+            id: id.to_string(),
+            title: title.to_string(),
+            content: format!("Content of {}", title),
+            relative_path: format!("{}.md", id),
+            aliases: Vec::new(),
+            status: NoteStatus::Draft,
+            tags: Vec::new(),
+            created_at: now,
+            updated_at: now,
+            schema_version: crate::models::note::CURRENT_NOTE_SCHEMA_VERSION,
+            migration_source: None,
+            optimizer_managed: false,
+            wikilinks: Vec::new(),
+            parsed_links: Vec::new(),
+            properties: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn queue_state_writes_are_atomic_with_no_tmp_litter() {
+        let data_dir = tempdir().expect("temp dir should be created");
+        let mut service = VaultOptimizerService::new(data_dir.path().to_path_buf());
+
+        service.bootstrap(&[make_note("note-1", "Optimizer Adoption")]);
+
+        let persisted =
+            std::fs::read_to_string(&service.queue_path).expect("queue.json should exist");
+        assert!(persisted.contains("note-1"));
+        assert_no_tmp_siblings(&service.optimizer_dir);
+    }
+}

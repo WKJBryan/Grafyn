@@ -758,6 +758,29 @@ mod tests {
     }
 
     #[test]
+    fn config_writes_are_atomic_with_no_tmp_litter() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let mut svc = RetrievalService::new(dir.path().to_path_buf());
+
+        svc.update_config(RetrievalConfigUpdate {
+            graph_hop_depth: Some(1),
+            graph_proximity_weight: None,
+            hub_boost_weight: None,
+            hub_threshold: None,
+            base_search_limit: None,
+            default_token_budget: None,
+            chunk_retrieval_enabled: None,
+            relation_weights: None,
+        })
+        .expect("config update should succeed");
+
+        let persisted = std::fs::read_to_string(dir.path().join("retrieval_config.json"))
+            .expect("retrieval_config.json should exist");
+        assert!(persisted.contains("\"graph_hop_depth\": 1"));
+        crate::services::atomic_io::assert_no_tmp_siblings(dir.path());
+    }
+
+    #[test]
     fn test_hub_detection_via_graph() {
         let notes = vec![
             make_note("hub", "Hub Note", vec![]),

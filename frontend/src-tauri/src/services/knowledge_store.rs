@@ -801,3 +801,52 @@ where
     }
     result
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::services::atomic_io::assert_no_tmp_siblings;
+    use tempfile::tempdir;
+
+    #[test]
+    fn note_and_overlay_writes_are_atomic_with_no_tmp_litter() {
+        let vault_dir = tempdir().expect("vault tempdir");
+        let data_dir = tempdir().expect("data tempdir");
+        let mut store = KnowledgeStore::new(
+            vault_dir.path().to_path_buf(),
+            data_dir.path().to_path_buf(),
+        );
+
+        let note = store
+            .create_note(NoteCreate {
+                title: "Atomic Adoption".to_string(),
+                content: "Body content survives the temp+rename write.".to_string(),
+                relative_path: None,
+                aliases: Vec::new(),
+                status: Default::default(),
+                tags: vec!["adoption".to_string()],
+                schema_version: CURRENT_NOTE_SCHEMA_VERSION,
+                migration_source: None,
+                optimizer_managed: false,
+                properties: HashMap::new(),
+            })
+            .expect("note should be created");
+
+        let note_path = vault_dir.path().join(&note.relative_path);
+        let persisted = std::fs::read_to_string(&note_path).expect("note file should exist");
+        assert!(persisted.contains("Atomic Adoption"));
+        assert!(persisted.contains("Body content survives the temp+rename write."));
+        assert_no_tmp_siblings(vault_dir.path());
+
+        store
+            .write_overlay(
+                &note.id,
+                &serde_json::json!({"aliases": ["Adoption Alias"]}),
+            )
+            .expect("overlay should be written");
+        let overlay = std::fs::read_to_string(store.overlay_path(&note.id))
+            .expect("overlay file should exist");
+        assert!(overlay.contains("Adoption Alias"));
+        assert_no_tmp_siblings(&store.overlay_notes_dir);
+    }
+}
