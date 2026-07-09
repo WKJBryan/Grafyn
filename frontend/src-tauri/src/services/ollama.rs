@@ -1,5 +1,6 @@
 use crate::models::canvas::AvailableModel;
 use crate::services::openrouter::ChatMessage;
+use crate::services::utf8_chunk::Utf8ChunkBuffer;
 use anyhow::{Context, Result};
 use futures::StreamExt;
 use reqwest::Client;
@@ -193,31 +194,39 @@ impl OllamaService {
             ));
         }
 
+        // Bytes are decoded via `Utf8ChunkBuffer` rather than
+        // `String::from_utf8_lossy` per network chunk: a multibyte UTF-8
+        // character split across two TCP chunks would otherwise be replaced
+        // with U+FFFD before the continuation bytes ever arrive.
         let byte_stream = Box::pin(response.bytes_stream());
         let stream = futures::stream::unfold(
-            (byte_stream, String::new()),
-            |(mut inner, mut buffer)| async move {
+            (byte_stream, String::new(), Utf8ChunkBuffer::new()),
+            |(mut inner, mut buffer, mut utf8_buffer)| async move {
                 loop {
                     if let Some(pos) = buffer.find('\n') {
                         let line = buffer[..pos].to_string();
                         buffer = buffer[pos + 1..].to_string();
-                        return Some((parse_ollama_line(&line), (inner, buffer)));
+                        return Some((parse_ollama_line(&line), (inner, buffer, utf8_buffer)));
                     }
 
                     match inner.next().await {
                         Some(Ok(bytes)) => {
-                            buffer.push_str(&String::from_utf8_lossy(&bytes));
+                            buffer.push_str(&utf8_buffer.push(&bytes));
                         }
                         Some(Err(error)) => {
                             return Some((
                                 Err(anyhow::anyhow!("Ollama stream error: {}", error)),
-                                (inner, buffer),
+                                (inner, buffer, utf8_buffer),
                             ));
                         }
                         None => {
+                            buffer.push_str(&utf8_buffer.flush());
                             if !buffer.trim().is_empty() {
                                 let remaining = std::mem::take(&mut buffer);
-                                return Some((parse_ollama_line(&remaining), (inner, buffer)));
+                                return Some((
+                                    parse_ollama_line(&remaining),
+                                    (inner, buffer, utf8_buffer),
+                                ));
                             }
                             return None;
                         }
