@@ -69,7 +69,7 @@ The first usable twin mode is a **native RAG twin**:
 - Stream responses in parallel.
 - Branch from model responses.
 - Debate mode for model critique and synthesis.
-- Semantic note context from the vault.
+- Graph-aware note context from the vault (Tantivy keyword search + link-graph boosts, not embedding-based retrieval).
 - Twin context mode using reviewed user records.
 - Smart web search detection for prompts that need current information.
 - Save Canvas sessions as notes.
@@ -178,11 +178,11 @@ Grafyn's data can later support stronger personal models, but those are not v1:
 |------|--------|
 | Knowledge vault (notes, wikilinks, full-text search) | ✅ Stable |
 | Knowledge graph + topic hub clustering | ✅ Stable |
-| Multi-LLM Canvas with semantic note context | ✅ Stable |
+| Multi-LLM Canvas with graph-aware note context | ✅ Stable |
 | Conversation import (ChatGPT, Claude, Grok, Gemini) | ✅ Stable |
-| Native RAG twin (Advisor + Simulation modes) | ✅ Stable |
-| Twin Identity, Constitution, Decision Mirror | ✅ Stable |
-| Twin evidence capture and review dashboard | ✅ Stable |
+| Native RAG twin (Advisor + Simulation modes) | 🧪 Experimental |
+| Twin Identity, Constitution, Decision Mirror | 🧪 Experimental |
+| Twin evidence capture and review dashboard | 🧪 Experimental |
 | Local model support via Ollama | ✅ Stable |
 | Background link discovery | ✅ Stable |
 | Vault Optimizer (background vault improvements) | ✅ Stable |
@@ -190,6 +190,8 @@ Grafyn's data can later support stronger personal models, but those are not v1:
 | MCP server (`grafyn-mcp`) for Claude Desktop / Codex Desktop | ✅ Stable |
 | Preference / ranking model from export bundles | 🔲 Not started |
 | Local adapters or fine-tuning from reviewed evidence | 🔲 Not started |
+
+Twin data capture and export are dependable today; the accuracy machinery that would make twin answers trustworthy — semantic (embedding-based) retrieval, temporal validity, and calibrated confidence — is roadmap work tracked in [TWIN_ACCURACY_ROADMAP.md](TWIN_ACCURACY_ROADMAP.md).
 
 Current version: see [Releases](https://github.com/WKJBryan/Grafyn/releases/latest).
 
@@ -329,7 +331,13 @@ npm run prepare:sidecar
 # Rust tests
 cd frontend/src-tauri
 cargo test
+
+# E2E (Playwright) — manual only, not run in CI
+npm run tauri:dev        # in one terminal, leave running (provides the Tauri IPC backend)
+cd frontend && npm run e2e   # in another terminal
 ```
+
+The `e2e/` Playwright suite is **not** wired into CI. Its specs call `invoke()` for note CRUD, canvas, etc., which needs a live Tauri IPC backend; a plain Vite dev server in a headless CI browser has no IPC handler, so the app's boot sequence gets stuck in a `failed` phase and most interactive specs time out (confirmed by a manual run of one spec file — only the static-layout tests pass). CI cannot cheaply provide the built/dev Tauri desktop app, so the suite is run manually via `npm run tauri:dev` + `npm run e2e`. See `e2e/README.md` for details.
 
 Known test noise:
 
