@@ -28,24 +28,48 @@ impl Utf8ChunkBuffer {
     /// Push newly received bytes and return as much valid UTF-8 text as can
     /// be decoded so far. Any trailing incomplete multi-byte sequence is
     /// retained and prepended to the next `push` call.
+    ///
+    /// Truly-malformed bytes (e.g. 0xFF, or a broken continuation sequence,
+    /// where `Utf8Error::error_len()` is `Some(n)`) are replaced with a
+    /// single U+FFFD each and decoding continues past them — otherwise a bad
+    /// byte at the front of the buffer would never be consumed and would pin
+    /// the buffer forever, stalling all subsequent output while the raw
+    /// bytes accumulate unbounded until end-of-stream.
     pub fn push(&mut self, bytes: &[u8]) -> String {
         self.pending.extend_from_slice(bytes);
 
-        match std::str::from_utf8(&self.pending) {
-            Ok(text) => {
-                let text = text.to_string();
-                self.pending.clear();
-                text
-            }
-            Err(error) => {
-                let valid_up_to = error.valid_up_to();
-                // Bytes [0, valid_up_to) are guaranteed valid UTF-8 by the
-                // error itself, so this cannot panic.
-                let text = std::str::from_utf8(&self.pending[..valid_up_to])
-                    .expect("bytes up to valid_up_to are valid UTF-8")
-                    .to_string();
-                self.pending.drain(..valid_up_to);
-                text
+        let mut output = String::new();
+        loop {
+            match std::str::from_utf8(&self.pending) {
+                Ok(text) => {
+                    output.push_str(text);
+                    self.pending.clear();
+                    return output;
+                }
+                Err(error) => {
+                    let valid_up_to = error.valid_up_to();
+                    // Bytes [0, valid_up_to) are guaranteed valid UTF-8 by
+                    // the error itself, so this cannot panic.
+                    output.push_str(
+                        std::str::from_utf8(&self.pending[..valid_up_to])
+                            .expect("bytes up to valid_up_to are valid UTF-8"),
+                    );
+
+                    match error.error_len() {
+                        // Definitively malformed sequence of `n` bytes:
+                        // replace it and keep decoding the remainder.
+                        Some(invalid_len) => {
+                            output.push('\u{FFFD}');
+                            self.pending.drain(..valid_up_to + invalid_len);
+                        }
+                        // Incomplete trailing sequence: might be completed
+                        // by the next network chunk, so carry it over.
+                        None => {
+                            self.pending.drain(..valid_up_to);
+                            return output;
+                        }
+                    }
+                }
             }
         }
     }
@@ -126,5 +150,50 @@ mod tests {
         buf.push(&[0xE6, 0x97]); // first two bytes of "日", never completed
         let flushed = buf.flush();
         assert!(flushed.contains('\u{FFFD}'));
+    }
+
+    #[test]
+    fn malformed_byte_mid_stream_yields_replacement_and_decoding_continues() {
+        // E6 97 = truncated "日" (invalid: interrupted by a non-continuation
+        // byte), FF = never valid in UTF-8, E5 A5 BD = "好". The malformed
+        // prefix must become replacement char(s) and decoding must continue
+        // within the same push — the valid "好" must come through.
+        let mut buf = Utf8ChunkBuffer::new();
+        let out = buf.push(&[0xE6, 0x97, 0xFF, 0xE5, 0xA5, 0xBD]);
+        assert!(
+            out.contains('好'),
+            "decoding must continue past malformed bytes, got {:?}",
+            out
+        );
+        assert!(
+            out.contains('\u{FFFD}'),
+            "malformed bytes must yield a replacement char, got {:?}",
+            out
+        );
+        assert_eq!(
+            buf.flush(),
+            "",
+            "nothing should remain pinned in the buffer"
+        );
+    }
+
+    #[test]
+    fn lone_invalid_byte_does_not_stall_subsequent_pushes() {
+        // A truly-malformed byte (0xFF) at the front of the buffer must not
+        // pin it: later valid pushes must flow through immediately instead of
+        // accumulating unbounded until flush.
+        let mut buf = Utf8ChunkBuffer::new();
+        let first = buf.push(&[0xFF]);
+        assert_eq!(first, "\u{FFFD}", "invalid byte must be consumed as U+FFFD");
+
+        let second = buf.push(b"hello");
+        assert_eq!(
+            second, "hello",
+            "valid ASCII must not be held hostage by a prior bad byte"
+        );
+
+        let third = buf.push(b" world");
+        assert_eq!(third, " world");
+        assert_eq!(buf.flush(), "");
     }
 }
