@@ -8,7 +8,7 @@ use crate::models::note::{
     PROP_INFERRED_LINK_IDS, PROP_TOPIC_ALIASES, PROP_TOPIC_KEY,
 };
 use crate::services::atomic_io::write_atomic;
-use crate::services::knowledge_store::KnowledgeStore;
+use crate::services::knowledge_store::{alias_candidates, KnowledgeStore};
 use crate::services::topic_hub::normalize_topic_key;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -588,13 +588,6 @@ impl MarkdownMigrationService {
         let mut updated_ids = Vec::new();
         let notes = store.list_full_notes()?;
         for note in notes {
-            if note.schema_version >= CURRENT_NOTE_SCHEMA_VERSION
-                && note.migration_source.is_some()
-                && !note.aliases.is_empty()
-            {
-                continue;
-            }
-
             // The note's original frontmatter failed to parse and is being preserved
             // verbatim (see `Note::frontmatter_raw_fallback`). Backfilling here would
             // explicitly set frontmatter-backed fields (aliases/schema_version/
@@ -609,7 +602,51 @@ impl MarkdownMigrationService {
                 continue;
             }
 
-            let updated = store.update_note(
+            // `note.aliases` is *always* the union of the raw frontmatter aliases plus
+            // recomputed candidates (see `KnowledgeStore::read_note_file`), whether or
+            // not that union has ever been persisted to disk. That makes `!aliases
+            // .is_empty()` a broken proxy for "already backfilled": for a note whose
+            // title matches its filename (a single word, e.g. "Foo" / "foo.md"),
+            // `alias_candidates` always returns zero candidates, so `aliases` stays
+            // empty forever and the old check `!note.aliases.is_empty()` could never
+            // be satisfied — the note was rewritten (and `updated_at` bumped) on every
+            // single boot. Recompute the candidates directly: if there are none, there
+            // is nothing this pass could ever add via aliases, so that requirement is
+            // vacuously satisfied instead of blocking the skip forever.
+            let file_stem = Path::new(&note.relative_path)
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .unwrap_or(note.relative_path.as_str());
+            let has_alias_candidates = !alias_candidates(&note.title, file_stem).is_empty();
+
+            let target_migration_source = note
+                .migration_source
+                .clone()
+                .unwrap_or_else(|| MIGRATION_SOURCE_BACKFILL.to_string());
+            let target_optimizer_managed = note.optimizer_managed || note.is_topic_hub();
+
+            let already_processed = note.schema_version >= CURRENT_NOTE_SCHEMA_VERSION
+                && note.migration_source.is_some()
+                && (!has_alias_candidates || !note.aliases.is_empty());
+
+            if already_processed {
+                continue;
+            }
+
+            // Belt-and-suspenders: only write if the computed update would actually
+            // change something on disk. This keeps a fully up-to-date vault at zero
+            // writes per boot (guarding against the O(N^2) `refresh_cache` cost of a
+            // spurious `update_note` call on every note, every launch) even if the
+            // `already_processed` heuristic above is ever wrong for some edge case.
+            let would_change = note.schema_version < CURRENT_NOTE_SCHEMA_VERSION
+                || note.migration_source.is_none()
+                || note.optimizer_managed != target_optimizer_managed;
+
+            if !would_change {
+                continue;
+            }
+
+            let updated = store.update_note_preserving_timestamp(
                 &note.id,
                 NoteUpdate {
                     title: None,
@@ -619,8 +656,8 @@ impl MarkdownMigrationService {
                     status: None,
                     tags: None,
                     schema_version: Some(CURRENT_NOTE_SCHEMA_VERSION),
-                    migration_source: Some(MIGRATION_SOURCE_BACKFILL.to_string()),
-                    optimizer_managed: Some(note.optimizer_managed || note.is_topic_hub()),
+                    migration_source: Some(target_migration_source),
+                    optimizer_managed: Some(target_optimizer_managed),
                     properties: Some(note.properties.clone()),
                 },
             )?;
@@ -1292,6 +1329,247 @@ mod tests {
         assert!(
             result.is_err(),
             "rollback must surface an error (not panic) when a backup file is missing"
+        );
+    }
+
+    /// Reads a note file's mtime + full byte content, for before/after comparisons.
+    fn snapshot(path: &Path) -> (std::time::SystemTime, Vec<u8>) {
+        let metadata = std::fs::metadata(path).expect("note file should exist");
+        let modified = metadata.modified().expect("mtime should be readable");
+        let bytes = std::fs::read(path).expect("note file should be readable");
+        (modified, bytes)
+    }
+
+    #[test]
+    fn backfill_is_idempotent_for_single_word_title_notes() {
+        // A single-word title matching its filename (e.g. "Foo" / "foo.md") makes
+        // `alias_candidates` return zero candidates forever (see
+        // `knowledge_store::alias_candidates`). The pre-fix skip condition required
+        // `!note.aliases.is_empty()`, which such a note can never satisfy, so it was
+        // rewritten (and `updated_at` bumped) on every single boot.
+        let vault_dir = tempdir().expect("vault tempdir");
+        let data_dir = tempdir().expect("data tempdir");
+        let mut store = KnowledgeStore::new(
+            vault_dir.path().to_path_buf(),
+            data_dir.path().to_path_buf(),
+        );
+
+        let note = store
+            .create_note(NoteCreate {
+                title: "Foo".to_string(),
+                content: "Single-word-title body.".to_string(),
+                relative_path: None,
+                aliases: Vec::new(),
+                status: Default::default(),
+                tags: Vec::new(),
+                schema_version: 1,
+                migration_source: None,
+                optimizer_managed: false,
+                properties: HashMap::new(),
+            })
+            .expect("note should be created");
+        let note_path = vault_dir.path().join(&note.relative_path);
+
+        let service = MarkdownMigrationService::new(data_dir.path().to_path_buf());
+
+        // First run: migration_source is None, so this note is legitimately touched
+        // once to record schema/provenance bookkeeping.
+        let first_pass = service
+            .backfill_legacy_grafyn_notes(&mut store)
+            .expect("first backfill pass should succeed");
+        assert!(
+            first_pass.contains(&note.id),
+            "first pass should backfill provenance for a never-migrated note"
+        );
+
+        // Give the filesystem a chance to distinguish mtimes if a second write occurs.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let after_first = snapshot(&note_path);
+
+        let second_pass = service
+            .backfill_legacy_grafyn_notes(&mut store)
+            .expect("second backfill pass should succeed");
+        assert!(
+            second_pass.is_empty(),
+            "second pass must not touch an already-backfilled note with zero alias candidates, got: {second_pass:?}"
+        );
+
+        let after_second = snapshot(&note_path);
+        assert_eq!(
+            after_first.1, after_second.1,
+            "note content must be byte-identical after a no-op second pass"
+        );
+        assert_eq!(
+            after_first.0, after_second.0,
+            "note mtime (and therefore frontmatter `updated_at`) must be unchanged by a no-op second pass"
+        );
+    }
+
+    #[test]
+    fn backfill_does_not_rewrite_an_already_processed_note_on_the_first_pass() {
+        // If a single-word-title note is *already* fully processed (schema current,
+        // migration_source recorded, optimizer flag correct) there is genuinely
+        // nothing left to backfill — zero candidates, zero diffs — so even the very
+        // first pass over it must be a no-op write.
+        let vault_dir = tempdir().expect("vault tempdir");
+        let data_dir = tempdir().expect("data tempdir");
+        let mut store = KnowledgeStore::new(
+            vault_dir.path().to_path_buf(),
+            data_dir.path().to_path_buf(),
+        );
+
+        let note = store
+            .create_note(NoteCreate {
+                title: "Foo".to_string(),
+                content: "Already processed body.".to_string(),
+                relative_path: None,
+                aliases: Vec::new(),
+                status: Default::default(),
+                tags: Vec::new(),
+                schema_version: CURRENT_NOTE_SCHEMA_VERSION,
+                migration_source: Some("markdown_migration".to_string()),
+                optimizer_managed: false,
+                properties: HashMap::new(),
+            })
+            .expect("note should be created");
+        let note_path = vault_dir.path().join(&note.relative_path);
+        let before = snapshot(&note_path);
+
+        let service = MarkdownMigrationService::new(data_dir.path().to_path_buf());
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let updated_ids = service
+            .backfill_legacy_grafyn_notes(&mut store)
+            .expect("backfill should succeed");
+
+        assert!(
+            updated_ids.is_empty(),
+            "an already-processed note must not be touched, got: {updated_ids:?}"
+        );
+        let after = snapshot(&note_path);
+        assert_eq!(before.1, after.1, "content must be untouched");
+        assert_eq!(before.0, after.0, "mtime must be untouched");
+    }
+
+    #[test]
+    fn backfill_does_zero_writes_on_a_second_pass_over_a_mixed_vault() {
+        // Guards the O(N^2) boot cost: once a vault has been backfilled, a second
+        // pass (e.g. the next app launch) must touch nothing at all, whether note
+        // titles are single-word (zero alias candidates) or multi-word (non-empty
+        // alias candidates).
+        let vault_dir = tempdir().expect("vault tempdir");
+        let data_dir = tempdir().expect("data tempdir");
+        let mut store = KnowledgeStore::new(
+            vault_dir.path().to_path_buf(),
+            data_dir.path().to_path_buf(),
+        );
+
+        let single_word = store
+            .create_note(NoteCreate {
+                title: "Foo".to_string(),
+                content: "Single word title.".to_string(),
+                relative_path: None,
+                aliases: Vec::new(),
+                status: Default::default(),
+                tags: Vec::new(),
+                schema_version: 1,
+                migration_source: None,
+                optimizer_managed: false,
+                properties: HashMap::new(),
+            })
+            .expect("single-word note should be created");
+        let multi_word = store
+            .create_note(NoteCreate {
+                title: "Multi Word Title".to_string(),
+                content: "Multi word title body.".to_string(),
+                relative_path: None,
+                aliases: Vec::new(),
+                status: Default::default(),
+                tags: Vec::new(),
+                schema_version: 1,
+                migration_source: None,
+                optimizer_managed: false,
+                properties: HashMap::new(),
+            })
+            .expect("multi-word note should be created");
+
+        let single_path = vault_dir.path().join(&single_word.relative_path);
+        let multi_path = vault_dir.path().join(&multi_word.relative_path);
+
+        let service = MarkdownMigrationService::new(data_dir.path().to_path_buf());
+        let first_pass = service
+            .backfill_legacy_grafyn_notes(&mut store)
+            .expect("first backfill pass should succeed");
+        assert_eq!(
+            first_pass.len(),
+            2,
+            "first pass should backfill both never-migrated notes, got: {first_pass:?}"
+        );
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let single_before = snapshot(&single_path);
+        let multi_before = snapshot(&multi_path);
+
+        let second_pass = service
+            .backfill_legacy_grafyn_notes(&mut store)
+            .expect("second backfill pass should succeed");
+        assert!(
+            second_pass.is_empty(),
+            "second pass over an already-backfilled vault must touch zero notes, got: {second_pass:?}"
+        );
+
+        let single_after = snapshot(&single_path);
+        let multi_after = snapshot(&multi_path);
+        assert_eq!(
+            single_before, single_after,
+            "single-word note must be untouched"
+        );
+        assert_eq!(
+            multi_before, multi_after,
+            "multi-word note must be untouched"
+        );
+    }
+
+    #[test]
+    fn backfill_skips_notes_with_unparsable_frontmatter() {
+        // Task 1.6 regression guard: notes carrying a raw-frontmatter fallback
+        // (`Note::frontmatter_raw_fallback`) must never be rewritten by boot
+        // backfill — doing so would silently clear the fallback and destroy the
+        // original unparsable YAML.
+        let vault_dir = tempdir().expect("vault tempdir");
+        let data_dir = tempdir().expect("data tempdir");
+
+        let malformed_path = vault_dir.path().join("broken.md");
+        std::fs::write(
+            &malformed_path,
+            "---\ntitle: Broken Note\ntags:\n\t- alpha\n---\n\nBroken body.",
+        )
+        .expect("malformed note file should be written");
+        let before = snapshot(&malformed_path);
+
+        let mut store = KnowledgeStore::new(
+            vault_dir.path().to_path_buf(),
+            data_dir.path().to_path_buf(),
+        );
+        let broken_id = store
+            .find_note_by_relative_path("broken.md")
+            .expect("lookup should not error")
+            .expect("malformed note should be readable")
+            .id;
+
+        let service = MarkdownMigrationService::new(data_dir.path().to_path_buf());
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let updated_ids = service
+            .backfill_legacy_grafyn_notes(&mut store)
+            .expect("backfill should succeed");
+
+        assert!(
+            !updated_ids.contains(&broken_id),
+            "fallback note must not be counted as backfilled"
+        );
+        let after = snapshot(&malformed_path);
+        assert_eq!(
+            before, after,
+            "fallback note's file must remain byte-identical after backfill"
         );
     }
 }

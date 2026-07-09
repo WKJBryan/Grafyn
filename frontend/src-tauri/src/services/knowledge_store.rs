@@ -235,6 +235,21 @@ impl KnowledgeStore {
     }
 
     pub fn update_note(&mut self, id: &str, update: NoteUpdate) -> Result<Note> {
+        self.update_note_with_options(id, update, true)
+    }
+
+    /// Same as `update_note`, but when `bump_updated_at` is false the note's existing
+    /// `updated_at` is preserved instead of being stamped with `Utc::now()`. Used by
+    /// `update_note_preserving_timestamp` (below) for the boot-time schema backfill
+    /// (`markdown_migration::backfill_legacy_grafyn_notes`), so a purely administrative
+    /// write (schema_version/migration_source bookkeeping) doesn't skew recency-based
+    /// ranking on every app launch.
+    fn update_note_with_options(
+        &mut self,
+        id: &str,
+        update: NoteUpdate,
+        bump_updated_at: bool,
+    ) -> Result<Note> {
         Self::validate_note_id(id)?;
         let mut note = self.get_note(id)?;
         let old_path = self.note_path(id)?;
@@ -290,7 +305,9 @@ impl KnowledgeStore {
             note.frontmatter_raw_fallback = None;
         }
 
-        note.updated_at = Utc::now();
+        if bump_updated_at {
+            note.updated_at = Utc::now();
+        }
         note.wikilinks = self.extract_wikilinks(&note.content);
         note.parsed_links = self.extract_links(&note.content, &note.relative_path);
 
@@ -307,6 +324,17 @@ impl KnowledgeStore {
 
         self.refresh_cache();
         self.get_note(&note.id)
+    }
+
+    /// Administrative variant of `update_note` that preserves the note's existing
+    /// `updated_at` timestamp. See `backfill_legacy_grafyn_notes` for the motivating
+    /// case: schema/provenance bookkeeping writes should not bump recency ranking.
+    pub(crate) fn update_note_preserving_timestamp(
+        &mut self,
+        id: &str,
+        update: NoteUpdate,
+    ) -> Result<Note> {
+        self.update_note_with_options(id, update, false)
     }
 
     pub fn delete_note(&mut self, id: &str) -> Result<()> {
@@ -897,7 +925,7 @@ fn humanize_filename(value: &str) -> String {
         .join(" ")
 }
 
-fn alias_candidates(title: &str, file_stem: &str) -> Vec<String> {
+pub(crate) fn alias_candidates(title: &str, file_stem: &str) -> Vec<String> {
     let mut candidates = Vec::new();
     let humanized = humanize_filename(file_stem);
     if !humanized.trim().is_empty() && !humanized.eq_ignore_ascii_case(title.trim()) {
