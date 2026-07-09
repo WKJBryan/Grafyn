@@ -561,10 +561,26 @@ pub async fn send_prompt(
         }
 
         // Batch update store with all results in a single write
-        {
+        let persistence_ok = {
             let mut store = canvas_store_arc.write().await;
-            let _ = store.batch_update_tile_responses(&session_id_clone, &tile_id_clone, &results);
-        }
+            match store.batch_update_tile_responses(&session_id_clone, &tile_id_clone, &results) {
+                Ok(()) => true,
+                Err(error) => {
+                    let model_ids: Vec<String> = results
+                        .iter()
+                        .map(|(model_id, _, _, _)| model_id.clone())
+                        .collect();
+                    emit_persistence_error(
+                        &window,
+                        &session_id_clone,
+                        &tile_id_clone,
+                        &model_ids,
+                        &error,
+                    );
+                    false
+                }
+            }
+        };
 
         append_model_result_traces(
             twin_store_arc.clone(),
@@ -597,13 +613,18 @@ pub async fn send_prompt(
             }
         }
 
-        // Emit session saved after all models complete
-        let _ = window.emit(
-            "canvas-stream",
-            CanvasStreamEvent::SessionSaved {
-                session_id: session_id_clone,
-            },
-        );
+        // Emit session saved after all models complete — but only if the
+        // batch persist above actually succeeded. If it failed, per-model
+        // Error events were already emitted and the frontend must not
+        // believe the (in-memory only) responses were saved to disk.
+        if persistence_ok {
+            let _ = window.emit(
+                "canvas-stream",
+                CanvasStreamEvent::SessionSaved {
+                    session_id: session_id_clone,
+                },
+            );
+        }
     });
 
     // Sealed twin prediction: one hidden, non-streaming call per decision
@@ -1192,27 +1213,66 @@ pub async fn start_debate(
             };
             debate_state.rounds.push(round);
 
-            // Persist after each round
-            {
+            // Persist after each round. If this fails, surface it instead of
+            // silently continuing to stream rounds that will never survive a
+            // session reopen.
+            let round_persisted = {
                 let mut store = canvas_store_arc.write().await;
-                let _ = store.update_debate(&session_id_clone, &debate_state);
+                match store.update_debate(&session_id_clone, &debate_state) {
+                    Ok(()) => true,
+                    Err(error) => {
+                        emit_debate_persist_error(
+                            &window,
+                            &session_id_clone,
+                            &debate_id_clone,
+                            round_num,
+                            &debate_state,
+                            &error,
+                        );
+                        false
+                    }
+                }
+            };
+
+            if !round_persisted {
+                return;
             }
         }
 
         // Mark debate as complete
         debate_state.status = "completed".to_string();
-        {
+        let final_round_number = debate_state
+            .rounds
+            .last()
+            .map(|round| round.round_number)
+            .unwrap_or(max_rounds);
+        let completion_persisted = {
             let mut store = canvas_store_arc.write().await;
-            let _ = store.update_debate(&session_id_clone, &debate_state);
-        }
+            match store.update_debate(&session_id_clone, &debate_state) {
+                Ok(()) => true,
+                Err(error) => {
+                    emit_debate_persist_error(
+                        &window,
+                        &session_id_clone,
+                        &debate_id_clone,
+                        final_round_number,
+                        &debate_state,
+                        &error,
+                    );
+                    false
+                }
+            }
+        };
 
-        let _ = window.emit(
-            "canvas-stream",
-            CanvasStreamEvent::DebateComplete {
-                session_id: session_id_clone,
-                debate_id: debate_id_clone,
-            },
-        );
+        if completion_persisted {
+            let _ = window.emit(
+                "canvas-stream",
+                CanvasStreamEvent::DebateComplete {
+                    session_id: session_id_clone,
+                    debate_id: debate_id_clone,
+                },
+            );
+        }
     });
 
     Ok(debate_id)
@@ -1488,18 +1548,33 @@ pub async fn continue_debate(
         };
         debate_state.rounds.push(round);
 
-        {
+        let persisted = {
             let mut store = canvas_store_arc.write().await;
-            let _ = store.update_debate(&session_id, &debate_state);
-        }
+            match store.update_debate(&session_id, &debate_state) {
+                Ok(()) => true,
+                Err(error) => {
+                    emit_debate_persist_error(
+                        &window,
+                        &session_id,
+                        &debate_id,
+                        round_num,
+                        &debate_state,
+                        &error,
+                    );
+                    false
+                }
+            }
+        };
 
-        let _ = window.emit(
-            "canvas-stream",
-            CanvasStreamEvent::DebateComplete {
-                session_id,
-                debate_id,
-            },
-        );
+        if persisted {
+            let _ = window.emit(
+                "canvas-stream",
+                CanvasStreamEvent::DebateComplete {
+                    session_id,
+                    debate_id,
+                },
+            );
+        }
     });
 
     Ok(())
@@ -1739,10 +1814,20 @@ pub async fn add_models_to_tile(
         }
 
         // Batch update store
-        {
+        let persistence_ok = {
             let mut store = canvas_store_arc.write().await;
-            let _ = store.batch_update_tile_responses(&session_id, &tile_id, &results);
-        }
+            match store.batch_update_tile_responses(&session_id, &tile_id, &results) {
+                Ok(()) => true,
+                Err(error) => {
+                    let model_ids: Vec<String> = results
+                        .iter()
+                        .map(|(model_id, _, _, _)| model_id.clone())
+                        .collect();
+                    emit_persistence_error(&window, &session_id, &tile_id, &model_ids, &error);
+                    false
+                }
+            }
+        };
 
         append_canvas_trace(
             twin_store_arc.clone(),
@@ -1763,10 +1848,12 @@ pub async fn add_models_to_tile(
         )
         .await;
 
-        let _ = window.emit(
-            "canvas-stream",
-            CanvasStreamEvent::SessionSaved { session_id },
-        );
+        if persistence_ok {
+            let _ = window.emit(
+                "canvas-stream",
+                CanvasStreamEvent::SessionSaved { session_id },
+            );
+        }
     });
 
     Ok(())
@@ -1877,15 +1964,17 @@ pub async fn regenerate_response(
             }
         };
 
+        let mut persistence_ok = true;
+
         match stream_result {
             Ok(stream) => {
                 let mut stream = stream;
                 let mut full_content = String::new();
                 let mut final_error: Option<String> = None;
 
-                while let Some(chunk_result) = stream.next().await {
-                    match chunk_result {
-                        Ok(chunk) => {
+                loop {
+                    match tokio::time::timeout(Duration::from_secs(60), stream.next()).await {
+                        Ok(Some(Ok(chunk))) => {
                             if !chunk.is_empty() {
                                 full_content.push_str(&chunk);
                                 let _ = window.emit(
@@ -1899,8 +1988,15 @@ pub async fn regenerate_response(
                                 );
                             }
                         }
-                        Err(e) => {
+                        Ok(Some(Err(e))) => {
                             let error = e.to_string();
+                            emit_canvas_error(&window, &session_id, &tile_id, &model_id, &error);
+                            final_error = Some(error);
+                            break;
+                        }
+                        Ok(None) => break, // Stream ended naturally
+                        Err(_) => {
+                            let error = "Stream idle timeout (60s)".to_string();
                             emit_canvas_error(&window, &session_id, &tile_id, &model_id, &error);
                             final_error = Some(error);
                             break;
@@ -1924,14 +2020,23 @@ pub async fn regenerate_response(
 
                 {
                     let mut store = canvas_store_arc.write().await;
-                    let _ = store.update_tile_response(
+                    if let Err(persist_error) = store.update_tile_response(
                         &session_id,
                         &tile_id,
                         &model_id,
                         &final_content,
                         final_status.clone(),
                         final_error.as_deref(),
-                    );
+                    ) {
+                        emit_persistence_error(
+                            &window,
+                            &session_id,
+                            &tile_id,
+                            std::slice::from_ref(&model_id),
+                            &persist_error,
+                        );
+                        persistence_ok = false;
+                    }
                 }
 
                 append_canvas_trace(
@@ -1952,14 +2057,23 @@ pub async fn regenerate_response(
                 let error = e.to_string();
                 {
                     let mut store = canvas_store_arc.write().await;
-                    let _ = store.update_tile_response(
+                    if let Err(persist_error) = store.update_tile_response(
                         &session_id,
                         &tile_id,
                         &model_id,
                         "",
                         ResponseStatus::Error,
                         Some(error.as_str()),
-                    );
+                    ) {
+                        emit_persistence_error(
+                            &window,
+                            &session_id,
+                            &tile_id,
+                            std::slice::from_ref(&model_id),
+                            &persist_error,
+                        );
+                        persistence_ok = false;
+                    }
                 }
                 emit_canvas_error(&window, &session_id, &tile_id, &model_id, &error);
                 append_canvas_trace(
@@ -1978,10 +2092,12 @@ pub async fn regenerate_response(
             }
         }
 
-        let _ = window.emit(
-            "canvas-stream",
-            CanvasStreamEvent::SessionSaved { session_id },
-        );
+        if persistence_ok {
+            let _ = window.emit(
+                "canvas-stream",
+                CanvasStreamEvent::SessionSaved { session_id },
+            );
+        }
     });
 
     Ok(())
@@ -2148,6 +2264,88 @@ fn emit_canvas_error(
             error: error.to_string(),
         },
     );
+}
+
+/// Emit an Error event for every model whose response was streamed
+/// successfully but then failed to persist to the session file (disk full,
+/// file locked, etc.). Without this, the frontend has already rendered a
+/// complete response, `SessionSaved` would otherwise still fire, and the
+/// content silently reverts to an empty Pending stub the next time the
+/// session is reopened — with no error anywhere in the UI.
+fn emit_persistence_error(
+    window: &tauri::Window,
+    session_id: &str,
+    tile_id: &str,
+    model_ids: &[String],
+    error: &anyhow::Error,
+) {
+    log::error!(
+        "Failed to persist canvas tile '{}' responses for session '{}': {}",
+        tile_id,
+        session_id,
+        error
+    );
+
+    let message = format!("Failed to save response: {}", error);
+    for model_id in model_ids {
+        emit_canvas_error(window, session_id, tile_id, model_id, &message);
+    }
+}
+
+/// Same contract as `emit_persistence_error` but for debate rounds, which
+/// don't have a single tile/model — a round can involve several models at
+/// once. Emits a `DebateError` per participating model in the round that
+/// failed to persist so the frontend has something concrete to render.
+fn emit_debate_persist_error(
+    window: &tauri::Window,
+    session_id: &str,
+    debate_id: &str,
+    round_number: u32,
+    debate_state: &Debate,
+    error: &anyhow::Error,
+) {
+    log::error!(
+        "Failed to persist debate '{}' round {} for session '{}': {}",
+        debate_id,
+        round_number,
+        session_id,
+        error
+    );
+
+    let model_ids: Vec<String> = debate_state
+        .rounds
+        .last()
+        .map(|round| round.responses.iter().map(|r| r.model_id.clone()).collect())
+        .unwrap_or_default();
+
+    let message = format!("Failed to save debate round: {}", error);
+
+    if model_ids.is_empty() {
+        let _ = window.emit(
+            "canvas-stream",
+            CanvasStreamEvent::DebateError {
+                session_id: session_id.to_string(),
+                debate_id: debate_id.to_string(),
+                model_id: "system".to_string(),
+                error: message,
+                round_number,
+            },
+        );
+        return;
+    }
+
+    for model_id in model_ids {
+        let _ = window.emit(
+            "canvas-stream",
+            CanvasStreamEvent::DebateError {
+                session_id: session_id.to_string(),
+                debate_id: debate_id.to_string(),
+                model_id,
+                error: message.clone(),
+                round_number,
+            },
+        );
+    }
 }
 
 fn emit_canvas_complete(window: &tauri::Window, session_id: &str, tile_id: &str, model_id: &str) {
