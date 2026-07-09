@@ -262,7 +262,11 @@ impl MarkdownMigrationService {
             }
 
             let note = store.get_note(&proposal.note_id)?;
-            self.backup_note(&run_dir, &preview.vault_path, &note.relative_path)?;
+            if self.backup_note(&run_dir, &preview.vault_path, &note.relative_path)?
+                && !manifest.backup_files.contains(&note.relative_path)
+            {
+                manifest.backup_files.push(note.relative_path.clone());
+            }
             let mut properties = note.properties.clone();
 
             if let Some(topic_key) = &proposal.topic_key {
@@ -438,42 +442,99 @@ impl MarkdownMigrationService {
 
     pub fn rollback(&self, run_id: &str, store: &mut KnowledgeStore) -> Result<()> {
         let manifest = self.load_manifest(run_id)?;
+
+        // Guard against ever reporting a no-op rollback as success. `touched_note_ids` is
+        // populated in `apply()` for every note that went through the backup+rewrite path
+        // (Hybrid/FullRewrite modes), so a manifest that recorded touched notes but has no
+        // backups is either corrupt or — as was the case for the historical bug this fix
+        // closes — was written by pre-fix code that never persisted `backup_files` at all.
+        // Either way, there is nothing safe to restore; refuse rather than silently
+        // "succeeding" at doing nothing.
+        if manifest.backup_files.is_empty() && !manifest.touched_note_ids.is_empty() {
+            anyhow::bail!(
+                "Refusing to report rollback success for run '{}': manifest recorded {} rewritten note(s) but no backup files were captured. This run's backups cannot be restored automatically; check for an external vault backup.",
+                run_id,
+                manifest.touched_note_ids.len()
+            );
+        }
+
         let vault_path = PathBuf::from(&manifest.vault_path);
         let run_dir = self.runs_dir.join(run_id);
         let backups_dir = run_dir.join("backups");
 
+        let mut failures = Vec::new();
+
         for relative_path in &manifest.backup_files {
             let backup_path = backups_dir.join(relative_path);
             let target_path = vault_path.join(relative_path);
-            if let Some(parent) = target_path.parent() {
-                std::fs::create_dir_all(parent)?;
+            if !backup_path.exists() {
+                failures.push(format!(
+                    "backup file missing for '{}' (expected at '{}')",
+                    relative_path,
+                    backup_path.display()
+                ));
+                continue;
             }
-            std::fs::copy(&backup_path, &target_path).with_context(|| {
-                format!(
-                    "Failed to restore backup '{}' -> '{}'",
+            if let Some(parent) = target_path.parent() {
+                if let Err(error) = std::fs::create_dir_all(parent) {
+                    failures.push(format!(
+                        "failed to create parent directory for '{}': {}",
+                        relative_path, error
+                    ));
+                    continue;
+                }
+            }
+            if let Err(error) = std::fs::copy(&backup_path, &target_path) {
+                failures.push(format!(
+                    "failed to restore '{}' -> '{}': {}",
                     backup_path.display(),
-                    target_path.display()
-                )
-            })?;
+                    target_path.display(),
+                    error
+                ));
+            }
         }
 
         for relative_path in &manifest.created_files {
             let target_path = vault_path.join(relative_path);
             if target_path.exists() {
-                std::fs::remove_file(&target_path)?;
+                if let Err(error) = std::fs::remove_file(&target_path) {
+                    failures.push(format!(
+                        "failed to remove created file '{}': {}",
+                        relative_path, error
+                    ));
+                }
             }
         }
 
         for note_id in &manifest.overlay_note_ids {
-            store.delete_overlay(note_id)?;
+            if let Err(error) = store.delete_overlay(note_id) {
+                failures.push(format!(
+                    "failed to delete overlay for note '{}': {}",
+                    note_id, error
+                ));
+            }
         }
 
         let mut updated_manifest = manifest;
-        updated_manifest.status = "rolled_back".to_string();
+        updated_manifest.status = if failures.is_empty() {
+            "rolled_back".to_string()
+        } else {
+            "rolled_back_with_errors".to_string()
+        };
         write_atomic(
             &run_dir.join("manifest.json"),
             serde_json::to_string_pretty(&updated_manifest)?.as_bytes(),
         )?;
+
+        if !failures.is_empty() {
+            anyhow::bail!(
+                "Rollback for run '{}' completed with {} failure(s) and could not fully restore the vault: {}",
+                run_id,
+                failures.len(),
+                failures.join("; ")
+            );
+        }
+
         Ok(())
     }
 
@@ -539,10 +600,17 @@ impl MarkdownMigrationService {
         Ok(serde_json::from_str(&data)?)
     }
 
-    fn backup_note(&self, run_dir: &Path, vault_path: &str, relative_path: &str) -> Result<()> {
+    /// Copies `relative_path` into this run's `backups/` directory so `rollback()` can
+    /// later restore it. Returns `Ok(true)` if a backup was actually captured (the source
+    /// existed on disk), or `Ok(false)` if there was nothing to back up (e.g. the note
+    /// file is missing). The caller is responsible for recording a successful backup into
+    /// the in-memory manifest — this function intentionally does not touch manifest.json,
+    /// since the manifest for a run is only written once, after `apply()` finishes, from
+    /// the single in-memory `StoredManifest` it accumulates.
+    fn backup_note(&self, run_dir: &Path, vault_path: &str, relative_path: &str) -> Result<bool> {
         let source_path = Path::new(vault_path).join(relative_path);
         if !source_path.exists() {
-            return Ok(());
+            return Ok(false);
         }
 
         let backup_path = run_dir.join("backups").join(relative_path);
@@ -557,20 +625,7 @@ impl MarkdownMigrationService {
             )
         })?;
 
-        let manifest_path = run_dir.join("manifest.json");
-        if manifest_path.exists() {
-            let mut manifest: StoredManifest =
-                serde_json::from_str(&std::fs::read_to_string(&manifest_path)?)?;
-            if !manifest.backup_files.contains(&relative_path.to_string()) {
-                manifest.backup_files.push(relative_path.to_string());
-                write_atomic(
-                    &manifest_path,
-                    serde_json::to_string_pretty(&manifest)?.as_bytes(),
-                )?;
-            }
-        }
-
-        Ok(())
+        Ok(true)
     }
 }
 
@@ -869,5 +924,223 @@ mod tests {
             .expect("preview.json should exist");
         assert!(persisted.contains(&preview.preview_id));
         assert_no_tmp_siblings(&run_dir);
+    }
+
+    fn seed_two_notes(store: &mut KnowledgeStore) -> (Note, Note) {
+        let note_a = store
+            .create_note(NoteCreate {
+                title: "Rollback Note A".to_string(),
+                content: "Original body A.".to_string(),
+                relative_path: None,
+                aliases: Vec::new(),
+                status: Default::default(),
+                tags: Vec::new(),
+                schema_version: 1,
+                migration_source: None,
+                optimizer_managed: false,
+                properties: HashMap::new(),
+            })
+            .expect("note a should be created");
+        let note_b = store
+            .create_note(NoteCreate {
+                title: "Rollback Note B".to_string(),
+                content: "Original body B.".to_string(),
+                relative_path: None,
+                aliases: Vec::new(),
+                status: Default::default(),
+                tags: Vec::new(),
+                schema_version: 1,
+                migration_source: None,
+                optimizer_managed: false,
+                properties: HashMap::new(),
+            })
+            .expect("note b should be created");
+        (note_a, note_b)
+    }
+
+    #[test]
+    fn rollback_restores_backed_up_note_contents() {
+        let vault_dir = tempdir().expect("vault tempdir");
+        let data_dir = tempdir().expect("data tempdir");
+        let mut store = KnowledgeStore::new(
+            vault_dir.path().to_path_buf(),
+            data_dir.path().to_path_buf(),
+        );
+
+        let (note_a, note_b) = seed_two_notes(&mut store);
+
+        let path_a = vault_dir.path().join(&note_a.relative_path);
+        let path_b = vault_dir.path().join(&note_b.relative_path);
+        let original_a = std::fs::read_to_string(&path_a).expect("note a file should exist");
+        let original_b = std::fs::read_to_string(&path_b).expect("note b file should exist");
+
+        let service = MarkdownMigrationService::new(data_dir.path().to_path_buf());
+        let preview = service
+            .preview(
+                vault_dir.path().to_path_buf(),
+                MarkdownMigrationRequest {
+                    mode: MarkdownMigrationMode::FullRewrite,
+                    auto_insert_links: Some(true),
+                    ..Default::default()
+                },
+            )
+            .expect("preview should succeed");
+
+        let apply_result = service
+            .apply(
+                &preview.preview_id,
+                MarkdownMigrationRequest {
+                    mode: MarkdownMigrationMode::FullRewrite,
+                    auto_insert_links: Some(true),
+                    ..Default::default()
+                },
+                &mut store,
+            )
+            .expect("apply should succeed");
+        assert_eq!(apply_result.touched_note_ids.len(), 2);
+
+        let rewritten_a = std::fs::read_to_string(&path_a).expect("note a should still exist");
+        let rewritten_b = std::fs::read_to_string(&path_b).expect("note b should still exist");
+        assert_ne!(rewritten_a, original_a, "apply should have rewritten note a");
+        assert_ne!(rewritten_b, original_b, "apply should have rewritten note b");
+
+        service
+            .rollback(&apply_result.run_id, &mut store)
+            .expect("rollback should succeed and restore backups");
+
+        let restored_a = std::fs::read_to_string(&path_a).expect("note a should exist post-rollback");
+        let restored_b = std::fs::read_to_string(&path_b).expect("note b should exist post-rollback");
+        assert_eq!(
+            restored_a, original_a,
+            "note a should be byte-equal to its pre-migration original after rollback"
+        );
+        assert_eq!(
+            restored_b, original_b,
+            "note b should be byte-equal to its pre-migration original after rollback"
+        );
+    }
+
+    #[test]
+    fn rollback_is_idempotent() {
+        let vault_dir = tempdir().expect("vault tempdir");
+        let data_dir = tempdir().expect("data tempdir");
+        let mut store = KnowledgeStore::new(
+            vault_dir.path().to_path_buf(),
+            data_dir.path().to_path_buf(),
+        );
+
+        let (note_a, note_b) = seed_two_notes(&mut store);
+        let path_a = vault_dir.path().join(&note_a.relative_path);
+        let path_b = vault_dir.path().join(&note_b.relative_path);
+
+        let service = MarkdownMigrationService::new(data_dir.path().to_path_buf());
+        let request = MarkdownMigrationRequest {
+            mode: MarkdownMigrationMode::FullRewrite,
+            ..Default::default()
+        };
+        let preview = service
+            .preview(vault_dir.path().to_path_buf(), request.clone())
+            .expect("preview should succeed");
+        let apply_result = service
+            .apply(&preview.preview_id, request, &mut store)
+            .expect("apply should succeed");
+
+        service
+            .rollback(&apply_result.run_id, &mut store)
+            .expect("first rollback should succeed");
+        let first_a = std::fs::read_to_string(&path_a).expect("note a should exist");
+        let first_b = std::fs::read_to_string(&path_b).expect("note b should exist");
+
+        service
+            .rollback(&apply_result.run_id, &mut store)
+            .expect("second rollback should also succeed (idempotent)");
+        let second_a = std::fs::read_to_string(&path_a).expect("note a should exist");
+        let second_b = std::fs::read_to_string(&path_b).expect("note b should exist");
+
+        assert_eq!(first_a, second_a, "repeated rollback must not change note a further");
+        assert_eq!(first_b, second_b, "repeated rollback must not change note b further");
+    }
+
+    #[test]
+    fn rollback_errors_when_backup_files_empty_but_notes_were_touched() {
+        // Simulates a manifest written by the pre-fix code path: touched_note_ids is
+        // populated (notes were rewritten) but backup_files was never populated, since
+        // that was exactly the silent-no-op bug this fix closes. Rollback must refuse
+        // to report success for such a manifest rather than silently doing nothing.
+        let vault_dir = tempdir().expect("vault tempdir");
+        let data_dir = tempdir().expect("data tempdir");
+        let service = MarkdownMigrationService::new(data_dir.path().to_path_buf());
+
+        let run_id = "legacy-run".to_string();
+        let run_dir = service.runs_dir.join(&run_id);
+        std::fs::create_dir_all(run_dir.join("backups")).expect("run dir should be created");
+
+        let legacy_manifest = StoredManifest {
+            run_id: run_id.clone(),
+            preview_id: run_id.clone(),
+            vault_path: vault_dir.path().to_string_lossy().to_string(),
+            mode: MarkdownMigrationMode::FullRewrite,
+            created_at: Utc::now(),
+            applied_at: Some(Utc::now()),
+            status: "applied".to_string(),
+            created_files: Vec::new(),
+            backup_files: Vec::new(),
+            overlay_note_ids: Vec::new(),
+            touched_note_ids: vec!["note-1".to_string()],
+            created_hub_note_ids: Vec::new(),
+        };
+        write_atomic(
+            &run_dir.join("manifest.json"),
+            serde_json::to_string_pretty(&legacy_manifest)
+                .expect("manifest should serialize")
+                .as_bytes(),
+        )
+        .expect("legacy manifest should be written");
+
+        let mut store = KnowledgeStore::new(
+            vault_dir.path().to_path_buf(),
+            data_dir.path().to_path_buf(),
+        );
+
+        let result = service.rollback(&run_id, &mut store);
+        assert!(
+            result.is_err(),
+            "rollback must error rather than report success for an empty-backup, touched-notes manifest"
+        );
+    }
+
+    #[test]
+    fn rollback_reports_failure_when_backup_file_missing_from_disk() {
+        let vault_dir = tempdir().expect("vault tempdir");
+        let data_dir = tempdir().expect("data tempdir");
+        let mut store = KnowledgeStore::new(
+            vault_dir.path().to_path_buf(),
+            data_dir.path().to_path_buf(),
+        );
+
+        let (note_a, _note_b) = seed_two_notes(&mut store);
+
+        let service = MarkdownMigrationService::new(data_dir.path().to_path_buf());
+        let request = MarkdownMigrationRequest {
+            mode: MarkdownMigrationMode::FullRewrite,
+            ..Default::default()
+        };
+        let preview = service
+            .preview(vault_dir.path().to_path_buf(), request.clone())
+            .expect("preview should succeed");
+        let apply_result = service
+            .apply(&preview.preview_id, request, &mut store)
+            .expect("apply should succeed");
+
+        // Corrupt the run dir by deleting one of the captured backup files.
+        let run_dir = service.runs_dir.join(&apply_result.run_id);
+        let corrupted_backup = run_dir.join("backups").join(&note_a.relative_path);
+        std::fs::remove_file(&corrupted_backup).expect("backup file should exist to delete");
+
+        let result = service.rollback(&apply_result.run_id, &mut store);
+        assert!(
+            result.is_err(),
+            "rollback must surface an error (not panic) when a backup file is missing"
+        );
     }
 }
