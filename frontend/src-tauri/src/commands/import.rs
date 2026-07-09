@@ -1,4 +1,4 @@
-use crate::commands::sync_chunk_index_for_notes;
+use crate::commands::commit_note_writes;
 use crate::models::import::{
     ConversationMetadata, ImportLinkSuggestion, ImportPreview, ImportResult, ParsedConversation,
     ParsedMessage,
@@ -88,7 +88,6 @@ async fn apply_conversation_import(
     };
 
     let mut note_ids = Vec::new();
-    let mut created_notes = Vec::new();
     let mut errors = Vec::new();
     let mut skipped = 0;
 
@@ -171,28 +170,10 @@ async fn apply_conversation_import(
             }
         };
 
-        // Index in search
-        {
-            let mut search = state.search_service.write().await;
-            if let Err(e) = search.index_note(&created) {
-                log::error!("Failed to index imported note '{}': {}", created.id, e);
-            }
-            if let Err(e) = search.commit() {
-                log::error!("Failed to commit after indexing '{}': {}", created.id, e);
-            }
-        }
-
-        // Update graph
-        {
-            let mut graph = state.graph_index.write().await;
-            graph.update_note(&created);
-        }
-
         note_ids.push(created.id.clone());
-        created_notes.push(created);
     }
 
-    sync_chunk_index_for_notes(state.inner(), &created_notes).await;
+    commit_note_writes(state.inner(), &note_ids, "import").await?;
 
     let imported = note_ids.len();
     let message = format!(
@@ -228,7 +209,6 @@ async fn apply_document_import(
     };
 
     let mut note_ids = Vec::new();
-    let mut created_notes = Vec::new();
     let mut errors = Vec::new();
     let mut skipped = 0;
     let mut imported_section_titles = Vec::new();
@@ -263,31 +243,15 @@ async fn apply_document_import(
             }
         };
 
-        {
-            let mut search = state.search_service.write().await;
-            if let Err(e) = search.index_note(&created) {
-                log::error!("Failed to index imported note '{}': {}", created.id, e);
-            }
-            if let Err(e) = search.commit() {
-                log::error!("Failed to commit after indexing '{}': {}", created.id, e);
-            }
-        }
-
-        {
-            let mut graph = state.graph_index.write().await;
-            graph.update_note(&created);
-        }
-
         if item.content_kind == "document_section" {
             imported_section_titles.push(item.title.clone());
             section_inputs.push((item.title.clone(), item.content.clone()));
         }
 
         note_ids.push(created.id.clone());
-        created_notes.push(created);
     }
 
-    sync_chunk_index_for_notes(state.inner(), &created_notes).await;
+    commit_note_writes(state.inner(), &note_ids, "import").await?;
 
     let (semantic_link_suggestions, semantic_link_error) =
         suggest_import_links_if_available(state.inner(), section_inputs).await;

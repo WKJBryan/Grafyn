@@ -1,4 +1,4 @@
-use crate::commands::{run_retrieval, sync_chunk_index_for_note};
+use crate::commands::{commit_note_write, run_retrieval};
 use crate::models::canvas::{
     AddModelsRequest, AvailableModel, CanvasSession, CanvasStreamEvent, CanvasViewport,
     ContextMode, Debate, DebateContinueRequest, DebateResponse, DebateRound, DebateStartRequest,
@@ -826,28 +826,7 @@ pub async fn export_to_note(
 
     drop(ks);
 
-    // Update search index (mirrors create_note in notes.rs)
-    {
-        let mut search = state.search_service.write().await;
-        if let Err(e) = search.index_note(&note) {
-            log::error!("Failed to index exported note '{}': {}", note.id, e);
-        }
-        if let Err(e) = search.commit() {
-            log::error!(
-                "Failed to commit search index after export '{}': {}",
-                note.id,
-                e
-            );
-        }
-    }
-
-    // Update graph index so backlinks/outgoing links are discoverable
-    {
-        let mut graph = state.graph_index.write().await;
-        graph.update_note(&note);
-    }
-
-    sync_chunk_index_for_note(state.inner(), &note).await;
+    commit_note_write(state.inner(), &note.id, "note_exported").await?;
 
     append_canvas_trace(
         state.twin_store.clone(),
