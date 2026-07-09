@@ -169,11 +169,7 @@ impl KnowledgeStore {
 
     pub fn get_note(&self, id: &str) -> Result<Note> {
         Self::validate_note_id(id)?;
-        let path = self
-            .path_index
-            .get(id)
-            .cloned()
-            .unwrap_or_else(|| self.vault_path.join(format!("{}.md", id)));
+        let path = self.note_path(id)?;
         self.read_note_file(&path)
             .with_context(|| format!("Note not found: {}", id))
     }
@@ -240,7 +236,7 @@ impl KnowledgeStore {
     pub fn update_note(&mut self, id: &str, update: NoteUpdate) -> Result<Note> {
         Self::validate_note_id(id)?;
         let mut note = self.get_note(id)?;
-        let old_path = self.note_path(id);
+        let old_path = self.note_path(id)?;
 
         if let Some(title) = update.title {
             note.title = title;
@@ -278,7 +274,7 @@ impl KnowledgeStore {
         note.parsed_links = self.extract_links(&note.content, &note.relative_path);
 
         self.write_note_file(&note)?;
-        let new_path = self.vault_path.join(&note.relative_path);
+        let new_path = self.resolve_vault_relative_path(&note.relative_path)?;
         if old_path != new_path && old_path.exists() {
             std::fs::remove_file(&old_path).with_context(|| {
                 format!(
@@ -294,7 +290,7 @@ impl KnowledgeStore {
 
     pub fn delete_note(&mut self, id: &str) -> Result<()> {
         Self::validate_note_id(id)?;
-        let path = self.note_path(id);
+        let path = self.note_path(id)?;
         std::fs::remove_file(&path).with_context(|| format!("Failed to delete note: {}", id))?;
         let overlay_path = self.overlay_path(id);
         if overlay_path.exists() {
@@ -414,17 +410,34 @@ impl KnowledgeStore {
     }
 
     fn validate_note_id(id: &str) -> Result<()> {
-        if id.is_empty() || id.contains('/') || id.contains('\\') || id.contains("..") {
+        if id.is_empty()
+            || id.contains('/')
+            || id.contains('\\')
+            || id.contains("..")
+            || id.contains(':')
+        {
             anyhow::bail!("Invalid note ID: {}", id);
+        }
+        if is_reserved_windows_component(id) {
+            anyhow::bail!("Invalid note ID: {} (reserved device name)", id);
         }
         Ok(())
     }
 
-    fn note_path(&self, id: &str) -> PathBuf {
-        self.path_index
-            .get(id)
-            .cloned()
-            .unwrap_or_else(|| self.vault_path.join(format!("{}.md", id)))
+    fn note_path(&self, id: &str) -> Result<PathBuf> {
+        match self.path_index.get(id) {
+            Some(cached) => Ok(cached.clone()),
+            None => self.resolve_vault_relative_path(&format!("{}.md", id)),
+        }
+    }
+
+    /// Joins `relative` onto the vault root and verifies the result cannot
+    /// have escaped the vault (belt-and-braces on top of the string-level
+    /// validators in `validate_note_id` / `normalize_note_relative_path`).
+    fn resolve_vault_relative_path(&self, relative: &str) -> Result<PathBuf> {
+        let joined = self.vault_path.join(relative);
+        ensure_path_within_vault(&self.vault_path, &joined)?;
+        Ok(joined)
     }
 
     fn read_note_file(&self, path: &Path) -> Result<Note> {
@@ -548,7 +561,7 @@ impl KnowledgeStore {
         } else {
             normalize_note_relative_path(&note.relative_path)?
         };
-        let path = self.vault_path.join(&relative_path);
+        let path = self.resolve_vault_relative_path(&relative_path)?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -704,6 +717,56 @@ fn normalize_relative_path_for_output(value: &str) -> String {
         .to_string()
 }
 
+/// Windows reserved device names — invalid as a file/directory stem
+/// regardless of extension (e.g. `con`, `CON.md`, `con.backup.md`).
+/// Checked platform-independently: a vault synced across OSes must not
+/// contain files that are unopenable on Windows.
+const RESERVED_WINDOWS_STEMS: &[&str] = &[
+    "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8",
+    "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+];
+
+/// Returns true if `component` (an id or a single path segment, with or
+/// without an extension) is a Windows-reserved device name. The reserved
+/// stem is the text before the *first* dot, matched case-insensitively, so
+/// `con.backup.md` is still reserved.
+fn is_reserved_windows_component(component: &str) -> bool {
+    let stem = component.split('.').next().unwrap_or(component);
+    RESERVED_WINDOWS_STEMS
+        .iter()
+        .any(|reserved| stem.eq_ignore_ascii_case(reserved))
+}
+
+/// Belt-and-braces check run after joining a (validated) relative path onto
+/// the vault root: confirms the resolved path is still lexically nested
+/// under `vault_path`. This is a pure component walk — no filesystem
+/// canonicalize, since the target may not exist yet (e.g. a note being
+/// created). Catches anything the string-level validators might miss,
+/// including Windows drive-relative joins (`PathBuf::join` replaces the
+/// base entirely when the argument carries its own drive prefix).
+fn ensure_path_within_vault(vault_path: &Path, resolved: &Path) -> Result<()> {
+    let remainder = resolved.strip_prefix(vault_path).map_err(|_| {
+        anyhow::anyhow!(
+            "Resolved note path escapes the vault: {}",
+            resolved.display()
+        )
+    })?;
+    for component in remainder.components() {
+        match component {
+            std::path::Component::Prefix(_)
+            | std::path::Component::RootDir
+            | std::path::Component::ParentDir => {
+                anyhow::bail!(
+                    "Resolved note path escapes the vault: {}",
+                    resolved.display()
+                );
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 fn normalize_note_relative_path(value: &str) -> Result<String> {
     let normalized = normalize_relative_path_for_output(value)
         .trim_matches('/')
@@ -714,11 +777,22 @@ fn normalize_note_relative_path(value: &str) -> Result<String> {
     if Path::new(&normalized).is_absolute() {
         anyhow::bail!("Absolute note paths are not allowed");
     }
-    if normalized
-        .split('/')
-        .any(|segment| segment.is_empty() || segment == "..")
-    {
-        anyhow::bail!("Path traversal is not allowed in note paths");
+    if normalized.contains(':') {
+        anyhow::bail!(
+            "Note paths must not contain ':' (drive-relative or alternate-data-stream syntax is not allowed): {}",
+            normalized
+        );
+    }
+    for segment in normalized.split('/') {
+        if segment.is_empty() || segment == ".." {
+            anyhow::bail!("Path traversal is not allowed in note paths");
+        }
+        if is_reserved_windows_component(segment) {
+            anyhow::bail!(
+                "Note paths must not use a reserved device name: {}",
+                segment
+            );
+        }
     }
     if normalized.to_lowercase().ends_with(".md") {
         Ok(normalized)
@@ -848,5 +922,156 @@ mod tests {
             .expect("overlay file should exist");
         assert!(overlay.contains("Adoption Alias"));
         assert_no_tmp_siblings(&store.overlay_notes_dir);
+    }
+
+    #[test]
+    fn validate_note_id_rejects_colon_variants() {
+        assert!(
+            KnowledgeStore::validate_note_id("C:foo").is_err(),
+            "drive-relative id must be rejected"
+        );
+        assert!(
+            KnowledgeStore::validate_note_id("foo:bar").is_err(),
+            "alternate-data-stream id must be rejected"
+        );
+    }
+
+    #[test]
+    fn validate_note_id_rejects_reserved_device_stems_case_insensitively() {
+        for candidate in [
+            "con", "CON", "con.md", "CON.backup", "prn", "PRN.md", "aux", "AUX", "nul",
+            "NUL.md", "com1", "COM1.md", "com9", "COM9", "lpt1", "LPT1.md", "lpt9", "LPT9",
+        ] {
+            assert!(
+                KnowledgeStore::validate_note_id(candidate).is_err(),
+                "expected '{}' to be rejected as a reserved device name",
+                candidate
+            );
+        }
+    }
+
+    #[test]
+    fn validate_note_id_accepts_normal_unicode_titles() {
+        for candidate in [
+            "my-note",
+            "笔记-notes",
+            "my.note.v2",
+            "project-plan-2026",
+            "console-notes",
+            "company",
+        ] {
+            assert!(
+                KnowledgeStore::validate_note_id(candidate).is_ok(),
+                "expected '{}' to be accepted",
+                candidate
+            );
+        }
+    }
+
+    #[test]
+    fn normalize_note_relative_path_rejects_colon_variants() {
+        assert!(
+            normalize_note_relative_path("C:foo").is_err(),
+            "drive-relative path must be rejected"
+        );
+        assert!(
+            normalize_note_relative_path("foo:bar.md").is_err(),
+            "alternate-data-stream path must be rejected"
+        );
+        assert!(
+            normalize_note_relative_path("sub/c:d.md").is_err(),
+            "colon in a nested component must be rejected"
+        );
+    }
+
+    #[test]
+    fn normalize_note_relative_path_rejects_reserved_device_components() {
+        for candidate in [
+            "con",
+            "CON.md",
+            "prn.md",
+            "aux",
+            "nul.md",
+            "com1.md",
+            "lpt9",
+            "con.backup.md",
+            "sub/CON/note.md",
+            "sub/prn.md/note.md",
+        ] {
+            assert!(
+                normalize_note_relative_path(candidate).is_err(),
+                "expected '{}' to be rejected",
+                candidate
+            );
+        }
+    }
+
+    #[test]
+    fn normalize_note_relative_path_accepts_normal_unicode_paths() {
+        for candidate in [
+            "笔记-notes.md",
+            "folder/my.note.v2.md",
+            "notes/2026/plan.md",
+            "console-notes.md",
+        ] {
+            assert!(
+                normalize_note_relative_path(candidate).is_ok(),
+                "expected '{}' to be accepted",
+                candidate
+            );
+        }
+    }
+
+    #[test]
+    fn ensure_path_within_vault_rejects_parent_dir_escape() {
+        let vault_dir = tempdir().expect("vault tempdir");
+        let vault_path = vault_dir.path();
+        let joined = vault_path.join(Path::new("../../outside.md"));
+        assert!(
+            ensure_path_within_vault(vault_path, &joined).is_err(),
+            "parent-dir escape must be rejected"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn ensure_path_within_vault_rejects_drive_relative_escape_on_windows() {
+        let vault_dir = tempdir().expect("vault tempdir");
+        let vault_path = vault_dir.path();
+        // On Windows, PathBuf::join replaces the base entirely when the
+        // argument carries its own drive prefix (drive-relative path).
+        let joined = vault_path.join("C:secret.md");
+        assert!(
+            ensure_path_within_vault(vault_path, &joined).is_err(),
+            "drive-relative escape must be rejected"
+        );
+    }
+
+    #[test]
+    fn store_rejects_hostile_note_ids_and_paths_end_to_end() {
+        let vault_dir = tempdir().expect("vault tempdir");
+        let data_dir = tempdir().expect("data tempdir");
+        let mut store = KnowledgeStore::new(
+            vault_dir.path().to_path_buf(),
+            data_dir.path().to_path_buf(),
+        );
+
+        assert!(store.get_note("C:secret").is_err());
+        assert!(store.get_note("con").is_err());
+        assert!(store.delete_note("con").is_err());
+        assert!(store
+            .create_note(NoteCreate {
+                title: "Hostile".to_string(),
+                content: "x".to_string(),
+                relative_path: Some("C:evil.md".to_string()),
+                aliases: Vec::new(),
+                status: Default::default(),
+                tags: Vec::new(),
+                schema_version: CURRENT_NOTE_SCHEMA_VERSION,
+                migration_source: None,
+                optimizer_managed: false,
+                properties: HashMap::new(),
+            })
+            .is_err());
     }
 }
