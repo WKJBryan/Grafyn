@@ -85,9 +85,8 @@ Grafyn is a **desktop-only** app — a single Tauri binary with a Vue frontend a
 
 ### Repo Hygiene (root-level gotchas)
 
-- Root `pyproject.toml`, `.python-version`, `uv.lock`, and `.venv/` are **dead artifacts of the deleted Python backend** — nothing in the app uses Python. Do not conclude a Python backend exists from them.
-- Root `package-lock.json` is an empty orphaned stub (there is no root `package.json`).
-- `e2e/` is a committed Playwright suite (6 specs) **not wired to any CI workflow or npm script** — manual-only via `cd e2e && npm test`.
+- The old Python backend is fully deleted; local `.venv/` and `uv.lock` are gitignored leftovers only — nothing in the app uses Python.
+- `e2e/` is a committed Playwright suite (6 specs), manual-only via `npm run e2e` from `frontend/` (requires a live `npm run tauri:dev` IPC backend); it is not wired into CI.
 
 ### Tauri IPC Commands
 
@@ -115,7 +114,7 @@ Grafyn is a **desktop-only** app — a single Tauri binary with a Vue frontend a
 ### Frontend
 
 - `src/api/client.js` — all backend calls go through Tauri `invoke()`; exports one namespace per command module plus `optimizer` and `isDesktopApp`
-- **Pinia stores (4):** `notes.js`, `canvas.js`, `theme.js`, `boot.js` — there is no twin store; twin UI state lives in `TwinReviewView.vue` and `stores/canvas.js`
+- **Pinia stores (3):** `canvas.js`, `theme.js`, `boot.js` — there is no twin store; twin UI state lives in `TwinReviewView.vue` and `stores/canvas.js`
 - **Routes:** `/` (notes), `/canvas`, `/canvas/:id`, `/import`, `/twin` (component: `TwinReviewView.vue`), plus catch-all → `NotFoundView.vue`
 - **Tests:** `src/__tests__/{unit,integration,fixtures}/` + `setup.js` (Vitest)
 
@@ -210,7 +209,7 @@ See `TWIN_RAG_SPEC.md` for the full twin RAG specification and `WORKING_GUIDE.md
 
 **Twin accuracy evaluation is external by design (owner decision, 2026-06-10):** Do NOT build in-app accuracy scoring, benchmark dashboards, or eval-result UIs. This is a public repo and the owner does not want to impose a specific evaluation format on users. The app's responsibility is **capture + export only**: sealed twin predictions at decision time, decision outcomes, feedback/ranking traces, and the JSONL export bundles (train/eval/holdout splits). Scoring, holdout replay, calibration analysis, and accuracy dashboards live in the owner's external evaluation harness (separate lab environment), consuming the exported data. See `TWIN_ACCURACY_ROADMAP.md`.
 
-**Web search:** When `web_search: true`, OpenRouter's `plugins: [{"id": "web", "max_results": 5}]` is added to the API request (~$0.02/query per model). The `web_search` flag is threaded through the full stack and persisted on `PromptTile` for regenerate/add-model replay.
+**Web search:** When `web_search: true`, OpenRouter's `plugins: [{"id": "web", "max_results": 5}]` is added to the API request (~$0.02/query per model). The `web_search` flag is threaded through the full stack and persisted on canvas tiles for regenerate/add-model replay.
 
 **Smart web search auto-detection:** Controlled by `UserSettings.smart_web_search` (default: `true`). When enabled, `useWebSearchDetection.js` analyzes prompt text with 5 heuristic rules (temporal markers, explicit search intent, news patterns, freshness queries, comparisons) and suppression rules (code blocks, wikilinks, short prompts). Detection result is shown as a hint in `PromptDialog.vue`. Disable via Settings toggle.
 
