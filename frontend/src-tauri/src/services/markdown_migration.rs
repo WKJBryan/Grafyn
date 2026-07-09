@@ -42,6 +42,10 @@ struct StoredManifest {
     touched_note_ids: Vec<String>,
     #[serde(default)]
     created_hub_note_ids: Vec<String>,
+    /// Notes skipped by apply because their original frontmatter is unparsable
+    /// and preserved verbatim (`Note::frontmatter_raw_fallback`).
+    #[serde(default)]
+    skipped_fallback_note_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -242,6 +246,7 @@ impl MarkdownMigrationService {
 
         let mut touched_note_ids = Vec::new();
         let mut overlay_note_ids = Vec::new();
+        let mut skipped_fallback_note_ids = Vec::new();
 
         for proposal in &preview.note_proposals {
             if request.mode == MarkdownMigrationMode::SidecarFirst {
@@ -262,6 +267,23 @@ impl MarkdownMigrationService {
             }
 
             let note = store.get_note(&proposal.note_id)?;
+
+            // The note's original frontmatter failed to parse and is preserved
+            // verbatim (see `Note::frontmatter_raw_fallback`). The update below
+            // explicitly sets frontmatter-backed fields, which would clear the
+            // fallback and permanently replace the unparsable original with
+            // defaulted frontmatter. Skip it (consistent with
+            // `backfill_legacy_grafyn_notes` and `vault_optimizer::run_next`) and
+            // report it in the apply result/manifest.
+            if note.frontmatter_raw_fallback.is_some() {
+                log::warn!(
+                    "Skipping markdown migration for note '{}': original frontmatter is unparsable and preserved verbatim",
+                    note.id
+                );
+                skipped_fallback_note_ids.push(note.id.clone());
+                continue;
+            }
+
             if self.backup_note(&run_dir, &preview.vault_path, &note.relative_path)?
                 && !manifest.backup_files.contains(&note.relative_path)
             {
@@ -397,10 +419,20 @@ impl MarkdownMigrationService {
         manifest.overlay_note_ids = overlay_note_ids.clone();
         manifest.touched_note_ids = touched_note_ids.clone();
         manifest.created_hub_note_ids = created_hub_note_ids.clone();
+        manifest.skipped_fallback_note_ids = skipped_fallback_note_ids.clone();
         write_atomic(
             &run_dir.join("manifest.json"),
             serde_json::to_string_pretty(&manifest)?.as_bytes(),
         )?;
+
+        let message = if skipped_fallback_note_ids.is_empty() {
+            "Markdown migration applied".to_string()
+        } else {
+            format!(
+                "Markdown migration applied ({} note(s) skipped: unparsable frontmatter preserved verbatim)",
+                skipped_fallback_note_ids.len()
+            )
+        };
 
         Ok(MarkdownMigrationApplyResult {
             run_id,
@@ -408,7 +440,8 @@ impl MarkdownMigrationService {
             created_hub_note_ids,
             touched_note_ids,
             overlay_note_ids,
-            message: "Markdown migration applied".to_string(),
+            skipped_fallback_note_ids,
+            message,
         })
     }
 
@@ -1103,6 +1136,82 @@ mod tests {
     }
 
     #[test]
+    fn apply_skips_fallback_notes_and_reports_them() {
+        let vault_dir = tempdir().expect("vault tempdir");
+        let data_dir = tempdir().expect("data tempdir");
+
+        // Malformed frontmatter: tab used as YAML block-sequence indentation, which
+        // yaml-rust2 rejects — the note carries a raw-frontmatter fallback on read.
+        let malformed_path = vault_dir.path().join("broken.md");
+        std::fs::write(
+            &malformed_path,
+            "---\ntitle: Broken Note\ntags:\n\t- alpha\n---\n\nBroken body.",
+        )
+        .expect("malformed note file should be written");
+
+        let mut store = KnowledgeStore::new(
+            vault_dir.path().to_path_buf(),
+            data_dir.path().to_path_buf(),
+        );
+        let healthy = store
+            .create_note(NoteCreate {
+                title: "Healthy Note".to_string(),
+                content: "Healthy body.".to_string(),
+                relative_path: None,
+                aliases: Vec::new(),
+                status: Default::default(),
+                tags: Vec::new(),
+                schema_version: 1,
+                migration_source: None,
+                optimizer_managed: false,
+                properties: HashMap::new(),
+            })
+            .expect("healthy note should be created");
+        let broken_id = store
+            .find_note_by_relative_path("broken.md")
+            .expect("lookup should not error")
+            .expect("malformed note should be readable")
+            .id;
+
+        let service = MarkdownMigrationService::new(data_dir.path().to_path_buf());
+        let request = MarkdownMigrationRequest {
+            mode: MarkdownMigrationMode::FullRewrite,
+            ..Default::default()
+        };
+        let preview = service
+            .preview(vault_dir.path().to_path_buf(), request.clone())
+            .expect("preview should succeed");
+        let apply_result = service
+            .apply(&preview.preview_id, request, &mut store)
+            .expect("apply should succeed");
+
+        assert!(
+            apply_result.touched_note_ids.contains(&healthy.id),
+            "healthy note should be rewritten by the migration"
+        );
+        assert!(
+            !apply_result.touched_note_ids.contains(&broken_id),
+            "fallback note must not be counted as touched"
+        );
+        assert_eq!(
+            apply_result.skipped_fallback_note_ids,
+            vec![broken_id.clone()],
+            "fallback note should be reported as skipped"
+        );
+
+        let persisted =
+            std::fs::read_to_string(&malformed_path).expect("malformed note should still exist");
+        assert!(
+            persisted.contains("title: Broken Note\ntags:\n\t- alpha"),
+            "original malformed frontmatter must be preserved byte-for-byte:\n{persisted}"
+        );
+        assert!(
+            persisted.contains("Broken body."),
+            "original content must be untouched:\n{persisted}"
+        );
+    }
+
+    #[test]
     fn rollback_errors_when_backup_files_empty_but_notes_were_touched() {
         // Simulates a manifest written by the pre-fix code path: touched_note_ids is
         // populated (notes were rewritten) but backup_files was never populated, since
@@ -1129,6 +1238,7 @@ mod tests {
             overlay_note_ids: Vec::new(),
             touched_note_ids: vec!["note-1".to_string()],
             created_hub_note_ids: Vec::new(),
+            skipped_fallback_note_ids: Vec::new(),
         };
         write_atomic(
             &run_dir.join("manifest.json"),

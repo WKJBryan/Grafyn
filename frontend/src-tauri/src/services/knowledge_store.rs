@@ -1339,4 +1339,83 @@ mod tests {
             "re-reading a well-formed note must not carry a raw fallback"
         );
     }
+
+    /// Valid YAML frontmatter that simply omits `title:` — the norm for
+    /// Obsidian-style and imported vaults. This must NOT be treated as a parse
+    /// failure: title falls back to the H1 heading downstream, and custom fields
+    /// must flow into `properties` and round-trip through writes.
+    const TITLE_LESS_VALID_FRONTMATTER_NOTE: &str = "---\nstatus: evidence\ntags:\n  - alpha\ncustom_field: keep-me\n---\n\n# Heading Title\n\nBody text.";
+
+    #[test]
+    fn title_less_valid_frontmatter_parses_without_fallback_and_round_trips() {
+        let vault_dir = tempdir().expect("vault tempdir");
+        let data_dir = tempdir().expect("data tempdir");
+
+        let note_path = vault_dir.path().join("no-title.md");
+        std::fs::write(&note_path, TITLE_LESS_VALID_FRONTMATTER_NOTE)
+            .expect("note file should be written");
+
+        let mut store = KnowledgeStore::new(
+            vault_dir.path().to_path_buf(),
+            data_dir.path().to_path_buf(),
+        );
+
+        let note = store
+            .find_note_by_relative_path("no-title.md")
+            .expect("lookup should not error")
+            .expect("title-less note should be readable");
+        assert!(
+            note.frontmatter_raw_fallback.is_none(),
+            "valid frontmatter without a title must NOT be treated as a parse failure"
+        );
+        assert_eq!(
+            note.title, "Heading Title",
+            "title should fall back to the H1 heading"
+        );
+        assert_eq!(note.status, NoteStatus::Evidence);
+        assert!(note.tags.contains(&"alpha".to_string()));
+        assert_eq!(
+            note.properties.get("custom_field").and_then(|v| v.as_str()),
+            Some("keep-me"),
+            "custom frontmatter fields should flow into properties"
+        );
+
+        // Content-only edit: custom field must survive on disk.
+        store
+            .update_note(
+                &note.id,
+                NoteUpdate {
+                    content: Some("# Heading Title\n\nEdited body.".to_string()),
+                    ..Default::default()
+                },
+            )
+            .expect("content-only update should succeed");
+        let persisted = std::fs::read_to_string(&note_path).expect("note file should still exist");
+        assert!(
+            persisted.contains("custom_field: keep-me"),
+            "custom field should round-trip through a content edit:\n{persisted}"
+        );
+        assert!(persisted.contains("Edited body."));
+
+        // Explicit frontmatter edit: custom field must STILL survive, because the
+        // frontmatter deserialized successfully and custom fields live in properties.
+        store
+            .update_note(
+                &note.id,
+                NoteUpdate {
+                    status: Some(NoteStatus::Canonical),
+                    ..Default::default()
+                },
+            )
+            .expect("explicit status update should succeed");
+        let persisted = std::fs::read_to_string(&note_path).expect("note file should still exist");
+        assert!(
+            persisted.contains("custom_field: keep-me"),
+            "custom field should round-trip through an explicit status edit:\n{persisted}"
+        );
+        assert!(
+            persisted.contains("status: canonical"),
+            "status edit should be reflected:\n{persisted}"
+        );
+    }
 }

@@ -99,16 +99,24 @@ pub async fn rollback_markdown_migration(
     run_id: String,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    {
+    // Rollback can fail after having already restored some files to disk. If we
+    // `?`-return before rebuilding, the search/graph/chunk indexes stay pointed at
+    // the pre-rollback state and disagree with the (partially) restored files. So:
+    // capture the rollback result, ALWAYS rebuild the indexes to match whatever is
+    // now on disk, then propagate the original rollback error (a rebuild error is
+    // only surfaced when the rollback itself succeeded).
+    let rollback_result = {
         let service = state.markdown_migration.read().await;
         let mut store = state.knowledge_store.write().await;
         service
             .rollback(&run_id, &mut store)
-            .map_err(|error| error.to_string())?;
-    }
+            .map_err(|error| error.to_string())
+    };
 
-    crate::commands::rebuild_all_indexes(state.inner()).await?;
-    Ok(())
+    let rebuild_result = crate::commands::rebuild_all_indexes(state.inner()).await;
+
+    rollback_result?;
+    rebuild_result.map(|_| ())
 }
 
 #[tauri::command]

@@ -376,6 +376,13 @@ pub struct NoteUpdate {
 pub struct NoteFrontmatter {
     #[serde(default)]
     pub note_id: Option<String>,
+    /// Defaulted so valid frontmatter without `title:` (the norm for Obsidian and
+    /// imported vaults) deserializes successfully instead of being treated as a
+    /// parse failure (which would fallback-freeze the note — see
+    /// `Note::frontmatter_raw_fallback`). An empty title is handled downstream:
+    /// `KnowledgeStore::read_note_file` falls back to the first H1 heading, then
+    /// to the humanized filename.
+    #[serde(default)]
     pub title: String,
     #[serde(default)]
     pub aliases: Vec<String>,
