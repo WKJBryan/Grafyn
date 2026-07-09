@@ -7,10 +7,23 @@
 //! rename, but the parent directory entry is not fsynced afterwards. After a power loss
 //! the rename itself may not have reached disk (the old content survives), but the
 //! target is never left truncated.
+//!
+//! Transient-lock note: on Windows, renaming over a destination that is concurrently
+//! being replaced (or briefly held open by antivirus/indexer scans) can return a
+//! transient `PermissionDenied`. The rename is therefore retried a bounded number of
+//! times with short backoff (~150ms worst case) before the error is surfaced; on Unix
+//! `PermissionDenied` is almost always real and simply fails after the same bounded
+//! retries.
 
 use std::io::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+
+/// Maximum rename attempts for transient `PermissionDenied` failures.
+const RENAME_ATTEMPTS: u32 = 5;
+/// Initial backoff between rename attempts; doubles each retry (10, 20, 40, 80 ms).
+const RENAME_BACKOFF: Duration = Duration::from_millis(10);
 
 /// Monotonic counter to disambiguate concurrent writers within the same process that
 /// share a pid (e.g. multiple threads writing to the same directory at once).
@@ -38,7 +51,7 @@ pub fn write_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
         file.write_all(contents)?;
         file.sync_all()?;
         drop(file);
-        std::fs::rename(&tmp_path, path)?;
+        rename_with_retry(&tmp_path, path)?;
         Ok(())
     })();
 
@@ -47,6 +60,34 @@ pub fn write_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     }
 
     result
+}
+
+/// Rename with a bounded retry on `PermissionDenied`.
+///
+/// On Windows, `MoveFileExW` onto a destination that is concurrently being replaced —
+/// or briefly held open by an antivirus or search-indexer scan — can return a transient
+/// ACCESS_DENIED. Only `PermissionDenied` is retried (up to [`RENAME_ATTEMPTS`] times
+/// with doubling backoff starting at [`RENAME_BACKOFF`]); every other error kind is
+/// returned immediately. If all attempts fail, the last error is returned.
+fn rename_with_retry(from: &Path, to: &Path) -> std::io::Result<()> {
+    let mut backoff = RENAME_BACKOFF;
+    let mut last_err = None;
+
+    for attempt in 0..RENAME_ATTEMPTS {
+        match std::fs::rename(from, to) {
+            Ok(()) => return Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+                last_err = Some(err);
+                if attempt + 1 < RENAME_ATTEMPTS {
+                    std::thread::sleep(backoff);
+                    backoff *= 2;
+                }
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    Err(last_err.expect("retry loop always records an error before exhausting attempts"))
 }
 
 /// Test helper: assert that `dir` contains no `*.tmp-*` litter from `write_atomic`.
