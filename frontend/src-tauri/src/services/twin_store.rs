@@ -4627,6 +4627,7 @@ mod tests {
             wikilinks: Vec::new(),
             parsed_links: Vec::new(),
             properties,
+            ..Default::default()
         }
     }
 

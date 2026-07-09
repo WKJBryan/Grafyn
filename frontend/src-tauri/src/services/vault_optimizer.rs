@@ -241,6 +241,21 @@ impl VaultOptimizerService {
             return Ok(());
         }
 
+        // The note's original frontmatter failed to parse and is preserved verbatim
+        // (see `Note::frontmatter_raw_fallback`). `full_rewrite` mode would explicitly
+        // set frontmatter-backed fields via `update_note`, clearing the fallback and
+        // permanently destroying the unparsable original on write. Skip optimizing it
+        // entirely until a human/editor fixes the YAML.
+        if note.frontmatter_raw_fallback.is_some() {
+            log::warn!(
+                "Skipping vault optimizer run for note '{}': original frontmatter is unparsable and preserved verbatim",
+                note.id
+            );
+            self.state.last_run_at = Some(Utc::now());
+            self.persist_state()?;
+            return Ok(());
+        }
+
         let proposal = build_optimizer_proposal(&note, store)?;
         if proposal.is_empty() {
             self.state.last_run_at = Some(Utc::now());
@@ -565,6 +580,7 @@ mod tests {
             wikilinks: Vec::new(),
             parsed_links: Vec::new(),
             properties: HashMap::new(),
+            ..Default::default()
         }
     }
 

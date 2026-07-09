@@ -562,6 +562,20 @@ impl MarkdownMigrationService {
                 continue;
             }
 
+            // The note's original frontmatter failed to parse and is being preserved
+            // verbatim (see `Note::frontmatter_raw_fallback`). Backfilling here would
+            // explicitly set frontmatter-backed fields (aliases/schema_version/
+            // migration_source/optimizer_managed/properties), which clears the
+            // fallback and permanently destroys the unparsable original on write.
+            // Skip it — it must not be rewritten until a human/editor fixes the YAML.
+            if note.frontmatter_raw_fallback.is_some() {
+                log::warn!(
+                    "Skipping boot backfill for note '{}': original frontmatter is unparsable and preserved verbatim",
+                    note.id
+                );
+                continue;
+            }
+
             let updated = store.update_note(
                 &note.id,
                 NoteUpdate {

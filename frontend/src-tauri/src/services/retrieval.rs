@@ -564,6 +564,7 @@ mod tests {
             wikilinks: wikilink_strings,
             parsed_links,
             properties: HashMap::new(),
+            ..Default::default()
         }
     }
 
@@ -593,6 +594,7 @@ mod tests {
             wikilinks: wikilink_strings,
             parsed_links,
             properties: HashMap::new(),
+            ..Default::default()
         }
     }
 

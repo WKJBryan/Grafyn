@@ -223,6 +223,7 @@ impl KnowledgeStore {
             wikilinks: Vec::new(),
             parsed_links: Vec::new(),
             properties: create.properties,
+            frontmatter_raw_fallback: None,
         };
 
         note.wikilinks = self.extract_wikilinks(&note.content);
@@ -237,6 +238,22 @@ impl KnowledgeStore {
         Self::validate_note_id(id)?;
         let mut note = self.get_note(id)?;
         let old_path = self.note_path(id)?;
+
+        // A note may be carrying an unparsable original frontmatter block
+        // (`frontmatter_raw_fallback`, see doc comment on `Note`). Any of these fields
+        // being explicitly set means the caller consciously wants new frontmatter
+        // written, so the fallback is cleared below and normal serialization takes
+        // over. A content-only update (only `content` and/or `relative_path` set)
+        // leaves the fallback in place, so the original frontmatter is re-emitted
+        // verbatim by `write_note_file` instead of being replaced by defaults.
+        let explicit_frontmatter_edit = update.title.is_some()
+            || update.aliases.is_some()
+            || update.status.is_some()
+            || update.tags.is_some()
+            || update.schema_version.is_some()
+            || update.migration_source.is_some()
+            || update.optimizer_managed.is_some()
+            || update.properties.is_some();
 
         if let Some(title) = update.title {
             note.title = title;
@@ -267,6 +284,10 @@ impl KnowledgeStore {
         }
         if let Some(properties) = update.properties {
             note.properties = properties;
+        }
+
+        if explicit_frontmatter_edit {
+            note.frontmatter_raw_fallback = None;
         }
 
         note.updated_at = Utc::now();
@@ -447,12 +468,35 @@ impl KnowledgeStore {
         let matter = Matter::<YAML>::new();
         let parsed = matter.parse(&content);
 
-        let frontmatter: NoteFrontmatter = parsed
+        // `parsed.matter` holds the raw text between the `---` delimiters verbatim,
+        // regardless of whether it deserialized successfully. We capture it before
+        // consuming `parsed.data` so a note can fall back to it below.
+        let raw_frontmatter_block = parsed.matter.clone();
+        let has_frontmatter_block = !raw_frontmatter_block.trim().is_empty();
+
+        let deserialized_frontmatter: Option<NoteFrontmatter> = parsed
             .data
             .map(|data| data.deserialize())
             .transpose()
-            .unwrap_or(None)
-            .unwrap_or_default();
+            .unwrap_or(None);
+
+        // If a frontmatter block exists but failed to deserialize (malformed YAML,
+        // missing required fields, etc.), preserve the raw block instead of silently
+        // discarding it. See `frontmatter_raw_fallback` doc comment on `Note` for the
+        // full preserve/clear contract.
+        let frontmatter_raw_fallback = if has_frontmatter_block
+            && deserialized_frontmatter.is_none()
+        {
+            log::warn!(
+                "Frontmatter for note '{}' failed to parse; preserving raw block verbatim instead of defaulting metadata",
+                path.display()
+            );
+            Some(raw_frontmatter_block)
+        } else {
+            None
+        };
+
+        let frontmatter = deserialized_frontmatter.unwrap_or_default();
 
         let file_metadata = std::fs::metadata(path)?;
         let file_modified = file_metadata.modified().ok();
@@ -524,6 +568,7 @@ impl KnowledgeStore {
             wikilinks: self.extract_wikilinks(&body),
             parsed_links: self.extract_links(&body, &relative_path),
             properties: frontmatter.extra,
+            frontmatter_raw_fallback,
         };
 
         self.merge_overlay(&mut note);
@@ -564,6 +609,23 @@ impl KnowledgeStore {
         let path = self.resolve_vault_relative_path(&relative_path)?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
+        }
+
+        // If the note's original frontmatter couldn't be parsed on read and the
+        // caller hasn't explicitly replaced it (see `update_note`, which clears
+        // `frontmatter_raw_fallback` on any explicit frontmatter-field edit), re-emit
+        // the original raw block byte-for-byte rather than serializing the (defaulted)
+        // `NoteFrontmatter` struct. This is what prevents a content-only save from
+        // silently destroying unparsable frontmatter.
+        if let Some(raw_frontmatter) = &note.frontmatter_raw_fallback {
+            log::warn!(
+                "Writing note '{}' with its original unparsable frontmatter preserved verbatim",
+                note.id
+            );
+            let file_content = format!("---\n{}\n---\n\n{}", raw_frontmatter.trim(), note.content);
+            write_atomic(&path, file_content.as_bytes())
+                .with_context(|| format!("Failed to write note: {}", path.display()))?;
+            return Ok(());
         }
 
         let mut frontmatter = serde_yaml::Mapping::new();
@@ -882,6 +944,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::note::NoteStatus;
     use crate::services::atomic_io::assert_no_tmp_siblings;
     use tempfile::tempdir;
 
@@ -1108,5 +1171,172 @@ mod tests {
                 properties: HashMap::new(),
             })
             .is_err());
+    }
+
+    /// Frontmatter block with a tab character used as block-sequence indentation,
+    /// which yaml-rust2 rejects ("tab cannot be used as indentation"). This is not
+    /// well-formed YAML, so `YamlLoader::load_from_str` errors and the gray_matter
+    /// engine falls back to `Pod::Null`, which then fails to deserialize into
+    /// `NoteFrontmatter` (a required `title` field is missing).
+    const MALFORMED_FRONTMATTER_NOTE: &str = "---\ntitle: Original Title\ntags:\n\t- alpha\nstatus: canonical\n---\n\nOriginal body content.";
+
+    #[test]
+    fn read_note_with_malformed_yaml_frontmatter_survives_without_error() {
+        let vault_dir = tempdir().expect("vault tempdir");
+        let data_dir = tempdir().expect("data tempdir");
+
+        let note_path = vault_dir.path().join("broken.md");
+        std::fs::write(&note_path, MALFORMED_FRONTMATTER_NOTE)
+            .expect("note file should be written");
+
+        let store = KnowledgeStore::new(
+            vault_dir.path().to_path_buf(),
+            data_dir.path().to_path_buf(),
+        );
+
+        let note = store
+            .find_note_by_relative_path("broken.md")
+            .expect("lookup should not error")
+            .expect("malformed note should still be readable");
+        assert!(
+            note.content.contains("Original body content."),
+            "body content should be preserved even though frontmatter failed to parse"
+        );
+        assert!(
+            note.frontmatter_raw_fallback.is_some(),
+            "unparsable frontmatter should be retained as a raw fallback"
+        );
+        assert!(
+            note.frontmatter_raw_fallback
+                .as_ref()
+                .unwrap()
+                .contains("Original Title"),
+            "raw fallback should contain the original frontmatter text"
+        );
+    }
+
+    #[test]
+    fn content_only_update_preserves_original_raw_frontmatter_verbatim() {
+        let vault_dir = tempdir().expect("vault tempdir");
+        let data_dir = tempdir().expect("data tempdir");
+
+        let note_path = vault_dir.path().join("broken.md");
+        std::fs::write(&note_path, MALFORMED_FRONTMATTER_NOTE)
+            .expect("note file should be written");
+
+        let mut store = KnowledgeStore::new(
+            vault_dir.path().to_path_buf(),
+            data_dir.path().to_path_buf(),
+        );
+        let note_id = store
+            .find_note_by_relative_path("broken.md")
+            .expect("lookup should not error")
+            .expect("malformed note should still be readable")
+            .id;
+
+        store
+            .update_note(
+                &note_id,
+                NoteUpdate {
+                    content: Some("Updated body content.".to_string()),
+                    ..Default::default()
+                },
+            )
+            .expect("content-only update should succeed on a malformed-frontmatter note");
+
+        let persisted = std::fs::read_to_string(&note_path).expect("note file should still exist");
+        assert!(
+            persisted.contains("title: Original Title\ntags:\n\t- alpha\nstatus: canonical"),
+            "original raw frontmatter block should be preserved byte-for-byte:\n{persisted}"
+        );
+        assert!(
+            persisted.contains("Updated body content."),
+            "new content should be written:\n{persisted}"
+        );
+        assert!(
+            !persisted.contains("Original body content."),
+            "old content should be replaced, not appended:\n{persisted}"
+        );
+    }
+
+    #[test]
+    fn explicit_frontmatter_update_replaces_malformed_original() {
+        let vault_dir = tempdir().expect("vault tempdir");
+        let data_dir = tempdir().expect("data tempdir");
+
+        let note_path = vault_dir.path().join("broken.md");
+        std::fs::write(&note_path, MALFORMED_FRONTMATTER_NOTE)
+            .expect("note file should be written");
+
+        let mut store = KnowledgeStore::new(
+            vault_dir.path().to_path_buf(),
+            data_dir.path().to_path_buf(),
+        );
+        let note_id = store
+            .find_note_by_relative_path("broken.md")
+            .expect("lookup should not error")
+            .expect("malformed note should still be readable")
+            .id;
+
+        let updated = store
+            .update_note(
+                &note_id,
+                NoteUpdate {
+                    status: Some(NoteStatus::Evidence),
+                    ..Default::default()
+                },
+            )
+            .expect("explicit frontmatter update should succeed");
+
+        assert!(
+            updated.frontmatter_raw_fallback.is_none(),
+            "explicitly editing a frontmatter field should clear the raw fallback"
+        );
+
+        let persisted = std::fs::read_to_string(&note_path).expect("note file should still exist");
+        assert!(
+            !persisted.contains("\t- alpha"),
+            "malformed original frontmatter should no longer be present:\n{persisted}"
+        );
+        assert!(
+            persisted.contains("status: evidence"),
+            "newly serialized frontmatter should reflect the explicit edit:\n{persisted}"
+        );
+    }
+
+    #[test]
+    fn well_formed_frontmatter_has_no_raw_fallback() {
+        let vault_dir = tempdir().expect("vault tempdir");
+        let data_dir = tempdir().expect("data tempdir");
+        let mut store = KnowledgeStore::new(
+            vault_dir.path().to_path_buf(),
+            data_dir.path().to_path_buf(),
+        );
+
+        let note = store
+            .create_note(NoteCreate {
+                title: "Well Formed".to_string(),
+                content: "Body.".to_string(),
+                relative_path: None,
+                aliases: Vec::new(),
+                status: Default::default(),
+                tags: Vec::new(),
+                schema_version: CURRENT_NOTE_SCHEMA_VERSION,
+                migration_source: None,
+                optimizer_managed: false,
+                properties: HashMap::new(),
+            })
+            .expect("note should be created");
+
+        assert!(
+            note.frontmatter_raw_fallback.is_none(),
+            "a freshly created, well-formed note must not carry a raw fallback"
+        );
+
+        let fetched = store.get_note(&note.id).expect("note should be readable");
+        assert!(
+            fetched.frontmatter_raw_fallback.is_none(),
+            "re-reading a well-formed note must not carry a raw fallback"
+        );
     }
 }
