@@ -1,14 +1,22 @@
 //! Canonical lock order: `knowledge_store` before `vault_optimizer`, always.
 //!
 //! The background vault-optimizer worker (`main.rs::start_vault_optimizer_worker`)
-//! acquires `state.knowledge_store.write()` then `state.vault_optimizer.write()`.
-//! Every other call site that needs both locks (e.g.
-//! `commands::migration::rollback_vault_optimizer_change`) must acquire them in
-//! the same order. Acquiring them in reverse order risks an ABBA deadlock: the
-//! worker fires every 30s, so a caller that takes `vault_optimizer` first and
-//! blocks on `knowledge_store` can cross with the worker holding
-//! `knowledge_store` and blocking on `vault_optimizer`, wedging both locks
-//! (and every command that touches either) until the app restarts.
+//! acquires both locks *twice per tick*, never holding either across LLM/network
+//! work: first `state.knowledge_store.read()` then `state.vault_optimizer.write()`
+//! around `VaultOptimizerService::prepare_next` (which resolves the common
+//! `sidecar_first` write path and every no-op/error/cap-deferred case using only
+//! read access to the vault), and — only when `prepare_next` returns a pending
+//! non-`sidecar_first` write — a second, narrower pass with
+//! `state.knowledge_store.write()` then `state.vault_optimizer.write()` around
+//! `VaultOptimizerService::apply_pending`. Every other call site that needs both
+//! locks (e.g. `commands::migration::rollback_vault_optimizer_change`) must
+//! acquire `knowledge_store` before `vault_optimizer` in the same way (read or
+//! write on `knowledge_store` doesn't matter for ordering — `vault_optimizer`
+//! must simply always come second). Acquiring them in reverse order risks an
+//! ABBA deadlock: the worker fires every 30s, so a caller that takes
+//! `vault_optimizer` first and blocks on `knowledge_store` can cross with the
+//! worker holding `knowledge_store` and blocking on `vault_optimizer`, wedging
+//! both locks (and every command that touches either) until the app restarts.
 
 pub mod boot;
 pub mod canvas;
