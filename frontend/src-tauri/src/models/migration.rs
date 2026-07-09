@@ -134,6 +134,10 @@ pub struct MarkdownMigrationApplyResult {
     pub touched_note_ids: Vec<String>,
     #[serde(default)]
     pub overlay_note_ids: Vec<String>,
+    /// Notes skipped because their original frontmatter is unparsable and preserved
+    /// verbatim (`Note::frontmatter_raw_fallback`); rewriting them would destroy it.
+    #[serde(default)]
+    pub skipped_fallback_note_ids: Vec<String>,
     #[serde(default)]
     pub message: String,
 }

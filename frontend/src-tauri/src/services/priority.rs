@@ -1,4 +1,5 @@
 use crate::models::note::{NoteMeta, NoteStatus, SearchResult};
+use crate::services::atomic_io::write_atomic;
 use anyhow::Result;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -68,7 +69,7 @@ impl PriorityScoringService {
         if let Some(parent) = self.settings_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(&self.settings_path, data)?;
+        write_atomic(&self.settings_path, data.as_bytes())?;
         Ok(())
     }
 
@@ -276,5 +277,24 @@ mod tests {
 
         assert_eq!(results[0].note.id, "tagged");
         assert!(results[0].score > results[1].score);
+    }
+
+    #[test]
+    fn settings_writes_are_atomic_with_no_tmp_litter() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let mut svc = PriorityScoringService::new(dir.path().to_path_buf());
+
+        svc.update_settings(PrioritySettingsUpdate {
+            recency_weight: Some(0.5),
+            recency_half_life_days: None,
+            content_type_weights: None,
+            tag_boosts: None,
+        })
+        .expect("settings update should succeed");
+
+        let persisted = std::fs::read_to_string(dir.path().join("priority_settings.json"))
+            .expect("priority_settings.json should exist");
+        assert!(persisted.contains("\"recency_weight\": 0.5"));
+        crate::services::atomic_io::assert_no_tmp_siblings(dir.path());
     }
 }

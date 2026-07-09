@@ -1,8 +1,10 @@
 //! Settings service for managing user preferences
 
 use crate::models::settings::{SettingsStatus, SettingsUpdate, UserSettings};
+use crate::services::atomic_io::write_atomic;
 use anyhow::{Context, Result};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const KEYRING_SERVICE: &str = "com.grafyn.app";
 const OPENROUTER_KEY_ACCOUNT: &str = "openrouter_api_key";
@@ -52,13 +54,7 @@ impl SettingsService {
         }
         let config_path = config_dir.join("settings.json");
 
-        let mut settings: UserSettings = if config_path.exists() {
-            let content =
-                std::fs::read_to_string(&config_path).context("Failed to read settings file")?;
-            serde_json::from_str(&content).unwrap_or_default()
-        } else {
-            UserSettings::default()
-        };
+        let mut settings: UserSettings = load_settings_from_file(&config_path)?;
 
         let mut migrated_legacy_plaintext_key = false;
 
@@ -257,7 +253,8 @@ impl SettingsService {
     fn save(&self) -> Result<()> {
         let json =
             serde_json::to_string_pretty(&self.settings).context("Failed to serialize settings")?;
-        std::fs::write(&self.config_path, json).context("Failed to write settings file")?;
+        write_atomic(&self.config_path, json.as_bytes())
+            .context("Failed to write settings file")?;
         log::info!("Settings saved to {:?}", self.config_path);
         Ok(())
     }
@@ -303,6 +300,71 @@ impl SettingsService {
         }
         self.settings.openrouter_api_key = None;
         self.save()
+    }
+}
+
+/// Load settings from `config_path`. If the file doesn't exist, returns defaults. If it
+/// exists but fails to parse (truncated write, hand edit gone wrong, etc.), the corrupt
+/// file is quarantined — renamed to `settings.json.corrupt-{unix-timestamp}` beside it —
+/// so the original bytes are never lost, an error is logged, and defaults are returned.
+///
+/// This is deliberately different from a bare `unwrap_or_default()`: without
+/// quarantining, a corrupt file would (a) silently reset every setting including the
+/// vault path, re-triggering first-run setup, and (b) get permanently overwritten by the
+/// very next `save()`, destroying any chance of recovering the original content.
+///
+/// Only parse failures are quarantined. An I/O read error (e.g. permissions) is
+/// propagated as before, since the file itself may be perfectly fine.
+fn load_settings_from_file(config_path: &Path) -> Result<UserSettings> {
+    if !config_path.exists() {
+        return Ok(UserSettings::default());
+    }
+
+    let content = std::fs::read_to_string(config_path).context("Failed to read settings file")?;
+
+    match serde_json::from_str(&content) {
+        Ok(settings) => Ok(settings),
+        Err(parse_error) => {
+            log::error!(
+                "Settings file {} is corrupt ({}); quarantining and falling back to defaults",
+                config_path.display(),
+                parse_error
+            );
+            quarantine_corrupt_file(config_path);
+            Ok(UserSettings::default())
+        }
+    }
+}
+
+/// Rename a corrupt file to `{name}.corrupt-{unix-timestamp}` in the same directory.
+/// Best-effort: if the rename itself fails, log and leave the file in place.
+fn quarantine_corrupt_file(path: &Path) {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("settings.json");
+    let quarantine_path = path.with_file_name(format!("{file_name}.corrupt-{timestamp}"));
+
+    match std::fs::rename(path, &quarantine_path) {
+        Ok(()) => {
+            log::error!(
+                "Quarantined corrupt file {} to {}",
+                path.display(),
+                quarantine_path.display()
+            );
+        }
+        Err(e) => {
+            log::error!(
+                "Failed to quarantine corrupt file {} to {}: {}",
+                path.display(),
+                quarantine_path.display(),
+                e
+            );
+        }
     }
 }
 
@@ -424,5 +486,131 @@ mod tests {
         assert!(persisted.contains("\"Fast trio\""));
 
         let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn settings_writes_are_atomic_with_no_tmp_litter() {
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let config_path = temp_dir.path().join("settings.json");
+
+        let mut service = SettingsService {
+            config_path: config_path.clone(),
+            settings: UserSettings::default(),
+        };
+
+        service
+            .update(SettingsUpdate {
+                vault_path: None,
+                openrouter_api_key: None,
+                setup_completed: None,
+                theme: Some("dark".to_string()),
+                mcp_enabled: None,
+                llm_model: None,
+                twin_llm_provider: None,
+                ollama_base_url: None,
+                ollama_model: None,
+                smart_web_search: None,
+                background_link_discovery_enabled: None,
+                background_link_discovery_llm_enabled: None,
+                background_vault_optimizer_enabled: None,
+                background_vault_optimizer_llm_enabled: None,
+                background_vault_optimizer_budget_monthly: None,
+                background_vault_optimizer_max_daily_writes: None,
+                background_vault_optimizer_edit_mode: None,
+                background_vault_optimizer_program_enabled: None,
+                vault_optimizer_program_path: None,
+                canvas_model_presets: None,
+            })
+            .expect("settings update should succeed");
+
+        let persisted = std::fs::read_to_string(&config_path).expect("settings file should exist");
+        assert!(persisted.contains("\"theme\": \"dark\""));
+        crate::services::atomic_io::assert_no_tmp_siblings(temp_dir.path());
+    }
+
+    #[test]
+    fn corrupt_settings_file_is_quarantined_and_defaults_returned() {
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let config_path = temp_dir.path().join("settings.json");
+        let corrupt_bytes = b"{ this is not valid json at all";
+        std::fs::write(&config_path, corrupt_bytes).expect("seed corrupt settings file");
+
+        let settings =
+            load_settings_from_file(&config_path).expect("should fall back to defaults, not error");
+
+        // Defaults returned, not an error and not a crash.
+        assert_eq!(settings.vault_path, UserSettings::default().vault_path);
+        assert!(settings.needs_setup());
+
+        // The original file is gone from its normal location...
+        assert!(
+            !config_path.exists(),
+            "corrupt file should be moved out of the way, not left in place"
+        );
+
+        // ...but quarantined as a sibling with the original bytes intact.
+        let quarantined: Vec<_> = std::fs::read_dir(temp_dir.path())
+            .expect("read temp dir")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.starts_with("settings.json.corrupt-"))
+                    .unwrap_or(false)
+            })
+            .collect();
+        assert_eq!(
+            quarantined.len(),
+            1,
+            "expected exactly one quarantined sibling file"
+        );
+        let quarantined_content =
+            std::fs::read(&quarantined[0]).expect("quarantined file should be readable");
+        assert_eq!(quarantined_content, corrupt_bytes);
+    }
+
+    #[test]
+    fn valid_settings_file_loads_normally() {
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let config_path = temp_dir.path().join("settings.json");
+
+        let original = UserSettings {
+            theme: "dark".to_string(),
+            vault_path: Some("/test/vault".to_string()),
+            ..UserSettings::default()
+        };
+        std::fs::write(
+            &config_path,
+            serde_json::to_string_pretty(&original).expect("serialize settings"),
+        )
+        .expect("seed valid settings file");
+
+        let loaded = load_settings_from_file(&config_path).expect("valid settings should load");
+        assert_eq!(loaded.theme, "dark");
+        assert_eq!(loaded.vault_path, Some("/test/vault".to_string()));
+
+        // Nothing should be quarantined for a healthy file.
+        let quarantined = std::fs::read_dir(temp_dir.path())
+            .expect("read temp dir")
+            .filter_map(|entry| entry.ok())
+            .any(|entry| {
+                entry
+                    .path()
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.contains(".corrupt-"))
+                    .unwrap_or(false)
+            });
+        assert!(!quarantined, "valid file should not be quarantined");
+    }
+
+    #[test]
+    fn missing_settings_file_returns_defaults_without_quarantine() {
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let config_path = temp_dir.path().join("settings.json");
+
+        let settings = load_settings_from_file(&config_path).expect("missing file is not an error");
+        assert!(settings.needs_setup());
     }
 }
