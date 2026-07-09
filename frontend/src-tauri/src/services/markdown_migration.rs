@@ -1014,15 +1014,23 @@ mod tests {
 
         let rewritten_a = std::fs::read_to_string(&path_a).expect("note a should still exist");
         let rewritten_b = std::fs::read_to_string(&path_b).expect("note b should still exist");
-        assert_ne!(rewritten_a, original_a, "apply should have rewritten note a");
-        assert_ne!(rewritten_b, original_b, "apply should have rewritten note b");
+        assert_ne!(
+            rewritten_a, original_a,
+            "apply should have rewritten note a"
+        );
+        assert_ne!(
+            rewritten_b, original_b,
+            "apply should have rewritten note b"
+        );
 
         service
             .rollback(&apply_result.run_id, &mut store)
             .expect("rollback should succeed and restore backups");
 
-        let restored_a = std::fs::read_to_string(&path_a).expect("note a should exist post-rollback");
-        let restored_b = std::fs::read_to_string(&path_b).expect("note b should exist post-rollback");
+        let restored_a =
+            std::fs::read_to_string(&path_a).expect("note a should exist post-rollback");
+        let restored_b =
+            std::fs::read_to_string(&path_b).expect("note b should exist post-rollback");
         assert_eq!(
             restored_a, original_a,
             "note a should be byte-equal to its pre-migration original after rollback"
@@ -1070,8 +1078,14 @@ mod tests {
         let second_a = std::fs::read_to_string(&path_a).expect("note a should exist");
         let second_b = std::fs::read_to_string(&path_b).expect("note b should exist");
 
-        assert_eq!(first_a, second_a, "repeated rollback must not change note a further");
-        assert_eq!(first_b, second_b, "repeated rollback must not change note b further");
+        assert_eq!(
+            first_a, second_a,
+            "repeated rollback must not change note a further"
+        );
+        assert_eq!(
+            first_b, second_b,
+            "repeated rollback must not change note b further"
+        );
     }
 
     #[test]
