@@ -379,7 +379,6 @@ impl VaultOptimizerService {
 
         Ok(Some(PendingOptimizerWrite {
             job,
-            note,
             proposal,
             change_id,
             decision,
@@ -392,6 +391,17 @@ impl VaultOptimizerService {
     /// pipeline that needs a mutable, cache-rebuilding `KnowledgeStore` write
     /// lock (`update_note` walks and reparses the vault), so callers should
     /// hold that lock only around this call — not around `prepare_next`.
+    ///
+    /// Between `prepare_next` (read lock) and this call (write lock) the
+    /// worker suspends at a real await point, so a concurrent user edit can
+    /// land in the gap. The snapshot captured in `prepare_next` is therefore
+    /// treated as stale by construction: the note is RE-FETCHED here under
+    /// the write lock, and the proposal contributes only its additive deltas
+    /// merged against the CURRENT `aliases`/`tags`/`properties` (and the
+    /// current `relative_path` is left untouched). Applying against the
+    /// snapshot instead would silently drop a tag the user just added or
+    /// revert a rename they just made. If the re-fetch shows the note gone
+    /// (deleted in the gap), the job is dropped like any missing note.
     pub fn apply_pending(
         &mut self,
         store: &mut KnowledgeStore,
@@ -399,33 +409,60 @@ impl VaultOptimizerService {
     ) -> Result<()> {
         let PendingOptimizerWrite {
             job,
-            note,
             proposal,
             change_id,
             decision,
             edit_mode,
         } = pending;
 
+        let current = match store.get_note(&job.note_id) {
+            Ok(current) => current,
+            Err(error) => {
+                log::warn!(
+                    "Skipping optimizer apply for note '{}': note disappeared between prepare and apply: {}",
+                    job.note_id,
+                    error
+                );
+                self.remove_queued_job(&job.note_id);
+                self.persist_state()?;
+                return Ok(());
+            }
+        };
+
+        // Same guard as `prepare_next`: an external edit in the gap may have
+        // (re)introduced unparsable frontmatter that must be preserved
+        // verbatim, and a full-rewrite `update_note` would destroy it.
+        if current.frontmatter_raw_fallback.is_some() {
+            log::warn!(
+                "Skipping optimizer apply for note '{}': frontmatter became unparsable between prepare and apply",
+                current.id
+            );
+            self.complete_noop_job(&job.note_id)?;
+            return Ok(());
+        }
+
         let write_result = store.update_note(
-            &note.id,
+            &current.id,
             NoteUpdate {
                 title: None,
                 content: None,
-                relative_path: Some(note.relative_path.clone()),
+                // None preserves the note's CURRENT path — never reapply the
+                // snapshot's path over an interleaved user rename.
+                relative_path: None,
                 aliases: Some(merge_unique_strings(
-                    note.aliases.clone(),
+                    current.aliases.clone(),
                     proposal.aliases.clone(),
                 )),
                 status: None,
                 tags: Some(merge_unique_strings(
-                    note.tags.clone(),
+                    current.tags.clone(),
                     proposal.tags.clone(),
                 )),
                 schema_version: Some(CURRENT_NOTE_SCHEMA_VERSION),
                 migration_source: Some("vault_optimizer".to_string()),
                 optimizer_managed: Some(false),
                 properties: Some(merge_note_properties(
-                    note.properties.clone(),
+                    current.properties.clone(),
                     proposal.properties.clone(),
                 )),
             },
@@ -435,14 +472,17 @@ impl VaultOptimizerService {
             Ok(updated) => {
                 let change = OptimizerChange {
                     change_id: change_id.clone(),
-                    note_id: note.id.clone(),
+                    note_id: current.id.clone(),
                     mode: edit_mode,
-                    note_before: Some(note.clone()),
+                    // `note_before` is the re-fetched CURRENT note (not the
+                    // stale snapshot), so a rollback restores the user's
+                    // interleaved edit instead of erasing it.
+                    note_before: Some(current.clone()),
                     note_after: Some(updated),
                     created_at: Some(Utc::now()),
                     ..Default::default()
                 };
-                self.finalize_applied_change(&job, &note, &change_id, decision, change)
+                self.finalize_applied_change(&job, &current, &change_id, decision, change)
             }
             Err(error) => self.defer_or_park_job(job, error),
         }
@@ -660,10 +700,14 @@ impl VaultOptimizerService {
 /// something other than `sidecar_first`, which applies inline within
 /// `prepare_next` instead). Returned by [`VaultOptimizerService::prepare_next`]
 /// and consumed by [`VaultOptimizerService::apply_pending`].
+///
+/// Deliberately does NOT carry the note snapshot from the prepare stage:
+/// `apply_pending` re-fetches the note under the write lock and merges the
+/// proposal's additive deltas against the note's current state, so an
+/// interleaved user edit between the two stages is never overwritten.
 #[derive(Debug, Clone)]
 pub struct PendingOptimizerWrite {
     job: QueuedOptimizerNote,
-    note: Note,
     proposal: OptimizerProposal,
     change_id: String,
     decision: VaultOptimizerDecision,
@@ -922,6 +966,126 @@ mod tests {
         assert_eq!(
             service.state.accepted_count, 2,
             "no write should be recorded past the daily cap"
+        );
+    }
+
+    #[test]
+    fn apply_pending_merges_against_current_note_not_stale_snapshot() {
+        // Between `prepare_next` (read lock) and `apply_pending` (write lock)
+        // there is a real await suspension in the background worker, so a
+        // concurrent user `update_note` can land in the gap. The apply stage
+        // must merge the proposal's ADDITIONS against the note's CURRENT
+        // state, not the snapshot captured in `prepare_next` — otherwise it
+        // silently drops the user's fresh tag and reverts their rename.
+        let vault_dir = tempdir().expect("vault tempdir should be created");
+        let data_dir = tempdir().expect("data tempdir should be created");
+        let mut store = KnowledgeStore::new(
+            vault_dir.path().to_path_buf(),
+            data_dir.path().to_path_buf(),
+        );
+
+        let note = store
+            .create_note(make_note_create("Interleaved Edit Topic"))
+            .expect("note should be created");
+
+        let mut service = VaultOptimizerService::new(data_dir.path().to_path_buf());
+        service.bootstrap(std::slice::from_ref(&note));
+
+        let settings = UserSettings {
+            background_vault_optimizer_edit_mode: "full_rewrite".to_string(),
+            ..UserSettings::default()
+        };
+
+        let pending = service
+            .prepare_next(&store, &settings)
+            .expect("prepare should not error")
+            .expect("full_rewrite mode must return a pending write");
+
+        // Simulate the interleaved user edit landing between the read-locked
+        // prepare stage and the write-locked apply stage: add a tag and move
+        // the note to a new path.
+        store
+            .update_note(
+                &note.id,
+                NoteUpdate {
+                    tags: Some(vec!["user-fresh-tag".to_string()]),
+                    relative_path: Some("renamed-by-user.md".to_string()),
+                    ..Default::default()
+                },
+            )
+            .expect("interleaved user edit should succeed");
+
+        service
+            .apply_pending(&mut store, pending)
+            .expect("apply should not error");
+
+        let final_note = store.get_note(&note.id).expect("note should still exist");
+        assert!(
+            final_note.tags.iter().any(|tag| tag == "user-fresh-tag"),
+            "the user's interleaved tag must survive the optimizer apply, got tags: {:?}",
+            final_note.tags
+        );
+        assert!(
+            final_note
+                .tags
+                .iter()
+                .any(|tag| tag == "interleaved_edit_topic"),
+            "the proposal's additive tag must still be applied, got tags: {:?}",
+            final_note.tags
+        );
+        assert_eq!(
+            final_note.relative_path, "renamed-by-user.md",
+            "the user's interleaved rename must not be reverted to the snapshot path"
+        );
+    }
+
+    #[test]
+    fn apply_pending_parks_job_when_note_deleted_in_the_gap() {
+        // If the note is deleted between prepare and apply, the apply stage
+        // must not resurrect it — the job is dropped like any missing note.
+        let vault_dir = tempdir().expect("vault tempdir should be created");
+        let data_dir = tempdir().expect("data tempdir should be created");
+        let mut store = KnowledgeStore::new(
+            vault_dir.path().to_path_buf(),
+            data_dir.path().to_path_buf(),
+        );
+
+        let note = store
+            .create_note(make_note_create("Deleted In Gap Topic"))
+            .expect("note should be created");
+
+        let mut service = VaultOptimizerService::new(data_dir.path().to_path_buf());
+        service.bootstrap(std::slice::from_ref(&note));
+
+        let settings = UserSettings {
+            background_vault_optimizer_edit_mode: "full_rewrite".to_string(),
+            ..UserSettings::default()
+        };
+
+        let pending = service
+            .prepare_next(&store, &settings)
+            .expect("prepare should not error")
+            .expect("full_rewrite mode must return a pending write");
+
+        store
+            .delete_note(&note.id)
+            .expect("interleaved delete should succeed");
+
+        service
+            .apply_pending(&mut store, pending)
+            .expect("apply of a deleted note must not error");
+
+        assert!(
+            store.get_note(&note.id).is_err(),
+            "the optimizer must not resurrect a note deleted in the gap"
+        );
+        assert!(
+            service.state.queue.is_empty(),
+            "the job for a deleted note must be dropped from the queue"
+        );
+        assert_eq!(
+            service.state.accepted_count, 0,
+            "no write should be recorded for a deleted note"
         );
     }
 
