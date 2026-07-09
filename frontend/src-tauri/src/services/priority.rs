@@ -1,4 +1,5 @@
 use crate::models::note::{NoteMeta, NoteStatus, SearchResult};
+use crate::services::atomic_io::write_atomic;
 use anyhow::Result;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -68,7 +69,7 @@ impl PriorityScoringService {
         if let Some(parent) = self.settings_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(&self.settings_path, data)?;
+        write_atomic(&self.settings_path, data.as_bytes())?;
         Ok(())
     }
 

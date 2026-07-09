@@ -7,6 +7,7 @@ use crate::models::note::{
     PROP_TOPIC_KEY,
 };
 use crate::models::settings::UserSettings;
+use crate::services::atomic_io::write_atomic;
 use crate::services::knowledge_store::KnowledgeStore;
 use crate::services::topic_hub::normalize_topic_key;
 use anyhow::{Context, Result};
@@ -341,7 +342,10 @@ impl VaultOptimizerService {
 
     fn persist_state(&self) -> Result<()> {
         std::fs::create_dir_all(&self.optimizer_dir)?;
-        std::fs::write(&self.queue_path, serde_json::to_string_pretty(&self.state)?)?;
+        write_atomic(
+            &self.queue_path,
+            serde_json::to_string_pretty(&self.state)?.as_bytes(),
+        )?;
         Ok(())
     }
 
@@ -356,9 +360,9 @@ impl VaultOptimizerService {
     fn push_decision(&self, decision: VaultOptimizerDecision) -> Result<()> {
         let mut decisions = self.load_decisions()?;
         decisions.push(decision);
-        std::fs::write(
+        write_atomic(
             &self.decisions_path,
-            serde_json::to_string_pretty(&decisions)?,
+            serde_json::to_string_pretty(&decisions)?.as_bytes(),
         )?;
         Ok(())
     }
@@ -376,15 +380,18 @@ impl VaultOptimizerService {
     fn push_inbox(&self, entry: VaultOptimizerInboxEntry) -> Result<()> {
         let mut inbox = self.load_inbox()?;
         inbox.push(entry);
-        std::fs::write(&self.inbox_path, serde_json::to_string_pretty(&inbox)?)?;
+        write_atomic(
+            &self.inbox_path,
+            serde_json::to_string_pretty(&inbox)?.as_bytes(),
+        )?;
         Ok(())
     }
 
     fn write_change(&self, change: &OptimizerChange) -> Result<()> {
         std::fs::create_dir_all(&self.changes_dir)?;
-        std::fs::write(
-            self.changes_dir.join(format!("{}.json", change.change_id)),
-            serde_json::to_string_pretty(change)?,
+        write_atomic(
+            &self.changes_dir.join(format!("{}.json", change.change_id)),
+            serde_json::to_string_pretty(change)?.as_bytes(),
         )?;
         Ok(())
     }

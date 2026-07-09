@@ -2,6 +2,7 @@ use crate::models::canvas::{
     CanvasSession, CanvasViewport, Debate, LLMNodePositionUpdate, PromptTile, SessionCreate,
     SessionMeta, SessionUpdate, TilePosition, TilePositionUpdate,
 };
+use crate::services::atomic_io::write_atomic;
 use anyhow::{Context, Result};
 use chrono::Utc;
 use std::collections::{HashMap, HashSet};
@@ -503,7 +504,7 @@ impl CanvasStore {
         let path = self.session_path(&session.id);
         let content = serde_json::to_string_pretty(session)?;
 
-        std::fs::write(&path, content)
+        write_atomic(&path, content.as_bytes())
             .with_context(|| format!("Failed to write session: {:?}", path))?;
 
         Ok(())

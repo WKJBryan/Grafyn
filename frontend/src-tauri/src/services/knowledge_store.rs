@@ -2,6 +2,7 @@ use crate::models::note::{
     Note, NoteCreate, NoteFrontmatter, NoteMeta, NoteUpdate, ParsedLink, RelationType,
     CURRENT_NOTE_SCHEMA_VERSION,
 };
+use crate::services::atomic_io::write_atomic;
 use anyhow::{Context, Result};
 use chrono::Utc;
 use gray_matter::{engine::YAML, Matter};
@@ -312,9 +313,9 @@ impl KnowledgeStore {
         if let Some(parent) = self.overlay_path(note_id).parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(
-            self.overlay_path(note_id),
-            serde_json::to_string_pretty(overlay)?,
+        write_atomic(
+            &self.overlay_path(note_id),
+            serde_json::to_string_pretty(overlay)?.as_bytes(),
         )
         .with_context(|| format!("Failed to write overlay for '{}'", note_id))?;
         Ok(())
@@ -631,7 +632,7 @@ impl KnowledgeStore {
 
         let yaml = serde_yaml::to_string(&frontmatter)?;
         let file_content = format!("---\n{}---\n\n{}", yaml, note.content);
-        std::fs::write(&path, file_content)
+        write_atomic(&path, file_content.as_bytes())
             .with_context(|| format!("Failed to write note: {}", path.display()))?;
 
         Ok(())

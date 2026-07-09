@@ -5,6 +5,7 @@ use crate::models::note::{
     ChunkResult, DiscoverLinksResponse, Note, TopicHubCandidate, ZettelLinkCandidate,
 };
 use crate::models::settings::UserSettings;
+use crate::services::atomic_io::write_atomic;
 use crate::services::retrieval::RetrievalResult;
 use crate::services::similarity::{sparse_cosine, SimilarityProvider, TfIdfProvider};
 use crate::services::yake::{self, YakeConfig, STOPWORDS};
@@ -755,7 +756,7 @@ impl LinkDiscoveryService {
         if let Some(record) = self.stored_notes.get(note_id) {
             let path = self.note_file_path(note_id);
             if let Ok(contents) = serde_json::to_string_pretty(record) {
-                let _ = std::fs::write(path, contents);
+                let _ = write_atomic(&path, contents.as_bytes());
             }
         }
     }
@@ -772,7 +773,7 @@ impl LinkDiscoveryService {
         }
 
         if let Ok(contents) = serde_json::to_string_pretty(&state) {
-            let _ = std::fs::write(&self.queue_path, contents);
+            let _ = write_atomic(&self.queue_path, contents.as_bytes());
         }
     }
 

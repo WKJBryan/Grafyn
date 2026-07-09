@@ -1,6 +1,7 @@
 //! Settings service for managing user preferences
 
 use crate::models::settings::{SettingsStatus, SettingsUpdate, UserSettings};
+use crate::services::atomic_io::write_atomic;
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 
@@ -257,7 +258,8 @@ impl SettingsService {
     fn save(&self) -> Result<()> {
         let json =
             serde_json::to_string_pretty(&self.settings).context("Failed to serialize settings")?;
-        std::fs::write(&self.config_path, json).context("Failed to write settings file")?;
+        write_atomic(&self.config_path, json.as_bytes())
+            .context("Failed to write settings file")?;
         log::info!("Settings saved to {:?}", self.config_path);
         Ok(())
     }

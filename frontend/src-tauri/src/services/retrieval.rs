@@ -9,6 +9,7 @@
 //! leverages the Zettelkasten graph structure.
 
 use crate::models::note::{ChunkResult, NoteMeta, RelationType};
+use crate::services::atomic_io::write_atomic;
 use crate::services::chunk_index::ChunkIndex;
 use crate::services::graph_index::GraphIndex;
 use crate::services::priority::PriorityScoringService;
@@ -165,7 +166,7 @@ impl RetrievalService {
         if let Some(parent) = self.config_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(&self.config_path, data)?;
+        write_atomic(&self.config_path, data.as_bytes())?;
         Ok(())
     }
 

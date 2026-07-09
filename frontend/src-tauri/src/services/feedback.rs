@@ -6,6 +6,7 @@
 use crate::models::feedback::{
     FeedbackCreate, FeedbackResponse, FeedbackStatus, FeedbackType, PendingFeedback, SystemInfo,
 };
+use crate::services::atomic_io::write_atomic;
 use anyhow::{Context, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -186,7 +187,8 @@ impl FeedbackService {
         let json = serde_json::to_string_pretty(&pending)
             .context("Failed to serialize pending feedback")?;
 
-        std::fs::write(&file_path, json).context("Failed to write pending feedback file")?;
+        write_atomic(&file_path, json.as_bytes())
+            .context("Failed to write pending feedback file")?;
 
         log::info!("Queued feedback: {}", pending.id);
         Ok(())
@@ -242,7 +244,7 @@ impl FeedbackService {
                     item.retry_count += 1;
                     let file_path = self.store_path.join(format!("{}.json", item.id));
                     if let Ok(json) = serde_json::to_string_pretty(&item) {
-                        std::fs::write(&file_path, json).ok();
+                        write_atomic(&file_path, json.as_bytes()).ok();
                     }
                     log::warn!(
                         "Failed to retry feedback {} (attempt {}): {}",

@@ -14,6 +14,7 @@ use crate::models::twin::{
 };
 #[cfg(test)]
 use crate::models::twin::{DecisionMirrorPreset, PrimitiveDecisionAssessment};
+use crate::services::atomic_io::write_atomic;
 use anyhow::{Context, Result};
 use chrono::Utc;
 use serde::Serialize;
@@ -2640,7 +2641,7 @@ impl TwinStore {
         if !content.is_empty() {
             content.push('\n');
         }
-        std::fs::write(path, content)
+        write_atomic(path, content.as_bytes())
             .with_context(|| format!("Failed to write JSONL file: {}", path.display()))
     }
 
@@ -2651,7 +2652,7 @@ impl TwinStore {
         }
 
         let content = serde_json::to_string_pretty(value)?;
-        std::fs::write(path, content)
+        write_atomic(path, content.as_bytes())
             .with_context(|| format!("Failed to write JSON file: {}", path.display()))
     }
 

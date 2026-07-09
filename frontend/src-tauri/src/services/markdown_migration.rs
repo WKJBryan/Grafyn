@@ -7,6 +7,7 @@ use crate::models::note::{
     Note, NoteCreate, NoteUpdate, CURRENT_NOTE_SCHEMA_VERSION, PROP_AUTO_INSERTED_LINK_IDS,
     PROP_INFERRED_LINK_IDS, PROP_TOPIC_ALIASES, PROP_TOPIC_KEY,
 };
+use crate::services::atomic_io::write_atomic;
 use crate::services::knowledge_store::KnowledgeStore;
 use crate::services::topic_hub::normalize_topic_key;
 use anyhow::{Context, Result};
@@ -209,9 +210,9 @@ impl MarkdownMigrationService {
 
         let run_dir = self.runs_dir.join(&preview_id);
         std::fs::create_dir_all(&run_dir)?;
-        std::fs::write(
-            run_dir.join("preview.json"),
-            serde_json::to_string_pretty(&preview)?,
+        write_atomic(
+            &run_dir.join("preview.json"),
+            serde_json::to_string_pretty(&preview)?.as_bytes(),
         )?;
 
         Ok(preview)
@@ -381,9 +382,10 @@ impl MarkdownMigrationService {
             if let Some(parent) = program_path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            std::fs::write(
+            write_atomic(
                 &program_path,
-                default_program_file_contents(&preview.hub_folder, &preview.program_path),
+                default_program_file_contents(&preview.hub_folder, &preview.program_path)
+                    .as_bytes(),
             )?;
             manifest.created_files.push(preview.program_path.clone());
         }
@@ -391,9 +393,9 @@ impl MarkdownMigrationService {
         manifest.overlay_note_ids = overlay_note_ids.clone();
         manifest.touched_note_ids = touched_note_ids.clone();
         manifest.created_hub_note_ids = created_hub_note_ids.clone();
-        std::fs::write(
-            run_dir.join("manifest.json"),
-            serde_json::to_string_pretty(&manifest)?,
+        write_atomic(
+            &run_dir.join("manifest.json"),
+            serde_json::to_string_pretty(&manifest)?.as_bytes(),
         )?;
 
         Ok(MarkdownMigrationApplyResult {
@@ -468,9 +470,9 @@ impl MarkdownMigrationService {
 
         let mut updated_manifest = manifest;
         updated_manifest.status = "rolled_back".to_string();
-        std::fs::write(
-            run_dir.join("manifest.json"),
-            serde_json::to_string_pretty(&updated_manifest)?,
+        write_atomic(
+            &run_dir.join("manifest.json"),
+            serde_json::to_string_pretty(&updated_manifest)?.as_bytes(),
         )?;
         Ok(())
     }
@@ -561,7 +563,10 @@ impl MarkdownMigrationService {
                 serde_json::from_str(&std::fs::read_to_string(&manifest_path)?)?;
             if !manifest.backup_files.contains(&relative_path.to_string()) {
                 manifest.backup_files.push(relative_path.to_string());
-                std::fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)?)?;
+                write_atomic(
+                    &manifest_path,
+                    serde_json::to_string_pretty(&manifest)?.as_bytes(),
+                )?;
             }
         }
 
