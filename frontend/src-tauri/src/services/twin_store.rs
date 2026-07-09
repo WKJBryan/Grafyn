@@ -2589,7 +2589,11 @@ impl TwinStore {
             if !path.extension().is_some_and(|ext| ext == "json") {
                 continue;
             }
-            let trace = self.read_trace_file(path)?;
+            let Some(trace) = load_or_quarantine::<SessionTrace>(path, "trace") else {
+                // A corrupt trace only omits its own evidence refs; the
+                // decision's evidence from healthy traces is still collected.
+                continue;
+            };
             for event in trace.events {
                 let event_decision_id =
                     payload_string(&event.payload, &["decision_episode_id"]).unwrap_or_default();
@@ -6740,6 +6744,53 @@ mod tests {
                 "corrupt file should be moved out of place"
             );
             assert_eq!(quarantined_siblings(&store.reflections_path).len(), 1);
+        }
+
+        #[test]
+        fn decision_evidence_refs_quarantines_corrupt_trace_and_returns_healthy_refs() {
+            let temp_dir = tempdir().expect("temp dir should be created");
+            let mut store = TwinStore::new(temp_dir.path().to_path_buf());
+
+            // Two healthy traces, each carrying one event tied to the decision.
+            store
+                .append_trace_event(
+                    "session-a",
+                    TraceEventType::DecisionEpisodeCreated,
+                    json!({"decision_episode_id": "decision-1"}),
+                )
+                .expect("trace a should append");
+            store
+                .append_trace_event(
+                    "session-b",
+                    TraceEventType::FeedbackRecorded,
+                    json!({"decision_episode_id": "decision-1"}),
+                )
+                .expect("trace b should append");
+
+            let corrupt_path = store.traces_path.join("truncated-trace.json");
+            std::fs::write(
+                &corrupt_path,
+                b"{ \"session_id\": \"broken\", \"events\": [",
+            )
+            .expect("seed truncated trace file");
+
+            let refs = store
+                .decision_evidence_refs("decision-1")
+                .expect("one corrupt trace must not brick evidence collection");
+
+            assert_eq!(
+                refs.len(),
+                2,
+                "evidence refs from both healthy traces should still be collected"
+            );
+            let mut session_ids: Vec<_> = refs.iter().map(|r| r.session_id.as_str()).collect();
+            session_ids.sort_unstable();
+            assert_eq!(session_ids, vec!["session-a", "session-b"]);
+            assert!(
+                !corrupt_path.exists(),
+                "corrupt file should be moved out of place"
+            );
+            assert_eq!(quarantined_siblings(&store.traces_path).len(), 1);
         }
     }
 }
