@@ -62,21 +62,29 @@ pub fn write_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     result
 }
 
-/// Rename with a bounded retry on `PermissionDenied`.
+/// Rename with a bounded retry on transient Windows errors.
 ///
 /// On Windows, `MoveFileExW` onto a destination that is concurrently being replaced —
 /// or briefly held open by an antivirus or search-indexer scan — can return a transient
-/// ACCESS_DENIED. Only `PermissionDenied` is retried (up to [`RENAME_ATTEMPTS`] times
-/// with doubling backoff starting at [`RENAME_BACKOFF`]); every other error kind is
-/// returned immediately. If all attempts fail, the last error is returned.
+/// ACCESS_DENIED (os error 5, `PermissionDenied`) or ERROR_SHARING_VIOLATION (os error
+/// 32, which does NOT map to `PermissionDenied`). Both are retried (up to
+/// [`RENAME_ATTEMPTS`] times with doubling backoff starting at [`RENAME_BACKOFF`]);
+/// every other error is returned immediately. If all attempts fail, the last error is
+/// returned.
 fn rename_with_retry(from: &Path, to: &Path) -> std::io::Result<()> {
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+    fn is_transient(err: &std::io::Error) -> bool {
+        err.kind() == std::io::ErrorKind::PermissionDenied
+            || err.raw_os_error() == Some(ERROR_SHARING_VIOLATION)
+    }
+
     let mut backoff = RENAME_BACKOFF;
     let mut last_err = None;
 
     for attempt in 0..RENAME_ATTEMPTS {
         match std::fs::rename(from, to) {
             Ok(()) => return Ok(()),
-            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+            Err(err) if is_transient(&err) => {
                 last_err = Some(err);
                 if attempt + 1 < RENAME_ATTEMPTS {
                     std::thread::sleep(backoff);
