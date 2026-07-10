@@ -11,7 +11,7 @@ use crate::models::twin::{
 use crate::services::ollama::OllamaService;
 use crate::services::openrouter::{ChatMessage, OpenRouterService};
 use crate::services::retrieval::RetrievalResult;
-use crate::services::twin_store::{parse_twin_prediction, TwinStore};
+use crate::services::twin::{parse_twin_prediction, TwinStore};
 use crate::AppState;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;

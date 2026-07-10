@@ -1,7 +1,7 @@
 use crate::models::canvas::{CanvasSession, ContextMode, PromptType};
 use crate::models::settings::UserSettings;
 use crate::models::twin::TraceEventType;
-use crate::services::twin_store::TwinStore;
+use crate::services::twin::TwinStore;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 

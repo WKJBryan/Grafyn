@@ -487,7 +487,7 @@ mod commit_note_write_tests {
     use crate::services::search::SearchService;
     use crate::services::settings::SettingsService;
     use crate::services::topic_hub::normalize_topic_key;
-    use crate::services::twin_store::TwinStore;
+    use crate::services::twin::TwinStore;
     use crate::services::vault_optimizer::VaultOptimizerService;
     use crate::AppState;
     use std::sync::Arc;

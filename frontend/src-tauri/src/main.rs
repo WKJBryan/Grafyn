@@ -21,7 +21,7 @@ use services::{
     retrieval::RetrievalService,
     search::SearchService,
     settings::SettingsService,
-    twin_store::TwinStore,
+    twin::TwinStore,
     vault_optimizer::{OptimizerTick, VaultOptimizerService},
 };
 use std::sync::Arc;

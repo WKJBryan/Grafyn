@@ -72,7 +72,7 @@ pub async fn update_settings(
         rebuild_all_indexes(state.inner()).await?;
         if let Some(new_twin_path) = new_twin_path {
             let mut twin_store = state.twin_store.write().await;
-            *twin_store = crate::services::twin_store::TwinStore::new(new_twin_path);
+            *twin_store = crate::services::twin::TwinStore::new(new_twin_path);
         }
         log::info!("Services rebuilt for new vault path");
     }

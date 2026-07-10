@@ -9,7 +9,7 @@ use crate::models::canvas::{
 use crate::models::twin::{
     DecisionEpisodeCreate, PrimitiveDecisionAssessment, ReflectionCardCreate, TraceEventType,
 };
-use crate::services::twin_store::TwinStore;
+use crate::services::twin::TwinStore;
 use crate::AppState;
 use chrono::Utc;
 use futures::StreamExt;
