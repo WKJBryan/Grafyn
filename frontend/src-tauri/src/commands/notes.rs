@@ -1,6 +1,6 @@
 use crate::commands::{
-    enqueue_vault_optimizer_note, remove_link_discovery_note, remove_note_chunks_from_index,
-    sync_topic_hubs,
+    commit_note_write, enqueue_vault_optimizer_note, remove_link_discovery_note,
+    remove_note_chunks_from_index, sync_topic_hubs,
 };
 use crate::models::note::{Note, NoteCreate, NoteMeta, NoteStatus, NoteUpdate};
 use crate::models::twin::TraceEventType;
@@ -45,8 +45,7 @@ pub async fn create_note(note: NoteCreate, state: State<'_, AppState>) -> Result
         )
         .await;
     }
-    sync_topic_hubs(state.inner()).await?;
-    enqueue_vault_optimizer_note(state.inner(), &created_id, "note_created").await;
+    commit_note_write(state.inner(), &created_id, "note_created").await?;
 
     let store = state.knowledge_store.read().await;
     store.get_note(&created_id).map_err(|e| e.to_string())
@@ -82,8 +81,7 @@ pub async fn update_note(
         )
         .await;
     }
-    sync_topic_hubs(state.inner()).await?;
-    enqueue_vault_optimizer_note(state.inner(), &updated_id, "note_updated").await;
+    commit_note_write(state.inner(), &updated_id, "note_updated").await?;
 
     let store = state.knowledge_store.read().await;
     store.get_note(&updated_id).map_err(|e| e.to_string())

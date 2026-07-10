@@ -1,4 +1,4 @@
-use crate::commands::{sync_chunk_index_for_note, sync_chunk_index_for_notes, sync_topic_hubs};
+use crate::commands::{commit_note_write, commit_note_writes, sync_chunk_index_for_note};
 use crate::models::note::{
     DeduplicationAction, DistillRequest, DistillResponse, ExtractionMode, HubCreatePolicy,
     HubUpdate, NoteCreate, NoteStatus, NoteUpdate,
@@ -829,7 +829,7 @@ pub async fn distill_note(
     let hub_updates: Vec<HubUpdate>;
     let mut skipped_duplicates: usize = 0;
     let mut merged_into: Vec<String> = Vec::new();
-    let mut chunk_updates = Vec::new();
+    let mut touched_ids: Vec<String> = Vec::new();
 
     for (i, candidate) in candidates.iter().enumerate() {
         // Check for duplicates
@@ -874,16 +874,7 @@ pub async fn distill_note(
                         };
 
                         if let Some(updated_note) = updated {
-                            {
-                                let mut search = state.search_service.write().await;
-                                let _ = search.index_note(&updated_note);
-                                let _ = search.commit();
-                            }
-                            {
-                                let mut graph = state.graph_index.write().await;
-                                graph.update_note(&updated_note);
-                            }
-                            chunk_updates.push(updated_note);
+                            touched_ids.push(updated_note.id);
                         }
                     }
 
@@ -945,24 +936,7 @@ pub async fn distill_note(
             store.create_note(note_create).map_err(|e| e.to_string())?
         };
 
-        // Index in search
-        {
-            let mut search = state.search_service.write().await;
-            if let Err(e) = search.index_note(&created) {
-                log::error!("Failed to index atomic note '{}': {}", created.id, e);
-            }
-            if let Err(e) = search.commit() {
-                log::error!("Failed to commit after indexing '{}': {}", created.id, e);
-            }
-        }
-
-        // Update graph
-        {
-            let mut graph = state.graph_index.write().await;
-            graph.update_note(&created);
-        }
-        chunk_updates.push(created.clone());
-
+        touched_ids.push(created.id.clone());
         created_ids.push(created.id.clone());
     }
 
@@ -1008,16 +982,7 @@ pub async fn distill_note(
         };
 
         if let Some(updated_note) = updated {
-            {
-                let mut search = state.search_service.write().await;
-                let _ = search.index_note(&updated_note);
-                let _ = search.commit();
-            }
-            {
-                let mut graph = state.graph_index.write().await;
-                graph.update_note(&updated_note);
-            }
-            chunk_updates.push(updated_note);
+            touched_ids.push(updated_note.id);
             true
         } else {
             false
@@ -1026,8 +991,7 @@ pub async fn distill_note(
         false
     };
 
-    sync_chunk_index_for_notes(state.inner(), &chunk_updates).await;
-    let synced_notes = sync_topic_hubs(state.inner()).await?;
+    let synced_notes = commit_note_writes(state.inner(), &touched_ids, "distill_note").await?;
     hub_updates = build_topic_hub_updates(&synced_notes, &created_ids, &existing_hub_ids);
 
     // 7. Build response message
@@ -1102,7 +1066,11 @@ pub async fn normalize_tags(
         store.update_note(&id, update).map_err(|e| e.to_string())?;
     }
 
-    let synced_notes = sync_topic_hubs(state.inner()).await?;
+    // Same reindex chokepoint as note create/update: a tag-only change is
+    // exactly the kind of edit `sync_topic_hubs` alone would previously miss
+    // (it only reindexes notes whose *hub* metadata changed), so this needs
+    // the full `commit_note_write` sequence too, not just `sync_topic_hubs`.
+    let synced_notes = commit_note_write(state.inner(), &id, "tags_normalized").await?;
     synced_notes
         .into_iter()
         .find(|updated| updated.id == id)

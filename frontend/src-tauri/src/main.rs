@@ -480,14 +480,35 @@ fn start_vault_optimizer_worker(state: AppState) {
                 settings.get().clone()
             };
 
-            let result = {
-                let mut store = state.knowledge_store.write().await;
+            // Lock order: knowledge_store before vault_optimizer (see
+            // commands/mod.rs doc comment). `prepare_next` only needs *read*
+            // access to the vault — it resolves the sidecar_first write path
+            // (and every no-op/error/cap-deferred case) entirely under a read
+            // lock, so LLM/network work (once added) and disk I/O here never
+            // block other note/search/canvas commands that need
+            // `knowledge_store.write()`.
+            let pending = {
+                let store = state.knowledge_store.read().await;
                 let mut optimizer = state.vault_optimizer.write().await;
-                optimizer.run_next(&mut store, &settings)
+                optimizer.prepare_next(&store, &settings)
             };
 
-            if let Err(error) = result {
-                log::warn!("Background vault optimizer failed: {}", error);
+            match pending {
+                Ok(Some(pending)) => {
+                    // Only non-`sidecar_first` edit modes reach here, and only
+                    // for the narrow `update_note` write itself — acquire the
+                    // write lock just for this, in the same canonical order.
+                    let result = {
+                        let mut store = state.knowledge_store.write().await;
+                        let mut optimizer = state.vault_optimizer.write().await;
+                        optimizer.apply_pending(&mut store, pending)
+                    };
+                    if let Err(error) = result {
+                        log::warn!("Background vault optimizer failed to apply: {}", error);
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => log::warn!("Background vault optimizer failed to prepare: {}", error),
             }
         }
     });

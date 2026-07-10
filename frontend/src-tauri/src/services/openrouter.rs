@@ -1,4 +1,5 @@
 use crate::models::canvas::{AvailableModel, ModelPricing};
+use crate::services::utf8_chunk::Utf8ChunkBuffer;
 use anyhow::{Context, Result};
 use futures::StreamExt;
 use reqwest::Client;
@@ -221,38 +222,48 @@ impl OpenRouterService {
         // Buffer raw bytes and split on SSE event boundaries (\n\n) to prevent
         // content loss from TCP chunk splitting. Without this, partial JSON lines
         // silently fail at serde_json::from_str and tokens are dropped.
+        //
+        // Bytes are decoded via `Utf8ChunkBuffer` rather than
+        // `String::from_utf8_lossy` per network chunk: a multibyte UTF-8
+        // character split across two TCP chunks would otherwise be replaced
+        // with U+FFFD before the continuation bytes ever arrive.
         let byte_stream = Box::pin(response.bytes_stream());
 
         let stream = futures::stream::unfold(
-            (byte_stream, String::new()),
-            |(mut inner, mut buffer)| async move {
+            (byte_stream, String::new(), Utf8ChunkBuffer::new()),
+            |(mut inner, mut buffer, mut utf8_buffer)| async move {
                 loop {
                     // Check for complete SSE event in buffer
                     if let Some(pos) = buffer.find("\n\n") {
                         let event = buffer[..pos].to_string();
                         buffer = buffer[pos + 2..].to_string();
-                        return Some((parse_sse_chunk(&event), (inner, buffer)));
+                        return Some((parse_sse_chunk(&event), (inner, buffer, utf8_buffer)));
                     }
 
                     // Need more data from the byte stream
                     match inner.next().await {
                         Some(Ok(bytes)) => {
-                            buffer.push_str(&String::from_utf8_lossy(&bytes));
+                            buffer.push_str(&utf8_buffer.push(&bytes));
                         }
                         Some(Err(e)) => {
                             return Some((
                                 Err(anyhow::anyhow!("Stream error: {}", e)),
-                                (inner, buffer),
+                                (inner, buffer, utf8_buffer),
                             ));
                         }
                         None => {
                             // Stream ended — flush remaining buffer
+                            buffer.push_str(&utf8_buffer.flush());
                             if !buffer.trim().is_empty() {
                                 let remaining = std::mem::take(&mut buffer);
-                                if let Ok(content) = parse_sse_chunk(&remaining) {
-                                    if !content.is_empty() {
-                                        return Some((Ok(content), (inner, buffer)));
+                                match parse_sse_chunk(&remaining) {
+                                    Ok(content) if !content.is_empty() => {
+                                        return Some((Ok(content), (inner, buffer, utf8_buffer)));
                                     }
+                                    Err(error) => {
+                                        return Some((Err(error), (inner, buffer, utf8_buffer)));
+                                    }
+                                    Ok(_) => {}
                                 }
                             }
                             return None;
@@ -288,7 +299,15 @@ fn build_reasoning(reasoning_effort: Option<&str>) -> Option<ReasoningRequest> {
     }
 }
 
-/// Parse SSE chunk to extract content
+/// Parse SSE chunk to extract content.
+///
+/// OpenRouter can emit a mid-stream error as a `data:` payload shaped like
+/// `{"error": {"message": ..., "code": ...}}` instead of the normal
+/// `StreamChunk` shape. That payload previously failed to parse as
+/// `StreamChunk` and was silently ignored, so a truncated response was
+/// classified as a normal `Completed` stream with no indication anything
+/// went wrong. Such payloads are now detected and surfaced as an `Err` so
+/// the caller can mark the response as errored instead.
 fn parse_sse_chunk(chunk: &str) -> Result<String> {
     let mut content = String::new();
 
@@ -304,6 +323,15 @@ fn parse_sse_chunk(chunk: &str) -> Result<String> {
                         content.push_str(delta_content);
                     }
                 }
+                continue;
+            }
+
+            if let Ok(error_payload) = serde_json::from_str::<StreamErrorPayload>(data) {
+                let message = error_payload
+                    .error
+                    .message
+                    .unwrap_or_else(|| "Unknown streaming error".to_string());
+                return Err(anyhow::anyhow!("OpenRouter stream error: {}", message));
             }
         }
     }
@@ -442,6 +470,22 @@ struct StreamDelta {
     content: Option<String>,
 }
 
+/// Shape of a mid-stream SSE error payload, e.g.
+/// `{"error": {"message": "rate limited", "code": 429}}`.
+#[derive(Debug, Deserialize)]
+struct StreamErrorPayload {
+    error: StreamErrorDetail,
+}
+
+#[derive(Debug, Deserialize)]
+struct StreamErrorDetail {
+    #[serde(default)]
+    message: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    code: Option<serde_json::Value>,
+}
+
 #[derive(Debug, Deserialize)]
 struct ModelsResponse {
     data: Vec<ModelInfo>,
@@ -487,5 +531,37 @@ mod tests {
 
         assert_eq!(value["reasoning"]["effort"], "high");
         assert!(value.get("max_tokens").is_none());
+    }
+
+    #[test]
+    fn parse_sse_chunk_extracts_content_from_well_formed_delta() {
+        let chunk = r#"data: {"choices":[{"delta":{"content":"hello"}}]}"#;
+        let result = parse_sse_chunk(chunk).unwrap();
+        assert_eq!(result, "hello");
+    }
+
+    #[test]
+    fn parse_sse_chunk_ignores_done_marker() {
+        let chunk = "data: [DONE]";
+        let result = parse_sse_chunk(chunk).unwrap();
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn parse_sse_chunk_surfaces_mid_stream_error_instead_of_dropping_it() {
+        let chunk = r#"data: {"error":{"message":"rate limited","code":429}}"#;
+        let result = parse_sse_chunk(chunk);
+        assert!(
+            result.is_err(),
+            "mid-stream error payload must surface as Err, not be silently dropped"
+        );
+        assert!(result.unwrap_err().to_string().contains("rate limited"));
+    }
+
+    #[test]
+    fn parse_sse_chunk_surfaces_error_with_missing_message() {
+        let chunk = r#"data: {"error":{"code":500}}"#;
+        let result = parse_sse_chunk(chunk);
+        assert!(result.is_err());
     }
 }
