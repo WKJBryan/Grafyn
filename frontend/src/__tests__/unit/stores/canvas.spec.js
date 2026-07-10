@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { flushPromises } from '@vue/test-utils'
 import { createPinia, setActivePinia } from 'pinia'
 import { useCanvasStore, THINK_HARDER_PROMPT, THINK_HARDER_WEB_SEARCH_MAX_RESULTS } from '@/stores/canvas'
 import * as apiClient from '@/api/client'
@@ -24,7 +25,7 @@ describe('Canvas Store', () => {
       return unlistenMock
     })
 
-    const sendPromptSpy = vi.spyOn(apiClient.canvas, 'sendPrompt').mockImplementation(async (_sessionId, request) => {
+    const sendPromptSpy = vi.spyOn(apiClient.canvas, 'sendPrompt').mockImplementation(async () => {
       streamHandler({
         payload: {
           session_id: 'session-1',
@@ -33,7 +34,7 @@ describe('Canvas Store', () => {
           model_id: 'openai/gpt-4'
         }
       })
-      return `request:${request.prompt}`
+      return 'child-tile'
     })
 
     const store = useCanvasStore()
@@ -71,6 +72,27 @@ describe('Canvas Store', () => {
       system_prompt: expect.stringContaining('Verify factual claims')
     }))
     expect(sendPromptSpy.mock.calls[0][1]).not.toHaveProperty('max_tokens')
+  })
+
+  it('loadModels surfaces a failure via store.error instead of failing silently', async () => {
+    vi.spyOn(apiClient.canvas, 'getModels').mockRejectedValue(new Error('OpenRouter unreachable'))
+
+    const store = useCanvasStore()
+    await store.loadModels()
+
+    expect(store.error).toBe('OpenRouter unreachable')
+    expect(store.availableModels).toEqual([])
+  })
+
+  it('loadModels clears a previous error on success', async () => {
+    const store = useCanvasStore()
+    store.error = 'stale error'
+    vi.spyOn(apiClient.canvas, 'getModels').mockResolvedValue([{ id: 'openai/gpt-4o', name: 'GPT-4o' }])
+
+    await store.loadModels()
+
+    expect(store.error).toBe(null)
+    expect(store.availableModels).toEqual([{ id: 'openai/gpt-4o', name: 'GPT-4o' }])
   })
 
   it('sendPrompt includes reasoning effort and omits max_tokens for normal prompts', async () => {
@@ -210,6 +232,26 @@ describe('Canvas Store', () => {
       prompt: 'Continue',
       reasoning_effort: 'xhigh'
     })
+  })
+
+  it('continueDebate rejects a blank prompt with a user-visible error and never calls the API', async () => {
+    const continueDebateSpy = vi.spyOn(apiClient.canvas, 'continueDebate')
+
+    const store = useCanvasStore()
+    store.currentSession = {
+      id: 'session-1',
+      prompt_tiles: [],
+      debates: [
+        { id: 'debate-1', participating_models: ['openai/gpt-4'], reasoning_effort: 'high' }
+      ]
+    }
+
+    await expect(store.continueDebate('debate-1', '   ')).rejects.toThrow(/prompt/i)
+    expect(continueDebateSpy).not.toHaveBeenCalled()
+    expect(store.error).toMatch(/prompt/i)
+
+    await expect(store.continueDebate('debate-1', undefined)).rejects.toThrow(/prompt/i)
+    expect(continueDebateSpy).not.toHaveBeenCalled()
   })
 
   it('sendPrompt includes twin answer mode and context policy for Twin Mode', async () => {
@@ -497,6 +539,181 @@ describe('Canvas Store', () => {
     })
   })
 
+  it('scopes concurrent sendPrompt streams per tile so same-model interleaved chunks do not cross-contaminate', async () => {
+    // Simulates the real Tauri behavior: every setupTauriStreamListener() call registers
+    // its own listener, and ALL listeners receive every canvas-stream event for the session.
+    const handlers = []
+    listenMock.mockImplementation(async (_eventName, handler) => {
+      handlers.push(handler)
+      return unlistenMock
+    })
+
+    function broadcast(payload) {
+      // Iterate a snapshot since a handler's own unlisten() (invoked from inside a
+      // handler-triggered callback) must not mutate the array mid-broadcast.
+      handlers.slice().forEach(handler => handler({ payload }))
+    }
+
+    let resolveA
+    let resolveB
+    vi.spyOn(apiClient.canvas, 'sendPrompt').mockImplementation(async (_sessionId, request) => {
+      if (request.prompt === 'Prompt A') {
+        return new Promise(resolve => { resolveA = resolve })
+      }
+      return new Promise(resolve => { resolveB = resolve })
+    })
+
+    const store = useCanvasStore()
+    store.currentSession = {
+      id: 'session-1',
+      prompt_tiles: [],
+      debates: []
+    }
+
+    const promiseA = store.sendPrompt('Prompt A', ['shared-model'])
+    await flushPromises()
+    const promiseB = store.sendPrompt('Prompt B', ['shared-model'])
+    await flushPromises()
+
+    expect(handlers.length).toBe(2)
+
+    // tile_created is broadcast to BOTH listeners (this is what causes duplicate-tile
+    // pushes today if the push isn't deduped by tile id).
+    broadcast({
+      session_id: 'session-1',
+      type: 'tile_created',
+      tile: {
+        id: 'tile-A',
+        prompt: 'Prompt A',
+        responses: {
+          'shared-model': { status: 'pending', content: '', position: { x: 0, y: 0, width: 280, height: 200 } }
+        }
+      }
+    })
+    broadcast({
+      session_id: 'session-1',
+      type: 'tile_created',
+      tile: {
+        id: 'tile-B',
+        prompt: 'Prompt B',
+        responses: {
+          'shared-model': { status: 'pending', content: '', position: { x: 0, y: 300, width: 280, height: 200 } }
+        }
+      }
+    })
+
+    resolveA('tile-A')
+    resolveB('tile-B')
+    await flushPromises()
+
+    // Interleave chunk events for both tiles under the SAME model id.
+    broadcast({ session_id: 'session-1', type: 'chunk', tile_id: 'tile-A', model_id: 'shared-model', chunk: 'Hello ' })
+    broadcast({ session_id: 'session-1', type: 'chunk', tile_id: 'tile-B', model_id: 'shared-model', chunk: 'World ' })
+    broadcast({ session_id: 'session-1', type: 'chunk', tile_id: 'tile-A', model_id: 'shared-model', chunk: 'from A' })
+    broadcast({ session_id: 'session-1', type: 'chunk', tile_id: 'tile-B', model_id: 'shared-model', chunk: 'from B' })
+    broadcast({ session_id: 'session-1', type: 'complete', tile_id: 'tile-A', model_id: 'shared-model' })
+    broadcast({ session_id: 'session-1', type: 'complete', tile_id: 'tile-B', model_id: 'shared-model' })
+
+    await Promise.all([promiseA, promiseB])
+
+    const tiles = store.currentSession.prompt_tiles
+    expect(tiles.map(t => t.id).sort()).toEqual(['tile-A', 'tile-B'])
+
+    const tileA = tiles.find(t => t.id === 'tile-A')
+    const tileB = tiles.find(t => t.id === 'tile-B')
+    expect(tileA.responses['shared-model'].content).toBe('Hello from A')
+    expect(tileB.responses['shared-model'].content).toBe('World from B')
+    expect(tileA.responses['shared-model'].status).toBe('completed')
+    expect(tileB.responses['shared-model'].status).toBe('completed')
+
+    // No streaming keys should remain — single-ownership decrement, no double-decrement leak.
+    expect(store.streamingModels.size).toBe(0)
+  })
+
+  it('buffers stream events arriving before invoke resolves, then replays own-tile events and drops foreign-tile ones', async () => {
+    // Exercises the buffer-replay branch: in production, canvas-stream events and the
+    // invoke() promise travel on separate channels, so chunk/complete can arrive BEFORE
+    // sendPrompt() resolves with this operation's tile id. Those events must be buffered
+    // (not guessed at), then replayed in order once the id is known — and any buffered
+    // event belonging to a different tile must be dropped at replay.
+    let streamHandler
+    listenMock.mockImplementation(async (_eventName, handler) => {
+      streamHandler = handler
+      return unlistenMock
+    })
+
+    function emit(payload) {
+      streamHandler({ payload })
+    }
+
+    let resolveInvoke
+    vi.spyOn(apiClient.canvas, 'sendPrompt').mockImplementation(async () => {
+      return new Promise(resolve => { resolveInvoke = resolve })
+    })
+
+    const store = useCanvasStore()
+    store.currentSession = {
+      id: 'session-1',
+      prompt_tiles: [
+        {
+          id: 'tile-other',
+          prompt: 'Someone else',
+          responses: {
+            'shared-model': {
+              status: 'completed',
+              content: 'untouched',
+              position: { x: 500, y: 0, width: 280, height: 200 }
+            }
+          }
+        }
+      ],
+      debates: []
+    }
+
+    const promise = store.sendPrompt('Prompt buffered', ['shared-model'])
+    await flushPromises()
+
+    // Invoke has NOT resolved yet — every tile-scoped event below lands in the buffer.
+    emit({
+      session_id: 'session-1',
+      type: 'tile_created',
+      tile: {
+        id: 'tile-own',
+        prompt: 'Prompt buffered',
+        responses: {
+          'shared-model': { status: 'pending', content: '', position: { x: 0, y: 0, width: 280, height: 200 } }
+        }
+      }
+    })
+    emit({ session_id: 'session-1', type: 'chunk', tile_id: 'tile-own', model_id: 'shared-model', chunk: 'first ' })
+    // Foreign-tile chunk interleaved into the buffer — must be dropped at replay, not
+    // appended to this operation's modelContent nor written into tile-other.
+    emit({ session_id: 'session-1', type: 'chunk', tile_id: 'tile-other', model_id: 'shared-model', chunk: 'INTRUDER' })
+    emit({ session_id: 'session-1', type: 'chunk', tile_id: 'tile-own', model_id: 'shared-model', chunk: 'second' })
+    emit({ session_id: 'session-1', type: 'complete', tile_id: 'tile-own', model_id: 'shared-model' })
+
+    // Nothing applied yet: replay only happens after invoke resolves with the tile id.
+    const tileOwnBefore = store.currentSession.prompt_tiles.find(t => t.id === 'tile-own')
+    expect(tileOwnBefore.responses['shared-model'].content).toBe('')
+
+    resolveInvoke('tile-own')
+    // If mark/replay ordering ever regresses (replay before streaming keys are marked,
+    // or buffered complete not clearing its key), this await hangs until the test times out.
+    await expect(promise).resolves.toBe('tile-own')
+
+    const tileOwn = store.currentSession.prompt_tiles.find(t => t.id === 'tile-own')
+    expect(tileOwn.responses['shared-model'].content).toBe('first second')
+    expect(tileOwn.responses['shared-model'].status).toBe('completed')
+
+    // Foreign tile untouched — its buffered chunk was dropped, not applied.
+    const tileOther = store.currentSession.prompt_tiles.find(t => t.id === 'tile-other')
+    expect(tileOther.responses['shared-model'].content).toBe('untouched')
+    expect(tileOther.responses['shared-model'].status).toBe('completed')
+
+    // Buffered complete cleared its streaming key — no leak, no timeout wait.
+    expect(store.streamingModels.size).toBe(0)
+  })
+
   it('loadSession maps persisted backend errors onto response.error_message', async () => {
     vi.spyOn(apiClient.canvas, 'get').mockResolvedValue({
       id: 'session-1',
@@ -698,6 +915,160 @@ describe('Canvas Store', () => {
       content: null
     })
     expect(result.created_record_ids).toEqual(['rec-1'])
+  })
+
+  it('session_saved reconciles silently mid-stream: no loading flash, no clobbered stream content, no reverted drag', async () => {
+    const handlers = []
+    listenMock.mockImplementation(async (_eventName, handler) => {
+      handlers.push(handler)
+      return unlistenMock
+    })
+    function broadcast(payload) {
+      handlers.slice().forEach(handler => handler({ payload }))
+    }
+
+    let resolveGet
+    vi.spyOn(apiClient.canvas, 'get').mockImplementation(() => new Promise(resolve => { resolveGet = resolve }))
+    vi.spyOn(apiClient.canvas, 'updateTilePosition').mockResolvedValue()
+
+    vi.spyOn(apiClient.canvas, 'sendPrompt').mockImplementation(async () => {
+      broadcast({
+        session_id: 'session-1',
+        type: 'tile_created',
+        tile: {
+          id: 'tile-1',
+          prompt: 'Hello',
+          position: { x: 0, y: 0, width: 200, height: 120 },
+          responses: {
+            'openai/gpt-4': { status: 'pending', content: '', position: { x: 300, y: 0, width: 280, height: 200 } }
+          }
+        }
+      })
+      return 'tile-1'
+    })
+
+    const store = useCanvasStore()
+    store.currentSession = { id: 'session-1', prompt_tiles: [], debates: [] }
+
+    const promise = store.sendPrompt('Hello', ['openai/gpt-4'])
+    await flushPromises()
+
+    // Partial content streams in
+    broadcast({ session_id: 'session-1', type: 'chunk', tile_id: 'tile-1', model_id: 'openai/gpt-4', chunk: 'Partial answer' })
+
+    // User drags the tile locally, inside the ~150ms position-debounce window
+    store.updateTilePosition('tile-1', { x: 999, y: 999 })
+
+    // Backend fires session_saved mid-stream (model is still marked streaming, not complete)
+    broadcast({ session_id: 'session-1', type: 'session_saved' })
+    await flushPromises()
+
+    // The reconciliation fetch is still in flight (resolveGet not called yet) — loading
+    // must never flip true, unlike the old wholesale loadSession() behavior.
+    expect(store.loading).toBe(false)
+
+    // Server's disk snapshot predates the chunk/drag above (stale content + stale position)
+    resolveGet({
+      id: 'session-1',
+      prompt_tiles: [
+        {
+          id: 'tile-1',
+          prompt: 'Hello',
+          position: { x: 0, y: 0, width: 200, height: 120 },
+          responses: {
+            'openai/gpt-4': { status: 'pending', content: '', position: { x: 300, y: 0, width: 280, height: 200 } }
+          }
+        }
+      ],
+      debates: []
+    })
+    await flushPromises()
+
+    expect(store.loading).toBe(false)
+    expect(store.currentSession.prompt_tiles[0].responses['openai/gpt-4'].content).toBe('Partial answer')
+    expect(store.currentSession.prompt_tiles[0].position).toMatchObject({ x: 999, y: 999 })
+
+    // Finish the stream normally
+    broadcast({ session_id: 'session-1', type: 'complete', tile_id: 'tile-1', model_id: 'openai/gpt-4' })
+    await promise
+
+    expect(store.streamingModels.size).toBe(0)
+  })
+
+  it('drops a stale session_saved reconciliation when the user has switched to another session', async () => {
+    const handlers = []
+    listenMock.mockImplementation(async (_eventName, handler) => {
+      handlers.push(handler)
+      return unlistenMock
+    })
+    function broadcast(payload) {
+      handlers.slice().forEach(handler => handler({ payload }))
+    }
+
+    // The reconciliation fetch returns session A (the session whose stream finished in
+    // the background) — it must NOT be applied once the user is viewing session B.
+    vi.spyOn(apiClient.canvas, 'get').mockResolvedValue({
+      id: 'session-A',
+      prompt_tiles: [
+        {
+          id: 'tile-A1',
+          prompt: 'Background prompt',
+          position: { x: 0, y: 0, width: 200, height: 120 },
+          responses: {
+            'openai/gpt-4': { status: 'completed', content: 'A answer', position: { x: 300, y: 0, width: 280, height: 200 } }
+          }
+        }
+      ],
+      debates: []
+    })
+
+    vi.spyOn(apiClient.canvas, 'sendPrompt').mockImplementation(async () => {
+      broadcast({
+        session_id: 'session-A',
+        type: 'tile_created',
+        tile: {
+          id: 'tile-A1',
+          prompt: 'Background prompt',
+          position: { x: 0, y: 0, width: 200, height: 120 },
+          responses: {
+            'openai/gpt-4': { status: 'pending', content: '', position: { x: 300, y: 0, width: 280, height: 200 } }
+          }
+        }
+      })
+      return 'tile-A1'
+    })
+
+    const store = useCanvasStore()
+    store.currentSession = { id: 'session-A', prompt_tiles: [], debates: [] }
+
+    const promise = store.sendPrompt('Background prompt', ['openai/gpt-4'])
+    await flushPromises()
+
+    // User switches to session B while A's stream is still in flight
+    store.currentSession = {
+      id: 'session-B',
+      prompt_tiles: [
+        {
+          id: 'tile-B1',
+          prompt: 'B prompt',
+          position: { x: 10, y: 10, width: 200, height: 120 },
+          responses: {}
+        }
+      ],
+      debates: []
+    }
+
+    // A's backend save lands — its session_saved must be dropped, not rendered under B
+    broadcast({ session_id: 'session-A', type: 'session_saved' })
+    await flushPromises()
+
+    expect(store.currentSession.id).toBe('session-B')
+    expect(store.currentSession.prompt_tiles.map(t => t.id)).toEqual(['tile-B1'])
+
+    // Let A's stream finish so the operation resolves cleanly
+    broadcast({ session_id: 'session-A', type: 'complete', tile_id: 'tile-A1', model_id: 'openai/gpt-4' })
+    await promise
+    expect(store.streamingModels.size).toBe(0)
   })
 
   it('exportTwinData proxies export requests to the twin API', async () => {

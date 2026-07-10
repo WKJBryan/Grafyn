@@ -2,7 +2,7 @@ import { describe, expect, it, beforeEach, vi } from 'vitest'
 import { mount, flushPromises } from '@vue/test-utils'
 import CanvasContainer from '@/components/canvas/CanvasContainer.vue'
 
-const { store, getOpenRouterStatus, getStatus, getSettings, updateSettings, listOllamaModels, getConstitutionSetup, saveConstitutionSetup, toastSuccess } = vi.hoisted(() => ({
+const { store, getOpenRouterStatus, getStatus, getSettings, updateSettings, listOllamaModels, getConstitutionSetup, saveConstitutionSetup, toastSuccess, toastError } = vi.hoisted(() => ({
   store: {
     currentSession: {
       id: 'session-1',
@@ -14,6 +14,7 @@ const { store, getOpenRouterStatus, getStatus, getSettings, updateSettings, list
     promptTiles: [],
     debates: [],
     availableModels: [{ id: 'openai/gpt-4o', name: 'GPT-4o', context_length: 128000 }],
+    error: null,
     loading: false,
     streamingModels: new Set(),
     debateStreamingContent: {},
@@ -59,7 +60,8 @@ const { store, getOpenRouterStatus, getStatus, getSettings, updateSettings, list
   listOllamaModels: vi.fn(),
   getConstitutionSetup: vi.fn(),
   saveConstitutionSetup: vi.fn(),
-  toastSuccess: vi.fn()
+  toastSuccess: vi.fn(),
+  toastError: vi.fn()
 }))
 
 vi.mock('@/stores/canvas', () => ({
@@ -84,7 +86,7 @@ vi.mock('@/api/client', () => ({
 vi.mock('@/composables/useToast', () => ({
   useToast: () => ({
     success: toastSuccess,
-    error: vi.fn(),
+    error: toastError,
     warning: vi.fn(),
     info: vi.fn(),
     remove: vi.fn(),
@@ -285,6 +287,8 @@ describe('CanvasContainer', () => {
     store.promptTiles = []
     store.debates = []
     store.availableModels = [{ id: 'openai/gpt-4o', name: 'GPT-4o', context_length: 128000 }]
+    store.error = null
+    store.loadModels.mockResolvedValue()
     store.listMemoryDigest.mockResolvedValue([])
     getSettings.mockResolvedValue({ smart_web_search: true, canvas_model_presets: [] })
     getStatus.mockResolvedValue({ smart_web_search: true })
@@ -299,6 +303,44 @@ describe('CanvasContainer', () => {
     })
     saveConstitutionSetup.mockResolvedValue({})
     toastSuccess.mockReset()
+    toastError.mockReset()
+  })
+
+  it('surfaces a toast when loadModels fails on mount, instead of leaving PromptDialog with no models and no explanation', async () => {
+    getOpenRouterStatus.mockResolvedValue({ has_key: true, is_configured: true })
+    store.loadModels.mockImplementation(async () => {
+      store.error = 'OpenRouter unreachable'
+    })
+
+    mountContainer()
+    await flushPromises()
+
+    expect(toastError).toHaveBeenCalledTimes(1)
+    expect(toastError.mock.calls[0][0]).toContain('OpenRouter unreachable')
+  })
+
+  it('persists the outgoing session viewport before loading a newly-switched-to session', async () => {
+    getOpenRouterStatus.mockResolvedValue({ has_key: true, is_configured: true })
+
+    const wrapper = mountContainer()
+    await flushPromises()
+
+    // Initial (immediate: true) mount must not treat "no previous session" as a switch
+    expect(store.updateViewport).not.toHaveBeenCalled()
+
+    store.loadSession.mockClear()
+    store.updateViewport.mockClear()
+
+    await wrapper.setProps({ sessionId: 'session-2' })
+    await flushPromises()
+
+    expect(store.updateViewport).toHaveBeenCalledWith({ x: 0, y: 0, zoom: 1 })
+    expect(store.loadSession).toHaveBeenCalledWith('session-2')
+    // Old session's viewport must be persisted BEFORE the new session is loaded, or the
+    // switch would already be underway (and currentSession already replaced) by the time
+    // it fires.
+    expect(store.updateViewport.mock.invocationCallOrder[0])
+      .toBeLessThan(store.loadSession.mock.invocationCallOrder[0])
   })
 
   it('opens the prompt dialog without an API key so users can choose a local twin runtime', async () => {

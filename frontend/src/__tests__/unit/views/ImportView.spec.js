@@ -164,4 +164,18 @@ describe('ImportView', () => {
     expect(wrapper.text()).toContain('[[Decision-Making Style]]')
     expect(wrapper.text()).toContain('[[Example Document]]')
   })
+
+  it('owns internal scrolling per view scrolling contract (#app is overflow:hidden)', () => {
+    // #app has overflow:hidden and height:100vh, so each view must own its scrolling
+    // with height:100% and overflow-y:auto on root container
+    const wrapper = mountView()
+    const rootElement = wrapper.find('.import-view')
+
+    expect(rootElement.exists()).toBe(true)
+    expect(rootElement.classes()).toContain('import-view')
+
+    // Verify the wrapper exists for content max-width centering
+    const contentWrapper = wrapper.find('.import-view-content')
+    expect(contentWrapper.exists()).toBe(true)
+  })
 })

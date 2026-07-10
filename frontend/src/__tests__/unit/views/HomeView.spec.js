@@ -21,6 +21,28 @@ vi.mock('@/stores/theme', () => ({
   })),
 }))
 
+const loadSessionsMock = vi.fn().mockResolvedValue()
+vi.mock('@/stores/canvas', () => ({
+  useCanvasStore: vi.fn(() => ({
+    loadSessions: loadSessionsMock,
+  })),
+}))
+
+const { toastError, toastSuccess } = vi.hoisted(() => ({
+  toastError: vi.fn(),
+  toastSuccess: vi.fn(),
+}))
+vi.mock('@/composables/useToast', () => ({
+  useToast: () => ({
+    success: toastSuccess,
+    error: toastError,
+    warning: vi.fn(),
+    info: vi.fn(),
+    remove: vi.fn(),
+    toasts: [],
+  }),
+}))
+
 // Mock child components
 vi.mock('@/components/SearchBar.vue', () => ({
   default: {
@@ -132,7 +154,13 @@ vi.mock('@/components/FeedbackModal.vue', () => ({
 vi.mock('@/components/SettingsModal.vue', () => ({
   default: {
     name: 'SettingsModal',
-    template: '<div class="settings-modal-stub"></div>',
+    template: `
+      <div class="settings-modal-stub">
+        <button class="saved-no-vault-change-btn" @click="$emit('saved', { vaultPathChanged: false })" />
+        <button class="saved-vault-change-btn" @click="$emit('saved', { vaultPathChanged: true })" />
+        <button class="setup-complete-btn" @click="$emit('setup-complete')" />
+      </div>
+    `,
     props: ['modelValue', 'isSetup'],
     emits: ['update:modelValue', 'saved', 'setup-complete'],
   },
@@ -205,6 +233,22 @@ describe('HomeView', () => {
       await flushPromises()
 
       expect(wrapper.find('.sidebar-right .link-inbox-stub').exists()).toBe(true)
+    })
+  })
+
+  // ============================================================================
+  // Error handling
+  // ============================================================================
+
+  describe('Error handling', () => {
+    it('surfaces a toast when loading notes fails, instead of failing silently', async () => {
+      vi.spyOn(apiClient.notes, 'list').mockRejectedValue(new Error('vault unreadable'))
+
+      wrapper = mount(HomeView)
+      await flushPromises()
+
+      expect(toastError).toHaveBeenCalledTimes(1)
+      expect(toastError.mock.calls[0][0]).toMatch(/failed to load notes/i)
     })
   })
 
@@ -356,6 +400,91 @@ describe('HomeView', () => {
       expect(updateSpy).toHaveBeenCalledWith('note-5', expect.objectContaining({
         title: 'Updated'
       }))
+    })
+  })
+
+  // ============================================================================
+  // Vault Switch Reset
+  // ============================================================================
+
+  describe('Vault switch reset', () => {
+    it('clears the selected note and reloads canvas sessions when settings save changes the vault path', async () => {
+      vi.spyOn(apiClient.notes, 'list').mockResolvedValue([])
+      vi.spyOn(apiClient.notes, 'get').mockResolvedValue({
+        id: 'note-5',
+        title: 'Graph Note',
+      })
+
+      wrapper = mount(HomeView)
+      await flushPromises()
+
+      // Select a note from the old vault
+      await wrapper.find('.full-graph-stub').trigger('click')
+      await flushPromises()
+      expect(wrapper.find('.note-editor-stub').exists()).toBe(true)
+
+      loadSessionsMock.mockClear()
+      const listSpy = vi.spyOn(apiClient.notes, 'list')
+      listSpy.mockClear()
+
+      await wrapper.find('[data-guide="settings-btn"]').trigger('click')
+      await wrapper.find('.saved-vault-change-btn').trigger('click')
+      await flushPromises()
+
+      // Stale note selection from the old vault must not survive the switch
+      expect(wrapper.find('.note-editor-stub').exists()).toBe(false)
+      expect(loadSessionsMock).toHaveBeenCalledTimes(1)
+      expect(listSpy).toHaveBeenCalled()
+    })
+
+    it('does not reset note selection when settings are saved without a vault path change', async () => {
+      vi.spyOn(apiClient.notes, 'list').mockResolvedValue([])
+      vi.spyOn(apiClient.notes, 'get').mockResolvedValue({
+        id: 'note-5',
+        title: 'Graph Note',
+      })
+
+      wrapper = mount(HomeView)
+      await flushPromises()
+
+      await wrapper.find('.full-graph-stub').trigger('click')
+      await flushPromises()
+      expect(wrapper.find('.note-editor-stub').exists()).toBe(true)
+
+      loadSessionsMock.mockClear()
+
+      await wrapper.find('[data-guide="settings-btn"]').trigger('click')
+      await wrapper.find('.saved-no-vault-change-btn').trigger('click')
+      await flushPromises()
+
+      expect(wrapper.find('.note-editor-stub').exists()).toBe(true)
+      expect(loadSessionsMock).not.toHaveBeenCalled()
+    })
+
+    it('clears the selected note and reloads canvas sessions when first-run setup completes', async () => {
+      vi.spyOn(apiClient.notes, 'list').mockResolvedValue([])
+      vi.spyOn(apiClient.notes, 'get').mockResolvedValue({
+        id: 'note-5',
+        title: 'Graph Note',
+      })
+
+      wrapper = mount(HomeView)
+      await flushPromises()
+
+      await wrapper.find('.full-graph-stub').trigger('click')
+      await flushPromises()
+      expect(wrapper.find('.note-editor-stub').exists()).toBe(true)
+
+      loadSessionsMock.mockClear()
+      const listSpy = vi.spyOn(apiClient.notes, 'list')
+      listSpy.mockClear()
+
+      await wrapper.find('.setup-complete-btn').trigger('click')
+      await flushPromises()
+
+      expect(wrapper.find('.note-editor-stub').exists()).toBe(false)
+      expect(loadSessionsMock).toHaveBeenCalledTimes(1)
+      expect(listSpy).toHaveBeenCalled()
     })
   })
 })

@@ -56,6 +56,31 @@ export const useCanvasStore = defineStore('canvas', () => {
     triggerRef(streamingModels)
   }
 
+  // Tracks streaming keys owned by a single in-flight operation (sendPrompt /
+  // addModelToTile / regenerateResponse). Single-ownership rule: the operation's own
+  // complete/error handler clears a key the moment that model finishes, and the
+  // operation's outer `finally` only clears whatever keys are still pending (crash/
+  // timeout safety) — so a given addStreaming() call is decremented exactly once,
+  // never both by the handler AND by the outer finally.
+  function createStreamingTracker() {
+    const pending = new Set()
+    return {
+      mark(key) {
+        if (!pending.has(key)) {
+          pending.add(key)
+          addStreaming(key)
+        }
+      },
+      clear(key) {
+        if (pending.delete(key)) removeStreaming(key)
+      },
+      finalize() {
+        pending.forEach(key => removeStreaming(key))
+        pending.clear()
+      }
+    }
+  }
+
   function normalizeResponse(response) {
     if (!response) return response
 
@@ -102,6 +127,90 @@ export const useCanvasStore = defineStore('canvas', () => {
         ...debate,
         reasoning_effort: normalizeReasoningEffort(debate.reasoning_effort)
       }))
+    }
+  }
+
+  // Silent reconciliation for `session_saved` events fired mid-stream by sendPrompt /
+  // addModelToTile / regenerateResponse. Unlike loadSession(), this must NOT touch the
+  // global `loading` flag (that flag drives CanvasContainer's full-screen overlay —
+  // toggling it on every background disk save produced a loading flash on every prompt
+  // completion) and must NOT replace currentSession wholesale, which would (a) wipe
+  // content for models still mid-stream when the save landed, and (b) snap tile/node
+  // positions back to their pre-drag values if the user dragged something inside the
+  // ~150ms position-debounce window (_debouncedPersist).
+  //
+  // Merge rule: for any tile/debate/response that exists locally, keep the LOCAL
+  // position (the server can never have a newer position than the client that set it —
+  // positions only ever originate from local drags) and keep LOCAL response
+  // content/status for any model still marked streaming (the server's disk copy
+  // predates the in-flight chunks). Everything else — prompt text, tokens_used,
+  // normalized status fields, tiles/debates the server knows about that we haven't seen
+  // a broadcast event for yet — is taken from the fresh server fetch. Tiles/debates that
+  // exist locally but are NOT yet in the server's fetch (e.g. a concurrent operation's
+  // tile_created that hasn't been persisted yet) are kept as-is, never dropped.
+  function mergeById(localItems, fetchedItems, mergeOne) {
+    const fetchedById = new Map(fetchedItems.map(item => [item.id, item]))
+    const merged = localItems.map(localItem => {
+      const fetchedItem = fetchedById.get(localItem.id)
+      if (!fetchedItem) return localItem
+      fetchedById.delete(localItem.id)
+      return mergeOne(localItem, fetchedItem)
+    })
+    merged.push(...fetchedById.values())
+    return merged
+  }
+
+  function mergeStreamingSafeResponse(localResponse, fetchedResponse, streamingKey) {
+    if (!localResponse) return fetchedResponse
+    if (streamingModels.value.has(streamingKey)) return localResponse
+    return { ...fetchedResponse, position: localResponse.position || fetchedResponse.position }
+  }
+
+  function mergeSavedSession(fetched) {
+    // Stale-save guard: session_saved can arrive for a session the user has already
+    // switched away from (its stream finishing in the background). Applying that fetch
+    // would render session A's tiles under /canvas/B — drop it instead. The switched-to
+    // session was loaded fresh by loadSession(), and A's save will be re-read from disk
+    // the next time A is opened, so nothing is lost.
+    if (!currentSession.value || currentSession.value.id !== fetched.id) return
+
+    const mergedTiles = mergeById(currentSession.value.prompt_tiles, fetched.prompt_tiles, (localTile, fetchedTile) => {
+      const responses = {}
+      for (const [modelId, fetchedResponse] of Object.entries(fetchedTile.responses || {})) {
+        responses[modelId] = mergeStreamingSafeResponse(
+          localTile.responses?.[modelId],
+          fetchedResponse,
+          `${localTile.id}:${modelId}`
+        )
+      }
+      return {
+        ...fetchedTile,
+        position: localTile.position || fetchedTile.position,
+        responses
+      }
+    })
+
+    const mergedDebates = mergeById(currentSession.value.debates || [], fetched.debates || [], (localDebate, fetchedDebate) => ({
+      ...fetchedDebate,
+      position: localDebate.position || fetchedDebate.position
+    }))
+
+    currentSession.value = {
+      ...fetched,
+      viewport: currentSession.value.viewport ?? fetched.viewport,
+      prompt_tiles: mergedTiles,
+      debates: mergedDebates
+    }
+  }
+
+  // Silent refetch used by `session_saved` handlers — does NOT set `loading`, does NOT
+  // replace currentSession wholesale. See mergeSavedSession() for the merge rule.
+  async function reconcileSessionSaved(sessionId) {
+    try {
+      const fetched = normalizeSession(await canvasApi.get(sessionId))
+      mergeSavedSession(fetched)
+    } catch (err) {
+      console.error('Failed to reconcile canvas session after save:', err)
     }
   }
 
@@ -226,9 +335,11 @@ export const useCanvasStore = defineStore('canvas', () => {
   }
 
   async function loadModels() {
+    error.value = null
     try {
       availableModels.value = await canvasApi.getModels()
     } catch (err) {
+      error.value = err.message || 'Failed to load models'
       console.error('Failed to load models:', err)
     }
   }
@@ -272,9 +383,6 @@ export const useCanvasStore = defineStore('canvas', () => {
     const sessionId = currentSession.value.id
     error.value = null
 
-    // Mark models as streaming
-    models.forEach(m => addStreaming(m))
-
     // Calculate position for new tile when branching from a parent response
     let position = undefined
     if (parentTileId && parentModelId) {
@@ -289,6 +397,23 @@ export const useCanvasStore = defineStore('canvas', () => {
         }
       }
     }
+
+    // This operation's own tile id — the ONLY reliable source is the invoke() return
+    // value below (a direct 1:1 RPC response), because tile_created is a broadcast
+    // event: every concurrent sendPrompt/addModelToTile/regenerateResponse call shares
+    // the same listener stream, so a second operation's tile_created can arrive on
+    // this operation's listener too. Until we know our own tile id, any tile-scoped
+    // event (chunk/complete/error/context_notes) is buffered rather than guessed at,
+    // then replayed and filtered once the real id is known — this covers events that
+    // arrive (as they do in production, since invoke() and events are separate
+    // channels) before the invoke() promise itself resolves.
+    //
+    // NOTE: buffering scopes events across concurrent operations within THIS window
+    // only — Tauri's per-window `window.emit()` isolation is load-bearing here, since
+    // events emitted for another window's operations never reach this listener.
+    let ownTileId = null
+    const pendingEvents = []
+    const tracker = createStreamingTracker()
 
     try {
       const modelContent = {}
@@ -313,40 +438,75 @@ export const useCanvasStore = defineStore('canvas', () => {
         web_search_max_results: webSearchMaxResults
       }
 
+      const applyContextNotes = (data) => {
+        if (currentSession.value) {
+          const tile = currentSession.value.prompt_tiles.find(t => t.id === data.tile_id)
+          if (tile) tile.context_notes = data.notes || []
+        }
+      }
+      const applyChunk = (data) => {
+        modelContent[data.model_id] = (modelContent[data.model_id] || '') + data.chunk
+        updateTileResponseLocal(data.tile_id, data.model_id, modelContent[data.model_id], 'streaming')
+      }
+      const applyComplete = (data) => {
+        updateTileResponseLocal(data.tile_id, data.model_id, modelContent[data.model_id], 'completed')
+        tracker.clear(`${ownTileId}:${data.model_id}`)
+      }
+      const applyError = (data) => {
+        updateTileResponseLocal(data.tile_id, data.model_id, '', 'error', data.error)
+        tracker.clear(`${ownTileId}:${data.model_id}`)
+      }
+      const scopedAppliers = { context_notes: applyContextNotes, chunk: applyChunk, complete: applyComplete, error: applyError }
+
       // Set up event listener BEFORE calling invoke
       const unlisten = await setupTauriStreamListener(sessionId, {
         tile_created: (data) => {
+          // Safe for every concurrent listener: push-if-absent dedupes the tile so N
+          // concurrent operations broadcasting to each other's listeners still result
+          // in exactly one push per tile, regardless of which operation it belongs to.
           if (currentSession.value && data.tile) {
-            currentSession.value.prompt_tiles.push(data.tile)
+            const exists = currentSession.value.prompt_tiles.some(t => t.id === data.tile.id)
+            if (!exists) currentSession.value.prompt_tiles.push(data.tile)
           }
         },
         context_notes: (data) => {
-          if (currentSession.value) {
-            const tile = currentSession.value.prompt_tiles.find(t => t.id === data.tile_id)
-            if (tile) tile.context_notes = data.notes || []
-          }
+          if (ownTileId === null) { pendingEvents.push(['context_notes', data]); return }
+          if (data.tile_id !== ownTileId) return
+          applyContextNotes(data)
         },
         chunk: (data) => {
-          modelContent[data.model_id] = (modelContent[data.model_id] || '') + data.chunk
-          updateTileResponseLocal(data.tile_id, data.model_id, modelContent[data.model_id], 'streaming')
+          if (ownTileId === null) { pendingEvents.push(['chunk', data]); return }
+          if (data.tile_id !== ownTileId) return
+          applyChunk(data)
         },
         complete: (data) => {
-          updateTileResponseLocal(data.tile_id, data.model_id, modelContent[data.model_id], 'completed')
-          removeStreaming(data.model_id)
+          if (ownTileId === null) { pendingEvents.push(['complete', data]); return }
+          if (data.tile_id !== ownTileId) return
+          applyComplete(data)
         },
         error: (data) => {
-          updateTileResponseLocal(data.tile_id, data.model_id, '', 'error', data.error)
-          removeStreaming(data.model_id)
+          if (ownTileId === null) { pendingEvents.push(['error', data]); return }
+          if (data.tile_id !== ownTileId) return
+          applyError(data)
         },
         session_saved: async () => {
-          await loadSession(sessionId)
+          await reconcileSessionSaved(sessionId)
         }
       })
 
       try {
         // invoke returns tile_id immediately; streaming happens via events
         const tileId = await canvasApi.sendPrompt(sessionId, request)
-        await waitForModelsComplete(models, 120000)
+        ownTileId = tileId
+        models.forEach(m => tracker.mark(`${tileId}:${m}`))
+
+        // Replay anything buffered while we didn't yet know our own tile id, dropping
+        // events that turned out to belong to a different concurrent operation.
+        pendingEvents.splice(0).forEach(([type, data]) => {
+          if (data.tile_id === ownTileId) scopedAppliers[type](data)
+        })
+
+        await waitForModelsComplete(models.map(m => `${tileId}:${m}`), 120000)
         return tileId
       } finally {
         unlisten()
@@ -356,16 +516,17 @@ export const useCanvasStore = defineStore('canvas', () => {
       console.error('Failed to send prompt:', err)
       throw err
     } finally {
-      models.forEach(m => removeStreaming(m))
+      tracker.finalize()
     }
   }
 
-  // Wait for all streaming models to complete (or timeout)
-  function waitForModelsComplete(models, timeoutMs = 120000) {
+  // Wait for all streaming keys to complete (or timeout). `keys` are the composite
+  // `${tileId}:${modelId}` streaming-state keys owned by the calling operation.
+  function waitForModelsComplete(keys, timeoutMs = 120000) {
     return new Promise((resolve) => {
       const start = Date.now()
       const check = () => {
-        const stillStreaming = models.some(m => streamingModels.value.has(m))
+        const stillStreaming = keys.some(k => streamingModels.value.has(k))
         if (!stillStreaming || Date.now() - start > timeoutMs) {
           resolve()
         } else {
@@ -709,6 +870,11 @@ export const useCanvasStore = defineStore('canvas', () => {
       throw new Error('No active session')
     }
 
+    if (!prompt || !prompt.trim()) {
+      error.value = 'Enter a prompt to continue the debate.'
+      throw new Error(error.value)
+    }
+
     const sessionId = currentSession.value.id
     const debate = currentSession.value.debates.find(d => d.id === debateId)
     if (!debate) {
@@ -816,8 +982,10 @@ export const useCanvasStore = defineStore('canvas', () => {
     const sessionId = currentSession.value.id
     error.value = null
 
-    // Mark new models as streaming
-    newModelIds.forEach(m => addStreaming(m))
+    // tileId is known synchronously (an existing tile), so streaming keys can be
+    // marked immediately — no need to learn ownership asynchronously like sendPrompt.
+    const tracker = createStreamingTracker()
+    newModelIds.forEach(m => tracker.mark(`${tileId}:${m}`))
 
     try {
       const modelContent = {}
@@ -827,33 +995,37 @@ export const useCanvasStore = defineStore('canvas', () => {
 
       const unlisten = await setupTauriStreamListener(sessionId, {
         models_added: (data) => {
-          const tile = currentSession.value.prompt_tiles.find(t => t.id === data.tile_id)
-          if (tile) {
+          if (data.tile_id !== tileId) return
+          const targetTile = currentSession.value.prompt_tiles.find(t => t.id === data.tile_id)
+          if (targetTile) {
             for (const [modelId, response] of Object.entries(data.responses)) {
-              tile.responses[modelId] = response
+              targetTile.responses[modelId] = response
             }
           }
         },
         chunk: (data) => {
+          if (data.tile_id !== tileId || !newModelIds.includes(data.model_id)) return
           modelContent[data.model_id] = (modelContent[data.model_id] || '') + data.chunk
           updateTileResponseLocal(tileId, data.model_id, modelContent[data.model_id], 'streaming')
         },
         complete: (data) => {
+          if (data.tile_id !== tileId || !newModelIds.includes(data.model_id)) return
           updateTileResponseLocal(tileId, data.model_id, modelContent[data.model_id], 'completed')
-          removeStreaming(data.model_id)
+          tracker.clear(`${tileId}:${data.model_id}`)
         },
         error: (data) => {
+          if (data.tile_id !== tileId || !newModelIds.includes(data.model_id)) return
           updateTileResponseLocal(tileId, data.model_id, '', 'error', data.error)
-          removeStreaming(data.model_id)
+          tracker.clear(`${tileId}:${data.model_id}`)
         },
         session_saved: async () => {
-          await loadSession(sessionId)
+          await reconcileSessionSaved(sessionId)
         }
       })
 
       try {
         await canvasApi.addModelsToTile(sessionId, tileId, request)
-        await waitForModelsComplete(newModelIds, 120000)
+        await waitForModelsComplete(newModelIds.map(m => `${tileId}:${m}`), 120000)
       } finally {
         unlisten()
       }
@@ -862,7 +1034,7 @@ export const useCanvasStore = defineStore('canvas', () => {
       console.error('Failed to add models to tile:', err)
       throw err
     } finally {
-      newModelIds.forEach(m => removeStreaming(m))
+      tracker.finalize()
     }
   }
 
@@ -880,8 +1052,11 @@ export const useCanvasStore = defineStore('canvas', () => {
     const sessionId = currentSession.value.id
     error.value = null
 
-    // Mark model as streaming
-    addStreaming(modelId)
+    // tileId is known synchronously (an existing tile), so the streaming key can be
+    // marked immediately.
+    const streamingKey = `${tileId}:${modelId}`
+    const tracker = createStreamingTracker()
+    tracker.mark(streamingKey)
 
     // Clear existing content
     updateTileResponseLocal(tileId, modelId, '', 'streaming')
@@ -891,31 +1066,28 @@ export const useCanvasStore = defineStore('canvas', () => {
 
       const unlisten = await setupTauriStreamListener(sessionId, {
         chunk: (data) => {
-          if (data.model_id === modelId) {
-            content += data.chunk
-            updateTileResponseLocal(tileId, modelId, content, 'streaming')
-          }
+          if (data.tile_id !== tileId || data.model_id !== modelId) return
+          content += data.chunk
+          updateTileResponseLocal(tileId, modelId, content, 'streaming')
         },
         complete: (data) => {
-          if (data.model_id === modelId) {
-            updateTileResponseLocal(tileId, modelId, content, 'completed')
-            removeStreaming(modelId)
-          }
+          if (data.tile_id !== tileId || data.model_id !== modelId) return
+          updateTileResponseLocal(tileId, modelId, content, 'completed')
+          tracker.clear(streamingKey)
         },
         error: (data) => {
-          if (data.model_id === modelId) {
-            updateTileResponseLocal(tileId, modelId, '', 'error', data.error)
-            removeStreaming(modelId)
-          }
+          if (data.tile_id !== tileId || data.model_id !== modelId) return
+          updateTileResponseLocal(tileId, modelId, '', 'error', data.error)
+          tracker.clear(streamingKey)
         },
         session_saved: async () => {
-          await loadSession(sessionId)
+          await reconcileSessionSaved(sessionId)
         }
       })
 
       try {
         await canvasApi.regenerateResponse(sessionId, tileId, modelId)
-        await waitForModelsComplete([modelId], 120000)
+        await waitForModelsComplete([streamingKey], 120000)
       } finally {
         unlisten()
       }
@@ -924,7 +1096,7 @@ export const useCanvasStore = defineStore('canvas', () => {
       console.error('Failed to regenerate response:', err)
       throw err
     } finally {
-      removeStreaming(modelId)
+      tracker.finalize()
     }
   }
 
