@@ -1,328 +1,330 @@
 <template>
   <div class="import-view">
-    <div class="import-header">
-      <h1>Import Content</h1>
-      <p class="subtitle">
-        Import conversations, documents, and transcripts as evidence notes
-      </p>
-    </div>
+    <div class="import-view-content">
+      <div class="import-header">
+        <h1>Import Content</h1>
+        <p class="subtitle">
+          Import conversations, documents, and transcripts as evidence notes
+        </p>
+      </div>
 
-    <!-- Step 1: File Selection -->
-    <div
-      v-if="!preview"
-      class="import-step"
-    >
-      <button
-        class="btn btn-primary file-btn"
-        data-guide="import-file-btn"
-        :disabled="loading"
-        @click="handlePickFile"
+      <!-- Step 1: File Selection -->
+      <div
+        v-if="!preview"
+        class="import-step"
       >
-        {{ loading ? 'Reading file...' : 'Choose Export File' }}
-      </button>
-      <p class="help-text">
-        Supported formats: ChatGPT conversations.json, Claude .dms/JSON, Grok export, Gemini export, Markdown, TXT, DOCX, PDF, and labeled interview transcripts
-      </p>
-      <p
-        v-if="error"
-        class="error-text"
-      >
-        {{ error }}
-      </p>
-    </div>
+        <button
+          class="btn btn-primary file-btn"
+          data-guide="import-file-btn"
+          :disabled="loading"
+          @click="handlePickFile"
+        >
+          {{ loading ? 'Reading file...' : 'Choose Export File' }}
+        </button>
+        <p class="help-text">
+          Supported formats: ChatGPT conversations.json, Claude .dms/JSON, Grok export, Gemini export, Markdown, TXT, DOCX, PDF, and labeled interview transcripts
+        </p>
+        <p
+          v-if="error"
+          class="error-text"
+        >
+          {{ error }}
+        </p>
+      </div>
 
-    <!-- Step 2: Preview & Select -->
-    <div
-      v-if="preview"
-      class="import-step"
-    >
-      <div class="preview-header">
-        <div class="preview-info">
-          <span class="platform-badge">{{ preview.platform }}</span>
-          <span>{{ totalContentItems }} content item{{ totalContentItems === 1 ? '' : 's' }} found</span>
+      <!-- Step 2: Preview & Select -->
+      <div
+        v-if="preview"
+        class="import-step"
+      >
+        <div class="preview-header">
+          <div class="preview-info">
+            <span class="platform-badge">{{ preview.platform }}</span>
+            <span>{{ totalContentItems }} content item{{ totalContentItems === 1 ? '' : 's' }} found</span>
+          </div>
+          <div class="preview-actions">
+            <button
+              class="btn btn-secondary"
+              @click="resetImport"
+            >
+              Choose Different File
+            </button>
+            <button
+              class="btn btn-primary"
+              :disabled="selectedIds.length === 0 || importing"
+              @click="handleImport"
+            >
+              {{ importing ? 'Importing...' : `Import ${selectedIds.length} Selected` }}
+            </button>
+          </div>
         </div>
-        <div class="preview-actions">
+
+        <div class="select-controls">
+          <button
+            class="btn btn-ghost btn-sm"
+            @click="selectAll"
+          >
+            Select All
+          </button>
+          <button
+            class="btn btn-ghost btn-sm"
+            @click="selectNone"
+          >
+            Select None
+          </button>
+        </div>
+
+        <div class="conversation-list">
+          <label
+            v-for="item in contentItems"
+            :key="item.id"
+            class="conversation-item"
+          >
+            <input
+              v-model="selectedIds"
+              type="checkbox"
+              :value="item.id"
+            >
+            <div class="conv-details">
+              <div class="conv-title">
+                {{ item.title }}
+              </div>
+              <div class="conv-meta">
+                {{ itemCountLabel(item) }}
+                <span v-if="item.metadata.model_info?.length">
+                  &middot; {{ item.metadata.model_info.join(', ') }}
+                </span>
+                <span v-if="item.metadata.created_at">
+                  &middot; {{ formatDate(item.metadata.created_at) }}
+                </span>
+              </div>
+              <div class="conv-tags">
+                <span
+                  v-for="tag in item.suggested_tags"
+                  :key="tag"
+                  class="tag"
+                >{{ tag }}</span>
+              </div>
+            </div>
+          </label>
+        </div>
+      </div>
+
+      <!-- Step 3: Results -->
+      <div
+        v-if="result"
+        class="import-step result-step"
+      >
+        <div class="result-message success">
+          {{ result.message }}
+        </div>
+        <div
+          v-if="result.errors?.length"
+          class="result-errors"
+        >
+          <p
+            v-for="(err, i) in result.errors"
+            :key="i"
+            class="error-text"
+          >
+            {{ err }}
+          </p>
+        </div>
+        <div
+          v-if="result.semantic_link_suggestions?.length"
+          class="semantic-section"
+        >
+          <div class="semantic-title">
+            Semantic Wikilink Suggestions
+          </div>
+          <div
+            v-for="(link, i) in result.semantic_link_suggestions"
+            :key="`${link.from_title}-${link.to_title}-${i}`"
+            class="semantic-row"
+          >
+            <span>[[{{ link.from_title }}]]</span>
+            <span class="semantic-arrow">-&gt;</span>
+            <span>[[{{ link.to_title }}]]</span>
+            <span
+              v-if="link.reason"
+              class="semantic-reason"
+            >{{ link.reason }}</span>
+          </div>
+        </div>
+        <p
+          v-if="result.semantic_link_error"
+          class="help-text"
+        >
+          Semantic wikilink suggestions skipped: {{ result.semantic_link_error }}
+        </p>
+        <div class="result-actions">
+          <button
+            v-if="!discoveryStarted && result.note_ids?.length"
+            class="btn btn-primary"
+            @click="startLinkDiscovery(result.note_ids)"
+          >
+            Discover Links
+          </button>
           <button
             class="btn btn-secondary"
             @click="resetImport"
           >
-            Choose Different File
+            Import More
           </button>
-          <button
-            class="btn btn-primary"
-            :disabled="selectedIds.length === 0 || importing"
-            @click="handleImport"
+          <router-link
+            to="/"
+            class="btn btn-secondary"
           >
-            {{ importing ? 'Importing...' : `Import ${selectedIds.length} Selected` }}
-          </button>
+            Go to Notes
+          </router-link>
         </div>
-      </div>
 
-      <div class="select-controls">
-        <button
-          class="btn btn-ghost btn-sm"
-          @click="selectAll"
-        >
-          Select All
-        </button>
-        <button
-          class="btn btn-ghost btn-sm"
-          @click="selectNone"
-        >
-          Select None
-        </button>
-      </div>
-
-      <div class="conversation-list">
-        <label
-          v-for="item in contentItems"
-          :key="item.id"
-          class="conversation-item"
-        >
-          <input
-            v-model="selectedIds"
-            type="checkbox"
-            :value="item.id"
-          >
-          <div class="conv-details">
-            <div class="conv-title">
-              {{ item.title }}
-            </div>
-            <div class="conv-meta">
-              {{ itemCountLabel(item) }}
-              <span v-if="item.metadata.model_info?.length">
-                &middot; {{ item.metadata.model_info.join(', ') }}
-              </span>
-              <span v-if="item.metadata.created_at">
-                &middot; {{ formatDate(item.metadata.created_at) }}
-              </span>
-            </div>
-            <div class="conv-tags">
-              <span
-                v-for="tag in item.suggested_tags"
-                :key="tag"
-                class="tag"
-              >{{ tag }}</span>
-            </div>
-          </div>
-        </label>
-      </div>
-    </div>
-
-    <!-- Step 3: Results -->
-    <div
-      v-if="result"
-      class="import-step result-step"
-    >
-      <div class="result-message success">
-        {{ result.message }}
-      </div>
-      <div
-        v-if="result.errors?.length"
-        class="result-errors"
-      >
-        <p
-          v-for="(err, i) in result.errors"
-          :key="i"
-          class="error-text"
-        >
-          {{ err }}
-        </p>
-      </div>
-      <div
-        v-if="result.semantic_link_suggestions?.length"
-        class="semantic-section"
-      >
-        <div class="semantic-title">
-          Semantic Wikilink Suggestions
-        </div>
+        <!-- Link Discovery Section -->
         <div
-          v-for="(link, i) in result.semantic_link_suggestions"
-          :key="`${link.from_title}-${link.to_title}-${i}`"
-          class="semantic-row"
+          v-if="discoveryState.size > 0"
+          class="discovery-section"
         >
-          <span>[[{{ link.from_title }}]]</span>
-          <span class="semantic-arrow">-&gt;</span>
-          <span>[[{{ link.to_title }}]]</span>
-          <span
-            v-if="link.reason"
-            class="semantic-reason"
-          >{{ link.reason }}</span>
-        </div>
-      </div>
-      <p
-        v-if="result.semantic_link_error"
-        class="help-text"
-      >
-        Semantic wikilink suggestions skipped: {{ result.semantic_link_error }}
-      </p>
-      <div class="result-actions">
-        <button
-          v-if="!discoveryStarted && result.note_ids?.length"
-          class="btn btn-primary"
-          @click="startLinkDiscovery(result.note_ids)"
-        >
-          Discover Links
-        </button>
-        <button
-          class="btn btn-secondary"
-          @click="resetImport"
-        >
-          Import More
-        </button>
-        <router-link
-          to="/"
-          class="btn btn-secondary"
-        >
-          Go to Notes
-        </router-link>
-      </div>
-
-      <!-- Link Discovery Section -->
-      <div
-        v-if="discoveryState.size > 0"
-        class="discovery-section"
-      >
-        <div class="discovery-header">
-          <div class="discovery-title-row">
-            <h3>Link Discovery</h3>
-            <span class="discovery-counter">
-              Found {{ totalCandidatesFound }} candidate{{ totalCandidatesFound !== 1 ? 's' : '' }}
-              &middot; {{ discoveryDoneCount }}/{{ discoveryState.size }} notes scanned
-            </span>
-          </div>
-          <button
-            v-if="totalSelectedCount > 0 && !batchApplying"
-            class="btn btn-primary btn-sm"
-            @click="applyAllSelected"
-          >
-            Apply All Selected ({{ totalSelectedCount }})
-          </button>
-          <span
-            v-if="batchApplying"
-            class="batch-applying"
-          >
-            <span class="loading-spinner loading-spinner-sm" />
-            Applying...
-          </span>
-        </div>
-
-        <!-- Note Status Chip Bar -->
-        <div class="note-status-bar">
-          <div
-            v-for="[noteId, entry] in discoveryState"
-            :key="noteId"
-            class="note-chip"
-            :class="{
-              pending: entry.status === 'pending',
-              loading: entry.status === 'loading',
-              done: entry.status === 'done' && entry.candidates.length > 0 && !entry.applied,
-              empty: entry.status === 'done' && entry.candidates.length === 0,
-              error: entry.status === 'error',
-              applied: entry.applied,
-            }"
-            :title="entry.noteTitle || noteId"
-            @click="entry.status === 'error' ? retryNote(noteId) : null"
-          >
-            <span class="chip-icon">
-              <span
-                v-if="entry.status === 'loading'"
-                class="loading-spinner loading-spinner-chip"
-              />
-              <template v-else-if="entry.applied">&#10003;&#10003;</template>
-              <template v-else-if="entry.status === 'done' && entry.candidates.length > 0">&#10003;</template>
-              <template v-else-if="entry.status === 'done' && entry.candidates.length === 0">&ndash;</template>
-              <template v-else-if="entry.status === 'error'">&#10005;</template>
-              <template v-else>&#9675;</template>
-            </span>
-            <span class="chip-title">{{ entry.noteTitle || noteId }}</span>
-            <span
-              v-if="entry.status === 'done' && entry.candidates.length > 0 && !entry.applied"
-              class="chip-count"
+          <div class="discovery-header">
+            <div class="discovery-title-row">
+              <h3>Link Discovery</h3>
+              <span class="discovery-counter">
+                Found {{ totalCandidatesFound }} candidate{{ totalCandidatesFound !== 1 ? 's' : '' }}
+                &middot; {{ discoveryDoneCount }}/{{ discoveryState.size }} notes scanned
+              </span>
+            </div>
+            <button
+              v-if="totalSelectedCount > 0 && !batchApplying"
+              class="btn btn-primary btn-sm"
+              @click="applyAllSelected"
             >
-              {{ entry.candidates.length }}
+              Apply All Selected ({{ totalSelectedCount }})
+            </button>
+            <span
+              v-if="batchApplying"
+              class="batch-applying"
+            >
+              <span class="loading-spinner loading-spinner-sm" />
+              Applying...
             </span>
           </div>
-        </div>
 
-        <!-- Candidate Feed -->
-        <TransitionGroup
-          v-if="flatCandidates.length > 0"
-          name="feed"
-          tag="div"
-          class="candidate-feed"
-        >
-          <div
-            v-for="item in flatCandidates"
-            :key="`${item.noteId}-${item.target_id}`"
-            class="candidate-row"
-            :class="{ applied: item.applied, selected: !item.applied && isSelected(item.noteId, item.target_id) }"
-          >
-            <label class="candidate-check">
-              <input
-                v-if="!item.applied"
-                type="checkbox"
-                :checked="isSelected(item.noteId, item.target_id)"
-                @change="toggleCandidate(item.noteId, item.target_id)"
-              >
-              <span
-                v-else
-                class="applied-check"
-              >&#10003;</span>
-            </label>
-            <div class="candidate-info">
-              <span class="source-label">from {{ item.noteTitle }}</span>
-              <div class="candidate-header">
-                <span class="candidate-title">{{ item.target_title }}</span>
+          <!-- Note Status Chip Bar -->
+          <div class="note-status-bar">
+            <div
+              v-for="[noteId, entry] in discoveryState"
+              :key="noteId"
+              class="note-chip"
+              :class="{
+                pending: entry.status === 'pending',
+                loading: entry.status === 'loading',
+                done: entry.status === 'done' && entry.candidates.length > 0 && !entry.applied,
+                empty: entry.status === 'done' && entry.candidates.length === 0,
+                error: entry.status === 'error',
+                applied: entry.applied,
+              }"
+              :title="entry.noteTitle || noteId"
+              @click="entry.status === 'error' ? retryNote(noteId) : null"
+            >
+              <span class="chip-icon">
                 <span
-                  class="confidence-badge"
-                  :class="confidenceClass(item.confidence)"
+                  v-if="entry.status === 'loading'"
+                  class="loading-spinner loading-spinner-chip"
+                />
+                <template v-else-if="entry.applied">&#10003;&#10003;</template>
+                <template v-else-if="entry.status === 'done' && entry.candidates.length > 0">&#10003;</template>
+                <template v-else-if="entry.status === 'done' && entry.candidates.length === 0">&ndash;</template>
+                <template v-else-if="entry.status === 'error'">&#10005;</template>
+                <template v-else>&#9675;</template>
+              </span>
+              <span class="chip-title">{{ entry.noteTitle || noteId }}</span>
+              <span
+                v-if="entry.status === 'done' && entry.candidates.length > 0 && !entry.applied"
+                class="chip-count"
+              >
+                {{ entry.candidates.length }}
+              </span>
+            </div>
+          </div>
+
+          <!-- Candidate Feed -->
+          <TransitionGroup
+            v-if="flatCandidates.length > 0"
+            name="feed"
+            tag="div"
+            class="candidate-feed"
+          >
+            <div
+              v-for="item in flatCandidates"
+              :key="`${item.noteId}-${item.target_id}`"
+              class="candidate-row"
+              :class="{ applied: item.applied, selected: !item.applied && isSelected(item.noteId, item.target_id) }"
+            >
+              <label class="candidate-check">
+                <input
+                  v-if="!item.applied"
+                  type="checkbox"
+                  :checked="isSelected(item.noteId, item.target_id)"
+                  @change="toggleCandidate(item.noteId, item.target_id)"
                 >
-                  {{ Math.round(item.confidence * 100) }}%
+                <span
+                  v-else
+                  class="applied-check"
+                >&#10003;</span>
+              </label>
+              <div class="candidate-info">
+                <span class="source-label">from {{ item.noteTitle }}</span>
+                <div class="candidate-header">
+                  <span class="candidate-title">{{ item.target_title }}</span>
+                  <span
+                    class="confidence-badge"
+                    :class="confidenceClass(item.confidence)"
+                  >
+                    {{ Math.round(item.confidence * 100) }}%
+                  </span>
+                </div>
+                <div
+                  v-if="item.reason"
+                  class="candidate-reason"
+                >
+                  {{ item.reason }}
+                </div>
+                <span
+                  class="link-type-badge"
+                  :class="'type-' + item.link_type"
+                >
+                  {{ item.link_type }}
                 </span>
               </div>
-              <div
-                v-if="item.reason"
-                class="candidate-reason"
-              >
-                {{ item.reason }}
-              </div>
-              <span
-                class="link-type-badge"
-                :class="'type-' + item.link_type"
-              >
-                {{ item.link_type }}
-              </span>
             </div>
-          </div>
-        </TransitionGroup>
+          </TransitionGroup>
 
-        <!-- Empty state -->
-        <div
-          v-if="discoveryDoneCount === discoveryState.size && flatCandidates.length === 0 && erroredNotes.length === 0"
-          class="feed-empty"
-        >
-          No link candidates found across {{ discoveryState.size }} note{{ discoveryState.size !== 1 ? 's' : '' }}.
-        </div>
-
-        <!-- Errors section -->
-        <div
-          v-if="erroredNotes.length > 0"
-          class="errors-section"
-        >
+          <!-- Empty state -->
           <div
-            v-for="[noteId, entry] in erroredNotes"
-            :key="noteId"
-            class="error-row"
+            v-if="discoveryDoneCount === discoveryState.size && flatCandidates.length === 0 && erroredNotes.length === 0"
+            class="feed-empty"
           >
-            <span class="error-row-title">{{ entry.noteTitle || noteId }}</span>
-            <span class="error-row-message">{{ entry.error }}</span>
-            <button
-              class="btn btn-secondary btn-sm"
-              @click="retryNote(noteId)"
+            No link candidates found across {{ discoveryState.size }} note{{ discoveryState.size !== 1 ? 's' : '' }}.
+          </div>
+
+          <!-- Errors section -->
+          <div
+            v-if="erroredNotes.length > 0"
+            class="errors-section"
+          >
+            <div
+              v-for="[noteId, entry] in erroredNotes"
+              :key="noteId"
+              class="error-row"
             >
-              Retry
-            </button>
+              <span class="error-row-title">{{ entry.noteTitle || noteId }}</span>
+              <span class="error-row-message">{{ entry.error }}</span>
+              <button
+                class="btn btn-secondary btn-sm"
+                @click="retryNote(noteId)"
+              >
+                Retry
+              </button>
+            </div>
           </div>
         </div>
       </div>
@@ -589,9 +591,17 @@ function itemCountLabel(item) {
 
 <style scoped>
 .import-view {
+  height: 100%;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+}
+
+.import-view-content {
   max-width: 800px;
   margin: 0 auto;
   padding: var(--spacing-xl);
+  width: 100%;
 }
 
 .import-header {

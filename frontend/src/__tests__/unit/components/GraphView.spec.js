@@ -3,7 +3,7 @@ import { mount, flushPromises } from '@vue/test-utils'
 import { createPinia, setActivePinia } from 'pinia'
 import GraphView from '@/components/GraphView.vue'
 import * as apiClient from '@/api/client'
-import { forceSimulation } from 'd3-force'
+import { forceSimulation, forceCenter } from 'd3-force'
 import { useBootStore } from '@/stores/boot'
 // Mock GraphSettings child component
 vi.mock('@/components/GraphSettings.vue', () => ({
@@ -35,16 +35,28 @@ vi.mock('d3-selection', () => ({
 }))
 
 vi.mock('d3-force', () => ({
-  forceSimulation: vi.fn(() => ({
-    force: vi.fn().mockReturnThis(),
-    on: vi.fn().mockReturnThis(),
-    stop: vi.fn(),
-    alpha: vi.fn().mockReturnThis(),
-    alphaTarget: vi.fn().mockReturnThis(),
-    restart: vi.fn().mockReturnThis(),
-    nodes: vi.fn().mockReturnThis(),
-    alphaDecay: vi.fn().mockReturnThis(),
-  })),
+  // A faithful-enough simulation mock: `.force(name)` returns the previously
+  // registered force object (like real d3-force), rather than always returning
+  // the simulation itself — needed so tests can assert on force.x()/force.y()
+  // calls made through simulation.force('x')/simulation.force('y').
+  forceSimulation: vi.fn(() => {
+    const registeredForces = {}
+    const sim = {
+      force: vi.fn((name, force) => {
+        if (force === undefined) return registeredForces[name]
+        registeredForces[name] = force
+        return sim
+      }),
+      on: vi.fn().mockReturnThis(),
+      stop: vi.fn(),
+      alpha: vi.fn().mockReturnThis(),
+      alphaTarget: vi.fn().mockReturnThis(),
+      restart: vi.fn().mockReturnThis(),
+      nodes: vi.fn().mockReturnThis(),
+      alphaDecay: vi.fn().mockReturnThis(),
+    }
+    return sim
+  }),
   forceLink: vi.fn(() => ({
     id: vi.fn().mockReturnThis(),
     distance: vi.fn().mockReturnThis(),
@@ -59,9 +71,11 @@ vi.mock('d3-force', () => ({
   })),
   forceX: vi.fn(() => ({
     strength: vi.fn().mockReturnThis(),
+    x: vi.fn().mockReturnThis(),
   })),
   forceY: vi.fn(() => ({
     strength: vi.fn().mockReturnThis(),
+    y: vi.fn().mockReturnThis(),
   })),
   forceCollide: vi.fn(() => ({
     strength: vi.fn().mockReturnThis(),
@@ -91,6 +105,7 @@ vi.mock('d3-transition', () => ({}))
 
 describe('GraphView', () => {
   let wrapper
+  let resizeCallback
   const mockGraphData = {
     nodes: [
       { id: '1', label: 'Note 1', val: 5, node_kind: 'note' },
@@ -113,8 +128,12 @@ describe('GraphView', () => {
     })
     vi.spyOn(apiClient.graph, 'full').mockResolvedValue(mockGraphData)
 
-    // Mock ResizeObserver
+    // Mock ResizeObserver, capturing the callback so tests can simulate a resize
+    resizeCallback = null
     global.ResizeObserver = class ResizeObserver {
+      constructor(cb) {
+        resizeCallback = cb
+      }
       observe = vi.fn()
       unobserve = vi.fn()
       disconnect = vi.fn()
@@ -174,6 +193,81 @@ describe('GraphView', () => {
     await flushPromises()
 
     expect(forceSimulation).toHaveBeenCalled()
+  })
+
+  it('stops the previous simulation before creating a new one on refresh', async () => {
+    wrapper = mount(GraphView)
+    await flushPromises()
+
+    const firstSim = forceSimulation.mock.results[0].value
+
+    const refreshBtn = wrapper.findAll('.btn-secondary')[0]
+    await refreshBtn.trigger('click')
+    await flushPromises()
+
+    expect(forceSimulation).toHaveBeenCalledTimes(2)
+    expect(firstSim.stop).toHaveBeenCalled()
+  })
+
+  it('stops the simulation on unmount', async () => {
+    wrapper = mount(GraphView)
+    await flushPromises()
+
+    const sim = forceSimulation.mock.results[0].value
+    wrapper.unmount()
+    wrapper = null
+
+    expect(sim.stop).toHaveBeenCalled()
+  })
+
+  it('updates existing forceX/forceY centers on resize instead of injecting forceCenter', async () => {
+    wrapper = mount(GraphView)
+    await flushPromises()
+
+    const sim = forceSimulation.mock.results[0].value
+    const xForce = sim.force('x')
+    const yForce = sim.force('y')
+    expect(xForce).toBeTruthy()
+    expect(yForce).toBeTruthy()
+
+    resizeCallback([{ contentRect: { width: 1000, height: 700 } }])
+    await flushPromises()
+
+    expect(forceCenter).not.toHaveBeenCalled()
+    expect(xForce.x).toHaveBeenCalledWith(500)
+    expect(yForce.y).toHaveBeenCalledWith(350)
+    expect(sim.restart).toHaveBeenCalled()
+  })
+
+  // ============================================================================
+  // Error handling
+  // ============================================================================
+
+  it('shows an inline error state when the graph fails to load', async () => {
+    apiClient.graph.full.mockRejectedValueOnce(new Error('vault read failed'))
+
+    wrapper = mount(GraphView)
+    await flushPromises()
+
+    expect(wrapper.find('.graph-error-state').exists()).toBe(true)
+    expect(wrapper.text()).toContain('vault read failed')
+    // Should not simultaneously claim the vault is merely empty
+    expect(wrapper.find('.graph-empty-state').exists()).toBe(false)
+  })
+
+  it('clears the error state after a successful retry', async () => {
+    apiClient.graph.full.mockRejectedValueOnce(new Error('vault read failed'))
+
+    wrapper = mount(GraphView)
+    await flushPromises()
+    expect(wrapper.find('.graph-error-state').exists()).toBe(true)
+
+    apiClient.graph.full.mockResolvedValueOnce(mockGraphData)
+    const retryBtn = wrapper.find('.graph-error-state button')
+    await retryBtn.trigger('click')
+    await flushPromises()
+
+    expect(wrapper.find('.graph-error-state').exists()).toBe(false)
   })
 
   // ============================================================================

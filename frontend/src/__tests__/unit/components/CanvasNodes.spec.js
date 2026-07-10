@@ -328,6 +328,53 @@ describe('Canvas Nodes', () => {
     expect(position).toEqual({ x: 30, y: 40, width: 280, height: 200 })
   })
 
+  it('collects a prompt before emitting continue on a debate node', async () => {
+    const wrapper = mountAttached(DebateNode, {
+      props: {
+        debate: {
+          id: 'debate-1',
+          participating_models: ['openai/gpt-4'],
+          rounds: [],
+          status: 'active',
+          position: { x: 0, y: 0, width: 280, height: 200 },
+          debate_mode: 'auto'
+        }
+      }
+    })
+
+    // Clicking Continue opens a prompt-collection affordance instead of emitting immediately
+    await wrapper.find('.continue-btn').trigger('click')
+    await nextTick()
+    expect(wrapper.emitted('continue')).toBeUndefined()
+    expect(wrapper.find('.continue-overlay').exists()).toBe(true)
+
+    await wrapper.find('.continue-prompt-input').setValue('Push back on the pricing argument')
+    await wrapper.find('.continue-prompt-submit').trigger('click')
+
+    expect(wrapper.emitted('continue')).toEqual([['debate-1', 'Push back on the pricing argument']])
+  })
+
+  it('does not emit continue for a blank debate prompt', async () => {
+    const wrapper = mountAttached(DebateNode, {
+      props: {
+        debate: {
+          id: 'debate-1',
+          participating_models: ['openai/gpt-4'],
+          rounds: [],
+          status: 'active',
+          position: { x: 0, y: 0, width: 280, height: 200 },
+          debate_mode: 'auto'
+        }
+      }
+    })
+
+    await wrapper.find('.continue-btn').trigger('click')
+    await nextTick()
+    await wrapper.find('.continue-prompt-submit').trigger('click')
+
+    expect(wrapper.emitted('continue')).toBeUndefined()
+  })
+
   it('shows every selected branch model chip instead of collapsing after three', async () => {
     const availableModels = [
       { id: 'openai/gpt-4', name: 'OpenAI: GPT-4' },

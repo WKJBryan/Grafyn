@@ -197,7 +197,7 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted, watch } from 'vue'
+import { ref, computed, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useCanvasStore } from '@/stores/canvas'
 import { useThemeStore } from '@/stores/theme'
@@ -207,11 +207,13 @@ import SettingsModal from '@/components/SettingsModal.vue'
 import ConfirmDialog from '@/components/ConfirmDialog.vue'
 import GIcon from '@/components/ui/GIcon.vue'
 import { useGuide } from '@/composables/useGuide'
+import { useToast } from '@/composables/useToast'
 
 const route = useRoute()
 const router = useRouter()
 const canvasStore = useCanvasStore()
 const themeStore = useThemeStore()
+const toast = useToast()
 
 // Local state
 const showCreateDialog = ref(false)
@@ -245,12 +247,11 @@ onMounted(async () => {
   await canvasStore.loadSessions()
 })
 
-// Watch for route changes
-watch(() => route.params.id, async (newId) => {
-  if (newId) {
-    await canvasStore.loadSession(newId)
-  }
-})
+// NOTE: session loading for a given route id is owned solely by CanvasContainer's own
+// `props.sessionId` watcher (immediate: true) — it fires on both the initial deep-link
+// mount and every subsequent route change, since CanvasContainer is re-rendered with a
+// new `sessionId` prop whenever `currentSessionId` changes below. A second watcher here
+// used to duplicate that IPC call and race it to set `currentSession` — do not re-add it.
 
 // Methods
 function selectSession(sessionId) {
@@ -304,7 +305,11 @@ function onSessionLoaded(_session) {
 function handleSettingsSaved(changes = {}) {
   showSettingsModal.value = false
   if (changes.modelSourceChanged) {
-    canvasStore.loadModels()
+    canvasStore.loadModels().then(() => {
+      if (canvasStore.error) {
+        toast.error(`Failed to load models: ${canvasStore.error}`)
+      }
+    })
   }
 }
 
