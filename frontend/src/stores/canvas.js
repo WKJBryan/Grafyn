@@ -167,10 +167,12 @@ export const useCanvasStore = defineStore('canvas', () => {
   }
 
   function mergeSavedSession(fetched) {
-    if (!currentSession.value || currentSession.value.id !== fetched.id) {
-      currentSession.value = fetched
-      return
-    }
+    // Stale-save guard: session_saved can arrive for a session the user has already
+    // switched away from (its stream finishing in the background). Applying that fetch
+    // would render session A's tiles under /canvas/B — drop it instead. The switched-to
+    // session was loaded fresh by loadSession(), and A's save will be re-read from disk
+    // the next time A is opened, so nothing is lost.
+    if (!currentSession.value || currentSession.value.id !== fetched.id) return
 
     const mergedTiles = mergeById(currentSession.value.prompt_tiles, fetched.prompt_tiles, (localTile, fetchedTile) => {
       const responses = {}

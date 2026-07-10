@@ -995,6 +995,82 @@ describe('Canvas Store', () => {
     expect(store.streamingModels.size).toBe(0)
   })
 
+  it('drops a stale session_saved reconciliation when the user has switched to another session', async () => {
+    const handlers = []
+    listenMock.mockImplementation(async (_eventName, handler) => {
+      handlers.push(handler)
+      return unlistenMock
+    })
+    function broadcast(payload) {
+      handlers.slice().forEach(handler => handler({ payload }))
+    }
+
+    // The reconciliation fetch returns session A (the session whose stream finished in
+    // the background) — it must NOT be applied once the user is viewing session B.
+    vi.spyOn(apiClient.canvas, 'get').mockResolvedValue({
+      id: 'session-A',
+      prompt_tiles: [
+        {
+          id: 'tile-A1',
+          prompt: 'Background prompt',
+          position: { x: 0, y: 0, width: 200, height: 120 },
+          responses: {
+            'openai/gpt-4': { status: 'completed', content: 'A answer', position: { x: 300, y: 0, width: 280, height: 200 } }
+          }
+        }
+      ],
+      debates: []
+    })
+
+    vi.spyOn(apiClient.canvas, 'sendPrompt').mockImplementation(async () => {
+      broadcast({
+        session_id: 'session-A',
+        type: 'tile_created',
+        tile: {
+          id: 'tile-A1',
+          prompt: 'Background prompt',
+          position: { x: 0, y: 0, width: 200, height: 120 },
+          responses: {
+            'openai/gpt-4': { status: 'pending', content: '', position: { x: 300, y: 0, width: 280, height: 200 } }
+          }
+        }
+      })
+      return 'tile-A1'
+    })
+
+    const store = useCanvasStore()
+    store.currentSession = { id: 'session-A', prompt_tiles: [], debates: [] }
+
+    const promise = store.sendPrompt('Background prompt', ['openai/gpt-4'])
+    await flushPromises()
+
+    // User switches to session B while A's stream is still in flight
+    store.currentSession = {
+      id: 'session-B',
+      prompt_tiles: [
+        {
+          id: 'tile-B1',
+          prompt: 'B prompt',
+          position: { x: 10, y: 10, width: 200, height: 120 },
+          responses: {}
+        }
+      ],
+      debates: []
+    }
+
+    // A's backend save lands — its session_saved must be dropped, not rendered under B
+    broadcast({ session_id: 'session-A', type: 'session_saved' })
+    await flushPromises()
+
+    expect(store.currentSession.id).toBe('session-B')
+    expect(store.currentSession.prompt_tiles.map(t => t.id)).toEqual(['tile-B1'])
+
+    // Let A's stream finish so the operation resolves cleanly
+    broadcast({ session_id: 'session-A', type: 'complete', tile_id: 'tile-A1', model_id: 'openai/gpt-4' })
+    await promise
+    expect(store.streamingModels.size).toBe(0)
+  })
+
   it('exportTwinData proxies export requests to the twin API', async () => {
     const exportSpy = vi.spyOn(apiClient.twin, 'exportData').mockResolvedValue({
       train: { count: 3 },
