@@ -197,94 +197,7 @@
 
         <TwinDecisionsTab v-else-if="twinStore.activeTab === 'decisions'" />
 
-        <section
-          v-else-if="twinStore.activeTab === 'memory'"
-          class="tab-panel memory-grid"
-        >
-          <section class="workspace-band">
-            <div class="panel-header compact">
-              <div>
-                <h2>Adaptive Digest</h2>
-                <span>{{ twinStore.memoryDigestItems.length }} clustered items</span>
-              </div>
-            </div>
-            <div
-              v-if="twinStore.memoryDigestItems.length === 0"
-              class="empty-panel"
-            >
-              No digest items need review.
-            </div>
-            <article
-              v-for="item in twinStore.memoryDigestItems"
-              :key="item.id"
-              class="digest-card"
-            >
-              <div class="card-topline">
-                <span class="status-pill">{{ statusLabel(item.state) }}</span>
-                <span>{{ item.evidence_count }} evidence</span>
-                <span>{{ item.trigger_reason }}</span>
-              </div>
-              <p>{{ item.pattern }}</p>
-              <small v-if="item.latest_evidence?.summary">{{ item.latest_evidence.summary }}</small>
-              <ReviewActions
-                @review="action => twinStore.reviewMemoryDigestItem(item.id, action)"
-              />
-            </article>
-          </section>
-
-          <section class="workspace-band">
-            <div class="panel-header compact">
-              <div>
-                <h2>User Records</h2>
-                <span>{{ twinStore.filteredReviewRecords.length }} shown</span>
-              </div>
-              <select v-model="twinStore.selectedRecordState">
-                <option
-                  v-for="state in recordStates"
-                  :key="state"
-                  :value="state"
-                >
-                  {{ statusLabel(state) }}
-                </option>
-              </select>
-            </div>
-            <div
-              v-if="twinStore.filteredReviewRecords.length === 0"
-              class="empty-panel"
-            >
-              No records in this state.
-            </div>
-            <article
-              v-for="item in twinStore.filteredReviewRecords"
-              :key="item.record.id"
-              class="record-card"
-            >
-              <div class="card-topline">
-                <span class="status-pill">{{ kindLabel(item.record.kind) }}</span>
-                <span>{{ statusLabel(item.record.promotion_state) }}</span>
-                <span>{{ item.evidence_count }} evidence</span>
-              </div>
-              <p>{{ item.record.content }}</p>
-              <div class="record-actions">
-                <button @click="twinStore.openEvidence(item.record.id)">
-                  Evidence
-                </button>
-                <button @click="twinStore.setPromotion(item.record.id, 'endorsed')">
-                  Endorse
-                </button>
-                <button @click="twinStore.setPromotion(item.record.id, 'private')">
-                  Private
-                </button>
-                <button @click="twinStore.setPromotion(item.record.id, 'no_train')">
-                  No Train
-                </button>
-                <button @click="twinStore.setPromotion(item.record.id, 'rejected')">
-                  Reject
-                </button>
-              </div>
-            </article>
-          </section>
-        </section>
+        <TwinMemoryTab v-else-if="twinStore.activeTab === 'memory'" />
 
         <TwinSetupTab v-else-if="twinStore.activeTab === 'setup'" />
 
@@ -352,16 +265,14 @@ import { useTwinStore } from '@/stores/twin'
 import {
   decisionState,
   decisionChips,
-  statusLabel,
-  kindLabel,
   formatPercent,
   formatDate,
   eventLabel
 } from '@/utils/twinFormat'
-import ReviewActions from '@/components/twin/ReviewActions.vue'
 import TwinActionGapsTab from '@/components/twin/TwinActionGapsTab.vue'
 import TwinConstitutionTab from '@/components/twin/TwinConstitutionTab.vue'
 import TwinDecisionsTab from '@/components/twin/TwinDecisionsTab.vue'
+import TwinMemoryTab from '@/components/twin/TwinMemoryTab.vue'
 import TwinGuideTab from '@/components/twin/TwinGuideTab.vue'
 import TwinSetupTab from '@/components/twin/TwinSetupTab.vue'
 import TwinConfigTab from '@/components/twin/TwinConfigTab.vue'
@@ -404,7 +315,6 @@ const navGroups = computed(() => [
   }
 ])
 
-const recordStates = ['candidate', 'auto_promoted', 'endorsed', 'private', 'no_train', 'rejected']
 const route = useRoute() || { query: {} }
 // Matches the original per-mount ref initialization: every time this view
 // mounts, the active tab is (re)computed from the current route query.
