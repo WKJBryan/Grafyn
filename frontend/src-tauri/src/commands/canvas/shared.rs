@@ -2,7 +2,6 @@ use crate::models::canvas::{CanvasSession, ContextMode, PromptType};
 use crate::models::settings::UserSettings;
 use crate::models::twin::TraceEventType;
 use crate::services::twin_store::TwinStore;
-use serde_json::json;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -65,7 +64,10 @@ pub(super) fn source_tile_context_provider(
     (false, None)
 }
 
-pub(super) fn is_vault_context_prompt(prompt_type: &PromptType, context_mode: &ContextMode) -> bool {
+pub(super) fn is_vault_context_prompt(
+    prompt_type: &PromptType,
+    context_mode: &ContextMode,
+) -> bool {
     prompt_type == &PromptType::Decision
         || matches!(
             context_mode,
@@ -77,7 +79,10 @@ pub(super) fn is_vault_context_prompt(prompt_type: &PromptType, context_mode: &C
         )
 }
 
-pub(super) fn effective_model_ids(route: &ModelRoute, requested_model_ids: &[String]) -> Vec<String> {
+pub(super) fn effective_model_ids(
+    route: &ModelRoute,
+    requested_model_ids: &[String],
+) -> Vec<String> {
     match route.provider {
         ModelProviderRoute::Ollama => {
             if requested_model_ids.is_empty() {
