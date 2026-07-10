@@ -15,6 +15,7 @@
     "test:run": "vitest run",
     "test:coverage": "vitest run --coverage",
     "prepare:sidecar": "node scripts/prepare-sidecar.cjs",
+    "check:file-sizes": "node scripts/check-file-sizes.cjs",
     "tauri": "tauri",
     "tauri:dev": "node scripts/run-tauri.cjs dev",
     "tauri:build": "node scripts/run-tauri.cjs build",
