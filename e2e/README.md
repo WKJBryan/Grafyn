@@ -2,6 +2,8 @@
 
 The E2E suite drives the desktop UI (via Vite dev server) without a separate backend or Python service. Web mode is removed.
 
+**Manual-only, not wired into CI.** All API calls go through `invoke()` from `@tauri-apps/api/tauri`, which requires a live Tauri IPC backend. Against a plain `npm run dev` Vite server in an ordinary browser (which is all a hosted CI runner can cheaply provide), there is no IPC handler, so `get_boot_status`/`settings.get()` calls never resolve and the app's boot sequence gets stuck in its `failed` phase — a `.startup-splash[data-phase="failed"]` overlay blocks all pointer interaction. Confirmed by running `npx playwright test --project=chromium tests/navigation.spec.js`: the 10 tests that only check static layout pass, but the 11 that need working IPC (note creation, TreeNav selection, canvas navigation, refresh persistence) fail/time out waiting on elements blocked by the failed-boot overlay. Running the suite for real requires the built/dev Tauri desktop app (`npm run tauri:dev`) as the IPC backend, which CI cannot provide cheaply (Tauri v1 GTK/webkit2gtk build + a display). Run it locally instead — see `npm run e2e` in `frontend/package.json`.
+
 ## Setup
 ```bash
 cd e2e

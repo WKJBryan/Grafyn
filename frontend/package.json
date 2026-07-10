@@ -22,7 +22,8 @@
     "release:verify": "node scripts/release-verify.cjs",
     "release:prepare": "node scripts/release-tag.cjs --prepare-only",
     "release:tag": "node scripts/release-tag.cjs",
-    "generate-icons": "node scripts/generate-icons.cjs && npx tauri icon src-tauri/icons/app-icon.png"
+    "generate-icons": "node scripts/generate-icons.cjs && npx tauri icon src-tauri/icons/app-icon.png",
+    "e2e": "echo 'Manual only: the Playwright suite needs a live Tauri IPC backend (run \"npm run tauri:dev\" first), so it cannot run against a plain browser or in CI. See e2e/README.md.' && cd ../e2e && npm install && npm test"
   },
   "dependencies": {
     "@tauri-apps/api": "^1.6.0",
