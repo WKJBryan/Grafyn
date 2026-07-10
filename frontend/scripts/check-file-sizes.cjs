@@ -2,7 +2,8 @@
 
 // Size tripwire: fails when a source file grows past a line-count threshold.
 // Catches the "one file does everything" drift this refactor split apart
-// (commands/canvas.rs, services/twin_store.rs) before it recurs. See
+// (the old single-file commands/canvas.rs and services/twin_store.rs, now
+// the commands/canvas/ and services/twin/ module directories) before it recurs. See
 // CLAUDE.md "Working conventions" for the ~1,500-line authoring target —
 // this threshold (2,500) is a hard CI failure with headroom above that.
 

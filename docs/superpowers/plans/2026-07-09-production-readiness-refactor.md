@@ -260,7 +260,7 @@
 - [ ] Add convention to CLAUDE.md: source files should stay under ~1,500 lines; new cross-cutting write paths must go through `commit_note_write`/`write_atomic`.
 - [ ] Optional CI tripwire: a 10-line script failing the lint job when any `src-tauri/src/**/*.rs` or `src/**/*.{vue,js}` exceeds 2,000 lines (excluding tests). Decide with owner at PR time.
 
-**Phase 4 acceptance:** no public behavior change (full Rust + Vitest + e2e suites green before/after); largest source file < 2,000 lines; twin state has a real store.
+**Phase 4 acceptance:** no public behavior change (full Rust + Vitest + e2e suites green before/after); source files target ~1,500 lines with a 2,500-line CI hard-fail (owner decision 2026-07-10: `commands/canvas/context.rs` at 2,279 accepted — keeping the twin Simulation gate and its 21 tests together outweighs the original < 2,000 line goal); twin state has a real store.
 
 ---
 
