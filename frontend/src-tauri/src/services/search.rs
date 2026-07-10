@@ -145,10 +145,18 @@ impl SearchService {
         Ok(())
     }
 
-    /// Commit pending changes
+    /// Commit pending changes and reload the reader.
+    ///
+    /// The reader uses `ReloadPolicy::OnCommitWithDelay`, which reloads
+    /// asynchronously on a background thread after commit — there's no
+    /// guarantee a `search()` immediately following `commit()` sees the new
+    /// segment. Reloading synchronously here closes that race so a note is
+    /// guaranteed searchable as soon as `commit()` returns (mirrors
+    /// `ChunkIndex::commit()`, which already does this).
     pub fn commit(&mut self) -> Result<()> {
         if let Some(writer) = self.writer.as_mut() {
             writer.commit()?;
+            self.reader.reload()?;
         }
         Ok(())
     }

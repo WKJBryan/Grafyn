@@ -1,4 +1,4 @@
-use crate::commands::{enqueue_vault_optimizer_note, sync_topic_hubs};
+use crate::commands::{commit_note_writes, enqueue_vault_optimizer_note};
 use crate::models::link_discovery::{
     DismissLinkSuggestionResponse, LinkDiscoveryStatus, LinkSuggestionQueueEntry,
 };
@@ -315,10 +315,8 @@ pub async fn apply_links(
     }
 
     if !dirty_note_ids.is_empty() {
-        sync_topic_hubs(state.inner()).await?;
-        for note_id in &dirty_note_ids {
-            enqueue_vault_optimizer_note(state.inner(), note_id, "links_applied").await;
-        }
+        let dirty_ids: Vec<String> = dirty_note_ids.iter().cloned().collect();
+        commit_note_writes(state.inner(), &dirty_ids, "links_applied").await?;
     }
 
     Ok(ApplyLinksResponse {
@@ -392,10 +390,8 @@ pub async fn create_link(
     }
 
     if !dirty_note_ids.is_empty() {
-        sync_topic_hubs(state.inner()).await?;
-        for note_id in &dirty_note_ids {
-            enqueue_vault_optimizer_note(state.inner(), note_id, "link_created").await;
-        }
+        let dirty_ids: Vec<String> = dirty_note_ids.iter().cloned().collect();
+        commit_note_writes(state.inner(), &dirty_ids, "link_created").await?;
     }
 
     Ok(CreateLinkResponse {
