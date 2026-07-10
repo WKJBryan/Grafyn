@@ -36,6 +36,7 @@ pub mod twin;
 pub mod zettelkasten;
 
 use crate::models::note::Note;
+use crate::services::index_commit;
 use crate::services::retrieval::RetrievalResult;
 use crate::AppState;
 use std::collections::HashSet;
@@ -131,14 +132,14 @@ pub(crate) async fn sync_topic_hubs(state: &AppState) -> Result<Vec<Note>, Strin
         remove_link_discovery_note(state, removed_note_id).await;
 
         let mut search = state.search_service.write().await;
-        if let Err(error) = search.remove_note(removed_note_id) {
+        if let Err(error) = index_commit::remove_note_for_search(&mut search, removed_note_id) {
             log::error!(
                 "Failed to remove topic-hub note '{}' from search index: {}",
                 removed_note_id,
                 error
             );
         }
-        if let Err(error) = search.commit() {
+        if let Err(error) = index_commit::commit_search(&mut search) {
             log::error!(
                 "Failed to commit search index after topic-hub removal: {}",
                 error
@@ -150,11 +151,11 @@ pub(crate) async fn sync_topic_hubs(state: &AppState) -> Result<Vec<Note>, Strin
         {
             let mut search = state.search_service.write().await;
             for note in &changed_notes {
-                if let Err(error) = search.index_note(note) {
+                if let Err(error) = index_commit::index_note_for_search(&mut search, note) {
                     log::error!("Failed to index topic-hub note '{}': {}", note.id, error);
                 }
             }
-            if let Err(error) = search.commit() {
+            if let Err(error) = index_commit::commit_search(&mut search) {
                 log::error!("Failed to commit search index after topic sync: {}", error);
             }
         }
@@ -273,11 +274,11 @@ pub(crate) async fn commit_note_writes(
     if !notes.is_empty() {
         let mut search = state.search_service.write().await;
         for note in &notes {
-            if let Err(error) = search.index_note(note) {
+            if let Err(error) = index_commit::index_note_for_search(&mut search, note) {
                 log::error!("Failed to index note '{}': {}", note.id, error);
             }
         }
-        if let Err(error) = search.commit() {
+        if let Err(error) = index_commit::commit_search(&mut search) {
             log::error!(
                 "Failed to commit search index after note write(s): {}",
                 error
@@ -378,14 +379,14 @@ pub(crate) async fn commit_note_index_refresh(
         Ok(note) => {
             {
                 let mut search = state.search_service.write().await;
-                if let Err(error) = search.index_note(&note) {
+                if let Err(error) = index_commit::index_note_for_search(&mut search, &note) {
                     log::error!(
                         "Failed to index optimizer-updated note '{}' into search: {}",
                         note.id,
                         error
                     );
                 }
-                if let Err(error) = search.commit() {
+                if let Err(error) = index_commit::commit_search(&mut search) {
                     log::error!(
                         "Failed to commit search index after optimizer update to '{}': {}",
                         note.id,

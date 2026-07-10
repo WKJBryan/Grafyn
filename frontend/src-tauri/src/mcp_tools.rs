@@ -7,6 +7,7 @@ use crate::models::note::{NoteCreate, NoteStatus, NoteUpdate, CURRENT_NOTE_SCHEM
 use crate::services::chunk_index::ChunkIndex;
 use crate::services::graph_index::GraphIndex;
 use crate::services::import;
+use crate::services::index_commit;
 use crate::services::knowledge_store::KnowledgeStore;
 use crate::services::memory::MemoryService;
 use crate::services::priority::PriorityScoringService;
@@ -381,10 +382,8 @@ impl GrafynMcpServer {
                 // Update search index (if writable)
                 {
                     let mut search = self.search_service.write().await;
-                    if !search.is_readonly() {
-                        let _ = search.index_note(&note);
-                        let _ = search.commit();
-                    }
+                    let _ = index_commit::index_note_for_search(&mut search, &note);
+                    let _ = index_commit::commit_search(&mut search);
                 }
                 // Update graph index
                 {
@@ -431,10 +430,8 @@ impl GrafynMcpServer {
                 // Update search index (if writable)
                 {
                     let mut search = self.search_service.write().await;
-                    if !search.is_readonly() {
-                        let _ = search.index_note(&note);
-                        let _ = search.commit();
-                    }
+                    let _ = index_commit::index_note_for_search(&mut search, &note);
+                    let _ = index_commit::commit_search(&mut search);
                 }
                 // Update graph index
                 {
@@ -467,10 +464,8 @@ impl GrafynMcpServer {
                 // Update search index (if writable)
                 {
                     let mut search = self.search_service.write().await;
-                    if !search.is_readonly() {
-                        let _ = search.remove_note(&params.id);
-                        let _ = search.commit();
-                    }
+                    let _ = index_commit::remove_note_for_search(&mut search, &params.id);
+                    let _ = index_commit::commit_search(&mut search);
                 }
                 // Update graph index
                 {
@@ -674,10 +669,8 @@ impl GrafynMcpServer {
                     // Index in search (if writable)
                     {
                         let mut search = self.search_service.write().await;
-                        if !search.is_readonly() {
-                            let _ = search.index_note(&note);
-                            let _ = search.commit();
-                        }
+                        let _ = index_commit::index_note_for_search(&mut search, &note);
+                        let _ = index_commit::commit_search(&mut search);
                     }
                     // Update graph
                     {
