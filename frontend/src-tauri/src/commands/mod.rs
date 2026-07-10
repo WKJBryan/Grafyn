@@ -411,6 +411,61 @@ pub(crate) async fn commit_note_index_refresh(
     Ok(())
 }
 
+/// Single chokepoint for "a note was just deleted from the vault and needs
+/// to disappear everywhere else": the search index, the chunk index, link
+/// discovery, topic hubs (which also rebuilds the graph), and the vault
+/// optimizer queue. Symmetric counterpart to [`commit_note_write`]/
+/// [`commit_note_writes`] — those handle "a note was created or edited and
+/// needs to become visible"; this handles the opposite direction.
+///
+/// Callers must have already removed the note from the vault itself (e.g.
+/// via `KnowledgeStore::delete_note`) before calling this — it only cleans
+/// up the derived indexes/queues, it does not touch the vault.
+///
+/// `reason` is forwarded to `enqueue_vault_optimizer_note` for its audit
+/// trail (e.g. `"note_deleted"`), mirroring `commit_note_write`. This looks
+/// odd at first — why enqueue a note that no longer exists? — but it's
+/// harmless and matches the pre-existing behavior this function replaces
+/// (`notes::delete_note` already did this): `VaultOptimizerService::
+/// prepare_next` handles a missing note by logging a warning and dequeuing
+/// it again on the very next tick (see its `store.get_note` error branch),
+/// so this is a no-op fast-path, not a real optimizer run.
+///
+/// Error handling mirrors `commit_note_write`: search/chunk/link-discovery
+/// failures are logged and swallowed (the note is already gone from the
+/// vault; a stale index self-heals on the next `rebuild_all_indexes`),
+/// while `sync_topic_hubs` failures propagate.
+pub(crate) async fn commit_note_delete(
+    state: &AppState,
+    note_id: &str,
+    reason: &str,
+) -> Result<(), String> {
+    {
+        let mut search = state.search_service.write().await;
+        if let Err(error) = index_commit::remove_note_for_search(&mut search, note_id) {
+            log::error!(
+                "Failed to remove note '{}' from search index: {}",
+                note_id,
+                error
+            );
+        }
+        if let Err(error) = index_commit::commit_search(&mut search) {
+            log::error!(
+                "Failed to commit search index after deleting note '{}': {}",
+                note_id,
+                error
+            );
+        }
+    }
+
+    remove_note_chunks_from_index(state, note_id).await;
+    remove_link_discovery_note(state, note_id).await;
+    sync_topic_hubs(state).await?;
+    enqueue_vault_optimizer_note(state, note_id, reason).await;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod commit_note_write_tests {
     use super::*;
@@ -831,6 +886,69 @@ mod commit_note_write_tests {
              search results without any manual reindex, got tags: {:?}",
             expected_tag,
             found.note.tags
+        );
+    }
+
+    /// `commit_note_delete` is the symmetric counterpart to
+    /// `commit_note_write`: a note removed from the vault must stop being
+    /// findable via search immediately, without a manual reindex.
+    #[tokio::test]
+    async fn deleted_note_is_no_longer_search_indexed_after_commit_note_delete() {
+        let (state, _vault_dir, _data_dir) = build_test_state();
+
+        let created = {
+            let mut store = state.knowledge_store.write().await;
+            store
+                .create_note(NoteCreate {
+                    title: "Platypus Gamma Burrow".to_string(),
+                    content: "Platypuses dig burrows along riverbanks in Tasmania.".to_string(),
+                    relative_path: None,
+                    aliases: Vec::new(),
+                    status: NoteStatus::Draft,
+                    tags: Vec::new(),
+                    schema_version: crate::models::note::CURRENT_NOTE_SCHEMA_VERSION,
+                    migration_source: None,
+                    optimizer_managed: false,
+                    properties: Default::default(),
+                })
+                .expect("note should be created")
+        };
+        commit_note_write(&state, &created.id, "test_note_created")
+            .await
+            .expect("commit_note_write should succeed");
+
+        // Sanity check: the note is indeed searchable before deletion.
+        {
+            let search = state.search_service.read().await;
+            let results = search
+                .search(&created.title, 10)
+                .expect("search should not error");
+            assert!(
+                results.iter().any(|r| r.note.id == created.id),
+                "note should be search-indexed before deletion"
+            );
+        }
+
+        {
+            let mut store = state.knowledge_store.write().await;
+            store
+                .delete_note(&created.id)
+                .expect("note should be deleted from the vault");
+        }
+
+        commit_note_delete(&state, &created.id, "test_note_deleted")
+            .await
+            .expect("commit_note_delete should succeed");
+
+        let search = state.search_service.read().await;
+        let results = search
+            .search(&created.title, 10)
+            .expect("search should not error");
+        assert!(
+            !results.iter().any(|r| r.note.id == created.id),
+            "expected deleted note to be immediately removed from search results \
+             without any manual reindex, found: {:?}",
+            results.iter().map(|r| &r.note.id).collect::<Vec<_>>()
         );
     }
 }
