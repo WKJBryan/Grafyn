@@ -1,5 +1,6 @@
 import { describe, expect, it, beforeEach, vi } from 'vitest'
 import { mount, flushPromises } from '@vue/test-utils'
+import { createPinia, setActivePinia } from 'pinia'
 import TwinReviewView from '@/views/TwinReviewView.vue'
 
 const api = vi.hoisted(() => ({
@@ -36,6 +37,7 @@ vi.mock('@/api/client', () => ({
 function mountView() {
   return mount(TwinReviewView, {
     global: {
+      plugins: [createPinia()],
       stubs: {
         RouterLink: {
           props: ['to'],
@@ -48,6 +50,7 @@ function mountView() {
 
 describe('TwinReviewView', () => {
   beforeEach(() => {
+    setActivePinia(createPinia())
     vi.clearAllMocks()
     routeState.query = {}
     localStorage.clear()

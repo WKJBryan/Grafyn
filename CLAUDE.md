@@ -90,14 +90,14 @@ Grafyn is a **desktop-only** app — a single Tauri binary with a Vue frontend a
 
 ### Tauri IPC Commands
 
-16 modules in `frontend/src-tauri/src/commands/`. Enumerate exact command names with `grep -rn "#\[tauri::command\]" -A1 src/commands/` — purposes only below, to avoid drift.
+16 modules in `frontend/src-tauri/src/commands/`. `canvas` is a directory module (split — see below); every other module is a single file. Enumerate exact command names with `grep -rn "#\[tauri::command\]" -A1 src/commands/` — purposes only below, to avoid drift.
 
 | Module | Purpose |
 |--------|---------|
 | `notes.rs` | Note CRUD |
 | `search.rs` | Full-text search, find-similar, reindex |
 | `graph.rs` | Link graph: backlinks, outgoing, neighbors, unlinked, full graph, rebuild |
-| `canvas.rs` | Multi-LLM canvas (18 commands) with note context; streaming via `canvas-stream` Tauri events |
+| `canvas/` | Multi-LLM canvas (18 commands) with note context; streaming via `canvas-stream` Tauri events. Split across `session.rs` (session/tile CRUD), `streaming.rs` (`send_prompt`/`add_models_to_tile`/`regenerate_response`), `debate.rs` (`start_debate`/`continue_debate`), `context.rs` (retrieval + twin-context prompt assembly, incl. `build_twin_context_prompt()`), `shared.rs` (common helpers), and `mod.rs` (re-exports) |
 | `distill.rs` | LLM + rules-based distillation, tag normalization |
 | `settings.rs` | Settings, first-run setup, OpenRouter key validation, Ollama status/models |
 | `feedback.rs` | Feedback with offline queue |
@@ -114,8 +114,9 @@ Grafyn is a **desktop-only** app — a single Tauri binary with a Vue frontend a
 ### Frontend
 
 - `src/api/client.js` — all backend calls go through Tauri `invoke()`; exports one namespace per command module plus `optimizer` and `isDesktopApp`
-- **Pinia stores (3):** `canvas.js`, `theme.js`, `boot.js` — there is no twin store; twin UI state lives in `TwinReviewView.vue` and `stores/canvas.js`
-- **Routes:** `/` (notes), `/canvas`, `/canvas/:id`, `/import`, `/twin` (component: `TwinReviewView.vue`), plus catch-all → `NotFoundView.vue`
+- **Pinia stores (4):** `canvas.js`, `theme.js`, `boot.js`, `twin.js` — twin state (records, review, Constitution, action gaps, decisions, Decision Mirror config, setup) lives in the store; components read/act through it rather than holding local copies
+- `components/twin/` — the Twin Workspace's tab components (`TwinOverviewTab.vue`, `TwinSetupTab.vue`, `TwinConfigTab.vue`, `TwinConstitutionTab.vue`, `TwinActionGapsTab.vue`, `TwinDecisionsTab.vue`, `TwinMemoryTab.vue`, `TwinGuideTab.vue`) plus shared pieces (`ReviewActions.vue`, `SetupField.vue`, `ActionGapRow.vue`, `DecisionRow.vue`, `EvidenceDrawer.vue`) and `twin-workspace.css`. `views/TwinReviewView.vue` is now a ~150-line shell that wires the store to these tabs — do not add Twin Workspace logic directly to the view.
+- **Routes:** `/` (notes), `/canvas`, `/canvas/:id`, `/import`, `/twin` (component: `TwinReviewView.vue`, thin shell over `components/twin/`), plus catch-all → `NotFoundView.vue`
 - **Tests:** `src/__tests__/{unit,integration,fixtures}/` + `setup.js` (Vitest)
 
 ## Key Concepts
@@ -186,7 +187,9 @@ Streaming commands: `send_prompt`, `start_debate`, `continue_debate`, `add_model
 
 ### Twin Identity, Constitution, And Decision Mirror
 
-Twin context mode is a native RAG path, not model-weight training. `frontend/src-tauri/src/commands/canvas.rs` assembles the model-facing prompt through `build_twin_context_prompt()`.
+Twin context mode is a native RAG path, not model-weight training. `frontend/src-tauri/src/commands/canvas/context.rs` assembles the model-facing prompt through `build_twin_context_prompt()`.
+
+`TwinStore` itself is defined in `services/twin/mod.rs` (struct + shared state) with its methods split by concern across sibling files in `services/twin/`: `records.rs` (user records, inference, promotion), `constitution.rs` (Constitution items + review), `decisions.rs` (decision episodes, outcomes, Decision Mirror), `digest.rs` (memory digest), `traces.rs` (session traces, reflection cards), `export.rs` (JSONL export bundles), and `shared.rs` (corrupt-file quarantine + common helpers). There is no single `twin_store.rs` file — treat `services/twin/` as one logical module split across files, the same pattern as `commands/canvas/`.
 
 The prompt order is:
 
@@ -231,13 +234,21 @@ Configurable via `RetrievalConfig` (persisted in `data/retrieval_config.json`): 
 
 Hub clustering rules: label-propagation over linked note groups; noise filtering suppresses model names, provider names, and transcript artifacts from becoming hubs; minor themes are grouped under a parent hub's `Subtopics` section rather than creating new hubs.
 
+### Note Write & Delete Chokepoints
+
+Any note write or delete that must stay consistent with the search index, chunk index, topic hubs, and vault-optimizer queue goes through two chokepoints in `commands/mod.rs`: **`commit_note_write`/`commit_note_writes`** (single/batch write — indexes the note, syncs the chunk index, runs `sync_topic_hubs`, enqueues the note in the vault optimizer) and **`commit_note_delete`** (the delete-side equivalent). **New cross-cutting write paths must call these** rather than writing a note and re-indexing ad hoc.
+
+Underlying atomic file I/O is `services/atomic_io.rs::write_atomic` (temp-file-then-rename, so a crash mid-write never leaves a half-written note on disk). `services/index_commit.rs` holds the shared search-index-write helpers (`index_note_for_search`, `commit_search`) used by both chokepoints and any other direct index writer.
+
+`commands/mod.rs`'s module-level doc comment documents the **canonical lock order**: `knowledge_store` must always be acquired before `vault_optimizer` (order doesn't matter between read/write, but `vault_optimizer` must come second) — reversing it risks an ABBA deadlock between the background vault-optimizer worker and any command that touches both locks.
+
 ### Background Services
 
 These services run automatically in the background and have dedicated inbox/decision/rollback APIs. Do not re-implement any of these — they already exist.
 
 **`services/link_discovery.rs`** — background link-discovery worker. Distinct from on-demand zettelkasten discovery (`discover_links` command). Uses YAKE keyword extraction (`services/yake.rs`) and TF-IDF cosine similarity (`services/similarity.rs`) to find wikilink candidates without LLM calls. Optional LLM pass controlled by `background_link_discovery_llm_enabled`. Results surface via `list_link_suggestion_queue` / `dismiss_link_suggestion` commands.
 
-**`services/vault_optimizer.rs`** — background vault optimizer. Queued via `enqueue_vault_optimizer_note()` whenever notes are created or migrated. Processes the queue and applies structural improvements in two modes: `sidecar_first` (overlay metadata) or `full_rewrite`. Budget caps and daily write limits prevent runaway LLM spend. Decisions are auditable via `list_vault_optimizer_decisions`; rollbacks are per-change via `rollback_vault_optimizer_change`.
+**`services/vault_optimizer.rs`** — background vault optimizer. Queued via `enqueue_vault_optimizer_note()` whenever notes are created or migrated. Processes the queue and applies structural improvements in two modes: `sidecar_first` (overlay metadata) or `full_rewrite`. **The proposals are rule-based, not LLM-based** — title-alias normalization and topic tagging computed directly from vault content; there is no `OpenRouterService`/network call anywhere in this file. `background_vault_optimizer_llm_enabled` is a reserved no-op today (a characterization test, `run_next_ignores_llm_enabled_because_no_llm_path_exists`, locks in that toggling it changes nothing); it exists as the gate a future LLM-backed enrichment step must check before making any network call. The budget/daily-write settings (`background_vault_optimizer_max_daily_writes`, etc.) cap **disk writes to the vault** (`daily_write_count`), not LLM spend. Decisions are auditable via `list_vault_optimizer_decisions`; rollbacks are per-change via `rollback_vault_optimizer_change`.
 
 **`services/markdown_migration.rs`** — one-shot structured vault migration. Preview → apply → rollback workflow. `apply_markdown_migration` runs `sync_topic_hubs` and rebuilds all indexes after applying, then enqueues touched notes in the vault optimizer. Rollback restores pre-migration state and rebuilds.
 
@@ -256,8 +267,8 @@ First-run setup wizard and persistent settings. Manages vault path, OpenRouter A
 - **`twin_llm_provider`** — selects the LLM runtime for twin context answers: `"openrouter"` (default) or `"ollama"`. Gates whether `OllamaService` or `OpenRouterService` is used in `build_twin_context_prompt()`.
 - **`ollama_base_url`** / **`ollama_model`** — endpoint and model for local inference. `get_ollama_status` probes the Ollama daemon; `list_ollama_models` enumerates pulled models. Synced via `ollama.set_base_url()` on settings change.
 - **`background_link_discovery_enabled`** / **`background_link_discovery_llm_enabled`** — controls the background link-discovery worker. When enabled, `LinkDiscoveryService` processes notes in the background using YAKE keyword extraction and TF-IDF similarity.
-- **`background_vault_optimizer_enabled`** — controls the `VaultOptimizerService`. When enabled, optimizer processes queued notes and applies structural improvements (sidecar overlay or full rewrite mode). Budget and max daily writes cap LLM costs.
-- **Vault optimizer sub-settings** (all on `UserSettings`): `background_vault_optimizer_llm_enabled`, `_budget_monthly`, `_max_daily_writes`, `_edit_mode`, `_program_enabled`, and `vault_optimizer_program_path` — the last two enable a **vault-local `program.md` policy file** that steers optimizer behavior per-vault.
+- **`background_vault_optimizer_enabled`** — controls the `VaultOptimizerService`. When enabled, optimizer processes queued notes and applies structural improvements (sidecar overlay or full rewrite mode) using rule-based proposals only (no LLM call today). Max daily writes cap disk writes to the vault, not LLM spend — see Background Services above.
+- **Vault optimizer sub-settings** (all on `UserSettings`): `background_vault_optimizer_llm_enabled` (reserved no-op — no LLM path exists yet), `_budget_monthly` (unused until an LLM path exists), `_max_daily_writes` (real — caps disk writes), `_edit_mode`, `_program_enabled`, and `vault_optimizer_program_path` — the last two enable a **vault-local `program.md` policy file** that steers optimizer behavior per-vault.
 - **`canvas_model_presets`** — saved canvas model combinations (`CanvasModelPreset` struct in `models/settings.rs`).
 
 **Runtime sync pattern:** When settings change via `update_settings`, dependent services are updated in-place — no restart required. The pattern (in `commands/settings.rs`): capture changed fields before moving the update, apply settings, then sync each affected service:
@@ -307,7 +318,7 @@ cargo build --release --bin grafyn-mcp --no-default-features --features mcp
 
 ### Test Pipeline
 
-`.github/workflows/test.yml` — runs on push to main and PRs. Jobs: `release-preflight` (version + Cargo.lock alignment), `rust-tests` (ubuntu-22.04), `frontend-tests` (Vitest), `lint` (eslint + `cargo clippy -D warnings`), `security` (`npm audit --audit-level=high`), `build` (Vite), `test-summary`. Clippy and npm audit **block** PRs.
+`.github/workflows/test.yml` — runs on push to main and PRs. Jobs: `release-preflight` (version + Cargo.lock alignment), `rust-tests` (ubuntu-22.04), `frontend-tests` (Vitest), `lint` (eslint + file-size tripwire + `cargo clippy -D warnings`), `security` (`npm audit --audit-level=high`), `build` (Vite), `test-summary`. npm audit **blocks** PRs; clippy currently runs with `continue-on-error: true` pending cleanup of pre-existing warnings (see the TODO in the `lint` job). The file-size tripwire (`npm run check:file-sizes`, `scripts/check-file-sizes.cjs`) blocks PRs when any non-test `.rs`/`.vue`/`.js` source file exceeds 2,500 lines.
 
 ### Release Pipeline
 
@@ -412,3 +423,4 @@ From `frontend/`:
 - **Read before editing.** Always Read a file in-session before Edit/Write; "File has not been read yet" failures were the most repeated tool error in this repo's sessions.
 - **Discussion-first.** When the user is exploring a design ("lets chat more", strategic questions), discuss — do not start implementing until explicitly told to build. Tool-use rejections are usually redirects back to discussion, not vetoes.
 - **Local models:** before benchmarking a new Ollama tag, smoke-test it first (prompt-echo check, choice-extraction check, max-token truncation check) — these three failure modes consumed entire past sessions.
+- **Source file size.** Keep new/edited source files under ~1,500 lines as an authoring target; CI hard-fails the `lint` job at 2,500 lines (`npm run check:file-sizes`, excludes `__tests__/`, `*.spec.js`, and Rust test-only files by path convention). New cross-cutting write paths must go through `commit_note_write`/`commit_note_delete` (`commands/mod.rs`) and `services/atomic_io.rs::write_atomic` — see "Note Write & Delete Chokepoints" above — not ad hoc file writes. When a file needs splitting, follow the mod-facade pattern already established by `commands/canvas/` (and `services/twin/`): one directory module, a `mod.rs` that re-exports, and sibling files split by concern (not by arbitrary line count).

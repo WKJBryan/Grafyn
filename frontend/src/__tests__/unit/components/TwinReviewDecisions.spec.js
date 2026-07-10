@@ -1,5 +1,6 @@
 import { describe, expect, it, vi, beforeEach } from 'vitest'
 import { mount, flushPromises } from '@vue/test-utils'
+import { createPinia, setActivePinia } from 'pinia'
 
 vi.mock('vue-router', () => ({
   useRoute: () => ({ query: {} })
@@ -50,7 +51,9 @@ function decisionItem(overrides = {}, episodeOverrides = {}) {
 
 async function mountWithDecisions(items) {
   twin.listDecisionEpisodes.mockResolvedValue(items)
-  const wrapper = mount(TwinReviewView)
+  const wrapper = mount(TwinReviewView, {
+    global: { plugins: [createPinia()] }
+  })
   await flushPromises()
   // Full decision cards live on the Decisions tab; the overview shows compact rows.
   await wrapper.findAll('.tab-button')
@@ -62,6 +65,7 @@ async function mountWithDecisions(items) {
 
 describe('TwinReviewView decision predictions', () => {
   beforeEach(() => {
+    setActivePinia(createPinia())
     vi.clearAllMocks()
     twin.getReview.mockResolvedValue([])
     twin.listMemoryDigest.mockResolvedValue([])

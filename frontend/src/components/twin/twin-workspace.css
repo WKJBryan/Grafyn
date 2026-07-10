@@ -1,0 +1,944 @@
+.twin-workspace {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  overflow: hidden;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+}
+
+.twin-workspace .workspace-header {
+  flex: 0 0 auto;
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
+  align-items: center;
+  gap: var(--spacing-md);
+  padding: var(--spacing-sm) var(--spacing-lg);
+  border-bottom: 1px solid var(--border-default);
+  background: var(--bg-secondary);
+}
+
+.twin-workspace .header-links,
+.twin-workspace .header-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-sm);
+}
+
+.twin-workspace .header-actions {
+  justify-content: flex-end;
+}
+
+.twin-workspace .header-actions.compact {
+  gap: 6px;
+}
+
+.twin-workspace .header-links a {
+  color: var(--text-secondary);
+  text-decoration: none;
+}
+
+.twin-workspace .header-links a:hover {
+  color: var(--accent-primary);
+}
+
+.twin-workspace .header-title {
+  text-align: center;
+}
+
+.twin-workspace .header-title h1 {
+  margin: 0;
+  font-size: 1.125rem;
+}
+
+.twin-workspace .header-title span,
+.twin-workspace .panel-header span,
+.twin-workspace .card-topline,
+.twin-workspace .metric-tile small,
+.twin-workspace .evidence-item small,
+.twin-workspace .digest-card small,
+.twin-workspace .muted {
+  color: var(--text-muted);
+  font-size: 0.75rem;
+}
+
+.twin-workspace .header-title span {
+  font-family: 'Fira Code', monospace;
+  font-size: 0.7rem;
+  letter-spacing: 0.02em;
+}
+
+/* Body: fixed rail + independently scrolling main pane.
+   #app is overflow:hidden, so this view must own its scrolling. */
+.twin-workspace .workspace-body {
+  flex: 1;
+  display: flex;
+  min-height: 0;
+}
+
+.twin-workspace .workspace-rail {
+  flex: 0 0 212px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: var(--spacing-sm) var(--spacing-sm) var(--spacing-lg) 0;
+  overflow-y: auto;
+  border-right: 1px solid var(--border-default);
+  background: var(--bg-secondary);
+}
+
+.twin-workspace .rail-label {
+  margin: var(--spacing-md) var(--spacing-sm) 4px var(--spacing-md);
+  font-size: 0.65rem;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.twin-workspace .tab-button {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+  min-height: 34px;
+  padding: 0 var(--spacing-sm) 0 13px;
+  border: none;
+  border-left: 3px solid transparent;
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 0.85rem;
+  text-align: left;
+  cursor: pointer;
+  transition: background var(--transition-fast), color var(--transition-fast);
+}
+
+.twin-workspace .tab-button:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.twin-workspace .tab-button.active {
+  border-left-color: var(--accent-primary);
+  background: color-mix(in srgb, var(--accent-primary) 12%, transparent);
+  color: var(--accent-primary);
+  font-weight: 600;
+}
+
+.twin-workspace .tab-button strong {
+  min-width: 22px;
+  font-family: 'Fira Code', monospace;
+  font-size: 0.7rem;
+  font-weight: 500;
+  text-align: right;
+  color: var(--text-muted);
+}
+
+.twin-workspace .tab-button.active strong {
+  color: var(--accent-primary);
+}
+
+.twin-workspace .workspace-main {
+  flex: 1;
+  min-width: 0;
+  overflow-y: auto;
+  padding: var(--spacing-lg);
+}
+
+.twin-workspace .tab-panel {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-md);
+  max-width: 980px;
+  margin: 0 auto;
+}
+
+.twin-workspace .overview-stats {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: var(--spacing-md);
+}
+
+.twin-workspace .metric-tile {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  padding: var(--spacing-md);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-lg);
+  background: var(--bg-secondary);
+  color: var(--text-secondary);
+  text-align: left;
+  cursor: pointer;
+  transition: border-color var(--transition-fast), box-shadow var(--transition-fast), transform var(--transition-fast);
+}
+
+.twin-workspace .metric-tile:hover {
+  border-color: var(--accent-primary);
+  box-shadow: var(--shadow-md);
+  transform: translateY(-1px);
+}
+
+.twin-workspace .metric-tile strong {
+  display: block;
+  margin: 4px 0;
+  font-family: 'Fira Code', monospace;
+  font-size: 1.8rem;
+  font-weight: 600;
+  color: var(--text-primary);
+  line-height: 1.1;
+}
+
+.twin-workspace .workspace-band,
+.twin-workspace .constitution-card,
+.twin-workspace .action-gap-card,
+.twin-workspace .decision-card,
+.twin-workspace .digest-card,
+.twin-workspace .record-card,
+.twin-workspace .evidence-drawer {
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  background: var(--bg-secondary);
+}
+
+.twin-workspace .workspace-band {
+  padding: var(--spacing-md);
+}
+
+.twin-workspace .tutorial-intro {
+  border-left: 3px solid var(--accent-primary);
+}
+
+.twin-workspace .band-header,
+.twin-workspace .panel-header,
+.twin-workspace .card-topline,
+.twin-workspace .drawer-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--spacing-sm);
+}
+
+.twin-workspace .band-header {
+  margin-bottom: var(--spacing-sm);
+}
+
+.twin-workspace .panel-header h2,
+.twin-workspace .band-header h2,
+.twin-workspace .drawer-header h2 {
+  margin: 0;
+  font-size: 1rem;
+}
+
+.twin-workspace .panel-header.compact {
+  margin-bottom: var(--spacing-sm);
+}
+
+.twin-workspace .text-button,
+.twin-workspace .record-actions button,
+.twin-workspace .review-actions button,
+.twin-workspace .drawer-header button {
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+.twin-workspace .text-button {
+  border: none;
+  color: var(--accent-primary);
+}
+
+.twin-workspace .empty-panel {
+  padding: var(--spacing-lg);
+  border: 1px dashed var(--border-default);
+  border-radius: var(--radius-md);
+  color: var(--text-muted);
+  text-align: center;
+}
+
+/* Compact triage rows on the overview */
+.twin-workspace .compact-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 8px 10px;
+  margin-bottom: 6px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-primary);
+  text-align: left;
+  cursor: pointer;
+  transition: border-color var(--transition-fast), background var(--transition-fast);
+}
+
+.twin-workspace .compact-row:hover {
+  border-color: var(--accent-primary);
+  background: var(--bg-hover);
+}
+
+.twin-workspace .compact-row.highlighted {
+  border-color: var(--accent-cyan);
+}
+
+.twin-workspace .row-dot {
+  flex: 0 0 8px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text-muted);
+}
+
+.twin-workspace .row-dot.is-sealed {
+  background: var(--accent-primary);
+}
+
+.twin-workspace .row-dot.is-pending {
+  background: var(--accent-warning);
+}
+
+.twin-workspace .row-dot.is-match {
+  background: var(--accent-green);
+}
+
+.twin-workspace .row-dot.is-miss {
+  background: var(--accent-red);
+}
+
+.twin-workspace .row-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.85rem;
+}
+
+.twin-workspace .row-chips,
+.twin-workspace .topline-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.twin-workspace .chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 8px;
+  border: 1px solid var(--border-default);
+  border-radius: 999px;
+  font-size: 0.68rem;
+  font-weight: 600;
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.twin-workspace .chip-sealed {
+  border-style: dashed;
+  border-color: color-mix(in srgb, var(--accent-primary) 55%, transparent);
+  color: var(--accent-primary);
+}
+
+.twin-workspace .chip-pending {
+  border-color: color-mix(in srgb, var(--accent-warning) 55%, transparent);
+  background: color-mix(in srgb, var(--accent-warning) 10%, transparent);
+  color: var(--accent-warning);
+}
+
+.twin-workspace .chip-match {
+  border-color: color-mix(in srgb, var(--accent-green) 55%, transparent);
+  background: color-mix(in srgb, var(--accent-green) 10%, transparent);
+  color: var(--accent-green);
+}
+
+.twin-workspace .chip-miss {
+  border-color: color-mix(in srgb, var(--accent-red) 55%, transparent);
+  background: color-mix(in srgb, var(--accent-red) 10%, transparent);
+  color: var(--accent-red);
+}
+
+.twin-workspace .dimension-section h3 {
+  margin: 0 0 var(--spacing-sm);
+  font-size: 0.875rem;
+  color: var(--text-secondary);
+}
+
+.twin-workspace .constitution-card,
+.twin-workspace .action-gap-card,
+.twin-workspace .decision-card,
+.twin-workspace .digest-card,
+.twin-workspace .record-card {
+  padding: var(--spacing-md);
+  margin-bottom: var(--spacing-sm);
+}
+
+/* Decision cards carry their state on the left edge */
+.twin-workspace .decision-card {
+  border-left: 3px solid var(--border-strong);
+}
+
+.twin-workspace .decision-card.is-sealed {
+  border-left-color: var(--accent-primary);
+}
+
+.twin-workspace .decision-card.is-pending {
+  border-left-color: var(--accent-warning);
+}
+
+.twin-workspace .decision-card.is-match {
+  border-left-color: var(--accent-green);
+}
+
+.twin-workspace .decision-card.is-miss {
+  border-left-color: var(--accent-red);
+}
+
+.twin-workspace .decision-card.highlighted {
+  border-color: var(--accent-cyan);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent-cyan) 18%, transparent);
+}
+
+.twin-workspace .decision-card h3 {
+  font-size: 0.95rem;
+  line-height: 1.4;
+}
+
+.twin-workspace .constitution-card p,
+.twin-workspace .action-gap-card p,
+.twin-workspace .decision-card h3,
+.twin-workspace .digest-card p,
+.twin-workspace .record-card p,
+.twin-workspace .evidence-item p {
+  margin: var(--spacing-sm) 0;
+}
+
+.twin-workspace .card-topline {
+  flex-wrap: wrap;
+  justify-content: flex-start;
+}
+
+.twin-workspace .card-topline .topline-chips {
+  margin-left: auto;
+}
+
+.twin-workspace .status-pill,
+.twin-workspace .tag-row span,
+.twin-workspace .source-row span {
+  display: inline-flex;
+  align-items: center;
+  min-height: 22px;
+  padding: 0 7px;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
+  color: var(--text-secondary);
+  font-size: 0.6875rem;
+}
+
+.twin-workspace .tag-row,
+.twin-workspace .source-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.twin-workspace .review-actions,
+.twin-workspace .record-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: var(--spacing-sm);
+}
+
+.twin-workspace .prediction-sealed-badge {
+  margin-top: var(--spacing-sm);
+  padding: 6px 10px;
+  border: 1px dashed color-mix(in srgb, var(--accent-primary) 45%, transparent);
+  border-radius: var(--radius-sm);
+  color: var(--accent-primary);
+  font-size: 0.8rem;
+}
+
+.twin-workspace .prediction-reveal {
+  margin-top: var(--spacing-sm);
+  padding: var(--spacing-sm);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--bg-tertiary) 75%, transparent);
+}
+
+.twin-workspace .prediction-headline {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.85rem;
+}
+
+.twin-workspace .prediction-confidence {
+  color: var(--text-secondary);
+}
+
+.twin-workspace .prediction-rationale {
+  margin: 6px 0 0;
+  color: var(--text-secondary);
+  font-size: 0.8rem;
+}
+
+.twin-workspace .agreement-badge {
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 0.72rem;
+}
+
+.twin-workspace .agreement-badge.match {
+  background: color-mix(in srgb, var(--accent-green, #22c55e) 18%, transparent);
+  color: var(--accent-green, #22c55e);
+}
+
+.twin-workspace .agreement-badge.miss {
+  background: color-mix(in srgb, var(--accent-red, #ef4444) 18%, transparent);
+  color: var(--accent-red, #ef4444);
+}
+
+.twin-workspace .review-actions button,
+.twin-workspace .record-actions button {
+  min-height: 28px;
+  padding: 4px 8px;
+}
+
+.twin-workspace .review-actions button:hover,
+.twin-workspace .record-actions button:hover {
+  border-color: var(--accent-primary);
+  color: var(--accent-primary);
+}
+
+.twin-workspace .gap-columns {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--spacing-md);
+}
+
+.twin-workspace .gap-columns small {
+  color: var(--text-muted);
+}
+
+.twin-workspace .primitive-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: var(--spacing-sm) 0;
+}
+
+.twin-workspace .primitive-grid span {
+  padding: 4px 8px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  color: var(--text-secondary);
+  font-size: 0.75rem;
+}
+
+.twin-workspace .reflection-details {
+  margin-top: var(--spacing-sm);
+}
+
+.twin-workspace .context-trace-details {
+  margin-top: var(--spacing-sm);
+  border-top: 1px solid var(--border-subtle);
+  padding-top: var(--spacing-sm);
+}
+
+.twin-workspace .context-trace-details summary,
+.twin-workspace .reflection-details summary,
+.twin-workspace .outcome-details summary {
+  cursor: pointer;
+  font-weight: 700;
+}
+
+.twin-workspace .reflection-details pre {
+  max-height: 220px;
+  overflow: auto;
+  white-space: pre-wrap;
+  padding: var(--spacing-sm);
+  background: var(--bg-tertiary);
+  border-radius: var(--radius-sm);
+}
+
+.twin-workspace .trace-metrics,
+.twin-workspace .trace-score-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: 6px;
+  margin: var(--spacing-sm) 0;
+}
+
+.twin-workspace .trace-metrics span,
+.twin-workspace .trace-score-grid span {
+  padding: 6px 8px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  color: var(--text-secondary);
+  font-size: 0.78rem;
+}
+
+.twin-workspace .trace-warning {
+  padding: 6px 8px;
+  border: 1px solid color-mix(in srgb, var(--accent-warning) 55%, transparent);
+  border-radius: var(--radius-sm);
+  color: var(--accent-warning);
+  background: color-mix(in srgb, var(--accent-warning) 10%, transparent);
+}
+
+.twin-workspace .trace-section {
+  margin-top: var(--spacing-sm);
+}
+
+.twin-workspace .trace-section h4 {
+  margin: 0 0 6px;
+  font-size: 0.78rem;
+  color: var(--text-primary);
+}
+
+.twin-workspace .trace-source-list,
+.twin-workspace .trace-feedback-list {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.twin-workspace .trace-source-list li,
+.twin-workspace .trace-feedback-list li {
+  display: grid;
+  gap: 2px;
+  padding: 7px 8px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  background: var(--bg-primary);
+}
+
+.twin-workspace .trace-source-list li span,
+.twin-workspace .trace-feedback-list li span {
+  color: var(--accent-cyan);
+  font-size: 0.72rem;
+  font-weight: 700;
+}
+
+.twin-workspace .trace-source-list li small,
+.twin-workspace .trace-feedback-list li small {
+  color: var(--text-secondary);
+}
+
+/* Outcome recording: labeled form, open until an outcome exists */
+.twin-workspace .outcome-details {
+  margin-top: var(--spacing-sm);
+  padding-top: var(--spacing-sm);
+  border-top: 1px dashed var(--border-default);
+}
+
+.twin-workspace .outcome-details summary {
+  font-size: 0.8rem;
+  color: var(--text-secondary);
+}
+
+.twin-workspace .outcome-row {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  align-items: end;
+  margin-top: var(--spacing-sm);
+}
+
+.twin-workspace .outcome-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.twin-workspace .outcome-field > span {
+  font-size: 0.68rem;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.twin-workspace .outcome-field input,
+.twin-workspace .outcome-field select,
+.twin-workspace .config-row select,
+.twin-workspace .identity-field input,
+.twin-workspace .setup-field textarea,
+.twin-workspace .panel-header select {
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
+  background: var(--bg-primary);
+  color: var(--text-primary);
+}
+
+.twin-workspace .outcome-field input,
+.twin-workspace .outcome-field select {
+  min-height: 32px;
+  padding: 4px 8px;
+}
+
+.twin-workspace .outcome-row .save-outcome {
+  grid-column: 1 / -1;
+  justify-self: start;
+}
+
+.twin-workspace .correction-row {
+  margin-top: 10px;
+}
+
+.twin-workspace .memory-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-items: start;
+}
+
+.twin-workspace .setup-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.twin-workspace .guide-panel,
+.twin-workspace .config-panel {
+  display: flex;
+  flex-direction: column;
+}
+
+.twin-workspace .guide-walkthrough ol {
+  margin: var(--spacing-sm) 0 0;
+  padding-left: 1.2rem;
+}
+
+.twin-workspace .guide-group dl {
+  display: grid;
+  grid-template-columns: minmax(120px, 180px) 1fr;
+  gap: 8px var(--spacing-md);
+  margin: var(--spacing-sm) 0 0;
+}
+
+.twin-workspace .guide-group dt {
+  font-weight: 700;
+}
+
+.twin-workspace .guide-group dd {
+  margin: 0;
+  color: var(--text-secondary);
+}
+
+.twin-workspace .config-row,
+.twin-workspace .config-toggle,
+.twin-workspace .weight-row,
+.twin-workspace .config-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-sm);
+}
+
+.twin-workspace .config-row,
+.twin-workspace .weight-row {
+  justify-content: space-between;
+}
+
+.twin-workspace .config-row select {
+  min-height: 32px;
+  padding: 4px 8px;
+}
+
+.twin-workspace .config-toggle {
+  margin-top: var(--spacing-sm);
+}
+
+.twin-workspace .config-actions {
+  margin-top: var(--spacing-sm);
+}
+
+.twin-workspace .weight-row {
+  margin-top: var(--spacing-sm);
+}
+
+.twin-workspace .weight-row span {
+  min-width: 160px;
+}
+
+.twin-workspace .weight-row input {
+  flex: 1;
+}
+
+.twin-workspace .weight-row strong {
+  min-width: 44px;
+  text-align: right;
+  font-family: 'Fira Code', monospace;
+  font-weight: 500;
+}
+
+.twin-workspace .setup-field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-xs);
+  padding: var(--spacing-md);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  background: var(--bg-secondary);
+}
+
+.twin-workspace .identity-section,
+.twin-workspace .setup-section-heading {
+  grid-column: 1 / -1;
+}
+
+.twin-workspace .identity-section {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--spacing-md);
+  padding: var(--spacing-md);
+  border: 1px solid var(--border-default);
+  border-left: 3px solid var(--accent-primary);
+  border-radius: var(--radius-md);
+  background: var(--bg-secondary);
+}
+
+.twin-workspace .identity-section > div {
+  grid-column: 1 / -1;
+}
+
+.twin-workspace .identity-section h2,
+.twin-workspace .setup-section-heading h2 {
+  margin: 0;
+}
+
+.twin-workspace .identity-section span,
+.twin-workspace .setup-section-heading span {
+  color: var(--text-secondary);
+}
+
+.twin-workspace .identity-field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-xs);
+}
+
+.twin-workspace .identity-field span {
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.twin-workspace .identity-field input {
+  min-height: 36px;
+  padding: 4px 8px;
+}
+
+.twin-workspace .identity-section .setup-field {
+  grid-column: 1 / -1;
+  padding: 0;
+  border: none;
+  background: transparent;
+}
+
+.twin-workspace .setup-field span {
+  font-weight: 600;
+}
+
+.twin-workspace .setup-field textarea {
+  resize: vertical;
+  padding: var(--spacing-sm);
+}
+
+.twin-workspace .setup-actions {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: flex-start;
+}
+
+.twin-workspace .evidence-drawer {
+  position: fixed;
+  top: 72px;
+  right: var(--spacing-lg);
+  width: min(420px, calc(100vw - 32px));
+  max-height: calc(100vh - 104px);
+  overflow: auto;
+  padding: var(--spacing-md);
+  background: var(--bg-elevated, var(--bg-secondary));
+  box-shadow: var(--shadow-xl);
+  z-index: 40;
+}
+
+.twin-workspace .evidence-item {
+  padding: var(--spacing-sm) 0;
+  border-top: 1px solid var(--border-subtle);
+}
+
+.twin-workspace .save-toast {
+  position: fixed;
+  bottom: var(--spacing-lg);
+  right: var(--spacing-lg);
+  padding: var(--spacing-sm) var(--spacing-md);
+  border-radius: var(--radius-sm);
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-default);
+  box-shadow: var(--shadow-lg);
+  z-index: 50;
+}
+
+.twin-workspace .save-toast.success {
+  border-color: var(--accent-green);
+}
+
+.twin-workspace .save-toast.error {
+  border-color: var(--accent-red);
+}
+
+@media (max-width: 980px) {
+  .twin-workspace .workspace-header,
+.twin-workspace .overview-stats,
+.twin-workspace .identity-section,
+.twin-workspace .memory-grid,
+.twin-workspace .setup-grid,
+.twin-workspace .gap-columns,
+.twin-workspace .outcome-row {
+    grid-template-columns: 1fr;
+  }
+
+  .twin-workspace .workspace-body {
+    flex-direction: column;
+  }
+
+  .twin-workspace .workspace-rail {
+    flex: 0 0 auto;
+    flex-direction: row;
+    align-items: center;
+    overflow-x: auto;
+    overflow-y: hidden;
+    padding: var(--spacing-xs) var(--spacing-sm);
+    border-right: none;
+    border-bottom: 1px solid var(--border-default);
+  }
+
+  .twin-workspace .rail-label {
+    display: none;
+  }
+
+  .twin-workspace .tab-button {
+    width: auto;
+    flex: 0 0 auto;
+    border-left: none;
+    border-bottom: 3px solid transparent;
+    border-radius: var(--radius-sm) var(--radius-sm) 0 0;
+  }
+
+  .twin-workspace .tab-button.active {
+    border-bottom-color: var(--accent-primary);
+  }
+
+  .twin-workspace .header-title {
+    text-align: left;
+  }
+}
