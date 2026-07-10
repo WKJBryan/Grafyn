@@ -715,7 +715,16 @@ function panToNode(position) {
 }
 
 // Watch for session changes
-watch(() => props.sessionId, async (newId) => {
+watch(() => props.sessionId, async (newId, oldId) => {
+  // Persist the OLD session's viewport before switching away. CanvasContainer is reused
+  // (v-else, not keyed) across /canvas/A -> /canvas/B, so onBeforeUnmount never fires on
+  // a session switch — only on a true unmount (e.g. leaving Canvas entirely). Without
+  // this, zoom/pan state for the session being left is silently lost. `oldId` guards
+  // against firing on the initial (immediate: true) mount, when there's nothing to save.
+  if (oldId && session.value) {
+    canvasStore.updateViewport(viewport.value)
+  }
+
   if (newId) {
     await canvasStore.loadSession(newId)
     // Restore viewport from session

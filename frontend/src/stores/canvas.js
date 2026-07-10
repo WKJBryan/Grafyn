@@ -130,6 +130,88 @@ export const useCanvasStore = defineStore('canvas', () => {
     }
   }
 
+  // Silent reconciliation for `session_saved` events fired mid-stream by sendPrompt /
+  // addModelToTile / regenerateResponse. Unlike loadSession(), this must NOT touch the
+  // global `loading` flag (that flag drives CanvasContainer's full-screen overlay —
+  // toggling it on every background disk save produced a loading flash on every prompt
+  // completion) and must NOT replace currentSession wholesale, which would (a) wipe
+  // content for models still mid-stream when the save landed, and (b) snap tile/node
+  // positions back to their pre-drag values if the user dragged something inside the
+  // ~150ms position-debounce window (_debouncedPersist).
+  //
+  // Merge rule: for any tile/debate/response that exists locally, keep the LOCAL
+  // position (the server can never have a newer position than the client that set it —
+  // positions only ever originate from local drags) and keep LOCAL response
+  // content/status for any model still marked streaming (the server's disk copy
+  // predates the in-flight chunks). Everything else — prompt text, tokens_used,
+  // normalized status fields, tiles/debates the server knows about that we haven't seen
+  // a broadcast event for yet — is taken from the fresh server fetch. Tiles/debates that
+  // exist locally but are NOT yet in the server's fetch (e.g. a concurrent operation's
+  // tile_created that hasn't been persisted yet) are kept as-is, never dropped.
+  function mergeById(localItems, fetchedItems, mergeOne) {
+    const fetchedById = new Map(fetchedItems.map(item => [item.id, item]))
+    const merged = localItems.map(localItem => {
+      const fetchedItem = fetchedById.get(localItem.id)
+      if (!fetchedItem) return localItem
+      fetchedById.delete(localItem.id)
+      return mergeOne(localItem, fetchedItem)
+    })
+    merged.push(...fetchedById.values())
+    return merged
+  }
+
+  function mergeStreamingSafeResponse(localResponse, fetchedResponse, streamingKey) {
+    if (!localResponse) return fetchedResponse
+    if (streamingModels.value.has(streamingKey)) return localResponse
+    return { ...fetchedResponse, position: localResponse.position || fetchedResponse.position }
+  }
+
+  function mergeSavedSession(fetched) {
+    if (!currentSession.value || currentSession.value.id !== fetched.id) {
+      currentSession.value = fetched
+      return
+    }
+
+    const mergedTiles = mergeById(currentSession.value.prompt_tiles, fetched.prompt_tiles, (localTile, fetchedTile) => {
+      const responses = {}
+      for (const [modelId, fetchedResponse] of Object.entries(fetchedTile.responses || {})) {
+        responses[modelId] = mergeStreamingSafeResponse(
+          localTile.responses?.[modelId],
+          fetchedResponse,
+          `${localTile.id}:${modelId}`
+        )
+      }
+      return {
+        ...fetchedTile,
+        position: localTile.position || fetchedTile.position,
+        responses
+      }
+    })
+
+    const mergedDebates = mergeById(currentSession.value.debates || [], fetched.debates || [], (localDebate, fetchedDebate) => ({
+      ...fetchedDebate,
+      position: localDebate.position || fetchedDebate.position
+    }))
+
+    currentSession.value = {
+      ...fetched,
+      viewport: currentSession.value.viewport ?? fetched.viewport,
+      prompt_tiles: mergedTiles,
+      debates: mergedDebates
+    }
+  }
+
+  // Silent refetch used by `session_saved` handlers — does NOT set `loading`, does NOT
+  // replace currentSession wholesale. See mergeSavedSession() for the merge rule.
+  async function reconcileSessionSaved(sessionId) {
+    try {
+      const fetched = normalizeSession(await canvasApi.get(sessionId))
+      mergeSavedSession(fetched)
+    } catch (err) {
+      console.error('Failed to reconcile canvas session after save:', err)
+    }
+  }
+
   // Getters
   const promptTiles = computed(() => currentSession.value?.prompt_tiles || [])
   const debates = computed(() => currentSession.value?.debates || [])
@@ -404,7 +486,7 @@ export const useCanvasStore = defineStore('canvas', () => {
           applyError(data)
         },
         session_saved: async () => {
-          await loadSession(sessionId)
+          await reconcileSessionSaved(sessionId)
         }
       })
 
@@ -933,7 +1015,7 @@ export const useCanvasStore = defineStore('canvas', () => {
           tracker.clear(`${tileId}:${data.model_id}`)
         },
         session_saved: async () => {
-          await loadSession(sessionId)
+          await reconcileSessionSaved(sessionId)
         }
       })
 
@@ -995,7 +1077,7 @@ export const useCanvasStore = defineStore('canvas', () => {
           tracker.clear(streamingKey)
         },
         session_saved: async () => {
-          await loadSession(sessionId)
+          await reconcileSessionSaved(sessionId)
         }
       })
 

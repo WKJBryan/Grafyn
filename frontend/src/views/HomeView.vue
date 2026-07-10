@@ -264,6 +264,7 @@
 <script setup>
 import { ref, watch, onMounted, computed } from 'vue'
 import { notes as notesApi, memory, settings as settingsApi, isDesktopApp } from '../api/client'
+import { useCanvasStore } from '../stores/canvas'
 import SearchBar from '../components/SearchBar.vue'
 import NoteEditor from '../components/NoteEditor.vue'
 import BacklinksPanel from '../components/BacklinksPanel.vue'
@@ -284,6 +285,7 @@ import { useGuide } from '../composables/useGuide'
 import grafynLogo from '../assets/grafyn-logo.png'
 
 const guide = useGuide()
+const canvasStore = useCanvasStore()
 const notes = ref([])
 const selectedNoteId = ref(null)
 const selectedNote = ref(null)
@@ -553,8 +555,20 @@ function handleFeedbackSubmitted() {
   toast.success('Feedback submitted successfully')
 }
 
-function handleSettingsSaved() {
+// A vault switch invalidates any note selection tied to the old vault (the id may not
+// exist in the new vault at all) and any canvas sessions loaded from the old vault's
+// data directory — both must be reset/reloaded, not just the note list.
+function resetForVaultSwitch() {
+  selectedNoteId.value = null
+  selectedNote.value = null
+  canvasStore.loadSessions()
+}
+
+function handleSettingsSaved(changes = {}) {
   console.log('Settings saved')
+  if (changes.vaultPathChanged) {
+    resetForVaultSwitch()
+  }
   // Reload notes in case vault path changed
   loadNotes()
 }
@@ -563,6 +577,8 @@ function handleSetupComplete() {
   console.log('Setup completed')
   isSetupMode.value = false
   showSettingsModal.value = false
+  // First-run setup always establishes/selects a vault, so this is always a vault switch.
+  resetForVaultSwitch()
   // Reload notes from new vault location
   loadNotes()
 }

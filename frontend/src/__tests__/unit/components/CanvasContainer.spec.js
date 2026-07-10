@@ -301,6 +301,30 @@ describe('CanvasContainer', () => {
     toastSuccess.mockReset()
   })
 
+  it('persists the outgoing session viewport before loading a newly-switched-to session', async () => {
+    getOpenRouterStatus.mockResolvedValue({ has_key: true, is_configured: true })
+
+    const wrapper = mountContainer()
+    await flushPromises()
+
+    // Initial (immediate: true) mount must not treat "no previous session" as a switch
+    expect(store.updateViewport).not.toHaveBeenCalled()
+
+    store.loadSession.mockClear()
+    store.updateViewport.mockClear()
+
+    await wrapper.setProps({ sessionId: 'session-2' })
+    await flushPromises()
+
+    expect(store.updateViewport).toHaveBeenCalledWith({ x: 0, y: 0, zoom: 1 })
+    expect(store.loadSession).toHaveBeenCalledWith('session-2')
+    // Old session's viewport must be persisted BEFORE the new session is loaded, or the
+    // switch would already be underway (and currentSession already replaced) by the time
+    // it fires.
+    expect(store.updateViewport.mock.invocationCallOrder[0])
+      .toBeLessThan(store.loadSession.mock.invocationCallOrder[0])
+  })
+
   it('opens the prompt dialog without an API key so users can choose a local twin runtime', async () => {
     getOpenRouterStatus.mockResolvedValue({ has_key: false, is_configured: false })
 

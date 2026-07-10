@@ -896,6 +896,84 @@ describe('Canvas Store', () => {
     expect(result.created_record_ids).toEqual(['rec-1'])
   })
 
+  it('session_saved reconciles silently mid-stream: no loading flash, no clobbered stream content, no reverted drag', async () => {
+    const handlers = []
+    listenMock.mockImplementation(async (_eventName, handler) => {
+      handlers.push(handler)
+      return unlistenMock
+    })
+    function broadcast(payload) {
+      handlers.slice().forEach(handler => handler({ payload }))
+    }
+
+    let resolveGet
+    vi.spyOn(apiClient.canvas, 'get').mockImplementation(() => new Promise(resolve => { resolveGet = resolve }))
+    vi.spyOn(apiClient.canvas, 'updateTilePosition').mockResolvedValue()
+
+    vi.spyOn(apiClient.canvas, 'sendPrompt').mockImplementation(async () => {
+      broadcast({
+        session_id: 'session-1',
+        type: 'tile_created',
+        tile: {
+          id: 'tile-1',
+          prompt: 'Hello',
+          position: { x: 0, y: 0, width: 200, height: 120 },
+          responses: {
+            'openai/gpt-4': { status: 'pending', content: '', position: { x: 300, y: 0, width: 280, height: 200 } }
+          }
+        }
+      })
+      return 'tile-1'
+    })
+
+    const store = useCanvasStore()
+    store.currentSession = { id: 'session-1', prompt_tiles: [], debates: [] }
+
+    const promise = store.sendPrompt('Hello', ['openai/gpt-4'])
+    await flushPromises()
+
+    // Partial content streams in
+    broadcast({ session_id: 'session-1', type: 'chunk', tile_id: 'tile-1', model_id: 'openai/gpt-4', chunk: 'Partial answer' })
+
+    // User drags the tile locally, inside the ~150ms position-debounce window
+    store.updateTilePosition('tile-1', { x: 999, y: 999 })
+
+    // Backend fires session_saved mid-stream (model is still marked streaming, not complete)
+    broadcast({ session_id: 'session-1', type: 'session_saved' })
+    await flushPromises()
+
+    // The reconciliation fetch is still in flight (resolveGet not called yet) — loading
+    // must never flip true, unlike the old wholesale loadSession() behavior.
+    expect(store.loading).toBe(false)
+
+    // Server's disk snapshot predates the chunk/drag above (stale content + stale position)
+    resolveGet({
+      id: 'session-1',
+      prompt_tiles: [
+        {
+          id: 'tile-1',
+          prompt: 'Hello',
+          position: { x: 0, y: 0, width: 200, height: 120 },
+          responses: {
+            'openai/gpt-4': { status: 'pending', content: '', position: { x: 300, y: 0, width: 280, height: 200 } }
+          }
+        }
+      ],
+      debates: []
+    })
+    await flushPromises()
+
+    expect(store.loading).toBe(false)
+    expect(store.currentSession.prompt_tiles[0].responses['openai/gpt-4'].content).toBe('Partial answer')
+    expect(store.currentSession.prompt_tiles[0].position).toMatchObject({ x: 999, y: 999 })
+
+    // Finish the stream normally
+    broadcast({ session_id: 'session-1', type: 'complete', tile_id: 'tile-1', model_id: 'openai/gpt-4' })
+    await promise
+
+    expect(store.streamingModels.size).toBe(0)
+  })
+
   it('exportTwinData proxies export requests to the twin API', async () => {
     const exportSpy = vi.spyOn(apiClient.twin, 'exportData').mockResolvedValue({
       train: { count: 3 },
