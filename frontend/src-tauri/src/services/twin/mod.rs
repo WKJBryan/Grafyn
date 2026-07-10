@@ -42,6 +42,7 @@ use std::path::{Path, PathBuf};
 const AUTO_PROMOTE_CONFIDENCE: f32 = 0.75;
 const AUTO_PROMOTE_SUPPORT_COUNT: usize = 3;
 
+#[derive(Debug)]
 pub struct TwinStore {
     root_path: PathBuf,
     traces_path: PathBuf,
