@@ -88,15 +88,48 @@
           /> See Fight
         </template>
       </button>
-      <button 
+      <button
         v-if="debate.status !== 'completed'"
         class="continue-btn"
-        @click.stop="$emit('continue', debate.id)"
+        @click.stop="toggleContinuePrompt"
       >
         Continue
       </button>
     </div>
-    
+
+    <!-- Prompt-collection affordance for continuing the debate -->
+    <div
+      v-if="showContinuePrompt"
+      class="continue-overlay"
+      @click.stop
+    >
+      <div class="continue-overlay-header">
+        <span class="continue-overlay-title">Continue debate</span>
+      </div>
+      <textarea
+        v-model="continuePromptText"
+        class="continue-prompt-input"
+        placeholder="What should the models address next?"
+        rows="3"
+        @keydown.enter.exact.prevent="submitContinuePrompt"
+      />
+      <div class="continue-overlay-actions">
+        <button
+          class="continue-prompt-cancel"
+          @click.stop="closeContinuePrompt"
+        >
+          Cancel
+        </button>
+        <button
+          class="continue-prompt-submit"
+          :disabled="!continuePromptText.trim()"
+          @click.stop="submitContinuePrompt"
+        >
+          Send
+        </button>
+      </div>
+    </div>
+
     <!-- Connection points for source tiles (left side) -->
     <div class="connection-point in" />
 
@@ -211,6 +244,10 @@ const isDragging = ref(false)
 const isResizing = ref(false)
 const dragStart = ref({ x: 0, y: 0, nodeX: 0, nodeY: 0 })
 
+// Continue-debate prompt collection state
+const showContinuePrompt = ref(false)
+const continuePromptText = ref('')
+
 // Computed
 const isActive = computed(() => props.debate.status === 'active')
 
@@ -287,6 +324,23 @@ function toggleExpand() {
   }
 }
 
+function toggleContinuePrompt() {
+  showContinuePrompt.value = !showContinuePrompt.value
+}
+
+function closeContinuePrompt() {
+  showContinuePrompt.value = false
+  continuePromptText.value = ''
+}
+
+function submitContinuePrompt() {
+  const prompt = continuePromptText.value.trim()
+  if (!prompt) return
+
+  emit('continue', props.debate.id, prompt)
+  closeContinuePrompt()
+}
+
 function getModelName(modelId) {
   if (!modelId || typeof modelId !== 'string') return 'Unknown'
   return modelId.split('/').pop() || modelId
@@ -320,9 +374,10 @@ function renderContent(content) {
 
 function handleMouseDown(e) {
   // Ignore clicks on interactive elements
-  if (e.target.closest('.node-actions') || 
+  if (e.target.closest('.node-actions') ||
       e.target.closest('.node-footer') ||
       e.target.closest('.expanded-overlay') ||
+      e.target.closest('.continue-overlay') ||
       e.target.closest('.resize-handle') ||
       e.target.closest('button')) {
     return
@@ -636,6 +691,84 @@ onBeforeUnmount(() => {
   border-color: var(--accent-green);
   color: var(--accent-green);
   background: color-mix(in srgb, var(--accent-green) 10%, transparent);
+}
+
+/* Continue-debate prompt overlay */
+.continue-overlay {
+  position: absolute;
+  left: 0;
+  right: -8px;
+  bottom: calc(100% + 12px);
+  padding: var(--spacing-md);
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-default, var(--border-subtle));
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-lg);
+  z-index: 60;
+}
+
+.continue-overlay-header {
+  margin-bottom: var(--spacing-xs);
+}
+
+.continue-overlay-title {
+  font-size: 0.8125rem;
+  font-weight: 700;
+  color: var(--text-primary);
+}
+
+.continue-prompt-input {
+  width: 100%;
+  box-sizing: border-box;
+  resize: vertical;
+  padding: var(--spacing-xs);
+  font-size: 0.75rem;
+  font-family: inherit;
+  color: var(--text-primary);
+  background: var(--bg-primary);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+}
+
+.continue-overlay-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--spacing-sm);
+  margin-top: var(--spacing-sm);
+}
+
+.continue-prompt-cancel,
+.continue-prompt-submit {
+  padding: 4px 12px;
+  border-radius: var(--radius-sm);
+  font-size: 0.75rem;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.continue-prompt-cancel {
+  background: transparent;
+  border: 1px solid var(--border-subtle);
+  color: var(--text-muted);
+}
+
+.continue-prompt-cancel:hover {
+  border-color: var(--text-muted);
+}
+
+.continue-prompt-submit {
+  background: color-mix(in srgb, var(--accent-green) 20%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent-green) 35%, transparent);
+  color: var(--accent-green);
+}
+
+.continue-prompt-submit:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--accent-green) 28%, transparent);
+}
+
+.continue-prompt-submit:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
 }
 
 /* Connection point */

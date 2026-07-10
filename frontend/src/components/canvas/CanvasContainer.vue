@@ -1533,6 +1533,7 @@ async function handleDebateContinue(debateId, prompt) {
     await canvasStore.continueDebate(debateId, prompt)
   } catch (err) {
     console.error('Failed to continue debate:', err)
+    showCanvasMessage('error', err.message || 'Failed to continue debate')
   }
 }
 

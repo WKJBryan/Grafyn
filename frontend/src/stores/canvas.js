@@ -784,6 +784,11 @@ export const useCanvasStore = defineStore('canvas', () => {
       throw new Error('No active session')
     }
 
+    if (!prompt || !prompt.trim()) {
+      error.value = 'Enter a prompt to continue the debate.'
+      throw new Error(error.value)
+    }
+
     const sessionId = currentSession.value.id
     const debate = currentSession.value.debates.find(d => d.id === debateId)
     if (!debate) {

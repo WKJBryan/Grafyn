@@ -213,6 +213,26 @@ describe('Canvas Store', () => {
     })
   })
 
+  it('continueDebate rejects a blank prompt with a user-visible error and never calls the API', async () => {
+    const continueDebateSpy = vi.spyOn(apiClient.canvas, 'continueDebate')
+
+    const store = useCanvasStore()
+    store.currentSession = {
+      id: 'session-1',
+      prompt_tiles: [],
+      debates: [
+        { id: 'debate-1', participating_models: ['openai/gpt-4'], reasoning_effort: 'high' }
+      ]
+    }
+
+    await expect(store.continueDebate('debate-1', '   ')).rejects.toThrow(/prompt/i)
+    expect(continueDebateSpy).not.toHaveBeenCalled()
+    expect(store.error).toMatch(/prompt/i)
+
+    await expect(store.continueDebate('debate-1', undefined)).rejects.toThrow(/prompt/i)
+    expect(continueDebateSpy).not.toHaveBeenCalled()
+  })
+
   it('sendPrompt includes twin answer mode and context policy for Twin Mode', async () => {
     let streamHandler
     listenMock.mockImplementation(async (_eventName, handler) => {
