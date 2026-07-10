@@ -193,29 +193,7 @@
 
         <TwinConstitutionTab v-else-if="twinStore.activeTab === 'constitution'" />
 
-        <section
-          v-else-if="twinStore.activeTab === 'action_gaps'"
-          class="tab-panel"
-        >
-          <div class="panel-header">
-            <div>
-              <h2>Action Gaps</h2>
-              <span>{{ twinStore.actionGaps.length }} stated versus revealed patterns</span>
-            </div>
-          </div>
-          <div
-            v-if="twinStore.actionGaps.length === 0"
-            class="empty-panel"
-          >
-            No action gaps yet.
-          </div>
-          <ActionGapRow
-            v-for="gap in twinStore.actionGaps"
-            :key="gap.id"
-            :gap="gap"
-            @review="twinStore.reviewActionGap"
-          />
-        </section>
+        <TwinActionGapsTab v-else-if="twinStore.activeTab === 'action_gaps'" />
 
         <section
           v-else-if="twinStore.activeTab === 'decisions'"
@@ -411,6 +389,7 @@ import {
   eventLabel
 } from '@/utils/twinFormat'
 import ReviewActions from '@/components/twin/ReviewActions.vue'
+import TwinActionGapsTab from '@/components/twin/TwinActionGapsTab.vue'
 import TwinConstitutionTab from '@/components/twin/TwinConstitutionTab.vue'
 import TwinGuideTab from '@/components/twin/TwinGuideTab.vue'
 import TwinSetupTab from '@/components/twin/TwinSetupTab.vue'
@@ -453,29 +432,6 @@ const navGroups = computed(() => [
     tabs: [{ id: 'guide', label: 'Guide', count: null }]
   }
 ])
-
-const ActionGapRow = defineComponent({
-  props: {
-    gap: { type: Object, required: true }
-  },
-  emits: ['review'],
-  setup(props, { emit }) {
-    return () => h('article', { class: 'action-gap-card' }, [
-      h('div', { class: 'card-topline' }, [
-        h('span', { class: 'status-pill' }, statusLabel(props.gap.status)),
-        h('span', formatPercent(props.gap.confidence)),
-        h('span', `${props.gap.evidence_refs?.length || 0} evidence`)
-      ]),
-      h('div', { class: 'gap-columns' }, [
-        h('div', [h('small', 'Stated'), h('p', props.gap.stated_value)]),
-        h('div', [h('small', 'Revealed'), h('p', props.gap.revealed_behavior)])
-      ]),
-      props.gap.driver_hypothesis ? h('p', { class: 'muted' }, props.gap.driver_hypothesis) : null,
-      h('p', props.gap.decision_risk),
-      h(ReviewActions, { onReview: action => emit('review', props.gap.id, action) })
-    ])
-  }
-})
 
 const DecisionRow = defineComponent({
   props: {
