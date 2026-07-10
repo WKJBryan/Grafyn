@@ -148,7 +148,10 @@ pub async fn update_decision_mirror_config(
     update: DecisionMirrorConfigUpdate,
     state: State<'_, AppState>,
 ) -> Result<DecisionMirrorConfig, String> {
-    let store = state.twin_store.read().await;
+    // Read-modify-write over the config file: must hold the write lock so two
+    // concurrent updates can't both read the same on-disk state and have the
+    // second writer silently clobber the first's change.
+    let store = state.twin_store.write().await;
     store
         .update_decision_mirror_config(update)
         .map_err(|error| error.to_string())
@@ -201,7 +204,9 @@ pub async fn create_constitution_item(
     item: ConstitutionItemCreate,
     state: State<'_, AppState>,
 ) -> Result<ConstitutionItem, String> {
-    let store = state.twin_store.read().await;
+    // Write lock: create_constitution_item does a read-modify-write file
+    // sequence (see update_decision_mirror_config above for why read() is unsafe here).
+    let store = state.twin_store.write().await;
     store
         .create_constitution_item(item)
         .map_err(|error| error.to_string())
@@ -213,7 +218,11 @@ pub async fn update_constitution_item(
     update: ConstitutionItemUpdate,
     state: State<'_, AppState>,
 ) -> Result<ConstitutionItem, String> {
-    let store = state.twin_store.read().await;
+    // Write lock: update_constitution_item reads the current item file, applies the
+    // update, then writes it back. Two concurrent updates to the same item under a
+    // shared read lock could both read the pre-update file and the second writer
+    // would silently clobber the first's change.
+    let store = state.twin_store.write().await;
     store
         .update_constitution_item(&id, update)
         .map_err(|error| error.to_string())
@@ -668,4 +677,102 @@ fn excerpt(content: &str) -> String {
     let mut excerpt: String = content.chars().take(MAX_LEN).collect();
     excerpt.push_str("...");
     excerpt
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::models::twin::{ConstitutionItemCreate, ConstitutionItemUpdate};
+    use crate::services::twin::TwinStore;
+    use std::sync::Arc;
+    use tempfile::tempdir;
+    use tokio::sync::RwLock;
+
+    /// Regression test for the read-modify-write lock fix: `update_constitution_item`
+    /// reads the current item file, applies the update's `Some` fields, and writes the
+    /// whole item back. Two concurrent updates to the *same* item under a shared read
+    /// lock (the pre-fix behavior) could both read the same pre-update file and the
+    /// second writer would silently clobber the first's change — a classic lost
+    /// update. With the write lock in place, `Arc<RwLock<TwinStore>>::write().await`
+    /// fully serializes the two calls (tokio's RwLock allows only one writer at a
+    /// time, with no `.await` point inside `update_constitution_item` for the second
+    /// task to interleave into), so both edits — one to `claim`, the other to
+    /// `priority` — must survive.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_constitution_updates_do_not_lose_a_write() {
+        let temp_dir = tempdir().expect("temp dir should be created");
+        let store = Arc::new(RwLock::new(TwinStore::new(temp_dir.path().to_path_buf())));
+
+        let item = {
+            let guard = store.read().await;
+            guard
+                .create_constitution_item(ConstitutionItemCreate {
+                    claim: "Original claim".to_string(),
+                    dimension: "values".to_string(),
+                    scope: vec!["general".to_string()],
+                    priority: 0.5,
+                    confidence: 0.5,
+                    status: Default::default(),
+                    evidence_refs: Vec::new(),
+                    tensions: Vec::new(),
+                    linked_record_ids: Vec::new(),
+                    source: None,
+                })
+                .expect("constitution item should be created")
+        };
+
+        let store_a = store.clone();
+        let item_id_a = item.id.clone();
+        let claim_update = tokio::spawn(async move {
+            // Mirrors the fixed `update_constitution_item` command: acquire the
+            // write lock for the whole read-modify-write sequence.
+            let guard = store_a.write().await;
+            guard
+                .update_constitution_item(
+                    &item_id_a,
+                    ConstitutionItemUpdate {
+                        claim: Some("Updated claim".to_string()),
+                        ..Default::default()
+                    },
+                )
+                .expect("claim update should persist")
+        });
+
+        let store_b = store.clone();
+        let item_id_b = item.id.clone();
+        let priority_update = tokio::spawn(async move {
+            let guard = store_b.write().await;
+            guard
+                .update_constitution_item(
+                    &item_id_b,
+                    ConstitutionItemUpdate {
+                        priority: Some(0.9),
+                        ..Default::default()
+                    },
+                )
+                .expect("priority update should persist")
+        });
+
+        let (a, b) = tokio::join!(claim_update, priority_update);
+        a.expect("claim-update task panicked");
+        b.expect("priority-update task panicked");
+
+        let final_item = {
+            let guard = store.read().await;
+            guard
+                .list_constitution_items()
+                .expect("constitution items should list")
+                .into_iter()
+                .find(|candidate| candidate.id == item.id)
+                .expect("updated item should still exist")
+        };
+
+        assert_eq!(
+            final_item.claim, "Updated claim",
+            "claim update must not be lost to the concurrent priority update"
+        );
+        assert_eq!(
+            final_item.priority, 0.9,
+            "priority update must not be lost to the concurrent claim update"
+        );
+    }
 }
