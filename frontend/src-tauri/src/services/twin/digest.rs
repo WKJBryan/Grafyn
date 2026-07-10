@@ -1,36 +1,19 @@
-use crate::models::note::Note;
-use crate::models::twin::{
-    ActionGap, ActionGapCreate, ConstitutionInferenceSummary, ConstitutionItem,
-    ConstitutionItemCreate, ConstitutionItemUpdate, ConstitutionReviewRequest, ConstitutionSetup,
-    ConstitutionStatus, DecisionEpisode, DecisionEpisodeCreate, DecisionEpisodeWithReflections,
-    DecisionEvidencePacket, DecisionEvidenceSource, DecisionMirrorConfig,
-    DecisionMirrorConfigUpdate, DecisionMirrorWeights, DecisionOutcomeUpdate, EvidenceRef,
-    ExportBundle, ExportFileSummary, MemoryDigestAction, MemoryDigestItem,
-    MemoryDigestReviewRequest, MemoryDigestState, PromotionState, RecordOrigin, ReflectionCard,
-    ReflectionCardCreate, ReflectionScores, ResolvedEvidenceRef, SessionTrace, TraceEvent,
-    TraceEventType, TwinContextRecord, TwinExportRequest, TwinInferenceRunSummary, TwinPrediction,
-    TwinPredictionDraft, TwinReviewRecord, UserRecord, UserRecordCreate, UserRecordKind,
-    UserRecordUpdate,
-};
+use super::constitution::normalize_key_text;
+use super::shared::lexical_terms;
+use super::TwinStore;
+use super::{AUTO_PROMOTE_CONFIDENCE, AUTO_PROMOTE_SUPPORT_COUNT};
 #[cfg(test)]
-use crate::models::twin::{DecisionMirrorPreset, PrimitiveDecisionAssessment};
-use crate::services::atomic_io::write_atomic;
+use crate::models::twin::{EvidenceRef, RecordOrigin, UserRecordCreate};
+use crate::models::twin::{
+    MemoryDigestAction, MemoryDigestItem, MemoryDigestReviewRequest, MemoryDigestState,
+    PromotionState, UserRecord, UserRecordKind, UserRecordUpdate,
+};
 use anyhow::{Context, Result};
 use chrono::Utc;
-use serde::de::DeserializeOwned;
-use serde::Serialize;
-use serde_json::{json, Value};
+use serde_json::Value;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
-use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
-use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
-use walkdir::WalkDir;
-use super::TwinStore;
-use super::shared::{lexical_terms};
-use super::{AUTO_PROMOTE_CONFIDENCE, AUTO_PROMOTE_SUPPORT_COUNT};
-use super::constitution::normalize_key_text;
 
 const MAX_MEMORY_DIGEST_ITEMS: usize = 5;
 
@@ -125,7 +108,6 @@ fn memory_digest_state_for_action(action: &MemoryDigestAction) -> MemoryDigestSt
         MemoryDigestAction::Reject => MemoryDigestState::Rejected,
     }
 }
-
 
 impl TwinStore {
     pub fn list_memory_digest(&mut self) -> Result<Vec<MemoryDigestItem>> {
@@ -318,16 +300,12 @@ impl TwinStore {
     fn write_memory_digest_file(&self, items: &[MemoryDigestItem]) -> Result<()> {
         self.write_pretty_json(&self.digest_path, &items)
     }
-
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::note::{Note, NoteStatus};
-    use crate::models::twin::{
-        default_record_confidence, PromotionState, RecordLink, RecordLinkType, UserRecordKind,
-    };
+    use crate::models::twin::{PromotionState, UserRecordKind};
     use tempfile::tempdir;
 
     #[test]
@@ -503,5 +481,4 @@ mod tests {
         assert_eq!(digest[0].evidence_count, 9);
         assert!(digest[0].trigger_reason.contains("clustered"));
     }
-
 }

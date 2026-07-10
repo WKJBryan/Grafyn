@@ -19,11 +19,15 @@
 //! `twin_store.rs` -- callers in `commands/twin.rs` and
 //! `commands/canvas/context.rs` do not need to change.
 
-mod shared;
-mod traces;
-mod records;
 mod constitution;
 mod decisions;
+mod records;
+mod shared;
+mod traces;
+// The mcp binary (grafyn-mcp) compiles this whole module tree but has no
+// caller for this re-export -- only the desktop app's commands/canvas/context.rs
+// imports `crate::services::twin::parse_twin_prediction`.
+#[allow(unused_imports)]
 pub use decisions::parse_twin_prediction;
 mod digest;
 mod export;
@@ -112,5 +116,4 @@ impl TwinStore {
 
         Ok(())
     }
-
 }
