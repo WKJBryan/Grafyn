@@ -1,7 +1,7 @@
 //! Test-only builder helpers shared by more than one canvas submodule's test
 //! suite (currently `context` and `streaming`). Kept separate from either
 //! module so neither has to duplicate `build_tile`/`build_response`.
-#![cfg(test)]
+//! Gated by the `#[cfg(test)] mod test_support;` declaration in `mod.rs`.
 
 use crate::models::canvas::{
     ContextMode, ModelResponse, PromptTile, PromptType, ResponseStatus, TilePosition,
