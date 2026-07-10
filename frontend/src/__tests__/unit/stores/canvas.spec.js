@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { flushPromises } from '@vue/test-utils'
 import { createPinia, setActivePinia } from 'pinia'
 import { useCanvasStore, THINK_HARDER_PROMPT, THINK_HARDER_WEB_SEARCH_MAX_RESULTS } from '@/stores/canvas'
 import * as apiClient from '@/api/client'
@@ -24,7 +25,7 @@ describe('Canvas Store', () => {
       return unlistenMock
     })
 
-    const sendPromptSpy = vi.spyOn(apiClient.canvas, 'sendPrompt').mockImplementation(async (_sessionId, request) => {
+    const sendPromptSpy = vi.spyOn(apiClient.canvas, 'sendPrompt').mockImplementation(async () => {
       streamHandler({
         payload: {
           session_id: 'session-1',
@@ -33,7 +34,7 @@ describe('Canvas Store', () => {
           model_id: 'openai/gpt-4'
         }
       })
-      return `request:${request.prompt}`
+      return 'child-tile'
     })
 
     const store = useCanvasStore()
@@ -495,6 +496,97 @@ describe('Canvas Store', () => {
       content: '',
       error_message: 'No response returned from model'
     })
+  })
+
+  it('scopes concurrent sendPrompt streams per tile so same-model interleaved chunks do not cross-contaminate', async () => {
+    // Simulates the real Tauri behavior: every setupTauriStreamListener() call registers
+    // its own listener, and ALL listeners receive every canvas-stream event for the session.
+    const handlers = []
+    listenMock.mockImplementation(async (_eventName, handler) => {
+      handlers.push(handler)
+      return unlistenMock
+    })
+
+    function broadcast(payload) {
+      // Iterate a snapshot since a handler's own unlisten() (invoked from inside a
+      // handler-triggered callback) must not mutate the array mid-broadcast.
+      handlers.slice().forEach(handler => handler({ payload }))
+    }
+
+    let resolveA
+    let resolveB
+    vi.spyOn(apiClient.canvas, 'sendPrompt').mockImplementation(async (_sessionId, request) => {
+      if (request.prompt === 'Prompt A') {
+        return new Promise(resolve => { resolveA = resolve })
+      }
+      return new Promise(resolve => { resolveB = resolve })
+    })
+
+    const store = useCanvasStore()
+    store.currentSession = {
+      id: 'session-1',
+      prompt_tiles: [],
+      debates: []
+    }
+
+    const promiseA = store.sendPrompt('Prompt A', ['shared-model'])
+    await flushPromises()
+    const promiseB = store.sendPrompt('Prompt B', ['shared-model'])
+    await flushPromises()
+
+    expect(handlers.length).toBe(2)
+
+    // tile_created is broadcast to BOTH listeners (this is what causes duplicate-tile
+    // pushes today if the push isn't deduped by tile id).
+    broadcast({
+      session_id: 'session-1',
+      type: 'tile_created',
+      tile: {
+        id: 'tile-A',
+        prompt: 'Prompt A',
+        responses: {
+          'shared-model': { status: 'pending', content: '', position: { x: 0, y: 0, width: 280, height: 200 } }
+        }
+      }
+    })
+    broadcast({
+      session_id: 'session-1',
+      type: 'tile_created',
+      tile: {
+        id: 'tile-B',
+        prompt: 'Prompt B',
+        responses: {
+          'shared-model': { status: 'pending', content: '', position: { x: 0, y: 300, width: 280, height: 200 } }
+        }
+      }
+    })
+
+    resolveA('tile-A')
+    resolveB('tile-B')
+    await flushPromises()
+
+    // Interleave chunk events for both tiles under the SAME model id.
+    broadcast({ session_id: 'session-1', type: 'chunk', tile_id: 'tile-A', model_id: 'shared-model', chunk: 'Hello ' })
+    broadcast({ session_id: 'session-1', type: 'chunk', tile_id: 'tile-B', model_id: 'shared-model', chunk: 'World ' })
+    broadcast({ session_id: 'session-1', type: 'chunk', tile_id: 'tile-A', model_id: 'shared-model', chunk: 'from A' })
+    broadcast({ session_id: 'session-1', type: 'chunk', tile_id: 'tile-B', model_id: 'shared-model', chunk: 'from B' })
+    broadcast({ session_id: 'session-1', type: 'complete', tile_id: 'tile-A', model_id: 'shared-model' })
+    broadcast({ session_id: 'session-1', type: 'complete', tile_id: 'tile-B', model_id: 'shared-model' })
+
+    await Promise.all([promiseA, promiseB])
+
+    const tiles = store.currentSession.prompt_tiles
+    expect(tiles.map(t => t.id).sort()).toEqual(['tile-A', 'tile-B'])
+
+    const tileA = tiles.find(t => t.id === 'tile-A')
+    const tileB = tiles.find(t => t.id === 'tile-B')
+    expect(tileA.responses['shared-model'].content).toBe('Hello from A')
+    expect(tileB.responses['shared-model'].content).toBe('World from B')
+    expect(tileA.responses['shared-model'].status).toBe('completed')
+    expect(tileB.responses['shared-model'].status).toBe('completed')
+
+    // No streaming keys should remain — single-ownership decrement, no double-decrement leak.
+    expect(store.streamingModels.size).toBe(0)
   })
 
   it('loadSession maps persisted backend errors onto response.error_message', async () => {

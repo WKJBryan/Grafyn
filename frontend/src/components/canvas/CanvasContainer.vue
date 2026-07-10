@@ -221,7 +221,7 @@
           :prompt-type="node.promptType"
           :decision-episode-id="node.decisionEpisodeId"
           :web-search="node.webSearch"
-          :is-streaming="streamingModels.has(node.modelId)"
+          :is-streaming="streamingModels.has(`${node.tileId}:${node.modelId}`)"
           :selected="selectedNodes.includes(`llm:${node.tileId}:${node.modelId}`)"
           :available-models="availableModels"
           @drag="handleLLMDrag"

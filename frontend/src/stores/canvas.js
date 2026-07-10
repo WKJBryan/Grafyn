@@ -56,6 +56,31 @@ export const useCanvasStore = defineStore('canvas', () => {
     triggerRef(streamingModels)
   }
 
+  // Tracks streaming keys owned by a single in-flight operation (sendPrompt /
+  // addModelToTile / regenerateResponse). Single-ownership rule: the operation's own
+  // complete/error handler clears a key the moment that model finishes, and the
+  // operation's outer `finally` only clears whatever keys are still pending (crash/
+  // timeout safety) — so a given addStreaming() call is decremented exactly once,
+  // never both by the handler AND by the outer finally.
+  function createStreamingTracker() {
+    const pending = new Set()
+    return {
+      mark(key) {
+        if (!pending.has(key)) {
+          pending.add(key)
+          addStreaming(key)
+        }
+      },
+      clear(key) {
+        if (pending.delete(key)) removeStreaming(key)
+      },
+      finalize() {
+        pending.forEach(key => removeStreaming(key))
+        pending.clear()
+      }
+    }
+  }
+
   function normalizeResponse(response) {
     if (!response) return response
 
@@ -272,9 +297,6 @@ export const useCanvasStore = defineStore('canvas', () => {
     const sessionId = currentSession.value.id
     error.value = null
 
-    // Mark models as streaming
-    models.forEach(m => addStreaming(m))
-
     // Calculate position for new tile when branching from a parent response
     let position = undefined
     if (parentTileId && parentModelId) {
@@ -289,6 +311,19 @@ export const useCanvasStore = defineStore('canvas', () => {
         }
       }
     }
+
+    // This operation's own tile id — the ONLY reliable source is the invoke() return
+    // value below (a direct 1:1 RPC response), because tile_created is a broadcast
+    // event: every concurrent sendPrompt/addModelToTile/regenerateResponse call shares
+    // the same listener stream, so a second operation's tile_created can arrive on
+    // this operation's listener too. Until we know our own tile id, any tile-scoped
+    // event (chunk/complete/error/context_notes) is buffered rather than guessed at,
+    // then replayed and filtered once the real id is known — this covers events that
+    // arrive (as they do in production, since invoke() and events are separate
+    // channels) before the invoke() promise itself resolves.
+    let ownTileId = null
+    const pendingEvents = []
+    const tracker = createStreamingTracker()
 
     try {
       const modelContent = {}
@@ -313,30 +348,56 @@ export const useCanvasStore = defineStore('canvas', () => {
         web_search_max_results: webSearchMaxResults
       }
 
+      const applyContextNotes = (data) => {
+        if (currentSession.value) {
+          const tile = currentSession.value.prompt_tiles.find(t => t.id === data.tile_id)
+          if (tile) tile.context_notes = data.notes || []
+        }
+      }
+      const applyChunk = (data) => {
+        modelContent[data.model_id] = (modelContent[data.model_id] || '') + data.chunk
+        updateTileResponseLocal(data.tile_id, data.model_id, modelContent[data.model_id], 'streaming')
+      }
+      const applyComplete = (data) => {
+        updateTileResponseLocal(data.tile_id, data.model_id, modelContent[data.model_id], 'completed')
+        tracker.clear(`${ownTileId}:${data.model_id}`)
+      }
+      const applyError = (data) => {
+        updateTileResponseLocal(data.tile_id, data.model_id, '', 'error', data.error)
+        tracker.clear(`${ownTileId}:${data.model_id}`)
+      }
+      const scopedAppliers = { context_notes: applyContextNotes, chunk: applyChunk, complete: applyComplete, error: applyError }
+
       // Set up event listener BEFORE calling invoke
       const unlisten = await setupTauriStreamListener(sessionId, {
         tile_created: (data) => {
+          // Safe for every concurrent listener: push-if-absent dedupes the tile so N
+          // concurrent operations broadcasting to each other's listeners still result
+          // in exactly one push per tile, regardless of which operation it belongs to.
           if (currentSession.value && data.tile) {
-            currentSession.value.prompt_tiles.push(data.tile)
+            const exists = currentSession.value.prompt_tiles.some(t => t.id === data.tile.id)
+            if (!exists) currentSession.value.prompt_tiles.push(data.tile)
           }
         },
         context_notes: (data) => {
-          if (currentSession.value) {
-            const tile = currentSession.value.prompt_tiles.find(t => t.id === data.tile_id)
-            if (tile) tile.context_notes = data.notes || []
-          }
+          if (ownTileId === null) { pendingEvents.push(['context_notes', data]); return }
+          if (data.tile_id !== ownTileId) return
+          applyContextNotes(data)
         },
         chunk: (data) => {
-          modelContent[data.model_id] = (modelContent[data.model_id] || '') + data.chunk
-          updateTileResponseLocal(data.tile_id, data.model_id, modelContent[data.model_id], 'streaming')
+          if (ownTileId === null) { pendingEvents.push(['chunk', data]); return }
+          if (data.tile_id !== ownTileId) return
+          applyChunk(data)
         },
         complete: (data) => {
-          updateTileResponseLocal(data.tile_id, data.model_id, modelContent[data.model_id], 'completed')
-          removeStreaming(data.model_id)
+          if (ownTileId === null) { pendingEvents.push(['complete', data]); return }
+          if (data.tile_id !== ownTileId) return
+          applyComplete(data)
         },
         error: (data) => {
-          updateTileResponseLocal(data.tile_id, data.model_id, '', 'error', data.error)
-          removeStreaming(data.model_id)
+          if (ownTileId === null) { pendingEvents.push(['error', data]); return }
+          if (data.tile_id !== ownTileId) return
+          applyError(data)
         },
         session_saved: async () => {
           await loadSession(sessionId)
@@ -346,7 +407,16 @@ export const useCanvasStore = defineStore('canvas', () => {
       try {
         // invoke returns tile_id immediately; streaming happens via events
         const tileId = await canvasApi.sendPrompt(sessionId, request)
-        await waitForModelsComplete(models, 120000)
+        ownTileId = tileId
+        models.forEach(m => tracker.mark(`${tileId}:${m}`))
+
+        // Replay anything buffered while we didn't yet know our own tile id, dropping
+        // events that turned out to belong to a different concurrent operation.
+        pendingEvents.splice(0).forEach(([type, data]) => {
+          if (data.tile_id === ownTileId) scopedAppliers[type](data)
+        })
+
+        await waitForModelsComplete(models.map(m => `${tileId}:${m}`), 120000)
         return tileId
       } finally {
         unlisten()
@@ -356,16 +426,17 @@ export const useCanvasStore = defineStore('canvas', () => {
       console.error('Failed to send prompt:', err)
       throw err
     } finally {
-      models.forEach(m => removeStreaming(m))
+      tracker.finalize()
     }
   }
 
-  // Wait for all streaming models to complete (or timeout)
-  function waitForModelsComplete(models, timeoutMs = 120000) {
+  // Wait for all streaming keys to complete (or timeout). `keys` are the composite
+  // `${tileId}:${modelId}` streaming-state keys owned by the calling operation.
+  function waitForModelsComplete(keys, timeoutMs = 120000) {
     return new Promise((resolve) => {
       const start = Date.now()
       const check = () => {
-        const stillStreaming = models.some(m => streamingModels.value.has(m))
+        const stillStreaming = keys.some(k => streamingModels.value.has(k))
         if (!stillStreaming || Date.now() - start > timeoutMs) {
           resolve()
         } else {
@@ -816,8 +887,10 @@ export const useCanvasStore = defineStore('canvas', () => {
     const sessionId = currentSession.value.id
     error.value = null
 
-    // Mark new models as streaming
-    newModelIds.forEach(m => addStreaming(m))
+    // tileId is known synchronously (an existing tile), so streaming keys can be
+    // marked immediately — no need to learn ownership asynchronously like sendPrompt.
+    const tracker = createStreamingTracker()
+    newModelIds.forEach(m => tracker.mark(`${tileId}:${m}`))
 
     try {
       const modelContent = {}
@@ -827,24 +900,28 @@ export const useCanvasStore = defineStore('canvas', () => {
 
       const unlisten = await setupTauriStreamListener(sessionId, {
         models_added: (data) => {
-          const tile = currentSession.value.prompt_tiles.find(t => t.id === data.tile_id)
-          if (tile) {
+          if (data.tile_id !== tileId) return
+          const targetTile = currentSession.value.prompt_tiles.find(t => t.id === data.tile_id)
+          if (targetTile) {
             for (const [modelId, response] of Object.entries(data.responses)) {
-              tile.responses[modelId] = response
+              targetTile.responses[modelId] = response
             }
           }
         },
         chunk: (data) => {
+          if (data.tile_id !== tileId || !newModelIds.includes(data.model_id)) return
           modelContent[data.model_id] = (modelContent[data.model_id] || '') + data.chunk
           updateTileResponseLocal(tileId, data.model_id, modelContent[data.model_id], 'streaming')
         },
         complete: (data) => {
+          if (data.tile_id !== tileId || !newModelIds.includes(data.model_id)) return
           updateTileResponseLocal(tileId, data.model_id, modelContent[data.model_id], 'completed')
-          removeStreaming(data.model_id)
+          tracker.clear(`${tileId}:${data.model_id}`)
         },
         error: (data) => {
+          if (data.tile_id !== tileId || !newModelIds.includes(data.model_id)) return
           updateTileResponseLocal(tileId, data.model_id, '', 'error', data.error)
-          removeStreaming(data.model_id)
+          tracker.clear(`${tileId}:${data.model_id}`)
         },
         session_saved: async () => {
           await loadSession(sessionId)
@@ -853,7 +930,7 @@ export const useCanvasStore = defineStore('canvas', () => {
 
       try {
         await canvasApi.addModelsToTile(sessionId, tileId, request)
-        await waitForModelsComplete(newModelIds, 120000)
+        await waitForModelsComplete(newModelIds.map(m => `${tileId}:${m}`), 120000)
       } finally {
         unlisten()
       }
@@ -862,7 +939,7 @@ export const useCanvasStore = defineStore('canvas', () => {
       console.error('Failed to add models to tile:', err)
       throw err
     } finally {
-      newModelIds.forEach(m => removeStreaming(m))
+      tracker.finalize()
     }
   }
 
@@ -880,8 +957,11 @@ export const useCanvasStore = defineStore('canvas', () => {
     const sessionId = currentSession.value.id
     error.value = null
 
-    // Mark model as streaming
-    addStreaming(modelId)
+    // tileId is known synchronously (an existing tile), so the streaming key can be
+    // marked immediately.
+    const streamingKey = `${tileId}:${modelId}`
+    const tracker = createStreamingTracker()
+    tracker.mark(streamingKey)
 
     // Clear existing content
     updateTileResponseLocal(tileId, modelId, '', 'streaming')
@@ -891,22 +971,19 @@ export const useCanvasStore = defineStore('canvas', () => {
 
       const unlisten = await setupTauriStreamListener(sessionId, {
         chunk: (data) => {
-          if (data.model_id === modelId) {
-            content += data.chunk
-            updateTileResponseLocal(tileId, modelId, content, 'streaming')
-          }
+          if (data.tile_id !== tileId || data.model_id !== modelId) return
+          content += data.chunk
+          updateTileResponseLocal(tileId, modelId, content, 'streaming')
         },
         complete: (data) => {
-          if (data.model_id === modelId) {
-            updateTileResponseLocal(tileId, modelId, content, 'completed')
-            removeStreaming(modelId)
-          }
+          if (data.tile_id !== tileId || data.model_id !== modelId) return
+          updateTileResponseLocal(tileId, modelId, content, 'completed')
+          tracker.clear(streamingKey)
         },
         error: (data) => {
-          if (data.model_id === modelId) {
-            updateTileResponseLocal(tileId, modelId, '', 'error', data.error)
-            removeStreaming(modelId)
-          }
+          if (data.tile_id !== tileId || data.model_id !== modelId) return
+          updateTileResponseLocal(tileId, modelId, '', 'error', data.error)
+          tracker.clear(streamingKey)
         },
         session_saved: async () => {
           await loadSession(sessionId)
@@ -915,7 +992,7 @@ export const useCanvasStore = defineStore('canvas', () => {
 
       try {
         await canvasApi.regenerateResponse(sessionId, tileId, modelId)
-        await waitForModelsComplete([modelId], 120000)
+        await waitForModelsComplete([streamingKey], 120000)
       } finally {
         unlisten()
       }
@@ -924,7 +1001,7 @@ export const useCanvasStore = defineStore('canvas', () => {
       console.error('Failed to regenerate response:', err)
       throw err
     } finally {
-      removeStreaming(modelId)
+      tracker.finalize()
     }
   }
 
