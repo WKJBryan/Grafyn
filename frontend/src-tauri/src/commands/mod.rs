@@ -36,6 +36,7 @@ pub mod twin;
 pub mod zettelkasten;
 
 use crate::models::note::Note;
+use crate::services::index_commit;
 use crate::services::retrieval::RetrievalResult;
 use crate::AppState;
 use std::collections::HashSet;
@@ -131,14 +132,14 @@ pub(crate) async fn sync_topic_hubs(state: &AppState) -> Result<Vec<Note>, Strin
         remove_link_discovery_note(state, removed_note_id).await;
 
         let mut search = state.search_service.write().await;
-        if let Err(error) = search.remove_note(removed_note_id) {
+        if let Err(error) = index_commit::remove_note_for_search(&mut search, removed_note_id) {
             log::error!(
                 "Failed to remove topic-hub note '{}' from search index: {}",
                 removed_note_id,
                 error
             );
         }
-        if let Err(error) = search.commit() {
+        if let Err(error) = index_commit::commit_search(&mut search) {
             log::error!(
                 "Failed to commit search index after topic-hub removal: {}",
                 error
@@ -150,11 +151,11 @@ pub(crate) async fn sync_topic_hubs(state: &AppState) -> Result<Vec<Note>, Strin
         {
             let mut search = state.search_service.write().await;
             for note in &changed_notes {
-                if let Err(error) = search.index_note(note) {
+                if let Err(error) = index_commit::index_note_for_search(&mut search, note) {
                     log::error!("Failed to index topic-hub note '{}': {}", note.id, error);
                 }
             }
-            if let Err(error) = search.commit() {
+            if let Err(error) = index_commit::commit_search(&mut search) {
                 log::error!("Failed to commit search index after topic sync: {}", error);
             }
         }
@@ -273,11 +274,11 @@ pub(crate) async fn commit_note_writes(
     if !notes.is_empty() {
         let mut search = state.search_service.write().await;
         for note in &notes {
-            if let Err(error) = search.index_note(note) {
+            if let Err(error) = index_commit::index_note_for_search(&mut search, note) {
                 log::error!("Failed to index note '{}': {}", note.id, error);
             }
         }
-        if let Err(error) = search.commit() {
+        if let Err(error) = index_commit::commit_search(&mut search) {
             log::error!(
                 "Failed to commit search index after note write(s): {}",
                 error
@@ -295,11 +296,182 @@ pub(crate) async fn commit_note_writes(
     Ok(all_notes)
 }
 
+/// Refreshes search + chunk + topic-hub/graph state for a note that the
+/// background vault optimizer worker (`main.rs::start_vault_optimizer_worker`)
+/// just wrote to disk directly — bypassing `commit_note_write`/
+/// `commit_note_writes` on purpose. See the design note below.
+///
+/// ## Why this exists (Part A of the 2026-07 optimizer-reindex fix)
+///
+/// The optimizer's two write paths — the `sidecar_first` overlay write
+/// inside `VaultOptimizerService::prepare_next`, and the `full_rewrite`
+/// `KnowledgeStore::update_note` inside `apply_pending` — change
+/// tags/aliases/properties. Those changes ARE visible through
+/// `KnowledgeStore::get_note` (overlays merge on read), and they DO matter to
+/// search ranking, chunk content, and topic-hub membership — but neither
+/// write path ever touched an index. The change was invisible to
+/// `search_notes`/`get_backlinks` until the next full `rebuild_all_indexes`
+/// (i.e. an app restart). That is the bug this function fixes.
+///
+/// ## Why a narrower helper instead of just calling `commit_note_write`
+///
+/// The obvious first idea is: call `commit_note_write(state, note_id, reason)`
+/// from the worker like every other write site does. That does not work
+/// cleanly, because `commit_note_write` unconditionally calls
+/// `enqueue_vault_optimizer_note` — which would re-enqueue the exact note the
+/// optimizer just finished processing (`finalize_applied_change` already
+/// removed it from the queue before this runs; `enqueue_note` has no memory
+/// of "we were the one who just wrote this").
+///
+/// That re-enqueue is NOT a runaway loop: on the next worker tick,
+/// `build_optimizer_proposal` computes its proposal from the note's CURRENT
+/// (already-updated) tags/aliases/properties, so the delta is empty,
+/// `prepare_next` takes its `proposal.is_empty()` branch, and
+/// `complete_noop_job` dequeues the job again. Critically, `complete_noop_job`
+/// does NOT call `record_daily_write` — only `finalize_applied_change` (a real
+/// write) does — so this extra pass costs nothing against
+/// `background_vault_optimizer_max_daily_writes`. It also cannot enqueue the
+/// rest of the vault: `sync_topic_hubs` (which this function still calls,
+/// see below) only re-bootstraps the WHOLE queue when the queue is fully
+/// empty, and a re-enqueued single note keeps the queue non-empty.
+///
+/// So the loop is real but self-correcting and free. It was still rejected
+/// in favor of this narrower helper for two reasons: (1) it's a wasted extra
+/// 30-second worker tick per optimizer write for no benefit, and (2) it
+/// would record a spurious no-op "decision"-shaped pass through the pipeline
+/// that has no meaningful audit story (the note wasn't touched by that
+/// second pass; there's nothing to explain). Skipping the enqueue avoids
+/// both for the price of duplicating the search+chunk+topic-hub sequence
+/// here instead of getting it for free from `commit_note_write` — an
+/// acceptable tradeoff since the vault optimizer worker is the only caller
+/// of this pattern.
+///
+/// ## Lock ordering
+///
+/// Must be called only after the caller (`main.rs::start_vault_optimizer_worker`)
+/// has released BOTH `knowledge_store` and `vault_optimizer` — the locks it
+/// held to drive `prepare_next`/`apply_pending`. This function reacquires
+/// `knowledge_store` itself (a read, then — via `sync_topic_hubs` — a write),
+/// so calling it while either lock from the optimizer tick is still held
+/// would at best double-acquire `knowledge_store` (a real risk of deadlock
+/// depending on lock implementation) and at worst invert the canonical
+/// `knowledge_store`-before-`vault_optimizer` order documented at the top of
+/// this file. The worker enforces this structurally: the block that computes
+/// `tick`/`applied_note_id` ends (dropping its guards) before this function
+/// is ever called.
+///
+/// Errors reading/indexing the note are logged and swallowed (matching
+/// `commit_note_writes`'s precedent) rather than propagated, since a
+/// background worker has no caller to report an error to and the note is
+/// already durably written — a stale index self-heals on the next
+/// `rebuild_all_indexes`. `sync_topic_hubs` failures DO propagate, matching
+/// `commit_note_writes`.
+pub(crate) async fn commit_note_index_refresh(
+    state: &AppState,
+    note_id: &str,
+) -> Result<(), String> {
+    let note = {
+        let store = state.knowledge_store.read().await;
+        store.get_note(note_id)
+    };
+
+    match note {
+        Ok(note) => {
+            {
+                let mut search = state.search_service.write().await;
+                if let Err(error) = index_commit::index_note_for_search(&mut search, &note) {
+                    log::error!(
+                        "Failed to index optimizer-updated note '{}' into search: {}",
+                        note.id,
+                        error
+                    );
+                }
+                if let Err(error) = index_commit::commit_search(&mut search) {
+                    log::error!(
+                        "Failed to commit search index after optimizer update to '{}': {}",
+                        note.id,
+                        error
+                    );
+                }
+            }
+            sync_chunk_index_for_note(state, &note).await;
+        }
+        Err(error) => {
+            log::warn!(
+                "commit_note_index_refresh: note '{}' could not be read for indexing: {}",
+                note_id,
+                error
+            );
+        }
+    }
+
+    // Deliberately no `enqueue_vault_optimizer_note` call here — see the doc
+    // comment above.
+    sync_topic_hubs(state).await?;
+    Ok(())
+}
+
+/// Single chokepoint for "a note was just deleted from the vault and needs
+/// to disappear everywhere else": the search index, the chunk index, link
+/// discovery, topic hubs (which also rebuilds the graph), and the vault
+/// optimizer queue. Symmetric counterpart to [`commit_note_write`]/
+/// [`commit_note_writes`] — those handle "a note was created or edited and
+/// needs to become visible"; this handles the opposite direction.
+///
+/// Callers must have already removed the note from the vault itself (e.g.
+/// via `KnowledgeStore::delete_note`) before calling this — it only cleans
+/// up the derived indexes/queues, it does not touch the vault.
+///
+/// `reason` is forwarded to `enqueue_vault_optimizer_note` for its audit
+/// trail (e.g. `"note_deleted"`), mirroring `commit_note_write`. This looks
+/// odd at first — why enqueue a note that no longer exists? — but it's
+/// harmless and matches the pre-existing behavior this function replaces
+/// (`notes::delete_note` already did this): `VaultOptimizerService::
+/// prepare_next` handles a missing note by logging a warning and dequeuing
+/// it again on the very next tick (see its `store.get_note` error branch),
+/// so this is a no-op fast-path, not a real optimizer run.
+///
+/// Error handling mirrors `commit_note_write`: search/chunk/link-discovery
+/// failures are logged and swallowed (the note is already gone from the
+/// vault; a stale index self-heals on the next `rebuild_all_indexes`),
+/// while `sync_topic_hubs` failures propagate.
+pub(crate) async fn commit_note_delete(
+    state: &AppState,
+    note_id: &str,
+    reason: &str,
+) -> Result<(), String> {
+    {
+        let mut search = state.search_service.write().await;
+        if let Err(error) = index_commit::remove_note_for_search(&mut search, note_id) {
+            log::error!(
+                "Failed to remove note '{}' from search index: {}",
+                note_id,
+                error
+            );
+        }
+        if let Err(error) = index_commit::commit_search(&mut search) {
+            log::error!(
+                "Failed to commit search index after deleting note '{}': {}",
+                note_id,
+                error
+            );
+        }
+    }
+
+    remove_note_chunks_from_index(state, note_id).await;
+    remove_link_discovery_note(state, note_id).await;
+    sync_topic_hubs(state).await?;
+    enqueue_vault_optimizer_note(state, note_id, reason).await;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod commit_note_write_tests {
     use super::*;
     use crate::models::boot::BootStatus;
     use crate::models::note::{NoteCreate, NoteStatus, NoteUpdate};
+    use crate::models::settings::UserSettings;
     use crate::services::canvas_store::CanvasStore;
     use crate::services::chunk_index::ChunkIndex;
     use crate::services::feedback::FeedbackService;
@@ -314,6 +486,7 @@ mod commit_note_write_tests {
     use crate::services::retrieval::RetrievalService;
     use crate::services::search::SearchService;
     use crate::services::settings::SettingsService;
+    use crate::services::topic_hub::normalize_topic_key;
     use crate::services::twin_store::TwinStore;
     use crate::services::vault_optimizer::VaultOptimizerService;
     use crate::AppState;
@@ -539,5 +712,243 @@ mod commit_note_write_tests {
                 i
             );
         }
+    }
+
+    /// Regression coverage for the optimizer-reindex bug: the background
+    /// vault optimizer's `sidecar_first` write path (`VaultOptimizerService::
+    /// prepare_next`) changes a note's tags via an overlay file, and that
+    /// change IS visible through `KnowledgeStore::get_note` (which merges the
+    /// overlay), but the search index's STORED tags field is a snapshot
+    /// frozen at the last `index_note` call — it goes stale the moment the
+    /// optimizer writes, until some other code path happens to reindex the
+    /// note. Searching by the note's own (unchanged) title still matches via
+    /// the title field regardless of the tag staleness, so the returned
+    /// `SearchResult::note.tags` — reconstructed purely from the indexed
+    /// document, not from the vault — is a direct probe of whether a reindex
+    /// actually happened.
+    #[tokio::test]
+    async fn optimizer_sidecar_write_is_reindexed_into_search() {
+        let (state, _vault_dir, _data_dir) = build_test_state();
+
+        let created = {
+            let mut store = state.knowledge_store.write().await;
+            store
+                .create_note(NoteCreate {
+                    title: "Quokka Alpha Habitat".to_string(),
+                    content: "Quokkas are found on Rottnest Island.".to_string(),
+                    relative_path: None,
+                    aliases: Vec::new(),
+                    status: NoteStatus::Draft,
+                    tags: Vec::new(),
+                    schema_version: crate::models::note::CURRENT_NOTE_SCHEMA_VERSION,
+                    migration_source: None,
+                    optimizer_managed: false,
+                    properties: Default::default(),
+                })
+                .expect("note should be created")
+        };
+        // Indexes the note once (empty tags) and enqueues it into the
+        // optimizer's queue, mirroring what actually happens on note
+        // creation in the running app.
+        commit_note_write(&state, &created.id, "test_note_created")
+            .await
+            .expect("commit_note_write should succeed");
+
+        let expected_tag = normalize_topic_key(&created.title).replace('-', "_");
+        let settings = UserSettings::default();
+        assert_eq!(
+            settings.background_vault_optimizer_edit_mode, "sidecar_first",
+            "this test exercises the sidecar_first path specifically"
+        );
+
+        // One worker tick, mirroring `main.rs::start_vault_optimizer_worker`
+        // exactly: `sidecar_first` applies the overlay write inline inside
+        // `prepare_next` (under a read lock on knowledge_store), which
+        // reports back which note needs reindexing.
+        let tick = {
+            let store = state.knowledge_store.read().await;
+            let mut optimizer = state.vault_optimizer.write().await;
+            optimizer
+                .prepare_next(&store, &settings)
+                .expect("prepare_next should not error")
+        };
+        let applied_note_id = match tick {
+            crate::services::vault_optimizer::OptimizerTick::Applied(note_id) => note_id,
+            other => panic!(
+                "expected sidecar_first mode to apply inline, got {:?}",
+                other
+            ),
+        };
+
+        // The locks taken above are released by now (the block ended) —
+        // `commit_note_index_refresh` is called exactly as the worker calls
+        // it, only after releasing every optimizer-tick lock.
+        commit_note_index_refresh(&state, &applied_note_id)
+            .await
+            .expect("commit_note_index_refresh should succeed");
+
+        let search = state.search_service.read().await;
+        let results = search
+            .search(&created.title, 10)
+            .expect("search should not error");
+        let found = results
+            .iter()
+            .find(|r| r.note.id == created.id)
+            .expect("note should still be findable by its unchanged title");
+        assert!(
+            found.note.tags.contains(&expected_tag),
+            "expected the optimizer's sidecar overlay tag '{}' to be visible in \
+             search results without any manual reindex, got tags: {:?}",
+            expected_tag,
+            found.note.tags
+        );
+    }
+
+    /// Same regression as `optimizer_sidecar_write_is_reindexed_into_search`,
+    /// but for the `full_rewrite` edit mode: `prepare_next` returns a
+    /// `PendingOptimizerWrite` that the caller applies via `apply_pending`
+    /// under a write lock (a real `KnowledgeStore::update_note`, not a
+    /// sidecar overlay). That write is also invisible to search until
+    /// something reindexes it.
+    #[tokio::test]
+    async fn optimizer_full_rewrite_write_is_reindexed_into_search() {
+        let (state, _vault_dir, _data_dir) = build_test_state();
+
+        let created = {
+            let mut store = state.knowledge_store.write().await;
+            store
+                .create_note(NoteCreate {
+                    title: "Narwhal Beta Colony".to_string(),
+                    content: "Narwhals gather near Baffin Island in summer.".to_string(),
+                    relative_path: None,
+                    aliases: Vec::new(),
+                    status: NoteStatus::Draft,
+                    tags: Vec::new(),
+                    schema_version: crate::models::note::CURRENT_NOTE_SCHEMA_VERSION,
+                    migration_source: None,
+                    optimizer_managed: false,
+                    properties: Default::default(),
+                })
+                .expect("note should be created")
+        };
+        commit_note_write(&state, &created.id, "test_note_created")
+            .await
+            .expect("commit_note_write should succeed");
+
+        let expected_tag = normalize_topic_key(&created.title).replace('-', "_");
+        let settings = UserSettings {
+            background_vault_optimizer_edit_mode: "full_rewrite".to_string(),
+            ..UserSettings::default()
+        };
+
+        let tick = {
+            let store = state.knowledge_store.read().await;
+            let mut optimizer = state.vault_optimizer.write().await;
+            optimizer
+                .prepare_next(&store, &settings)
+                .expect("prepare_next should not error")
+        };
+        let pending = match tick {
+            crate::services::vault_optimizer::OptimizerTick::Pending(pending) => pending,
+            other => panic!(
+                "full_rewrite mode must return a pending write, got {:?}",
+                other
+            ),
+        };
+
+        let applied_note_id = {
+            let mut store = state.knowledge_store.write().await;
+            let mut optimizer = state.vault_optimizer.write().await;
+            optimizer
+                .apply_pending(&mut store, *pending)
+                .expect("apply_pending should not error")
+                .expect("full_rewrite apply should report the written note id")
+        };
+
+        // The locks taken above are released by now (the block ended) —
+        // `commit_note_index_refresh` is called exactly as the worker calls
+        // it, only after releasing every optimizer-tick lock.
+        commit_note_index_refresh(&state, &applied_note_id)
+            .await
+            .expect("commit_note_index_refresh should succeed");
+
+        let search = state.search_service.read().await;
+        let results = search
+            .search(&created.title, 10)
+            .expect("search should not error");
+        let found = results
+            .iter()
+            .find(|r| r.note.id == created.id)
+            .expect("note should still be findable by its unchanged title");
+        assert!(
+            found.note.tags.contains(&expected_tag),
+            "expected the optimizer's full_rewrite tag '{}' to be visible in \
+             search results without any manual reindex, got tags: {:?}",
+            expected_tag,
+            found.note.tags
+        );
+    }
+
+    /// `commit_note_delete` is the symmetric counterpart to
+    /// `commit_note_write`: a note removed from the vault must stop being
+    /// findable via search immediately, without a manual reindex.
+    #[tokio::test]
+    async fn deleted_note_is_no_longer_search_indexed_after_commit_note_delete() {
+        let (state, _vault_dir, _data_dir) = build_test_state();
+
+        let created = {
+            let mut store = state.knowledge_store.write().await;
+            store
+                .create_note(NoteCreate {
+                    title: "Platypus Gamma Burrow".to_string(),
+                    content: "Platypuses dig burrows along riverbanks in Tasmania.".to_string(),
+                    relative_path: None,
+                    aliases: Vec::new(),
+                    status: NoteStatus::Draft,
+                    tags: Vec::new(),
+                    schema_version: crate::models::note::CURRENT_NOTE_SCHEMA_VERSION,
+                    migration_source: None,
+                    optimizer_managed: false,
+                    properties: Default::default(),
+                })
+                .expect("note should be created")
+        };
+        commit_note_write(&state, &created.id, "test_note_created")
+            .await
+            .expect("commit_note_write should succeed");
+
+        // Sanity check: the note is indeed searchable before deletion.
+        {
+            let search = state.search_service.read().await;
+            let results = search
+                .search(&created.title, 10)
+                .expect("search should not error");
+            assert!(
+                results.iter().any(|r| r.note.id == created.id),
+                "note should be search-indexed before deletion"
+            );
+        }
+
+        {
+            let mut store = state.knowledge_store.write().await;
+            store
+                .delete_note(&created.id)
+                .expect("note should be deleted from the vault");
+        }
+
+        commit_note_delete(&state, &created.id, "test_note_deleted")
+            .await
+            .expect("commit_note_delete should succeed");
+
+        let search = state.search_service.read().await;
+        let results = search
+            .search(&created.title, 10)
+            .expect("search should not error");
+        assert!(
+            !results.iter().any(|r| r.note.id == created.id),
+            "expected deleted note to be immediately removed from search results \
+             without any manual reindex, found: {:?}",
+            results.iter().map(|r| &r.note.id).collect::<Vec<_>>()
+        );
     }
 }

@@ -1,7 +1,4 @@
-use crate::commands::{
-    commit_note_write, enqueue_vault_optimizer_note, remove_link_discovery_note,
-    remove_note_chunks_from_index, sync_topic_hubs,
-};
+use crate::commands::{commit_note_delete, commit_note_write};
 use crate::models::note::{Note, NoteCreate, NoteMeta, NoteStatus, NoteUpdate};
 use crate::models::twin::TraceEventType;
 use crate::AppState;
@@ -94,26 +91,7 @@ pub async fn delete_note(id: String, state: State<'_, AppState>) -> Result<(), S
     store.delete_note(&id).map_err(|e| e.to_string())?;
     drop(store);
 
-    {
-        let mut search = state.search_service.write().await;
-        if let Err(e) = search.remove_note(&id) {
-            log::error!("Failed to remove note '{}' from search index: {}", id, e);
-        }
-        if let Err(e) = search.commit() {
-            log::error!(
-                "Failed to commit search index after deleting note '{}': {}",
-                id,
-                e
-            );
-        }
-    }
-
-    remove_note_chunks_from_index(state.inner(), &id).await;
-    remove_link_discovery_note(state.inner(), &id).await;
-    sync_topic_hubs(state.inner()).await?;
-    enqueue_vault_optimizer_note(state.inner(), &id, "note_deleted").await;
-
-    Ok(())
+    commit_note_delete(state.inner(), &id, "note_deleted").await
 }
 
 async fn append_note_trace(state: &AppState, event_type: TraceEventType, note: &Note) {

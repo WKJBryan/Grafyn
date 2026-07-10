@@ -248,24 +248,35 @@ impl VaultOptimizerService {
     /// itself (`KnowledgeStore::write_overlay` takes `&self`, so it's safe under
     /// a read lock). Only when `edit_mode` is something other than
     /// `sidecar_first` (i.e. a real note rewrite is needed) does this return
-    /// `Some(PendingOptimizerWrite)` for the caller to apply via
+    /// `OptimizerTick::Pending` for the caller to apply via
     /// [`Self::apply_pending`] under a write lock. This mirrors
     /// `link_discovery::discover_for_note`'s snapshot-under-read-lock /
     /// work-lock-free / write-lock-only-to-apply pattern: the background
     /// worker (`main.rs::start_vault_optimizer_worker`) no longer needs to hold
     /// `knowledge_store.write()` for the whole run, only for the narrow
     /// `apply_pending` step when one is actually needed.
+    ///
+    /// When a `sidecar_first` write is applied inline, the return value is
+    /// `OptimizerTick::Applied(note_id)` rather than a bare "done" signal —
+    /// the write already changed the note's tags/aliases/properties on disk,
+    /// and the caller (`main.rs::start_vault_optimizer_worker`) MUST refresh
+    /// that note's search/chunk/topic-hub state afterward (via
+    /// `commands::commit_note_index_refresh`, once every lock this call held
+    /// has been released) or the change is invisible to search until the next
+    /// full index rebuild. See `commit_note_index_refresh`'s doc comment for
+    /// why that's a narrower helper than `commit_note_write` and not just a
+    /// call to it.
     pub fn prepare_next(
         &mut self,
         store: &KnowledgeStore,
         settings: &UserSettings,
-    ) -> Result<Option<PendingOptimizerWrite>> {
+    ) -> Result<OptimizerTick> {
         if !settings.background_vault_optimizer_enabled {
-            return Ok(None);
+            return Ok(OptimizerTick::Idle);
         }
 
         let Some(job) = self.state.queue.first().cloned() else {
-            return Ok(None);
+            return Ok(OptimizerTick::Idle);
         };
 
         let note = match store.get_note(&job.note_id) {
@@ -274,13 +285,13 @@ impl VaultOptimizerService {
                 log::warn!("Skipping optimizer note '{}': {}", job.note_id, error);
                 self.remove_queued_job(&job.note_id);
                 self.persist_state()?;
-                return Ok(None);
+                return Ok(OptimizerTick::Idle);
             }
         };
 
         if note.is_topic_hub() {
             self.complete_noop_job(&job.note_id)?;
-            return Ok(None);
+            return Ok(OptimizerTick::Idle);
         }
 
         // The note's original frontmatter failed to parse and is preserved verbatim
@@ -294,7 +305,7 @@ impl VaultOptimizerService {
                 note.id
             );
             self.complete_noop_job(&job.note_id)?;
-            return Ok(None);
+            return Ok(OptimizerTick::Idle);
         }
 
         // `background_vault_optimizer_llm_enabled` is meant to gate LLM-based
@@ -312,13 +323,13 @@ impl VaultOptimizerService {
             Ok(proposal) => proposal,
             Err(error) => {
                 self.defer_or_park_job(job, error)?;
-                return Ok(None);
+                return Ok(OptimizerTick::Idle);
             }
         };
 
         if proposal.is_empty() {
             self.complete_noop_job(&job.note_id)?;
-            return Ok(None);
+            return Ok(OptimizerTick::Idle);
         }
 
         if self.daily_write_cap_reached(settings) {
@@ -329,7 +340,7 @@ impl VaultOptimizerService {
             );
             // Leave the job queued untouched; it's retried on a later tick
             // (possibly after the daily counter rolls over to a new date).
-            return Ok(None);
+            return Ok(OptimizerTick::Idle);
         }
 
         let change_id = Uuid::new_v4().to_string();
@@ -367,23 +378,25 @@ impl VaultOptimizerService {
                 })
             })();
 
-            match write_result {
+            return match write_result {
                 Ok(change) => {
-                    self.finalize_applied_change(&job, &note, &change_id, decision, change)?
+                    self.finalize_applied_change(&job, &note, &change_id, decision, change)?;
+                    Ok(OptimizerTick::Applied(note.id.clone()))
                 }
-                Err(error) => self.defer_or_park_job(job, error)?,
-            }
-
-            return Ok(None);
+                Err(error) => {
+                    self.defer_or_park_job(job, error)?;
+                    Ok(OptimizerTick::Idle)
+                }
+            };
         }
 
-        Ok(Some(PendingOptimizerWrite {
+        Ok(OptimizerTick::Pending(Box::new(PendingOptimizerWrite {
             job,
             proposal,
             change_id,
             decision,
             edit_mode: settings.background_vault_optimizer_edit_mode.clone(),
-        }))
+        })))
     }
 
     /// Applies a `PendingOptimizerWrite` returned by [`Self::prepare_next`] for
@@ -402,11 +415,20 @@ impl VaultOptimizerService {
     /// snapshot instead would silently drop a tag the user just added or
     /// revert a rename they just made. If the re-fetch shows the note gone
     /// (deleted in the gap), the job is dropped like any missing note.
+    ///
+    /// Returns `Ok(Some(note_id))` when a write actually happened — the
+    /// caller (`main.rs::start_vault_optimizer_worker`) must then refresh
+    /// that note's search/chunk/topic-hub state (via
+    /// `commands::commit_note_index_refresh`) once it has released the
+    /// `knowledge_store`/`vault_optimizer` locks this call needed. Returns
+    /// `Ok(None)` for every terminal no-write case (note deleted in the gap,
+    /// frontmatter became unparsable in the gap, or the write itself failed
+    /// and was deferred/parked) — nothing to reindex.
     pub fn apply_pending(
         &mut self,
         store: &mut KnowledgeStore,
         pending: PendingOptimizerWrite,
-    ) -> Result<()> {
+    ) -> Result<Option<String>> {
         let PendingOptimizerWrite {
             job,
             proposal,
@@ -425,7 +447,7 @@ impl VaultOptimizerService {
                 );
                 self.remove_queued_job(&job.note_id);
                 self.persist_state()?;
-                return Ok(());
+                return Ok(None);
             }
         };
 
@@ -438,7 +460,7 @@ impl VaultOptimizerService {
                 current.id
             );
             self.complete_noop_job(&job.note_id)?;
-            return Ok(());
+            return Ok(None);
         }
 
         let write_result = store.update_note(
@@ -482,9 +504,13 @@ impl VaultOptimizerService {
                     created_at: Some(Utc::now()),
                     ..Default::default()
                 };
-                self.finalize_applied_change(&job, &current, &change_id, decision, change)
+                self.finalize_applied_change(&job, &current, &change_id, decision, change)?;
+                Ok(Some(current.id.clone()))
             }
-            Err(error) => self.defer_or_park_job(job, error),
+            Err(error) => {
+                self.defer_or_park_job(job, error)?;
+                Ok(None)
+            }
         }
     }
 
@@ -695,11 +721,39 @@ impl VaultOptimizerService {
     }
 }
 
+/// Outcome of a single [`VaultOptimizerService::prepare_next`] tick.
+///
+/// `prepare_next` handles every case that's resolvable under a read lock on
+/// `KnowledgeStore` — including the common `sidecar_first` edit mode, which
+/// applies its overlay write inline rather than deferring to a second stage.
+/// Only a non-`sidecar_first` edit mode needs the caller to come back with a
+/// write lock via [`VaultOptimizerService::apply_pending`].
+#[derive(Debug)]
+pub enum OptimizerTick {
+    /// Nothing to do this tick: optimizer disabled, empty queue, a
+    /// missing/topic-hub/unparsable-frontmatter/no-op note (all terminal —
+    /// dequeued inside `prepare_next`), the daily write cap reached, or a
+    /// transient processing error that was recorded and deferred/parked.
+    /// Nothing was written, so there is nothing to reindex.
+    Idle,
+    /// A `sidecar_first` overlay write was already applied to disk (and the
+    /// job already dequeued) inside this call. The note identified here has
+    /// stale search/chunk/topic-hub state that the caller must refresh —
+    /// see `commands::commit_note_index_refresh` — after releasing every
+    /// lock it took to drive this tick.
+    Applied(String),
+    /// A non-`sidecar_first` edit mode computed a proposal but needs a real
+    /// `KnowledgeStore::update_note` rewrite to apply it. Pass this to
+    /// [`VaultOptimizerService::apply_pending`] under a write lock.
+    Pending(Box<PendingOptimizerWrite>),
+}
+
 /// A rules-based proposal that was accepted but needs a mutable, cache-
 /// rebuilding `KnowledgeStore::update_note` write to apply (i.e. edit_mode is
 /// something other than `sidecar_first`, which applies inline within
 /// `prepare_next` instead). Returned by [`VaultOptimizerService::prepare_next`]
-/// and consumed by [`VaultOptimizerService::apply_pending`].
+/// (wrapped in [`OptimizerTick::Pending`]) and consumed by
+/// [`VaultOptimizerService::apply_pending`].
 ///
 /// Deliberately does NOT carry the note snapshot from the prepare stage:
 /// `apply_pending` re-fetches the note under the write lock and merges the
@@ -933,14 +987,18 @@ mod tests {
             ..UserSettings::default()
         };
 
-        assert!(service
-            .prepare_next(&store, &settings)
-            .expect("tick 1 should not error")
-            .is_none());
-        assert!(service
-            .prepare_next(&store, &settings)
-            .expect("tick 2 should not error")
-            .is_none());
+        assert!(matches!(
+            service
+                .prepare_next(&store, &settings)
+                .expect("tick 1 should not error"),
+            OptimizerTick::Applied(_)
+        ));
+        assert!(matches!(
+            service
+                .prepare_next(&store, &settings)
+                .expect("tick 2 should not error"),
+            OptimizerTick::Applied(_)
+        ));
         assert_eq!(
             service.state.queue.len(),
             1,
@@ -950,10 +1008,12 @@ mod tests {
         assert_eq!(service.state.daily_write_count, 2);
 
         let queue_before_cap = service.state.queue.clone();
-        assert!(service
-            .prepare_next(&store, &settings)
-            .expect("tick 3 (capped) should not error")
-            .is_none());
+        assert!(matches!(
+            service
+                .prepare_next(&store, &settings)
+                .expect("tick 3 (capped) should not error"),
+            OptimizerTick::Idle
+        ));
         assert_eq!(
             service.state.queue.len(),
             1,
@@ -996,10 +1056,16 @@ mod tests {
             ..UserSettings::default()
         };
 
-        let pending = service
+        let pending = match service
             .prepare_next(&store, &settings)
             .expect("prepare should not error")
-            .expect("full_rewrite mode must return a pending write");
+        {
+            OptimizerTick::Pending(pending) => pending,
+            other => panic!(
+                "full_rewrite mode must return a pending write, got {:?}",
+                other
+            ),
+        };
 
         // Simulate the interleaved user edit landing between the read-locked
         // prepare stage and the write-locked apply stage: add a tag and move
@@ -1015,9 +1081,14 @@ mod tests {
             )
             .expect("interleaved user edit should succeed");
 
-        service
-            .apply_pending(&mut store, pending)
+        let applied_note_id = service
+            .apply_pending(&mut store, *pending)
             .expect("apply should not error");
+        assert_eq!(
+            applied_note_id.as_deref(),
+            Some(note.id.as_str()),
+            "apply_pending must report the written note id for reindexing"
+        );
 
         let final_note = store.get_note(&note.id).expect("note should still exist");
         assert!(
@@ -1062,18 +1133,28 @@ mod tests {
             ..UserSettings::default()
         };
 
-        let pending = service
+        let pending = match service
             .prepare_next(&store, &settings)
             .expect("prepare should not error")
-            .expect("full_rewrite mode must return a pending write");
+        {
+            OptimizerTick::Pending(pending) => pending,
+            other => panic!(
+                "full_rewrite mode must return a pending write, got {:?}",
+                other
+            ),
+        };
 
         store
             .delete_note(&note.id)
             .expect("interleaved delete should succeed");
 
-        service
-            .apply_pending(&mut store, pending)
+        let applied_note_id = service
+            .apply_pending(&mut store, *pending)
             .expect("apply of a deleted note must not error");
+        assert_eq!(
+            applied_note_id, None,
+            "no note id should be reported for reindexing when the note was deleted in the gap"
+        );
 
         assert!(
             store.get_note(&note.id).is_err(),
@@ -1120,10 +1201,12 @@ mod tests {
                 background_vault_optimizer_llm_enabled: llm_enabled,
                 ..UserSettings::default()
             };
-            assert!(service
-                .prepare_next(&store, &settings)
-                .expect("tick should not error")
-                .is_none());
+            assert!(matches!(
+                service
+                    .prepare_next(&store, &settings)
+                    .expect("tick should not error"),
+                OptimizerTick::Applied(_)
+            ));
 
             service
                 .list_decisions(1)
@@ -1178,10 +1261,12 @@ mod tests {
 
         let settings = UserSettings::default();
 
-        assert!(service
-            .prepare_next(&store, &settings)
-            .expect("a processing error must not bubble up as Err")
-            .is_none());
+        assert!(matches!(
+            service
+                .prepare_next(&store, &settings)
+                .expect("a processing error must not bubble up as Err"),
+            OptimizerTick::Idle
+        ));
 
         assert_eq!(
             service.state.queue.len(),
@@ -1211,10 +1296,12 @@ mod tests {
         let settings = UserSettings::default();
 
         for attempt in 1..=MAX_OPTIMIZER_ATTEMPTS {
-            assert!(service
-                .prepare_next(&store, &settings)
-                .expect("a processing error must not bubble up as Err")
-                .is_none());
+            assert!(matches!(
+                service
+                    .prepare_next(&store, &settings)
+                    .expect("a processing error must not bubble up as Err"),
+                OptimizerTick::Idle
+            ));
             if attempt < MAX_OPTIMIZER_ATTEMPTS {
                 assert_eq!(
                     service.state.queue.len(),

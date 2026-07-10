@@ -7,12 +7,22 @@ mod services;
 
 use models::boot::BootStatus;
 use services::{
-    canvas_store::CanvasStore, chunk_index::ChunkIndex, feedback::FeedbackService,
-    graph_index::GraphIndex, knowledge_store::KnowledgeStore, link_discovery::LinkDiscoveryService,
-    markdown_migration::MarkdownMigrationService, memory::MemoryService, ollama::OllamaService,
-    openrouter::OpenRouterService, priority::PriorityScoringService, retrieval::RetrievalService,
-    search::SearchService, settings::SettingsService, twin_store::TwinStore,
-    vault_optimizer::VaultOptimizerService,
+    canvas_store::CanvasStore,
+    chunk_index::ChunkIndex,
+    feedback::FeedbackService,
+    graph_index::GraphIndex,
+    knowledge_store::KnowledgeStore,
+    link_discovery::LinkDiscoveryService,
+    markdown_migration::MarkdownMigrationService,
+    memory::MemoryService,
+    ollama::OllamaService,
+    openrouter::OpenRouterService,
+    priority::PriorityScoringService,
+    retrieval::RetrievalService,
+    search::SearchService,
+    settings::SettingsService,
+    twin_store::TwinStore,
+    vault_optimizer::{OptimizerTick, VaultOptimizerService},
 };
 use std::sync::Arc;
 use std::time::Instant;
@@ -487,28 +497,54 @@ fn start_vault_optimizer_worker(state: AppState) {
             // lock, so LLM/network work (once added) and disk I/O here never
             // block other note/search/canvas commands that need
             // `knowledge_store.write()`.
-            let pending = {
+            let tick = {
                 let store = state.knowledge_store.read().await;
                 let mut optimizer = state.vault_optimizer.write().await;
                 optimizer.prepare_next(&store, &settings)
             };
 
-            match pending {
-                Ok(Some(pending)) => {
+            // Whichever branch below reindexes a note, it does so only AFTER
+            // the block that produced `applied_note_id` has ended and its
+            // `knowledge_store`/`vault_optimizer` guards have dropped —
+            // `commit_note_index_refresh` reacquires `knowledge_store` itself
+            // (see its doc comment in `commands/mod.rs` for why this can't
+            // just be a call to `commit_note_write`).
+            let applied_note_id = match tick {
+                Ok(OptimizerTick::Idle) => None,
+                Ok(OptimizerTick::Applied(note_id)) => Some(note_id),
+                Ok(OptimizerTick::Pending(pending)) => {
                     // Only non-`sidecar_first` edit modes reach here, and only
                     // for the narrow `update_note` write itself — acquire the
                     // write lock just for this, in the same canonical order.
                     let result = {
                         let mut store = state.knowledge_store.write().await;
                         let mut optimizer = state.vault_optimizer.write().await;
-                        optimizer.apply_pending(&mut store, pending)
+                        optimizer.apply_pending(&mut store, *pending)
                     };
-                    if let Err(error) = result {
-                        log::warn!("Background vault optimizer failed to apply: {}", error);
+                    match result {
+                        Ok(applied_note_id) => applied_note_id,
+                        Err(error) => {
+                            log::warn!("Background vault optimizer failed to apply: {}", error);
+                            None
+                        }
                     }
                 }
-                Ok(None) => {}
-                Err(error) => log::warn!("Background vault optimizer failed to prepare: {}", error),
+                Err(error) => {
+                    log::warn!("Background vault optimizer failed to prepare: {}", error);
+                    None
+                }
+            };
+
+            if let Some(note_id) = applied_note_id {
+                if let Err(error) =
+                    crate::commands::commit_note_index_refresh(&state, &note_id).await
+                {
+                    log::warn!(
+                        "Background vault optimizer failed to reindex note '{}': {}",
+                        note_id,
+                        error
+                    );
+                }
             }
         }
     });
