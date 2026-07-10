@@ -589,6 +589,90 @@ describe('Canvas Store', () => {
     expect(store.streamingModels.size).toBe(0)
   })
 
+  it('buffers stream events arriving before invoke resolves, then replays own-tile events and drops foreign-tile ones', async () => {
+    // Exercises the buffer-replay branch: in production, canvas-stream events and the
+    // invoke() promise travel on separate channels, so chunk/complete can arrive BEFORE
+    // sendPrompt() resolves with this operation's tile id. Those events must be buffered
+    // (not guessed at), then replayed in order once the id is known — and any buffered
+    // event belonging to a different tile must be dropped at replay.
+    let streamHandler
+    listenMock.mockImplementation(async (_eventName, handler) => {
+      streamHandler = handler
+      return unlistenMock
+    })
+
+    function emit(payload) {
+      streamHandler({ payload })
+    }
+
+    let resolveInvoke
+    vi.spyOn(apiClient.canvas, 'sendPrompt').mockImplementation(async () => {
+      return new Promise(resolve => { resolveInvoke = resolve })
+    })
+
+    const store = useCanvasStore()
+    store.currentSession = {
+      id: 'session-1',
+      prompt_tiles: [
+        {
+          id: 'tile-other',
+          prompt: 'Someone else',
+          responses: {
+            'shared-model': {
+              status: 'completed',
+              content: 'untouched',
+              position: { x: 500, y: 0, width: 280, height: 200 }
+            }
+          }
+        }
+      ],
+      debates: []
+    }
+
+    const promise = store.sendPrompt('Prompt buffered', ['shared-model'])
+    await flushPromises()
+
+    // Invoke has NOT resolved yet — every tile-scoped event below lands in the buffer.
+    emit({
+      session_id: 'session-1',
+      type: 'tile_created',
+      tile: {
+        id: 'tile-own',
+        prompt: 'Prompt buffered',
+        responses: {
+          'shared-model': { status: 'pending', content: '', position: { x: 0, y: 0, width: 280, height: 200 } }
+        }
+      }
+    })
+    emit({ session_id: 'session-1', type: 'chunk', tile_id: 'tile-own', model_id: 'shared-model', chunk: 'first ' })
+    // Foreign-tile chunk interleaved into the buffer — must be dropped at replay, not
+    // appended to this operation's modelContent nor written into tile-other.
+    emit({ session_id: 'session-1', type: 'chunk', tile_id: 'tile-other', model_id: 'shared-model', chunk: 'INTRUDER' })
+    emit({ session_id: 'session-1', type: 'chunk', tile_id: 'tile-own', model_id: 'shared-model', chunk: 'second' })
+    emit({ session_id: 'session-1', type: 'complete', tile_id: 'tile-own', model_id: 'shared-model' })
+
+    // Nothing applied yet: replay only happens after invoke resolves with the tile id.
+    const tileOwnBefore = store.currentSession.prompt_tiles.find(t => t.id === 'tile-own')
+    expect(tileOwnBefore.responses['shared-model'].content).toBe('')
+
+    resolveInvoke('tile-own')
+    // If mark/replay ordering ever regresses (replay before streaming keys are marked,
+    // or buffered complete not clearing its key), this await hangs until the test times out.
+    await expect(promise).resolves.toBe('tile-own')
+
+    const tileOwn = store.currentSession.prompt_tiles.find(t => t.id === 'tile-own')
+    expect(tileOwn.responses['shared-model'].content).toBe('first second')
+    expect(tileOwn.responses['shared-model'].status).toBe('completed')
+
+    // Foreign tile untouched — its buffered chunk was dropped, not applied.
+    const tileOther = store.currentSession.prompt_tiles.find(t => t.id === 'tile-other')
+    expect(tileOther.responses['shared-model'].content).toBe('untouched')
+    expect(tileOther.responses['shared-model'].status).toBe('completed')
+
+    // Buffered complete cleared its streaming key — no leak, no timeout wait.
+    expect(store.streamingModels.size).toBe(0)
+  })
+
   it('loadSession maps persisted backend errors onto response.error_message', async () => {
     vi.spyOn(apiClient.canvas, 'get').mockResolvedValue({
       id: 'session-1',

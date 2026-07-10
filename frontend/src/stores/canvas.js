@@ -321,6 +321,10 @@ export const useCanvasStore = defineStore('canvas', () => {
     // then replayed and filtered once the real id is known — this covers events that
     // arrive (as they do in production, since invoke() and events are separate
     // channels) before the invoke() promise itself resolves.
+    //
+    // NOTE: buffering scopes events across concurrent operations within THIS window
+    // only — Tauri's per-window `window.emit()` isolation is load-bearing here, since
+    // events emitted for another window's operations never reach this listener.
     let ownTileId = null
     const pendingEvents = []
     const tracker = createStreamingTracker()
