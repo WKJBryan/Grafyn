@@ -207,11 +207,13 @@ import SettingsModal from '@/components/SettingsModal.vue'
 import ConfirmDialog from '@/components/ConfirmDialog.vue'
 import GIcon from '@/components/ui/GIcon.vue'
 import { useGuide } from '@/composables/useGuide'
+import { useToast } from '@/composables/useToast'
 
 const route = useRoute()
 const router = useRouter()
 const canvasStore = useCanvasStore()
 const themeStore = useThemeStore()
+const toast = useToast()
 
 // Local state
 const showCreateDialog = ref(false)
@@ -303,7 +305,11 @@ function onSessionLoaded(_session) {
 function handleSettingsSaved(changes = {}) {
   showSettingsModal.value = false
   if (changes.modelSourceChanged) {
-    canvasStore.loadModels()
+    canvasStore.loadModels().then(() => {
+      if (canvasStore.error) {
+        toast.error(`Failed to load models: ${canvasStore.error}`)
+      }
+    })
   }
 }
 

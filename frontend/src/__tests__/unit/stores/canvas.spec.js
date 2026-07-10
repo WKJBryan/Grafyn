@@ -74,6 +74,27 @@ describe('Canvas Store', () => {
     expect(sendPromptSpy.mock.calls[0][1]).not.toHaveProperty('max_tokens')
   })
 
+  it('loadModels surfaces a failure via store.error instead of failing silently', async () => {
+    vi.spyOn(apiClient.canvas, 'getModels').mockRejectedValue(new Error('OpenRouter unreachable'))
+
+    const store = useCanvasStore()
+    await store.loadModels()
+
+    expect(store.error).toBe('OpenRouter unreachable')
+    expect(store.availableModels).toEqual([])
+  })
+
+  it('loadModels clears a previous error on success', async () => {
+    const store = useCanvasStore()
+    store.error = 'stale error'
+    vi.spyOn(apiClient.canvas, 'getModels').mockResolvedValue([{ id: 'openai/gpt-4o', name: 'GPT-4o' }])
+
+    await store.loadModels()
+
+    expect(store.error).toBe(null)
+    expect(store.availableModels).toEqual([{ id: 'openai/gpt-4o', name: 'GPT-4o' }])
+  })
+
   it('sendPrompt includes reasoning effort and omits max_tokens for normal prompts', async () => {
     let streamHandler
     listenMock.mockImplementation(async (_eventName, handler) => {

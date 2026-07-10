@@ -28,6 +28,21 @@ vi.mock('@/stores/canvas', () => ({
   })),
 }))
 
+const { toastError, toastSuccess } = vi.hoisted(() => ({
+  toastError: vi.fn(),
+  toastSuccess: vi.fn(),
+}))
+vi.mock('@/composables/useToast', () => ({
+  useToast: () => ({
+    success: toastSuccess,
+    error: toastError,
+    warning: vi.fn(),
+    info: vi.fn(),
+    remove: vi.fn(),
+    toasts: [],
+  }),
+}))
+
 // Mock child components
 vi.mock('@/components/SearchBar.vue', () => ({
   default: {
@@ -218,6 +233,22 @@ describe('HomeView', () => {
       await flushPromises()
 
       expect(wrapper.find('.sidebar-right .link-inbox-stub').exists()).toBe(true)
+    })
+  })
+
+  // ============================================================================
+  // Error handling
+  // ============================================================================
+
+  describe('Error handling', () => {
+    it('surfaces a toast when loading notes fails, instead of failing silently', async () => {
+      vi.spyOn(apiClient.notes, 'list').mockRejectedValue(new Error('vault unreadable'))
+
+      wrapper = mount(HomeView)
+      await flushPromises()
+
+      expect(toastError).toHaveBeenCalledTimes(1)
+      expect(toastError.mock.calls[0][0]).toMatch(/failed to load notes/i)
     })
   })
 

@@ -58,7 +58,23 @@
     </div>
 
     <div
-      v-if="!loading && !waitingForBoot && stats && stats.nodes === 0"
+      v-if="!loading && !waitingForBoot && loadError"
+      class="graph-error-state"
+    >
+      <p>Failed to load knowledge graph.</p>
+      <p class="empty-hint">
+        {{ loadError }}
+      </p>
+      <button
+        class="btn btn-secondary btn-sm"
+        @click="refreshGraph"
+      >
+        Retry
+      </button>
+    </div>
+
+    <div
+      v-if="!loading && !waitingForBoot && !loadError && stats && stats.nodes === 0"
       class="graph-empty-state"
     >
       <p>Your knowledge graph is empty.</p>
@@ -73,7 +89,7 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { select } from 'd3-selection'
 import { zoom as d3Zoom, zoomIdentity } from 'd3-zoom'
-import { forceSimulation, forceLink, forceManyBody, forceCenter, forceCollide, forceX, forceY } from 'd3-force'
+import { forceSimulation, forceLink, forceManyBody, forceCollide, forceX, forceY } from 'd3-force'
 import { drag as d3Drag } from 'd3-drag'
 import 'd3-transition'
 import { graph as graphApi } from '../api/client'
@@ -105,6 +121,7 @@ const container = ref(null)
 const canvas = ref(null)
 const loading = ref(false)
 const stats = ref(null)
+const loadError = ref(null)
 const boot = useBootStore()
 const graphReady = computed(() => boot.ready || boot.failed)
 const waitingForBoot = computed(() => !graphReady.value)
@@ -185,20 +202,22 @@ watch(graphReady, (isReady, wasReady) => {
 
 async function loadGraph() {
   loading.value = true
+  loadError.value = null
   try {
     const data = await graphApi.full()
     allNodes = data.nodes.map(d => ({ ...d })) // Clone to avoid mutation issues
     allLinks = data.links.map(d => ({ ...d }))
-    
+
     stats.value = {
       nodes: allNodes.length,
       edges: allLinks.length
     }
-    
+
     applyFilters()
     initGraph()
   } catch (error) {
     console.error('Failed to load graph:', error)
+    loadError.value = error?.message || 'Failed to load graph'
   } finally {
     loading.value = false
   }
@@ -231,6 +250,13 @@ function applyFilters() {
 }
 
 function initGraph() {
+  // Stop any previous simulation so it doesn't keep ticking against a detached DOM
+  // (a bare reassignment would otherwise orphan it until alpha decays on its own)
+  if (simulation) {
+    simulation.stop()
+    simulation = null
+  }
+
   // Clear previous
   if (canvas.value) canvas.value.innerHTML = ''
   
@@ -391,10 +417,18 @@ function updateTextOpacity() {
 }
 
 function updateDimensions() {
-  if (simulation) {
-    simulation.force('center', forceCenter(canvasWidth / 2, canvasHeight / 2).strength(currentForces.value.center))
-    simulation.alpha(0.3).restart()
-  }
+  if (!simulation) return
+
+  // Update the existing forceX/forceY centers rather than injecting a forceCenter
+  // (the initial force set uses forceX/forceY only — adding forceCenter here would
+  // double up centering and isn't tracked/removed by handleForcesUpdate)
+  const xForce = simulation.force('x')
+  if (xForce) xForce.x(canvasWidth / 2)
+
+  const yForce = simulation.force('y')
+  if (yForce) yForce.y(canvasHeight / 2)
+
+  simulation.alpha(0.3).restart()
 }
 
 function handleFiltersUpdate(filters) {
@@ -655,5 +689,23 @@ function resetZoom() {
   font-size: 0.8rem !important;
   color: var(--text-muted);
   opacity: 0.7;
+}
+
+.graph-error-state {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--spacing-sm);
+  color: var(--accent-red);
+  text-align: center;
+  z-index: 5;
+}
+
+.graph-error-state p {
+  margin: 0;
+  font-size: 0.9rem;
 }
 </style>

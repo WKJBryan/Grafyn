@@ -333,9 +333,11 @@ export const useCanvasStore = defineStore('canvas', () => {
   }
 
   async function loadModels() {
+    error.value = null
     try {
       availableModels.value = await canvasApi.getModels()
     } catch (err) {
+      error.value = err.message || 'Failed to load models'
       console.error('Failed to load models:', err)
     }
   }

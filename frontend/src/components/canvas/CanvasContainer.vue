@@ -744,7 +744,14 @@ watch(() => props.sessionId, async (newId, oldId) => {
 // Lifecycle
 onMounted(async () => {
   initZoom()
-  canvasStore.loadModels()
+  // Fire-and-forget: PromptDialog just renders whatever's in availableModels, so
+  // don't block the rest of mount on this. Surface a failure via toast — silently
+  // leaving availableModels empty makes PromptDialog look broken with no explanation.
+  canvasStore.loadModels().then(() => {
+    if (canvasStore.error) {
+      toast.error(`Failed to load models: ${canvasStore.error}`)
+    }
+  })
   await loadCanvasPreferences()
 
   // Add click outside listener for dropdown

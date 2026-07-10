@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { mount } from '@vue/test-utils'
 import PromptNode from '@/components/canvas/PromptNode.vue'
 
@@ -55,5 +55,26 @@ describe('PromptNode', () => {
     expect(wrapper.text()).toContain('Prefers evidence-backed')
     expect(wrapper.text()).toContain('Candidate')
     expect(wrapper.text()).toContain('May prefer red-team')
+  })
+
+  it('removes resize listeners on unmount if a resize is in progress', async () => {
+    const addSpy = vi.spyOn(document, 'addEventListener')
+    const removeSpy = vi.spyOn(document, 'removeEventListener')
+    const wrapper = mountNode()
+
+    await wrapper.find('.resize-handle').trigger('mousedown')
+
+    const moveCall = addSpy.mock.calls.find(([evt, fn]) => evt === 'mousemove' && fn.name === 'onResize')
+    const upCall = addSpy.mock.calls.find(([evt, fn]) => evt === 'mouseup' && fn.name === 'stopResize')
+    expect(moveCall).toBeTruthy()
+    expect(upCall).toBeTruthy()
+
+    wrapper.unmount()
+
+    expect(removeSpy).toHaveBeenCalledWith('mousemove', moveCall[1])
+    expect(removeSpy).toHaveBeenCalledWith('mouseup', upCall[1])
+
+    addSpy.mockRestore()
+    removeSpy.mockRestore()
   })
 })

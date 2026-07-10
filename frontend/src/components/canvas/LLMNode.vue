@@ -603,6 +603,11 @@ function stopDrag() {
   document.body.classList.remove('tile-dragging')
 }
 
+// Tracks the resize listeners registered by the most recent startResize() call so
+// onBeforeUnmount can remove them if the component is torn down mid-resize (e.g. a
+// canvas reconcile replacing this tile before the user releases the mouse).
+let activeResizeListeners = null
+
 function startResize(e) {
   isResizing.value = true
   const startX = e.clientX
@@ -629,10 +634,12 @@ function startResize(e) {
     isResizing.value = false
     document.removeEventListener('mousemove', onResize)
     document.removeEventListener('mouseup', stopResize)
+    activeResizeListeners = null
   }
 
   document.addEventListener('mousemove', onResize)
   document.addEventListener('mouseup', stopResize)
+  activeResizeListeners = { onResize, stopResize }
 }
 
 function toggleBranch() {
@@ -713,6 +720,12 @@ onBeforeUnmount(() => {
   document.removeEventListener('mousemove', onDrag)
   document.removeEventListener('mouseup', stopDrag)
   document.body.classList.remove('tile-dragging')
+
+  if (activeResizeListeners) {
+    document.removeEventListener('mousemove', activeResizeListeners.onResize)
+    document.removeEventListener('mouseup', activeResizeListeners.stopResize)
+    activeResizeListeners = null
+  }
 })
 </script>
 

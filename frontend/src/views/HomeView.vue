@@ -443,6 +443,7 @@ async function loadNotes() {
     graphRefreshKey.value++
   } catch (error) {
     console.error('Failed to load notes:', error)
+    toast.error('Failed to load notes. Your vault may be unreadable or the index may need rebuilding.')
   }
 }
 
