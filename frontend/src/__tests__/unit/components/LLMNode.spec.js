@@ -24,6 +24,18 @@ function mountNode(response = {}) {
 }
 
 describe('LLMNode', () => {
+  it('shows a friendly rounded provider-reported cost after completion', () => {
+    const wrapper = mountNode({ cost_usd: 0.002341 })
+
+    expect(wrapper.find('.response-cost').text()).toBe('$0.0023')
+  })
+
+  it('does not show a cost for legacy responses without provider usage', () => {
+    const wrapper = mountNode()
+
+    expect(wrapper.find('.response-cost').exists()).toBe(false)
+  })
+
   it('removes resize listeners on unmount if a resize is in progress', async () => {
     const addSpy = vi.spyOn(document, 'addEventListener')
     const removeSpy = vi.spyOn(document, 'removeEventListener')

@@ -185,6 +185,8 @@ Compare responses from multiple LLM models simultaneously via OpenRouter. Featur
 
 Streaming commands: `send_prompt`, `start_debate`, `continue_debate`, `add_models_to_tile`, `regenerate_response`
 
+**Canvas response costs and caching:** OpenRouter's final streaming usage chunk provides the exact `cost_usd` persisted on each `ModelResponse` and `DebateResponse`; legacy sessions have no cost and show no label. Canvas OpenRouter requests include a stable session-and-model identifier so OpenRouter can apply compatible provider-side prompt caching to follow-up context without changing model routing.
+
 ### Twin Identity, Constitution, And Decision Mirror
 
 Twin context mode is a native RAG path, not model-weight training. `frontend/src-tauri/src/commands/canvas/context.rs` assembles the model-facing prompt through `build_twin_context_prompt()`.

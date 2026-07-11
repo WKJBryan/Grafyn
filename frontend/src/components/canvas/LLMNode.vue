@@ -87,6 +87,12 @@
         <span>Waiting...</span>
       </div>
     </div>
+    <div
+      v-if="isCompleted && formattedCost"
+      class="response-cost"
+    >
+      {{ formattedCost }}
+    </div>
     
     <div
       v-if="isDecisionMirror && isCompleted"
@@ -509,6 +515,14 @@ const renderedContent = computed(() => {
   return renderMarkdown(props.response.content)
 })
 
+const formattedCost = computed(() => formatCost(props.response.cost_usd))
+
+function formatCost(cost) {
+  if (typeof cost !== 'number' || !Number.isFinite(cost) || cost < 0) return null
+  if (cost < 0.0001) return '< $0.0001'
+  return `$${cost.toFixed(4)}`
+}
+
 // Watch for branch input focus
 watch(showBranch, async (isShowing) => {
   if (isShowing) {
@@ -881,6 +895,12 @@ onBeforeUnmount(() => {
 .node-content :deep(p) {
   margin: 0 0 var(--spacing-xs) 0;
   color: var(--text-primary);
+}
+
+.response-cost {
+  padding: 0 var(--spacing-sm) var(--spacing-sm);
+  color: var(--text-secondary);
+  font-size: 0.75rem;
 }
 
 .node-content :deep(p:last-child) {

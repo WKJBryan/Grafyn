@@ -12,6 +12,27 @@ vi.mock('@tauri-apps/api/event', () => ({
 }))
 
 describe('Canvas Store', () => {
+  it('keeps the provider-reported cost when a streamed response completes', async () => {
+    let streamHandler
+    listenMock.mockImplementation(async (_eventName, handler) => {
+      streamHandler = handler
+      return unlistenMock
+    })
+    vi.spyOn(apiClient.canvas, 'sendPrompt').mockImplementation(async () => {
+      streamHandler({ payload: { session_id: 'session-1', type: 'tile_created', tile: {
+        id: 'tile-1', responses: { 'openai/gpt-4': { content: '', status: 'pending' } }
+      } } })
+      streamHandler({ payload: { session_id: 'session-1', type: 'complete', tile_id: 'tile-1', model_id: 'openai/gpt-4', cost_usd: 0.002341 } })
+      return 'tile-1'
+    })
+
+    const store = useCanvasStore()
+    store.currentSession = { id: 'session-1', prompt_tiles: [], debates: [] }
+    await store.sendPrompt('Hello', ['openai/gpt-4'])
+
+    expect(store.currentSession.prompt_tiles[0].responses['openai/gpt-4'].cost_usd).toBe(0.002341)
+  })
+
   beforeEach(() => {
     setActivePinia(createPinia())
     vi.clearAllMocks()

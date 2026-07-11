@@ -426,16 +426,18 @@ impl CanvasStore {
             String,
             crate::models::canvas::ResponseStatus,
             Option<String>,
+            Option<f64>,
         )],
     ) -> Result<()> {
         let session = self.get_session_mut(session_id)?;
 
         if let Some(tile) = session.prompt_tiles.iter_mut().find(|t| t.id == tile_id) {
-            for (model_id, content, status, error) in updates {
+            for (model_id, content, status, error, cost_usd) in updates {
                 if let Some(response) = tile.responses.get_mut(model_id) {
                     response.content = content.clone();
                     response.status = status.clone();
                     response.error = error.clone();
+                    response.cost_usd = *cost_usd;
                 }
             }
         }
@@ -454,6 +456,7 @@ impl CanvasStore {
         content: &str,
         status: crate::models::canvas::ResponseStatus,
         error: Option<&str>,
+        cost_usd: Option<f64>,
     ) -> Result<()> {
         let session = self.get_session_mut(session_id)?;
 
@@ -462,6 +465,7 @@ impl CanvasStore {
                 response.content = content.to_string();
                 response.status = status;
                 response.error = error.map(str::to_string);
+                response.cost_usd = cost_usd;
             }
         }
 

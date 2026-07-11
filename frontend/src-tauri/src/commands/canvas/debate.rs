@@ -7,13 +7,20 @@ use crate::models::canvas::{
     DebateStartRequest, PromptType, TilePosition,
 };
 use crate::models::twin::TraceEventType;
-use crate::services::openrouter::ChatMessage;
+use crate::services::openrouter::{ChatMessage, StreamUpdate};
 use crate::AppState;
 use chrono::Utc;
 use futures::StreamExt;
 use serde_json::json;
 use std::time::Duration;
 use tauri::State;
+
+fn no_cost_stream<S>(stream: S) -> std::pin::Pin<Box<dyn futures::Stream<Item = anyhow::Result<StreamUpdate>> + Send>>
+where
+    S: futures::Stream<Item = anyhow::Result<String>> + Send + 'static,
+{
+    Box::pin(stream.map(|result| result.map(|content| StreamUpdate { content, cost_usd: None })))
+}
 
 /// Start a debate between models with streaming via Tauri events
 #[tauri::command]
@@ -195,15 +202,7 @@ pub async fn start_debate(
                                 .chat_stream(&model_id, messages, None, Some(0.7))
                                 .await;
                             drop(ollama);
-                            result.map(|stream| {
-                                Box::pin(stream)
-                                    as std::pin::Pin<
-                                        Box<
-                                            dyn futures::Stream<Item = anyhow::Result<String>>
-                                                + Send,
-                                        >,
-                                    >
-                            })
+                            result.map(no_cost_stream)
                         }
                         ModelProviderRoute::OpenRouter => {
                             let openrouter = openrouter_arc.read().await;
@@ -217,18 +216,11 @@ pub async fn start_debate(
                                     Some(reasoning_effort.as_str()),
                                     false,
                                     5,
+                                    Some(&format!("canvas:{session_id}:{model_id}")),
                                 )
                                 .await;
                             drop(openrouter);
-                            result.map(|stream| {
-                                Box::pin(stream)
-                                    as std::pin::Pin<
-                                        Box<
-                                            dyn futures::Stream<Item = anyhow::Result<String>>
-                                                + Send,
-                                        >,
-                                    >
-                            })
+                            result.map(|stream| Box::pin(stream) as std::pin::Pin<Box<dyn futures::Stream<Item = anyhow::Result<StreamUpdate>> + Send>>)
                         }
                     };
 
@@ -236,12 +228,17 @@ pub async fn start_debate(
                         Ok(stream) => {
                             let mut stream = stream;
                             let mut full_content = String::new();
+                            let mut cost_usd = None;
 
                             loop {
                                 match tokio::time::timeout(Duration::from_secs(60), stream.next())
                                     .await
                                 {
-                                    Ok(Some(Ok(chunk))) => {
+                                    Ok(Some(Ok(update))) => {
+                                        if update.cost_usd.is_some() {
+                                            cost_usd = update.cost_usd;
+                                        }
+                                        let chunk = update.content;
                                         if !chunk.is_empty() {
                                             full_content.push_str(&chunk);
                                             let _ = window.emit(
@@ -272,6 +269,7 @@ pub async fn start_debate(
                                             model_name,
                                             content: full_content,
                                             stance: None,
+                                            cost_usd: None,
                                         };
                                     }
                                     Ok(None) => break, // Stream ended naturally
@@ -291,6 +289,7 @@ pub async fn start_debate(
                                             model_name,
                                             content: full_content,
                                             stance: None,
+                                            cost_usd: None,
                                         };
                                     }
                                 }
@@ -303,6 +302,7 @@ pub async fn start_debate(
                                     debate_id: debate_id.clone(),
                                     model_id: model_id.clone(),
                                     round_number: round_num,
+                                    cost_usd,
                                 },
                             );
 
@@ -311,6 +311,7 @@ pub async fn start_debate(
                                 model_name,
                                 content: full_content,
                                 stance: None,
+                                cost_usd,
                             }
                         }
                         Err(e) => {
@@ -331,6 +332,7 @@ pub async fn start_debate(
                                     debate_id: debate_id.clone(),
                                     model_id: model_id.clone(),
                                     round_number: round_num,
+                                    cost_usd: None,
                                 },
                             );
                             DebateResponse {
@@ -338,6 +340,7 @@ pub async fn start_debate(
                                 model_name,
                                 content: e.to_string(),
                                 stance: None,
+                                cost_usd: None,
                             }
                         }
                     }
@@ -537,12 +540,7 @@ pub async fn continue_debate(
                             .chat_stream(&model_id, messages, None, Some(0.7))
                             .await;
                         drop(ollama);
-                        result.map(|stream| {
-                            Box::pin(stream)
-                                as std::pin::Pin<
-                                    Box<dyn futures::Stream<Item = anyhow::Result<String>> + Send>,
-                                >
-                        })
+                        result.map(no_cost_stream)
                     }
                     ModelProviderRoute::OpenRouter => {
                         let openrouter = openrouter_arc.read().await;
@@ -556,15 +554,11 @@ pub async fn continue_debate(
                                 Some(reasoning_effort.as_str()),
                                 false,
                                 5,
+                                Some(&format!("canvas:{session_id}:{model_id}")),
                             )
                             .await;
                         drop(openrouter);
-                        result.map(|stream| {
-                            Box::pin(stream)
-                                as std::pin::Pin<
-                                    Box<dyn futures::Stream<Item = anyhow::Result<String>> + Send>,
-                                >
-                        })
+                        result.map(|stream| Box::pin(stream) as std::pin::Pin<Box<dyn futures::Stream<Item = anyhow::Result<StreamUpdate>> + Send>>)
                     }
                 };
 
@@ -572,11 +566,16 @@ pub async fn continue_debate(
                     Ok(stream) => {
                         let mut stream = stream;
                         let mut full_content = String::new();
+                        let mut cost_usd = None;
 
                         loop {
                             match tokio::time::timeout(Duration::from_secs(60), stream.next()).await
                             {
-                                Ok(Some(Ok(chunk))) => {
+                                Ok(Some(Ok(update))) => {
+                                    if update.cost_usd.is_some() {
+                                        cost_usd = update.cost_usd;
+                                    }
+                                    let chunk = update.content;
                                     if !chunk.is_empty() {
                                         full_content.push_str(&chunk);
                                         let _ = window.emit(
@@ -607,6 +606,7 @@ pub async fn continue_debate(
                                         model_name,
                                         content: full_content,
                                         stance: None,
+                                        cost_usd: None,
                                     };
                                 }
                                 Ok(None) => break, // Stream ended naturally
@@ -626,6 +626,7 @@ pub async fn continue_debate(
                                         model_name,
                                         content: full_content,
                                         stance: None,
+                                        cost_usd: None,
                                     };
                                 }
                             }
@@ -638,6 +639,7 @@ pub async fn continue_debate(
                                 debate_id: debate_id.clone(),
                                 model_id: model_id.clone(),
                                 round_number: round_num,
+                                cost_usd,
                             },
                         );
 
@@ -646,6 +648,7 @@ pub async fn continue_debate(
                             model_name,
                             content: full_content,
                             stance: None,
+                            cost_usd,
                         }
                     }
                     Err(e) => {
@@ -666,12 +669,14 @@ pub async fn continue_debate(
                                 debate_id: debate_id.clone(),
                                 model_id: model_id.clone(),
                                 round_number: round_num,
+                                cost_usd: None,
                             },
                         );
                         DebateResponse {
                             model_id,
                             model_name,
                             content: e.to_string(),
+                            cost_usd: None,
                             stance: None,
                         }
                     }
