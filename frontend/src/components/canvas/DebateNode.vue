@@ -175,8 +175,12 @@
               <span class="response-model">{{ getModelName(modelId) }}</span>
               <div
                 class="response-content"
-                v-html="renderContent(response)"
+                v-html="renderContent(response.content || response)"
               />
+              <span
+                v-if="formatCost(response.cost_usd)"
+                class="response-cost"
+              >{{ formatCost(response.cost_usd) }}</span>
             </div>
           </div>
         </div>
@@ -311,8 +315,7 @@ const lastRoundSummary = computed(() => {
   if (!firstResponse) return null
 
   // Show full content (scrollable in UI)
-  if (typeof firstResponse !== 'string') return null
-  return renderMarkdown(firstResponse)
+  return renderMarkdown(firstResponse.content || firstResponse)
 })
 
 // Methods
@@ -353,7 +356,7 @@ function getRoundResponses(round) {
   if (round.responses && Array.isArray(round.responses)) {
     const result = {}
     for (const resp of round.responses) {
-      result[resp.model_id] = resp.content
+      result[resp.model_id] = resp
     }
     return result
   }
@@ -370,6 +373,12 @@ function renderContent(content) {
     content = JSON.stringify(content)
   }
   return renderMarkdown(content)
+}
+
+function formatCost(cost) {
+  if (typeof cost !== 'number' || !Number.isFinite(cost) || cost < 0) return null
+  if (cost < 0.0001) return '< $0.0001'
+  return `$${cost.toFixed(4)}`
 }
 
 function handleMouseDown(e) {
@@ -895,6 +904,13 @@ onBeforeUnmount(() => {
   background: var(--bg-secondary);
   border-radius: var(--radius-sm);
   padding: var(--spacing-sm);
+}
+
+.response-cost {
+  display: block;
+  margin-top: var(--spacing-xs);
+  color: var(--text-secondary);
+  font-size: 0.75rem;
 }
 
 .response-model {

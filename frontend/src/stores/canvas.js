@@ -449,7 +449,7 @@ export const useCanvasStore = defineStore('canvas', () => {
         updateTileResponseLocal(data.tile_id, data.model_id, modelContent[data.model_id], 'streaming')
       }
       const applyComplete = (data) => {
-        updateTileResponseLocal(data.tile_id, data.model_id, modelContent[data.model_id], 'completed')
+        updateTileResponseLocal(data.tile_id, data.model_id, modelContent[data.model_id], 'completed', null, data.cost_usd)
         tracker.clear(`${ownTileId}:${data.model_id}`)
       }
       const applyError = (data) => {
@@ -537,7 +537,7 @@ export const useCanvasStore = defineStore('canvas', () => {
     })
   }
 
-  function updateTileResponseLocal(tileId, modelId, content, status, errorMessage = null) {
+  function updateTileResponseLocal(tileId, modelId, content, status, errorMessage = null, costUsd) {
     if (!currentSession.value) return
 
     const tile = currentSession.value.prompt_tiles.find(t => t.id === tileId)
@@ -550,6 +550,7 @@ export const useCanvasStore = defineStore('canvas', () => {
       tile.responses[modelId].error_message = status === 'error'
         ? (errorMessage || content || 'Error occurred')
         : null
+      if (costUsd !== undefined) tile.responses[modelId].cost_usd = costUsd
     }
   }
 
@@ -1010,7 +1011,7 @@ export const useCanvasStore = defineStore('canvas', () => {
         },
         complete: (data) => {
           if (data.tile_id !== tileId || !newModelIds.includes(data.model_id)) return
-          updateTileResponseLocal(tileId, data.model_id, modelContent[data.model_id], 'completed')
+          updateTileResponseLocal(tileId, data.model_id, modelContent[data.model_id], 'completed', null, data.cost_usd)
           tracker.clear(`${tileId}:${data.model_id}`)
         },
         error: (data) => {
@@ -1072,7 +1073,7 @@ export const useCanvasStore = defineStore('canvas', () => {
         },
         complete: (data) => {
           if (data.tile_id !== tileId || data.model_id !== modelId) return
-          updateTileResponseLocal(tileId, modelId, content, 'completed')
+          updateTileResponseLocal(tileId, modelId, content, 'completed', null, data.cost_usd)
           tracker.clear(streamingKey)
         },
         error: (data) => {

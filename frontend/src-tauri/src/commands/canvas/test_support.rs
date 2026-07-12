@@ -18,6 +18,7 @@ pub(super) fn build_response(model_id: &str, content: &str) -> ModelResponse {
         status: ResponseStatus::Completed,
         error: None,
         tokens_used: None,
+        cost_usd: None,
         created_at: chrono::Utc::now(),
         position: TilePosition::default(),
     }

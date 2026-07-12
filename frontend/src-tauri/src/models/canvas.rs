@@ -229,6 +229,8 @@ pub struct ModelResponse {
     pub error: Option<String>,
     #[serde(default)]
     pub tokens_used: Option<u32>,
+    #[serde(default)]
+    pub cost_usd: Option<f64>,
     pub created_at: DateTime<Utc>,
     #[serde(default)]
     pub position: TilePosition,
@@ -244,6 +246,7 @@ impl Default for ModelResponse {
             status: ResponseStatus::Pending,
             error: None,
             tokens_used: None,
+            cost_usd: None,
             created_at: Utc::now(),
             position: TilePosition {
                 x: 0.0,
@@ -323,6 +326,8 @@ pub struct DebateResponse {
     pub model_name: String,
     pub content: String,
     pub stance: Option<String>,
+    #[serde(default)]
+    pub cost_usd: Option<f64>,
 }
 
 /// Request to create a new session
@@ -557,6 +562,7 @@ pub enum CanvasStreamEvent {
         tile_id: String,
         model_id: String,
         tokens_used: Option<u32>,
+        cost_usd: Option<f64>,
     },
     Error {
         session_id: String,
@@ -598,6 +604,7 @@ pub enum CanvasStreamEvent {
         debate_id: String,
         model_id: String,
         round_number: u32,
+        cost_usd: Option<f64>,
     },
     DebateError {
         session_id: String,

@@ -15,6 +15,12 @@ pub struct OpenRouterService {
     api_key: String,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct StreamUpdate {
+    pub content: String,
+    pub cost_usd: Option<f64>,
+}
+
 impl OpenRouterService {
     pub fn new(api_key: String) -> Self {
         Self {
@@ -132,6 +138,7 @@ impl OpenRouterService {
             max_tokens,
             reasoning,
             plugins,
+            session_id: None,
         };
 
         let response = self
@@ -174,7 +181,8 @@ impl OpenRouterService {
         reasoning_effort: Option<&str>,
         web_search: bool,
         web_search_max_results: u32,
-    ) -> Result<impl futures::Stream<Item = Result<String>>> {
+        session_id: Option<&str>,
+    ) -> Result<impl futures::Stream<Item = Result<StreamUpdate>>> {
         if !self.is_configured() {
             return Err(anyhow::anyhow!("OpenRouter API key not configured"));
         }
@@ -201,6 +209,7 @@ impl OpenRouterService {
             max_tokens,
             reasoning,
             plugins,
+            session_id: session_id.map(str::to_string),
         };
 
         let response = self
@@ -257,8 +266,8 @@ impl OpenRouterService {
                             if !buffer.trim().is_empty() {
                                 let remaining = std::mem::take(&mut buffer);
                                 match parse_sse_chunk(&remaining) {
-                                    Ok(content) if !content.is_empty() => {
-                                        return Some((Ok(content), (inner, buffer, utf8_buffer)));
+                                    Ok(update) if !update.content.is_empty() || update.cost_usd.is_some() => {
+                                        return Some((Ok(update), (inner, buffer, utf8_buffer)));
                                     }
                                     Err(error) => {
                                         return Some((Err(error), (inner, buffer, utf8_buffer)));
@@ -308,8 +317,8 @@ fn build_reasoning(reasoning_effort: Option<&str>) -> Option<ReasoningRequest> {
 /// classified as a normal `Completed` stream with no indication anything
 /// went wrong. Such payloads are now detected and surfaced as an `Err` so
 /// the caller can mark the response as errored instead.
-fn parse_sse_chunk(chunk: &str) -> Result<String> {
-    let mut content = String::new();
+fn parse_sse_chunk(chunk: &str) -> Result<StreamUpdate> {
+    let mut update = StreamUpdate { content: String::new(), cost_usd: None };
 
     for line in chunk.lines() {
         if let Some(data) = line.strip_prefix("data: ") {
@@ -320,8 +329,11 @@ fn parse_sse_chunk(chunk: &str) -> Result<String> {
             if let Ok(parsed) = serde_json::from_str::<StreamChunk>(data) {
                 if let Some(choice) = parsed.choices.first() {
                     if let Some(delta_content) = &choice.delta.content {
-                        content.push_str(delta_content);
+                        update.content.push_str(delta_content);
                     }
+                }
+                if let Some(usage) = parsed.usage {
+                    update.cost_usd = usage.cost;
                 }
                 continue;
             }
@@ -336,7 +348,7 @@ fn parse_sse_chunk(chunk: &str) -> Result<String> {
         }
     }
 
-    Ok(content)
+    Ok(update)
 }
 
 /// Extract provider name from model ID (e.g., "openai/gpt-4" -> "OpenAI")
@@ -432,6 +444,8 @@ struct ChatRequest {
     reasoning: Option<ReasoningRequest>,
     #[serde(skip_serializing_if = "Option::is_none")]
     plugins: Option<Vec<WebPlugin>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -458,6 +472,14 @@ struct ChatChoice {
 #[derive(Debug, Deserialize)]
 struct StreamChunk {
     choices: Vec<StreamChoice>,
+    #[serde(default)]
+    usage: Option<StreamUsage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StreamUsage {
+    #[serde(default)]
+    cost: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -525,6 +547,7 @@ mod tests {
                 effort: "high".to_string(),
             }),
             plugins: None,
+            session_id: None,
         };
 
         let value = serde_json::to_value(request).unwrap();
@@ -537,14 +560,25 @@ mod tests {
     fn parse_sse_chunk_extracts_content_from_well_formed_delta() {
         let chunk = r#"data: {"choices":[{"delta":{"content":"hello"}}]}"#;
         let result = parse_sse_chunk(chunk).unwrap();
-        assert_eq!(result, "hello");
+        assert_eq!(result.content, "hello");
     }
 
     #[test]
     fn parse_sse_chunk_ignores_done_marker() {
         let chunk = "data: [DONE]";
         let result = parse_sse_chunk(chunk).unwrap();
-        assert_eq!(result, "");
+        assert_eq!(result.content, "");
+    }
+
+    #[test]
+    fn parse_sse_chunk_preserves_usage_cost_from_final_chunk() {
+        let chunk = r#"data: {"choices":[],"usage":{"cost":0.002341}}"#;
+        let result = parse_sse_chunk(chunk).unwrap();
+
+        assert!(
+            format!("{result:?}").contains("cost_usd: Some(0.002341)"),
+            "final stream usage must retain OpenRouter's exact response cost"
+        );
     }
 
     #[test]
