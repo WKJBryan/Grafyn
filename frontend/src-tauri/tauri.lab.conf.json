@@ -1,0 +1,33 @@
+{
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build",
+    "devPath": "http://localhost:5173/lab.html",
+    "distDir": "../dist"
+  },
+  "package": {
+    "productName": "Grafyn Twin Eval Lab",
+    "version": "0.1.13"
+  },
+  "tauri": {
+    "bundle": {
+      "identifier": "com.grafyn.twin-eval-lab"
+    },
+    "updater": {
+      "active": false
+    },
+    "windows": [
+      {
+        "fullscreen": false,
+        "height": 900,
+        "resizable": true,
+        "title": "Grafyn Twin Eval Lab",
+        "width": 1280,
+        "minWidth": 960,
+        "minHeight": 720,
+        "center": true,
+        "visible": true
+      }
+    ]
+  }
+}

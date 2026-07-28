@@ -19,6 +19,7 @@ pub mod similarity;
 pub mod texttiling;
 pub mod topic_hub;
 pub mod twin;
+pub mod twin_eval;
 pub mod utf8_chunk;
 pub mod vault_optimizer;
 pub mod yake;
