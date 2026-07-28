@@ -2,6 +2,7 @@ import { defineConfig } from 'vite'
 import vue from '@vitejs/plugin-vue'
 import { fileURLToPath, URL } from 'node:url'
 import { readFileSync } from 'node:fs'
+import { resolve } from 'node:path'
 
 const pkg = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf-8'))
 
@@ -33,6 +34,10 @@ export default defineConfig({
     // Produce sourcemaps for debug builds
     sourcemap: !!process.env.TAURI_DEBUG,
     rollupOptions: {
+      input: {
+        main: resolve(__dirname, 'index.html'),
+        lab: resolve(__dirname, 'lab.html'),
+      },
       output: {
         manualChunks: {
           'vendor': ['vue', 'vue-router', 'pinia'],

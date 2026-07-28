@@ -256,6 +256,13 @@ fn main() {
             commands::twin::get_constitution_setup,
             commands::twin::save_constitution_setup,
             commands::twin::run_constitution_inference,
+            // Twin evaluation commands
+            commands::twin_eval::get_twin_eval_model_matrix,
+            commands::twin_eval::preview_twin_eval_input,
+            commands::twin_eval::preview_twin_eval_context,
+            commands::twin_eval::run_twin_eval_lab,
+            commands::twin_eval::run_twin_eval_lab_stream,
+            commands::twin_eval::export_twin_eval_results,
             // Feedback commands
             commands::feedback::submit_feedback,
             commands::feedback::get_system_info,

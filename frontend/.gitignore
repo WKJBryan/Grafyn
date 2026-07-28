@@ -31,3 +31,6 @@ dist-ssr
 # Build output
 build
 .cache
+
+# Local Twin Eval model cache and generated manifests
+twin-eval-models/

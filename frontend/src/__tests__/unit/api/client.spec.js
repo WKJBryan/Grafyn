@@ -30,6 +30,7 @@ import {
   graph,
   canvas,
   twin,
+  twinEval,
   feedback,
   settings,
   mcp,
@@ -367,6 +368,44 @@ describe('API Client (Tauri)', () => {
 
       await twin.runConstitutionInference()
       expect(mockInvoke).toHaveBeenLastCalledWith('run_constitution_inference', {})
+    })
+  })
+
+  describe('Twin Eval API', () => {
+    it('getModelMatrix() invokes get_twin_eval_model_matrix', async () => {
+      mockInvoke.mockResolvedValue([])
+      await twinEval.getModelMatrix()
+      expect(mockInvoke).toHaveBeenCalledWith('get_twin_eval_model_matrix', {})
+    })
+
+    it('previewInput() invokes preview_twin_eval_input with raw question content', async () => {
+      mockInvoke.mockResolvedValue({ id: 'case-1', options: [] })
+      await twinEval.previewInput('Question\nA) One', null)
+      expect(mockInvoke).toHaveBeenCalledWith('preview_twin_eval_input', {
+        rawQuestion: 'Question\nA) One',
+        answerKey: null,
+      })
+    })
+
+    it('previewContext() invokes preview_twin_eval_context with selected mode', async () => {
+      const request = { raw_question: 'Question', context_mode: 'system_only' }
+      mockInvoke.mockResolvedValue({ mode: 'system_only' })
+      await twinEval.previewContext(request)
+      expect(mockInvoke).toHaveBeenCalledWith('preview_twin_eval_context', { request })
+    })
+
+    it('runLab() invokes run_twin_eval_lab with request', async () => {
+      const request = { raw_question: 'Question', model_keys: ['gemma4-e2b-it'] }
+      mockInvoke.mockResolvedValue({ results: [] })
+      await twinEval.runLab(request)
+      expect(mockInvoke).toHaveBeenCalledWith('run_twin_eval_lab', { request })
+    })
+
+    it('exportResults() invokes export_twin_eval_results with results', async () => {
+      const results = [{ case_id: 'case-1', model_key: 'gemma4-e2b-it' }]
+      mockInvoke.mockResolvedValue({ json: '[]', csv: 'case_id' })
+      await twinEval.exportResults(results)
+      expect(mockInvoke).toHaveBeenCalledWith('export_twin_eval_results', { results })
     })
   })
 

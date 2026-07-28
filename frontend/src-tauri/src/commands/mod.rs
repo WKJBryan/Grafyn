@@ -13,6 +13,7 @@ pub mod retrieval;
 pub mod search;
 pub mod settings;
 pub mod twin;
+pub mod twin_eval;
 pub mod zettelkasten;
 
 use crate::models::note::Note;

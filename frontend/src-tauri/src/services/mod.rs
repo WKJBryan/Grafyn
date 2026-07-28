@@ -16,6 +16,7 @@ pub mod settings;
 pub mod similarity;
 pub mod texttiling;
 pub mod topic_hub;
+pub mod twin_eval;
 pub mod twin_store;
 pub mod vault_optimizer;
 pub mod yake;
