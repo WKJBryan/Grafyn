@@ -3,7 +3,7 @@ name = "grafyn"
 version = "0.3.0"
 description = "Grafyn - Knowledge Management Desktop App"
 authors = ["Bryan"]
-license = "GPL-3.0-only"
+license = "MPL-2.0"
 repository = "https://github.com/WKJBryan/Grafyn"
 edition = "2021"
 

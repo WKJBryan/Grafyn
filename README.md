@@ -12,7 +12,7 @@
 
 <p align="center">
   <a href="https://github.com/WKJBryan/Grafyn/releases/latest"><img src="https://img.shields.io/github/v/release/WKJBryan/Grafyn?style=flat-square&color=blue" alt="Release"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL--3.0-green?style=flat-square" alt="License: GPL-3.0"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MPL--2.0-green?style=flat-square" alt="License: MPL-2.0"></a>
   <a href="https://github.com/WKJBryan/Grafyn/actions/workflows/test.yml"><img src="https://img.shields.io/github/actions/workflow/status/WKJBryan/Grafyn/test.yml?branch=main&style=flat-square&label=tests" alt="Tests"></a>
   <a href="https://github.com/WKJBryan/Grafyn/releases"><img src="https://img.shields.io/github/downloads/WKJBryan/Grafyn/total?style=flat-square&color=orange" alt="Downloads"></a>
 </p>
@@ -157,10 +157,18 @@ Tauri Desktop App
 
 Deeper architecture notes live in [CLAUDE.md](CLAUDE.md).
 
+## Editions and licensing
+
+The open client and local core in this repository are available under [MPL-2.0](LICENSE). A future public sync protocol package may be offered under `Apache-2.0 OR MPL-2.0` to support independent implementations.
+
+The approved design also leaves room for a future optional hosted service that relays opaque end-to-end encrypted operations. That hosted service, along with billing and operations, is a separate proprietary boundary and is not currently available. Local capture, recall, export, and access to local data do not depend on it.
+
+See [RELICENSING.md](RELICENSING.md) for the provenance audit and change record, [CONTRIBUTING.md](CONTRIBUTING.md) for DCO sign-off, and [TRADEMARKS.md](TRADEMARKS.md) for the name and logo policy.
+
 ## Contributing
 
 Contributions are welcome — the project has a full CI pipeline (tests, lint, multi-platform release smoke) and firm product rules around twin data ethics and local-first storage. Start with [CONTRIBUTING.md](CONTRIBUTING.md) for setup, test commands, and the rules that keep the twin honest.
 
 ## License
 
-[GPL-3.0](LICENSE) — Grafyn is free software; improvements to it stay free.
+[MPL-2.0](LICENSE) — modifications to covered source files remain available under the MPL's file-level terms.

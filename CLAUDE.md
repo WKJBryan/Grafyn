@@ -73,7 +73,7 @@ The approved implementation is specified in `docs/superpowers/specs/2026-08-29-g
 - orthogonal review, authority, sensitivity, allowed-use, and explainable attention data;
 - compact Capture, Recall, Twin review/chat, linear Canvas, and one-shot image flows;
 - an optional public E2EE sync protocol/local engine, while production relay, billing, pairing/recovery, and operations remain separate and unavailable until genuinely built;
-- MPL-2.0 for the open client/local core, subject to the repository governance task.
+- MPL-2.0 for the open client/local core, with the provenance decision recorded in `RELICENSING.md`; a future protocol package may explicitly use `Apache-2.0 OR MPL-2.0`, while any future hosted service remains separate and unavailable until built.
 
 Until a task lands and its tests pass, the current implementation facts in the rest of this file remain authoritative. Update those sections in the same commit as each architectural change; never document a planned capability as already working.
 

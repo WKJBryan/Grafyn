@@ -3,7 +3,7 @@
   "version": "0.3.0",
   "type": "module",
   "description": "Grafyn frontend - Vue 3 SPA for knowledge management",
-  "license": "GPL-3.0-only",
+  "license": "MPL-2.0",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
@@ -24,6 +24,7 @@
     "twin-eval:models:dry-run": "node scripts/setup-twin-eval-models.cjs --dry-run",
     "twin-eval:models:setup": "node scripts/setup-twin-eval-models.cjs --execute",
     "version:bump": "node scripts/bump-version.cjs",
+    "check:licenses": "node scripts/check-license-alignment.cjs",
     "release:verify": "node scripts/release-verify.cjs",
     "release:prepare": "node scripts/release-tag.cjs --prepare-only",
     "release:tag": "node scripts/release-tag.cjs",
