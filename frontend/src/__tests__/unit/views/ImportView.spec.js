@@ -20,7 +20,7 @@ const api = vi.hoisted(() => ({
   }
 }))
 
-vi.mock('@tauri-apps/api/dialog', () => dialog)
+vi.mock('@tauri-apps/plugin-dialog', () => dialog)
 vi.mock('@/api/client', () => api)
 vi.mock('@/composables/useToast', () => ({
   useToast: () => ({

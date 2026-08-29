@@ -334,7 +334,7 @@
 
 <script setup>
 import { ref, reactive, computed } from 'vue'
-import { open } from '@tauri-apps/api/dialog'
+import { open } from '@tauri-apps/plugin-dialog'
 import { importApi, zettelkasten, notes } from '@/api/client'
 import { useToast } from '@/composables/useToast'
 

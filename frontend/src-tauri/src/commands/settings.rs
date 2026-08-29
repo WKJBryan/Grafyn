@@ -5,7 +5,8 @@ use crate::models::canvas::AvailableModel;
 use crate::models::settings::{SettingsStatus, SettingsUpdate, UserSettings};
 use crate::services::ollama::OllamaStatus;
 use crate::AppState;
-use tauri::State;
+use tauri::{AppHandle, State};
+use tauri_plugin_dialog::DialogExt;
 
 /// Get current settings
 #[tauri::command]
@@ -32,7 +33,8 @@ pub async fn update_settings(
 
     // Update settings
     let mut settings = state.settings_service.write().await;
-    let vault_path_changed = vault_path_update_changed(settings.get(), update.vault_path.as_deref());
+    let vault_path_changed =
+        vault_path_update_changed(settings.get(), update.vault_path.as_deref());
     let result = settings.update(update).map_err(|e| e.to_string())?;
 
     // Get new vault path while we still hold the lock
@@ -89,22 +91,26 @@ pub async fn complete_setup(state: State<'_, AppState>) -> Result<(), String> {
 
 /// Open folder picker dialog for vault selection
 #[tauri::command]
-pub async fn pick_vault_folder() -> Result<Option<String>, String> {
-    use std::sync::mpsc;
-    use tauri::api::dialog::FileDialogBuilder;
+pub async fn pick_vault_folder(app: AppHandle) -> Result<Option<String>, String> {
+    #[cfg(desktop)]
+    {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        app.dialog()
+            .file()
+            .set_title("Select Vault Folder")
+            .set_directory(dirs::document_dir().unwrap_or_else(|| std::path::PathBuf::from(".")))
+            .pick_folder(move |folder_path| {
+                let _ = tx.send(folder_path.map(|path| path.to_string()));
+            });
 
-    let (tx, rx) = mpsc::channel();
+        return rx.await.map_err(|e| format!("Dialog error: {}", e));
+    }
 
-    FileDialogBuilder::new()
-        .set_title("Select Vault Folder")
-        .set_directory(dirs::document_dir().unwrap_or_else(|| std::path::PathBuf::from(".")))
-        .pick_folder(move |folder_path| {
-            let path = folder_path.map(|p| p.to_string_lossy().to_string());
-            let _ = tx.send(path);
-        });
-
-    // Wait for the dialog result
-    rx.recv().map_err(|e| format!("Dialog error: {}", e))
+    #[cfg(mobile)]
+    {
+        let _ = app;
+        Err("Vault folder selection is unavailable on mobile".to_string())
+    }
 }
 
 /// Check if OpenRouter API key is valid by making a test request

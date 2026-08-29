@@ -18,6 +18,7 @@ const releaseManifestFiles = [
   'frontend/src-tauri/Cargo.toml',
   'frontend/src-tauri/Cargo.lock',
   'frontend/src-tauri/tauri.conf.json',
+  'frontend/src-tauri/tauri.lab.conf.json',
 ]
 
 function fail(message, details = '') {
@@ -121,11 +122,11 @@ function getVersionState() {
   const packageJson = readJson('package.json')
   const tauriConfig = readJson('src-tauri/tauri.conf.json')
   const cargoToml = readText('src-tauri/Cargo.toml')
-  const windowTitle = tauriConfig.tauri?.windows?.[0]?.title || ''
+  const windowTitle = tauriConfig.app?.windows?.[0]?.title || ''
 
   return {
     packageVersion: packageJson.version,
-    tauriVersion: tauriConfig.package?.version || '',
+    tauriVersion: tauriConfig.version || '',
     cargoVersion: extractCargoVersion(cargoToml),
     windowTitle,
   }

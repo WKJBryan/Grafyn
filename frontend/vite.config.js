@@ -1,16 +1,31 @@
 import { defineConfig } from 'vite'
 import vue from '@vitejs/plugin-vue'
 import { fileURLToPath, URL } from 'node:url'
-import { readFileSync } from 'node:fs'
-import { resolve } from 'node:path'
+import pkg from './package.json' with { type: 'json' }
+import {
+  assertTwinEvalIsolation,
+  resolveViteInputs,
+} from './scripts/twin-eval-isolation.mjs'
 
-const pkg = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf-8'))
+const twinEvalLabEnabled = process.env.GRAFYN_TWIN_EVAL_LAB === '1'
+
+function twinEvalIsolationPlugin() {
+  return {
+    name: 'grafyn-twin-eval-isolation',
+    generateBundle(_options, bundle) {
+      if (!twinEvalLabEnabled) {
+        assertTwinEvalIsolation(bundle)
+      }
+    },
+  }
+}
 
 // https://vitejs.dev/config/
 export default defineConfig({
-  plugins: [vue()],
+  plugins: [vue(), twinEvalIsolationPlugin()],
   define: {
     __APP_VERSION__: JSON.stringify(pkg.version),
+    __TWIN_EVAL_LAB__: JSON.stringify(twinEvalLabEnabled),
   },
   resolve: {
     alias: {
@@ -28,18 +43,15 @@ export default defineConfig({
   envPrefix: ['VITE_', 'TAURI_'],
   build: {
     // Tauri uses Chromium on Windows and WebKit on macOS/Linux
-    target: process.env.TAURI_PLATFORM === 'windows' ? 'chrome105' : 'safari13',
+    target: process.env.TAURI_ENV_PLATFORM === 'windows' ? 'chrome105' : 'safari13',
     // Don't minify for debug builds. vite 8 bundles with Rolldown and keeps
     // esbuild out of the default tree, so use the built-in (oxc) minifier
     // rather than 'esbuild' (which would pull a still-flagged esbuild back in).
-    minify: !process.env.TAURI_DEBUG,
+    minify: !process.env.TAURI_ENV_DEBUG,
     // Produce sourcemaps for debug builds
-    sourcemap: !!process.env.TAURI_DEBUG,
+    sourcemap: !!process.env.TAURI_ENV_DEBUG,
     rollupOptions: {
-      input: {
-        main: resolve(__dirname, 'index.html'),
-        lab: resolve(__dirname, 'lab.html'),
-      },
+      input: resolveViteInputs(__dirname, twinEvalLabEnabled),
       output: {
         // vite 8 bundles with Rolldown, which only accepts the function form of
         // manualChunks (the object map form is Rollup-only and throws).

@@ -21,8 +21,10 @@ window.addEventListener('grafyn-app-mounted', () => {
   appShellShown = true
 
   requestAnimationFrame(() => {
-    if (window.__TAURI__) {
-      import('@tauri-apps/api/window').then(({ appWindow }) => appWindow.show())
+    if (window.__TAURI__ || window.__TAURI_INTERNALS__) {
+      import('@tauri-apps/api/webviewWindow')
+        .then(({ getCurrentWebviewWindow }) => getCurrentWebviewWindow().show())
+        .catch((error) => console.error('Failed to show Grafyn window:', error))
     }
     removeBootstrapSplash()
   })

@@ -33,6 +33,7 @@ pub mod retrieval;
 pub mod search;
 pub mod settings;
 pub mod twin;
+#[cfg(feature = "twin-eval-lab")]
 pub mod twin_eval;
 pub mod zettelkasten;
 

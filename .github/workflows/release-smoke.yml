@@ -66,7 +66,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             libgtk-3-dev \
-            libwebkit2gtk-4.0-dev \
+            libwebkit2gtk-4.1-dev \
             libayatana-appindicator3-dev \
             librsvg2-dev \
             patchelf
@@ -102,25 +102,25 @@ jobs:
         id: tauri_args
         shell: bash
         env:
-          TAURI_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
         run: |
-          args="--target ${{ matrix.target }} -- --locked"
+          config_path="frontend/src-tauri/tauri.desktop.conf.json"
 
-          if [ -z "${TAURI_PRIVATE_KEY}" ]; then
+          if [ -z "${TAURI_SIGNING_PRIVATE_KEY}" ]; then
             config_path="$RUNNER_TEMP/tauri-smoke-config.json"
-            printf '%s' '{"tauri":{"updater":{"active":false}}}' > "$config_path"
-            args="$args --config $config_path"
-            echo "TAURI_PRIVATE_KEY is unavailable; updater signing is disabled for this smoke build."
+            node -e "const fs=require('fs'); const config=JSON.parse(fs.readFileSync('frontend/src-tauri/tauri.desktop.conf.json','utf8')); config.bundle.createUpdaterArtifacts=false; fs.writeFileSync(process.argv[1], JSON.stringify(config));" "$config_path"
+            echo "TAURI_SIGNING_PRIVATE_KEY is unavailable; updater artifacts are disabled for this smoke build."
           fi
 
+          args="--target ${{ matrix.target }} --config $config_path -- --locked"
           echo "args=$args" >> "$GITHUB_OUTPUT"
 
       - name: Build Tauri app
-        uses: tauri-apps/tauri-action@v0
+        uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAURI_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
-          TAURI_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
         with:
           projectPath: frontend
           tauriScript: npx tauri

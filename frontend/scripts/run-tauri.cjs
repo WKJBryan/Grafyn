@@ -1,4 +1,5 @@
 const { spawnSync } = require('node:child_process')
+const fs = require('node:fs')
 const path = require('node:path')
 
 const projectRoot = path.resolve(__dirname, '..')
@@ -73,6 +74,17 @@ function localBundleTargets(target) {
   return []
 }
 
+function isMobileTarget(target) {
+  return target.includes('android') || target.includes('ios')
+}
+
+function featureList(args) {
+  return findOption(args, '--features')
+    .split(',')
+    .map((feature) => feature.trim())
+    .filter(Boolean)
+}
+
 function main() {
   const [subcommand, ...tauriArgs] = process.argv.slice(2)
   if (!subcommand || !['build', 'dev'].includes(subcommand)) {
@@ -80,6 +92,21 @@ function main() {
   }
 
   const target = findOption(tauriArgs, '--target')
+  const config = findOption(tauriArgs, '--config')
+  const features = featureList(tauriArgs)
+  const labConfig = config.endsWith('tauri.lab.conf.json')
+  const labFeature = features.includes('twin-eval-lab')
+
+  if (labConfig !== labFeature) {
+    fail('Twin Eval lab builds require both tauri.lab.conf.json and the twin-eval-lab feature')
+  }
+  if (labFeature && isMobileTarget(target)) {
+    fail('Twin Eval lab builds are desktop-only')
+  }
+  if (labFeature) {
+    process.env.GRAFYN_TWIN_EVAL_LAB = '1'
+  }
+
   const prepareArgs = []
   if (subcommand === 'build') {
     prepareArgs.push('--release')
@@ -90,32 +117,32 @@ function main() {
 
   if (
     subcommand === 'build' &&
-    !process.env.TAURI_PRIVATE_KEY &&
+    !process.env.TAURI_SIGNING_PRIVATE_KEY &&
     !hasOption(tauriArgs, '--bundles') &&
-    !hasOption(tauriArgs, '--config')
+    !config &&
+    !isMobileTarget(target)
   ) {
     const bundleTargets = localBundleTargets(resolveTargetForBundles(target))
     if (bundleTargets.length > 0) {
       console.log(
-        `TAURI_PRIVATE_KEY is not set; building local installer bundles only (${bundleTargets.join(', ')})`,
+        `TAURI_SIGNING_PRIVATE_KEY is not set; building local installer bundles only (${bundleTargets.join(', ')})`,
       )
-      tauriArgs.push(
-        '--config',
-        JSON.stringify({
-          tauri: {
-            bundle: {
-              targets: bundleTargets,
-            },
-            updater: {
-              active: false,
-            },
-          },
-        }),
+      const desktopConfig = JSON.parse(
+        fs.readFileSync(path.join(projectRoot, 'src-tauri', 'tauri.desktop.conf.json'), 'utf8'),
       )
+      desktopConfig.bundle.targets = bundleTargets
+      desktopConfig.bundle.createUpdaterArtifacts = false
+      tauriArgs.push('--config', JSON.stringify(desktopConfig))
     }
   }
 
-  run(process.execPath, [path.join(__dirname, 'prepare-sidecar.cjs'), ...prepareArgs])
+  if (!config && !hasOption(tauriArgs, '--config') && !isMobileTarget(target)) {
+    tauriArgs.push('--config', 'src-tauri/tauri.desktop.conf.json')
+  }
+
+  if (!labFeature && !isMobileTarget(target)) {
+    run(process.execPath, [path.join(__dirname, 'prepare-sidecar.cjs'), ...prepareArgs])
+  }
   const tauriEntrypoint = path.join(
     projectRoot,
     'node_modules',

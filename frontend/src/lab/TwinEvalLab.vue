@@ -399,7 +399,7 @@
 
 <script setup>
 import { computed, onMounted, ref } from 'vue'
-import { twinEval } from '../api/client'
+import { twinEval } from './api'
 
 const rawQuestion = ref('')
 const answerKey = ref('')

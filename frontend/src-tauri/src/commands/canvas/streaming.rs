@@ -9,8 +9,8 @@ use crate::models::canvas::{
 use crate::models::twin::{
     DecisionEpisodeCreate, PrimitiveDecisionAssessment, ReflectionCardCreate, TraceEventType,
 };
-use crate::services::twin::TwinStore;
 use crate::services::openrouter::StreamUpdate;
+use crate::services::twin::TwinStore;
 use crate::AppState;
 use chrono::Utc;
 use futures::StreamExt;
@@ -18,7 +18,7 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tauri::State;
+use tauri::{Emitter, State};
 use tokio::sync::RwLock;
 
 const EMPTY_MODEL_RESPONSE_ERROR: &str = "No response returned from model";
@@ -42,7 +42,7 @@ where
 /// Returns the tile_id immediately; actual responses stream via "canvas-stream" events.
 #[tauri::command]
 pub async fn send_prompt(
-    window: tauri::Window,
+    window: tauri::WebviewWindow,
     session_id: String,
     mut request: PromptRequest,
     state: State<'_, AppState>,
@@ -510,7 +510,7 @@ pub async fn send_prompt(
 /// Add new models to an existing tile (same prompt, new model responses)
 #[tauri::command]
 pub async fn add_models_to_tile(
-    window: tauri::Window,
+    window: tauri::WebviewWindow,
     session_id: String,
     tile_id: String,
     request: AddModelsRequest,
@@ -789,7 +789,7 @@ pub async fn add_models_to_tile(
 /// Regenerate a single model's response
 #[tauri::command]
 pub async fn regenerate_response(
-    window: tauri::Window,
+    window: tauri::WebviewWindow,
     session_id: String,
     tile_id: String,
     model_id: String,
@@ -1087,7 +1087,7 @@ async fn append_model_result_traces(
 }
 
 fn emit_canvas_error(
-    window: &tauri::Window,
+    window: &tauri::WebviewWindow,
     session_id: &str,
     tile_id: &str,
     model_id: &str,
@@ -1111,7 +1111,7 @@ fn emit_canvas_error(
 /// content silently reverts to an empty Pending stub the next time the
 /// session is reopened — with no error anywhere in the UI.
 fn emit_persistence_error(
-    window: &tauri::Window,
+    window: &tauri::WebviewWindow,
     session_id: &str,
     tile_id: &str,
     model_ids: &[String],
@@ -1130,7 +1130,7 @@ fn emit_persistence_error(
     }
 }
 
-fn emit_canvas_complete(window: &tauri::Window, session_id: &str, tile_id: &str, model_id: &str, cost_usd: Option<f64>) {
+fn emit_canvas_complete(window: &tauri::WebviewWindow, session_id: &str, tile_id: &str, model_id: &str, cost_usd: Option<f64>) {
     let _ = window.emit(
         "canvas-stream",
         CanvasStreamEvent::Complete {
@@ -1144,7 +1144,7 @@ fn emit_canvas_complete(window: &tauri::Window, session_id: &str, tile_id: &str,
 }
 
 fn finalize_streamed_model_response(
-    window: &tauri::Window,
+    window: &tauri::WebviewWindow,
     session_id: &str,
     tile_id: &str,
     model_id: String,

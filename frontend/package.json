@@ -18,9 +18,9 @@
     "check:file-sizes": "node scripts/check-file-sizes.cjs",
     "tauri": "tauri",
     "tauri:dev": "node scripts/run-tauri.cjs dev",
-    "tauri:lab": "node scripts/run-tauri.cjs dev --config src-tauri/tauri.lab.conf.json",
+    "tauri:lab": "node scripts/run-tauri.cjs dev --features twin-eval-lab --config src-tauri/tauri.lab.conf.json",
     "tauri:build": "node scripts/run-tauri.cjs build",
-    "tauri:lab:build": "node scripts/run-tauri.cjs build --config src-tauri/tauri.lab.conf.json",
+    "tauri:lab:build": "node scripts/run-tauri.cjs build --features twin-eval-lab --config src-tauri/tauri.lab.conf.json",
     "twin-eval:models:dry-run": "node scripts/setup-twin-eval-models.cjs --dry-run",
     "twin-eval:models:setup": "node scripts/setup-twin-eval-models.cjs --execute",
     "version:bump": "node scripts/bump-version.cjs",
@@ -33,7 +33,10 @@
     "e2e": "echo 'Manual only: the Playwright suite needs a live Tauri IPC backend (run \"npm run tauri:dev\" first), so it cannot run against a plain browser or in CI. See e2e/README.md.' && cd ../e2e && npm install && npm test"
   },
   "dependencies": {
-    "@tauri-apps/api": "^1.6.0",
+    "@tauri-apps/api": "2.11.1",
+    "@tauri-apps/plugin-dialog": "2.7.2",
+    "@tauri-apps/plugin-opener": "2.5.4",
+    "@tauri-apps/plugin-updater": "2.10.1",
     "d3-drag": "^3.0.0",
     "d3-force": "^3.0.0",
     "d3-selection": "^3.0.0",
@@ -47,7 +50,7 @@
   },
   "devDependencies": {
     "@pinia/testing": "^0.1.0",
-    "@tauri-apps/cli": "^1.6.0",
+    "@tauri-apps/cli": "2.11.4",
     "@vitejs/plugin-vue": "^6.0.3",
     "@vitest/coverage-v8": "^4.0.16",
     "@vitest/ui": "^4.0.16",

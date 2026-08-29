@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 | Component | Stack | Entry Point | Port |
 |-----------|-------|-------------|------|
-| **Backend (Rust)** | Tauri, Tantivy, petgraph, reqwest | `frontend/src-tauri/src/main.rs` | N/A |
+| **Backend (Rust)** | Tauri 2, Tantivy, petgraph, reqwest | `frontend/src-tauri/src/lib.rs` (`run()`); thin desktop binary in `main.rs` | N/A |
 | **MCP Server** | rmcp, Tantivy, stdio transport | `frontend/src-tauri/src/mcp.rs` (entry) + `mcp_tools.rs` (tool impls) | stdio |
 | **Frontend** | Vue 3, Vite, Pinia, D3.js | `frontend/src/main.js` | 5173 |
 
@@ -25,7 +25,7 @@ npm run format       # Format code
 
 ### Desktop App (Tauri)
 
-**Prerequisites:** See [Tauri v1 prerequisites](https://v1.tauri.app/v1/guides/getting-started/prerequisites). Also need Rust via [rustup](https://rustup.rs/). Generate app icons with `npm run generate-icons`.
+**Prerequisites:** See [Tauri 2 prerequisites](https://v2.tauri.app/start/prerequisites/). Linux requires WebKitGTK 4.1. Also install Rust via [rustup](https://rustup.rs/). Generate app icons with `npm run generate-icons`.
 
 ```bash
 cd frontend
@@ -60,7 +60,7 @@ npx vitest run src/__tests__/unit/components/PromptDialog.spec.js
 
 ## Architecture Overview
 
-**Current implementation at the start of the companion-first branch:** Grafyn is a desktop-only Tauri v1 app — a single Tauri binary with a Vue frontend and Rust backend. No web mode, no Python backend. Do not treat this snapshot description as the target architecture while executing the approved plan below.
+**Current implementation:** Grafyn uses a Tauri 2 shared Rust library entry point with a working wide desktop shell and Vue frontend. The shell has platform-scoped capabilities and Android-neutral base configuration, but Android initialization, storage, routes, and compact UI remain unavailable until later companion-first tasks land. No web mode and no Python backend exist.
 
 ### Approved companion-first direction (owner decision, 2026-08-29)
 
@@ -79,7 +79,7 @@ Until a task lands and its tests pass, the current implementation facts in the r
 
 ```
 ┌────────────────────────────────────────────────┐
-│           Tauri Desktop App (Single Binary)     │
+│        Tauri 2 Shared Core + Desktop Shell       │
 │  ┌──────────────────────────────────────────┐  │
 │  │         Vue 3 Frontend (WebView)          │  │
 │  └──────────────────┬───────────────────────┘  │
@@ -105,7 +105,7 @@ Until a task lands and its tests pass, the current implementation facts in the r
 
 ### Tauri IPC Commands
 
-16 modules in `frontend/src-tauri/src/commands/`. `canvas` is a directory module (split — see below); every other module is a single file. Enumerate exact command names with `grep -rn "#\[tauri::command\]" -A1 src/commands/` — purposes only below, to avoid drift.
+The normal shell registers 15 command modules from `frontend/src-tauri/src/commands/`. `canvas` is a directory module (split — see below); every other normal module is a single file. A sixteenth source module, `twin_eval`, is compiled and registered only with the non-default `twin-eval-lab` feature. Enumerate exact command names with `grep -rn "#\[tauri::command\]" -A1 src/commands/` — purposes only below, to avoid drift.
 
 | Module | Purpose |
 |--------|---------|
@@ -125,6 +125,8 @@ Until a task lands and its tests pass, the current implementation facts in the r
 | `twin.rs` | 27 commands: user records, review, inference, Decision Mirror, Constitution, action gaps, setup, export, memory digest, session trace. Naming quirks: list commands are plural (`list_constitution_items`, `list_action_gaps`) and the digest review command is `review_memory_digest_item` |
 | `migration.rs` | Markdown migration (preview/apply/rollback) + vault optimizer admin (status/settings/decisions/inbox/rollback) |
 | `boot.rs` | App startup state (index ready, migration status) |
+
+**Twin Eval lab isolation:** Normal desktop and all mobile builds omit `lab.html`, the lab frontend API, the `twin_eval` service, and all scoring/export invoke registrations. `npm run tauri:lab` and `npm run tauri:lab:build` are the only supported opt-in shell scripts; they enable both the Vite lab input and Cargo `twin-eval-lab` feature.
 
 ### Frontend
 
@@ -363,26 +365,23 @@ prepare-release → build (4-platform matrix: MCP binary + tauri-action) → ver
 
 ## CI Pitfalls (Known Issues & Fixes)
 
-### Tauri v1 Requires Ubuntu 22.04
+### Tauri 2 Requires WebKitGTK 4.1
 
-Tauri v1 depends on `libwebkit2gtk-4.0-dev` which **does not exist on Ubuntu 24.04** (`ubuntu-latest`). The `rust-tests` and `lint` CI jobs must use `runs-on: ubuntu-22.04`. Do NOT use `ubuntu-latest` for any job that compiles Tauri Rust code.
+Every Linux job that compiles the Tauri shell installs `libwebkit2gtk-4.1-dev`. Ubuntu 22.04 remains the release baseline to avoid unnecessarily raising the AppImage glibc floor.
 
-- `libwebkit2gtk-4.1-dev` (Ubuntu 24.04) does NOT satisfy Tauri v1's `webkit2gtk-sys` crate — it provides `webkit2gtk-4.1.pc` but Tauri v1 needs `webkit2gtk-4.0.pc`.
-- The `linux-ipc-protocol` Tauri feature is **Tauri v2 only** — do not attempt to use it with Tauri v1.8.
+### Rust CI Requires Stub dist/; Desktop Bundles Require the MCP Binary
 
-### Rust CI Requires MCP Binary + Stub dist/
+`cargo test` compiles the full crate including `tauri::generate_context!()`. Keep the test and bundle prerequisites separate:
 
-`cargo test` compiles the full crate including `tauri::generate_context!()`. Two prerequisites must exist before running tests:
-
-1. **MCP binary** — Tauri's `externalBin` config expects `binaries/grafyn-mcp-{target-triple}` at compile time. Use the script that CI uses:
-   ```bash
-   cd frontend && npm run prepare:sidecar
-   ```
-   (Builds `grafyn-mcp` with `--no-default-features --features mcp` and copies it to `binaries/grafyn-mcp-<host-triple>`. Supports `--release`, `--locked`, `--target <triple>`.)
-2. **Stub dist directory** — `tauri::generate_context!()` panics if `distDir` (configured as `../dist`) doesn't exist.
+1. **Stub frontend** — `tauri::generate_context!()` requires the base config's `frontendDist` directory to exist:
    ```bash
    mkdir -p ../dist && echo '<html></html>' > ../dist/index.html
    ```
+2. **Desktop bundle sidecar** — `tauri.desktop.conf.json` declares `binaries/grafyn-mcp`, so desktop bundle jobs prepare the target-suffixed binary first:
+   ```bash
+   cd frontend && npm run prepare:sidecar
+   ```
+   This builds `grafyn-mcp` with `--no-default-features --features mcp` and copies it to `binaries/grafyn-mcp-<target-triple>`. It supports `--release`, `--locked`, and `--target <triple>`, and skips mobile targets.
 
 ### Cargo.lock Must Be Committed
 
@@ -392,9 +391,9 @@ Tauri v1 depends on `libwebkit2gtk-4.0-dev` which **does not exist on Ubuntu 24.
 
 When `Cargo.toml` version changes, `Cargo.lock` must be regenerated with `cargo generate-lockfile` (not just `cargo update -p grafyn`). The lockfile must satisfy `--locked` for all 4 release targets (Windows x64/ARM64, macOS ARM64, Linux x64) and both feature sets (default features for desktop app, `--no-default-features --features mcp` for MCP binary). The `npm run release:prepare` script handles this automatically.
 
-### Tauri Features Must Include `process-all` and `protocol-all`
+### Desktop Configuration and Data Origin
 
-Removing `process-all` or `protocol-all` from the Tauri features in `Cargo.toml` changes the `wry`/`webkit2gtk` feature graph and breaks the Linux build. The `wry` crate's webkitgtk code depends on `SettingsExt` trait methods that are only in scope when these features are enabled.
+`tauri.conf.json` is Android-neutral. Desktop builds must merge `tauri.desktop.conf.json` so the MCP external binary, updater endpoint/public key, `createUpdaterArtifacts: "v1Compatible"`, and desktop capability are present. The main desktop window keeps `useHttpsScheme: true`; changing it would reset the Tauri v1 HTTPS webview origin's IndexedDB, localStorage, and cookies for existing users.
 
 ### ESLint `_` Prefix Convention
 

@@ -38,7 +38,35 @@ function handleExternalLinkClick(event) {
   const href = el.getAttribute('href')
   if (href && (href.startsWith('http://') || href.startsWith('https://'))) {
     event.preventDefault()
-    import('@tauri-apps/api/shell').then(({ open }) => open(href))
+    import('@tauri-apps/plugin-opener')
+      .then(({ openUrl }) => openUrl(href))
+      .catch((error) => console.error('Failed to open external link:', error))
+  }
+}
+
+async function checkForDesktopUpdate() {
+  try {
+    const [{ check }, { confirm }] = await Promise.all([
+      import('@tauri-apps/plugin-updater'),
+      import('@tauri-apps/plugin-dialog'),
+    ])
+    const update = await check()
+    if (!update) return
+
+    const shouldInstall = await confirm(
+      `Grafyn ${update.version} is available. Install it now?`,
+      {
+        title: 'Grafyn update',
+        kind: 'info',
+        okLabel: 'Install',
+        cancelLabel: 'Later',
+      },
+    )
+    if (shouldInstall) {
+      await update.downloadAndInstall()
+    }
+  } catch (error) {
+    console.error('Failed to check for Grafyn updates:', error)
   }
 }
 
@@ -48,8 +76,9 @@ onMounted(() => {
   guide.setCurrentRoute(route.path)
   guide.checkNewFeatures()
 
-  if (window.__TAURI__) {
+  if (window.__TAURI__ || window.__TAURI_INTERNALS__) {
     document.addEventListener('click', handleExternalLinkClick)
+    void checkForDesktopUpdate()
   }
 })
 

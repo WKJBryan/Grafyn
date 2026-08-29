@@ -55,18 +55,18 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.0-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev
 
       - name: Prepare build artifacts for Tauri
         run: |
-          # Tauri's generate_context!() requires distDir to exist at compile time
+          # Tauri's generate_context!() requires frontendDist to exist at compile time.
           mkdir -p frontend/dist && echo '<html></html>' > frontend/dist/index.html
           cd frontend
-          # Tauri's build script requires the MCP external binary
+          # Exercise the desktop MCP sidecar preparation path used by bundles.
           node scripts/prepare-sidecar.cjs
 
       - name: Run Rust tests
-        run: cd frontend/src-tauri && cargo test
+        run: cd frontend/src-tauri && cargo test --locked
 
   frontend-tests:
     name: Frontend Tests
@@ -117,7 +117,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.0-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev
 
       - name: Install frontend dependencies
         run: cd frontend && npm ci
@@ -167,6 +167,12 @@ jobs:
 
       - name: Build frontend
         run: cd frontend && npm run build
+
+      - name: Build Twin Eval lab explicitly
+        working-directory: frontend
+        env:
+          GRAFYN_TWIN_EVAL_LAB: 1
+        run: npm run build
 
   # ============================================================================
   # Summary

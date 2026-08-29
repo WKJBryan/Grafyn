@@ -14,7 +14,7 @@ use futures::StreamExt;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tauri::State;
+use tauri::{Emitter, State};
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -178,7 +178,7 @@ pub async fn export_twin_eval_results(
 /// models finish and appear in the table while larger 27B models are still generating.
 #[tauri::command]
 pub async fn run_twin_eval_lab_stream(
-    window: tauri::Window,
+    window: tauri::WebviewWindow,
     state: State<'_, AppState>,
     request: TwinEvalRunRequest,
 ) -> Result<(), String> {

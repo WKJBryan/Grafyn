@@ -10,7 +10,7 @@ const twinEvalApi = vi.hoisted(() => ({
   exportResults: vi.fn()
 }))
 
-vi.mock('@/api/client', () => ({
+vi.mock('@/lab/api', () => ({
   twinEval: twinEvalApi
 }))
 
@@ -195,6 +195,7 @@ it('uses structured JSON output only when explicitly enabled', async () => {
   })
 
   it('exports lab results through the backend exporter', async () => {
+    const anchorClick = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => {})
     const wrapper = mountLab()
     await flushPromises()
 
@@ -206,5 +207,6 @@ it('uses structured JSON output only when explicitly enabled', async () => {
     expect(twinEvalApi.exportResults).toHaveBeenCalledWith([
       expect.objectContaining({ model_key: 'gemma4-e2b-it' })
     ])
+    anchorClick.mockRestore()
   })
 })

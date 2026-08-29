@@ -13,7 +13,7 @@ use chrono::Utc;
 use futures::StreamExt;
 use serde_json::json;
 use std::time::Duration;
-use tauri::State;
+use tauri::{Emitter, State};
 
 fn no_cost_stream<S>(stream: S) -> std::pin::Pin<Box<dyn futures::Stream<Item = anyhow::Result<StreamUpdate>> + Send>>
 where
@@ -25,7 +25,7 @@ where
 /// Start a debate between models with streaming via Tauri events
 #[tauri::command]
 pub async fn start_debate(
-    window: tauri::Window,
+    window: tauri::WebviewWindow,
     session_id: String,
     mut request: DebateStartRequest,
     state: State<'_, AppState>,
@@ -432,7 +432,7 @@ pub async fn start_debate(
 /// Continue a debate with a new round
 #[tauri::command]
 pub async fn continue_debate(
-    window: tauri::Window,
+    window: tauri::WebviewWindow,
     session_id: String,
     debate_id: String,
     request: DebateContinueRequest,
@@ -738,7 +738,7 @@ pub async fn continue_debate(
 /// once. Emits a `DebateError` per participating model in the round that
 /// failed to persist so the frontend has something concrete to render.
 fn emit_debate_persist_error(
-    window: &tauri::Window,
+    window: &tauri::WebviewWindow,
     session_id: &str,
     debate_id: &str,
     round_number: u32,

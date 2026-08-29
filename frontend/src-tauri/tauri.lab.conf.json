@@ -1,23 +1,15 @@
 {
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Grafyn Twin Eval Lab",
+  "version": "0.3.0",
+  "identifier": "com.grafyn.twin-eval-lab",
   "build": {
-    "beforeDevCommand": "npm run dev",
-    "beforeBuildCommand": "npm run build",
-    "devPath": "http://localhost:5173/lab.html",
-    "distDir": "../dist"
+    "devUrl": "http://localhost:5173/lab.html"
   },
-  "package": {
-    "productName": "Grafyn Twin Eval Lab",
-    "version": "0.1.13"
-  },
-  "tauri": {
-    "bundle": {
-      "identifier": "com.grafyn.twin-eval-lab"
-    },
-    "updater": {
-      "active": false
-    },
+  "app": {
     "windows": [
       {
+        "label": "main",
         "fullscreen": false,
         "height": 900,
         "resizable": true,
@@ -26,8 +18,13 @@
         "minWidth": 960,
         "minHeight": 720,
         "center": true,
-        "visible": true
+        "visible": true,
+        "useHttpsScheme": true
       }
     ]
+  },
+  "bundle": {
+    "createUpdaterArtifacts": false,
+    "targets": ["nsis", "dmg", "deb", "appimage"]
   }
 }

@@ -1,3 +1,5 @@
+//! Local Twin Eval Lab implementation, compiled only by the `twin-eval-lab` feature.
+
 use anyhow::{anyhow, Result};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
