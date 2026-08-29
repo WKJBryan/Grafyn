@@ -460,9 +460,15 @@ fn pending_draft_item(
     by_id: &BTreeMap<EventId, &TwinEvent>,
     active_superseded: &BTreeSet<EventId>,
     reference_time: DateTime<Utc>,
-) -> Result<ProjectedStateItem, ProjectionError> {
-    let sources = draft
-        .evidence_event_ids
+) -> Result<(ProjectedStateItem, EventId), ProjectionError> {
+    let (support_count, opposition_count, support_event_ids) = matching_observation_counts(
+        events,
+        active_superseded,
+        &draft.claim,
+        &draft.relationship_variant,
+        reference_time,
+    );
+    let sources = support_event_ids
         .iter()
         .map(|id| {
             by_id
@@ -471,6 +477,9 @@ fn pending_draft_item(
                 .ok_or_else(|| ProjectionError::DanglingReference(id.clone()))
         })
         .collect::<Result<Vec<_>, _>>()?;
+    // Aggregate every matching support before applying each context vector's
+    // own deterministic lexicographic bound. The 64 retained evidence IDs are
+    // an explanation subset only and never define projected state.
     let goals = sources
         .iter()
         .flat_map(|event| event.context.goals.iter().cloned())
@@ -485,40 +494,49 @@ fn pending_draft_item(
         .into_iter()
         .take(crate::models::twin_state::MAX_STATE_LINKS)
         .collect();
-    let (support_count, opposition_count, _) = matching_observation_counts(
-        events,
-        active_superseded,
-        &draft.claim,
-        &draft.relationship_variant,
+    let (causal_stream, governance) = effective_exposure(
+        support_event_ids.iter().cloned(),
+        by_id,
         reference_time,
+        ReviewState::Pending,
+        AuthorityClass::EvidenceObservation,
     );
-    let last_confirmed_at = sources
+    let timeline_source = sources
         .iter()
-        .map(|event| fallback_confirmation(event, reference_time))
-        .max()
+        .max_by_key(|event| {
+            (
+                fallback_confirmation(event, reference_time),
+                event.event_id.clone(),
+            )
+        })
         .expect("proposal rules always cite evidence");
+    let last_confirmed_at = fallback_confirmation(timeline_source, reference_time);
+    let timeline_source_event_id = timeline_source.event_id.clone();
 
-    Ok(ProjectedStateItem {
-        item_id: draft.memory_id.clone(),
-        kind: ProjectedItemKind::PendingProposal,
-        claim: draft.claim.clone(),
-        summary: None,
-        proposal_event_id: None,
-        review_event_ids: Vec::new(),
-        causal_stream: draft.causal_stream,
-        governance: draft.governance.clone(),
-        relationship_variant: draft.relationship_variant.clone(),
-        evidence_event_ids: draft.evidence_event_ids.clone(),
-        support_count: draft.support_count.max(support_count),
-        opposition_count: draft.opposition_count.max(opposition_count),
-        prior_exact_support_count: draft.support_count.max(support_count),
-        last_confirmed_at,
-        valid_from: None,
-        valid_to: None,
-        superseded_by: Vec::new(),
-        goals,
-        tags,
-    })
+    Ok((
+        ProjectedStateItem {
+            item_id: draft.memory_id.clone(),
+            kind: ProjectedItemKind::PendingProposal,
+            claim: draft.claim.clone(),
+            summary: None,
+            proposal_event_id: None,
+            review_event_ids: Vec::new(),
+            causal_stream,
+            governance,
+            relationship_variant: draft.relationship_variant.clone(),
+            evidence_event_ids: draft.evidence_event_ids.clone(),
+            support_count,
+            opposition_count,
+            prior_exact_support_count: support_count,
+            last_confirmed_at,
+            valid_from: None,
+            valid_to: None,
+            superseded_by: Vec::new(),
+            goals,
+            tags,
+        },
+        timeline_source_event_id,
+    ))
 }
 
 fn group_variants(
@@ -641,11 +659,6 @@ pub fn project(
     let by_id = applied
         .iter()
         .map(|event| (event.event_id.clone(), event))
-        .collect::<BTreeMap<_, _>>();
-    let event_order = applied
-        .iter()
-        .enumerate()
-        .map(|(index, event)| (event.event_id.clone(), index))
         .collect::<BTreeMap<_, _>>();
     let active_superseded = active_superseded_event_ids(&applied, reference_time);
 
@@ -946,24 +959,13 @@ pub fn project(
         if materialized_memory_ids.contains(&draft.memory_id) {
             continue;
         }
-        let timeline_evidence = derived
-            .contradiction_clusters
-            .iter()
-            .find(|cluster| cluster.memory_ids.contains(&draft.memory_id))
-            .map(|cluster| cluster.evidence_event_ids.as_slice())
-            .unwrap_or(&draft.evidence_event_ids);
-        let source_event_id = timeline_evidence
-            .iter()
-            .max_by_key(|id| event_order.get(*id))
-            .expect("proposal rules always cite evidence")
-            .clone();
-        let source_event = by_id[&source_event_id];
-        let item = pending_draft_item(draft, &applied, &by_id, &active_superseded, reference_time)?;
+        let (item, source_event_id) =
+            pending_draft_item(draft, &applied, &by_id, &active_superseded, reference_time)?;
         timeline.push(TemporalStateEntry {
             item_id: item.item_id.clone(),
             source_event_id,
             state: TimelineState::Pending,
-            effective_at: fallback_confirmation(source_event, reference_time),
+            effective_at: item.last_confirmed_at,
             valid_from: None,
             valid_to: None,
         });
@@ -1022,6 +1024,58 @@ mod tests {
 
     fn reference() -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 9, 1, 0, 0, 0).unwrap()
+    }
+
+    fn contextual_observation(device: &str) -> TwinEvent {
+        let mut event = valid_event_for_device(device, 1, Vec::new());
+        event.context.relationships = vec![RelationshipAssertion {
+            subject_id: EntityId::parse("owner").unwrap(),
+            predicate: RelationshipPredicate::parse("works_with").unwrap(),
+            object_id: EntityId::parse("manager").unwrap(),
+            direction: RelationshipDirection::Directed,
+            valid_from: None,
+            valid_to: None,
+            evidence: Vec::new(),
+            governance: Governance::direct_observation(),
+        }];
+        event.event_id = derive_event_id(&event);
+        event
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum InapplicableRelationshipCase {
+        ExpiredLocalOnly,
+        RejectedRestricted,
+        SupersededSyncDisabled,
+        FutureSensitiveSyncDisabled,
+    }
+
+    fn apply_inapplicable_relationship_case(
+        event: &mut TwinEvent,
+        case: InapplicableRelationshipCase,
+    ) {
+        let relationship = &mut event.context.relationships[0];
+        relationship.governance.allowed_uses.recall = false;
+        relationship.governance.allowed_uses.export = false;
+        relationship.governance.allowed_uses.sync = false;
+        match case {
+            InapplicableRelationshipCase::ExpiredLocalOnly => {
+                relationship.valid_to = Some(reference() - Duration::seconds(1));
+                relationship.governance.visibility = Visibility::LocalOnly;
+            }
+            InapplicableRelationshipCase::RejectedRestricted => {
+                relationship.governance.review = ReviewState::Rejected;
+                relationship.governance.sensitivity = Sensitivity::Restricted;
+            }
+            InapplicableRelationshipCase::SupersededSyncDisabled => {
+                relationship.governance.review = ReviewState::Superseded;
+            }
+            InapplicableRelationshipCase::FutureSensitiveSyncDisabled => {
+                relationship.valid_from = Some(reference() + Duration::seconds(1));
+                relationship.governance.sensitivity = Sensitivity::Sensitive;
+            }
+        }
+        event.event_id = derive_event_id(event);
     }
 
     fn proposal(device: &str, memory: &str) -> TwinEvent {
@@ -1692,6 +1746,44 @@ mod tests {
     }
 
     #[test]
+    fn direct_projection_retains_inapplicable_relationship_exposure() {
+        for case in [
+            InapplicableRelationshipCase::ExpiredLocalOnly,
+            InapplicableRelationshipCase::RejectedRestricted,
+            InapplicableRelationshipCase::SupersededSyncDisabled,
+            InapplicableRelationshipCase::FutureSensitiveSyncDisabled,
+        ] {
+            let mut observation = contextual_observation("observation-device");
+            apply_inapplicable_relationship_case(&mut observation, case);
+
+            let snapshot = project(&[observation], reference()).unwrap();
+            let item = &snapshot.recent_observations[0];
+            assert_eq!(
+                item.relationship_variant.relationships,
+                vec![RelationshipKey {
+                    subject_id: EntityId::parse("owner").unwrap(),
+                    predicate: RelationshipPredicate::parse("works_with").unwrap(),
+                    object_id: EntityId::parse("manager").unwrap(),
+                    direction: RelationshipDirection::Directed,
+                }],
+                "case: {case:?}"
+            );
+            assert!(!item.governance.allowed_uses.recall, "case: {case:?}");
+            assert!(!item.governance.allowed_uses.export, "case: {case:?}");
+            assert!(!item.governance.allowed_uses.sync, "case: {case:?}");
+            let expected_sensitivity = match case {
+                InapplicableRelationshipCase::RejectedRestricted => Sensitivity::Restricted,
+                InapplicableRelationshipCase::FutureSensitiveSyncDisabled => Sensitivity::Sensitive,
+                _ => Sensitivity::Standard,
+            };
+            assert_eq!(
+                item.governance.sensitivity, expected_sensitivity,
+                "case: {case:?}"
+            );
+        }
+    }
+
+    #[test]
     fn relationship_variant_state_lists_every_recent_observation_event() {
         let observations = ["observation-a", "observation-b", "observation-c"]
             .into_iter()
@@ -1740,6 +1832,75 @@ mod tests {
             .iter()
             .all(|item| item.support_count == 65 && item.evidence_event_ids.len() == 64));
         assert_eq!(first.timeline.len(), 66);
+
+        observations.reverse();
+        let second = project(&observations, reference()).unwrap();
+        assert_eq!(
+            canonical_snapshot_json(&first).unwrap(),
+            canonical_snapshot_json(&second).unwrap()
+        );
+    }
+
+    #[test]
+    fn derived_proposal_aggregates_context_and_time_from_unretained_support() {
+        let mut observations = (0..64)
+            .map(|index| contextual_observation(&format!("observation-{index:03}")))
+            .collect::<Vec<_>>();
+        let retained_max = observations
+            .iter()
+            .map(|event| event.event_id.clone())
+            .max()
+            .unwrap();
+        let newest = (0..10_000)
+            .find_map(|nonce| {
+                let mut event = contextual_observation(&format!("newest-observation-{nonce:04}"));
+                event.observed_at = reference() - Duration::minutes(1);
+                event.recorded_at = reference() - Duration::seconds(30);
+                event.context.goals = vec!["newest-goal".to_string()];
+                event.context.tags = vec!["newest-tag".to_string()];
+                event.context.relationships[0].governance.sensitivity = Sensitivity::Sensitive;
+                event.context.relationships[0]
+                    .governance
+                    .allowed_uses
+                    .recall = false;
+                event.context.relationships[0].governance.visibility = Visibility::LocalOnly;
+                event.context.relationships[0]
+                    .governance
+                    .allowed_uses
+                    .export = false;
+                event.context.relationships[0].governance.allowed_uses.sync = false;
+                event.event_id = derive_event_id(&event);
+                (event.event_id > retained_max).then_some(event)
+            })
+            .expect("bounded deterministic search finds an ID outside the retained lowest 64");
+        let newest_id = newest.event_id.clone();
+        let newest_time = newest.observed_at;
+        observations.push(newest);
+
+        let first = project(&observations, reference()).unwrap();
+        let draft = first
+            .pending_proposals
+            .iter()
+            .find(|item| item.proposal_event_id.is_none())
+            .unwrap();
+        assert_eq!(draft.support_count, 65);
+        assert_eq!(draft.evidence_event_ids.len(), 64);
+        assert!(!draft.evidence_event_ids.contains(&newest_id));
+        assert_eq!(draft.last_confirmed_at, newest_time);
+        assert_eq!(draft.goals, vec!["newest-goal"]);
+        assert_eq!(draft.tags, vec!["newest-tag"]);
+        assert_eq!(draft.governance.sensitivity, Sensitivity::Sensitive);
+        assert_eq!(draft.governance.visibility, Visibility::LocalOnly);
+        assert!(!draft.governance.allowed_uses.recall);
+        assert!(!draft.governance.allowed_uses.export);
+        assert!(!draft.governance.allowed_uses.sync);
+        let pending_timeline = first
+            .timeline
+            .iter()
+            .find(|entry| entry.item_id == draft.item_id && entry.state == TimelineState::Pending)
+            .unwrap();
+        assert_eq!(pending_timeline.source_event_id, newest_id);
+        assert_eq!(pending_timeline.effective_at, newest_time);
 
         observations.reverse();
         let second = project(&observations, reference()).unwrap();

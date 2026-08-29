@@ -113,7 +113,7 @@ fn event_reference_ids(event: &TwinEvent) -> Vec<EventId> {
 pub(super) fn effective_exposure(
     source_ids: impl IntoIterator<Item = EventId>,
     by_id: &BTreeMap<EventId, &TwinEvent>,
-    reference_time: DateTime<Utc>,
+    _reference_time: DateTime<Utc>,
     review: ReviewState,
     authority: AuthorityClass,
 ) -> (CausalStream, Governance) {
@@ -145,17 +145,11 @@ pub(super) fn effective_exposure(
             stream = CausalStream::LocalOnly;
         }
         fold_governance(&mut exposure, &event.governance);
+        // Relationship applicability controls current relationship state, not
+        // provenance. Privacy and allowed-use constraints remain immutable
+        // after a qualifier expires or is rejected/superseded.
         for relationship in &event.context.relationships {
-            if time_active(
-                relationship.valid_from,
-                relationship.valid_to,
-                reference_time,
-            ) && !matches!(
-                relationship.governance.review,
-                ReviewState::Rejected | ReviewState::Superseded
-            ) {
-                fold_governance(&mut exposure, &relationship.governance);
-            }
+            fold_governance(&mut exposure, &relationship.governance);
         }
         pending.extend(event_reference_ids(event));
     }
@@ -416,6 +410,42 @@ mod tests {
         Utc.with_ymd_and_hms(2026, 9, 1, 0, 0, 0).unwrap()
     }
 
+    #[derive(Debug, Clone, Copy)]
+    enum InapplicableRelationshipCase {
+        ExpiredLocalOnly,
+        RejectedRestricted,
+        SupersededSyncDisabled,
+        FutureSensitiveSyncDisabled,
+    }
+
+    fn apply_inapplicable_relationship_case(
+        event: &mut TwinEvent,
+        case: InapplicableRelationshipCase,
+    ) {
+        let relationship = &mut event.context.relationships[0];
+        relationship.governance.allowed_uses.recall = false;
+        relationship.governance.allowed_uses.export = false;
+        relationship.governance.allowed_uses.sync = false;
+        match case {
+            InapplicableRelationshipCase::ExpiredLocalOnly => {
+                relationship.valid_to = Some(reference() - chrono::Duration::seconds(1));
+                relationship.governance.visibility = Visibility::LocalOnly;
+            }
+            InapplicableRelationshipCase::RejectedRestricted => {
+                relationship.governance.review = ReviewState::Rejected;
+                relationship.governance.sensitivity = Sensitivity::Restricted;
+            }
+            InapplicableRelationshipCase::SupersededSyncDisabled => {
+                relationship.governance.review = ReviewState::Superseded;
+            }
+            InapplicableRelationshipCase::FutureSensitiveSyncDisabled => {
+                relationship.valid_from = Some(reference() + chrono::Duration::seconds(1));
+                relationship.governance.sensitivity = Sensitivity::Sensitive;
+            }
+        }
+        event.event_id = derive_event_id(event);
+    }
+
     #[test]
     fn proposal_entry_point_requires_three_exact_observations() {
         let two = vec![
@@ -537,6 +567,48 @@ mod tests {
         let result = build_proposal_drafts(&restricted, reference()).unwrap();
         assert_eq!(result.drafts.len(), 1);
         assert_eq!(result.drafts[0].relationship_variant.relationships.len(), 1);
+    }
+
+    #[test]
+    fn proposal_exposure_retains_every_relationship_qualifier_as_provenance() {
+        for case in [
+            InapplicableRelationshipCase::ExpiredLocalOnly,
+            InapplicableRelationshipCase::RejectedRestricted,
+            InapplicableRelationshipCase::SupersededSyncDisabled,
+            InapplicableRelationshipCase::FutureSensitiveSyncDisabled,
+        ] {
+            let mut events = ["device-a", "device-b", "device-c"]
+                .into_iter()
+                .map(|device| observation(device, ClaimPolarity::Affirmed, Some("manager")))
+                .collect::<Vec<_>>();
+            apply_inapplicable_relationship_case(&mut events[0], case);
+
+            let result = build_proposal_drafts(&events, reference()).unwrap();
+            let draft = &result.drafts[0];
+            assert_eq!(draft.support_count, 3, "case: {case:?}");
+            assert_eq!(
+                draft.relationship_variant.relationships,
+                vec![RelationshipKey {
+                    subject_id: EntityId::parse("owner").unwrap(),
+                    predicate: RelationshipPredicate::parse("works_with").unwrap(),
+                    object_id: EntityId::parse("manager").unwrap(),
+                    direction: RelationshipDirection::Directed,
+                }],
+                "case: {case:?}"
+            );
+            assert!(!draft.governance.allowed_uses.recall, "case: {case:?}");
+            assert!(!draft.governance.allowed_uses.export, "case: {case:?}");
+            assert!(!draft.governance.allowed_uses.sync, "case: {case:?}");
+            let expected_sensitivity = match case {
+                InapplicableRelationshipCase::RejectedRestricted => Sensitivity::Restricted,
+                InapplicableRelationshipCase::FutureSensitiveSyncDisabled => Sensitivity::Sensitive,
+                _ => Sensitivity::Standard,
+            };
+            assert_eq!(
+                draft.governance.sensitivity, expected_sensitivity,
+                "case: {case:?}"
+            );
+        }
     }
 
     #[test]
