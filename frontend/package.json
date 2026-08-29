@@ -25,6 +25,7 @@
     "twin-eval:models:setup": "node scripts/setup-twin-eval-models.cjs --execute",
     "version:bump": "node scripts/bump-version.cjs",
     "check:licenses": "node scripts/check-license-alignment.cjs",
+    "test:license-alignment": "node scripts/check-license-alignment.test.cjs",
     "release:verify": "node scripts/release-verify.cjs",
     "release:prepare": "node scripts/release-tag.cjs --prepare-only",
     "release:tag": "node scripts/release-tag.cjs",

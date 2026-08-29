@@ -40,6 +40,7 @@ function parseJson(relativePath) {
 
 const mplSha256 = '3f3d9e0024b1921b067d6f7f88deb4a60cbe7a78e76c64e3f1d7fc3b779b9d04'
 const apacheSha256 = 'cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30'
+const dcoSha256 = 'f7ac75b443f4ca16b503241344b41aeff9503b0c30bedc2b119551d83cb0fa90'
 
 const license = read('LICENSE')
 const mplLicense = read('LICENSES/MPL-2.0.txt')
@@ -54,6 +55,9 @@ const frontendPackage = parseJson('frontend/package.json')
 const frontendLock = parseJson('frontend/package-lock.json')
 const e2ePackage = parseJson('e2e/package.json')
 const e2eLock = parseJson('e2e/package-lock.json')
+const dcoBlock = normalized(contributing).match(
+  /```text\n(Developer Certificate of Origin\nVersion 1\.1[\s\S]*?)\n```/,
+)?.[1]
 
 check(sha256(license) === mplSha256, 'LICENSE must be the unmodified official MPL-2.0 text')
 check(sha256(mplLicense) === mplSha256, 'LICENSES/MPL-2.0.txt must be the unmodified official MPL-2.0 text')
@@ -67,7 +71,10 @@ check(e2eLock.packages?.['']?.license === 'MPL-2.0', 'e2e/package-lock.json root
 check(/^license = "MPL-2\.0"$/m.test(cargoToml), 'frontend/src-tauri/Cargo.toml must declare MPL-2.0')
 check(/\[\[package\]\]\r?\nname = "grafyn"\r?\nversion = "0\.3\.0"/m.test(cargoLock), 'frontend/src-tauri/Cargo.lock must contain the locked Grafyn package')
 
-check(contributing.includes('Developer\'s Certificate of Origin 1.1'), 'CONTRIBUTING.md must use DCO 1.1')
+check(
+  dcoBlock && sha256(dcoBlock) === dcoSha256,
+  'CONTRIBUTING.md must contain the complete unmodified official DCO 1.1 text',
+)
 check(contributing.includes('inbound equals outbound'), 'CONTRIBUTING.md must state inbound equals outbound')
 check(contributing.includes('Signed-off-by:'), 'CONTRIBUTING.md must explain DCO sign-off')
 check(!/contributor license agreement|\bCLA\b/i.test(contributing), 'CONTRIBUTING.md must not introduce a CLA')
