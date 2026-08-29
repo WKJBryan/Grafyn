@@ -1,11 +1,12 @@
 use super::topological_order;
 use crate::models::twin_event::{
-    ClaimAssertion, ClaimObject, ClaimPolarity, ClaimPredicate, EntityId, EventId, ReviewState,
-    Sensitivity, TwinEvent, TwinEventPayload,
+    AllowedUses, AuthorityClass, CausalStream, ClaimAssertion, ClaimObject, ClaimPolarity,
+    ClaimPredicate, EntityId, EventId, EvidenceType, Governance, ReviewState, Sensitivity,
+    TwinEvent, TwinEventPayload, Visibility,
 };
 use crate::models::twin_state::{
     ContradictionCluster, ProposalDraft, ProposalDraftSet, ProposalRule, RelationshipKey,
-    RelationshipVariant,
+    RelationshipVariant, MAX_STATE_LINKS,
 };
 use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
@@ -59,27 +60,120 @@ fn time_active(
         && to.is_none_or(|value| reference_time <= value)
 }
 
-fn relationship_variant(event: &TwinEvent, reference_time: DateTime<Utc>) -> RelationshipVariant {
+fn relationship_variant(event: &TwinEvent, _reference_time: DateTime<Utc>) -> RelationshipVariant {
     RelationshipVariant::new(
         event
             .context
             .relationships
             .iter()
-            .filter(|relationship| {
-                relationship.governance.sensitivity != Sensitivity::Restricted
-                    && !matches!(
-                        relationship.governance.review,
-                        ReviewState::Rejected | ReviewState::Superseded
-                    )
-                    && time_active(
-                        relationship.valid_from,
-                        relationship.valid_to,
-                        reference_time,
-                    )
-            })
             .map(RelationshipKey::from)
             .collect(),
     )
+}
+
+fn sensitivity_rank(value: &Sensitivity) -> u8 {
+    match value {
+        Sensitivity::Standard => 0,
+        Sensitivity::Sensitive => 1,
+        Sensitivity::Restricted => 2,
+    }
+}
+
+fn fold_governance(exposure: &mut Governance, governance: &Governance) {
+    if sensitivity_rank(&governance.sensitivity) > sensitivity_rank(&exposure.sensitivity) {
+        exposure.sensitivity = governance.sensitivity.clone();
+    }
+    if governance.visibility == Visibility::LocalOnly {
+        exposure.visibility = Visibility::LocalOnly;
+    }
+    exposure.allowed_uses.recall &= governance.allowed_uses.recall;
+    exposure.allowed_uses.twin_advisor &= governance.allowed_uses.twin_advisor;
+    exposure.allowed_uses.twin_simulation &= governance.allowed_uses.twin_simulation;
+    exposure.allowed_uses.export &= governance.allowed_uses.export;
+    exposure.allowed_uses.training &= governance.allowed_uses.training;
+    exposure.allowed_uses.sync &= governance.allowed_uses.sync;
+}
+
+fn event_reference_ids(event: &TwinEvent) -> Vec<EventId> {
+    event
+        .evidence
+        .iter()
+        .chain(
+            event
+                .context
+                .relationships
+                .iter()
+                .flat_map(|relationship| &relationship.evidence),
+        )
+        .filter(|evidence| evidence.evidence_type == EvidenceType::Event)
+        .filter_map(|evidence| EventId::parse(evidence.source_id.as_str()).ok())
+        .collect()
+}
+
+pub(super) fn effective_exposure(
+    source_ids: impl IntoIterator<Item = EventId>,
+    by_id: &BTreeMap<EventId, &TwinEvent>,
+    reference_time: DateTime<Utc>,
+    review: ReviewState,
+    authority: AuthorityClass,
+) -> (CausalStream, Governance) {
+    let mut exposure = Governance {
+        review,
+        authority,
+        sensitivity: Sensitivity::Standard,
+        visibility: Visibility::SyncedVault,
+        allowed_uses: AllowedUses {
+            recall: true,
+            twin_advisor: true,
+            twin_simulation: true,
+            export: true,
+            training: true,
+            sync: true,
+        },
+    };
+    let mut stream = CausalStream::SyncEligible;
+    let mut pending = source_ids.into_iter().collect::<Vec<_>>();
+    let mut visited = BTreeSet::new();
+    while let Some(id) = pending.pop() {
+        if !visited.insert(id.clone()) {
+            continue;
+        }
+        let Some(event) = by_id.get(&id).copied() else {
+            continue;
+        };
+        if event.causal_stream == CausalStream::LocalOnly {
+            stream = CausalStream::LocalOnly;
+        }
+        fold_governance(&mut exposure, &event.governance);
+        for relationship in &event.context.relationships {
+            if time_active(
+                relationship.valid_from,
+                relationship.valid_to,
+                reference_time,
+            ) && !matches!(
+                relationship.governance.review,
+                ReviewState::Rejected | ReviewState::Superseded
+            ) {
+                fold_governance(&mut exposure, &relationship.governance);
+            }
+        }
+        pending.extend(event_reference_ids(event));
+    }
+    if exposure.visibility == Visibility::LocalOnly || stream == CausalStream::LocalOnly {
+        stream = CausalStream::LocalOnly;
+        exposure.visibility = Visibility::LocalOnly;
+        exposure.allowed_uses.export = false;
+        exposure.allowed_uses.sync = false;
+    }
+    if exposure.sensitivity == Sensitivity::Restricted {
+        exposure.allowed_uses.export = false;
+        exposure.allowed_uses.sync = false;
+    }
+    (stream, exposure)
+}
+
+fn retain_lowest_ids(ids: &BTreeSet<EventId>) -> Vec<EventId> {
+    ids.iter().take(MAX_STATE_LINKS).cloned().collect()
 }
 
 fn write_framed(hasher: &mut Sha256, bytes: &[u8]) {
@@ -142,6 +236,10 @@ pub fn build_proposal_drafts(
         event.validate().map_err(ProposalError::InvalidEvent)?;
     }
     let applied = topological_order(&eligible).map_err(ProposalError::EventOrder)?;
+    let by_id = applied
+        .iter()
+        .map(|event| (event.event_id.clone(), event))
+        .collect::<BTreeMap<_, _>>();
     let superseded = applied
         .iter()
         .flat_map(|event| event.supersedes.iter().cloned())
@@ -204,7 +302,7 @@ pub fn build_proposal_drafts(
             if item_evidence.len() < 3 && !contradictory {
                 continue;
             }
-            let claim = base_claim(&base, polarity);
+            let claim = base_claim(&base, polarity.clone());
             let memory_id = derived_id(
                 "memory",
                 MEMORY_ID_DOMAIN,
@@ -219,6 +317,24 @@ pub fn build_proposal_drafts(
                 rules.push(ProposalRule::RepeatedExactClaim);
             }
             rules.sort();
+            let support_count = u16::try_from(item_evidence.len()).unwrap_or(u16::MAX);
+            let opposition_count = evidence
+                .get(&(
+                    base.clone(),
+                    match polarity {
+                        ClaimPolarity::Affirmed => ClaimPolarity::Denied,
+                        ClaimPolarity::Denied => ClaimPolarity::Affirmed,
+                    },
+                ))
+                .map(|ids| u16::try_from(ids.len()).unwrap_or(u16::MAX))
+                .unwrap_or(0);
+            let (causal_stream, governance) = effective_exposure(
+                item_evidence.iter().cloned(),
+                &by_id,
+                reference_time,
+                ReviewState::Pending,
+                AuthorityClass::EvidenceObservation,
+            );
             cluster_memory_ids.push(memory_id.clone());
             cluster_claims.push(claim.clone());
             cluster_evidence.extend(item_evidence.iter().cloned());
@@ -226,7 +342,11 @@ pub fn build_proposal_drafts(
                 memory_id,
                 claim,
                 relationship_variant: base.relationship_variant.clone(),
-                evidence_event_ids: item_evidence.into_iter().collect(),
+                causal_stream,
+                governance,
+                evidence_event_ids: retain_lowest_ids(&item_evidence),
+                support_count,
+                opposition_count,
                 rules,
             });
             if drafts.len() > crate::models::twin_state::MAX_PROJECTED_ITEMS {
@@ -247,7 +367,7 @@ pub fn build_proposal_drafts(
                 relationship_variant: base.relationship_variant,
                 memory_ids: cluster_memory_ids,
                 claims: cluster_claims,
-                evidence_event_ids: cluster_evidence.into_iter().collect(),
+                evidence_event_ids: retain_lowest_ids(&cluster_evidence),
             });
             if clusters.len() > crate::models::twin_state::MAX_PROJECTED_ITEMS {
                 return Err(ProposalError::TooManyDrafts);
@@ -380,7 +500,7 @@ mod tests {
     }
 
     #[test]
-    fn closed_relationship_validity_and_governance_are_applied_before_variant_identity() {
+    fn relationship_qualifiers_remain_part_of_identity_when_restricted_or_inactive() {
         let mut event = observation("device-a", ClaimPolarity::Affirmed, Some("manager"));
         event.context.relationships[0].valid_from = Some(reference());
         event.context.relationships[0].valid_to = Some(reference());
@@ -395,20 +515,102 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result.drafts[0].relationship_variant.relationships.len(), 1);
-        event.context.relationships[0].governance.sensitivity = Sensitivity::Restricted;
-        event.event_id = derive_event_id(&event);
-        let result = build_proposal_drafts(
-            &[
-                event,
-                observation("device-d", ClaimPolarity::Affirmed, None),
-                observation("device-e", ClaimPolarity::Affirmed, None),
-            ],
-            reference(),
-        )
-        .unwrap();
-        assert!(result.drafts[0]
-            .relationship_variant
-            .relationships
-            .is_empty());
+        let mut restricted = ["device-d", "device-e", "device-f"]
+            .into_iter()
+            .map(|device| observation(device, ClaimPolarity::Affirmed, Some("manager")))
+            .collect::<Vec<_>>();
+        for event in &mut restricted {
+            event.causal_stream = CausalStream::LocalOnly;
+            event.context.relationships[0].governance.sensitivity = Sensitivity::Restricted;
+            event.event_id = derive_event_id(event);
+        }
+        let result = build_proposal_drafts(&restricted, reference()).unwrap();
+        assert_eq!(result.drafts.len(), 1);
+        assert_eq!(result.drafts[0].relationship_variant.relationships.len(), 1);
+
+        for event in &mut restricted {
+            event.context.relationships[0].governance.sensitivity = Sensitivity::Standard;
+            event.context.relationships[0].valid_to =
+                Some(reference() - chrono::Duration::seconds(1));
+            event.event_id = derive_event_id(event);
+        }
+        let result = build_proposal_drafts(&restricted, reference()).unwrap();
+        assert_eq!(result.drafts.len(), 1);
+        assert_eq!(result.drafts[0].relationship_variant.relationships.len(), 1);
+    }
+
+    #[test]
+    fn draft_exposure_folds_every_support_and_local_relationship() {
+        let mut events = ["device-a", "device-b", "device-c"]
+            .into_iter()
+            .map(|device| observation(device, ClaimPolarity::Affirmed, Some("manager")))
+            .collect::<Vec<_>>();
+        events[0].causal_stream = CausalStream::LocalOnly;
+        events[0].context.relationships[0].governance.visibility = Visibility::LocalOnly;
+        events[0].context.relationships[0].governance.sensitivity = Sensitivity::Sensitive;
+        events[0].context.relationships[0]
+            .governance
+            .allowed_uses
+            .export = false;
+        events[0].context.relationships[0]
+            .governance
+            .allowed_uses
+            .sync = false;
+        events[0].event_id = derive_event_id(&events[0]);
+
+        let result = build_proposal_drafts(&events, reference()).unwrap();
+        let draft = &result.drafts[0];
+        assert_eq!(draft.causal_stream, CausalStream::LocalOnly);
+        assert_eq!(draft.governance.sensitivity, Sensitivity::Sensitive);
+        assert_eq!(draft.governance.visibility, Visibility::LocalOnly);
+        assert!(!draft.governance.allowed_uses.export);
+        assert!(!draft.governance.allowed_uses.sync);
+
+        for event in &mut events {
+            event.causal_stream = CausalStream::SyncEligible;
+            event.context.relationships[0].governance.visibility = Visibility::SyncedVault;
+            event.context.relationships[0].governance.sensitivity = Sensitivity::Sensitive;
+            event.context.relationships[0]
+                .governance
+                .allowed_uses
+                .export = true;
+            event.context.relationships[0].governance.allowed_uses.sync = true;
+            event.event_id = derive_event_id(event);
+        }
+        let result = build_proposal_drafts(&events, reference()).unwrap();
+        let draft = &result.drafts[0];
+        assert_eq!(draft.causal_stream, CausalStream::SyncEligible);
+        assert_eq!(draft.governance.sensitivity, Sensitivity::Sensitive);
+        assert_eq!(draft.governance.visibility, Visibility::SyncedVault);
+        assert!(draft.governance.allowed_uses.export);
+        assert!(draft.governance.allowed_uses.sync);
+    }
+
+    #[test]
+    fn retained_evidence_is_bounded_but_counts_and_ids_are_stable() {
+        let mut events = (0..100)
+            .map(|index| observation(&format!("device-{index:03}"), ClaimPolarity::Affirmed, None))
+            .collect::<Vec<_>>();
+        let expected = events
+            .iter()
+            .map(|event| event.event_id.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .take(crate::models::twin_state::MAX_STATE_LINKS)
+            .collect::<Vec<_>>();
+
+        let first = build_proposal_drafts(&events, reference()).unwrap();
+        let first_draft = &first.drafts[0];
+        assert_eq!(first_draft.support_count, 100);
+        assert_eq!(first_draft.opposition_count, 0);
+        assert_eq!(first_draft.evidence_event_ids, expected);
+
+        events.reverse();
+        let second = build_proposal_drafts(&events, reference()).unwrap();
+        assert_eq!(first_draft.memory_id, second.drafts[0].memory_id);
+        assert_eq!(
+            serde_json::to_vec(&first).unwrap(),
+            serde_json::to_vec(&second).unwrap()
+        );
     }
 }

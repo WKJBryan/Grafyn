@@ -139,12 +139,14 @@ impl TwinStore {
         let constitution_lines = self
             .list_constitution_items()?
             .into_iter()
+            .filter(|item| !self.artifact_has_only_legacy_auto_support(&item.linked_record_ids))
             .map(|item| serde_json::to_string(&item))
             .collect::<std::result::Result<Vec<_>, _>>()?;
         self.write_jsonl_file(&constitution_path, &constitution_lines)?;
         let action_gap_lines = self
             .list_action_gaps()?
             .into_iter()
+            .filter(|gap| !self.artifact_has_only_legacy_auto_support(&gap.linked_record_ids))
             .map(|gap| serde_json::to_string(&gap))
             .collect::<std::result::Result<Vec<_>, _>>()?;
         self.write_jsonl_file(&action_gaps_path, &action_gap_lines)?;
@@ -487,6 +489,84 @@ mod tests {
             assert!(!content.contains("legacy content must not export"));
         }
         assert_eq!(bundle.included_records, 0);
+    }
+
+    #[test]
+    fn materialized_legacy_artifacts_are_excluded_from_exports_and_benchmarks() {
+        let temp_dir = tempdir().expect("temp dir should be created");
+        let mut store = TwinStore::new(temp_dir.path().to_path_buf());
+        let now = Utc::now();
+        let legacy = UserRecord {
+            id: "legacy-artifact-record".to_string(),
+            kind: UserRecordKind::Preference,
+            content: "legacy artifact authority".to_string(),
+            evidence_refs: Vec::new(),
+            confidence: 1.0,
+            origin: RecordOrigin::Inferred,
+            promotion_state: PromotionState::AutoPromoted,
+            created_at: now,
+            updated_at: now,
+            valid_from: None,
+            valid_until: None,
+            links: Vec::new(),
+            metadata: HashMap::new(),
+        };
+        store
+            .write_pretty_json(
+                &store.records_path.join("legacy-artifact-record.json"),
+                &legacy,
+            )
+            .unwrap();
+        let item = store
+            .create_constitution_item(crate::models::twin::ConstitutionItemCreate {
+                claim: "legacy-only constitution export".to_string(),
+                dimension: "values".to_string(),
+                scope: Vec::new(),
+                priority: 1.0,
+                confidence: 1.0,
+                status: crate::models::twin::ConstitutionStatus::Active,
+                evidence_refs: Vec::new(),
+                tensions: Vec::new(),
+                linked_record_ids: vec![legacy.id.clone()],
+                source: None,
+            })
+            .unwrap();
+        let gap = store
+            .create_action_gap(crate::models::twin::ActionGapCreate {
+                stated_value: "Move quickly".to_string(),
+                revealed_behavior: "Waited".to_string(),
+                driver_hypothesis: None,
+                somatic_taste_signal: None,
+                decision_risk: "legacy-only action gap export".to_string(),
+                evidence_refs: Vec::new(),
+                linked_record_ids: vec![legacy.id],
+                confidence: 1.0,
+                status: crate::models::twin::ConstitutionStatus::Active,
+            })
+            .unwrap();
+        store
+            .record_reflection_card(crate::models::twin::ReflectionCardCreate {
+                decision_episode_id: "legacy-decision".to_string(),
+                session_id: "legacy-session".to_string(),
+                tile_id: "legacy-tile".to_string(),
+                model_id: "test-model".to_string(),
+                content: "Decision frame with cited legacy evidence".to_string(),
+                cited_note_ids: Vec::new(),
+                cited_user_record_ids: Vec::new(),
+                cited_constitution_item_ids: vec![item.id.clone()],
+                cited_action_gap_ids: vec![gap.id.clone()],
+                evidence_packet: None,
+            })
+            .unwrap();
+
+        let bundle = store.export_bundle(TwinExportRequest::default()).unwrap();
+        let constitution = std::fs::read_to_string(&bundle.constitution_items.path).unwrap();
+        let gaps = std::fs::read_to_string(&bundle.action_gaps.path).unwrap();
+        let benchmark = std::fs::read_to_string(&bundle.decision_mirror_benchmark.path).unwrap();
+        assert!(!constitution.contains(&item.id));
+        assert!(!gaps.contains(&gap.id));
+        assert!(!benchmark.contains(&item.id));
+        assert!(!benchmark.contains(&gap.id));
     }
 
     fn prediction_options() -> Vec<String> {

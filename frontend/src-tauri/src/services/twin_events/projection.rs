@@ -1,19 +1,21 @@
+use super::proposals::effective_exposure;
 use super::{build_proposal_drafts, topological_order, ATTENTION_PROFILE_VERSION};
 use crate::models::twin_event::{
-    AllowedUses, AuthorityClass, ClaimAssertion, EventId, EvidenceType, Governance, Identifier,
-    MemoryReviewDecision, ReviewState, Sensitivity, TwinEvent, TwinEventPayload, Visibility,
+    AuthorityClass, CausalStream, ClaimAssertion, EventId, EvidenceType, Governance, Identifier,
+    MemoryReviewDecision, ReviewState, Sensitivity, TwinEvent, TwinEventPayload,
 };
 use crate::models::twin_state::{
     ContradictionCluster, ProjectedItemKind, ProjectedStateItem, ProjectionSnapshot, ProposalDraft,
     RelationshipKey, RelationshipVariant, RelationshipVariantState, SnapshotId, StateModelError,
-    TemporalStateEntry, TimelineState, MAX_PROJECTED_ITEMS,
+    TemporalStateEntry, TimelineState, EXPECTED_PROJECTION_SCHEMA_VERSION,
+    EXPECTED_PROJECTION_VERSION, MAX_PROJECTED_ITEMS,
 };
 use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
-pub const PROJECTION_SCHEMA_VERSION: u16 = 1;
-pub const PROJECTION_VERSION: u16 = 1;
+pub const PROJECTION_SCHEMA_VERSION: u16 = EXPECTED_PROJECTION_SCHEMA_VERSION;
+pub const PROJECTION_VERSION: u16 = EXPECTED_PROJECTION_VERSION;
 const SNAPSHOT_ID_DOMAIN: &[u8] = b"grafyn.twin_projection.canonical_json.v1";
 
 #[derive(Debug)]
@@ -77,23 +79,12 @@ fn time_active(event: &TwinEvent, reference_time: DateTime<Utc>) -> bool {
         && event.valid_to.is_none_or(|to| reference_time <= to)
 }
 
-fn relationship_variant(event: &TwinEvent, reference_time: DateTime<Utc>) -> RelationshipVariant {
+fn relationship_variant(event: &TwinEvent, _reference_time: DateTime<Utc>) -> RelationshipVariant {
     RelationshipVariant::new(
         event
             .context
             .relationships
             .iter()
-            .filter(|relationship| {
-                relationship.governance.sensitivity != Sensitivity::Restricted
-                    && !matches!(
-                        relationship.governance.review,
-                        ReviewState::Rejected | ReviewState::Superseded
-                    )
-                    && relationship
-                        .valid_from
-                        .is_none_or(|from| reference_time >= from)
-                    && relationship.valid_to.is_none_or(|to| reference_time <= to)
-            })
             .map(RelationshipKey::from)
             .collect(),
     )
@@ -225,7 +216,8 @@ fn maximal_reviews<'a>(
         .filter(|candidate| {
             !reviews.iter().any(|other| {
                 candidate.event_id != other.event_id
-                    && is_ancestor(&candidate.event_id, other, by_id)
+                    && (is_ancestor(&candidate.event_id, other, by_id)
+                        || other.supersedes.contains(&candidate.event_id))
             })
         })
         .collect::<Vec<_>>();
@@ -233,20 +225,75 @@ fn maximal_reviews<'a>(
     result
 }
 
+type ReviewOutcome = (
+    u8,
+    ClaimAssertion,
+    CausalStream,
+    Governance,
+    Option<DateTime<Utc>>,
+    Option<DateTime<Utc>>,
+);
+
+fn review_outcome(
+    proposal_event: &TwinEvent,
+    review_event: &TwinEvent,
+    by_id: &BTreeMap<EventId, &TwinEvent>,
+    reference_time: DateTime<Utc>,
+) -> ReviewOutcome {
+    let TwinEventPayload::MemoryProposed(proposal) = &proposal_event.payload else {
+        unreachable!("review outcome requires proposal")
+    };
+    let TwinEventPayload::MemoryReviewed(review) = &review_event.payload else {
+        unreachable!("review outcome requires review")
+    };
+    let decision = match review.decision {
+        MemoryReviewDecision::Accept => 0,
+        MemoryReviewDecision::Reject => 1,
+        MemoryReviewDecision::Supersede => 2,
+    };
+    let (causal_stream, governance) = effective_exposure(
+        [
+            proposal_event.event_id.clone(),
+            review_event.event_id.clone(),
+        ],
+        by_id,
+        reference_time,
+        review_event.governance.review.clone(),
+        review_event.governance.authority.clone(),
+    );
+    let valid_to = match (proposal_event.valid_to, review_event.valid_to) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    };
+    (
+        decision,
+        review
+            .reviewed_claim
+            .clone()
+            .unwrap_or_else(|| proposal.claim.clone()),
+        causal_stream,
+        governance,
+        proposal_event.valid_from.max(review_event.valid_from),
+        valid_to,
+    )
+}
+
 fn review_state(event: &TwinEvent) -> Result<TimelineState, ProjectionError> {
     let TwinEventPayload::MemoryReviewed(review) = &event.payload else {
         unreachable!("review_state called with non-review")
     };
+    if !matches!(
+        event.governance.authority,
+        AuthorityClass::ReviewedMemory
+            | AuthorityClass::CanonicalUserRule
+            | AuthorityClass::DeterministicallyVerified { .. }
+    ) {
+        return Err(ProjectionError::InvalidReview(event.event_id.to_string()));
+    }
     match review.decision {
         MemoryReviewDecision::Accept => {
-            if event.governance.review != ReviewState::Accepted
-                || !matches!(
-                    event.governance.authority,
-                    AuthorityClass::ReviewedMemory
-                        | AuthorityClass::CanonicalUserRule
-                        | AuthorityClass::DeterministicallyVerified { .. }
-                )
-            {
+            if event.governance.review != ReviewState::Accepted {
                 return Err(ProjectionError::InvalidReview(event.event_id.to_string()));
             }
             Ok(TimelineState::Accepted)
@@ -266,41 +313,26 @@ fn review_state(event: &TwinEvent) -> Result<TimelineState, ProjectionError> {
     }
 }
 
-fn sensitivity_rank(value: &Sensitivity) -> u8 {
-    match value {
-        Sensitivity::Standard => 0,
-        Sensitivity::Sensitive => 1,
-        Sensitivity::Restricted => 2,
-    }
-}
-
-fn conservative_review_governance(proposal: &Governance, review: &Governance) -> Governance {
-    Governance {
-        review: review.review.clone(),
-        authority: review.authority.clone(),
-        sensitivity: if sensitivity_rank(&proposal.sensitivity)
-            >= sensitivity_rank(&review.sensitivity)
-        {
-            proposal.sensitivity.clone()
-        } else {
-            review.sensitivity.clone()
-        },
-        visibility: if proposal.visibility == Visibility::LocalOnly
-            || review.visibility == Visibility::LocalOnly
-        {
-            Visibility::LocalOnly
-        } else {
-            Visibility::SyncedVault
-        },
-        allowed_uses: AllowedUses {
-            recall: proposal.allowed_uses.recall && review.allowed_uses.recall,
-            twin_advisor: proposal.allowed_uses.twin_advisor && review.allowed_uses.twin_advisor,
-            twin_simulation: proposal.allowed_uses.twin_simulation
-                && review.allowed_uses.twin_simulation,
-            export: proposal.allowed_uses.export && review.allowed_uses.export,
-            training: proposal.allowed_uses.training && review.allowed_uses.training,
-            sync: proposal.allowed_uses.sync && review.allowed_uses.sync,
-        },
+fn validate_projection_governance(event: &TwinEvent) -> Result<(), ProjectionError> {
+    let valid = match &event.payload {
+        TwinEventPayload::ObservationRecorded(_) => {
+            event.governance.review == ReviewState::NotApplicable
+                && event.governance.authority == AuthorityClass::EvidenceObservation
+        }
+        TwinEventPayload::MemoryProposed(_) => {
+            event.governance.review == ReviewState::Pending
+                && event.governance.authority == AuthorityClass::EvidenceObservation
+        }
+        TwinEventPayload::MemoryReviewed(_) => {
+            review_state(event)?;
+            true
+        }
+        _ => true,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(ProjectionError::InvalidReview(event.event_id.to_string()))
     }
 }
 
@@ -370,16 +402,34 @@ fn observation_item(
     claim: &ClaimAssertion,
     claim_index: usize,
     events: &[TwinEvent],
+    by_id: &BTreeMap<EventId, &TwinEvent>,
     active_superseded: &BTreeSet<EventId>,
     reference_time: DateTime<Utc>,
 ) -> Result<ProjectedStateItem, ProjectionError> {
     let variant = relationship_variant(event, reference_time);
-    let (support_count, opposition_count, evidence_event_ids) =
+    let (support_count, opposition_count, mut evidence_event_ids) =
         matching_observation_counts(events, active_superseded, claim, &variant, reference_time);
+    evidence_event_ids.extend(event_evidence(event)?);
+    evidence_event_ids.sort();
+    evidence_event_ids.dedup();
+    let (causal_stream, governance) = effective_exposure(
+        std::iter::once(event.event_id.clone()).chain(evidence_event_ids.iter().cloned()),
+        by_id,
+        reference_time,
+        ReviewState::NotApplicable,
+        AuthorityClass::EvidenceObservation,
+    );
+    evidence_event_ids.truncate(crate::models::twin_state::MAX_STATE_LINKS);
     let summary = match &event.payload {
         TwinEventPayload::ObservationRecorded(value) => value.summary.clone(),
         _ => None,
     };
+    let mut superseded_by = active_superseders(events, &event.event_id, reference_time);
+    superseded_by.truncate(crate::models::twin_state::MAX_STATE_LINKS);
+    let mut goals = event.context.goals.clone();
+    goals.sort();
+    let mut tags = event.context.tags.clone();
+    tags.sort();
     Ok(ProjectedStateItem {
         item_id: Identifier::parse(format!("observation:{}:{claim_index}", event.event_id))
             .map_err(ProjectionError::InvalidIdentifier)?,
@@ -388,7 +438,8 @@ fn observation_item(
         summary,
         proposal_event_id: None,
         review_event_ids: Vec::new(),
-        governance: event.governance.clone(),
+        causal_stream,
+        governance,
         relationship_variant: variant,
         evidence_event_ids,
         support_count,
@@ -397,9 +448,9 @@ fn observation_item(
         last_confirmed_at: fallback_confirmation(event, reference_time),
         valid_from: event.valid_from,
         valid_to: event.valid_to,
-        superseded_by: active_superseders(events, &event.event_id, reference_time),
-        goals: event.context.goals.clone(),
-        tags: event.context.tags.clone(),
+        superseded_by,
+        goals,
+        tags,
     })
 }
 
@@ -420,34 +471,19 @@ fn pending_draft_item(
                 .ok_or_else(|| ProjectionError::DanglingReference(id.clone()))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let sensitivity = sources
-        .iter()
-        .map(|event| event.governance.sensitivity.clone())
-        .max_by_key(sensitivity_rank)
-        .unwrap_or(Sensitivity::Standard);
-    let visibility = if sources
-        .iter()
-        .any(|event| event.governance.visibility == Visibility::LocalOnly)
-    {
-        Visibility::LocalOnly
-    } else {
-        Visibility::SyncedVault
-    };
-    let sync_allowed = visibility == Visibility::SyncedVault
-        && sources
-            .iter()
-            .all(|event| event.governance.allowed_uses.sync);
     let goals = sources
         .iter()
         .flat_map(|event| event.context.goals.iter().cloned())
         .collect::<BTreeSet<_>>()
         .into_iter()
+        .take(crate::models::twin_state::MAX_STATE_LINKS)
         .collect();
     let tags = sources
         .iter()
         .flat_map(|event| event.context.tags.iter().cloned())
         .collect::<BTreeSet<_>>()
         .into_iter()
+        .take(crate::models::twin_state::MAX_STATE_LINKS)
         .collect();
     let (support_count, opposition_count, _) = matching_observation_counts(
         events,
@@ -469,25 +505,13 @@ fn pending_draft_item(
         summary: None,
         proposal_event_id: None,
         review_event_ids: Vec::new(),
-        governance: Governance {
-            review: ReviewState::Pending,
-            authority: AuthorityClass::EvidenceObservation,
-            sensitivity,
-            visibility,
-            allowed_uses: AllowedUses {
-                recall: false,
-                twin_advisor: false,
-                twin_simulation: false,
-                export: false,
-                training: false,
-                sync: sync_allowed,
-            },
-        },
+        causal_stream: draft.causal_stream,
+        governance: draft.governance.clone(),
         relationship_variant: draft.relationship_variant.clone(),
         evidence_event_ids: draft.evidence_event_ids.clone(),
-        support_count,
-        opposition_count,
-        prior_exact_support_count: support_count,
+        support_count: draft.support_count.max(support_count),
+        opposition_count: draft.opposition_count.max(opposition_count),
+        prior_exact_support_count: draft.support_count.max(support_count),
         last_confirmed_at,
         valid_from: None,
         valid_to: None,
@@ -607,6 +631,7 @@ pub fn project(
         .collect::<Vec<_>>();
     for event in &eligible {
         event.validate().map_err(ProjectionError::InvalidEvent)?;
+        validate_projection_governance(event)?;
     }
     let applied = topological_order(&eligible).map_err(ProjectionError::EventOrder)?;
     if applied.len() > MAX_PROJECTED_ITEMS {
@@ -674,6 +699,7 @@ pub fn project(
                     claim,
                     index,
                     &applied,
+                    &by_id,
                     &active_superseded,
                     reference_time,
                 )?;
@@ -726,21 +752,16 @@ pub fn project(
         let active_reviews = memory_reviews
             .iter()
             .copied()
-            .filter(|event| time_active(event, reference_time))
+            .filter(|event| {
+                time_active(event, reference_time) && !active_superseded.contains(&event.event_id)
+            })
             .collect::<Vec<_>>();
         let maximal = maximal_reviews(&active_reviews, &by_id);
-        let maximal_decisions = maximal
+        let maximal_outcomes = maximal
             .iter()
-            .filter_map(|event| match &event.payload {
-                TwinEventPayload::MemoryReviewed(value) => Some(match value.decision {
-                    MemoryReviewDecision::Accept => 0_u8,
-                    MemoryReviewDecision::Reject => 1,
-                    MemoryReviewDecision::Supersede => 2,
-                }),
-                _ => None,
-            })
+            .map(|event| review_outcome(proposal_event, event, &by_id, reference_time))
             .collect::<BTreeSet<_>>();
-        let conflict = maximal_decisions.len() > 1;
+        let conflict = maximal_outcomes.len() > 1;
         let selected_review = (!conflict).then(|| maximal.first().copied()).flatten();
         if conflict {
             timeline.push(TemporalStateEntry {
@@ -757,7 +778,7 @@ pub fn project(
             });
         }
 
-        let (claim, governance, accepted) = match selected_review {
+        let (claim, accepted) = match selected_review {
             Some(review_event) => {
                 let TwinEventPayload::MemoryReviewed(review) = &review_event.payload else {
                     unreachable!()
@@ -767,18 +788,10 @@ pub fn project(
                         .reviewed_claim
                         .clone()
                         .unwrap_or_else(|| proposal.claim.clone()),
-                    conservative_review_governance(
-                        &proposal_event.governance,
-                        &review_event.governance,
-                    ),
                     review.decision == MemoryReviewDecision::Accept,
                 )
             }
-            None => (
-                proposal.claim.clone(),
-                proposal_event.governance.clone(),
-                false,
-            ),
+            None => (proposal.claim.clone(), false),
         };
         let variant = relationship_variant(proposal_event, reference_time);
         let (support_count, opposition_count, observed_evidence) = matching_observation_counts(
@@ -792,19 +805,54 @@ pub fn project(
         evidence_event_ids.extend(observed_evidence);
         evidence_event_ids.sort();
         evidence_event_ids.dedup();
+        let exposure_ids = std::iter::once(proposal_event.event_id.clone())
+            .chain(
+                selected_review
+                    .into_iter()
+                    .map(|event| event.event_id.clone()),
+            )
+            .chain(evidence_event_ids.iter().cloned())
+            .collect::<Vec<_>>();
+        let (causal_stream, governance) = effective_exposure(
+            exposure_ids,
+            &by_id,
+            reference_time,
+            selected_review
+                .map(|event| event.governance.review.clone())
+                .unwrap_or(ReviewState::Pending),
+            selected_review
+                .map(|event| event.governance.authority.clone())
+                .unwrap_or(AuthorityClass::EvidenceObservation),
+        );
+        evidence_event_ids.truncate(crate::models::twin_state::MAX_STATE_LINKS);
         let mut confirmation = fallback_confirmation(proposal_event, reference_time);
         if accepted {
             confirmation = selected_review.expect("accepted review exists").observed_at;
         }
-        let review_ids = memory_reviews
+        let all_review_ids = memory_reviews
             .iter()
             .map(|event| event.event_id.clone())
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
+        let review_ids = all_review_ids
+            .iter()
+            .take(crate::models::twin_state::MAX_STATE_LINKS)
+            .cloned()
+            .collect::<Vec<_>>();
+        let reinforcement_targets = std::iter::once(proposal_event.event_id.clone())
+            .chain(
+                accepted
+                    .then_some(selected_review)
+                    .flatten()
+                    .map(|event| event.event_id.clone()),
+            )
+            .collect::<BTreeSet<_>>();
         for event in &applied {
-            if event.reinforces.contains(&proposal_event.event_id)
-                || review_ids.iter().any(|id| event.reinforces.contains(id))
+            if event
+                .reinforces
+                .iter()
+                .any(|id| reinforcement_targets.contains(id))
             {
                 if active_superseded.contains(&event.event_id)
                     || !time_active(event, reference_time)
@@ -820,11 +868,26 @@ pub fn project(
         }
         let mut superseded_by =
             active_superseders(&applied, &proposal_event.event_id, reference_time);
-        for review_id in &review_ids {
-            superseded_by.extend(active_superseders(&applied, review_id, reference_time));
+        for review_id in &all_review_ids {
+            superseded_by.extend(
+                active_superseders(&applied, review_id, reference_time)
+                    .into_iter()
+                    .filter(|superseder_id| {
+                        !matches!(
+                            &by_id[superseder_id].payload,
+                            TwinEventPayload::MemoryReviewed(review)
+                                if review.memory_id == memory_id
+                        )
+                    }),
+            );
         }
         superseded_by.sort();
         superseded_by.dedup();
+        superseded_by.truncate(crate::models::twin_state::MAX_STATE_LINKS);
+        let mut goals = proposal_event.context.goals.clone();
+        goals.sort();
+        let mut tags = proposal_event.context.tags.clone();
+        tags.sort();
         let item = ProjectedStateItem {
             item_id: memory_id.clone(),
             kind: if accepted {
@@ -836,6 +899,7 @@ pub fn project(
             summary: proposal.summary.clone(),
             proposal_event_id: Some(proposal_event.event_id.clone()),
             review_event_ids: review_ids,
+            causal_stream,
             governance,
             relationship_variant: variant,
             evidence_event_ids,
@@ -846,8 +910,8 @@ pub fn project(
             valid_from: proposal_event.valid_from,
             valid_to: proposal_event.valid_to,
             superseded_by: superseded_by.clone(),
-            goals: proposal_event.context.goals.clone(),
-            tags: proposal_event.context.tags.clone(),
+            goals,
+            tags,
         };
 
         let expired = !time_active(proposal_event, reference_time);
@@ -910,10 +974,13 @@ pub fn project(
     pending_proposals.sort_by(|left, right| left.item_id.cmp(&right.item_id));
     recent_observations.sort_by(|left, right| left.item_id.cmp(&right.item_id));
     timeline.sort_by(|left, right| {
-        event_order[&left.source_event_id]
-            .cmp(&event_order[&right.source_event_id])
+        left.source_event_id
+            .cmp(&right.source_event_id)
             .then_with(|| left.state.cmp(&right.state))
             .then_with(|| left.item_id.cmp(&right.item_id))
+            .then_with(|| left.effective_at.cmp(&right.effective_at))
+            .then_with(|| left.valid_from.cmp(&right.valid_from))
+            .then_with(|| left.valid_to.cmp(&right.valid_to))
     });
     let relationship_variants =
         group_variants(&reviewed_memories, &pending_proposals, &recent_observations);
@@ -922,7 +989,12 @@ pub fn project(
         projection_version: PROJECTION_VERSION,
         attention_profile_version: ATTENTION_PROFILE_VERSION,
         reference_time,
-        applied_event_ids: applied.iter().map(|event| event.event_id.clone()).collect(),
+        applied_event_ids: applied
+            .iter()
+            .map(|event| event.event_id.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect(),
         reviewed_memories,
         pending_proposals,
         relationship_variants,
@@ -1006,6 +1078,54 @@ mod tests {
     }
 
     #[test]
+    fn canonical_snapshot_rejects_rehashed_versions_and_noncanonical_vectors() {
+        let mut wrong_version = project(&[], reference()).unwrap();
+        wrong_version.projection_version += 1;
+        wrong_version.snapshot_id = derive_snapshot_id(&wrong_version).unwrap();
+        assert!(matches!(
+            canonical_snapshot_json(&wrong_version),
+            Err(ProjectionError::InvalidSnapshot(_))
+        ));
+
+        let observations = ["canonical-a", "canonical-b", "canonical-c"]
+            .into_iter()
+            .map(|device| valid_event_for_device(device, 1, Vec::new()))
+            .collect::<Vec<_>>();
+        let canonical = project(&observations, reference()).unwrap();
+
+        let mut unsorted = canonical.clone();
+        unsorted.applied_event_ids.reverse();
+        unsorted.snapshot_id = derive_snapshot_id(&unsorted).unwrap();
+        assert!(matches!(
+            canonical_snapshot_json(&unsorted),
+            Err(ProjectionError::InvalidSnapshot(_))
+        ));
+
+        let mut forged_exposure = canonical.clone();
+        forged_exposure.recent_observations[0].governance.visibility = Visibility::SyncedVault;
+        forged_exposure.recent_observations[0]
+            .governance
+            .allowed_uses
+            .sync = true;
+        forged_exposure.snapshot_id = derive_snapshot_id(&forged_exposure).unwrap();
+        assert!(matches!(
+            canonical_snapshot_json(&forged_exposure),
+            Err(ProjectionError::InvalidSnapshot(_))
+        ));
+
+        let mut nested_duplicate = canonical;
+        let duplicate = nested_duplicate.pending_proposals[0].evidence_event_ids[0].clone();
+        nested_duplicate.pending_proposals[0]
+            .evidence_event_ids
+            .push(duplicate);
+        nested_duplicate.snapshot_id = derive_snapshot_id(&nested_duplicate).unwrap();
+        assert!(matches!(
+            canonical_snapshot_json(&nested_duplicate),
+            Err(ProjectionError::InvalidSnapshot(_))
+        ));
+    }
+
+    #[test]
     fn explicit_accept_promotes_while_reject_remains_audit_only() {
         let proposed = proposal("proposal-device", "memory-one");
         let accepted = review(
@@ -1060,6 +1180,82 @@ mod tests {
     }
 
     #[test]
+    fn reviewed_memory_folds_referenced_event_exposure() {
+        let mut source = valid_event_for_device("source-device", 1, Vec::new());
+        source.payload = TwinEventPayload::DecisionRecorded(DecisionRecorded {
+            decision_id: Identifier::parse("source-decision").unwrap(),
+            decision: BoundedContent::parse("private source").unwrap(),
+            options: Vec::new(),
+            stakes: None,
+            initial_leaning: None,
+        });
+        source.event_type = TwinEventType::DecisionRecorded;
+        source.causal_stream = CausalStream::LocalOnly;
+        source.governance.sensitivity = Sensitivity::Restricted;
+        source.governance.visibility = Visibility::LocalOnly;
+        source.governance.allowed_uses.recall = false;
+        source.governance.allowed_uses.export = false;
+        source.governance.allowed_uses.sync = false;
+        source.event_id = derive_event_id(&source);
+
+        let mut relationship_source = source.clone();
+        relationship_source.device_id = DeviceId::parse("relationship-source-device").unwrap();
+        relationship_source.payload = TwinEventPayload::DecisionRecorded(DecisionRecorded {
+            decision_id: Identifier::parse("relationship-source-decision").unwrap(),
+            decision: BoundedContent::parse("relationship evidence source").unwrap(),
+            options: Vec::new(),
+            stakes: None,
+            initial_leaning: None,
+        });
+        relationship_source.governance.sensitivity = Sensitivity::Standard;
+        relationship_source.governance.allowed_uses.recall = true;
+        relationship_source.governance.allowed_uses.twin_advisor = false;
+        relationship_source.event_id = derive_event_id(&relationship_source);
+
+        let mut proposed = proposal("proposal-device", "memory-one");
+        proposed.evidence = vec![EvidenceRef {
+            evidence_type: EvidenceType::Event,
+            source_id: Identifier::parse(source.event_id.as_str()).unwrap(),
+            digest: None,
+        }];
+        proposed.context.relationships = vec![RelationshipAssertion {
+            subject_id: EntityId::parse("owner").unwrap(),
+            predicate: RelationshipPredicate::parse("works_with").unwrap(),
+            object_id: EntityId::parse("manager").unwrap(),
+            direction: RelationshipDirection::Directed,
+            valid_from: None,
+            valid_to: None,
+            evidence: vec![EvidenceRef {
+                evidence_type: EvidenceType::Event,
+                source_id: Identifier::parse(relationship_source.event_id.as_str()).unwrap(),
+                digest: None,
+            }],
+            governance: Governance::direct_observation(),
+        }];
+        proposed.event_id = derive_event_id(&proposed);
+        let accepted = review(
+            "review-device",
+            "memory-one",
+            MemoryReviewDecision::Accept,
+            vec![proposed.event_id.clone()],
+        );
+
+        let snapshot = project(
+            &[accepted, proposed, source, relationship_source],
+            reference(),
+        )
+        .unwrap();
+        let item = &snapshot.reviewed_memories[0];
+        assert_eq!(item.causal_stream, CausalStream::LocalOnly);
+        assert_eq!(item.governance.sensitivity, Sensitivity::Restricted);
+        assert_eq!(item.governance.visibility, Visibility::LocalOnly);
+        assert!(!item.governance.allowed_uses.recall);
+        assert!(!item.governance.allowed_uses.twin_advisor);
+        assert!(!item.governance.allowed_uses.export);
+        assert!(!item.governance.allowed_uses.sync);
+    }
+
+    #[test]
     fn review_decision_and_governance_state_must_agree() {
         let proposed = proposal("proposal-device", "memory-one");
         let mut accepted = review(
@@ -1074,6 +1270,79 @@ mod tests {
             project(&[proposed, accepted], reference()),
             Err(ProjectionError::InvalidReview(_))
         ));
+
+        let proposed = proposal("proposal-device", "memory-two");
+        let mut rejected = review(
+            "review-device",
+            "memory-two",
+            MemoryReviewDecision::Reject,
+            vec![proposed.event_id.clone()],
+        );
+        rejected.governance.authority = AuthorityClass::EvidenceObservation;
+        rejected.event_id = derive_event_id(&rejected);
+        assert!(matches!(
+            project(&[proposed, rejected], reference()),
+            Err(ProjectionError::InvalidReview(_))
+        ));
+    }
+
+    #[test]
+    fn observations_and_proposals_cannot_forge_reviewed_governance() {
+        let mut observation = valid_event_for_device("observation-device", 1, Vec::new());
+        observation.governance.review = ReviewState::Accepted;
+        observation.governance.authority = AuthorityClass::CanonicalUserRule;
+        observation.governance.allowed_uses.twin_simulation = true;
+        observation.event_id = derive_event_id(&observation);
+        assert!(matches!(
+            project(&[observation], reference()),
+            Err(ProjectionError::InvalidReview(_))
+        ));
+
+        let mut proposed = proposal("proposal-device", "forged-memory");
+        proposed.governance.review = ReviewState::Accepted;
+        proposed.governance.authority = AuthorityClass::DeterministicallyVerified {
+            method: VerificationMethod::HumanReview,
+        };
+        proposed.governance.allowed_uses.twin_simulation = true;
+        proposed.event_id = derive_event_id(&proposed);
+        assert!(matches!(
+            project(&[proposed], reference()),
+            Err(ProjectionError::InvalidReview(_))
+        ));
+    }
+
+    #[test]
+    fn event_projection_and_ranking_never_turn_pending_simulation_consent_into_authority() {
+        let mut proposed = proposal("proposal-device", "pending-simulation");
+        proposed.governance.allowed_uses.twin_simulation = true;
+        proposed.event_id = derive_event_id(&proposed);
+        let snapshot = project(&[proposed], reference()).unwrap();
+        let candidates = snapshot
+            .pending_proposals
+            .iter()
+            .cloned()
+            .map(|item| crate::models::twin_state::AttentionCandidate { item })
+            .collect::<Vec<_>>();
+        let trace = crate::services::twin_events::rank(
+            snapshot.snapshot_id,
+            &candidates,
+            crate::models::twin_state::AttentionProfile::Simulation,
+            &crate::models::twin_state::AttentionRequest {
+                query: "quiet work".to_string(),
+                relationship_variant: RelationshipVariant::global(),
+                goals: Vec::new(),
+                reference_time: reference(),
+                destination: crate::models::twin_state::SelectionDestination::Local,
+                limit: 10,
+            },
+        )
+        .unwrap();
+        assert!(trace.selected.is_empty());
+        assert_eq!(trace.excluded.len(), 1);
+        assert_eq!(
+            trace.excluded[0].reason,
+            crate::models::twin_state::ExclusionReasonCode::Review
+        );
     }
 
     #[test]
@@ -1157,6 +1426,163 @@ mod tests {
         );
         let snapshot = project(&[reject, resolved, proposed, accept], reference()).unwrap();
         assert_eq!(snapshot.reviewed_memories.len(), 1);
+    }
+
+    #[test]
+    fn accepted_review_that_supersedes_an_older_review_becomes_the_frontier() {
+        let proposed = proposal("proposal-device", "memory-one");
+        let first = review(
+            "review-one-device",
+            "memory-one",
+            MemoryReviewDecision::Accept,
+            vec![proposed.event_id.clone()],
+        );
+        let mut correction = review(
+            "review-two-device",
+            "memory-one",
+            MemoryReviewDecision::Accept,
+            vec![proposed.event_id.clone()],
+        );
+        let TwinEventPayload::MemoryReviewed(payload) = &mut correction.payload else {
+            unreachable!()
+        };
+        let mut corrected_claim = match &proposed.payload {
+            TwinEventPayload::MemoryProposed(payload) => payload.claim.clone(),
+            _ => unreachable!(),
+        };
+        corrected_claim.object = ClaimObject::parse("quiet collaborative work").unwrap();
+        payload.reviewed_claim = Some(corrected_claim.clone());
+        correction.supersedes = vec![first.event_id.clone()];
+        correction.observed_at = reference() - Duration::hours(1);
+        correction.event_id = derive_event_id(&correction);
+
+        let snapshot = project(&[first, correction.clone(), proposed], reference()).unwrap();
+        assert_eq!(snapshot.reviewed_memories.len(), 1);
+        assert_eq!(snapshot.reviewed_memories[0].claim, corrected_claim);
+        assert_eq!(
+            snapshot.reviewed_memories[0].last_confirmed_at,
+            correction.observed_at
+        );
+    }
+
+    #[test]
+    fn concurrent_accepts_compare_complete_effective_outcomes() {
+        let proposed = proposal("proposal-device", "memory-one");
+        let mut first = review(
+            "review-one-device",
+            "memory-one",
+            MemoryReviewDecision::Accept,
+            vec![proposed.event_id.clone()],
+        );
+        let mut second = review(
+            "review-two-device",
+            "memory-one",
+            MemoryReviewDecision::Accept,
+            vec![proposed.event_id.clone()],
+        );
+        let TwinEventPayload::MemoryReviewed(first_payload) = &mut first.payload else {
+            unreachable!()
+        };
+        let mut edited = match &proposed.payload {
+            TwinEventPayload::MemoryProposed(payload) => payload.claim.clone(),
+            _ => unreachable!(),
+        };
+        edited.object = ClaimObject::parse("quiet solo work").unwrap();
+        first_payload.reviewed_claim = Some(edited);
+        first.event_id = derive_event_id(&first);
+        second.governance.allowed_uses.export = false;
+        second.event_id = derive_event_id(&second);
+
+        let divergent = project(&[first, second, proposed.clone()], reference()).unwrap();
+        assert!(divergent.reviewed_memories.is_empty());
+        assert_eq!(divergent.pending_proposals.len(), 1);
+        assert!(divergent
+            .timeline
+            .iter()
+            .any(|entry| entry.state == TimelineState::PendingConflict));
+
+        let mut shared_proposal = proposal("shared-proposal-device", "shared-memory");
+        shared_proposal.causal_stream = CausalStream::SyncEligible;
+        shared_proposal.event_id = derive_event_id(&shared_proposal);
+        let mut standard = review(
+            "standard-review-device",
+            "shared-memory",
+            MemoryReviewDecision::Accept,
+            vec![shared_proposal.event_id.clone()],
+        );
+        standard.causal_stream = CausalStream::SyncEligible;
+        standard.event_id = derive_event_id(&standard);
+        let mut sensitive = review(
+            "sensitive-review-device",
+            "shared-memory",
+            MemoryReviewDecision::Accept,
+            vec![shared_proposal.event_id.clone()],
+        );
+        sensitive.causal_stream = CausalStream::SyncEligible;
+        sensitive.governance.sensitivity = Sensitivity::Sensitive;
+        sensitive.event_id = derive_event_id(&sensitive);
+        let governance_divergent =
+            project(&[sensitive, shared_proposal, standard], reference()).unwrap();
+        assert!(governance_divergent.reviewed_memories.is_empty());
+        assert!(governance_divergent
+            .timeline
+            .iter()
+            .any(|entry| entry.state == TimelineState::PendingConflict));
+
+        let identical_one = review(
+            "identical-one-device",
+            "memory-one",
+            MemoryReviewDecision::Accept,
+            vec![proposed.event_id.clone()],
+        );
+        let identical_two = review(
+            "identical-two-device",
+            "memory-one",
+            MemoryReviewDecision::Accept,
+            vec![proposed.event_id.clone()],
+        );
+        let identical = project(&[identical_two, proposed, identical_one], reference()).unwrap();
+        assert_eq!(identical.reviewed_memories.len(), 1);
+        assert!(!identical
+            .timeline
+            .iter()
+            .any(|entry| entry.state == TimelineState::PendingConflict));
+    }
+
+    #[test]
+    fn reinforcement_of_historical_review_does_not_refresh_current_memory() {
+        let proposed = proposal("proposal-device", "memory-one");
+        let first = review(
+            "review-one-device",
+            "memory-one",
+            MemoryReviewDecision::Accept,
+            vec![proposed.event_id.clone()],
+        );
+        let mut current = review(
+            "review-two-device",
+            "memory-one",
+            MemoryReviewDecision::Accept,
+            vec![proposed.event_id.clone()],
+        );
+        current.supersedes = vec![first.event_id.clone()];
+        current.observed_at = reference() - Duration::hours(2);
+        current.event_id = derive_event_id(&current);
+        let mut historical_reinforcement =
+            valid_event_for_device("reinforcement-device", 1, vec![first.event_id.clone()]);
+        historical_reinforcement.reinforces = vec![first.event_id.clone()];
+        historical_reinforcement.observed_at = reference() - Duration::hours(1);
+        historical_reinforcement.event_id = derive_event_id(&historical_reinforcement);
+
+        let snapshot = project(
+            &[proposed, first, current.clone(), historical_reinforcement],
+            reference(),
+        )
+        .unwrap();
+        assert_eq!(snapshot.reviewed_memories.len(), 1);
+        assert_eq!(
+            snapshot.reviewed_memories[0].last_confirmed_at,
+            current.observed_at
+        );
     }
 
     #[test]
@@ -1249,6 +1675,23 @@ mod tests {
     }
 
     #[test]
+    fn projected_observation_folds_local_lane_before_selection() {
+        let mut observation = valid_event_for_device("observation-device", 1, Vec::new());
+        observation.causal_stream = CausalStream::LocalOnly;
+        observation.governance.visibility = Visibility::SyncedVault;
+        observation.governance.allowed_uses.export = true;
+        observation.governance.allowed_uses.sync = true;
+        observation.event_id = derive_event_id(&observation);
+
+        let snapshot = project(&[observation], reference()).unwrap();
+        let item = &snapshot.recent_observations[0];
+        assert_eq!(item.causal_stream, CausalStream::LocalOnly);
+        assert_eq!(item.governance.visibility, Visibility::LocalOnly);
+        assert!(!item.governance.allowed_uses.export);
+        assert!(!item.governance.allowed_uses.sync);
+    }
+
+    #[test]
     fn relationship_variant_state_lists_every_recent_observation_event() {
         let observations = ["observation-a", "observation-b", "observation-c"]
             .into_iter()
@@ -1267,6 +1710,42 @@ mod tests {
         assert_eq!(
             snapshot.relationship_variants[0].observation_event_ids,
             expected
+        );
+    }
+
+    #[test]
+    fn projection_retains_lowest_64_evidence_ids_but_complete_counts_and_timeline() {
+        let mut observations = (0..65)
+            .map(|index| valid_event_for_device(&format!("observation-{index:03}"), 1, Vec::new()))
+            .collect::<Vec<_>>();
+        let expected = observations
+            .iter()
+            .map(|event| event.event_id.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .take(crate::models::twin_state::MAX_STATE_LINKS)
+            .collect::<Vec<_>>();
+
+        let first = project(&observations, reference()).unwrap();
+        let draft = first
+            .pending_proposals
+            .iter()
+            .find(|item| item.proposal_event_id.is_none())
+            .unwrap();
+        assert_eq!(draft.support_count, 65);
+        assert_eq!(draft.evidence_event_ids, expected);
+        assert_eq!(first.recent_observations.len(), 65);
+        assert!(first
+            .recent_observations
+            .iter()
+            .all(|item| item.support_count == 65 && item.evidence_event_ids.len() == 64));
+        assert_eq!(first.timeline.len(), 66);
+
+        observations.reverse();
+        let second = project(&observations, reference()).unwrap();
+        assert_eq!(
+            canonical_snapshot_json(&first).unwrap(),
+            canonical_snapshot_json(&second).unwrap()
         );
     }
 

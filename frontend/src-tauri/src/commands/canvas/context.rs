@@ -1810,6 +1810,79 @@ mod tests {
     }
 
     #[test]
+    fn materialized_legacy_artifacts_cannot_enter_canvas_twin_context() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let records_path = temp_dir.path().join("records");
+        std::fs::create_dir_all(&records_path).unwrap();
+        let now = Utc::now();
+        let legacy = crate::models::twin::UserRecord {
+            id: "legacy-canvas-record".to_string(),
+            kind: crate::models::twin::UserRecordKind::Preference,
+            content: "legacy Canvas authority".to_string(),
+            evidence_refs: Vec::new(),
+            confidence: 1.0,
+            origin: crate::models::twin::RecordOrigin::Inferred,
+            promotion_state: crate::models::twin::PromotionState::AutoPromoted,
+            created_at: now,
+            updated_at: now,
+            valid_from: None,
+            valid_until: None,
+            links: Vec::new(),
+            metadata: std::collections::HashMap::new(),
+        };
+        crate::services::atomic_io::write_atomic(
+            &records_path.join("legacy-canvas-record.json"),
+            serde_json::to_vec_pretty(&legacy).unwrap().as_slice(),
+        )
+        .unwrap();
+        let store = crate::services::twin::TwinStore::new(temp_dir.path().to_path_buf());
+        store
+            .create_constitution_item(crate::models::twin::ConstitutionItemCreate {
+                claim: "LEGACY_CONSTITUTION_MUST_NOT_ENTER_CANVAS".to_string(),
+                dimension: "values".to_string(),
+                scope: Vec::new(),
+                priority: 1.0,
+                confidence: 1.0,
+                status: crate::models::twin::ConstitutionStatus::Active,
+                evidence_refs: Vec::new(),
+                tensions: Vec::new(),
+                linked_record_ids: vec![legacy.id.clone()],
+                source: None,
+            })
+            .unwrap();
+        store
+            .create_action_gap(crate::models::twin::ActionGapCreate {
+                stated_value: "Move quickly".to_string(),
+                revealed_behavior: "Waited".to_string(),
+                driver_hypothesis: None,
+                somatic_taste_signal: None,
+                decision_risk: "LEGACY_GAP_MUST_NOT_ENTER_CANVAS".to_string(),
+                evidence_refs: Vec::new(),
+                linked_record_ids: vec![legacy.id],
+                confidence: 1.0,
+                status: crate::models::twin::ConstitutionStatus::Active,
+            })
+            .unwrap();
+        let (constitution, gaps) = store
+            .select_constitution_context("LEGACY CONSTITUTION GAP CANVAS")
+            .unwrap();
+        let prompt = build_twin_context_prompt(
+            &ConstitutionSetup::default(),
+            &[],
+            &[],
+            &[],
+            &[],
+            &constitution,
+            &gaps,
+            &TwinAnswerMode::Advisor,
+            &PromptType::Standard,
+            None,
+        );
+        assert!(!prompt.contains("LEGACY_CONSTITUTION_MUST_NOT_ENTER_CANVAS"));
+        assert!(!prompt.contains("LEGACY_GAP_MUST_NOT_ENTER_CANVAS"));
+    }
+
+    #[test]
     fn twin_context_prompt_labels_simulation_mode() {
         let setup = test_twin_identity_setup();
         let prompt = build_twin_context_prompt(

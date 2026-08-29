@@ -478,6 +478,25 @@ fn looks_implementation_detailed(text: &str) -> bool {
 }
 
 impl TwinStore {
+    /// Read-time compatibility overlay for artifacts materialized from the
+    /// retired AutoPromoted state. Raw records and artifacts remain unchanged.
+    pub(super) fn artifact_has_only_legacy_auto_support(&self, record_ids: &[String]) -> bool {
+        let mut saw_legacy_auto = false;
+        for id in record_ids {
+            let record = self.record_cache.get(id).cloned().or_else(|| {
+                Self::validate_file_id(id)
+                    .ok()
+                    .and_then(|_| self.read_record_file(&self.record_file_path(id)).ok())
+            });
+            match record.map(|record| record.promotion_state) {
+                Some(PromotionState::Endorsed) => return false,
+                Some(PromotionState::AutoPromoted) => saw_legacy_auto = true,
+                _ => {}
+            }
+        }
+        saw_legacy_auto
+    }
+
     pub fn list_user_records(&mut self) -> Result<Vec<UserRecord>> {
         self.ensure_record_cache()?;
         let mut records: Vec<UserRecord> = self.record_cache.values().cloned().collect();

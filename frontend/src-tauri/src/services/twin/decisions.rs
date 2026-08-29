@@ -841,9 +841,67 @@ impl TwinStore {
         self.write_decision_file(&episode)
     }
 
+    fn constitution_citation_is_supported(&self, id: &str) -> bool {
+        Self::validate_file_id(id).is_ok()
+            && self
+                .read_constitution_file(&self.constitution_file_path(id))
+                .ok()
+                .is_some_and(|item| {
+                    !self.artifact_has_only_legacy_auto_support(&item.linked_record_ids)
+                })
+    }
+
+    fn action_gap_citation_is_supported(&self, id: &str) -> bool {
+        Self::validate_file_id(id).is_ok()
+            && self
+                .read_action_gap_file(&self.action_gap_file_path(id))
+                .ok()
+                .is_some_and(|gap| {
+                    !self.artifact_has_only_legacy_auto_support(&gap.linked_record_ids)
+                })
+    }
+
+    fn filter_artifact_citations(
+        &self,
+        constitution_ids: &mut Vec<String>,
+        action_gap_ids: &mut Vec<String>,
+        packet: &mut DecisionEvidencePacket,
+    ) {
+        constitution_ids.retain(|id| self.constitution_citation_is_supported(id));
+        action_gap_ids.retain(|id| self.action_gap_citation_is_supported(id));
+        packet
+            .selected_sources
+            .retain(|source| match source.source_type.as_str() {
+                "constitution_item" => self.constitution_citation_is_supported(&source.id),
+                "action_gap" => self.action_gap_citation_is_supported(&source.id),
+                _ => true,
+            });
+    }
+
+    fn overlay_legacy_artifacts_on_reflection(&self, card: &mut ReflectionCard) {
+        self.filter_artifact_citations(
+            &mut card.cited_constitution_item_ids,
+            &mut card.cited_action_gap_ids,
+            &mut card.evidence_packet,
+        );
+        let config = card
+            .evidence_packet
+            .config_snapshot
+            .clone()
+            .unwrap_or_default();
+        card.scores = score_reflection_card(
+            &card.content,
+            &card.cited_note_ids,
+            &card.cited_user_record_ids,
+            &card.cited_constitution_item_ids,
+            &card.cited_action_gap_ids,
+            &config,
+        );
+    }
+
     pub fn record_reflection_card(
         &mut self,
-        create: ReflectionCardCreate,
+        mut create: ReflectionCardCreate,
     ) -> Result<ReflectionCard> {
         Self::validate_file_id(&create.decision_episode_id)?;
         Self::validate_file_id(&create.session_id)?;
@@ -863,6 +921,11 @@ impl TwinStore {
         if evidence_packet.config_snapshot.is_none() {
             evidence_packet.config_snapshot = Some(config.clone());
         }
+        self.filter_artifact_citations(
+            &mut create.cited_constitution_item_ids,
+            &mut create.cited_action_gap_ids,
+            &mut evidence_packet,
+        );
         let scores = score_reflection_card(
             &create.content,
             &create.cited_note_ids,
@@ -960,30 +1023,32 @@ impl TwinStore {
         }
 
         for id in cited_constitution_item_ids {
-            let label = self
-                .read_constitution_file(&self.constitution_file_path(id))
-                .ok()
-                .map(|item| excerpt(&item.claim))
-                .unwrap_or_else(|| format!("Constitution {}", id));
+            let Ok(item) = self.read_constitution_file(&self.constitution_file_path(id)) else {
+                continue;
+            };
+            if self.artifact_has_only_legacy_auto_support(&item.linked_record_ids) {
+                continue;
+            }
             selected_sources.push(DecisionEvidenceSource {
                 source_type: "constitution_item".to_string(),
                 id: id.clone(),
-                label,
+                label: excerpt(&item.claim),
                 weight: weights.constitution_weight,
                 reason: "Higher-order constitution item selected for decision framing".to_string(),
             });
         }
 
         for id in cited_action_gap_ids {
-            let label = self
-                .read_action_gap_file(&self.action_gap_file_path(id))
-                .ok()
-                .map(|gap| excerpt(&gap.decision_risk))
-                .unwrap_or_else(|| format!("Action Gap {}", id));
+            let Ok(gap) = self.read_action_gap_file(&self.action_gap_file_path(id)) else {
+                continue;
+            };
+            if self.artifact_has_only_legacy_auto_support(&gap.linked_record_ids) {
+                continue;
+            }
             selected_sources.push(DecisionEvidenceSource {
                 source_type: "action_gap".to_string(),
                 id: id.clone(),
-                label,
+                label: excerpt(&gap.decision_risk),
                 weight: weights.action_gaps_weight,
                 reason: "Action gap selected as decision risk context".to_string(),
             });
@@ -1122,7 +1187,10 @@ impl TwinStore {
         {
             let path = entry.path();
             if path.extension().is_some_and(|ext| ext == "json") {
-                if let Some(card) = load_or_quarantine::<ReflectionCard>(path, "reflection card") {
+                if let Some(mut card) =
+                    load_or_quarantine::<ReflectionCard>(path, "reflection card")
+                {
+                    self.overlay_legacy_artifacts_on_reflection(&mut card);
                     cards.push(card);
                 }
             }
@@ -1142,7 +1210,7 @@ impl TwinStore {
             .filter_map(|entry| entry.ok())
         {
             let path = entry.path();
-            if !path.extension().is_some_and(|ext| ext == "json") {
+            if path.extension().is_none_or(|ext| ext != "json") {
                 continue;
             }
             let Some(trace) = load_or_quarantine::<SessionTrace>(path, "trace") else {
@@ -1239,6 +1307,72 @@ mod tests {
                 &["legacy-auto".to_string()],
                 &[],
                 &[],
+                &DecisionMirrorConfig::default(),
+            )
+            .unwrap();
+        assert!(packet.selected_sources.is_empty());
+    }
+
+    #[test]
+    fn materialized_legacy_artifacts_are_not_decision_evidence() {
+        let temp_dir = tempdir().expect("temp dir should be created");
+        let mut store = TwinStore::new(temp_dir.path().to_path_buf());
+        let now = Utc::now();
+        let legacy = crate::models::twin::UserRecord {
+            id: "legacy-artifact-record".to_string(),
+            kind: crate::models::twin::UserRecordKind::Preference,
+            content: "legacy artifact authority".to_string(),
+            evidence_refs: Vec::new(),
+            confidence: 1.0,
+            origin: crate::models::twin::RecordOrigin::Inferred,
+            promotion_state: PromotionState::AutoPromoted,
+            created_at: now,
+            updated_at: now,
+            valid_from: None,
+            valid_until: None,
+            links: Vec::new(),
+            metadata: HashMap::new(),
+        };
+        store
+            .write_pretty_json(
+                &store.records_path.join("legacy-artifact-record.json"),
+                &legacy,
+            )
+            .unwrap();
+        let item = store
+            .create_constitution_item(crate::models::twin::ConstitutionItemCreate {
+                claim: "legacy-only constitution evidence".to_string(),
+                dimension: "values".to_string(),
+                scope: Vec::new(),
+                priority: 1.0,
+                confidence: 1.0,
+                status: ConstitutionStatus::Active,
+                evidence_refs: Vec::new(),
+                tensions: Vec::new(),
+                linked_record_ids: vec![legacy.id.clone()],
+                source: None,
+            })
+            .unwrap();
+        let gap = store
+            .create_action_gap(crate::models::twin::ActionGapCreate {
+                stated_value: "Move quickly".to_string(),
+                revealed_behavior: "Waited".to_string(),
+                driver_hypothesis: None,
+                somatic_taste_signal: None,
+                decision_risk: "legacy-only gap evidence".to_string(),
+                evidence_refs: Vec::new(),
+                linked_record_ids: vec![legacy.id],
+                confidence: 1.0,
+                status: ConstitutionStatus::Active,
+            })
+            .unwrap();
+
+        let packet = store
+            .build_decision_evidence_packet(
+                &[],
+                &[],
+                &[item.id],
+                &[gap.id],
                 &DecisionMirrorConfig::default(),
             )
             .unwrap();

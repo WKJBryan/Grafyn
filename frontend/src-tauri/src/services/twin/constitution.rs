@@ -541,7 +541,7 @@ fn constitution_item_is_vault_derived(item: &ConstitutionItem) -> bool {
 }
 
 fn record_is_vault_derived(record: &UserRecord) -> bool {
-    record.metadata.get("source_note_id").is_some()
+    record.metadata.contains_key("source_note_id")
         || matches!(
             record.metadata.get("source_type").and_then(Value::as_str),
             Some("interview_answer") | Some("note")
@@ -616,9 +616,17 @@ impl TwinStore {
         {
             let path = entry.path();
             if path.extension().is_some_and(|ext| ext == "json") {
-                if let Some(item) =
+                if let Some(mut item) =
                     load_or_quarantine::<ConstitutionItem>(path, "constitution item")
                 {
+                    if self.artifact_has_only_legacy_auto_support(&item.linked_record_ids)
+                        && matches!(
+                            item.status,
+                            ConstitutionStatus::Active | ConstitutionStatus::Softened
+                        )
+                    {
+                        item.status = ConstitutionStatus::Candidate;
+                    }
                     items.push(item);
                 }
             }
@@ -731,7 +739,15 @@ impl TwinStore {
         {
             let path = entry.path();
             if path.extension().is_some_and(|ext| ext == "json") {
-                if let Some(gap) = load_or_quarantine::<ActionGap>(path, "action gap") {
+                if let Some(mut gap) = load_or_quarantine::<ActionGap>(path, "action gap") {
+                    if self.artifact_has_only_legacy_auto_support(&gap.linked_record_ids)
+                        && matches!(
+                            gap.status,
+                            ConstitutionStatus::Active | ConstitutionStatus::Softened
+                        )
+                    {
+                        gap.status = ConstitutionStatus::Candidate;
+                    }
                     gaps.push(gap);
                 }
             }
@@ -1200,7 +1216,7 @@ impl TwinStore {
         let stale_items = self
             .list_constitution_items()?
             .into_iter()
-            .filter(|item| constitution_item_is_vault_derived(item))
+            .filter(constitution_item_is_vault_derived)
             .filter(|item| {
                 item.evidence_refs
                     .iter()
@@ -1256,6 +1272,7 @@ impl TwinStore {
         let mut items = self
             .list_constitution_items()?
             .into_iter()
+            .filter(|item| !self.artifact_has_only_legacy_auto_support(&item.linked_record_ids))
             .filter(|item| constitution_context_allowed(&item.status))
             .map(|item| (constitution_item_relevance(&item, &query_terms), item))
             .filter(|(score, item)| *score > 0 || item.status == ConstitutionStatus::Active)
@@ -1273,6 +1290,7 @@ impl TwinStore {
         let mut gaps = self
             .list_action_gaps()?
             .into_iter()
+            .filter(|gap| !self.artifact_has_only_legacy_auto_support(&gap.linked_record_ids))
             .filter(|gap| constitution_context_allowed(&gap.status))
             .map(|gap| (action_gap_relevance(&gap, &query_terms), gap))
             .filter(|(score, gap)| *score > 0 || gap.status == ConstitutionStatus::Active)
@@ -1403,6 +1421,135 @@ mod tests {
             constitution_status_from_record(&record),
             ConstitutionStatus::Candidate
         );
+    }
+
+    #[test]
+    fn materialized_legacy_artifacts_are_overlaid_without_rewriting_disk() {
+        let temp_dir = tempdir().expect("temp dir should be created");
+        let store = TwinStore::new(temp_dir.path().to_path_buf());
+        let now = Utc::now();
+        let legacy = UserRecord {
+            id: "legacy-auto".to_string(),
+            kind: UserRecordKind::Preference,
+            content: "legacy constitutional authority".to_string(),
+            evidence_refs: Vec::new(),
+            confidence: 1.0,
+            origin: RecordOrigin::Inferred,
+            promotion_state: PromotionState::AutoPromoted,
+            created_at: now,
+            updated_at: now,
+            valid_from: None,
+            valid_until: None,
+            links: Vec::new(),
+            metadata: HashMap::new(),
+        };
+        store
+            .write_pretty_json(&store.records_path.join("legacy-auto.json"), &legacy)
+            .unwrap();
+        let item = store
+            .create_constitution_item(ConstitutionItemCreate {
+                claim: "Legacy-only active constitution".to_string(),
+                dimension: "values".to_string(),
+                scope: Vec::new(),
+                priority: 1.0,
+                confidence: 1.0,
+                status: ConstitutionStatus::Active,
+                evidence_refs: Vec::new(),
+                tensions: Vec::new(),
+                linked_record_ids: vec![legacy.id.clone()],
+                source: Some("legacy_materialized".to_string()),
+            })
+            .unwrap();
+        let gap = store
+            .create_action_gap(ActionGapCreate {
+                stated_value: "Act quickly".to_string(),
+                revealed_behavior: "Waited".to_string(),
+                driver_hypothesis: None,
+                somatic_taste_signal: None,
+                decision_risk: "Legacy-only action gap".to_string(),
+                evidence_refs: Vec::new(),
+                linked_record_ids: vec![legacy.id.clone()],
+                confidence: 1.0,
+                status: ConstitutionStatus::Active,
+            })
+            .unwrap();
+
+        let listed_item = store
+            .list_constitution_items()
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.id == item.id)
+            .unwrap();
+        let listed_gap = store
+            .list_action_gaps()
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.id == gap.id)
+            .unwrap();
+        assert_eq!(listed_item.status, ConstitutionStatus::Candidate);
+        assert_eq!(listed_gap.status, ConstitutionStatus::Candidate);
+        let (selected_items, selected_gaps) = store
+            .select_constitution_context("Legacy-only active constitution action gap")
+            .unwrap();
+        assert!(selected_items
+            .iter()
+            .all(|candidate| candidate.id != item.id));
+        assert!(selected_gaps.iter().all(|candidate| candidate.id != gap.id));
+
+        assert_eq!(
+            store
+                .read_constitution_file(&store.constitution_file_path(&item.id))
+                .unwrap()
+                .status,
+            ConstitutionStatus::Active
+        );
+        assert_eq!(
+            store
+                .read_action_gap_file(&store.action_gap_file_path(&gap.id))
+                .unwrap()
+                .status,
+            ConstitutionStatus::Active
+        );
+
+        let endorsed = UserRecord {
+            id: "endorsed-record".to_string(),
+            promotion_state: PromotionState::Endorsed,
+            content: "independent approved support".to_string(),
+            ..legacy.clone()
+        };
+        store
+            .write_pretty_json(&store.records_path.join("endorsed-record.json"), &endorsed)
+            .unwrap();
+        let preserved = store
+            .create_constitution_item(ConstitutionItemCreate {
+                claim: "Approved independent constitution".to_string(),
+                dimension: "values".to_string(),
+                scope: Vec::new(),
+                priority: 1.0,
+                confidence: 1.0,
+                status: ConstitutionStatus::Active,
+                evidence_refs: Vec::new(),
+                tensions: Vec::new(),
+                linked_record_ids: vec![legacy.id, endorsed.id],
+                source: None,
+            })
+            .unwrap();
+        assert_eq!(
+            store
+                .list_constitution_items()
+                .unwrap()
+                .into_iter()
+                .find(|candidate| candidate.id == preserved.id)
+                .unwrap()
+                .status,
+            ConstitutionStatus::Active
+        );
+        assert!(store
+            .select_constitution_context("Approved independent constitution")
+            .unwrap()
+            .0
+            .iter()
+            .any(|candidate| candidate.id == preserved.id));
     }
 
     fn test_note(id: &str, title: &str, content: &str, source_type: Option<&str>) -> Note {

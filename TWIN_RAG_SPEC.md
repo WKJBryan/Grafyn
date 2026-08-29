@@ -25,11 +25,15 @@ The append-only Twin event spine now has a pure deterministic read-model layer:
 - exact repeated observations create pending proposal drafts after three supports;
 - exact affirm/deny observations create two pending drafts and an unresolved contradiction cluster;
 - global, single-relationship, and composite-relationship variants remain distinct;
+- relationship identity retains restrictive or inactive qualifiers, while effective exposure intersects the causal lane plus event, active relationship, support, and event-evidence governance; any local source keeps the result local and unsyncable;
 - only an explicit accepted `MemoryReviewed` event creates reviewed memory;
-- concurrent contradictory reviews remain pending until a causally later review resolves them;
+- the current review frontier removes superseded reviews and compares complete effective outcomes, so divergent concurrent edits/governance remain pending while identical outcomes converge;
 - validity, expiry, reinforcement, and supersession are evaluated at an explicit reference time;
-- projection snapshots use sorted vectors, integer values, and a content-derived v1 snapshot ID;
+- complete support/opposition totals are retained while item/draft evidence lists keep the stable lowest 64 event IDs;
+- projection snapshots require declared v1 versions and sorted/unique top-level and nested vectors before accepting content-derived snapshot IDs;
 - Recall, Decision, Simulation, Reflection, and Capture Review use fixed integer attention profiles with hard governance gates before scoring.
+
+Legacy materialized Constitution/action-gap artifacts linked only to `auto_promoted` records receive a read-time overlay: listings downgrade them to Candidate, and Canvas context, Decision evidence, export, and benchmark/training consumers exclude them without rewriting disk. Independent support from an Endorsed record preserves the artifact.
 
 This layer is implemented as pure Rust entry points. Capture hooks and projection-backed UI/API integration belong to later tasks; no current command is documented as emitting these events yet.
 

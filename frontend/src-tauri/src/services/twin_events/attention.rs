@@ -1,14 +1,17 @@
-use crate::models::twin_event::{AuthorityClass, ReviewState, Sensitivity, Visibility};
+use crate::models::twin_event::{
+    AuthorityClass, CausalStream, ReviewState, Sensitivity, Visibility,
+};
 use crate::models::twin_state::{
     AttentionCandidate, AttentionComponent, AttentionContribution, AttentionExplanation,
     AttentionProfile, AttentionRequest, AttentionScore, AttentionVector, AttentionWeight,
     ExcludedSelection, ExclusionReasonCode, ProjectedItemKind, RankedSelection,
     RelationshipVariant, SelectionDestination, SelectionTrace, SnapshotId, BASIS_POINTS_MAX,
+    EXPECTED_ATTENTION_PROFILE_VERSION,
 };
 use chrono::{DateTime, Utc};
 use std::collections::BTreeSet;
 
-pub const ATTENTION_PROFILE_VERSION: u16 = 1;
+pub const ATTENTION_PROFILE_VERSION: u16 = EXPECTED_ATTENTION_PROFILE_VERSION;
 pub const RECENCY_HORIZON_SECONDS: u64 = 31_536_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -351,12 +354,16 @@ fn first_exclusion(
         return Some(ExclusionReasonCode::Sensitivity);
     }
     if request.destination != SelectionDestination::Local
-        && item.governance.visibility == Visibility::LocalOnly
+        && (item.causal_stream == CausalStream::LocalOnly
+            || item.governance.visibility == Visibility::LocalOnly)
     {
         return Some(ExclusionReasonCode::Visibility);
     }
     let review_allowed = match profile {
-        AttentionProfile::Simulation => item.governance.review == ReviewState::Accepted,
+        AttentionProfile::Simulation => {
+            item.kind == ProjectedItemKind::ReviewedMemory
+                && item.governance.review == ReviewState::Accepted
+        }
         AttentionProfile::CaptureReview => {
             (item.kind == ProjectedItemKind::PendingProposal
                 && item.governance.review == ReviewState::Pending)
@@ -501,6 +508,7 @@ mod tests {
                 summary: Some(BoundedSummary::parse("deep work in quiet rooms").unwrap()),
                 proposal_event_id: None,
                 review_event_ids: Vec::new(),
+                causal_stream: CausalStream::SyncEligible,
                 governance: governance(ReviewState::Accepted, AuthorityClass::ReviewedMemory),
                 relationship_variant: RelationshipVariant::global(),
                 evidence_event_ids: Vec::new(),
@@ -812,6 +820,53 @@ mod tests {
         .unwrap();
         assert!(trace.selected.is_empty());
         assert_eq!(trace.excluded.len(), 100);
+    }
+
+    #[test]
+    fn simulation_requires_reviewed_memory_kind_even_with_forged_maximal_governance() {
+        let at = Utc.with_ymd_and_hms(2026, 8, 29, 0, 0, 0).unwrap();
+        let mut forged = candidate("forged-pending");
+        forged.item.kind = ProjectedItemKind::PendingProposal;
+        forged.item.governance.review = ReviewState::Accepted;
+        forged.item.governance.authority = AuthorityClass::CanonicalUserRule;
+        forged.item.governance.allowed_uses.twin_simulation = true;
+
+        let trace = rank(
+            SnapshotId::parse("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+                .unwrap(),
+            &[forged],
+            AttentionProfile::Simulation,
+            &request(at),
+        )
+        .unwrap();
+
+        assert!(trace.selected.is_empty());
+        assert_eq!(trace.excluded.len(), 1);
+        assert_eq!(trace.excluded[0].reason, ExclusionReasonCode::Review);
+    }
+
+    #[test]
+    fn local_only_causal_lane_blocks_sync_even_with_synced_governance() {
+        let at = Utc.with_ymd_and_hms(2026, 8, 29, 0, 0, 0).unwrap();
+        let mut forged = candidate("local-lane");
+        forged.item.causal_stream = CausalStream::LocalOnly;
+        forged.item.governance.visibility = Visibility::SyncedVault;
+        forged.item.governance.allowed_uses.sync = true;
+
+        let trace = rank(
+            SnapshotId::parse("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+                .unwrap(),
+            &[forged],
+            AttentionProfile::Recall,
+            &AttentionRequest {
+                destination: SelectionDestination::Sync,
+                ..request(at)
+            },
+        )
+        .unwrap();
+
+        assert!(trace.selected.is_empty());
+        assert_eq!(trace.excluded[0].reason, ExclusionReasonCode::Visibility);
     }
 
     #[test]

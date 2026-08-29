@@ -1,6 +1,6 @@
 use crate::models::twin_event::{
-    BoundedSummary, ClaimAssertion, EventId, Governance, Identifier, RelationshipAssertion,
-    RelationshipDirection,
+    BoundedSummary, CausalStream, ClaimAssertion, EventId, Governance, Identifier,
+    RelationshipAssertion, RelationshipDirection, Visibility,
 };
 use chrono::{DateTime, Utc};
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
@@ -8,6 +8,9 @@ use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
 pub const BASIS_POINTS_MAX: u16 = 10_000;
 pub const MAX_PROJECTED_ITEMS: usize = 16_384;
 pub const MAX_STATE_LINKS: usize = 64;
+pub const EXPECTED_PROJECTION_SCHEMA_VERSION: u16 = 1;
+pub const EXPECTED_PROJECTION_VERSION: u16 = 1;
+pub const EXPECTED_ATTENTION_PROFILE_VERSION: u16 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(transparent)]
@@ -44,6 +47,9 @@ pub enum StateModelError {
     InvalidDigest,
     InvalidRelationshipVariant,
     CollectionTooLarge(&'static str),
+    UnsupportedVersion(&'static str, u16),
+    NonCanonicalCollection(&'static str),
+    InvalidExposure,
 }
 
 impl std::fmt::Display for StateModelError {
@@ -60,6 +66,14 @@ impl std::fmt::Display for StateModelError {
                 formatter.write_str("relationship variant must be sorted and unique")
             }
             Self::CollectionTooLarge(name) => write!(formatter, "{name} exceeds its item limit"),
+            Self::UnsupportedVersion(name, version) => {
+                write!(formatter, "unsupported {name} version {version}")
+            }
+            Self::NonCanonicalCollection(name) => {
+                write!(formatter, "{name} must be sorted and unique")
+            }
+            Self::InvalidExposure => formatter
+                .write_str("local-only projected state must remain local and disallow sync/export"),
         }
     }
 }
@@ -238,6 +252,7 @@ pub struct ProjectedStateItem {
     #[serde(default)]
     pub proposal_event_id: Option<EventId>,
     pub review_event_ids: Vec<EventId>,
+    pub causal_stream: CausalStream,
     pub governance: Governance,
     pub relationship_variant: RelationshipVariant,
     pub evidence_event_ids: Vec<EventId>,
@@ -263,6 +278,20 @@ impl ProjectedStateItem {
 
     pub fn validate(&self) -> Result<(), StateModelError> {
         self.relationship_variant.validate()?;
+        if (self.causal_stream == CausalStream::LocalOnly
+            && (self.governance.visibility != Visibility::LocalOnly
+                || self.governance.allowed_uses.sync
+                || self.governance.allowed_uses.export))
+            || (self.governance.visibility == Visibility::LocalOnly
+                && self.causal_stream != CausalStream::LocalOnly)
+        {
+            return Err(StateModelError::InvalidExposure);
+        }
+        validate_sorted_unique(&self.review_event_ids, "review_event_ids")?;
+        validate_sorted_unique(&self.evidence_event_ids, "evidence_event_ids")?;
+        validate_sorted_unique(&self.superseded_by, "superseded_by")?;
+        validate_sorted_unique(&self.goals, "goals")?;
+        validate_sorted_unique(&self.tags, "tags")?;
         for (name, len) in [
             ("review_event_ids", self.review_event_ids.len()),
             ("evidence_event_ids", self.evidence_event_ids.len()),
@@ -296,7 +325,11 @@ pub struct ProposalDraft {
     pub memory_id: Identifier,
     pub claim: ClaimAssertion,
     pub relationship_variant: RelationshipVariant,
+    pub causal_stream: CausalStream,
+    pub governance: Governance,
     pub evidence_event_ids: Vec<EventId>,
+    pub support_count: u16,
+    pub opposition_count: u16,
     pub rules: Vec<ProposalRule>,
 }
 
@@ -409,6 +442,27 @@ pub struct ProjectionSnapshot {
 
 impl ProjectionSnapshot {
     pub fn validate(&self) -> Result<(), StateModelError> {
+        for (name, actual, expected) in [
+            (
+                "projection schema",
+                self.schema_version,
+                EXPECTED_PROJECTION_SCHEMA_VERSION,
+            ),
+            (
+                "projection",
+                self.projection_version,
+                EXPECTED_PROJECTION_VERSION,
+            ),
+            (
+                "attention profile",
+                self.attention_profile_version,
+                EXPECTED_ATTENTION_PROFILE_VERSION,
+            ),
+        ] {
+            if actual != expected {
+                return Err(StateModelError::UnsupportedVersion(name, actual));
+            }
+        }
         for (name, len) in [
             ("applied_event_ids", self.applied_event_ids.len()),
             ("reviewed_memories", self.reviewed_memories.len()),
@@ -422,8 +476,75 @@ impl ProjectionSnapshot {
                 return Err(StateModelError::CollectionTooLarge(name));
             }
         }
+        validate_sorted_unique(&self.applied_event_ids, "applied_event_ids")?;
+        validate_sorted_unique(
+            &self
+                .reviewed_memories
+                .iter()
+                .map(|item| item.item_id.clone())
+                .collect::<Vec<_>>(),
+            "reviewed_memories",
+        )?;
+        validate_sorted_unique(
+            &self
+                .pending_proposals
+                .iter()
+                .map(|item| item.item_id.clone())
+                .collect::<Vec<_>>(),
+            "pending_proposals",
+        )?;
+        validate_sorted_unique(
+            &self
+                .relationship_variants
+                .iter()
+                .map(|state| state.relationship_variant.clone())
+                .collect::<Vec<_>>(),
+            "relationship_variants",
+        )?;
+        validate_sorted_unique(
+            &self
+                .timeline
+                .iter()
+                .map(|entry| {
+                    (
+                        entry.source_event_id.clone(),
+                        entry.state,
+                        entry.item_id.clone(),
+                        entry.effective_at,
+                        entry.valid_from,
+                        entry.valid_to,
+                    )
+                })
+                .collect::<Vec<_>>(),
+            "timeline",
+        )?;
+        validate_sorted_unique(
+            &self
+                .contradiction_clusters
+                .iter()
+                .map(|cluster| cluster.cluster_id.clone())
+                .collect::<Vec<_>>(),
+            "contradiction_clusters",
+        )?;
+        validate_sorted_unique(
+            &self
+                .recent_observations
+                .iter()
+                .map(|item| item.item_id.clone())
+                .collect::<Vec<_>>(),
+            "recent_observations",
+        )?;
         for variant in &self.relationship_variants {
             variant.relationship_variant.validate()?;
+            validate_sorted_unique(&variant.reviewed_memory_ids, "reviewed_memory_ids")?;
+            validate_sorted_unique(&variant.pending_memory_ids, "pending_memory_ids")?;
+            validate_sorted_unique(&variant.observation_event_ids, "observation_event_ids")?;
+        }
+        for cluster in &self.contradiction_clusters {
+            cluster.relationship_variant.validate()?;
+            validate_sorted_unique(&cluster.memory_ids, "cluster.memory_ids")?;
+            validate_sorted_unique(&cluster.claims, "cluster.claims")?;
+            validate_sorted_unique(&cluster.evidence_event_ids, "cluster.evidence_event_ids")?;
         }
         for item in self
             .reviewed_memories
@@ -433,6 +554,14 @@ impl ProjectionSnapshot {
         {
             item.validate()?;
         }
+        Ok(())
+    }
+}
+
+fn validate_sorted_unique<T: Ord>(values: &[T], name: &'static str) -> Result<(), StateModelError> {
+    if values.windows(2).any(|pair| pair[0] >= pair[1]) {
+        Err(StateModelError::NonCanonicalCollection(name))
+    } else {
         Ok(())
     }
 }
