@@ -104,7 +104,7 @@ jobs:
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
         run: |
-          config_path="frontend/src-tauri/tauri.desktop.conf.json"
+          config_path="src-tauri/tauri.desktop.conf.json"
 
           if [ -z "${TAURI_SIGNING_PRIVATE_KEY}" ]; then
             config_path="$RUNNER_TEMP/tauri-smoke-config.json"

@@ -404,6 +404,35 @@ describe('HomeView', () => {
   })
 
   // ============================================================================
+  // Desktop first-run setup
+  // ============================================================================
+
+  describe('Desktop first-run setup', () => {
+    it('opens setup before loading notes when the Tauri 2 runtime is desktop', async () => {
+      vi.mocked(apiClient.isDesktopApp).mockReturnValue(true)
+      const statusSpy = vi.spyOn(apiClient.settings, 'getStatus').mockResolvedValue({ needs_setup: true })
+      const listSpy = vi.spyOn(apiClient.notes, 'list').mockResolvedValue([])
+
+      wrapper = mount(HomeView)
+      await flushPromises()
+
+      expect(statusSpy).toHaveBeenCalledOnce()
+      expect(wrapper.findComponent({ name: 'SettingsModal' }).props('isSetup')).toBe(true)
+      expect(listSpy).not.toHaveBeenCalled()
+    })
+
+    it('does not call the desktop setup command in a mobile runtime', async () => {
+      const statusSpy = vi.spyOn(apiClient.settings, 'getStatus')
+      vi.spyOn(apiClient.notes, 'list').mockResolvedValue([])
+
+      wrapper = mount(HomeView)
+      await flushPromises()
+
+      expect(statusSpy).not.toHaveBeenCalled()
+    })
+  })
+
+  // ============================================================================
   // Vault Switch Reset
   // ============================================================================
 

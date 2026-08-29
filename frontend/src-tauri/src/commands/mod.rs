@@ -24,6 +24,7 @@ pub mod distill;
 pub mod feedback;
 pub mod graph;
 pub mod import;
+#[cfg(desktop)]
 pub mod mcp;
 pub mod memory;
 pub mod migration;

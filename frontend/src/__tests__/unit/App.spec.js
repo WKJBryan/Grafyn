@@ -7,6 +7,17 @@ const tauriPlugins = vi.hoisted(() => ({
   confirm: vi.fn(),
   check: vi.fn(),
   downloadAndInstall: vi.fn(),
+  relaunch: vi.fn(),
+  runtime: {
+    isTauri: true,
+    isDesktop: true,
+    platform: 'windows',
+  },
+}))
+
+vi.mock('@/api/client', () => ({
+  isTauriApp: () => tauriPlugins.runtime.isTauri,
+  isDesktopApp: () => tauriPlugins.runtime.isDesktop,
 }))
 
 vi.mock('@tauri-apps/plugin-opener', () => ({
@@ -19,6 +30,14 @@ vi.mock('@tauri-apps/plugin-dialog', () => ({
 
 vi.mock('@tauri-apps/plugin-updater', () => ({
   check: tauriPlugins.check,
+}))
+
+vi.mock('@tauri-apps/plugin-process', () => ({
+  relaunch: tauriPlugins.relaunch,
+}))
+
+vi.mock('@tauri-apps/plugin-os', () => ({
+  platform: () => tauriPlugins.runtime.platform,
 }))
 
 vi.mock('vue-router', () => ({
@@ -60,7 +79,9 @@ function mountApp() {
 describe('desktop Tauri shell', () => {
   beforeEach(() => {
     vi.clearAllMocks()
-    window.__TAURI__ = true
+    tauriPlugins.runtime.isTauri = true
+    tauriPlugins.runtime.isDesktop = true
+    tauriPlugins.runtime.platform = 'windows'
     tauriPlugins.check.mockResolvedValue(null)
   })
 
@@ -95,6 +116,33 @@ describe('desktop Tauri shell', () => {
       expect.objectContaining({ title: 'Grafyn update' }),
     )
     expect(tauriPlugins.downloadAndInstall).toHaveBeenCalledOnce()
+    expect(tauriPlugins.relaunch).not.toHaveBeenCalled()
+    wrapper.unmount()
+  })
+
+  it.each(['macos', 'linux'])('relaunches %s after a successful update install', async (platform) => {
+    tauriPlugins.runtime.platform = platform
+    tauriPlugins.check.mockResolvedValue({
+      version: '0.4.0',
+      downloadAndInstall: tauriPlugins.downloadAndInstall,
+    })
+    tauriPlugins.confirm.mockResolvedValue(true)
+
+    const wrapper = mountApp()
+    await flushPromises()
+
+    expect(tauriPlugins.downloadAndInstall).toHaveBeenCalledOnce()
+    expect(tauriPlugins.relaunch).toHaveBeenCalledOnce()
+    wrapper.unmount()
+  })
+
+  it('does not initialize the desktop updater on mobile', async () => {
+    tauriPlugins.runtime.isDesktop = false
+
+    const wrapper = mountApp()
+    await flushPromises()
+
+    expect(tauriPlugins.check).not.toHaveBeenCalled()
     wrapper.unmount()
   })
 })

@@ -12,15 +12,25 @@
  * - MCP API methods (getStatus, getConfigSnippet)
  * - Memory API methods (recall, contradictions, extract)
  * - Zettelkasten API methods (discoverLinks, applyLinks, createLink, getLinkTypes)
- * - isDesktopApp detects the Tauri IPC bridge
+ * - isDesktopApp detects a Tauri 2 desktop runtime without admitting mobile
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 
 // vi.hoisted ensures mockInvoke is declared before vi.mock's hoisted factory runs
-const { mockInvoke } = vi.hoisted(() => ({ mockInvoke: vi.fn() }))
+const { mockInvoke, runtime } = vi.hoisted(() => ({
+  mockInvoke: vi.fn(),
+  runtime: {
+    isTauri: false,
+    platform: 'windows',
+  },
+}))
 vi.mock('@tauri-apps/api/core', () => ({
   invoke: mockInvoke,
+  isTauri: () => runtime.isTauri,
+}))
+vi.mock('@tauri-apps/plugin-os', () => ({
+  platform: () => runtime.platform,
 }))
 
 import {
@@ -41,15 +51,32 @@ import {
 describe('API Client (Tauri)', () => {
   beforeEach(() => {
     mockInvoke.mockReset()
+    runtime.isTauri = false
+    runtime.platform = 'windows'
+    delete window.__TAURI_IPC__
   })
 
   describe('isDesktopApp', () => {
-    it('detects the Tauri IPC bridge', () => {
-      delete window.__TAURI_IPC__
+    it('uses the Tauri 2 runtime API instead of the removed Tauri 1 IPC global', () => {
+      window.__TAURI_IPC__ = vi.fn()
       expect(isDesktopApp()).toBe(false)
 
-      window.__TAURI_IPC__ = vi.fn()
+      runtime.isTauri = true
       expect(isDesktopApp()).toBe(true)
+    })
+
+    it.each(['windows', 'macos', 'linux'])('admits the %s desktop runtime', (platform) => {
+      runtime.isTauri = true
+      runtime.platform = platform
+
+      expect(isDesktopApp()).toBe(true)
+    })
+
+    it.each(['android', 'ios'])('rejects the %s mobile runtime', (platform) => {
+      runtime.isTauri = true
+      runtime.platform = platform
+
+      expect(isDesktopApp()).toBe(false)
     })
   })
 

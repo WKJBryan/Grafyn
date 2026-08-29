@@ -77,7 +77,7 @@
 
 <script setup>
 import { onMounted, ref } from 'vue'
-import { optimizer as optimizerApi } from '@/api/client'
+import { isDesktopApp, optimizer as optimizerApi } from '@/api/client'
 import { useToast } from '@/composables/useToast'
 import AsyncListState from './AsyncListState.vue'
 
@@ -86,7 +86,7 @@ const status = ref(null)
 const recentInbox = ref([])
 
 async function load() {
-  if (typeof window === 'undefined' || typeof window.__TAURI_IPC__ !== 'function') {
+  if (!isDesktopApp()) {
     return
   }
   try {

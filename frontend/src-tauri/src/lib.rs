@@ -57,10 +57,14 @@ pub fn run() {
 
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_opener::init());
+        .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_os::init());
 
-    #[cfg(desktop)]
+    #[cfg(all(desktop, feature = "desktop-updater"))]
     let builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
+
+    #[cfg(all(desktop, feature = "desktop-process"))]
+    let builder = builder.plugin(tauri_plugin_process::init());
 
     builder
         .setup(|app| {
@@ -317,7 +321,9 @@ pub fn run() {
             commands::distill::distill_note,
             commands::distill::normalize_tags,
             // MCP commands
+            #[cfg(desktop)]
             commands::mcp::get_mcp_status,
+            #[cfg(desktop)]
             commands::mcp::get_mcp_config_snippet,
             // Memory commands
             commands::memory::recall_relevant,

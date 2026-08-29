@@ -36,6 +36,8 @@ npm run tauri:build      # Production build → src-tauri/target/release/bundle/
 
 Environment: `set OPENROUTER_API_KEY=your-key` (Windows) or `export OPENROUTER_API_KEY=your-key`
 
+The updater and process plugins are desktop-feature/target gated. After an accepted update finishes installing, macOS and Linux relaunch through the process plugin; Windows remains under the updater installer's supported restart behavior.
+
 **Release prep:** Use `npm run release:prepare -- X.Y.Z` on a release branch (bumps versions, regenerates Cargo.lock, validates, commits). After merging to main, use `npm run release:tag -- X.Y.Z` to create the annotated tag. See `WORKING_GUIDE.md` for the full release process.
 
 ### Testing
@@ -105,7 +107,7 @@ Until a task lands and its tests pass, the current implementation facts in the r
 
 ### Tauri IPC Commands
 
-The normal shell registers 15 command modules from `frontend/src-tauri/src/commands/`. `canvas` is a directory module (split — see below); every other normal module is a single file. A sixteenth source module, `twin_eval`, is compiled and registered only with the non-default `twin-eval-lab` feature. Enumerate exact command names with `grep -rn "#\[tauri::command\]" -A1 src/commands/` — purposes only below, to avoid drift.
+The normal desktop shell registers 15 command modules from `frontend/src-tauri/src/commands/`. `canvas` is a directory module (split — see below); every other normal module is a single file. The `mcp` command module and both MCP invoke registrations are compiled only on desktop targets, so the shared/mobile library surface has 14 normal command modules. A sixteenth desktop source module, `twin_eval`, is compiled and registered only with the non-default `twin-eval-lab` feature. Enumerate exact command names with `grep -rn "#\[tauri::command\]" -A1 src/commands/` — purposes only below, to avoid drift.
 
 | Module | Purpose |
 |--------|---------|
@@ -130,7 +132,7 @@ The normal shell registers 15 command modules from `frontend/src-tauri/src/comma
 
 ### Frontend
 
-- `src/api/client.js` — all backend calls go through Tauri `invoke()`; exports one namespace per command module plus `optimizer` and `isDesktopApp`
+- `src/api/client.js` — all backend calls go through Tauri `invoke()`; exports one namespace per command module plus `optimizer`, `isTauriApp`, and `isDesktopApp`. Runtime detection uses Tauri 2's `isTauri()` API plus the OS plugin's platform value; Android/iOS are Tauri runtimes but are not admitted to desktop-only setup, vault-picker, MCP, or updater paths.
 - **Pinia stores (4):** `canvas.js`, `theme.js`, `boot.js`, `twin.js` — twin state (records, review, Constitution, action gaps, decisions, Decision Mirror config, setup) lives in the store; components read/act through it rather than holding local copies
 - `components/twin/` — the Twin Workspace's tab components (`TwinOverviewTab.vue`, `TwinSetupTab.vue`, `TwinConfigTab.vue`, `TwinConstitutionTab.vue`, `TwinActionGapsTab.vue`, `TwinDecisionsTab.vue`, `TwinMemoryTab.vue`, `TwinGuideTab.vue`) plus shared pieces (`ReviewActions.vue`, `SetupField.vue`, `ActionGapRow.vue`, `DecisionRow.vue`, `EvidenceDrawer.vue`) and `twin-workspace.css`. `views/TwinReviewView.vue` is now a ~150-line shell that wires the store to these tabs — do not add Twin Workspace logic directly to the view.
 - **Routes:** `/` (notes), `/canvas`, `/canvas/:id`, `/import`, `/twin` (component: `TwinReviewView.vue`, thin shell over `components/twin/`), plus catch-all → `NotFoundView.vue`

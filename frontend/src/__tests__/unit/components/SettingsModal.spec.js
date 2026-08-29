@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { mount, flushPromises } from '@vue/test-utils'
 import SettingsModal from '@/components/SettingsModal.vue'
 
-const { settingsGet, settingsStatus, settingsUpdate, pickVaultFolder, validateOpenRouterKey, getOllamaStatus, listOllamaModels, getModels, getMcpStatus, optimizerStatus, themeStore, toast, routerPush } = vi.hoisted(() => ({
+const { settingsGet, settingsStatus, settingsUpdate, pickVaultFolder, validateOpenRouterKey, getOllamaStatus, listOllamaModels, getModels, getMcpStatus, optimizerStatus, desktopRuntime, themeStore, toast, routerPush } = vi.hoisted(() => ({
   settingsGet: vi.fn(),
   settingsStatus: vi.fn(),
   settingsUpdate: vi.fn(),
@@ -13,6 +13,7 @@ const { settingsGet, settingsStatus, settingsUpdate, pickVaultFolder, validateOp
   getModels: vi.fn(),
   getMcpStatus: vi.fn(),
   optimizerStatus: vi.fn(),
+  desktopRuntime: { value: true },
   themeStore: {
     setTheme: vi.fn()
   },
@@ -42,7 +43,7 @@ vi.mock('@/api/client', () => ({
   optimizer: {
     status: optimizerStatus
   },
-  isDesktopApp: () => true
+  isDesktopApp: () => desktopRuntime.value
 }))
 
 vi.mock('@/composables/useToast', () => ({
@@ -62,6 +63,7 @@ vi.mock('vue-router', () => ({
 describe('SettingsModal', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    desktopRuntime.value = true
     settingsGet.mockResolvedValue({
       vault_path: 'C:\\Vault',
       theme: 'system',
@@ -92,6 +94,39 @@ describe('SettingsModal', () => {
       addEventListener: vi.fn(),
       removeEventListener: vi.fn()
     })
+  })
+
+  it('uses the native vault picker in the Tauri 2 desktop runtime', async () => {
+    pickVaultFolder.mockResolvedValue('D:\\Grafyn Vault')
+    const wrapper = mount(SettingsModal, {
+      props: {
+        modelValue: true,
+        isSetup: true
+      }
+    })
+
+    await flushPromises()
+    await wrapper.find('.browse-btn').trigger('click')
+    await flushPromises()
+
+    expect(pickVaultFolder).toHaveBeenCalledOnce()
+    expect(wrapper.find('.vault-input').element.value).toBe('D:\\Grafyn Vault')
+  })
+
+  it('omits desktop settings and backend loads in a mobile runtime', async () => {
+    desktopRuntime.value = false
+    const wrapper = mount(SettingsModal, {
+      props: {
+        modelValue: true,
+        isSetup: false
+      }
+    })
+
+    await flushPromises()
+
+    expect(wrapper.find('.browse-btn').exists()).toBe(false)
+    expect(settingsGet).not.toHaveBeenCalled()
+    expect(getMcpStatus).not.toHaveBeenCalled()
   })
 
   it('labels the toggle as Canvas Web Search and explains the default-on behavior', async () => {

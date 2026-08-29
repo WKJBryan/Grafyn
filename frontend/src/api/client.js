@@ -1,4 +1,7 @@
-import { invoke } from '@tauri-apps/api/core'
+import { invoke, isTauri } from '@tauri-apps/api/core'
+import { platform } from '@tauri-apps/plugin-os'
+
+const MOBILE_PLATFORMS = new Set(['android', 'ios'])
 
 // App boot API
 export const boot = {
@@ -289,4 +292,6 @@ export const importApi = {
   getSupportedFormats: () => invoke('get_supported_formats', {}),
 }
 
-export const isDesktopApp = () => typeof window !== 'undefined' && typeof window.__TAURI_IPC__ === 'function'
+export const isTauriApp = () => isTauri()
+
+export const isDesktopApp = () => isTauriApp() && !MOBILE_PLATFORMS.has(platform())

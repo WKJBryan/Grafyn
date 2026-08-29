@@ -17,10 +17,12 @@
 <script setup>
 import { onBeforeUnmount, onMounted, watch } from 'vue'
 import { useRoute } from 'vue-router'
+import { platform } from '@tauri-apps/plugin-os'
 import ToastNotification from '@/components/ToastNotification.vue'
 import GuidePanel from '@/components/GuidePanel.vue'
 import GuideTip from '@/components/GuideTip.vue'
 import StartupSplash from '@/components/StartupSplash.vue'
+import { isDesktopApp, isTauriApp } from '@/api/client'
 import { useBootStore } from '@/stores/boot'
 import { useGuide } from '@/composables/useGuide'
 
@@ -64,6 +66,11 @@ async function checkForDesktopUpdate() {
     )
     if (shouldInstall) {
       await update.downloadAndInstall()
+      const currentPlatform = platform()
+      if (currentPlatform === 'macos' || currentPlatform === 'linux') {
+        const { relaunch } = await import('@tauri-apps/plugin-process')
+        await relaunch()
+      }
     }
   } catch (error) {
     console.error('Failed to check for Grafyn updates:', error)
@@ -76,8 +83,10 @@ onMounted(() => {
   guide.setCurrentRoute(route.path)
   guide.checkNewFeatures()
 
-  if (window.__TAURI__ || window.__TAURI_INTERNALS__) {
+  if (isTauriApp()) {
     document.addEventListener('click', handleExternalLinkClick)
+  }
+  if (isDesktopApp()) {
     void checkForDesktopUpdate()
   }
 })
