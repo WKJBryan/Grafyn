@@ -534,6 +534,9 @@ mod commit_note_write_tests {
             ))),
             vault_optimizer: Arc::new(RwLock::new(VaultOptimizerService::new(data_path.clone()))),
             twin_store: Arc::new(RwLock::new(TwinStore::new(data_path.join("twin")))),
+            twin_event_store: Arc::new(crate::services::twin_events::TwinEventStore::new(
+                data_path.clone(),
+            )),
             memory_service: Arc::new(MemoryService::new()),
             boot_state: Arc::new(RwLock::new(BootStatus::default())),
         };

@@ -21,6 +21,7 @@ use services::{
     search::SearchService,
     settings::SettingsService,
     twin::TwinStore,
+    twin_events::TwinEventStore,
     vault_optimizer::{OptimizerTick, VaultOptimizerService},
 };
 use std::sync::Arc;
@@ -46,6 +47,7 @@ pub struct AppState {
     pub markdown_migration: Arc<RwLock<MarkdownMigrationService>>,
     pub vault_optimizer: Arc<RwLock<VaultOptimizerService>>,
     pub twin_store: Arc<RwLock<TwinStore>>,
+    pub twin_event_store: Arc<TwinEventStore>,
     /// MemoryService is stateless — no lock needed, just Arc for shared ownership
     pub memory_service: Arc<MemoryService>,
     pub boot_state: Arc<RwLock<BootStatus>>,
@@ -143,6 +145,9 @@ pub fn run() {
 
             let canvas_store = CanvasStore::new(data_path.join("canvas"));
             let twin_store = TwinStore::new(settings_service.get().effective_twin_data_path());
+            // Construction is deliberately side-effect free. Canonical storage is
+            // opened fallibly as the first warm-start phase below.
+            let twin_event_store = TwinEventStore::new(data_path.clone());
 
             // Get OpenRouter API key from settings, fall back to environment
             let api_key = settings_service
@@ -184,6 +189,7 @@ pub fn run() {
                 markdown_migration: Arc::new(RwLock::new(markdown_migration)),
                 vault_optimizer: Arc::new(RwLock::new(vault_optimizer)),
                 twin_store: Arc::new(RwLock::new(twin_store)),
+                twin_event_store: Arc::new(twin_event_store),
                 memory_service: Arc::new(MemoryService::new()),
                 boot_state,
             };
@@ -364,6 +370,15 @@ async fn warm_start_services(app_handle: tauri::AppHandle, state: AppState) -> R
         &app_handle,
         &state,
         &boot_started,
+        BootStatus::new("opening_twin_events", "Opening governed Twin history"),
+    )
+    .await;
+    initialize_twin_event_store_for_boot(&state.twin_event_store)?;
+
+    publish_boot_phase(
+        &app_handle,
+        &state,
+        &boot_started,
         BootStatus::new("opening_store", "Loading notes from your vault"),
     )
     .await;
@@ -433,6 +448,10 @@ async fn warm_start_services(app_handle: tauri::AppHandle, state: AppState) -> R
     .await;
 
     Ok(())
+}
+
+fn initialize_twin_event_store_for_boot(store: &TwinEventStore) -> Result<(), String> {
+    store.initialize().map_err(|error| error.to_string())
 }
 
 async fn publish_boot_phase(
@@ -588,5 +607,23 @@ mod tests {
         update_boot_state(&boot_state, &next).await;
 
         assert_eq!(*boot_state.read().await, next);
+    }
+
+    #[test]
+    fn canonical_directory_path_is_file_surfaces_as_recoverable_boot_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = TwinEventStore::new(temp.path());
+        let events_path = store.events_dir();
+        std::fs::create_dir_all(events_path.parent().unwrap()).unwrap();
+        std::fs::write(&events_path, b"not a directory").unwrap();
+
+        let error = initialize_twin_event_store_for_boot(&store).unwrap_err();
+        let status = BootStatus::failed("failed", "Startup failed", error);
+        assert_eq!(status.phase, "failed");
+        assert!(!status.ready);
+        assert!(status
+            .error
+            .unwrap()
+            .contains("canonical Twin event directory"));
     }
 }

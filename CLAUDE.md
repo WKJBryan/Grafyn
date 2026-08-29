@@ -141,6 +141,14 @@ The normal desktop shell registers 15 command modules from `frontend/src-tauri/s
 
 ## Key Concepts
 
+### Governed Twin Event Spine
+
+Canonical Twin history is stored as immutable JSON records below the app data directory at `twin/events/v1/<event-id-prefix>/<event-id>.json`; quarantine is the sibling `twin/events/quarantine/v1/` tree. `TwinEventStore::new` is side-effect free, and the first warm-start phase fallibly initializes and validates this canonical store. A canonical path that is unusable, an unreadable record, or a failed quarantine becomes a recoverable `BootStatus` failure instead of a process exit or disposable/default Twin history.
+
+The envelope preserves recorded, observed, occurred, and validity time separately, plus supersession, reinforcement, context, evidence, and orthogonal review/authority/sensitivity/visibility/allowed-use governance. All ten approved event classes use dedicated typed payload structs. Observation and proposal payloads carry typed claim assertions for later deterministic projections; Canvas, conversation, feedback, and decision payloads retain bounded meaningful content and decimal-text costs without API keys or raw unselected context. This task defines storage and vocabulary only: capture hooks, attention, proposals, projections, and legacy `AutoPromoted` migration remain unavailable until their owning tasks land.
+
+Event IDs are SHA-256 digests over an explicit domain-tagged, length-prefixed semantic encoding that excludes `event_id`; JSON field order and formatting never affect identity. Set-like fields are normalized or rejected deterministically. Appends use a cross-process lock and same-directory no-clobber installation, so identical duplicates are no-ops and ID/content collisions or wrong IDs fail closed. Device sequences start at 1 and each later event must directly name the immediately preceding same-device event as a causal parent. Reads refresh across desktop/MCP peer writers and use a deterministic topological order: parents first, then stable event ID among independent ready events; timestamps and arrival order are never tiebreakers.
+
 ### Wikilink Pattern
 
 ```markdown
