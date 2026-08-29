@@ -60,7 +60,22 @@ npx vitest run src/__tests__/unit/components/PromptDialog.spec.js
 
 ## Architecture Overview
 
-Grafyn is a **desktop-only** app — a single Tauri binary with a Vue frontend and Rust backend. No web mode, no Python backend.
+**Current implementation at the start of the companion-first branch:** Grafyn is a desktop-only Tauri v1 app — a single Tauri binary with a Vue frontend and Rust backend. No web mode, no Python backend. Do not treat this snapshot description as the target architecture while executing the approved plan below.
+
+### Approved companion-first direction (owner decision, 2026-08-29)
+
+Grafyn's mission is the local-first data-collection and governed-state layer for a person's digital twin. Desktop and Android are to become peer clients with app-owned offline vaults. Models may propose patterns, but explicit review/verification governs durable Twin memory; privacy and allowed-use gates run before per-use-case attention ranking. Time, relationship, activity, environment, and goal context remain first-class rather than being collapsed into one global trait or importance score.
+
+The approved implementation is specified in `docs/superpowers/specs/2026-08-29-grafyn-companion-system-design.md` and decomposed in `docs/superpowers/plans/2026-08-29-grafyn-companion-first-implementation.md`. The target includes:
+
+- Tauri 2 with a library entry point and capability-gated desktop/Android services;
+- an append-only governed Twin event spine with deterministic temporal/context projections;
+- orthogonal review, authority, sensitivity, allowed-use, and explainable attention data;
+- compact Capture, Recall, Twin review/chat, linear Canvas, and one-shot image flows;
+- an optional public E2EE sync protocol/local engine, while production relay, billing, pairing/recovery, and operations remain separate and unavailable until genuinely built;
+- MPL-2.0 for the open client/local core, subject to the repository governance task.
+
+Until a task lands and its tests pass, the current implementation facts in the rest of this file remain authoritative. Update those sections in the same commit as each architectural change; never document a planned capability as already working.
 
 ```
 ┌────────────────────────────────────────────────┐
