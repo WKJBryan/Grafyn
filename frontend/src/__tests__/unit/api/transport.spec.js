@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { createPinia, setActivePinia } from 'pinia'
-import { createTransport, resetTransport, setTransport } from '@/api/transport'
+import { createTransport, resetTransport, setRuntimeProfile, setTransport } from '@/api/transport'
 import { notes } from '@/api/client'
 import { twinEval } from '@/lab/api'
 import { CapabilityUnavailableError, assertCapability } from '@/platform/capabilities'
@@ -21,6 +21,35 @@ describe('frontend transport seam', () => {
     expect(invoke).toHaveBeenCalledWith('list_notes', {})
   })
 
+  it('exposes exactly the four approved runtime bridge names', async () => {
+    const invoke = vi.fn()
+    const listen = vi.fn()
+    const openExternal = vi.fn().mockResolvedValue(undefined)
+    const showMainWindow = vi.fn().mockResolvedValue(undefined)
+    const transport = createTransport({ invoke, listen, openExternal, showMainWindow })
+
+    expect(Object.keys(transport).sort()).toEqual([
+      'invoke',
+      'listen',
+      'openExternal',
+      'showMainWindow',
+    ])
+
+    await transport.openExternal({ type: 'url', url: 'https://grafyn.app/docs' })
+    await transport.openExternal({ type: 'file-dialog', options: { multiple: false } })
+    await transport.showMainWindow()
+
+    expect(openExternal).toHaveBeenNthCalledWith(1, {
+      type: 'url',
+      url: 'https://grafyn.app/docs',
+    })
+    expect(openExternal).toHaveBeenNthCalledWith(2, {
+      type: 'file-dialog',
+      options: { multiple: false },
+    })
+    expect(showMainWindow).toHaveBeenCalledOnce()
+  })
+
   it('routes the desktop-only lab API through the injected invoke operation', async () => {
     const invoke = vi.fn().mockResolvedValue([])
     setTransport(createTransport({ invoke }))
@@ -31,9 +60,8 @@ describe('frontend transport seam', () => {
   })
 
   it('uses the active runtime when asserting a capability', () => {
-    setTransport(createTransport({
-      getRuntimeProfile: () => ({ name: 'android-compact' }),
-    }))
+    setTransport(createTransport())
+    setRuntimeProfile({ name: 'android-compact' })
 
     expect(() => assertCapability('mcp')).toThrow(CapabilityUnavailableError)
   })

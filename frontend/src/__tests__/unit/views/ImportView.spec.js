@@ -2,8 +2,8 @@ import { describe, expect, it, beforeEach, vi } from 'vitest'
 import { mount, flushPromises } from '@vue/test-utils'
 import ImportView from '@/views/ImportView.vue'
 
-const dialog = vi.hoisted(() => ({
-  open: vi.fn()
+const transport = vi.hoisted(() => ({
+  openExternal: vi.fn(),
 }))
 
 const api = vi.hoisted(() => ({
@@ -20,7 +20,9 @@ const api = vi.hoisted(() => ({
   }
 }))
 
-vi.mock('@tauri-apps/plugin-dialog', () => dialog)
+vi.mock('@/api/transport', () => ({
+  getTransport: () => transport,
+}))
 vi.mock('@/api/client', () => api)
 vi.mock('@/composables/useToast', () => ({
   useToast: () => ({
@@ -45,7 +47,7 @@ function mountView() {
 describe('ImportView', () => {
   beforeEach(() => {
     vi.clearAllMocks()
-    dialog.open.mockResolvedValue('C:/tmp/interview.md')
+    transport.openExternal.mockResolvedValue('C:/tmp/interview.md')
     api.importApi.preview.mockResolvedValue({
       platform: 'interview',
       total_conversations: 1,
@@ -94,11 +96,14 @@ describe('ImportView', () => {
     await wrapper.find('[data-guide="import-file-btn"]').trigger('click')
     await flushPromises()
 
-    expect(dialog.open).toHaveBeenCalledWith(expect.objectContaining({
+    expect(transport.openExternal).toHaveBeenCalledWith({
+      type: 'file-dialog',
+      options: expect.objectContaining({
       filters: expect.arrayContaining([
         expect.objectContaining({ extensions: expect.arrayContaining(['md', 'txt', 'docx', 'pdf']) })
       ])
-    }))
+      }),
+    })
     expect(api.importApi.preview).toHaveBeenCalledWith('C:/tmp/interview.md')
     expect(wrapper.text()).toContain('interview')
     expect(wrapper.text()).toContain('Interview Transcript')

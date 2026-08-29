@@ -1,13 +1,15 @@
 import { defineConfig } from 'vite'
 import vue from '@vitejs/plugin-vue'
+import { createRequire } from 'node:module'
 import { fileURLToPath, URL } from 'node:url'
-import pkg from './package.json' with { type: 'json' }
 import {
   assertTwinEvalIsolation,
   resolveViteInputs,
 } from './scripts/twin-eval-isolation.mjs'
 
 const twinEvalLabEnabled = process.env.GRAFYN_TWIN_EVAL_LAB === '1'
+const require = createRequire(import.meta.url)
+const pkg = require('./package.json')
 
 function twinEvalIsolationPlugin() {
   return {

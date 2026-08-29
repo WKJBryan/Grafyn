@@ -405,13 +405,16 @@ function isSelected(noteId, targetId) {
 async function handlePickFile() {
   error.value = null
 
-  const selected = await getTransport().open({
-    multiple: false,
-    filters: [
-      { name: 'Supported imports', extensions: ['json', 'dms', 'md', 'txt', 'docx', 'pdf'] },
-      { name: 'JSON', extensions: ['json', 'dms'] },
-      { name: 'Documents', extensions: ['md', 'txt', 'docx', 'pdf'] }
-    ],
+  const selected = await getTransport().openExternal({
+    type: 'file-dialog',
+    options: {
+      multiple: false,
+      filters: [
+        { name: 'Supported imports', extensions: ['json', 'dms', 'md', 'txt', 'docx', 'pdf'] },
+        { name: 'JSON', extensions: ['json', 'dms'] },
+        { name: 'Documents', extensions: ['md', 'txt', 'docx', 'pdf'] }
+      ],
+    },
   })
 
   if (!selected) return

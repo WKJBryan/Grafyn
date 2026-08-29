@@ -3,7 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import App from '@/App.vue'
 
 const tauriPlugins = vi.hoisted(() => ({
-  openUrl: vi.fn().mockResolvedValue(undefined),
+  openExternal: vi.fn().mockResolvedValue(undefined),
   confirm: vi.fn(),
   check: vi.fn(),
   downloadAndInstall: vi.fn(),
@@ -22,11 +22,7 @@ vi.mock('@/api/client', () => ({
 
 vi.mock('@/api/transport', () => ({
   getRuntimeProfile: () => ({ platform: tauriPlugins.runtime.platform }),
-  getTransport: () => ({ openUrl: tauriPlugins.openUrl }),
-}))
-
-vi.mock('@tauri-apps/plugin-opener', () => ({
-  openUrl: tauriPlugins.openUrl,
+  getTransport: () => ({ openExternal: tauriPlugins.openExternal }),
 }))
 
 vi.mock('@tauri-apps/plugin-dialog', () => ({
@@ -96,7 +92,10 @@ describe('desktop Tauri shell', () => {
     link.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }))
     await flushPromises()
 
-    expect(tauriPlugins.openUrl).toHaveBeenCalledWith('https://grafyn.app/docs')
+    expect(tauriPlugins.openExternal).toHaveBeenCalledWith({
+      type: 'url',
+      url: 'https://grafyn.app/docs',
+    })
     wrapper.unmount()
     link.remove()
   })

@@ -4,7 +4,6 @@ import App from './App.vue'
 import router from './router'
 import { settings } from './api/client'
 import { getRuntimeProfile, getTransport } from './api/transport'
-import { hasCapability } from './platform/capabilities'
 import { resolveThemePreference, useThemeStore } from './stores/theme'
 import './style.css'
 
@@ -23,8 +22,8 @@ window.addEventListener('grafyn-app-mounted', () => {
   appShellShown = true
 
   requestAnimationFrame(() => {
-    if (hasCapability(getRuntimeProfile(), 'windowShow')) {
-      getTransport().show()
+    if (getRuntimeProfile().name === 'desktop-wide') {
+      getTransport().showMainWindow()
         .catch((error) => console.error('Failed to show Grafyn window:', error))
     }
     removeBootstrapSplash()

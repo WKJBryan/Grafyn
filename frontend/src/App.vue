@@ -40,7 +40,7 @@ function handleExternalLinkClick(event) {
   const href = el.getAttribute('href')
   if (href && (href.startsWith('http://') || href.startsWith('https://'))) {
     event.preventDefault()
-    getTransport().openUrl(href)
+    getTransport().openExternal({ type: 'url', url: href })
       .catch((error) => console.error('Failed to open external link:', error))
   }
 }

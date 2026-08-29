@@ -34,7 +34,7 @@ try {
   const contributingPath = path.join(fixtureRoot, 'CONTRIBUTING.md')
   const contributing = fs.readFileSync(contributingPath, 'utf8')
   const mutated = contributing.replace(
-    /    maintained indefinitely and may be redistributed consistent with\r?\n    this project or the open source license\(s\) involved\./,
+    / {4}maintained indefinitely and may be redistributed consistent with\r?\n {4}this project or the open source license\(s\) involved\./,
     '    maintained temporarily.',
   )
   assert.notEqual(mutated, contributing, 'test fixture must alter DCO clause (d)')

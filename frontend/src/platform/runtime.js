@@ -4,7 +4,7 @@ export const RUNTIME_PROFILES = Object.freeze({
   PLAIN_WEB: 'plain-web',
 })
 
-const DESKTOP_PLATFORMS = new Set(['windows', 'macos', 'linux'])
+const MOBILE_PLATFORMS = new Set(['android', 'ios'])
 
 export function createRuntimeProfile({ isTauri = false, platform = null } = {}) {
   if (!isTauri) {
@@ -16,9 +16,9 @@ export function createRuntimeProfile({ isTauri = false, platform = null } = {}) 
   }
 
   return Object.freeze({
-    name: DESKTOP_PLATFORMS.has(platform)
-      ? RUNTIME_PROFILES.DESKTOP_WIDE
-      : RUNTIME_PROFILES.ANDROID_COMPACT,
+    name: MOBILE_PLATFORMS.has(platform)
+      ? RUNTIME_PROFILES.ANDROID_COMPACT
+      : RUNTIME_PROFILES.DESKTOP_WIDE,
     isTauri: true,
     platform,
   })

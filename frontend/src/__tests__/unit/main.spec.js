@@ -1,14 +1,10 @@
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
 
 const shell = vi.hoisted(() => ({
-  show: vi.fn().mockResolvedValue(undefined),
+  showMainWindow: vi.fn().mockResolvedValue(undefined),
   mount: vi.fn(),
   use: vi.fn().mockReturnThis(),
   setTheme: vi.fn(),
-}))
-
-vi.mock('@tauri-apps/api/webviewWindow', () => ({
-  getCurrentWebviewWindow: () => ({ show: shell.show }),
 }))
 
 vi.mock('vue', () => ({
@@ -26,7 +22,7 @@ vi.mock('@/api/client', () => ({
 }))
 vi.mock('@/api/transport', () => ({
   getRuntimeProfile: () => ({ name: 'desktop-wide' }),
-  getTransport: () => ({ show: shell.show }),
+  getTransport: () => ({ showMainWindow: shell.showMainWindow }),
 }))
 vi.mock('@/stores/theme', () => ({
   resolveThemePreference: () => 'system',
@@ -46,6 +42,6 @@ describe('frontend bootstrap', () => {
 
   it('shows the initially hidden current webview after the app mounts', async () => {
     window.dispatchEvent(new Event('grafyn-app-mounted'))
-    await vi.waitFor(() => expect(shell.show).toHaveBeenCalledOnce())
+    await vi.waitFor(() => expect(shell.showMainWindow).toHaveBeenCalledOnce())
   })
 })
