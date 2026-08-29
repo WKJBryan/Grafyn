@@ -111,7 +111,12 @@ impl OllamaService {
             model: model.to_string(),
             messages: all_messages,
             stream: false,
-            options: temperature.map(|temperature| OllamaOptions { temperature }),
+            options: temperature.map(|temperature| OllamaOptions {
+                temperature: Some(temperature),
+                top_p: None,
+                num_predict: None,
+                stop: None,
+            }),
         };
 
         let response = self
@@ -543,7 +548,12 @@ mod tests {
                 content: "Which option do I choose?".to_string(),
             }],
             stream: false,
-            options: Some(OllamaOptions { temperature: 0.2 }),
+            options: Some(OllamaOptions {
+                temperature: Some(0.2),
+                top_p: None,
+                num_predict: None,
+                stop: None,
+            }),
         };
 
         let value = serde_json::to_value(request).unwrap();

@@ -32,6 +32,18 @@
 
         <div class="control-row">
           <label>
+            Selected context mode
+            <select
+              v-model="contextMode"
+              data-test="context-mode"
+            >
+              <option value="system_only">System only</option>
+              <option value="retrieval_only">Retrieval only</option>
+              <option value="constitution_only">Constitution only</option>
+              <option value="retrieval_and_constitution">Retrieval and constitution</option>
+            </select>
+          </label>
+          <label>
             Answer key (optional)
             <input
               v-model="answerKey"
@@ -62,9 +74,43 @@
               class="short-input"
             >
           </label>
+          <label>
+            <input
+              v-model="showReasoningTrace"
+              data-test="show-trace"
+              type="checkbox"
+            >
+            Show reasoning trace
+          </label>
+          <label>
+            <input
+              v-model="structuredOutput"
+              data-test="structured-output"
+              type="checkbox"
+            >
+            Structured JSON output
+          </label>
         </div>
 
+        <label>
+          System prompt
+          <textarea
+            v-model="systemPrompt"
+            data-test="system-prompt"
+            :disabled="contextMode !== 'system_only'"
+            class="system-prompt-input"
+          />
+        </label>
+
         <div class="actions">
+          <button
+            data-test="preview-input"
+            class="btn secondary"
+            :disabled="!rawQuestion.trim()"
+            @click="previewInput"
+          >
+            Preview Input
+          </button>
           <button
             data-test="preview-context"
             class="btn secondary"
@@ -81,6 +127,15 @@
           >
             {{ running ? 'Running...' : 'Run Models' }}
           </button>
+        </div>
+        <div
+          v-if="inputPreview"
+          class="input-preview"
+        >
+          <p v-for="option in inputPreview.options" :key="option.key">
+            {{ option.key }}. {{ option.text }}
+          </p>
+          <p>{{ inputPreview.answer_key ? `Answer key: ${inputPreview.answer_key}` : 'No answer key' }}</p>
         </div>
         <p
           v-if="errorMessage"
@@ -160,6 +215,7 @@
           <h2>Results</h2>
           <div class="actions">
             <button
+              data-test="export-json"
               class="btn secondary"
               @click="downloadExport('json')"
             >
@@ -318,7 +374,7 @@
                   </td>
                 </tr>
                 <tr
-                  v-if="result.model_trace && isTraceOpen(runIdx, result.model_key)"
+                  v-if="result.model_trace && (showReasoningTrace || isTraceOpen(runIdx, result.model_key))"
                   class="trace-row"
                 >
                   <td colspan="6">
@@ -343,15 +399,19 @@
 
 <script setup>
 import { computed, onMounted, ref } from 'vue'
-import { invoke } from '@tauri-apps/api/tauri'
 import { twinEval } from '../api/client'
 
 const rawQuestion = ref('')
 const answerKey = ref('')
 const temperature = ref(0.2)
 const topP = ref(0.95)
+const contextMode = ref('system_only')
+const systemPrompt = ref('')
+const showReasoningTrace = ref(false)
+const structuredOutput = ref(false)
 const modelMatrix = ref([])
 const selectedModelKeys = ref([])
+const inputPreview = ref(null)
 const contextPacket = ref(null)
 const allRuns = ref([])
 const expandedTraces = ref(new Set())
@@ -404,57 +464,35 @@ async function previewContext() {
   }
 }
 
+async function previewInput() {
+  errorMessage.value = ''
+  try {
+    inputPreview.value = await twinEval.previewInput(
+      rawQuestion.value,
+      answerKey.value.trim().toUpperCase() || null
+    )
+  } catch (error) {
+    errorMessage.value = String(error)
+  }
+}
+
 async function runLab() {
   running.value = true
   errorMessage.value = ''
-
-  // activeRun is mutated by event handlers; we capture a ref so handlers can find it
-  let activeRun = null
-  let unlisten = null
-
   try {
-    const { listen } = await import('@tauri-apps/api/event')
-    unlisten = await listen('lab-stream', (event) => {
-      const e = event.payload
-      if (e.type === 'start') {
-        activeRun = {
-          question: e.question,
-          context_packet: e.context_packet,
-          results: [],
-          skipped: [],
-          pendingKeys: new Set(e.model_keys)
-        }
-        contextPacket.value = e.context_packet
-        allRuns.value.push(activeRun)
-      } else if (e.type === 'model_start') {
-        // pendingKeys already seeded from start event; nothing extra needed
-      } else if (e.type === 'model_complete') {
-        if (activeRun) {
-          activeRun.pendingKeys.delete(e.result.model_key)
-          activeRun.results.push(e.result)
-          // trigger Vue reactivity on the array
-          allRuns.value = [...allRuns.value]
-        }
-      } else if (e.type === 'complete') {
-        if (activeRun) {
-          activeRun.skipped = e.skipped_models || []
-          activeRun.pendingKeys = new Set()
-          allRuns.value = [...allRuns.value]
-        }
-        running.value = false
-        unlisten?.()
-      } else if (e.type === 'error') {
-        errorMessage.value = e.message
-        running.value = false
-        unlisten?.()
-      }
+    const report = await twinEval.runLab(buildRequest())
+    contextPacket.value = report.context_packet
+    allRuns.value.push({
+      question: report.question,
+      context_packet: report.context_packet,
+      results: report.results,
+      skipped: report.skipped_models || [],
+      pendingKeys: new Set()
     })
-
-    await invoke('run_twin_eval_lab_stream', { request: buildRequest() })
   } catch (error) {
     errorMessage.value = String(error)
+  } finally {
     running.value = false
-    unlisten?.()
   }
 }
 
@@ -483,11 +521,12 @@ function buildRequest() {
     raw_question: rawQuestion.value,
     answer_key: answerKey.value.trim().toUpperCase() || null,
     model_keys: selectedModelKeys.value,
-    context_mode: 'retrieval_and_constitution',
+    context_mode: contextMode.value,
     temperature: temperature.value,
     top_p: topP.value,
-    structured_output: false,
-    show_reasoning_trace: true
+    system_prompt: contextMode.value === 'system_only' ? systemPrompt.value || null : null,
+    structured_output: structuredOutput.value,
+    show_reasoning_trace: showReasoningTrace.value
   }
 }
 
@@ -617,6 +656,24 @@ input {
   padding: 7px 10px;
   background: #ffffff;
   font-size: 0.9rem;
+}
+
+select,
+.system-prompt-input {
+  border: 1px solid #c8d0dc;
+  border-radius: 6px;
+  padding: 7px 10px;
+  background: #ffffff;
+  font: inherit;
+}
+
+.system-prompt-input {
+  min-height: 72px;
+  resize: vertical;
+}
+
+.input-preview p {
+  margin: 6px 0 0;
 }
 
 .short-input {
