@@ -91,7 +91,7 @@ pub fn all_payloads() -> Vec<TwinEventPayload> {
             response_id: id(),
             prompt: BoundedContent::parse("prompt text").unwrap(),
             response: BoundedContent::parse("response text").unwrap(),
-            model_id: id(),
+            model_id: ModelId::parse("anthropic/claude-3.5-haiku").unwrap(),
             provider: None,
             provenance: None,
             tokens_used: None,

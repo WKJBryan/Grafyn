@@ -57,8 +57,14 @@ fn encode_context(out: &mut Encoder, context: &EventContext) {
         out.tag("context.entity", "grafyn.context_entity.v1");
         out.text("entity_id", entity.entity_id.as_str());
         out.text("entity_type", entity.entity_type.as_str());
-        out.optional_text("display_label", entity.display_label.as_deref());
-        out.optional_text("role_in_event", entity.role_in_event.as_deref());
+        out.optional_text(
+            "display_label",
+            entity.display_label.as_ref().map(BoundedLabel::as_str),
+        );
+        out.optional_text(
+            "role_in_event",
+            entity.role_in_event.as_ref().map(BoundedRole::as_str),
+        );
     }
     out.count("context.relationships", context.relationships.len());
     for relation in &context.relationships {
@@ -197,7 +203,7 @@ fn encode_payload(out: &mut Encoder, payload: &TwinEventPayload) {
             out.text("turn_id", v.turn_id.as_str());
             out.text("role", v.role.as_str());
             out.text("content", v.content.as_str());
-            out.optional_text("model_id", v.model_id.as_ref().map(Identifier::as_str));
+            out.optional_text("model_id", v.model_id.as_ref().map(ModelId::as_str));
             out.optional_text(
                 "provenance",
                 v.provenance.as_ref().map(ProvenanceLabel::as_str),
@@ -220,7 +226,10 @@ fn encode_payload(out: &mut Encoder, payload: &TwinEventPayload) {
                 v.provenance.as_ref().map(ProvenanceLabel::as_str),
             );
             out.optional_u64("tokens_used", v.tokens_used);
-            out.optional_text("cost_usd_decimal", v.cost_usd_decimal.as_deref());
+            out.optional_text(
+                "cost_usd_decimal",
+                v.cost_usd_decimal.as_ref().map(DecimalCost::as_str),
+            );
             out.optional_text(
                 "prompt_digest",
                 v.prompt_digest.as_ref().map(ContentDigest::as_str),
@@ -497,7 +506,7 @@ mod tests {
             TwinEventPayload::CanvasResponseRecorded(canvas.clone()),
         ));
         let mut changed = canvas;
-        changed.cost_usd_decimal = Some("0.25".into());
+        changed.cost_usd_decimal = Some(DecimalCost::parse("0.25").unwrap());
         assert_ne!(
             baseline,
             super::derive_event_id(&event_for_payload(
@@ -542,5 +551,51 @@ mod tests {
                 TwinEventPayload::DecisionOutcomeRecorded(changed)
             ))
         );
+    }
+
+    #[test]
+    fn decision_option_order_and_duplicates_are_semantic_and_preserved() {
+        use crate::models::twin_event::*;
+        use crate::services::twin_events::test_support::event_for_payload;
+        let decision = |options: &[&str]| {
+            event_for_payload(TwinEventPayload::DecisionRecorded(DecisionRecorded {
+                decision_id: Identifier::parse("decision-1").unwrap(),
+                decision: BoundedContent::parse("choose").unwrap(),
+                options: options
+                    .iter()
+                    .map(|value| BoundedContent::parse(*value).unwrap())
+                    .collect(),
+                stakes: None,
+                initial_leaning: None,
+            }))
+        };
+        let first = decision(&["alpha", "alpha", "beta"]);
+        let reversed = decision(
+            &["alpha", "alpha", "beta"]
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>(),
+        );
+        assert_ne!(
+            super::derive_event_id(&first),
+            super::derive_event_id(&reversed)
+        );
+
+        let mut normalized = first.clone();
+        normalized.normalize();
+        let TwinEventPayload::DecisionRecorded(payload) = normalized.payload else {
+            unreachable!()
+        };
+        assert_eq!(
+            payload
+                .options
+                .iter()
+                .map(BoundedContent::as_str)
+                .collect::<Vec<_>>(),
+            vec!["alpha", "alpha", "beta"]
+        );
+        let round_trip: TwinEvent =
+            serde_json::from_str(&serde_json::to_string(&first).unwrap()).unwrap();
+        assert_eq!(round_trip, first);
     }
 }

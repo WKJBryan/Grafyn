@@ -9,6 +9,8 @@ use std::sync::Mutex;
 use uuid::Uuid;
 use walkdir::WalkDir;
 
+pub const MAX_TWIN_EVENT_BYTES: usize = 256 * 1024;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppendOutcome {
     Appended,
@@ -89,21 +91,18 @@ impl TwinEventStore {
             .join("append-v1.lock")
     }
 
+    fn canonical_event_path(&self, event_id: &EventId) -> PathBuf {
+        self.events_dir()
+            .join(&event_id.as_str()[..2])
+            .join(format!("{event_id}.json"))
+    }
+
     pub fn initialize(&self) -> Result<(), StoreError> {
         let mut state = self
             .state
             .lock()
             .map_err(|_| StoreError::Invalid("Twin event store lock poisoned".into()))?;
-        fs::create_dir_all(self.events_dir()).map_err(|error| {
-            StoreError::Io(format!(
-                "failed to initialize canonical Twin event directory: {error}"
-            ))
-        })?;
-        fs::create_dir_all(self.quarantine_dir()).map_err(|error| {
-            StoreError::Io(format!(
-                "failed to initialize Twin event quarantine: {error}"
-            ))
-        })?;
+        self.ensure_store_layout()?;
         let lock = self.acquire_process_lock()?;
         let events = self.load_records()?;
         FileExt::unlock(&lock)?;
@@ -122,6 +121,7 @@ impl TwinEventStore {
         }
         event.validate().map_err(StoreError::Invalid)?;
         event.normalize();
+        let bytes = serialize_record(&event)?;
         let lock = self.acquire_process_lock()?;
         state.events = self.load_records()?;
 
@@ -150,7 +150,7 @@ impl TwinEventStore {
                 return Err(StoreError::MissingParent(parent.clone()));
             }
         }
-        self.install_no_clobber(&event)?;
+        self.install_no_clobber(&event, &bytes)?;
         state.events.insert(event.event_id.clone(), event);
         FileExt::unlock(&lock)?;
         Ok(AppendOutcome::Appended)
@@ -171,31 +171,113 @@ impl TwinEventStore {
     }
 
     fn acquire_process_lock(&self) -> Result<File, StoreError> {
-        let parent = self
-            .lock_path()
-            .parent()
-            .expect("lock path has parent")
-            .to_path_buf();
-        fs::create_dir_all(parent)?;
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
+        self.validate_store_layout()?;
+        let path = self.lock_path();
+        let file = match OpenOptions::new()
+            .create_new(true)
             .read(true)
             .write(true)
-            .open(self.lock_path())?;
+            .open(&path)
+        {
+            Ok(file) => {
+                sync_directory(&self.events_dir())?;
+                file
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                validate_real_file(&path, "Twin event process lock")?;
+                OpenOptions::new().read(true).write(true).open(&path)?
+            }
+            Err(error) => return Err(error.into()),
+        };
+        validate_real_file(&path, "Twin event process lock")?;
         file.lock_exclusive()?;
         Ok(file)
     }
 
+    fn ensure_store_layout(&self) -> Result<(), StoreError> {
+        if !self.data_path.exists() {
+            fs::create_dir_all(&self.data_path)?;
+        }
+        let root = fs::metadata(&self.data_path)?;
+        if !root.is_dir() {
+            return Err(StoreError::Invalid(format!(
+                "trusted app-data root is not a directory: {}",
+                self.data_path.display()
+            )));
+        }
+        let twin = ensure_real_child_directory(&self.data_path, "twin", true)?;
+        let events = ensure_real_child_directory(&twin, "events", false)?;
+        ensure_real_child_directory(&events, "v1", false).map_err(|error| {
+            StoreError::Io(format!(
+                "failed to initialize canonical Twin event directory: {error}"
+            ))
+        })?;
+        let quarantine = ensure_real_child_directory(&events, "quarantine", false)?;
+        ensure_real_child_directory(&quarantine, "v1", false).map_err(|error| {
+            StoreError::Io(format!(
+                "failed to initialize Twin event quarantine: {error}"
+            ))
+        })?;
+        Ok(())
+    }
+
+    fn validate_store_layout(&self) -> Result<(), StoreError> {
+        let root = fs::metadata(&self.data_path)?;
+        if !root.is_dir() {
+            return Err(StoreError::Invalid(format!(
+                "trusted app-data root is not a directory: {}",
+                self.data_path.display()
+            )));
+        }
+        validate_real_directory(&self.data_path.join("twin"), "Twin directory")?;
+        validate_real_directory(
+            &self.data_path.join("twin").join("events"),
+            "Twin events directory",
+        )?;
+        validate_real_directory(&self.events_dir(), "canonical Twin event directory")?;
+        validate_real_directory(
+            &self
+                .data_path
+                .join("twin")
+                .join("events")
+                .join("quarantine"),
+            "Twin event quarantine directory",
+        )?;
+        validate_real_directory(&self.quarantine_dir(), "Twin event quarantine v1 directory")?;
+        Ok(())
+    }
+
     fn load_records(&self) -> Result<BTreeMap<EventId, TwinEvent>, StoreError> {
+        self.validate_store_layout()?;
         let mut parsed = Vec::new();
         for entry in WalkDir::new(self.events_dir()).min_depth(1) {
             let entry = entry.map_err(|error| {
                 StoreError::Io(format!("failed to read Twin event directory: {error}"))
             })?;
+            if entry.file_type().is_symlink() {
+                return Err(StoreError::Invalid(format!(
+                    "canonical Twin event tree contains a symlink: {}",
+                    entry.path().display()
+                )));
+            }
+            if entry.file_type().is_dir() {
+                validate_real_directory(entry.path(), "canonical Twin event tree directory")?;
+                continue;
+            }
             if !entry.file_type().is_file()
                 || entry.path().extension().and_then(|v| v.to_str()) != Some("json")
             {
+                continue;
+            }
+            validate_real_file(entry.path(), "canonical Twin event record")?;
+            let metadata = fs::symlink_metadata(entry.path()).map_err(|error| {
+                StoreError::Io(format!(
+                    "failed to inspect Twin event {}: {error}",
+                    entry.path().display()
+                ))
+            })?;
+            if validate_record_size(metadata.len()).is_err() {
+                self.quarantine(entry.path())?;
                 continue;
             }
             let bytes = fs::read(entry.path()).map_err(|error| {
@@ -210,6 +292,10 @@ impl TwinEventStore {
                         self.quarantine(entry.path())?;
                         continue;
                     }
+                    if entry.path() != self.canonical_event_path(&event.event_id) {
+                        self.quarantine(entry.path())?;
+                        continue;
+                    }
                     event.normalize();
                     event
                 }
@@ -220,20 +306,39 @@ impl TwinEventStore {
             };
             parsed.push((entry.path().to_path_buf(), event));
         }
-        let known: BTreeSet<_> = parsed
+        let mut known: BTreeSet<_> = parsed
             .iter()
             .map(|(_, event)| event.event_id.clone())
             .collect();
+        loop {
+            let invalid: BTreeSet<_> = parsed
+                .iter()
+                .filter(|(_, event)| {
+                    event
+                        .causal_parents
+                        .iter()
+                        .any(|parent| !known.contains(parent))
+                })
+                .map(|(_, event)| event.event_id.clone())
+                .collect();
+            if invalid.is_empty() {
+                break;
+            }
+            let mut retained = Vec::with_capacity(parsed.len() - invalid.len());
+            for (path, event) in parsed {
+                if invalid.contains(&event.event_id) {
+                    self.quarantine(&path)?;
+                } else {
+                    retained.push((path, event));
+                }
+            }
+            for event_id in &invalid {
+                known.remove(event_id);
+            }
+            parsed = retained;
+        }
         let mut events = BTreeMap::new();
         for (path, event) in parsed {
-            if event
-                .causal_parents
-                .iter()
-                .any(|parent| !known.contains(parent))
-            {
-                self.quarantine(&path)?;
-                continue;
-            }
             if let Some(existing) = events.get(&event.event_id) {
                 if semantic_bytes(existing) != semantic_bytes(&event) {
                     return Err(StoreError::Collision(event.event_id));
@@ -249,7 +354,8 @@ impl TwinEventStore {
     }
 
     fn quarantine(&self, source: &Path) -> Result<(), StoreError> {
-        fs::create_dir_all(self.quarantine_dir())?;
+        self.validate_store_layout()?;
+        validate_real_file(source, "quarantined Twin event record")?;
         let name = source
             .file_name()
             .and_then(|v| v.to_str())
@@ -262,13 +368,16 @@ impl TwinEventStore {
                 "failed to quarantine malformed Twin event {}: {error}",
                 source.display()
             ))
-        })
+        })?;
+        sync_directory(source.parent().expect("quarantined record has parent"))?;
+        sync_directory(&self.quarantine_dir())?;
+        Ok(())
     }
 
-    fn install_no_clobber(&self, event: &TwinEvent) -> Result<(), StoreError> {
+    fn install_no_clobber(&self, event: &TwinEvent, bytes: &[u8]) -> Result<(), StoreError> {
+        self.validate_store_layout()?;
         let prefix = &event.event_id.as_str()[..2];
-        let directory = self.events_dir().join(prefix);
-        fs::create_dir_all(&directory)?;
+        let directory = ensure_real_child_directory(&self.events_dir(), prefix, false)?;
         let target = directory.join(format!("{}.json", event.event_id));
         let temporary = directory.join(format!(".{}.{}.tmp", event.event_id, Uuid::new_v4()));
         let result = (|| {
@@ -276,20 +385,15 @@ impl TwinEventStore {
                 .create_new(true)
                 .write(true)
                 .open(&temporary)?;
-            let bytes = serde_json::to_vec_pretty(event)
-                .map_err(|error| StoreError::Invalid(error.to_string()))?;
-            file.write_all(&bytes)?;
-            file.write_all(b"\n")?;
+            file.write_all(bytes)?;
             file.sync_all()?;
             match fs::hard_link(&temporary, &target) {
-                Ok(()) => Ok(()),
+                Ok(()) => {
+                    sync_directory(&directory)?;
+                    Ok(())
+                }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                    let existing: TwinEvent =
-                        serde_json::from_slice(&fs::read(&target)?).map_err(|parse| {
-                            StoreError::Invalid(format!(
-                                "existing Twin event is malformed: {parse}"
-                            ))
-                        })?;
+                    let existing = self.read_existing_canonical(&target, &event.event_id)?;
                     if semantic_bytes(&existing) == semantic_bytes(event) {
                         Ok(())
                     } else {
@@ -309,7 +413,144 @@ impl TwinEventStore {
                 )));
             }
         }
+        sync_directory(&directory)?;
         result
+    }
+
+    fn read_existing_canonical(
+        &self,
+        path: &Path,
+        expected_id: &EventId,
+    ) -> Result<TwinEvent, StoreError> {
+        validate_real_file(path, "existing canonical Twin event")?;
+        let metadata = fs::symlink_metadata(path)?;
+        validate_record_size(metadata.len())?;
+        let mut event: TwinEvent = serde_json::from_slice(&fs::read(path)?).map_err(|error| {
+            StoreError::Invalid(format!("existing Twin event is malformed: {error}"))
+        })?;
+        event.validate().map_err(StoreError::Invalid)?;
+        if &event.event_id != expected_id
+            || derive_event_id(&event) != event.event_id
+            || path != self.canonical_event_path(&event.event_id)
+        {
+            return Err(StoreError::Invalid(
+                "existing Twin event is not a canonical record".into(),
+            ));
+        }
+        event.normalize();
+        Ok(event)
+    }
+}
+
+fn serialize_record(event: &TwinEvent) -> Result<Vec<u8>, StoreError> {
+    let mut bytes =
+        serde_json::to_vec_pretty(event).map_err(|error| StoreError::Invalid(error.to_string()))?;
+    bytes.push(b'\n');
+    validate_record_size(bytes.len() as u64)?;
+    Ok(bytes)
+}
+
+fn ensure_real_child_directory(
+    parent: &Path,
+    name: &str,
+    parent_is_trusted_root: bool,
+) -> Result<PathBuf, StoreError> {
+    if parent_is_trusted_root {
+        if !fs::metadata(parent)?.is_dir() {
+            return Err(StoreError::Invalid(format!(
+                "trusted directory boundary is not a directory: {}",
+                parent.display()
+            )));
+        }
+    } else {
+        validate_real_directory(parent, "Twin event directory parent")?;
+    }
+    let path = parent.join(name);
+    match fs::symlink_metadata(&path) {
+        Ok(_) => validate_real_directory(&path, "Twin event directory component")?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            fs::create_dir(&path)?;
+            if parent_is_trusted_root {
+                sync_directory_impl(parent, true)?;
+            } else {
+                sync_directory(parent)?;
+            }
+            validate_real_directory(&path, "Twin event directory component")?;
+        }
+        Err(error) => return Err(error.into()),
+    }
+    Ok(path)
+}
+
+fn validate_real_directory(path: &Path, label: &str) -> Result<(), StoreError> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(StoreError::Invalid(format!(
+            "{label} must be a real directory, not a symlink or other entry: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_real_file(path: &Path, label: &str) -> Result<(), StoreError> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(StoreError::Invalid(format!(
+            "{label} must be a real regular file, not a symlink or other entry: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_record_size(length: u64) -> Result<(), StoreError> {
+    if length > MAX_TWIN_EVENT_BYTES as u64 {
+        return Err(StoreError::Invalid(format!(
+            "Twin event record exceeds the {MAX_TWIN_EVENT_BYTES}-byte limit"
+        )));
+    }
+    Ok(())
+}
+
+fn sync_directory(path: &Path) -> Result<(), StoreError> {
+    sync_directory_impl(path, false)
+}
+
+fn sync_directory_impl(path: &Path, trusted_boundary: bool) -> Result<(), StoreError> {
+    let metadata = if trusted_boundary {
+        fs::metadata(path)?
+    } else {
+        fs::symlink_metadata(path)?
+    };
+    if (!trusted_boundary && metadata.file_type().is_symlink()) || !metadata.is_dir() {
+        return Err(StoreError::Invalid(format!(
+            "directory sync target is not a real directory: {}",
+            path.display()
+        )));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        let directory = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)?;
+        directory.sync_all()?;
+        Ok(())
+    }
+    #[cfg(unix)]
+    {
+        File::open(path)?.sync_all()?;
+        Ok(())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        Err(StoreError::Io(
+            "directory synchronization is unsupported on this platform".into(),
+        ))
     }
 }
 
@@ -450,7 +691,60 @@ impl EventRecorder for NoopEventRecorder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::twin_event::{
+        BoundedContent, DecisionRecorded, Identifier, TwinEventPayload, MAX_DECISION_OPTIONS,
+    };
     use crate::services::twin_events::test_support::{valid_event, valid_event_for_device};
+
+    fn write_event(path: &Path, event: &TwinEvent) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, serde_json::to_vec_pretty(event).unwrap()).unwrap();
+    }
+
+    fn canonical_path(store: &TwinEventStore, event: &TwinEvent) -> PathBuf {
+        store
+            .events_dir()
+            .join(&event.event_id.as_str()[..2])
+            .join(format!("{}.json", event.event_id))
+    }
+
+    fn try_symlink_dir(original: &Path, link: &Path) -> bool {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(original, link).unwrap();
+            true
+        }
+        #[cfg(windows)]
+        {
+            match std::os::windows::fs::symlink_dir(original, link) {
+                Ok(()) => true,
+                Err(error) if error.raw_os_error() == Some(1314) => {
+                    eprintln!("skipping symlink regression without Windows symlink privilege");
+                    false
+                }
+                Err(error) => panic!("failed to create directory symlink: {error}"),
+            }
+        }
+    }
+
+    fn try_symlink_file(original: &Path, link: &Path) -> bool {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(original, link).unwrap();
+            true
+        }
+        #[cfg(windows)]
+        {
+            match std::os::windows::fs::symlink_file(original, link) {
+                Ok(()) => true,
+                Err(error) if error.raw_os_error() == Some(1314) => {
+                    eprintln!("skipping symlink regression without Windows symlink privilege");
+                    false
+                }
+                Err(error) => panic!("failed to create file symlink: {error}"),
+            }
+        }
+    }
 
     #[test]
     fn duplicate_is_noop_and_collision_is_rejected() {
@@ -614,5 +908,198 @@ mod tests {
         second.initialize().unwrap();
         second.append(valid_event(1, Vec::new())).unwrap();
         assert_eq!(first.ordered_events().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn record_size_limit_is_inclusive() {
+        assert!(validate_record_size(MAX_TWIN_EVENT_BYTES as u64).is_ok());
+        assert!(validate_record_size(MAX_TWIN_EVENT_BYTES as u64 + 1).is_err());
+    }
+
+    #[test]
+    fn oversized_append_is_rejected_before_installation() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = TwinEventStore::new(temp.path());
+        store.initialize().unwrap();
+        let options = (0..MAX_DECISION_OPTIONS)
+            .map(|index| {
+                BoundedContent::parse(format!("{index:02}{}", "x".repeat(32_760))).unwrap()
+            })
+            .collect();
+        let mut event = crate::services::twin_events::test_support::event_for_payload(
+            TwinEventPayload::DecisionRecorded(DecisionRecorded {
+                decision_id: Identifier::parse("large-decision").unwrap(),
+                decision: BoundedContent::parse("choose").unwrap(),
+                options,
+                stakes: None,
+                initial_leaning: None,
+            }),
+        );
+        event.event_id = crate::services::twin_events::derive_event_id(&event);
+        assert!(matches!(store.append(event), Err(StoreError::Invalid(_))));
+        assert_eq!(
+            WalkDir::new(store.events_dir())
+                .into_iter()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.path().extension().and_then(|v| v.to_str()) == Some("json"))
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn oversized_record_is_quarantined_before_parsing() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = TwinEventStore::new(temp.path());
+        let path = store
+            .events_dir()
+            .join("aa")
+            .join(format!("{}.json", "a".repeat(64)));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, vec![b' '; MAX_TWIN_EVENT_BYTES + 1]).unwrap();
+        store.initialize().unwrap();
+        assert!(!path.exists());
+        assert_eq!(
+            std::fs::read_dir(store.quarantine_dir()).unwrap().count(),
+            1
+        );
+    }
+
+    #[test]
+    fn directory_sync_helper_accepts_a_directory_and_rejects_a_file() {
+        let temp = tempfile::tempdir().unwrap();
+        sync_directory(temp.path()).unwrap();
+        let file = temp.path().join("file");
+        std::fs::write(&file, b"data").unwrap();
+        assert!(sync_directory(&file).is_err());
+    }
+
+    #[test]
+    fn wrong_path_is_quarantined_before_duplicates_and_canonical_copy_is_preserved() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = TwinEventStore::new(temp.path());
+        let event = (0..100)
+            .map(|index| valid_event_for_device(&format!("device-{index}"), 1, Vec::new()))
+            .find(|event| &event.event_id.as_str()[..2] != "00")
+            .unwrap();
+        let wrong = store
+            .events_dir()
+            .join("00")
+            .join(format!("{}.json", event.event_id));
+        let canonical = canonical_path(&store, &event);
+        write_event(&wrong, &event);
+        write_event(&canonical, &event);
+
+        store.initialize().unwrap();
+
+        assert_eq!(store.ordered_events().unwrap(), vec![event]);
+        assert!(canonical.exists());
+        assert!(!wrong.exists());
+        assert_eq!(
+            std::fs::read_dir(store.quarantine_dir()).unwrap().count(),
+            1
+        );
+    }
+
+    #[test]
+    fn unknown_bytes_under_an_unchanged_event_id_are_quarantined() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = TwinEventStore::new(temp.path());
+        let event = valid_event(1, Vec::new());
+        let mut json = serde_json::to_value(&event).unwrap();
+        json["payload"]["data"]["api_key"] = serde_json::json!("must-not-pass");
+        let path = canonical_path(&store, &event);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, serde_json::to_vec_pretty(&json).unwrap()).unwrap();
+
+        store.initialize().unwrap();
+
+        assert!(store.ordered_events().unwrap().is_empty());
+        assert!(!path.exists());
+        assert_eq!(
+            std::fs::read_dir(store.quarantine_dir()).unwrap().count(),
+            1
+        );
+    }
+
+    #[test]
+    fn missing_parent_quarantine_is_transitively_closed_in_one_initialization() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = TwinEventStore::new(temp.path());
+        let missing =
+            EventId::parse("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+                .unwrap();
+        let child = valid_event_for_device("bad-child", 1, vec![missing]);
+        let grandchild = valid_event_for_device("bad-grandchild", 1, vec![child.event_id.clone()]);
+        let clean = valid_event_for_device("clean-sibling", 1, Vec::new());
+        for event in [&child, &grandchild, &clean] {
+            write_event(&canonical_path(&store, event), event);
+        }
+
+        store.initialize().unwrap();
+
+        assert_eq!(store.ordered_events().unwrap(), vec![clean]);
+        assert_eq!(
+            std::fs::read_dir(store.quarantine_dir()).unwrap().count(),
+            2
+        );
+        assert!(!canonical_path(&store, &child).exists());
+        assert!(!canonical_path(&store, &grandchild).exists());
+    }
+
+    #[test]
+    fn real_store_components_initialize_and_append_normally() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = TwinEventStore::new(temp.path());
+        store.initialize().unwrap();
+        let event = valid_event(1, Vec::new());
+        store.append(event.clone()).unwrap();
+        assert!(canonical_path(&store, &event).is_file());
+    }
+
+    #[test]
+    fn symlinked_twin_component_fails_initialization_closed() {
+        let temp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        if !try_symlink_dir(outside.path(), &temp.path().join("twin")) {
+            return;
+        }
+        let store = TwinEventStore::new(temp.path());
+        assert!(store.initialize().is_err());
+        assert!(!outside.path().join("events").exists());
+    }
+
+    #[test]
+    fn symlinked_prefix_cannot_redirect_an_append() {
+        let temp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let store = TwinEventStore::new(temp.path());
+        store.initialize().unwrap();
+        let event = valid_event(1, Vec::new());
+        let prefix = store.events_dir().join(&event.event_id.as_str()[..2]);
+        if !try_symlink_dir(outside.path(), &prefix) {
+            return;
+        }
+        assert!(store.append(event).is_err());
+        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn symlinked_canonical_target_and_encountered_record_fail_closed() {
+        let temp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let store = TwinEventStore::new(temp.path());
+        store.initialize().unwrap();
+        let event = valid_event(1, Vec::new());
+        let target = canonical_path(&store, &event);
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        let external = outside.path().join("event.json");
+        write_event(&external, &event);
+        if !try_symlink_file(&external, &target) {
+            return;
+        }
+        assert!(store.append(event).is_err());
+        let peer = TwinEventStore::new(temp.path());
+        assert!(peer.initialize().is_err());
     }
 }

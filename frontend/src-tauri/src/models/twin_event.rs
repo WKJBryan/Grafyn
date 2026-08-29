@@ -2,6 +2,19 @@ use chrono::{DateTime, Utc};
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
 use std::fmt;
 
+pub const MAX_CAUSAL_PARENTS: usize = 64;
+pub const MAX_EVENT_LINKS: usize = 64;
+pub const MAX_EVIDENCE_REFS: usize = 64;
+pub const MAX_CONTEXT_ENTITIES: usize = 64;
+pub const MAX_CONTEXT_RELATIONSHIPS: usize = 64;
+pub const MAX_CONTEXT_VALUES: usize = 64;
+pub const MAX_RELATIONSHIP_EVIDENCE: usize = 32;
+pub const MAX_CLAIMS: usize = 64;
+pub const MAX_DECISION_OPTIONS: usize = 32;
+pub const MAX_LABEL_BYTES: usize = 256;
+pub const MAX_ROLE_BYTES: usize = 128;
+pub const MAX_COST_DECIMAL_BYTES: usize = 64;
+
 fn validate_identifier(value: &str) -> Result<(), String> {
     if value.is_empty() || value.len() > 256 || value == "." || value == ".." {
         return Err("identifier must contain 1..=256 safe characters".into());
@@ -59,6 +72,45 @@ identifier_type!(EntityType);
 identifier_type!(ClaimPredicate);
 identifier_type!(RelationshipPredicate);
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(transparent)]
+pub struct ModelId(String);
+
+impl ModelId {
+    pub fn parse(value: impl Into<String>) -> Result<Self, String> {
+        let value = value.into();
+        if value.is_empty()
+            || value.len() > 256
+            || value.contains('\\')
+            || value.chars().any(|character| {
+                character.is_whitespace()
+                    || character.is_control()
+                    || !(character.is_ascii_alphanumeric()
+                        || matches!(character, '-' | '_' | '.' | ':' | '/' | '@'))
+            })
+            || value
+                .split(['/', ':'])
+                .any(|segment| segment.is_empty() || matches!(segment, "." | ".."))
+        {
+            return Err("model id contains unsafe or unsupported path material".into());
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for ModelId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Self::parse(String::deserialize(deserializer)?).map_err(D::Error::custom)
+    }
+}
+
 fn validate_text(value: &str, limit: usize, name: &str) -> Result<(), String> {
     if value.trim().is_empty() || value.len() > limit || value.chars().any(char::is_control) {
         return Err(format!(
@@ -96,8 +148,37 @@ macro_rules! validated_text_type {
 
 validated_text_type!(ClaimObject, 4096, "claim object");
 validated_text_type!(BoundedSummary, 1024, "summary");
-validated_text_type!(BoundedRole, 128, "role or kind");
+validated_text_type!(BoundedLabel, MAX_LABEL_BYTES, "label");
+validated_text_type!(BoundedRole, MAX_ROLE_BYTES, "role or kind");
 validated_text_type!(ProvenanceLabel, 512, "provenance");
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(transparent)]
+pub struct DecimalCost(String);
+
+impl DecimalCost {
+    pub fn parse(value: impl Into<String>) -> Result<Self, String> {
+        let value = value.into();
+        if value.len() > MAX_COST_DECIMAL_BYTES {
+            return Err("cost exceeds its byte limit".into());
+        }
+        validate_decimal(&value)?;
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for DecimalCost {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Self::parse(String::deserialize(deserializer)?).map_err(D::Error::custom)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
@@ -206,7 +287,7 @@ where
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum TwinEventType {
     ObservationRecorded,
     NoteChanged,
@@ -221,6 +302,7 @@ pub enum TwinEventType {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TwinEvent {
     pub schema_version: u16,
     pub event_id: EventId,
@@ -270,6 +352,32 @@ impl TwinEvent {
         {
             return Err("relationship context observation requires a relationship".into());
         }
+        validate_max_len(&self.causal_parents, MAX_CAUSAL_PARENTS, "causal_parents")?;
+        validate_max_len(&self.supersedes, MAX_EVENT_LINKS, "supersedes")?;
+        validate_max_len(&self.reinforces, MAX_EVENT_LINKS, "reinforces")?;
+        validate_max_len(
+            &self.context.entities,
+            MAX_CONTEXT_ENTITIES,
+            "context.entities",
+        )?;
+        validate_max_len(
+            &self.context.relationships,
+            MAX_CONTEXT_RELATIONSHIPS,
+            "context.relationships",
+        )?;
+        validate_max_len(
+            &self.context.environments,
+            MAX_CONTEXT_VALUES,
+            "context.environments",
+        )?;
+        validate_max_len(
+            &self.context.activities,
+            MAX_CONTEXT_VALUES,
+            "context.activities",
+        )?;
+        validate_max_len(&self.context.goals, MAX_CONTEXT_VALUES, "context.goals")?;
+        validate_max_len(&self.context.tags, MAX_CONTEXT_VALUES, "context.tags")?;
+        validate_max_len(&self.evidence, MAX_EVIDENCE_REFS, "evidence")?;
         for value in self
             .context
             .environments
@@ -281,6 +389,11 @@ impl TwinEvent {
             validate_text(value, 256, "context value")?;
         }
         for relationship in &self.context.relationships {
+            validate_max_len(
+                &relationship.evidence,
+                MAX_RELATIONSHIP_EVIDENCE,
+                "relationship.evidence",
+            )?;
             if relationship
                 .valid_from
                 .zip(relationship.valid_to)
@@ -320,6 +433,13 @@ impl TwinEvent {
     }
 }
 
+fn validate_max_len<T>(items: &[T], limit: usize, name: &str) -> Result<(), String> {
+    if items.len() > limit {
+        return Err(format!("{name} exceeds its {limit}-item limit"));
+    }
+    Ok(())
+}
+
 fn validate_unique<T: Ord + Clone>(items: &[T], name: &str) -> Result<(), String> {
     let mut normalized = items.to_vec();
     sort_dedup(&mut normalized);
@@ -335,6 +455,7 @@ fn sort_dedup<T: Ord>(items: &mut Vec<T>) {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EventContext {
     pub entities: Vec<ContextEntity>,
     pub relationships: Vec<RelationshipAssertion>,
@@ -360,16 +481,18 @@ impl Default for EventContext {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ContextEntity {
     pub entity_id: EntityId,
     pub entity_type: EntityType,
     #[serde(deserialize_with = "required_option")]
-    pub display_label: Option<String>,
+    pub display_label: Option<BoundedLabel>,
     #[serde(deserialize_with = "required_option")]
-    pub role_in_event: Option<String>,
+    pub role_in_event: Option<BoundedRole>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RelationshipAssertion {
     pub subject_id: EntityId,
     pub predicate: RelationshipPredicate,
@@ -384,13 +507,14 @@ pub struct RelationshipAssertion {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum RelationshipDirection {
     Directed,
     Bidirectional,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EvidenceRef {
     pub evidence_type: EvidenceType,
     pub source_id: Identifier,
@@ -399,7 +523,7 @@ pub struct EvidenceRef {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum EvidenceType {
     Note,
     Conversation,
@@ -414,6 +538,7 @@ pub enum EvidenceType {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Governance {
     pub review: ReviewState,
     pub authority: AuthorityClass,
@@ -442,7 +567,7 @@ impl Governance {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum ReviewState {
     NotApplicable,
     Pending,
@@ -452,7 +577,7 @@ pub enum ReviewState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "class")]
+#[serde(rename_all = "snake_case", tag = "class", deny_unknown_fields)]
 pub enum AuthorityClass {
     EvidenceObservation,
     ReviewedMemory,
@@ -461,7 +586,7 @@ pub enum AuthorityClass {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum VerificationMethod {
     HumanReview,
     SourceChecksum,
@@ -470,7 +595,7 @@ pub enum VerificationMethod {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum Sensitivity {
     Standard,
     Sensitive,
@@ -478,13 +603,14 @@ pub enum Sensitivity {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum Visibility {
     LocalOnly,
     SyncedVault,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AllowedUses {
     pub recall: bool,
     pub twin_advisor: bool,
@@ -495,7 +621,12 @@ pub struct AllowedUses {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+#[serde(
+    tag = "type",
+    content = "data",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
 pub enum TwinEventPayload {
     ObservationRecorded(ObservationRecorded),
     NoteChanged(NoteChanged),
@@ -527,21 +658,19 @@ impl TwinEventPayload {
 
     fn validate(&self) -> Result<(), String> {
         match self {
-            Self::CanvasResponseRecorded(value) => {
-                if let Some(cost) = &value.cost_usd_decimal {
-                    validate_decimal(cost)?;
-                }
-                Ok(())
+            Self::ObservationRecorded(value) => {
+                validate_max_len(&value.claims, MAX_CLAIMS, "observation.claims")
+            }
+            Self::DecisionRecorded(value) => {
+                validate_max_len(&value.options, MAX_DECISION_OPTIONS, "decision.options")
             }
             _ => Ok(()),
         }
     }
 
     fn normalize(&mut self) {
-        match self {
-            Self::ObservationRecorded(value) => sort_dedup(&mut value.claims),
-            Self::DecisionRecorded(value) => sort_dedup(&mut value.options),
-            _ => {}
+        if let Self::ObservationRecorded(value) = self {
+            sort_dedup(&mut value.claims);
         }
     }
 }
@@ -561,6 +690,7 @@ fn validate_decimal(value: &str) -> Result<(), String> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClaimAssertion {
     pub subject_id: EntityId,
     pub predicate: ClaimPredicate,
@@ -569,13 +699,14 @@ pub struct ClaimAssertion {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum ClaimPolarity {
     Affirmed,
     Denied,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ObservationRecorded {
     pub observation_id: Identifier,
     pub claims: Vec<ClaimAssertion>,
@@ -586,6 +717,7 @@ pub struct ObservationRecorded {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NoteChanged {
     pub note_id: Identifier,
     pub change: NoteChangeKind,
@@ -594,7 +726,7 @@ pub struct NoteChanged {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum NoteChangeKind {
     Created,
     Updated,
@@ -602,13 +734,14 @@ pub enum NoteChangeKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ConversationTurnRecorded {
     pub conversation_id: Identifier,
     pub turn_id: Identifier,
     pub role: BoundedRole,
     pub content: BoundedContent,
     #[serde(deserialize_with = "required_option")]
-    pub model_id: Option<Identifier>,
+    pub model_id: Option<ModelId>,
     #[serde(deserialize_with = "required_option")]
     pub provenance: Option<ProvenanceLabel>,
     #[serde(deserialize_with = "required_option")]
@@ -616,13 +749,14 @@ pub struct ConversationTurnRecorded {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CanvasResponseRecorded {
     pub session_id: Identifier,
     pub tile_id: Identifier,
     pub response_id: Identifier,
     pub prompt: BoundedContent,
     pub response: BoundedContent,
-    pub model_id: Identifier,
+    pub model_id: ModelId,
     #[serde(deserialize_with = "required_option")]
     pub provider: Option<Identifier>,
     #[serde(deserialize_with = "required_option")]
@@ -630,7 +764,7 @@ pub struct CanvasResponseRecorded {
     #[serde(deserialize_with = "required_option")]
     pub tokens_used: Option<u64>,
     #[serde(deserialize_with = "required_option")]
-    pub cost_usd_decimal: Option<String>,
+    pub cost_usd_decimal: Option<DecimalCost>,
     #[serde(deserialize_with = "required_option")]
     pub prompt_digest: Option<ContentDigest>,
     #[serde(deserialize_with = "required_option")]
@@ -638,6 +772,7 @@ pub struct CanvasResponseRecorded {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MemoryProposed {
     pub memory_id: Identifier,
     pub claim: ClaimAssertion,
@@ -647,6 +782,7 @@ pub struct MemoryProposed {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MemoryReviewed {
     pub memory_id: Identifier,
     pub decision: MemoryReviewDecision,
@@ -657,7 +793,7 @@ pub struct MemoryReviewed {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum MemoryReviewDecision {
     Accept,
     Reject,
@@ -665,6 +801,7 @@ pub enum MemoryReviewDecision {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DecisionRecorded {
     pub decision_id: Identifier,
     pub decision: BoundedContent,
@@ -676,6 +813,7 @@ pub struct DecisionRecorded {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DecisionOutcomeRecorded {
     pub decision_id: Identifier,
     pub outcome: BoundedContent,
@@ -690,6 +828,7 @@ pub struct DecisionOutcomeRecorded {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FeedbackRecorded {
     pub feedback_id: Identifier,
     pub target_id: Identifier,
@@ -700,6 +839,7 @@ pub struct FeedbackRecorded {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RelationshipContextObserved {}
 
 #[cfg(test)]
@@ -809,5 +949,149 @@ mod tests {
         assert!(BoundedContent::parse("unsafe\0content").is_err());
         assert!(Identifier::parse("../unsafe").is_err());
         assert!(EventId::parse("ABC").is_err());
+    }
+
+    #[test]
+    fn model_ids_accept_provider_paths_but_reject_unsafe_path_material() {
+        let valid = ModelId::parse("anthropic/claude-3.5-haiku").unwrap();
+        assert_eq!(valid.as_str(), "anthropic/claude-3.5-haiku");
+        assert!(ModelId::parse("openrouter:anthropic/claude-3.5-haiku").is_ok());
+        for invalid in [
+            "",
+            "anthropic model",
+            "anthropic\\model",
+            "anthropic//model",
+            ":anthropic/model",
+            "anthropic:/model",
+            "anthropic::model",
+            "anthropic/../model",
+            "anthropic/./model",
+            "anthropic/model\0",
+        ] {
+            assert!(ModelId::parse(invalid).is_err(), "{invalid:?}");
+        }
+        assert!(ModelId::parse("a".repeat(257)).is_err());
+    }
+
+    #[test]
+    fn unknown_json_is_rejected_at_envelope_context_governance_and_payload_boundaries() {
+        let event = crate::services::twin_events::test_support::valid_event(1, Vec::new());
+        let baseline = serde_json::to_value(&event).unwrap();
+
+        let mut top_level = baseline.clone();
+        top_level["api_key"] = serde_json::json!("must-not-pass");
+        assert!(serde_json::from_value::<TwinEvent>(top_level).is_err());
+
+        let mut context = baseline.clone();
+        context["context"]["unselected_context"] = serde_json::json!({"raw": true});
+        assert!(serde_json::from_value::<TwinEvent>(context).is_err());
+
+        let mut governance = baseline.clone();
+        governance["governance"]["api_key"] = serde_json::json!("must-not-pass");
+        assert!(serde_json::from_value::<TwinEvent>(governance).is_err());
+
+        let mut payload_wrapper = baseline.clone();
+        payload_wrapper["payload"]["api_key"] = serde_json::json!("must-not-pass");
+        assert!(serde_json::from_value::<TwinEvent>(payload_wrapper).is_err());
+
+        let mut payload_data = baseline;
+        payload_data["payload"]["data"]["unselected_context"] = serde_json::json!({"raw": true});
+        assert!(serde_json::from_value::<TwinEvent>(payload_data).is_err());
+
+        let empty_payload = crate::services::twin_events::test_support::event_for_payload(
+            TwinEventPayload::RelationshipContextObserved(RelationshipContextObserved {}),
+        );
+        let mut empty_payload = serde_json::to_value(empty_payload).unwrap();
+        empty_payload["payload"]["data"]["api_key"] = serde_json::json!("must-not-pass");
+        assert!(serde_json::from_value::<TwinEvent>(empty_payload).is_err());
+    }
+
+    #[test]
+    fn bounded_labels_roles_and_decimal_costs_accept_the_limit_and_reject_overflow() {
+        assert!(BoundedLabel::parse("a".repeat(MAX_LABEL_BYTES)).is_ok());
+        assert!(BoundedLabel::parse("a".repeat(MAX_LABEL_BYTES + 1)).is_err());
+        assert!(BoundedLabel::parse("unsafe\nlabel").is_err());
+        assert!(BoundedRole::parse("r".repeat(MAX_ROLE_BYTES)).is_ok());
+        assert!(BoundedRole::parse("r".repeat(MAX_ROLE_BYTES + 1)).is_err());
+        assert!(DecimalCost::parse("0.000125").is_ok());
+        assert!(DecimalCost::parse("1".repeat(MAX_COST_DECIMAL_BYTES + 1)).is_err());
+        assert!(DecimalCost::parse("1\n0").is_err());
+    }
+
+    #[test]
+    fn event_lists_accept_their_limit_and_reject_one_over() {
+        let ids = (0..=MAX_CAUSAL_PARENTS)
+            .map(|index| EventId::parse(format!("{index:064x}")).unwrap())
+            .collect::<Vec<_>>();
+        let mut event = crate::services::twin_events::test_support::valid_event(1, Vec::new());
+        event.causal_parents = ids[..MAX_CAUSAL_PARENTS].to_vec();
+        assert!(event.validate().is_ok());
+        event.causal_parents = ids;
+        assert!(event.validate().is_err());
+
+        let evidence = (0..=MAX_EVIDENCE_REFS)
+            .map(|index| EvidenceRef {
+                evidence_type: EvidenceType::Note,
+                source_id: Identifier::parse(format!("evidence-{index}")).unwrap(),
+                digest: None,
+            })
+            .collect::<Vec<_>>();
+        let mut event = crate::services::twin_events::test_support::valid_event(1, Vec::new());
+        event.evidence = evidence[..MAX_EVIDENCE_REFS].to_vec();
+        assert!(event.validate().is_ok());
+        event.evidence = evidence;
+        assert!(event.validate().is_err());
+
+        let context_values = (0..=MAX_CONTEXT_VALUES)
+            .map(|index| format!("context-{index}"))
+            .collect::<Vec<_>>();
+        let mut event = crate::services::twin_events::test_support::valid_event(1, Vec::new());
+        event.context.environments = context_values[..MAX_CONTEXT_VALUES].to_vec();
+        assert!(event.validate().is_ok());
+        event.context.environments = context_values;
+        assert!(event.validate().is_err());
+
+        let claims = (0..=MAX_CLAIMS)
+            .map(|index| ClaimAssertion {
+                subject_id: EntityId::parse("owner").unwrap(),
+                predicate: ClaimPredicate::parse("prefers").unwrap(),
+                object: ClaimObject::parse(format!("claim {index}")).unwrap(),
+                polarity: ClaimPolarity::Affirmed,
+            })
+            .collect::<Vec<_>>();
+        let observation = |claims| {
+            TwinEventPayload::ObservationRecorded(ObservationRecorded {
+                observation_id: Identifier::parse("observation-1").unwrap(),
+                claims,
+                summary: None,
+                content_digest: None,
+            })
+        };
+        let event = crate::services::twin_events::test_support::event_for_payload(observation(
+            claims[..MAX_CLAIMS].to_vec(),
+        ));
+        assert!(event.validate().is_ok());
+        let event =
+            crate::services::twin_events::test_support::event_for_payload(observation(claims));
+        assert!(event.validate().is_err());
+
+        let options = (0..=MAX_DECISION_OPTIONS)
+            .map(|index| BoundedContent::parse(format!("option {index}")).unwrap())
+            .collect::<Vec<_>>();
+        let payload = |options| {
+            TwinEventPayload::DecisionRecorded(DecisionRecorded {
+                decision_id: Identifier::parse("decision-1").unwrap(),
+                decision: BoundedContent::parse("choose").unwrap(),
+                options,
+                stakes: None,
+                initial_leaning: None,
+            })
+        };
+        let event = crate::services::twin_events::test_support::event_for_payload(payload(
+            options[..MAX_DECISION_OPTIONS].to_vec(),
+        ));
+        assert!(event.validate().is_ok());
+        let event = crate::services::twin_events::test_support::event_for_payload(payload(options));
+        assert!(event.validate().is_err());
     }
 }
