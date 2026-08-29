@@ -3,8 +3,10 @@ import { createPinia, setActivePinia } from 'pinia'
 import { useBootStore } from '@/stores/boot'
 import * as apiClient from '@/api/client'
 
-const listenMock = vi.fn()
-const unlistenMock = vi.fn()
+const { listenMock, unlistenMock } = vi.hoisted(() => ({
+  listenMock: vi.fn(),
+  unlistenMock: vi.fn(),
+}))
 
 vi.mock('@tauri-apps/api/event', () => ({
   listen: listenMock,

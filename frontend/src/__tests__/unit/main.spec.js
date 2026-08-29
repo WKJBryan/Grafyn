@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
 
 const shell = vi.hoisted(() => ({
-  show: vi.fn(),
+  show: vi.fn().mockResolvedValue(undefined),
   mount: vi.fn(),
   use: vi.fn().mockReturnThis(),
   setTheme: vi.fn(),
@@ -23,6 +23,10 @@ vi.mock('@/App.vue', () => ({ default: {} }))
 vi.mock('@/router', () => ({ default: {} }))
 vi.mock('@/api/client', () => ({
   settings: { get: vi.fn().mockResolvedValue({ theme: 'system' }) },
+}))
+vi.mock('@/api/transport', () => ({
+  getRuntimeProfile: () => ({ name: 'desktop-wide' }),
+  getTransport: () => ({ show: shell.show }),
 }))
 vi.mock('@/stores/theme', () => ({
   resolveThemePreference: () => 'system',

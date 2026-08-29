@@ -1,6 +1,7 @@
 import { defineStore } from 'pinia'
 import { ref, shallowRef, computed, triggerRef, toRaw } from 'vue'
 import { canvas as canvasApi, twin as twinApi } from '@/api/client'
+import { getTransport } from '@/api/transport'
 import { useAsyncOperation } from '@/composables/useAsyncOperation'
 
 export const DEFAULT_WEB_SEARCH_MAX_RESULTS = 5
@@ -344,11 +345,10 @@ export const useCanvasStore = defineStore('canvas', () => {
     }
   }
 
-  // Helper to set up Tauri event listener for canvas-stream events
+  // Helper to set up the transport event listener for canvas-stream events
   // Returns unlisten cleanup handle
   async function setupTauriStreamListener(sessionId, handlers) {
-    const { listen } = await import('@tauri-apps/api/event')
-    const unlisten = await listen('canvas-stream', (event) => {
+    const unlisten = await getTransport().listen('canvas-stream', (event) => {
       const data = event.payload
       // Filter events for this session
       if (data.session_id !== sessionId) return

@@ -3,6 +3,8 @@ import { createPinia } from 'pinia'
 import App from './App.vue'
 import router from './router'
 import { settings } from './api/client'
+import { getRuntimeProfile, getTransport } from './api/transport'
+import { hasCapability } from './platform/capabilities'
 import { resolveThemePreference, useThemeStore } from './stores/theme'
 import './style.css'
 
@@ -21,9 +23,8 @@ window.addEventListener('grafyn-app-mounted', () => {
   appShellShown = true
 
   requestAnimationFrame(() => {
-    if (window.__TAURI__ || window.__TAURI_INTERNALS__) {
-      import('@tauri-apps/api/webviewWindow')
-        .then(({ getCurrentWebviewWindow }) => getCurrentWebviewWindow().show())
+    if (hasCapability(getRuntimeProfile(), 'windowShow')) {
+      getTransport().show()
         .catch((error) => console.error('Failed to show Grafyn window:', error))
     }
     removeBootstrapSplash()

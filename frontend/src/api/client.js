@@ -1,7 +1,6 @@
-import { invoke, isTauri } from '@tauri-apps/api/core'
-import { platform } from '@tauri-apps/plugin-os'
+import { getRuntimeProfile, getTransport } from './transport'
 
-const MOBILE_PLATFORMS = new Set(['android', 'ios'])
+const invoke = (...args) => getTransport().invoke(...args)
 
 // App boot API
 export const boot = {
@@ -292,6 +291,6 @@ export const importApi = {
   getSupportedFormats: () => invoke('get_supported_formats', {}),
 }
 
-export const isTauriApp = () => isTauri()
+export const isTauriApp = () => getRuntimeProfile().isTauri
 
-export const isDesktopApp = () => isTauriApp() && !MOBILE_PLATFORMS.has(platform())
+export const isDesktopApp = () => getRuntimeProfile().name === 'desktop-wide'

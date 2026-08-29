@@ -17,12 +17,12 @@
 <script setup>
 import { onBeforeUnmount, onMounted, watch } from 'vue'
 import { useRoute } from 'vue-router'
-import { platform } from '@tauri-apps/plugin-os'
 import ToastNotification from '@/components/ToastNotification.vue'
 import GuidePanel from '@/components/GuidePanel.vue'
 import GuideTip from '@/components/GuideTip.vue'
 import StartupSplash from '@/components/StartupSplash.vue'
 import { isDesktopApp, isTauriApp } from '@/api/client'
+import { getRuntimeProfile, getTransport } from '@/api/transport'
 import { useBootStore } from '@/stores/boot'
 import { useGuide } from '@/composables/useGuide'
 
@@ -40,8 +40,7 @@ function handleExternalLinkClick(event) {
   const href = el.getAttribute('href')
   if (href && (href.startsWith('http://') || href.startsWith('https://'))) {
     event.preventDefault()
-    import('@tauri-apps/plugin-opener')
-      .then(({ openUrl }) => openUrl(href))
+    getTransport().openUrl(href)
       .catch((error) => console.error('Failed to open external link:', error))
   }
 }
@@ -66,7 +65,7 @@ async function checkForDesktopUpdate() {
     )
     if (shouldInstall) {
       await update.downloadAndInstall()
-      const currentPlatform = platform()
+      const currentPlatform = getRuntimeProfile().platform
       if (currentPlatform === 'macos' || currentPlatform === 'linux') {
         const { relaunch } = await import('@tauri-apps/plugin-process')
         await relaunch()

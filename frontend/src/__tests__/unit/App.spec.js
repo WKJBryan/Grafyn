@@ -3,7 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import App from '@/App.vue'
 
 const tauriPlugins = vi.hoisted(() => ({
-  openUrl: vi.fn(),
+  openUrl: vi.fn().mockResolvedValue(undefined),
   confirm: vi.fn(),
   check: vi.fn(),
   downloadAndInstall: vi.fn(),
@@ -20,6 +20,11 @@ vi.mock('@/api/client', () => ({
   isDesktopApp: () => tauriPlugins.runtime.isDesktop,
 }))
 
+vi.mock('@/api/transport', () => ({
+  getRuntimeProfile: () => ({ platform: tauriPlugins.runtime.platform }),
+  getTransport: () => ({ openUrl: tauriPlugins.openUrl }),
+}))
+
 vi.mock('@tauri-apps/plugin-opener', () => ({
   openUrl: tauriPlugins.openUrl,
 }))
@@ -34,10 +39,6 @@ vi.mock('@tauri-apps/plugin-updater', () => ({
 
 vi.mock('@tauri-apps/plugin-process', () => ({
   relaunch: tauriPlugins.relaunch,
-}))
-
-vi.mock('@tauri-apps/plugin-os', () => ({
-  platform: () => tauriPlugins.runtime.platform,
 }))
 
 vi.mock('vue-router', () => ({

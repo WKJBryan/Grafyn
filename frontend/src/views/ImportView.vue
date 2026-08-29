@@ -334,8 +334,8 @@
 
 <script setup>
 import { ref, reactive, computed } from 'vue'
-import { open } from '@tauri-apps/plugin-dialog'
 import { importApi, zettelkasten, notes } from '@/api/client'
+import { getTransport } from '@/api/transport'
 import { useToast } from '@/composables/useToast'
 
 const toast = useToast()
@@ -405,7 +405,7 @@ function isSelected(noteId, targetId) {
 async function handlePickFile() {
   error.value = null
 
-  const selected = await open({
+  const selected = await getTransport().open({
     multiple: false,
     filters: [
       { name: 'Supported imports', extensions: ['json', 'dms', 'md', 'txt', 'docx', 'pdf'] },

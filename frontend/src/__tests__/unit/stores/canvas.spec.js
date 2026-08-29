@@ -4,8 +4,10 @@ import { createPinia, setActivePinia } from 'pinia'
 import { useCanvasStore, THINK_HARDER_PROMPT, THINK_HARDER_WEB_SEARCH_MAX_RESULTS } from '@/stores/canvas'
 import * as apiClient from '@/api/client'
 
-const listenMock = vi.fn()
-const unlistenMock = vi.fn()
+const { listenMock, unlistenMock } = vi.hoisted(() => ({
+  listenMock: vi.fn(),
+  unlistenMock: vi.fn(),
+}))
 
 vi.mock('@tauri-apps/api/event', () => ({
   listen: listenMock,

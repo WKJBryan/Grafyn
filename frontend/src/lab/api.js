@@ -1,4 +1,6 @@
-import { invoke } from '@tauri-apps/api/core'
+import { getTransport } from '@/api/transport'
+
+const invoke = (...args) => getTransport().invoke(...args)
 
 export const twinEval = {
   getModelMatrix: () => invoke('get_twin_eval_model_matrix', {}),
