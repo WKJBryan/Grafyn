@@ -24,12 +24,9 @@ fn memory_digest_trigger(record: &UserRecord) -> Option<&'static str> {
 
     match record.promotion_state {
         PromotionState::Rejected | PromotionState::Private | PromotionState::NoTrain => None,
-        PromotionState::AutoPromoted
+        PromotionState::Candidate | PromotionState::AutoPromoted
             if record.evidence_refs.len() >= AUTO_PROMOTE_SUPPORT_COUNT =>
         {
-            Some("3+ evidence points support this durable pattern")
-        }
-        PromotionState::Candidate if record.evidence_refs.len() >= AUTO_PROMOTE_SUPPORT_COUNT => {
             Some("candidate pattern has enough evidence for review")
         }
         PromotionState::Candidate
@@ -307,6 +304,45 @@ mod tests {
     use super::*;
     use crate::models::twin::{PromotionState, UserRecordKind};
     use tempfile::tempdir;
+
+    #[test]
+    fn legacy_auto_promoted_is_only_a_pending_review_trigger() {
+        let temp_dir = tempdir().expect("temp dir should be created");
+        let mut store = TwinStore::new(temp_dir.path().to_path_buf());
+        let mut record = store
+            .create_user_record(UserRecordCreate {
+                kind: UserRecordKind::Preference,
+                content: "legacy review pattern".to_string(),
+                origin: RecordOrigin::Inferred,
+                evidence_refs: Vec::new(),
+                confidence: 1.0,
+                promotion_state: Some(PromotionState::Candidate),
+                valid_from: None,
+                valid_until: None,
+                links: Vec::new(),
+                metadata: HashMap::new(),
+            })
+            .unwrap();
+        record.promotion_state = PromotionState::AutoPromoted;
+        let evidence = EvidenceRef {
+            trace_id: "trace".to_string(),
+            event_id: "event".to_string(),
+            session_id: "session".to_string(),
+            tile_id: None,
+            model_id: None,
+            note: None,
+            source_type: Some("behavior".to_string()),
+            source_id: None,
+            source_label: None,
+            excerpt: None,
+            speaker_role: None,
+        };
+        record.evidence_refs = vec![evidence; AUTO_PROMOTE_SUPPORT_COUNT];
+        assert_eq!(
+            memory_digest_trigger(&record),
+            Some("candidate pattern has enough evidence for review")
+        );
+    }
 
     #[test]
     fn memory_digest_caps_review_items_and_updates_record_state() {

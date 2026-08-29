@@ -86,7 +86,7 @@ impl TwinStore {
             let line = serde_json::to_string(&Self::record_to_export_value(&record))?;
 
             match record.promotion_state {
-                PromotionState::AutoPromoted | PromotionState::Endorsed => {
+                PromotionState::Endorsed => {
                     included_record_ids.push(record.id.clone());
                     approved_lines.push(line.clone());
                     match Self::split_for_record(&record, eval_percentage, holdout_percentage) {
@@ -101,7 +101,9 @@ impl TwinStore {
                 PromotionState::Rejected => {
                     rejected_lines.push(line);
                 }
-                PromotionState::Private | PromotionState::NoTrain => {
+                PromotionState::AutoPromoted
+                | PromotionState::Private
+                | PromotionState::NoTrain => {
                     private_or_no_train_record_ids.push(record.id.clone());
                 }
             }
@@ -185,7 +187,10 @@ impl TwinStore {
             .filter(|record| {
                 matches!(
                     record.promotion_state,
-                    PromotionState::Rejected | PromotionState::Private | PromotionState::NoTrain
+                    PromotionState::AutoPromoted
+                        | PromotionState::Rejected
+                        | PromotionState::Private
+                        | PromotionState::NoTrain
                 )
             })
             .flat_map(|record| {
@@ -445,6 +450,43 @@ mod tests {
         assert!(std::path::Path::new(&bundle.approved_user_records.path).exists());
         assert!(std::path::Path::new(&bundle.candidate_user_records.path).exists());
         assert!(std::path::Path::new(&bundle.rejected_user_records.path).exists());
+    }
+
+    #[test]
+    fn legacy_auto_promoted_is_excluded_from_every_export_and_training_split() {
+        let temp_dir = tempdir().expect("temp dir should be created");
+        let mut store = TwinStore::new(temp_dir.path().to_path_buf());
+        let now = Utc::now();
+        let legacy = UserRecord {
+            id: "legacy-auto".to_string(),
+            kind: UserRecordKind::Preference,
+            content: "legacy content must not export".to_string(),
+            evidence_refs: Vec::new(),
+            confidence: 1.0,
+            origin: RecordOrigin::Inferred,
+            promotion_state: PromotionState::AutoPromoted,
+            created_at: now,
+            updated_at: now,
+            valid_from: None,
+            valid_until: None,
+            links: Vec::new(),
+            metadata: HashMap::new(),
+        };
+        store.record_cache.insert(legacy.id.clone(), legacy);
+        store.records_cache_ready = true;
+        let bundle = store.export_bundle(TwinExportRequest::default()).unwrap();
+        for path in [
+            &bundle.approved_user_records.path,
+            &bundle.candidate_user_records.path,
+            &bundle.rejected_user_records.path,
+            &bundle.train.path,
+            &bundle.eval.path,
+            &bundle.holdout.path,
+        ] {
+            let content = std::fs::read_to_string(path).unwrap();
+            assert!(!content.contains("legacy content must not export"));
+        }
+        assert_eq!(bundle.included_records, 0);
     }
 
     fn prediction_options() -> Vec<String> {

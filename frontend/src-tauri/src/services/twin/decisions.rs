@@ -53,7 +53,7 @@ fn clamp_weight(weight: f32) -> f32 {
 fn promotion_state_label(state: &PromotionState) -> &'static str {
     match state {
         PromotionState::Candidate => "Candidate",
-        PromotionState::AutoPromoted => "Auto-promoted",
+        PromotionState::AutoPromoted => "Candidate (legacy)",
         PromotionState::Endorsed => "Endorsed",
         PromotionState::Rejected => "Rejected",
         PromotionState::Private => "Private",
@@ -933,13 +933,14 @@ impl TwinStore {
         for id in cited_user_record_ids {
             if let Ok(record) = self.get_user_record(id) {
                 let (source_type, weight) = match &record.promotion_state {
-                    PromotionState::Endorsed | PromotionState::AutoPromoted => {
+                    PromotionState::Endorsed => {
                         ("approved_record", weights.approved_records_weight)
                     }
                     PromotionState::Candidate => {
                         ("candidate_record", weights.candidate_records_weight)
                     }
-                    PromotionState::Rejected
+                    PromotionState::AutoPromoted
+                    | PromotionState::Rejected
                     | PromotionState::Private
                     | PromotionState::NoTrain => {
                         continue;
@@ -1209,6 +1210,40 @@ impl TwinStore {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn legacy_auto_promoted_is_not_decision_evidence() {
+        let temp_dir = tempdir().expect("temp dir should be created");
+        let mut store = TwinStore::new(temp_dir.path().to_path_buf());
+        let now = Utc::now();
+        let legacy = crate::models::twin::UserRecord {
+            id: "legacy-auto".to_string(),
+            kind: crate::models::twin::UserRecordKind::Preference,
+            content: "legacy decision authority".to_string(),
+            evidence_refs: Vec::new(),
+            confidence: 1.0,
+            origin: crate::models::twin::RecordOrigin::Inferred,
+            promotion_state: PromotionState::AutoPromoted,
+            created_at: now,
+            updated_at: now,
+            valid_from: None,
+            valid_until: None,
+            links: Vec::new(),
+            metadata: HashMap::new(),
+        };
+        store.record_cache.insert(legacy.id.clone(), legacy);
+        store.records_cache_ready = true;
+        let packet = store
+            .build_decision_evidence_packet(
+                &[],
+                &["legacy-auto".to_string()],
+                &[],
+                &[],
+                &DecisionMirrorConfig::default(),
+            )
+            .unwrap();
+        assert!(packet.selected_sources.is_empty());
+    }
 
     #[test]
     fn decision_episode_and_reflection_card_persist_with_scores() {

@@ -38,10 +38,16 @@ impl Default for PromotionState {
 }
 
 impl PromotionState {
-    pub fn default_for_origin(origin: &RecordOrigin) -> Self {
-        match origin {
-            RecordOrigin::User => PromotionState::AutoPromoted,
-            RecordOrigin::Synthetic | RecordOrigin::Inferred => PromotionState::Candidate,
+    pub fn default_for_origin(_origin: &RecordOrigin) -> Self {
+        PromotionState::Candidate
+    }
+
+    /// Keeps the legacy serialized variant available for audit while removing
+    /// its former authority. All behavioral consumers must use this view.
+    pub fn effective(&self) -> Self {
+        match self {
+            PromotionState::AutoPromoted => PromotionState::Candidate,
+            state => state.clone(),
         }
     }
 }
@@ -1007,4 +1013,20 @@ fn default_privacy_weight() -> f32 {
 
 fn default_unsupported_penalty_weight() -> f32 {
     1.5
+}
+
+#[cfg(test)]
+mod promotion_state_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_auto_promoted_deserializes_but_is_effectively_pending() {
+        let state: PromotionState = serde_json::from_str("\"auto_promoted\"").unwrap();
+        assert_eq!(state, PromotionState::AutoPromoted);
+        assert_eq!(state.effective(), PromotionState::Candidate);
+        assert_eq!(
+            PromotionState::default_for_origin(&RecordOrigin::User),
+            PromotionState::Candidate
+        );
+    }
 }

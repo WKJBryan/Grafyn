@@ -14,9 +14,24 @@ Stage 1 already captures explicit and passive evidence:
 - Canvas behavior: branching, model comparison, debate, regeneration, note export, and think-harder flows.
 - Notes behavior: note creation/update and canonical promotion.
 - Inferred user records: `fact`, `preference`, and `reasoning_pattern`.
-- Review states: `auto_promoted`, `candidate`, `endorsed`, `rejected`, `private`, and `no_train`.
+- Review states: `candidate`, `endorsed`, `rejected`, `private`, and `no_train`. The legacy serialized `auto_promoted` value remains readable for audit only and is treated as pending/candidate rather than authority.
 
-Approved and candidate records are stored separately from rejected records during export. Rejected records are negative evidence for future pipelines, not live personalization context.
+Only explicitly endorsed records enter approved export/training splits. Candidate and rejected records retain their separate legacy review/export surfaces, while legacy `auto_promoted` records are excluded from all export and training files. Rejected records are negative evidence for future pipelines, not live personalization context.
+
+## Governed State Core
+
+The append-only Twin event spine now has a pure deterministic read-model layer:
+
+- exact repeated observations create pending proposal drafts after three supports;
+- exact affirm/deny observations create two pending drafts and an unresolved contradiction cluster;
+- global, single-relationship, and composite-relationship variants remain distinct;
+- only an explicit accepted `MemoryReviewed` event creates reviewed memory;
+- concurrent contradictory reviews remain pending until a causally later review resolves them;
+- validity, expiry, reinforcement, and supersession are evaluated at an explicit reference time;
+- projection snapshots use sorted vectors, integer values, and a content-derived v1 snapshot ID;
+- Recall, Decision, Simulation, Reflection, and Capture Review use fixed integer attention profiles with hard governance gates before scoring.
+
+This layer is implemented as pure Rust entry points. Capture hooks and projection-backed UI/API integration belong to later tasks; no current command is documented as emitting these events yet.
 
 ## Native RAG Twin Architecture
 
@@ -27,7 +42,7 @@ Context assembly:
 - Require Twin Identity name and role/context before Simulation mode can run.
 - Inject Twin Identity before Constitution so the model has a first-person operating identity before it receives priors and evidence.
 - Retrieve relevant vault notes/chunks through Grafyn's existing retrieval service.
-- Include approved twin records: `endorsed` and `auto_promoted`.
+- Include approved twin records only when explicitly `endorsed`.
 - Include candidate records only when locally relevant to the prompt.
 - Exclude `rejected`, `private`, and `no_train` records from live answer context.
 - Store used note ids and twin record ids on the prompt tile and trace event.
@@ -42,7 +57,7 @@ The model receives a system prompt with separated sections:
 - `Tentative Candidate Records`
 - `Answer Instructions`
 
-Candidate records are labeled as unreviewed hypotheses and must not be treated as facts.
+Candidate records are labeled as unreviewed hypotheses and must not be treated as facts. Legacy `auto_promoted` records are not admitted to either prompt section.
 
 ## Answer Modes
 

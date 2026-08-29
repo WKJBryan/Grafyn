@@ -1112,6 +1112,14 @@ fn build_twin_context_prompt(
     prompt_type: &PromptType,
     decision_metadata: Option<&DecisionPromptMetadata>,
 ) -> String {
+    let approved_records = approved_records
+        .iter()
+        .filter(|record| record.promotion_state == crate::models::twin::PromotionState::Endorsed)
+        .collect::<Vec<_>>();
+    let candidate_records = candidate_records
+        .iter()
+        .filter(|record| record.promotion_state == crate::models::twin::PromotionState::Candidate)
+        .collect::<Vec<_>>();
     let mut prompt = String::from(
         "## Twin Operating Contract\n\n\
          You are Grafyn's native RAG twin mode. Use only the provided Constitution, action gaps, vault evidence, and user-reviewed twin records as context. \
@@ -1187,7 +1195,7 @@ fn build_twin_context_prompt(
 
     prompt.push_str("## Approved User Records\n\n");
     if approved_records.is_empty() {
-        prompt.push_str("No endorsed or auto-promoted user records were selected.\n\n");
+        prompt.push_str("No endorsed user records were selected.\n\n");
     } else {
         for record in approved_records {
             prompt.push_str(&format_twin_record(record));
@@ -1772,6 +1780,33 @@ mod tests {
         assert!(prompt.contains("Do not use evidence to justify a preselected answer"));
         assert!(prompt.contains("Recommended option"));
         assert!(prompt.contains("decision-support assistant"));
+    }
+
+    #[test]
+    fn legacy_auto_promoted_content_cannot_enter_twin_prompt_sections() {
+        let legacy = TwinContextRecord {
+            id: "legacy-auto".into(),
+            kind: crate::models::twin::UserRecordKind::Preference,
+            content: "LEGACY_AUTO_MUST_NOT_ENTER_PROMPT".into(),
+            confidence: 1.0,
+            promotion_state: crate::models::twin::PromotionState::AutoPromoted,
+            evidence_count: 99,
+            source_label: Some("legacy".into()),
+        };
+        let prompt = build_twin_context_prompt(
+            &ConstitutionSetup::default(),
+            &[],
+            &[],
+            std::slice::from_ref(&legacy),
+            std::slice::from_ref(&legacy),
+            &[],
+            &[],
+            &TwinAnswerMode::Advisor,
+            &PromptType::Standard,
+            None,
+        );
+        assert!(!prompt.contains("LEGACY_AUTO_MUST_NOT_ENTER_PROMPT"));
+        assert!(!prompt.contains("auto-promoted"));
     }
 
     #[test]

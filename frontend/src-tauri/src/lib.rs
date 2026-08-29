@@ -1,8 +1,8 @@
 #![cfg(feature = "tauri-app")]
 
 mod commands;
-mod models;
-mod services;
+pub mod models;
+pub mod services;
 
 use models::boot::BootStatus;
 use services::{

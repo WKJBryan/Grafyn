@@ -3,7 +3,6 @@ use super::shared::{
     lexical_terms, load_or_quarantine, payload_string, text_contains_any, value_contains_key,
 };
 use super::TwinStore;
-use super::{AUTO_PROMOTE_CONFIDENCE, AUTO_PROMOTE_SUPPORT_COUNT};
 #[cfg(test)]
 use crate::models::twin::TwinExportRequest;
 use crate::models::twin::{
@@ -391,9 +390,8 @@ fn append_promotion_history(
 }
 
 fn promotion_state_sort_key(state: &PromotionState) -> u8 {
-    match state {
-        PromotionState::AutoPromoted => 0,
-        PromotionState::Candidate => 1,
+    match state.effective() {
+        PromotionState::Candidate | PromotionState::AutoPromoted => 0,
         PromotionState::Endorsed => 2,
         PromotionState::Rejected => 3,
         PromotionState::Private => 4,
@@ -407,7 +405,7 @@ fn twin_context_record(record: &UserRecord, source_label: &str) -> TwinContextRe
         kind: record.kind.clone(),
         content: record.content.clone(),
         confidence: record.confidence,
-        promotion_state: record.promotion_state.clone(),
+        promotion_state: record.promotion_state.effective(),
         evidence_count: record.evidence_refs.len(),
         source_label: Some(source_label.to_string()),
     }
@@ -505,7 +503,8 @@ impl TwinStore {
         let now = Utc::now();
         let promotion_state = create
             .promotion_state
-            .unwrap_or_else(|| PromotionState::default_for_origin(&create.origin));
+            .unwrap_or_else(|| PromotionState::default_for_origin(&create.origin))
+            .effective();
 
         let record = UserRecord {
             id: uuid::Uuid::new_v4().to_string(),
@@ -540,7 +539,7 @@ impl TwinStore {
             record.confidence = confidence.clamp(0.0, 1.0);
         }
         if let Some(promotion_state) = update.promotion_state {
-            record.promotion_state = promotion_state;
+            record.promotion_state = promotion_state.effective();
         }
         if let Some(valid_from) = update.valid_from {
             record.valid_from = Some(valid_from);
@@ -586,20 +585,13 @@ impl TwinStore {
 
         let mut created_records = 0_usize;
         let mut updated_records = 0_usize;
-        let mut auto_promoted_records = 0_usize;
+        let auto_promoted_records = 0_usize;
         let mut candidate_records = 0_usize;
         let mut skipped_rejected_records = 0_usize;
 
         for draft in drafts {
-            let desired_state = if draft.confidence >= AUTO_PROMOTE_CONFIDENCE
-                && draft.support_count >= AUTO_PROMOTE_SUPPORT_COUNT
-            {
-                PromotionState::AutoPromoted
-            } else {
-                PromotionState::Candidate
-            };
-            let mut metadata =
-                build_inference_metadata(&draft, desired_state == PromotionState::AutoPromoted);
+            let desired_state = PromotionState::Candidate;
+            let mut metadata = build_inference_metadata(&draft, false);
 
             if let Some(existing_id) = existing_by_key.get(&draft.inference_key).cloned() {
                 let mut record = self.get_user_record(&existing_id)?;
@@ -616,10 +608,7 @@ impl TwinStore {
                     metadata.insert("auto_promoted".to_string(), Value::Bool(false));
                     record.promotion_state = PromotionState::Rejected;
                     skipped_rejected_records += 1;
-                } else if matches!(
-                    record.promotion_state,
-                    PromotionState::Candidate | PromotionState::AutoPromoted
-                ) {
+                } else if record.promotion_state.effective() == PromotionState::Candidate {
                     record.promotion_state = desired_state.clone();
                 }
 
@@ -640,17 +629,6 @@ impl TwinStore {
                 self.write_record_file(&record)?;
                 updated_records += 1;
             } else {
-                let mut metadata = metadata;
-                if desired_state == PromotionState::AutoPromoted {
-                    append_promotion_history(
-                        &mut metadata,
-                        &PromotionState::Candidate,
-                        &PromotionState::AutoPromoted,
-                        Some("confidence >= 0.75 and support_count >= 3"),
-                        true,
-                    );
-                }
-
                 self.create_user_record(UserRecordCreate {
                     kind: draft.kind,
                     content: draft.content,
@@ -671,9 +649,8 @@ impl TwinStore {
             if record.origin != RecordOrigin::Inferred {
                 continue;
             }
-            match record.promotion_state {
-                PromotionState::AutoPromoted => auto_promoted_records += 1,
-                PromotionState::Candidate => candidate_records += 1,
+            match record.promotion_state.effective() {
+                PromotionState::AutoPromoted | PromotionState::Candidate => candidate_records += 1,
                 _ => {}
             }
         }
@@ -725,8 +702,8 @@ impl TwinStore {
         let mut candidates = Vec::new();
 
         for record in self.record_cache.values() {
-            match record.promotion_state {
-                PromotionState::Endorsed | PromotionState::AutoPromoted => {
+            match &record.promotion_state {
+                PromotionState::Endorsed => {
                     let relevance = twin_record_relevance(record, &query_terms);
                     if relevance > 0 {
                         approved.push((relevance, twin_context_record(record, "approved")));
@@ -744,7 +721,10 @@ impl TwinStore {
                         ));
                     }
                 }
-                PromotionState::Rejected | PromotionState::Private | PromotionState::NoTrain => {}
+                PromotionState::AutoPromoted
+                | PromotionState::Rejected
+                | PromotionState::Private
+                | PromotionState::NoTrain => {}
             }
         }
 
@@ -812,6 +792,7 @@ impl TwinStore {
         let previous_state = record.promotion_state.clone();
         let now = Utc::now();
 
+        let promotion_state = promotion_state.effective();
         record.promotion_state = promotion_state.clone();
         record.updated_at = now;
 
@@ -957,7 +938,7 @@ mod tests {
     }
 
     #[test]
-    fn user_records_auto_promote_and_export() {
+    fn user_records_start_pending_and_require_endorsement_before_export() {
         let temp_dir = tempdir().expect("temp dir should be created");
         let mut store = TwinStore::new(temp_dir.path().to_path_buf());
 
@@ -976,17 +957,25 @@ mod tests {
             })
             .expect("user record should be created");
 
-        assert_eq!(record.promotion_state, PromotionState::AutoPromoted);
+        assert_eq!(record.promotion_state, PromotionState::Candidate);
 
         let bundle = store
             .export_bundle(TwinExportRequest::default())
             .expect("export should succeed");
+        assert_eq!(bundle.included_records, 0);
+        assert_eq!(bundle.approved_user_records.count, 0);
+
+        store
+            .set_user_record_promotion(&record.id, PromotionState::Endorsed, None)
+            .expect("explicit endorsement should succeed");
+        let bundle = store
+            .export_bundle(TwinExportRequest::default())
+            .expect("endorsed export should succeed");
         assert_eq!(bundle.included_records, 1);
-        assert_eq!(bundle.approved_user_records.count, 1);
     }
 
     #[test]
-    fn inference_creates_candidate_below_threshold_and_auto_promotes_at_threshold() {
+    fn inference_remains_candidate_even_above_the_legacy_threshold() {
         let temp_dir = tempdir().expect("temp dir should be created");
         let mut store = TwinStore::new(temp_dir.path().to_path_buf());
 
@@ -1040,8 +1029,14 @@ mod tests {
                     == Some("preference.implementation_detail")
             })
             .expect("implementation detail record should exist");
-        assert_eq!(record.promotion_state, PromotionState::AutoPromoted);
-        assert!(record.confidence >= AUTO_PROMOTE_CONFIDENCE);
+        assert_eq!(record.promotion_state, PromotionState::Candidate);
+        assert_eq!(
+            record
+                .metadata
+                .get("auto_promoted")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
     }
 
     #[test]
@@ -1084,7 +1079,7 @@ mod tests {
     }
 
     #[test]
-    fn rejected_inference_keys_are_not_auto_promoted_again() {
+    fn rejected_inference_keys_remain_rejected() {
         let temp_dir = tempdir().expect("temp dir should be created");
         let mut store = TwinStore::new(temp_dir.path().to_path_buf());
 
@@ -1112,7 +1107,7 @@ mod tests {
                     == Some("reasoning.uses_debate")
             })
             .expect("debate record should exist");
-        assert_eq!(record.promotion_state, PromotionState::AutoPromoted);
+        assert_eq!(record.promotion_state, PromotionState::Candidate);
 
         store
             .set_user_record_promotion(
@@ -1219,6 +1214,68 @@ mod tests {
 
         assert!(approved.is_empty());
         assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn legacy_auto_promoted_is_auditable_but_never_selected_as_twin_context() {
+        let temp_dir = tempdir().expect("temp dir should be created");
+        let mut store = TwinStore::new(temp_dir.path().to_path_buf());
+        let now = Utc::now();
+        let legacy = UserRecord {
+            id: "legacy-auto".to_string(),
+            kind: UserRecordKind::Preference,
+            content: "red-team every shipping decision".to_string(),
+            evidence_refs: Vec::new(),
+            confidence: 1.0,
+            origin: RecordOrigin::Inferred,
+            promotion_state: PromotionState::AutoPromoted,
+            created_at: now,
+            updated_at: now,
+            valid_from: None,
+            valid_until: None,
+            links: Vec::new(),
+            metadata: HashMap::new(),
+        };
+        store.record_cache.insert(legacy.id.clone(), legacy);
+        store.records_cache_ready = true;
+
+        let (approved, candidates) = store
+            .select_context_records("red-team shipping decision")
+            .expect("selection should succeed");
+        assert!(approved.is_empty());
+        assert!(candidates.is_empty());
+        assert_eq!(
+            store
+                .get_user_record("legacy-auto")
+                .unwrap()
+                .promotion_state,
+            PromotionState::AutoPromoted
+        );
+    }
+
+    #[test]
+    fn new_mutations_cannot_recreate_auto_promoted_authority() {
+        let temp_dir = tempdir().expect("temp dir should be created");
+        let mut store = TwinStore::new(temp_dir.path().to_path_buf());
+        let record = store
+            .create_user_record(UserRecordCreate {
+                kind: UserRecordKind::Preference,
+                content: "explicit legacy request".to_string(),
+                evidence_refs: Vec::new(),
+                confidence: 1.0,
+                origin: RecordOrigin::User,
+                promotion_state: Some(PromotionState::AutoPromoted),
+                valid_from: None,
+                valid_until: None,
+                links: Vec::new(),
+                metadata: HashMap::new(),
+            })
+            .unwrap();
+        assert_eq!(record.promotion_state, PromotionState::Candidate);
+        let updated = store
+            .set_user_record_promotion(&record.id, PromotionState::AutoPromoted, None)
+            .unwrap();
+        assert_eq!(updated.promotion_state, PromotionState::Candidate);
     }
 
     #[test]

@@ -58,7 +58,10 @@ pub(super) fn normalize_key_text(text: &str) -> String {
 fn constitution_allows_record(record: &UserRecord) -> bool {
     !matches!(
         record.promotion_state,
-        PromotionState::Rejected | PromotionState::Private | PromotionState::NoTrain
+        PromotionState::AutoPromoted
+            | PromotionState::Rejected
+            | PromotionState::Private
+            | PromotionState::NoTrain
     ) && record.kind != UserRecordKind::Fact
 }
 
@@ -81,9 +84,7 @@ fn behavior_event_for_constitution(event_type: &TraceEventType) -> bool {
 fn constitution_status_from_record(record: &UserRecord) -> ConstitutionStatus {
     let support_count = record.evidence_refs.len();
     match record.promotion_state {
-        PromotionState::AutoPromoted | PromotionState::Endorsed
-            if support_count >= AUTO_PROMOTE_SUPPORT_COUNT =>
-        {
+        PromotionState::Endorsed if support_count >= AUTO_PROMOTE_SUPPORT_COUNT => {
             ConstitutionStatus::Active
         }
         _ => ConstitutionStatus::Candidate,
@@ -1378,6 +1379,32 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::models::twin::ConstitutionStatus;
+
+    #[test]
+    fn legacy_auto_promoted_cannot_seed_or_activate_constitution() {
+        let now = Utc::now();
+        let record = UserRecord {
+            id: "legacy-auto".to_string(),
+            kind: UserRecordKind::Preference,
+            content: "legacy constitutional claim".to_string(),
+            evidence_refs: Vec::new(),
+            confidence: 1.0,
+            origin: RecordOrigin::Inferred,
+            promotion_state: PromotionState::AutoPromoted,
+            created_at: now,
+            updated_at: now,
+            valid_from: None,
+            valid_until: None,
+            links: Vec::new(),
+            metadata: HashMap::new(),
+        };
+        assert!(!constitution_allows_record(&record));
+        assert_eq!(
+            constitution_status_from_record(&record),
+            ConstitutionStatus::Candidate
+        );
+    }
+
     fn test_note(id: &str, title: &str, content: &str, source_type: Option<&str>) -> Note {
         let now = Utc::now();
         let mut properties = HashMap::new();
@@ -1408,7 +1435,7 @@ mod tests {
     }
 
     #[test]
-    fn constitution_inference_uses_repeated_behavior_as_primary_evidence() {
+    fn constitution_inference_keeps_repeated_behavior_pending_review() {
         let temp_dir = tempdir().expect("temp dir should be created");
         let mut store = TwinStore::new(temp_dir.path().to_path_buf());
 
@@ -1441,8 +1468,9 @@ mod tests {
             .expect("behavior-derived constitution item should exist");
 
         assert_eq!(summary.scanned_behavior_events, 3);
-        assert_eq!(summary.auto_active_items, 1);
-        assert_eq!(item.status, ConstitutionStatus::Active);
+        assert_eq!(summary.auto_active_items, 0);
+        assert_eq!(summary.review_candidate_items, 1);
+        assert_eq!(item.status, ConstitutionStatus::Candidate);
         assert_eq!(item.source.as_deref(), Some("behavior_inference"));
         assert!(item
             .evidence_refs
