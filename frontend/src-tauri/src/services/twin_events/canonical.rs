@@ -19,6 +19,13 @@ pub(crate) fn semantic_bytes(event: &TwinEvent) -> Vec<u8> {
     out.tag("event_type", event_type(&event.event_type));
     out.text("actor_id", event.actor_id.as_str());
     out.text("device_id", event.device_id.as_str());
+    out.tag(
+        "causal_stream",
+        match event.causal_stream {
+            CausalStream::LocalOnly => "local_only",
+            CausalStream::SyncEligible => "sync_eligible",
+        },
+    );
     out.u64("device_sequence", event.device_sequence);
     out.ids("causal_parents", &event.causal_parents);
     out.time("recorded_at", &event.recorded_at);
@@ -426,6 +433,7 @@ impl Encoder {
 
 #[cfg(test)]
 mod tests {
+    use crate::models::twin_event::CausalStream;
     use crate::services::twin_events::test_support::valid_event;
 
     #[test]
@@ -459,6 +467,17 @@ mod tests {
         assert_eq!(
             super::derive_event_id(&compact_event),
             super::derive_event_id(&reordered_event)
+        );
+    }
+
+    #[test]
+    fn causal_stream_is_part_of_event_identity() {
+        let local = valid_event(1, Vec::new());
+        let mut shared = local.clone();
+        shared.causal_stream = CausalStream::SyncEligible;
+        assert_ne!(
+            super::derive_event_id(&local),
+            super::derive_event_id(&shared)
         );
     }
 

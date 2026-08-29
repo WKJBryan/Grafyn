@@ -301,6 +301,13 @@ pub enum TwinEventType {
     RelationshipContextObserved,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum CausalStream {
+    LocalOnly,
+    SyncEligible,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TwinEvent {
@@ -309,6 +316,7 @@ pub struct TwinEvent {
     pub event_type: TwinEventType,
     pub actor_id: ActorId,
     pub device_id: DeviceId,
+    pub causal_stream: CausalStream,
     pub device_sequence: u64,
     pub causal_parents: Vec<EventId>,
     pub recorded_at: DateTime<Utc>,
@@ -351,6 +359,12 @@ impl TwinEvent {
         ) && self.context.relationships.is_empty()
         {
             return Err("relationship context observation requires a relationship".into());
+        }
+        if self.causal_stream == CausalStream::SyncEligible {
+            validate_sync_governance(&self.governance, "event governance")?;
+            for relationship in &self.context.relationships {
+                validate_sync_governance(&relationship.governance, "relationship governance")?;
+            }
         }
         validate_max_len(&self.causal_parents, MAX_CAUSAL_PARENTS, "causal_parents")?;
         validate_max_len(&self.supersedes, MAX_EVENT_LINKS, "supersedes")?;
@@ -431,6 +445,19 @@ impl TwinEvent {
         sort_dedup(&mut self.evidence);
         self.payload.normalize();
     }
+}
+
+fn validate_sync_governance(governance: &Governance, name: &str) -> Result<(), String> {
+    if governance.visibility != Visibility::SyncedVault {
+        return Err(format!("{name} must have synced_vault visibility"));
+    }
+    if governance.sensitivity == Sensitivity::Restricted {
+        return Err(format!("{name} must not be restricted"));
+    }
+    if !governance.allowed_uses.sync {
+        return Err(format!("{name} must explicitly allow sync"));
+    }
+    Ok(())
 }
 
 fn validate_max_len<T>(items: &[T], limit: usize, name: &str) -> Result<(), String> {
@@ -912,6 +939,7 @@ mod tests {
         let event = crate::services::twin_events::test_support::valid_event(1, Vec::new());
         let mut value = serde_json::to_value(event).unwrap();
         for key in [
+            "causal_stream",
             "recorded_at",
             "observed_at",
             "occurred_at",
@@ -930,6 +958,47 @@ mod tests {
             );
         }
         assert!(value.get_mut("event_id").is_some());
+    }
+
+    #[test]
+    fn sync_eligible_requires_syncable_top_level_and_relationship_governance() {
+        let mut event = crate::services::twin_events::test_support::valid_event(1, Vec::new());
+        event.causal_stream = CausalStream::SyncEligible;
+        assert!(event.validate().is_ok());
+
+        event.governance.visibility = Visibility::LocalOnly;
+        assert!(event.validate().is_err());
+        event.governance.visibility = Visibility::SyncedVault;
+        event.governance.allowed_uses.sync = false;
+        assert!(event.validate().is_err());
+        event.governance.allowed_uses.sync = true;
+        event.governance.sensitivity = Sensitivity::Restricted;
+        assert!(event.validate().is_err());
+
+        event.governance.sensitivity = Sensitivity::Sensitive;
+        assert!(event.validate().is_ok());
+        let mut relationship_governance = Governance::direct_observation();
+        relationship_governance.visibility = Visibility::LocalOnly;
+        event.context.relationships.push(RelationshipAssertion {
+            subject_id: EntityId::parse("owner").unwrap(),
+            predicate: RelationshipPredicate::parse("works_with").unwrap(),
+            object_id: EntityId::parse("person-1").unwrap(),
+            direction: RelationshipDirection::Directed,
+            valid_from: None,
+            valid_to: None,
+            evidence: Vec::new(),
+            governance: relationship_governance,
+        });
+        assert!(event.validate().is_err());
+        event.context.relationships[0].governance.visibility = Visibility::SyncedVault;
+        event.context.relationships[0].governance.allowed_uses.sync = false;
+        assert!(event.validate().is_err());
+        event.context.relationships[0].governance.allowed_uses.sync = true;
+        event.context.relationships[0].governance.sensitivity = Sensitivity::Restricted;
+        assert!(event.validate().is_err());
+
+        event.causal_stream = CausalStream::LocalOnly;
+        assert!(event.validate().is_ok());
     }
 
     #[test]

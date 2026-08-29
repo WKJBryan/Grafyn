@@ -130,6 +130,7 @@ pub struct TwinEvent {
     pub event_type: TwinEventType,
     pub actor_id: ActorId,
     pub device_id: DeviceId,
+    pub causal_stream: CausalStream,
     pub device_sequence: u64,
     pub causal_parents: Vec<EventId>,
     pub recorded_at: DateTime<Utc>,
@@ -144,6 +145,8 @@ pub struct TwinEvent {
     pub governance: Governance,
     pub payload: TwinEventPayload,
 }
+
+pub enum CausalStream { LocalOnly, SyncEligible }
 ```
 
 Required event classes for this delivery:
@@ -172,9 +175,12 @@ One timestamp cannot describe a human state. Grafyn keeps:
 - `last_confirmed_at`: a derived memory field updated only by explicit reinforcing/confirming evidence
 - `supersedes`: which prior proposal or reviewed memory it replaces
 - `reinforces`: which prior claim it supports without replacing
-- `device_sequence`: a monotonic local sequence, chained through causal parents
+- `causal_stream`: the explicit `LocalOnly` or conservatively `SyncEligible` causal lane
+- `device_sequence`: a monotonic per-`(device_id, causal_stream)` sequence, chained through same-lane causal parents
 
-Projection code must not use wall-clock time as a conflict tiebreaker. Events are deterministically topologically ordered with all causal parents first; independent ready events are ordered by `event_id`. `device_sequence` validates a device-local chain but never orders independent devices. Decay is computed at query time from a declared reference time, so tests are deterministic even when delivery is reordered. Human-state time uses the explicit occurred/valid fields, not relay arrival order.
+The two lanes let sync omit local-only material without creating a device-sequence gap or a missing predecessor on a peer: each lane starts at 1 and later events directly cite the preceding event in that same lane. Cross-stream causal parents are invalid. `SyncEligible` is structural eligibility, not transport state: the event and every embedded relationship must have `SyncedVault` visibility, non-`Restricted` sensitivity, and `allowed_uses.sync = true`; `Sensitive` is allowed only when explicitly enabled. Every referenced event from a sync-eligible event must exist in the sync-eligible lane. A local-only event may retain non-causal references to either lane, but downstream resolution may only downgrade eligibility and never upgrade a failing baseline.
+
+Projection code must not use wall-clock time as a conflict tiebreaker. Full and lane-filtered event sets are deterministically topologically ordered with all causal parents first; independent ready events are ordered by `event_id`. `device_sequence` validates a device-local lane but never orders independent devices. Decay is computed at query time from a declared reference time, so tests are deterministic even when delivery is reordered. Human-state time uses the explicit occurred/valid fields, not relay arrival order.
 
 ### Context and relationships
 

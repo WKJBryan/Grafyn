@@ -6,6 +6,15 @@ pub fn valid_event(sequence: u64, parents: Vec<EventId>) -> TwinEvent {
 }
 
 pub fn valid_event_for_device(device: &str, sequence: u64, parents: Vec<EventId>) -> TwinEvent {
+    valid_event_for_device_and_stream(device, CausalStream::LocalOnly, sequence, parents)
+}
+
+pub fn valid_event_for_device_and_stream(
+    device: &str,
+    causal_stream: CausalStream,
+    sequence: u64,
+    parents: Vec<EventId>,
+) -> TwinEvent {
     let mut event = TwinEvent {
         schema_version: 1,
         event_id: EventId::parse(
@@ -15,6 +24,7 @@ pub fn valid_event_for_device(device: &str, sequence: u64, parents: Vec<EventId>
         event_type: TwinEventType::ObservationRecorded,
         actor_id: ActorId::parse("owner").unwrap(),
         device_id: DeviceId::parse(device).unwrap(),
+        causal_stream,
         device_sequence: sequence,
         causal_parents: parents,
         recorded_at: Utc

@@ -1,5 +1,7 @@
 use super::{derive_event_id, semantic_bytes};
-use crate::models::twin_event::{DeviceId, EventId, TwinEvent};
+use crate::models::twin_event::{
+    CausalStream, DeviceId, EventId, EvidenceRef, EvidenceType, TwinEvent,
+};
 use fs2::FileExt;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
@@ -144,12 +146,12 @@ impl TwinEventStore {
             });
         }
         validate_append_sequence(&state.events, &event)?;
-        for parent in &event.causal_parents {
-            if !state.events.contains_key(parent) {
-                FileExt::unlock(&lock)?;
-                return Err(StoreError::MissingParent(parent.clone()));
-            }
-        }
+        let known = state
+            .events
+            .values()
+            .map(|known| (known.event_id.clone(), known.causal_stream))
+            .collect();
+        validate_event_references(&known, &event)?;
         self.install_no_clobber(&event, &bytes)?;
         state.events.insert(event.event_id.clone(), event);
         FileExt::unlock(&lock)?;
@@ -170,6 +172,37 @@ impl TwinEventStore {
         topological_order(&state.events.values().cloned().collect::<Vec<_>>())
     }
 
+    pub fn ordered_events_for_stream(
+        &self,
+        causal_stream: CausalStream,
+    ) -> Result<Vec<TwinEvent>, StoreError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| StoreError::Invalid("Twin event store lock poisoned".into()))?;
+        if !state.initialized {
+            return Err(StoreError::NotInitialized);
+        }
+        let lock = self.acquire_process_lock()?;
+        state.events = self.load_records()?;
+        FileExt::unlock(&lock)?;
+        topological_order(
+            &state
+                .events
+                .values()
+                .filter(|event| event.causal_stream == causal_stream)
+                .cloned()
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    fn lock_durability_directory(&self) -> Result<PathBuf, StoreError> {
+        self.lock_path()
+            .parent()
+            .map(Path::to_path_buf)
+            .ok_or_else(|| StoreError::Invalid("Twin event lock has no parent directory".into()))
+    }
+
     fn acquire_process_lock(&self) -> Result<File, StoreError> {
         self.validate_store_layout()?;
         let path = self.lock_path();
@@ -180,7 +213,7 @@ impl TwinEventStore {
             .open(&path)
         {
             Ok(file) => {
-                sync_directory(&self.events_dir())?;
+                sync_directory(&self.lock_durability_directory()?)?;
                 file
             }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
@@ -306,19 +339,14 @@ impl TwinEventStore {
             };
             parsed.push((entry.path().to_path_buf(), event));
         }
-        let mut known: BTreeSet<_> = parsed
+        let mut known: BTreeMap<_, _> = parsed
             .iter()
-            .map(|(_, event)| event.event_id.clone())
+            .map(|(_, event)| (event.event_id.clone(), event.causal_stream))
             .collect();
         loop {
             let invalid: BTreeSet<_> = parsed
                 .iter()
-                .filter(|(_, event)| {
-                    event
-                        .causal_parents
-                        .iter()
-                        .any(|parent| !known.contains(parent))
-                })
+                .filter(|(_, event)| validate_event_references(&known, event).is_err())
                 .map(|(_, event)| event.event_id.clone())
                 .collect();
             if invalid.is_empty() {
@@ -560,7 +588,9 @@ fn validate_append_sequence(
 ) -> Result<(), StoreError> {
     let same_device: Vec<_> = events
         .values()
-        .filter(|item| item.device_id == event.device_id)
+        .filter(|item| {
+            item.device_id == event.device_id && item.causal_stream == event.causal_stream
+        })
         .collect();
     let expected = same_device
         .iter()
@@ -590,10 +620,10 @@ fn validate_append_sequence(
 }
 
 fn validate_all_sequences(events: &BTreeMap<EventId, TwinEvent>) -> Result<(), StoreError> {
-    let mut by_device: BTreeMap<DeviceId, Vec<&TwinEvent>> = BTreeMap::new();
+    let mut by_device: BTreeMap<(DeviceId, CausalStream), Vec<&TwinEvent>> = BTreeMap::new();
     for event in events.values() {
         by_device
-            .entry(event.device_id.clone())
+            .entry((event.device_id.clone(), event.causal_stream))
             .or_default()
             .push(event);
     }
@@ -619,6 +649,55 @@ fn validate_all_sequences(events: &BTreeMap<EventId, TwinEvent>) -> Result<(), S
         }
     }
     Ok(())
+}
+
+fn validate_event_references(
+    known: &BTreeMap<EventId, CausalStream>,
+    event: &TwinEvent,
+) -> Result<(), StoreError> {
+    for parent in &event.causal_parents {
+        let parent_stream = known
+            .get(parent)
+            .ok_or_else(|| StoreError::MissingParent(parent.clone()))?;
+        if *parent_stream != event.causal_stream {
+            return Err(StoreError::Invalid(
+                "causal parents must be in the same causal stream".into(),
+            ));
+        }
+    }
+    let mut evidence_event_ids = event_event_ids(&event.evidence)?;
+    for relationship in &event.context.relationships {
+        evidence_event_ids.extend(event_event_ids(&relationship.evidence)?);
+    }
+    if event.causal_stream == CausalStream::LocalOnly {
+        return Ok(());
+    }
+    for reference in event
+        .supersedes
+        .iter()
+        .chain(&event.reinforces)
+        .cloned()
+        .chain(evidence_event_ids)
+    {
+        match known.get(&reference) {
+            Some(CausalStream::SyncEligible) => {}
+            Some(CausalStream::LocalOnly) => {
+                return Err(StoreError::Invalid(
+                    "sync-eligible events may not reference local-only events".into(),
+                ))
+            }
+            None => return Err(StoreError::MissingParent(reference)),
+        }
+    }
+    Ok(())
+}
+
+fn event_event_ids(evidence: &[EvidenceRef]) -> Result<Vec<EventId>, StoreError> {
+    evidence
+        .iter()
+        .filter(|reference| reference.evidence_type == EvidenceType::Event)
+        .map(|reference| EventId::parse(reference.source_id.as_str()).map_err(StoreError::Invalid))
+        .collect()
 }
 
 pub fn topological_order(events: &[TwinEvent]) -> Result<Vec<TwinEvent>, StoreError> {
@@ -692,9 +771,13 @@ impl EventRecorder for NoopEventRecorder {
 mod tests {
     use super::*;
     use crate::models::twin_event::{
-        BoundedContent, DecisionRecorded, Identifier, TwinEventPayload, MAX_DECISION_OPTIONS,
+        BoundedContent, CausalStream, DecisionRecorded, EvidenceRef, EvidenceType, Governance,
+        Identifier, RelationshipAssertion, RelationshipDirection, RelationshipPredicate,
+        TwinEventPayload, MAX_DECISION_OPTIONS,
     };
-    use crate::services::twin_events::test_support::{valid_event, valid_event_for_device};
+    use crate::services::twin_events::test_support::{
+        valid_event, valid_event_for_device, valid_event_for_device_and_stream,
+    };
 
     fn write_event(path: &Path, event: &TwinEvent) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -706,6 +789,27 @@ mod tests {
             .events_dir()
             .join(&event.event_id.as_str()[..2])
             .join(format!("{}.json", event.event_id))
+    }
+
+    fn event_reference(event: &TwinEvent) -> EvidenceRef {
+        EvidenceRef {
+            evidence_type: EvidenceType::Event,
+            source_id: Identifier::parse(event.event_id.as_str()).unwrap(),
+            digest: None,
+        }
+    }
+
+    fn relationship_with_event_reference(event: &TwinEvent) -> RelationshipAssertion {
+        RelationshipAssertion {
+            subject_id: crate::models::twin_event::EntityId::parse("owner").unwrap(),
+            predicate: RelationshipPredicate::parse("works_with").unwrap(),
+            object_id: crate::models::twin_event::EntityId::parse("person-1").unwrap(),
+            direction: RelationshipDirection::Directed,
+            valid_from: None,
+            valid_to: None,
+            evidence: vec![event_reference(event)],
+            governance: Governance::direct_observation(),
+        }
     }
 
     fn try_symlink_dir(original: &Path, link: &Path) -> bool {
@@ -788,6 +892,223 @@ mod tests {
     }
 
     #[test]
+    fn causal_lanes_sequence_independently_and_sync_peer_can_omit_local_lane() {
+        let sync_one = valid_event_for_device_and_stream(
+            "device-a",
+            CausalStream::SyncEligible,
+            1,
+            Vec::new(),
+        );
+        let local_one =
+            valid_event_for_device_and_stream("device-a", CausalStream::LocalOnly, 1, Vec::new());
+        let sync_two = valid_event_for_device_and_stream(
+            "device-a",
+            CausalStream::SyncEligible,
+            2,
+            vec![sync_one.event_id.clone()],
+        );
+
+        let origin_dir = tempfile::tempdir().unwrap();
+        let peer_dir = tempfile::tempdir().unwrap();
+        let origin = TwinEventStore::new(origin_dir.path());
+        let peer = TwinEventStore::new(peer_dir.path());
+        origin.initialize().unwrap();
+        peer.initialize().unwrap();
+        for event in [sync_one.clone(), local_one, sync_two.clone()] {
+            origin.append(event).unwrap();
+        }
+        for event in [sync_one.clone(), sync_two.clone()] {
+            peer.append(event).unwrap();
+        }
+
+        let origin_shared = origin
+            .ordered_events_for_stream(CausalStream::SyncEligible)
+            .unwrap();
+        let peer_shared = peer
+            .ordered_events_for_stream(CausalStream::SyncEligible)
+            .unwrap();
+        assert_eq!(origin_shared, vec![sync_one, sync_two]);
+        assert_eq!(peer_shared, origin_shared);
+    }
+
+    #[test]
+    fn sequence_predecessors_are_lane_local_and_cross_stream_causal_parents_are_rejected() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = TwinEventStore::new(temp.path());
+        store.initialize().unwrap();
+        let local_one =
+            valid_event_for_device_and_stream("device-a", CausalStream::LocalOnly, 1, Vec::new());
+        let sync_one = valid_event_for_device_and_stream(
+            "device-a",
+            CausalStream::SyncEligible,
+            1,
+            Vec::new(),
+        );
+        store.append(local_one.clone()).unwrap();
+        store.append(sync_one.clone()).unwrap();
+
+        let local_two_wrong = valid_event_for_device_and_stream(
+            "device-a",
+            CausalStream::LocalOnly,
+            2,
+            vec![sync_one.event_id.clone()],
+        );
+        assert!(store.append(local_two_wrong).is_err());
+        let sync_two_wrong = valid_event_for_device_and_stream(
+            "device-a",
+            CausalStream::SyncEligible,
+            2,
+            vec![local_one.event_id.clone()],
+        );
+        assert!(store.append(sync_two_wrong).is_err());
+
+        let local_two = valid_event_for_device_and_stream(
+            "device-a",
+            CausalStream::LocalOnly,
+            2,
+            vec![local_one.event_id],
+        );
+        let sync_two = valid_event_for_device_and_stream(
+            "device-a",
+            CausalStream::SyncEligible,
+            2,
+            vec![sync_one.event_id],
+        );
+        store.append(local_two).unwrap();
+        store.append(sync_two).unwrap();
+    }
+
+    #[test]
+    fn sync_eligible_rejects_every_reference_to_a_local_event_but_local_may_reference_shared() {
+        for kind in [
+            "causal",
+            "supersedes",
+            "reinforces",
+            "evidence",
+            "relationship",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let store = TwinEventStore::new(temp.path());
+            store.initialize().unwrap();
+            let local = valid_event_for_device_and_stream(
+                "local-device",
+                CausalStream::LocalOnly,
+                1,
+                Vec::new(),
+            );
+            store.append(local.clone()).unwrap();
+            let mut shared = valid_event_for_device_and_stream(
+                "shared-device",
+                CausalStream::SyncEligible,
+                1,
+                Vec::new(),
+            );
+            match kind {
+                "causal" => shared.causal_parents.push(local.event_id.clone()),
+                "supersedes" => shared.supersedes.push(local.event_id.clone()),
+                "reinforces" => shared.reinforces.push(local.event_id.clone()),
+                "evidence" => shared.evidence.push(event_reference(&local)),
+                "relationship" => shared
+                    .context
+                    .relationships
+                    .push(relationship_with_event_reference(&local)),
+                _ => unreachable!(),
+            }
+            shared.event_id = crate::services::twin_events::derive_event_id(&shared);
+            assert!(store.append(shared).is_err(), "{kind}");
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let store = TwinEventStore::new(temp.path());
+        store.initialize().unwrap();
+        let shared = valid_event_for_device_and_stream(
+            "shared-device",
+            CausalStream::SyncEligible,
+            1,
+            Vec::new(),
+        );
+        store.append(shared.clone()).unwrap();
+        let mut local = valid_event_for_device_and_stream(
+            "local-device",
+            CausalStream::LocalOnly,
+            1,
+            Vec::new(),
+        );
+        local.supersedes.push(shared.event_id.clone());
+        local.reinforces.push(shared.event_id.clone());
+        local.evidence.push(event_reference(&shared));
+        local
+            .context
+            .relationships
+            .push(relationship_with_event_reference(&shared));
+        local.event_id = crate::services::twin_events::derive_event_id(&local);
+        store.append(local).unwrap();
+    }
+
+    #[test]
+    fn event_evidence_requires_a_valid_event_id_in_both_lanes() {
+        for causal_stream in [CausalStream::LocalOnly, CausalStream::SyncEligible] {
+            let temp = tempfile::tempdir().unwrap();
+            let store = TwinEventStore::new(temp.path());
+            store.initialize().unwrap();
+            let mut event =
+                valid_event_for_device_and_stream("device-a", causal_stream, 1, Vec::new());
+            event.evidence.push(EvidenceRef {
+                evidence_type: EvidenceType::Event,
+                source_id: Identifier::parse("not-an-event-id").unwrap(),
+                digest: None,
+            });
+            event.event_id = crate::services::twin_events::derive_event_id(&event);
+            assert!(store.append(event).is_err(), "{causal_stream:?}");
+        }
+    }
+
+    #[test]
+    fn loading_quarantines_sync_event_that_references_local_event() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = TwinEventStore::new(temp.path());
+        let local = valid_event_for_device_and_stream(
+            "local-device",
+            CausalStream::LocalOnly,
+            1,
+            Vec::new(),
+        );
+        let mut shared = valid_event_for_device_and_stream(
+            "shared-device",
+            CausalStream::SyncEligible,
+            1,
+            Vec::new(),
+        );
+        shared.evidence.push(event_reference(&local));
+        shared.event_id = crate::services::twin_events::derive_event_id(&shared);
+        write_event(&canonical_path(&store, &local), &local);
+        write_event(&canonical_path(&store, &shared), &shared);
+
+        store.initialize().unwrap();
+
+        assert_eq!(store.ordered_events().unwrap(), vec![local]);
+        assert_eq!(
+            std::fs::read_dir(store.quarantine_dir()).unwrap().count(),
+            1
+        );
+    }
+
+    #[test]
+    fn lock_creation_durability_uses_the_lock_files_actual_parent() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = TwinEventStore::new(temp.path());
+        store.initialize().unwrap();
+        assert_eq!(
+            store.lock_durability_directory().unwrap(),
+            store.lock_path().parent().unwrap()
+        );
+        assert_eq!(
+            store.lock_durability_directory().unwrap(),
+            temp.path().join("twin").join("events")
+        );
+    }
+
+    #[test]
     fn ordering_is_parent_first_and_independent_of_cross_device_arrival() {
         let first_a = valid_event_for_device("device-a", 1, Vec::new());
         let child_a = valid_event_for_device("device-a", 2, vec![first_a.event_id.clone()]);
@@ -820,6 +1141,65 @@ mod tests {
         assert!(
             ids_a.iter().position(|id| id == &first_a.event_id).unwrap()
                 < ids_a.iter().position(|id| id == &child_a.event_id).unwrap()
+        );
+    }
+
+    #[test]
+    fn full_and_sync_filtered_order_are_stable_across_arrival_order() {
+        let shared_a = valid_event_for_device_and_stream(
+            "shared-a",
+            CausalStream::SyncEligible,
+            1,
+            Vec::new(),
+        );
+        let shared_b = valid_event_for_device_and_stream(
+            "shared-b",
+            CausalStream::SyncEligible,
+            1,
+            Vec::new(),
+        );
+        let local =
+            valid_event_for_device_and_stream("local-a", CausalStream::LocalOnly, 1, Vec::new());
+        let first_dir = tempfile::tempdir().unwrap();
+        let second_dir = tempfile::tempdir().unwrap();
+        let first = TwinEventStore::new(first_dir.path());
+        let second = TwinEventStore::new(second_dir.path());
+        first.initialize().unwrap();
+        second.initialize().unwrap();
+        for event in [shared_b.clone(), local.clone(), shared_a.clone()] {
+            first.append(event).unwrap();
+        }
+        for event in [shared_a, local, shared_b] {
+            second.append(event).unwrap();
+        }
+
+        let full_ids = |store: &TwinEventStore| {
+            store
+                .ordered_events()
+                .unwrap()
+                .into_iter()
+                .map(|event| event.event_id)
+                .collect::<Vec<_>>()
+        };
+        let shared_ids = |store: &TwinEventStore| {
+            store
+                .ordered_events_for_stream(CausalStream::SyncEligible)
+                .unwrap()
+                .into_iter()
+                .map(|event| event.event_id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(full_ids(&first), full_ids(&second));
+        assert_eq!(shared_ids(&first), shared_ids(&second));
+        assert_eq!(
+            shared_ids(&first),
+            first
+                .ordered_events()
+                .unwrap()
+                .into_iter()
+                .filter(|event| event.causal_stream == CausalStream::SyncEligible)
+                .map(|event| event.event_id)
+                .collect::<Vec<_>>()
         );
     }
 
