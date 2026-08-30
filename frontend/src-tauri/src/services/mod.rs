@@ -13,6 +13,7 @@ pub mod ollama;
 pub mod openrouter;
 pub mod priority;
 pub mod retrieval;
+pub mod root_transition;
 pub mod search;
 pub mod settings;
 pub mod similarity;

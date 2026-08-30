@@ -8,7 +8,7 @@ use crate::models::twin::{
     MemoryDigestAction, MemoryDigestItem, MemoryDigestReviewRequest, MemoryDigestState,
     PromotionState, UserRecord, UserRecordKind, UserRecordUpdate,
 };
-use anyhow::{Context, Result};
+use anyhow::Result;
 use chrono::Utc;
 use serde_json::{json, Value};
 use std::collections::hash_map::DefaultHasher;
@@ -16,6 +16,13 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
 const MAX_MEMORY_DIGEST_ITEMS: usize = 5;
+
+type MemoryDigestReviewPlan = (
+    MemoryDigestItem,
+    Vec<UserRecord>,
+    Vec<(std::path::PathBuf, String)>,
+    crate::services::twin_events::TwinEventDraft,
+);
 
 fn memory_digest_trigger(record: &UserRecord) -> Option<&'static str> {
     if record.kind == UserRecordKind::Fact {
@@ -119,7 +126,47 @@ fn memory_digest_action_label(action: &MemoryDigestAction) -> &'static str {
 
 impl TwinStore {
     pub fn list_memory_digest(&mut self) -> Result<Vec<MemoryDigestItem>> {
-        self.ensure_record_cache()?;
+        if !self.event_recorder.is_noop() {
+            let recorder = self.event_recorder.clone();
+            let mut committed = None;
+            let mut planner = || {
+                let (all_items, pending) = self.plan_memory_digest_items().map_err(|error| {
+                    crate::services::twin_events::MutationError::Invalid(error.to_string())
+                })?;
+                let content = serde_json::to_string_pretty(&all_items).map_err(|error| {
+                    crate::services::twin_events::MutationError::Invalid(error.to_string())
+                })?;
+                let targets = self
+                    .governed_json_targets(vec![(self.digest_path.clone(), content)])
+                    .map_err(|error| {
+                        crate::services::twin_events::MutationError::Invalid(error.to_string())
+                    })?;
+                committed = Some(pending);
+                Ok(Some(crate::services::twin_events::MutationPlan::new(
+                    crate::models::twin_event::CausalStream::LocalOnly,
+                    crate::models::twin_event::SourceChannel::parse("legacy_twin")
+                        .map_err(crate::services::twin_events::MutationError::Invalid)?,
+                    targets,
+                    Vec::new(),
+                )))
+            };
+            if let Err(error) = recorder.commit_planned_mutation(
+                crate::services::twin_events::MutationOrigin::Local,
+                &mut planner,
+            ) {
+                self.invalidate_mutation_caches();
+                return Err(anyhow::Error::new(error));
+            }
+            return committed.ok_or_else(|| anyhow::anyhow!("memory digest was not planned"));
+        }
+        let (all_items, pending) = self.plan_memory_digest_items()?;
+        self.write_memory_digest_file(&all_items)?;
+        Ok(pending)
+    }
+
+    fn plan_memory_digest_items(
+        &self,
+    ) -> Result<(Vec<MemoryDigestItem>, Vec<MemoryDigestItem>)> {
         let mut existing = self.read_memory_digest_file()?;
         let mut existing_by_id = existing
             .iter()
@@ -128,10 +175,9 @@ impl TwinStore {
             .collect::<HashMap<_, _>>();
         let now = Utc::now();
         let records = self
-            .record_cache
-            .values()
+            .list_user_records_durable()?
+            .into_iter()
             .filter(|record| memory_digest_trigger(record).is_some())
-            .cloned()
             .collect::<Vec<_>>();
         let mut clusters: HashMap<String, Vec<UserRecord>> = HashMap::new();
 
@@ -183,7 +229,7 @@ impl TwinStore {
                     .to_string()
             };
             let latest_evidence = self
-                .resolve_evidence_refs(&primary.evidence_refs)
+                .resolve_evidence_refs_durable(&primary.evidence_refs)
                 .ok()
                 .and_then(|mut refs| refs.drain(..).next());
             let item = MemoryDigestItem {
@@ -213,13 +259,13 @@ impl TwinStore {
                 })
                 .then_with(|| b.updated_at.cmp(&a.updated_at))
         });
-        self.write_memory_digest_file(&existing)?;
-
-        Ok(existing
-            .into_iter()
+        let pending = existing
+            .iter()
             .filter(|item| item.state == MemoryDigestState::Pending)
             .take(MAX_MEMORY_DIGEST_ITEMS)
-            .collect())
+            .cloned()
+            .collect();
+        Ok((existing, pending))
     }
 
     pub fn review_memory_digest_item(
@@ -228,6 +274,42 @@ impl TwinStore {
         request: MemoryDigestReviewRequest,
     ) -> Result<MemoryDigestItem> {
         Self::validate_file_id(id)?;
+        if !self.event_recorder.is_noop() {
+            let recorder = self.event_recorder.clone();
+            let mut committed = None;
+            let mut planner = || {
+                let (item, records, values, draft) = self
+                    .plan_memory_digest_review(id, &request)
+                    .map_err(|error| {
+                        crate::services::twin_events::MutationError::Invalid(error.to_string())
+                    })?;
+                let targets = self.governed_json_targets(values).map_err(|error| {
+                    crate::services::twin_events::MutationError::Invalid(error.to_string())
+                })?;
+                committed = Some((item, records));
+                Ok(Some(crate::services::twin_events::MutationPlan::new(
+                    crate::models::twin_event::CausalStream::SyncEligible,
+                    crate::models::twin_event::SourceChannel::parse("legacy_twin")
+                        .map_err(crate::services::twin_events::MutationError::Invalid)?,
+                    targets,
+                    vec![draft],
+                )))
+            };
+            if let Err(error) = recorder.commit_planned_mutation(
+                crate::services::twin_events::MutationOrigin::Local,
+                &mut planner,
+            ) {
+                self.invalidate_mutation_caches();
+                return Err(anyhow::Error::new(error));
+            }
+            let (item, records) = committed
+                .ok_or_else(|| anyhow::anyhow!("memory digest review was not planned"))?;
+            for record in records {
+                self.record_cache.insert(record.id.clone(), record);
+            }
+            self.records_cache_ready = true;
+            return Ok(item);
+        }
         let mut items = self.read_memory_digest_file()?;
         if !items.iter().any(|item| item.id == id) {
             let _ = self.list_memory_digest()?;
@@ -390,23 +472,127 @@ impl TwinStore {
         Ok(item)
     }
 
-    fn read_memory_digest_file(&self) -> Result<Vec<MemoryDigestItem>> {
-        if !self.digest_path.exists() {
-            return Ok(Vec::new());
+    fn plan_memory_digest_review(
+        &self,
+        id: &str,
+        request: &MemoryDigestReviewRequest,
+    ) -> Result<MemoryDigestReviewPlan> {
+        let mut items = self.read_memory_digest_file()?;
+        if !items.iter().any(|item| item.id == id) {
+            items = self.plan_memory_digest_items()?.0;
+        }
+        let item_index = items
+            .iter()
+            .position(|item| item.id == id)
+            .ok_or_else(|| anyhow::anyhow!("Memory digest item not found: {}", id))?;
+        let mut item = items[item_index].clone();
+        item.state = memory_digest_state_for_action(&request.action);
+        item.updated_at = Utc::now();
+        items[item_index] = item.clone();
+        if item.record_ids.len() > 63 {
+            anyhow::bail!("a digest review can update at most 63 records");
         }
 
-        let content = std::fs::read_to_string(&self.digest_path).with_context(|| {
-            format!(
-                "Failed to read memory digest file: {}",
-                self.digest_path.display()
+        let mut updated_records = Vec::new();
+        for record_id in &item.record_ids {
+            let Some(mut record) = self
+                .read_twin_json_bounded::<UserRecord>(&self.record_file_path(record_id))?
+            else {
+                continue;
+            };
+            let next_state = match request.action {
+                MemoryDigestAction::Keep => PromotionState::Endorsed,
+                MemoryDigestAction::Soften => PromotionState::Candidate,
+                MemoryDigestAction::NotMe | MemoryDigestAction::Reject => {
+                    PromotionState::Rejected
+                }
+                MemoryDigestAction::Private => PromotionState::Private,
+                MemoryDigestAction::NoTrain => PromotionState::NoTrain,
+            };
+            let previous_state = record.promotion_state.clone();
+            record.promotion_state = next_state.clone();
+            record.updated_at = item.updated_at;
+            super::records::append_promotion_history(
+                &mut record.metadata,
+                &previous_state,
+                &next_state,
+                request.rationale.as_deref(),
+                false,
+            );
+            if next_state == PromotionState::Rejected {
+                record
+                    .metadata
+                    .insert("reverted_at".to_string(), json!(item.updated_at));
+                record.metadata.insert(
+                    "revert_reason".to_string(),
+                    json!(request.rationale.clone()),
+                );
+                record
+                    .metadata
+                    .insert("auto_promoted".to_string(), Value::Bool(false));
+            }
+            if request.action == MemoryDigestAction::Soften {
+                record.confidence = (record.confidence * 0.85).max(0.35);
+            }
+            updated_records.push(record);
+        }
+
+        let digest_content = serde_json::to_string_pretty(&items)?;
+        let digest_after = crate::services::twin_events::digest_bytes(digest_content.as_bytes());
+        let mut values = vec![(self.digest_path.clone(), digest_content)];
+        let action = memory_digest_action_label(&request.action);
+        let feedback_seed = format!("{}\0{}\0{}", item.id, action, item.updated_at);
+        let feedback_id = format!(
+            "feedback-{}",
+            crate::services::twin_events::digest_bytes(feedback_seed.as_bytes()).as_str()
+        );
+        let governance = if request.action == MemoryDigestAction::Private {
+            crate::services::twin_events::local_capture_governance(
+                crate::models::twin_event::Sensitivity::Restricted,
             )
-        })?;
-        serde_json::from_str(&content).with_context(|| {
-            format!(
-                "Failed to parse memory digest file: {}",
-                self.digest_path.display()
-            )
-        })
+        } else {
+            crate::services::twin_events::standard_capture_governance()
+        };
+        let mut draft = crate::services::twin_events::feedback_draft(
+            crate::services::twin_events::FeedbackDraft {
+                feedback_id: &feedback_id,
+                target_id: &item.id,
+                kind: action,
+                content: None,
+                rationale: request.rationale.as_deref(),
+                rank: None,
+                observed_at: item.updated_at,
+                source_channel: crate::models::twin_event::SourceChannel::parse("legacy_twin")
+                    .map_err(anyhow::Error::msg)?,
+                governance,
+            },
+        )
+        .map_err(anyhow::Error::msg)?;
+        draft.evidence.push(crate::models::twin_event::EvidenceRef {
+            evidence_type: crate::models::twin_event::EvidenceType::TwinRecord,
+            source_id: crate::models::twin_event::Identifier::parse(&item.id)
+                .map_err(anyhow::Error::msg)?,
+            digest: Some(digest_after),
+        });
+        for record in &updated_records {
+            let content = serde_json::to_string_pretty(record)?;
+            let digest = crate::services::twin_events::digest_bytes(content.as_bytes());
+            values.push((self.record_file_path(&record.id), content));
+            draft.evidence.push(crate::models::twin_event::EvidenceRef {
+                evidence_type: crate::models::twin_event::EvidenceType::TwinRecord,
+                source_id: crate::models::twin_event::Identifier::parse(&record.id)
+                    .map_err(anyhow::Error::msg)?,
+                digest: Some(digest),
+            });
+        }
+        draft.evidence.sort();
+        Ok((item, updated_records, values, draft))
+    }
+
+    fn read_memory_digest_file(&self) -> Result<Vec<MemoryDigestItem>> {
+        Ok(self
+            .read_twin_json_bounded(&self.digest_path)?
+            .unwrap_or_default())
     }
 
     fn write_memory_digest_file(&self, items: &[MemoryDigestItem]) -> Result<()> {

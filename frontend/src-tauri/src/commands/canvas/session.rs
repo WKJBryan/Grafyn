@@ -14,6 +14,7 @@ use tauri::State;
 /// List all canvas sessions
 #[tauri::command]
 pub async fn list_sessions(state: State<'_, AppState>) -> Result<Vec<SessionMeta>, String> {
+    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
     let mut store = state.canvas_store.write().await;
     store.list_sessions().map_err(|e| e.to_string())
 }
@@ -21,6 +22,7 @@ pub async fn list_sessions(state: State<'_, AppState>) -> Result<Vec<SessionMeta
 /// Get a single session by ID
 #[tauri::command]
 pub async fn get_session(id: String, state: State<'_, AppState>) -> Result<CanvasSession, String> {
+    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
     let mut store = state.canvas_store.write().await;
     store.get_session(&id).map_err(|e| e.to_string())
 }
@@ -31,6 +33,7 @@ pub async fn create_session(
     session: SessionCreate,
     state: State<'_, AppState>,
 ) -> Result<CanvasSession, String> {
+    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
     let mut store = state.canvas_store.write().await;
     let created = store.create_session(session).map_err(|e| e.to_string())?;
     drop(store);
@@ -58,6 +61,7 @@ pub async fn update_session(
     update: SessionUpdate,
     state: State<'_, AppState>,
 ) -> Result<CanvasSession, String> {
+    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
     let mut store = state.canvas_store.write().await;
     let updated = store
         .update_session(&id, update)
@@ -85,6 +89,7 @@ pub async fn update_session(
 /// Delete a canvas session
 #[tauri::command]
 pub async fn delete_session(id: String, state: State<'_, AppState>) -> Result<(), String> {
+    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
     let mut store = state.canvas_store.write().await;
     store.delete_session(&id).map_err(|e| e.to_string())?;
     drop(store);
@@ -122,6 +127,7 @@ pub async fn update_tile_position(
     position: TilePositionUpdate,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
+    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
     let mut store = state.canvas_store.write().await;
     store
         .update_tile_position(&session_id, &tile_id, position)
@@ -136,6 +142,7 @@ pub async fn delete_tile(
     tile_id: String,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
+    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
     let mut store = state.canvas_store.write().await;
     store
         .delete_tile(&session_id, &tile_id)
@@ -163,6 +170,7 @@ pub async fn delete_response(
     model_id: String,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
+    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
     let mut store = state.canvas_store.write().await;
     store
         .delete_response(&session_id, &tile_id, &model_id)
@@ -190,6 +198,7 @@ pub async fn update_viewport(
     viewport: CanvasViewport,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
+    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
     let mut store = state.canvas_store.write().await;
     store
         .update_viewport(&session_id, viewport)
@@ -205,6 +214,7 @@ pub async fn update_llm_node_position(
     position: LLMNodePositionUpdate,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
+    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
     let mut store = state.canvas_store.write().await;
     store
         .update_llm_node_position(&session_id, &tile_id, &model_id, position)
@@ -218,6 +228,7 @@ pub async fn auto_arrange(
     positions: HashMap<String, TilePosition>,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
+    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
     let mut store = state.canvas_store.write().await;
     store
         .batch_update_positions(&session_id, positions)
@@ -230,6 +241,7 @@ pub async fn export_to_note(
     session_id: String,
     state: State<'_, AppState>,
 ) -> Result<serde_json::Value, String> {
+    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
     let mut store = state.canvas_store.write().await;
     let session = store.get_session(&session_id).map_err(|e| e.to_string())?;
     drop(store);

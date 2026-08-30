@@ -76,6 +76,15 @@ impl MemoryService {
         note_id: &str,
     ) -> Result<Vec<Contradiction>, String> {
         let note = store.get_note(note_id).map_err(|e| e.to_string())?;
+        self.find_contradictions_for_note(search, &note)
+    }
+
+    pub fn find_contradictions_for_note(
+        &self,
+        search: &SearchService,
+        note: &crate::models::note::Note,
+    ) -> Result<Vec<Contradiction>, String> {
+        let note_id = note.id.as_str();
 
         // Find similar notes
         let similar = search

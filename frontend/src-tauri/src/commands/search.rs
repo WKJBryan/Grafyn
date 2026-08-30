@@ -10,6 +10,7 @@ pub async fn search_notes(
     limit: Option<usize>,
     state: State<'_, AppState>,
 ) -> Result<Vec<SearchResult>, String> {
+    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
     let search = state.search_service.read().await;
     let limit = limit.unwrap_or(20);
     let mut results = search.search(&query, limit).map_err(|e| e.to_string())?;
@@ -28,6 +29,7 @@ pub async fn find_similar(
     limit: Option<usize>,
     state: State<'_, AppState>,
 ) -> Result<Vec<SearchResult>, String> {
+    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
     let limit = limit.unwrap_or(10);
 
     // Get the note content for keyword extraction
@@ -89,6 +91,7 @@ pub async fn find_similar(
 /// Reindex all notes
 #[tauri::command]
 pub async fn reindex(state: State<'_, AppState>) -> Result<(), String> {
+    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
     rebuild_all_indexes(state.inner()).await?;
     Ok(())
 }

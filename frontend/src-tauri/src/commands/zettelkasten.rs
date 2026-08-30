@@ -211,9 +211,12 @@ pub async fn apply_links(
     #[allow(non_snake_case)] noteId: String,
     request: ApplyLinksRequest,
 ) -> Result<ApplyLinksResponse, String> {
+    let mut root_guard = Some(crate::commands::acquire_root_epoch(state.inner()).await?);
+    let root_epoch = crate::commands::capture_root_epoch(state.inner())?;
     let requested_candidates = if !request.candidates.is_empty() {
         deduplicate_links(request.candidates.clone())
     } else {
+        drop(root_guard.take());
         // Backward-compatibility path for older callers that only send IDs.
         let response = discover_for_note(
             state.inner(),
@@ -236,6 +239,10 @@ pub async fn apply_links(
             .into_iter()
             .filter(|c| requested.contains(&c.target_id))
             .collect()
+    };
+    let _root_guard = match root_guard {
+        Some(guard) => guard,
+        None => crate::commands::acquire_expected_root_epoch(state.inner(), &root_epoch).await?,
     };
     let links_attempted = requested_candidates.len();
 
@@ -334,6 +341,7 @@ pub async fn create_link(
     #[allow(non_snake_case)] targetId: String,
     #[allow(non_snake_case)] linkType: Option<String>,
 ) -> Result<CreateLinkResponse, String> {
+    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
     let link_type = linkType.unwrap_or_else(|| "related".to_string());
     let mut dirty_note_ids: HashSet<String> = HashSet::new();
 
@@ -415,6 +423,7 @@ pub async fn list_link_suggestion_queue(
     status: Option<String>,
     limit: Option<usize>,
 ) -> Result<Vec<LinkSuggestionQueueEntry>, String> {
+    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
     let discovery = state.link_discovery.read().await;
     Ok(discovery.list_queue_entries(status.as_deref(), limit.unwrap_or(25)))
 }
@@ -426,6 +435,7 @@ pub async fn dismiss_link_suggestion(
     #[allow(non_snake_case)] noteId: String,
     #[allow(non_snake_case)] targetId: String,
 ) -> Result<DismissLinkSuggestionResponse, String> {
+    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
     let mut discovery = state.link_discovery.write().await;
     let response = discovery.dismiss_suggestion(&noteId, &targetId);
     drop(discovery);
@@ -438,6 +448,7 @@ pub async fn dismiss_link_suggestion(
 pub async fn get_link_discovery_status(
     state: State<'_, AppState>,
 ) -> Result<LinkDiscoveryStatus, String> {
+    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
     let settings = state.settings_service.read().await;
     let discovery = state.link_discovery.read().await;
     Ok(discovery.status(settings.get()))

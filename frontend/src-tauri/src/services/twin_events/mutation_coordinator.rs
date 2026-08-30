@@ -12,6 +12,22 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use uuid::Uuid;
 
+pub(crate) struct CoordinatorProcessLock(File);
+
+impl std::ops::Deref for CoordinatorProcessLock {
+    type Target = File;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl CoordinatorProcessLock {
+    pub(crate) fn unlock(self) -> io::Result<()> {
+        FileExt::unlock(&self.0)
+    }
+}
+
 const WRITER_SCHEMA_VERSION: u16 = 1;
 const WRITER_FILE_LIMIT: u64 = 4096;
 
@@ -215,36 +231,10 @@ impl StoreEventGroupFinalizer {
             .join("mutation-v1.lock")
     }
 
-    pub(crate) fn acquire_coordinator_lock(&self) -> Result<File, MutationError> {
-        let path = self.coordinator_lock_path();
-        let parent = path
-            .parent()
-            .ok_or_else(|| MutationError::Invalid("coordinator lock has no parent".into()))?;
-        crate::services::twin_events::validate_real_directory(
-            parent,
-            "Twin mutation coordinator directory",
-        )?;
-        let file = match OpenOptions::new()
-            .create_new(true)
-            .read(true)
-            .write(true)
-            .open(&path)
-        {
-            Ok(file) => {
-                crate::services::twin_events::sync_directory(parent)?;
-                file
-            }
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                crate::services::twin_events::validate_real_file(
-                    &path,
-                    "Twin mutation coordinator lock",
-                )?;
-                OpenOptions::new().read(true).write(true).open(&path)?
-            }
-            Err(error) => return Err(error.into()),
-        };
-        file.lock_exclusive()?;
-        Ok(file)
+    pub(crate) fn acquire_coordinator_lock(
+        &self,
+    ) -> Result<CoordinatorProcessLock, MutationError> {
+        acquire_coordinator_process_lock_at(&self.coordinator_lock_path())
     }
 
     pub(crate) fn finalize_locked(
@@ -323,6 +313,50 @@ impl StoreEventGroupFinalizer {
     }
 }
 
+pub(crate) fn acquire_shared_coordinator_process_lock(
+    data_path: &Path,
+) -> Result<CoordinatorProcessLock, MutationError> {
+    acquire_coordinator_process_lock_at(
+        &data_path
+            .join("twin")
+            .join("events")
+            .join("mutation-v1.lock"),
+    )
+}
+
+fn acquire_coordinator_process_lock_at(
+    path: &Path,
+) -> Result<CoordinatorProcessLock, MutationError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| MutationError::Invalid("coordinator lock has no parent".into()))?;
+    crate::services::twin_events::validate_real_directory(
+        parent,
+        "Twin mutation coordinator directory",
+    )?;
+    let file = match OpenOptions::new()
+        .create_new(true)
+        .read(true)
+        .write(true)
+        .open(path)
+    {
+        Ok(file) => {
+            crate::services::twin_events::sync_directory(parent)?;
+            file
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            crate::services::twin_events::validate_real_file(
+                path,
+                "Twin mutation coordinator lock",
+            )?;
+            OpenOptions::new().read(true).write(true).open(path)?
+        }
+        Err(error) => return Err(error.into()),
+    };
+    file.lock_exclusive()?;
+    Ok(CoordinatorProcessLock(file))
+}
+
 impl EventGroupFinalizer for StoreEventGroupFinalizer {
     fn finalize(
         &self,
@@ -331,7 +365,7 @@ impl EventGroupFinalizer for StoreEventGroupFinalizer {
     ) -> Result<Vec<TwinEvent>, MutationError> {
         let lock = self.acquire_coordinator_lock()?;
         let result = self.finalize_locked(requested_stream, drafts);
-        FileExt::unlock(&lock)?;
+        lock.unlock()?;
         result
     }
 }
@@ -423,7 +457,8 @@ pub struct MutationCommit {
 
 pub struct MutationCoordinator {
     data_path: PathBuf,
-    vault_path: std::sync::Mutex<PathBuf>,
+    data_root: crate::services::twin_events::AnchoredRoot,
+    vault_root: std::sync::Mutex<crate::services::twin_events::AnchoredRoot>,
     store: Arc<TwinEventStore>,
     finalizer: StoreEventGroupFinalizer,
     journal: crate::services::twin_events::LocalMutationJournal,
@@ -433,15 +468,30 @@ pub struct MutationCoordinator {
     root_lease: std::sync::Mutex<ActiveMarkdownRootLeaseV1>,
 }
 
+pub(crate) struct MutationRootTransitionGuard<'a> {
+    coordinator: &'a MutationCoordinator,
+    _process_lock: CoordinatorProcessLock,
+}
+
 const ACTIVE_ROOT_LEASE_SCHEMA_VERSION: u16 = 1;
 const ACTIVE_ROOT_LEASE_LIMIT: u64 = 4096;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ActiveMarkdownRootLeaseV1 {
-    schema_version: u16,
-    root_scope: crate::models::twin_event::ContentDigest,
-    epoch_uuid: String,
+pub(crate) struct ActiveMarkdownRootLeaseV1 {
+    pub(crate) schema_version: u16,
+    pub(crate) root_scope: crate::models::twin_event::ContentDigest,
+    pub(crate) epoch_uuid: String,
+}
+
+impl ActiveMarkdownRootLeaseV1 {
+    pub(crate) fn new(root_scope: crate::models::twin_event::ContentDigest) -> Self {
+        Self {
+            schema_version: ACTIVE_ROOT_LEASE_SCHEMA_VERSION,
+            root_scope,
+            epoch_uuid: Uuid::new_v4().to_string(),
+        }
+    }
 }
 
 impl MutationCoordinator {
@@ -458,31 +508,28 @@ impl MutationCoordinator {
             &vault_path,
             "trusted Markdown vault root",
         )?;
+        let data_path = fs::canonicalize(data_path)?;
         let vault_path = fs::canonicalize(vault_path)?;
+        let data_root = crate::services::twin_events::AnchoredRoot::open(&data_path)?;
+        data_root.open_directory("canvas", true)?;
+        let twin_path = fs::canonicalize(data_path.join("twin"))?;
+        let canvas_path = fs::canonicalize(data_path.join("canvas"))?;
+        validate_disjoint_roots(&vault_path, &canvas_path, &twin_path)?;
+        let vault_root = crate::services::twin_events::AnchoredRoot::open(&vault_path)?;
         let identity = Arc::new(PersistedMutationIdentityProvider::load_or_create(
             &data_path,
         )?);
         let finalizer = StoreEventGroupFinalizer::new(store.clone(), identity);
         let journal = crate::services::twin_events::LocalMutationJournal::initialize(&data_path)?;
-        let canvas_path = data_path.join("canvas");
-        match fs::symlink_metadata(&canvas_path) {
-            Ok(_) => crate::services::twin_events::validate_real_directory(
-                &canvas_path,
-                "Canvas data directory",
-            )?,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                fs::create_dir(&canvas_path)?;
-                crate::services::twin_events::sync_directory(&data_path)?;
-            }
-            Err(error) => return Err(error.into()),
-        }
         let process_lock = finalizer.acquire_coordinator_lock()?;
+        journal.cleanup_orphan_temps_locked(&process_lock)?;
         let root_scope = markdown_root_scope_for(&vault_path)?;
-        let root_lease = load_or_create_active_root_lease(&data_path, root_scope)?;
-        FileExt::unlock(&process_lock)?;
+        let root_lease = load_or_create_active_root_lease(&data_root, root_scope)?;
+        process_lock.unlock()?;
         Ok(Self {
             data_path,
-            vault_path: std::sync::Mutex::new(vault_path),
+            data_root,
+            vault_root: std::sync::Mutex::new(vault_root),
             store,
             finalizer,
             journal,
@@ -525,26 +572,27 @@ impl MutationCoordinator {
             .map_err(|_| MutationError::Invalid("mutation coordinator lock poisoned".into()))?;
         let process_lock = self.finalizer.acquire_coordinator_lock()?;
         if let Err(error) = self.verify_root_lease_locked() {
-            FileExt::unlock(&process_lock)?;
+            process_lock.unlock()?;
             return Err(error);
         }
-        for (_, pending) in self.journal.load_pending()? {
-            if let Err(error) = self.replay_intent_locked(&pending, false) {
-                FileExt::unlock(&process_lock)?;
+        self.journal.cleanup_orphan_temps_locked(&process_lock)?;
+        for (_, pending) in self.journal.load_pending(&process_lock)? {
+            if let Err(error) = self.replay_intent_locked(&process_lock, &pending, false) {
+                process_lock.unlock()?;
                 return Err(error);
             }
         }
         let Some(plan) = (match planner() {
             Ok(plan) => plan,
             Err(error) => {
-                FileExt::unlock(&process_lock)?;
+                process_lock.unlock()?;
                 if origin == MutationOrigin::Local {
                     self.lifecycle.known_failure(None, &error.to_string());
                 }
                 return Err(error);
             }
         }) else {
-            FileExt::unlock(&process_lock)?;
+            process_lock.unlock()?;
             return Ok(MutationCommit {
                 mutation_id: None,
                 events: Vec::new(),
@@ -559,14 +607,14 @@ impl MutationCoordinator {
         ) {
             Ok(Some(intent)) => intent,
             Ok(None) => {
-                FileExt::unlock(&process_lock)?;
+                process_lock.unlock()?;
                 return Ok(MutationCommit {
                     mutation_id: None,
                     events: Vec::new(),
                 });
             }
             Err(error) => {
-                FileExt::unlock(&process_lock)?;
+                process_lock.unlock()?;
                 if origin == MutationOrigin::Local {
                     self.lifecycle.known_failure(None, &error.to_string());
                 }
@@ -577,14 +625,14 @@ impl MutationCoordinator {
         let invoke_lifecycle = origin == MutationOrigin::Local && !prepared.events.is_empty();
         if invoke_lifecycle {
             if let Err(error) = self.lifecycle.stage_before_local(&prepared) {
-                FileExt::unlock(&process_lock)?;
+                process_lock.unlock()?;
                 self.lifecycle
                     .known_failure(Some(prepared.mutation_id.as_str()), &error.to_string());
                 return Err(error);
             }
         }
-        if let Err(error) = self.journal.stage(&prepared) {
-            FileExt::unlock(&process_lock)?;
+        if let Err(error) = self.journal.stage(&process_lock, &prepared) {
+            process_lock.unlock()?;
             if invoke_lifecycle {
                 self.lifecycle
                     .known_failure(Some(prepared.mutation_id.as_str()), &error.to_string());
@@ -593,8 +641,8 @@ impl MutationCoordinator {
         }
         let committed = self
             .inject(MutationFaultPoint::AfterStage)
-            .and_then(|()| self.replay_intent_locked(&prepared, true));
-        let unlock = FileExt::unlock(&process_lock);
+            .and_then(|()| self.replay_intent_locked(&process_lock, &prepared, true));
+        let unlock = process_lock.unlock();
         if let Err(error) = unlock {
             return Err(error.into());
         }
@@ -647,24 +695,62 @@ impl MutationCoordinator {
             .map_err(|_| MutationError::Invalid("mutation coordinator lock poisoned".into()))?;
         let process_lock = self.finalizer.acquire_coordinator_lock()?;
         self.verify_root_lease_locked()?;
-        let pending = self.journal.load_pending()?;
+        self.journal.cleanup_orphan_temps_locked(&process_lock)?;
+        let pending = self.journal.load_pending(&process_lock)?;
         let mut recovered = 0usize;
         for (_, intent) in pending {
-            if let Err(error) = self.replay_intent_locked(&intent, false) {
-                FileExt::unlock(&process_lock)?;
+            if let Err(error) = self.replay_intent_locked(&process_lock, &intent, false) {
+                process_lock.unlock()?;
                 return Err(error);
             }
             recovered += 1;
         }
-        FileExt::unlock(&process_lock)?;
+        process_lock.unlock()?;
         Ok(recovered)
     }
 
     pub fn pending_count(&self) -> Result<usize, MutationError> {
-        self.journal.pending_count()
+        let _in_process = self
+            .in_process
+            .lock()
+            .map_err(|_| MutationError::Invalid("mutation coordinator lock poisoned".into()))?;
+        let process_lock = self.finalizer.acquire_coordinator_lock()?;
+        self.journal.cleanup_orphan_temps_locked(&process_lock)?;
+        self.journal.pending_count(&process_lock)
     }
 
-    pub fn retarget_markdown_root(&self, vault_path: &Path) -> Result<(), MutationError> {
+    pub(crate) fn current_root_epoch(&self) -> Result<ActiveMarkdownRootLeaseV1, MutationError> {
+        let _in_process = self
+            .in_process
+            .lock()
+            .map_err(|_| MutationError::Invalid("mutation coordinator lock poisoned".into()))?;
+        let process_lock = self.finalizer.acquire_coordinator_lock()?;
+        let result = (|| {
+            self.verify_root_lease_locked()?;
+            self.root_lease
+                .lock()
+                .map_err(|_| MutationError::Invalid("Markdown root lease lock poisoned".into()))
+                .map(|lease| lease.clone())
+        })();
+        process_lock.unlock()?;
+        result
+    }
+
+    pub(crate) fn validate_root_epoch(
+        &self,
+        expected: &ActiveMarkdownRootLeaseV1,
+    ) -> Result<(), MutationError> {
+        let current = self.current_root_epoch()?;
+        if &current != expected {
+            return Err(MutationError::RecoveryConflict(
+                "root epoch changed while work was in flight".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retarget_markdown_root(&self, vault_path: &Path) -> Result<(), MutationError> {
         let _in_process = self
             .in_process
             .lock()
@@ -677,31 +763,66 @@ impl MutationCoordinator {
                 "trusted Markdown vault root",
             )?;
             let new_root = fs::canonicalize(vault_path)?;
-            for (_, pending) in self.journal.load_pending()? {
-                self.replay_intent_locked(&pending, false)?;
+            validate_disjoint_roots(
+                &new_root,
+                self.data_root.canonical_path().join("canvas").as_path(),
+                self.data_root.canonical_path().join("twin").as_path(),
+            )?;
+            let new_root_capability =
+                crate::services::twin_events::AnchoredRoot::open(&new_root)?;
+            self.journal.cleanup_orphan_temps_locked(&process_lock)?;
+            for (_, pending) in self.journal.load_pending(&process_lock)? {
+                self.replay_intent_locked(&process_lock, &pending, false)?;
             }
             let next_lease = ActiveMarkdownRootLeaseV1 {
                 schema_version: ACTIVE_ROOT_LEASE_SCHEMA_VERSION,
                 root_scope: markdown_root_scope_for(&new_root)?,
                 epoch_uuid: Uuid::new_v4().to_string(),
             };
-            write_active_root_lease(&self.data_path, &next_lease)?;
+            write_active_root_lease(&self.data_root, &next_lease)?;
             *self
-                .vault_path
+                .vault_root
                 .lock()
                 .map_err(|_| MutationError::Invalid("Markdown root lock poisoned".into()))? =
-                new_root;
+                new_root_capability;
             *self.root_lease.lock().map_err(|_| {
                 MutationError::Invalid("Markdown root lease lock poisoned".into())
             })? = next_lease;
             Ok(())
         })();
-        FileExt::unlock(&process_lock)?;
+        process_lock.unlock()?;
         result
     }
 
+    pub(crate) fn begin_root_transition(
+        &self,
+    ) -> Result<MutationRootTransitionGuard<'_>, MutationError> {
+        let process_lock = self.finalizer.acquire_coordinator_lock()?;
+        let result = (|| -> Result<(), MutationError> {
+            self.verify_root_lease_locked()?;
+            self.journal.cleanup_orphan_temps_locked(&process_lock)?;
+            for (_, pending) in self.journal.load_pending(&process_lock)? {
+                self.replay_intent_locked(&process_lock, &pending, false)?;
+            }
+            self.verify_root_lease_locked()
+        })();
+        if let Err(error) = result {
+            process_lock.unlock()?;
+            return Err(error);
+        }
+        Ok(MutationRootTransitionGuard {
+            coordinator: self,
+            _process_lock: process_lock,
+        })
+    }
+
     pub fn quarantine_count(&self) -> Result<usize, MutationError> {
-        self.journal.quarantine_count()
+        let _in_process = self
+            .in_process
+            .lock()
+            .map_err(|_| MutationError::Invalid("mutation coordinator lock poisoned".into()))?;
+        let process_lock = self.finalizer.acquire_coordinator_lock()?;
+        self.journal.quarantine_count(&process_lock)
     }
 
     fn prepare_intent(
@@ -712,21 +833,24 @@ impl MutationCoordinator {
         targets: Vec<crate::services::twin_events::TargetMutation>,
         drafts: Vec<TwinEventDraft>,
     ) -> Result<Option<crate::services::twin_events::MutationIntentV1>, MutationError> {
-        if targets.is_empty() || targets.len() > crate::services::twin_events::MAX_INTENT_TARGETS {
+        if targets.len() > crate::services::twin_events::MAX_INTENT_TARGETS {
             return Err(MutationError::Invalid(
-                "local mutation must contain 1..=64 targets".into(),
+                "local mutation must contain at most 64 targets".into(),
             ));
         }
+        if targets.is_empty() && drafts.is_empty() {
+            return Err(MutationError::Invalid(
+                "mutation must contain a target or event draft".into(),
+            ));
+        }
+        let event_only = targets.is_empty();
         let mut targets = targets;
         targets.sort_by(|left, right| {
             (left.kind, left.relative_key.as_str()).cmp(&(right.kind, right.relative_key.as_str()))
         });
         let mut physical_keys = std::collections::BTreeSet::new();
         for target in &targets {
-            let key = crate::services::twin_events::physical_target_key(
-                target.kind,
-                &target.relative_key,
-            )?;
+            let key = self.physical_target_id(target.kind, &target.relative_key)?;
             if !physical_keys.insert(key) {
                 return Err(MutationError::Invalid(
                     "duplicate or aliased mutation target".into(),
@@ -736,8 +860,7 @@ impl MutationCoordinator {
         let mut prepared_targets = Vec::new();
         for target in targets {
             crate::services::twin_events::validate_relative_key(&target.relative_key)?;
-            let path = self.resolve_target_path(target.kind, &target.relative_key, false)?;
-            let before = self.before_image(&path)?;
+            let before = self.before_image(target.kind, &target.relative_key)?;
             let after_digest = crate::services::twin_events::desired_digest(&target.after);
             if target_matches_after(&before, &target.after, &after_digest) {
                 continue;
@@ -750,7 +873,7 @@ impl MutationCoordinator {
                 after_digest,
             });
         }
-        if prepared_targets.is_empty() {
+        if prepared_targets.is_empty() && !event_only {
             return Ok(None);
         }
         if origin != MutationOrigin::Local && !drafts.is_empty() {
@@ -809,6 +932,7 @@ impl MutationCoordinator {
 
     fn replay_intent_locked(
         &self,
+        process_lock: &CoordinatorProcessLock,
         intent: &crate::services::twin_events::MutationIntentV1,
         inject_faults: bool,
     ) -> Result<(), MutationError> {
@@ -816,7 +940,7 @@ impl MutationCoordinator {
         self.store.preflight_append_group(&intent.events)?;
         if let Some(intent_scope) = &intent.markdown_root_scope {
             if &self.current_markdown_root_scope()? != intent_scope {
-                self.journal.quarantine_intent(intent)?;
+                self.journal.quarantine_intent(process_lock, intent)?;
                 return Err(MutationError::RecoveryConflict(
                     intent.mutation_id.as_str().to_string(),
                 ));
@@ -824,8 +948,7 @@ impl MutationCoordinator {
         }
         let mut classifications = Vec::with_capacity(intent.targets.len());
         for target in &intent.targets {
-            let path = self.resolve_target_path(target.kind, &target.relative_key, false)?;
-            let current = self.before_image(&path)?;
+            let current = self.before_image(target.kind, &target.relative_key)?;
             let classification = if current == target.before {
                 TargetClassification::Before
             } else if target_matches_after(&current, &target.after, &target.after_digest) {
@@ -836,7 +959,7 @@ impl MutationCoordinator {
             classifications.push(classification);
         }
         if classifications.contains(&TargetClassification::Third) {
-            self.journal.quarantine_intent(intent)?;
+            self.journal.quarantine_intent(process_lock, intent)?;
             return Err(MutationError::RecoveryConflict(
                 intent.mutation_id.as_str().to_string(),
             ));
@@ -879,7 +1002,7 @@ impl MutationCoordinator {
         if inject_faults {
             self.inject(MutationFaultPoint::BeforeCleanup)?;
         }
-        self.journal.remove(intent)?;
+        self.journal.remove(process_lock, intent)?;
         if inject_faults {
             self.inject(MutationFaultPoint::AfterCleanupBeforeFanout)?;
         }
@@ -902,31 +1025,13 @@ impl MutationCoordinator {
         target: &crate::services::twin_events::TargetMutation,
     ) -> Result<(), MutationError> {
         crate::services::twin_events::validate_relative_key(&target.relative_key)?;
-        let create_parents = matches!(
-            target.after,
-            crate::services::twin_events::DesiredImage::Utf8Bytes(_)
-        );
-        let path = self.resolve_target_path(target.kind, &target.relative_key, create_parents)?;
         match &target.after {
             crate::services::twin_events::DesiredImage::Utf8Bytes(content) => {
-                if path.exists() {
-                    crate::services::twin_events::validate_real_file(
-                        &path,
-                        "local mutation target",
-                    )?;
-                }
-                crate::services::atomic_io::write_atomic(&path, content.as_bytes())?;
-                crate::services::twin_events::sync_directory(
-                    path.parent().expect("target path has parent"),
-                )?;
+                self.put_target(target.kind, &target.relative_key, content.as_bytes())?;
             }
-            crate::services::twin_events::DesiredImage::Tombstone => match fs::remove_file(&path) {
-                Ok(()) => crate::services::twin_events::sync_directory(
-                    path.parent().expect("target path has parent"),
-                )?,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
-            },
+            crate::services::twin_events::DesiredImage::Tombstone => {
+                self.delete_target(target.kind, &target.relative_key)?;
+            }
         }
         Ok(())
     }
@@ -937,10 +1042,11 @@ impl MutationCoordinator {
     ) -> Result<PathBuf, MutationError> {
         Ok(match kind {
             crate::services::twin_events::TargetKind::Markdown => self
-                .vault_path
+                .vault_root
                 .lock()
                 .map_err(|_| MutationError::Invalid("Markdown root lock poisoned".into()))?
-                .clone(),
+                .canonical_path()
+                .to_path_buf(),
             crate::services::twin_events::TargetKind::TwinJson => self.data_path.join("twin"),
             crate::services::twin_events::TargetKind::CanvasJson => self.data_path.join("canvas"),
         })
@@ -960,7 +1066,7 @@ impl MutationCoordinator {
             .lock()
             .map_err(|_| MutationError::Invalid("Markdown root lease lock poisoned".into()))?
             .clone();
-        let durable = load_active_root_lease(&self.data_path)?;
+        let durable = load_active_root_lease(&self.data_root)?;
         if durable != expected || durable.root_scope != self.current_markdown_root_scope()? {
             return Err(MutationError::RecoveryConflict(
                 "stale-markdown-root-lease".into(),
@@ -969,88 +1075,115 @@ impl MutationCoordinator {
         Ok(())
     }
 
-    fn resolve_target_path(
+    fn target_key(
         &self,
         kind: crate::services::twin_events::TargetKind,
         relative_key: &str,
-        create_parents: bool,
-    ) -> Result<PathBuf, MutationError> {
+    ) -> Result<String, MutationError> {
         crate::services::twin_events::validate_relative_key(relative_key)?;
-        let root = self.target_root(kind)?;
-        crate::services::twin_events::validate_real_directory(&root, "mutation target root")?;
-        let components = Path::new(relative_key)
-            .components()
-            .map(|component| match component {
-                std::path::Component::Normal(value) => value
-                    .to_str()
-                    .map(str::to_string)
-                    .ok_or_else(|| MutationError::Invalid("target key is not UTF-8".into())),
-                _ => Err(MutationError::Invalid("unsafe target key".into())),
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut parent = root;
-        for (index, component) in components[..components.len() - 1].iter().enumerate() {
-            let candidate = parent.join(component);
-            match fs::symlink_metadata(&candidate) {
-                Ok(_) => crate::services::twin_events::validate_real_directory(
-                    &candidate,
-                    "mutation target path component",
-                )?,
-                Err(error) if error.kind() == io::ErrorKind::NotFound && create_parents => {
-                    parent = crate::services::twin_events::ensure_real_child_directory(
-                        &parent, component, false,
-                    )?;
-                    continue;
-                }
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    for remaining in &components[index..] {
-                        parent.push(remaining);
-                    }
-                    return Ok(parent);
-                }
-                Err(error) => return Err(error.into()),
+        Ok(match kind {
+            crate::services::twin_events::TargetKind::Markdown => relative_key.to_string(),
+            crate::services::twin_events::TargetKind::TwinJson => {
+                format!("twin/{relative_key}")
             }
-            parent = candidate;
-        }
-        let path = parent.join(components.last().expect("validated key is nonempty"));
-        if path.exists() {
-            crate::services::twin_events::validate_real_file(&path, "mutation target")?;
-        }
-        Ok(path)
+            crate::services::twin_events::TargetKind::CanvasJson => {
+                format!("canvas/{relative_key}")
+            }
+        })
     }
 
     fn before_image(
         &self,
-        path: &Path,
+        kind: crate::services::twin_events::TargetKind,
+        relative_key: &str,
     ) -> Result<crate::services::twin_events::BeforeImage, MutationError> {
-        match fs::symlink_metadata(path) {
-            Ok(_) => {
-                crate::services::twin_events::validate_real_file(path, "mutation target")?;
-                let mut file = File::open(path)?;
-                let mut hasher = sha2::Sha256::new();
-                let mut buffer = [0u8; 64 * 1024];
-                loop {
-                    let count = std::io::Read::read(&mut file, &mut buffer)?;
-                    if count == 0 {
-                        break;
-                    }
-                    use sha2::Digest as _;
-                    hasher.update(&buffer[..count]);
-                }
-                use sha2::Digest as _;
-                Ok(crate::services::twin_events::BeforeImage::Sha256(
-                    crate::models::twin_event::ContentDigest::parse(format!(
-                        "{:x}",
-                        hasher.finalize()
-                    ))
-                    .map_err(MutationError::Invalid)?,
-                ))
+        let limit = match kind {
+            crate::services::twin_events::TargetKind::Markdown
+            | crate::services::twin_events::TargetKind::TwinJson => {
+                crate::services::twin_events::MAX_MARKDOWN_TWIN_BYTES
             }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                Ok(crate::services::twin_events::BeforeImage::Absent)
+            crate::services::twin_events::TargetKind::CanvasJson => {
+                crate::services::twin_events::MAX_CANVAS_BYTES
             }
-            Err(error) => Err(error.into()),
+        };
+        let bytes = self.read_target(kind, relative_key, limit)?;
+        match bytes {
+            Some(bytes) => Ok(crate::services::twin_events::BeforeImage::Sha256(
+                crate::services::twin_events::digest_bytes(&bytes),
+            )),
+            None => Ok(crate::services::twin_events::BeforeImage::Absent),
         }
+    }
+
+    fn read_target(
+        &self,
+        kind: crate::services::twin_events::TargetKind,
+        relative_key: &str,
+        limit: usize,
+    ) -> Result<Option<Vec<u8>>, MutationError> {
+        match kind {
+            crate::services::twin_events::TargetKind::Markdown => self
+                .vault_root
+                .lock()
+                .map_err(|_| MutationError::Invalid("Markdown root lock poisoned".into()))?
+                .read_bounded(relative_key, limit),
+            crate::services::twin_events::TargetKind::TwinJson
+            | crate::services::twin_events::TargetKind::CanvasJson => self
+                .data_root
+                .read_bounded(&self.target_key(kind, relative_key)?, limit),
+        }
+    }
+
+    fn put_target(
+        &self,
+        kind: crate::services::twin_events::TargetKind,
+        relative_key: &str,
+        bytes: &[u8],
+    ) -> Result<(), MutationError> {
+        match kind {
+            crate::services::twin_events::TargetKind::Markdown => self
+                .vault_root
+                .lock()
+                .map_err(|_| MutationError::Invalid("Markdown root lock poisoned".into()))?
+                .put_atomic(relative_key, bytes),
+            crate::services::twin_events::TargetKind::TwinJson
+            | crate::services::twin_events::TargetKind::CanvasJson => self
+                .data_root
+                .put_atomic(&self.target_key(kind, relative_key)?, bytes),
+        }
+    }
+
+    fn delete_target(
+        &self,
+        kind: crate::services::twin_events::TargetKind,
+        relative_key: &str,
+    ) -> Result<(), MutationError> {
+        match kind {
+            crate::services::twin_events::TargetKind::Markdown => self
+                .vault_root
+                .lock()
+                .map_err(|_| MutationError::Invalid("Markdown root lock poisoned".into()))?
+                .delete(relative_key),
+            crate::services::twin_events::TargetKind::TwinJson
+            | crate::services::twin_events::TargetKind::CanvasJson => self
+                .data_root
+                .delete(&self.target_key(kind, relative_key)?),
+        }
+    }
+
+    fn physical_target_id(
+        &self,
+        kind: crate::services::twin_events::TargetKind,
+        relative_key: &str,
+    ) -> Result<Vec<u8>, MutationError> {
+        crate::services::twin_events::validate_relative_key(relative_key)?;
+        let mut target = platform_canonical_path_bytes(&self.target_root(kind)?)?;
+        target.push(b'/');
+        #[cfg(windows)]
+        target.extend_from_slice(relative_key.to_lowercase().as_bytes());
+        #[cfg(not(windows))]
+        target.extend_from_slice(relative_key.as_bytes());
+        Ok(target)
     }
 
     fn inject(&self, point: MutationFaultPoint) -> Result<(), MutationError> {
@@ -1068,35 +1201,154 @@ impl MutationCoordinator {
     }
 }
 
+impl MutationRootTransitionGuard<'_> {
+    pub(crate) fn current_lease(&self) -> Result<ActiveMarkdownRootLeaseV1, MutationError> {
+        self.coordinator
+            .root_lease
+            .lock()
+            .map_err(|_| MutationError::Invalid("Markdown root lease lock poisoned".into()))
+            .map(|lease| lease.clone())
+    }
+
+    pub(crate) fn current_vault_path(&self) -> Result<PathBuf, MutationError> {
+        self.coordinator
+            .vault_root
+            .lock()
+            .map_err(|_| MutationError::Invalid("Markdown root lock poisoned".into()))
+            .map(|root| root.canonical_path().to_path_buf())
+    }
+
+    pub(crate) fn adopt_durable_root(
+        &self,
+        vault_path: &Path,
+        lease: &ActiveMarkdownRootLeaseV1,
+    ) -> Result<(), MutationError> {
+        crate::services::twin_events::validate_real_directory(
+            vault_path,
+            "trusted Markdown vault root",
+        )?;
+        let canonical = fs::canonicalize(vault_path)?;
+        validate_disjoint_roots(
+            &canonical,
+            self.coordinator
+                .data_root
+                .canonical_path()
+                .join("canvas")
+                .as_path(),
+            self.coordinator
+                .data_root
+                .canonical_path()
+                .join("twin")
+                .as_path(),
+        )?;
+        let durable = load_active_root_lease(&self.coordinator.data_root)?;
+        if &durable != lease || lease.root_scope != markdown_root_scope_for(&canonical)? {
+            return Err(MutationError::RecoveryConflict(
+                "root-transition-lease-mismatch".into(),
+            ));
+        }
+        let capability = crate::services::twin_events::AnchoredRoot::open(&canonical)?;
+        *self
+            .coordinator
+            .vault_root
+            .lock()
+            .map_err(|_| MutationError::Invalid("Markdown root lock poisoned".into()))? =
+            capability;
+        *self
+            .coordinator
+            .root_lease
+            .lock()
+            .map_err(|_| MutationError::Invalid("Markdown root lease lock poisoned".into()))? =
+            lease.clone();
+        Ok(())
+    }
+}
+
 fn markdown_root_scope_for(
     root: &Path,
 ) -> Result<crate::models::twin_event::ContentDigest, MutationError> {
+    root_identity_for_path(root)
+}
+
+pub(crate) fn root_identity_for_path(
+    root: &Path,
+) -> Result<crate::models::twin_event::ContentDigest, MutationError> {
     crate::services::twin_events::validate_real_directory(root, "trusted Markdown vault root")?;
-    let canonical = fs::canonicalize(root)?;
-    let encoded = canonical
-        .to_str()
-        .ok_or_else(|| MutationError::Invalid("Markdown vault root must be valid UTF-8".into()))?;
-    let mut scoped = Vec::with_capacity(encoded.len() + 48);
-    scoped.extend_from_slice(b"grafyn.markdown_root_scope.v1");
+    let encoded = platform_canonical_path_bytes(root)?;
+    let platform: &[u8] = if cfg!(windows) { b"windows" } else { b"unix" };
+    let mut scoped = Vec::with_capacity(encoded.len() + 64);
+    scoped.extend_from_slice(b"grafyn.root_identity.v1");
+    scoped.extend_from_slice(&(platform.len() as u64).to_be_bytes());
+    scoped.extend_from_slice(platform);
     scoped.extend_from_slice(&(encoded.len() as u64).to_be_bytes());
-    scoped.extend_from_slice(encoded.as_bytes());
+    scoped.extend_from_slice(&encoded);
     Ok(crate::services::twin_events::digest_bytes(&scoped))
 }
 
-fn active_root_lease_path(data_path: &Path) -> PathBuf {
-    data_path
-        .join("twin")
-        .join("events")
-        .join("active-markdown-root-v1.json")
+fn validate_disjoint_roots(
+    markdown: &Path,
+    canvas: &Path,
+    twin: &Path,
+) -> Result<(), MutationError> {
+    let roots = [
+        ("Markdown", platform_canonical_path_bytes(markdown)?),
+        ("Canvas", platform_canonical_path_bytes(canvas)?),
+        ("Twin", platform_canonical_path_bytes(twin)?),
+    ];
+    for left in 0..roots.len() {
+        for right in left + 1..roots.len() {
+            if physical_paths_overlap(&roots[left].1, &roots[right].1) {
+                return Err(MutationError::Invalid(format!(
+                    "{} and {} roots overlap",
+                    roots[left].0, roots[right].0
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
+fn physical_paths_overlap(left: &[u8], right: &[u8]) -> bool {
+    fn is_ancestor(ancestor: &[u8], descendant: &[u8]) -> bool {
+        descendant.starts_with(ancestor)
+            && (descendant.len() == ancestor.len()
+                || descendant
+                    .get(ancestor.len())
+                    .is_some_and(|separator| *separator == b'/' || *separator == b'\\'))
+    }
+    is_ancestor(left, right) || is_ancestor(right, left)
+}
+
+#[cfg(unix)]
+fn platform_canonical_path_bytes(path: &Path) -> Result<Vec<u8>, MutationError> {
+    use std::os::unix::ffi::OsStrExt;
+    Ok(fs::canonicalize(path)?.as_os_str().as_bytes().to_vec())
+}
+
+#[cfg(windows)]
+fn platform_canonical_path_bytes(path: &Path) -> Result<Vec<u8>, MutationError> {
+    let canonical = fs::canonicalize(path)?;
+    let encoded = canonical
+        .to_str()
+        .ok_or_else(|| MutationError::Invalid("canonical root path must be Unicode".into()))?;
+    let normalized = encoded
+        .strip_prefix(r"\\?\")
+        .unwrap_or(encoded)
+        .replace('/', "\\")
+        .to_lowercase();
+    Ok(normalized.into_bytes())
+}
+
+const ACTIVE_ROOT_LEASE_KEY: &str = "twin/events/active-markdown-root-v1.json";
+
 fn load_or_create_active_root_lease(
-    data_path: &Path,
+    data_root: &crate::services::twin_events::AnchoredRoot,
     root_scope: crate::models::twin_event::ContentDigest,
 ) -> Result<ActiveMarkdownRootLeaseV1, MutationError> {
-    let path = active_root_lease_path(data_path);
-    if path.exists() {
-        let lease = load_active_root_lease(data_path)?;
+    if let Some(bytes) =
+        data_root.read_bounded(ACTIVE_ROOT_LEASE_KEY, ACTIVE_ROOT_LEASE_LIMIT as usize)?
+    {
+        let lease = parse_active_root_lease(&bytes)?;
         if lease.root_scope != root_scope {
             return Err(MutationError::RecoveryConflict(
                 "configured-markdown-root-is-not-active".into(),
@@ -1109,20 +1361,21 @@ fn load_or_create_active_root_lease(
         root_scope,
         epoch_uuid: Uuid::new_v4().to_string(),
     };
-    write_active_root_lease(data_path, &lease)?;
+    write_active_root_lease(data_root, &lease)?;
     Ok(lease)
 }
 
-fn load_active_root_lease(data_path: &Path) -> Result<ActiveMarkdownRootLeaseV1, MutationError> {
-    let path = active_root_lease_path(data_path);
-    crate::services::twin_events::validate_real_file(&path, "active Markdown root lease")?;
-    let metadata = fs::symlink_metadata(&path)?;
-    if metadata.len() > ACTIVE_ROOT_LEASE_LIMIT {
-        return Err(MutationError::Invalid(
-            "active Markdown root lease exceeds its size limit".into(),
-        ));
-    }
-    let lease: ActiveMarkdownRootLeaseV1 = serde_json::from_slice(&fs::read(path)?)
+fn load_active_root_lease(
+    data_root: &crate::services::twin_events::AnchoredRoot,
+) -> Result<ActiveMarkdownRootLeaseV1, MutationError> {
+    let bytes = data_root
+        .read_bounded(ACTIVE_ROOT_LEASE_KEY, ACTIVE_ROOT_LEASE_LIMIT as usize)?
+        .ok_or_else(|| MutationError::Invalid("active Markdown root lease is missing".into()))?;
+    parse_active_root_lease(&bytes)
+}
+
+fn parse_active_root_lease(bytes: &[u8]) -> Result<ActiveMarkdownRootLeaseV1, MutationError> {
+    let lease: ActiveMarkdownRootLeaseV1 = serde_json::from_slice(bytes)
         .map_err(|error| MutationError::Invalid(format!("invalid root lease: {error}")))?;
     if lease.schema_version != ACTIVE_ROOT_LEASE_SCHEMA_VERSION
         || Uuid::parse_str(&lease.epoch_uuid).is_err()
@@ -1135,23 +1388,18 @@ fn load_active_root_lease(data_path: &Path) -> Result<ActiveMarkdownRootLeaseV1,
 }
 
 fn write_active_root_lease(
-    data_path: &Path,
+    data_root: &crate::services::twin_events::AnchoredRoot,
     lease: &ActiveMarkdownRootLeaseV1,
 ) -> Result<(), MutationError> {
-    let path = active_root_lease_path(data_path);
-    let parent = path
-        .parent()
-        .ok_or_else(|| MutationError::Invalid("active root lease has no parent".into()))?;
-    crate::services::twin_events::validate_real_directory(parent, "Twin events directory")?;
-    if path.exists() {
-        crate::services::twin_events::validate_real_file(&path, "active Markdown root lease")?;
-    }
     let mut bytes = serde_json::to_vec_pretty(lease)
         .map_err(|error| MutationError::Invalid(error.to_string()))?;
     bytes.push(b'\n');
-    crate::services::atomic_io::write_atomic(&path, &bytes)?;
-    crate::services::twin_events::sync_directory(parent)?;
-    Ok(())
+    if bytes.len() > ACTIVE_ROOT_LEASE_LIMIT as usize {
+        return Err(MutationError::Invalid(
+            "active Markdown root lease exceeds its size limit".into(),
+        ));
+    }
+    data_root.put_atomic(ACTIVE_ROOT_LEASE_KEY, &bytes)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1180,13 +1428,6 @@ fn target_matches_after(
 }
 
 impl crate::services::twin_events::EventRecorder for MutationCoordinator {
-    fn record(
-        &self,
-        event: TwinEvent,
-    ) -> Result<crate::services::twin_events::AppendOutcome, StoreError> {
-        self.store.append(event)
-    }
-
     fn commit_mutation(
         &self,
         origin: MutationOrigin,
@@ -1219,6 +1460,7 @@ impl crate::services::twin_events::EventRecorder for MutationCoordinator {
         self.recover_pending()
     }
 
+    #[cfg(test)]
     fn retarget_markdown_root(&self, vault_path: &Path) -> Result<(), MutationError> {
         MutationCoordinator::retarget_markdown_root(self, vault_path)
     }
@@ -1324,6 +1566,130 @@ mod tests {
         assert!(events
             .iter()
             .all(|event| event.causal_stream == CausalStream::LocalOnly));
+    }
+
+    #[test]
+    fn coordinator_rejects_overlapping_markdown_canvas_or_twin_roots() {
+        let temp = tempdir().unwrap();
+        let data = temp.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        let store = Arc::new(crate::services::twin_events::TwinEventStore::new(&data));
+        store.initialize().unwrap();
+
+        let twin_overlap = MutationCoordinator::new(
+            &data,
+            data.join("twin"),
+            store.clone(),
+            Arc::new(NoopMutationLifecycle),
+        );
+        let twin_error = twin_overlap.err().expect("Twin overlap must fail");
+        assert!(
+            twin_error.to_string().contains("overlap"),
+            "unexpected construction failure: {twin_error}"
+        );
+        let canvas_overlap = MutationCoordinator::new(
+            &data,
+            data.join("canvas"),
+            store,
+            Arc::new(NoopMutationLifecycle),
+        );
+        let canvas_error = canvas_overlap.err().expect("Canvas overlap must fail");
+        assert!(
+            canvas_error.to_string().contains("overlap"),
+            "unexpected construction failure: {canvas_error}"
+        );
+    }
+
+    #[test]
+    fn rejected_overlapping_retarget_keeps_old_root_and_lease_authoritative() {
+        let temp = tempdir().unwrap();
+        let data = temp.path().join("data");
+        let vault = temp.path().join("vault");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::create_dir(&vault).unwrap();
+        let store = Arc::new(crate::services::twin_events::TwinEventStore::new(&data));
+        store.initialize().unwrap();
+        let coordinator = MutationCoordinator::new(
+            &data,
+            &vault,
+            store,
+            Arc::new(NoopMutationLifecycle),
+        )
+        .unwrap();
+
+        assert!(coordinator.retarget_markdown_root(&data.join("canvas")).is_err());
+        coordinator
+            .commit_local(
+                CausalStream::SyncEligible,
+                crate::models::twin_event::SourceChannel::parse("note_editor").unwrap(),
+                vec![crate::services::twin_events::TargetMutation::put(
+                    crate::services::twin_events::TargetKind::Markdown,
+                    "still-old.md",
+                    "old root",
+                )],
+                vec![draft("still-old")],
+            )
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(vault.join("still-old.md")).unwrap(),
+            "old root"
+        );
+        assert!(!data.join("canvas").join("still-old.md").exists());
+    }
+
+    #[test]
+    fn coordinated_event_only_group_appends_distinct_primitive_assessments() {
+        use crate::models::twin_event::{
+            BoundedContent, DecisionRecorded, Identifier, PrimitiveDecisionAssessmentPayload,
+        };
+        let temp = tempdir().unwrap();
+        let vault = temp.path().join("vault");
+        std::fs::create_dir(&vault).unwrap();
+        let store = Arc::new(crate::services::twin_events::TwinEventStore::new(
+            temp.path(),
+        ));
+        store.initialize().unwrap();
+        let coordinator = MutationCoordinator::new(
+            temp.path(),
+            &vault,
+            store.clone(),
+            Arc::new(NoopMutationLifecycle),
+        )
+        .unwrap();
+        let payload = |field: &str| {
+            let mut assessment = PrimitiveDecisionAssessmentPayload::default();
+            let value = Some(BoundedContent::parse(format!("{field} value")).unwrap());
+            match field {
+                "stakes" => assessment.stakes = value,
+                "reversibility" => assessment.reversibility = value,
+                _ => unreachable!(),
+            }
+            crate::models::twin_event::TwinEventPayload::DecisionRecorded(DecisionRecorded {
+                decision_id: Identifier::parse("primitive-decision").unwrap(),
+                decision: BoundedContent::parse("choose").unwrap(),
+                options: vec![BoundedContent::parse("a").unwrap()],
+                stakes: None,
+                initial_leaning: None,
+                review_date: None,
+                primitive_assessment: assessment,
+            })
+        };
+        let mut first = draft("placeholder-a");
+        first.payload = payload("stakes");
+        let mut second = draft("placeholder-b");
+        second.payload = payload("reversibility");
+
+        let committed = coordinator
+            .commit_local(
+                CausalStream::LocalOnly,
+                crate::models::twin_event::SourceChannel::parse("legacy_twin").unwrap(),
+                Vec::new(),
+                vec![first, second],
+            )
+            .unwrap();
+        assert_eq!(committed.events.len(), 2);
+        assert_ne!(committed.events[0].event_id, committed.events[1].event_id);
+        assert_eq!(store.ordered_events().unwrap().len(), 2);
     }
 
     #[test]

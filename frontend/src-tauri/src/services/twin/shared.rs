@@ -8,6 +8,7 @@ use crate::models::twin::{
 use crate::models::twin::{TraceEvent, TraceEventType};
 #[cfg(test)]
 use chrono::Utc;
+#[cfg(test)]
 use serde::de::DeserializeOwned;
 #[cfg(test)]
 use serde_json::json;
@@ -15,12 +16,15 @@ use serde_json::Value;
 #[cfg(test)]
 use std::collections::HashMap;
 use std::collections::HashSet;
+#[cfg(test)]
 use std::path::Path;
+#[cfg(test)]
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const EXCERPT_MAX_CHARS: usize = 220;
 
 /// Outcome of attempting to load a single JSON file within a per-file directory listing.
+#[cfg(test)]
 pub(super) enum FileLoadOutcome<T> {
     Loaded(T),
     /// The file couldn't be read (permissions, transient lock, etc). This is not
@@ -32,6 +36,7 @@ pub(super) enum FileLoadOutcome<T> {
     ParseFailed(anyhow::Error),
 }
 
+#[cfg(test)]
 pub(super) fn load_json_file<T: DeserializeOwned>(path: &Path) -> FileLoadOutcome<T> {
     let content = match std::fs::read_to_string(path) {
         Ok(content) => content,
@@ -46,6 +51,7 @@ pub(super) fn load_json_file<T: DeserializeOwned>(path: &Path) -> FileLoadOutcom
 /// Rename a corrupt file to `{name}.corrupt-{unix-timestamp}` in the same directory so
 /// the bytes aren't lost. Best-effort: if the rename itself fails, log and leave the
 /// file in place (it's still skipped for this pass by the caller).
+#[cfg(test)]
 fn quarantine_corrupt_file(path: &Path) {
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -82,6 +88,7 @@ fn quarantine_corrupt_file(path: &Path) {
 /// - a parse failure quarantines the file (renamed + logged) so it's never retried, and
 /// - a read failure is skipped without quarantine, since it may be transient/permissions
 ///   and the file itself could be perfectly fine.
+#[cfg(test)]
 pub(super) fn load_or_quarantine<T: DeserializeOwned>(path: &Path, kind: &str) -> Option<T> {
     match load_json_file::<T>(path) {
         FileLoadOutcome::Loaded(value) => Some(value),
@@ -408,7 +415,7 @@ mod tests {
         #[test]
         fn list_constitution_items_quarantines_corrupt_item_and_returns_healthy_ones() {
             let temp_dir = tempdir().expect("temp dir should be created");
-            let store = TwinStore::new(temp_dir.path().to_path_buf());
+            let mut store = TwinStore::new(temp_dir.path().to_path_buf());
 
             for i in 0..2 {
                 store
@@ -446,7 +453,7 @@ mod tests {
         #[test]
         fn list_action_gaps_quarantines_corrupt_gap_and_returns_healthy_ones() {
             let temp_dir = tempdir().expect("temp dir should be created");
-            let store = TwinStore::new(temp_dir.path().to_path_buf());
+            let mut store = TwinStore::new(temp_dir.path().to_path_buf());
 
             for i in 0..2 {
                 store

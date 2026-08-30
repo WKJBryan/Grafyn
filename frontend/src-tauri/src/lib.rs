@@ -30,7 +30,7 @@ use services::{
 use std::sync::Arc;
 use std::time::Instant;
 use tauri::{Emitter, Manager};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::RwLock;
 
 /// Application state holding all services
 #[derive(Clone)]
@@ -51,8 +51,9 @@ pub struct AppState {
     pub vault_optimizer: Arc<RwLock<VaultOptimizerService>>,
     pub twin_store: Arc<RwLock<TwinStore>>,
     pub twin_event_store: Arc<TwinEventStore>,
-    pub mutation_startup_error: Option<String>,
-    pub vault_transition: Arc<Mutex<()>>,
+    pub mutation_coordinator: Option<Arc<MutationCoordinator>>,
+    pub mutation_startup_error: Arc<RwLock<Option<String>>>,
+    pub vault_transition: Arc<RwLock<()>>,
     /// MemoryService is stateless — no lock needed, just Arc for shared ownership
     pub memory_service: Arc<MemoryService>,
     pub boot_state: Arc<RwLock<BootStatus>>,
@@ -75,14 +76,9 @@ pub fn run() {
 
     builder
         .setup(|app| {
-            // Load user settings first (fall back to defaults on error)
-            let settings_service = match SettingsService::load() {
-                Ok(s) => s,
-                Err(e) => {
-                    log::error!("Failed to load settings: {}. Using defaults.", e);
-                    SettingsService::load_defaults()
-                }
-            };
+            // Root/settings recovery is part of SettingsService::load and must fail closed
+            // before any store constructs itself from a possibly split authority.
+            let settings_service = SettingsService::load()?;
 
             let vault_path = settings_service.vault_path();
             let data_path = settings_service.data_path();
@@ -126,11 +122,15 @@ pub fn run() {
                     .map_err(|error| error.to_string())?;
                 Ok(coordinator)
             })();
-            let (event_recorder, mutation_startup_error): (Arc<dyn EventRecorder>, Option<String>) =
-                match coordinator {
-                    Ok(coordinator) => (coordinator, None),
+            let (event_recorder, mutation_coordinator, mutation_startup_error): (
+                Arc<dyn EventRecorder>,
+                Option<Arc<MutationCoordinator>>,
+                Option<String>,
+            ) = match coordinator {
+                    Ok(coordinator) => (coordinator.clone(), Some(coordinator), None),
                     Err(error) => (
                         Arc::new(UnavailableEventRecorder::new(error.clone())),
+                        None,
                         Some(error),
                     ),
                 };
@@ -184,7 +184,8 @@ pub fn run() {
             let canvas_store =
                 CanvasStore::with_event_recorder(data_path.join("canvas"), event_recorder.clone());
             let twin_store = TwinStore::with_event_recorder(
-                settings_service.get().effective_twin_data_path(),
+                crate::services::settings::prepare_twin_data_path(&data_path, &vault_path)
+                    .map_err(|error| error.to_string())?,
                 data_path.join("twin"),
                 event_recorder.clone(),
             );
@@ -230,8 +231,9 @@ pub fn run() {
                 vault_optimizer: Arc::new(RwLock::new(vault_optimizer)),
                 twin_store: Arc::new(RwLock::new(twin_store)),
                 twin_event_store,
-                mutation_startup_error,
-                vault_transition: Arc::new(Mutex::new(())),
+                mutation_coordinator,
+                mutation_startup_error: Arc::new(RwLock::new(mutation_startup_error)),
+                vault_transition: Arc::new(RwLock::new(())),
                 memory_service: Arc::new(MemoryService::new()),
                 boot_state,
             };
@@ -406,6 +408,7 @@ pub fn run() {
 }
 
 async fn warm_start_services(app_handle: tauri::AppHandle, state: AppState) -> Result<(), String> {
+    let _root_epoch = acquire_warm_start_root_gate(&state).await?;
     let boot_started = Instant::now();
 
     publish_boot_phase(
@@ -416,10 +419,6 @@ async fn warm_start_services(app_handle: tauri::AppHandle, state: AppState) -> R
     )
     .await;
     initialize_twin_event_store_for_boot(&state.twin_event_store)?;
-    if let Some(error) = &state.mutation_startup_error {
-        return Err(error.clone());
-    }
-
     publish_boot_phase(
         &app_handle,
         &state,
@@ -495,6 +494,12 @@ async fn warm_start_services(app_handle: tauri::AppHandle, state: AppState) -> R
     Ok(())
 }
 
+async fn acquire_warm_start_root_gate(
+    state: &AppState,
+) -> Result<tokio::sync::OwnedRwLockReadGuard<()>, String> {
+    crate::commands::acquire_root_epoch(state).await
+}
+
 fn initialize_twin_event_store_for_boot(store: &TwinEventStore) -> Result<(), String> {
     store.initialize().map_err(|error| error.to_string())
 }
@@ -530,6 +535,21 @@ fn start_link_discovery_worker(state: AppState) {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(12)).await;
 
+            let root_guard = match crate::commands::acquire_root_epoch(&state).await {
+                Ok(guard) => guard,
+                Err(error) => {
+                    log::warn!("Background link discovery paused: {error}");
+                    continue;
+                }
+            };
+            let root_epoch = match crate::commands::capture_root_epoch(&state) {
+                Ok(epoch) => epoch,
+                Err(error) => {
+                    log::warn!("Background link discovery could not capture root epoch: {error}");
+                    continue;
+                }
+            };
+
             let settings = {
                 let settings = state.settings_service.read().await;
                 settings.get().clone()
@@ -543,15 +563,30 @@ fn start_link_discovery_worker(state: AppState) {
             let Some(job) = job else {
                 continue;
             };
+            drop(root_guard);
 
-            let result = services::link_discovery::discover_for_note(
+            let result = services::link_discovery::discover_for_note_at_epoch(
                 &state,
                 &job.note_id,
                 job.mode,
                 10,
                 false,
+                Some(&root_epoch),
             )
             .await;
+
+            let _root_guard = match crate::commands::acquire_expected_root_epoch(
+                &state,
+                &root_epoch,
+            )
+            .await
+            {
+                Ok(guard) => guard,
+                Err(error) => {
+                    log::warn!("Background link discovery discarded stale result: {error}");
+                    continue;
+                }
+            };
 
             let mut discovery = state.link_discovery.write().await;
             match result {
@@ -574,6 +609,14 @@ fn start_vault_optimizer_worker(state: AppState) {
     tauri::async_runtime::spawn(async move {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+
+            let _root_guard = match crate::commands::acquire_root_epoch(&state).await {
+                Ok(guard) => guard,
+                Err(error) => {
+                    log::warn!("Background vault optimizer paused: {error}");
+                    continue;
+                }
+            };
 
             let settings = {
                 let settings = state.settings_service.read().await;
@@ -654,6 +697,19 @@ mod tests {
         assert_eq!(*boot_state.read().await, next);
     }
 
+    #[tokio::test]
+    async fn warm_start_waits_behind_root_transition_before_reading_services() {
+        let (state, _vault, _data) =
+            crate::commands::commit_note_write_tests::build_test_state();
+        let transition = state.vault_transition.write().await;
+        let task_state = state.clone();
+        let task = tokio::spawn(async move { acquire_warm_start_root_gate(&task_state).await });
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished(), "warm start must wait behind root transition");
+        drop(transition);
+        drop(task.await.unwrap().unwrap());
+    }
+
     #[test]
     fn canonical_directory_path_is_file_surfaces_as_recoverable_boot_failure() {
         let temp = tempfile::tempdir().unwrap();
@@ -686,7 +742,9 @@ mod tests {
         let retarget = settings
             .find("twin.replace_root_path(candidate_twin)")
             .unwrap();
-        let publish = settings.find("settings.update(update)").unwrap();
+        let publish = settings
+            .find("settings.publish_runtime_authority(")
+            .unwrap();
         assert!(retarget < publish);
         let settings_noop = ["TwinStore::", "new(new_twin_path)"].concat();
         assert!(!settings.contains(&settings_noop));

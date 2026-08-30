@@ -59,6 +59,7 @@ pub async fn preview_twin_eval_context(
     state: State<'_, AppState>,
     request: TwinEvalRunRequest,
 ) -> Result<TwinEvalContextPacket, String> {
+    let _root_guard = crate::commands::acquire_root_epoch(state.inner()).await?;
     let question = parse_lab_question(&request.raw_question, request.answer_key.clone())
         .map_err(|error| error.to_string())?;
     build_context_packet(&state, &question, &request).await
@@ -69,10 +70,13 @@ pub async fn run_twin_eval_lab(
     state: State<'_, AppState>,
     request: TwinEvalRunRequest,
 ) -> Result<TwinEvalRunReport, String> {
+    let root_guard = crate::commands::acquire_root_epoch(state.inner()).await?;
+    let root_epoch = crate::commands::capture_root_epoch(state.inner())?;
     let question = parse_lab_question(&request.raw_question, request.answer_key.clone())
         .map_err(|error| error.to_string())?;
     let context_packet = build_context_packet(&state, &question, &request).await?;
     let settings = request.settings();
+    drop(root_guard);
 
     let installed = installed_ollama_model_ids(&state).await;
     let matrix = default_model_matrix(&installed);
@@ -158,6 +162,7 @@ pub async fn run_twin_eval_lab(
         }
     }
 
+    let _root_guard = crate::commands::acquire_expected_root_epoch(state.inner(), &root_epoch).await?;
     Ok(TwinEvalRunReport {
         question,
         context_packet,
@@ -182,10 +187,13 @@ pub async fn run_twin_eval_lab_stream(
     state: State<'_, AppState>,
     request: TwinEvalRunRequest,
 ) -> Result<(), String> {
+    let root_guard = crate::commands::acquire_root_epoch(state.inner()).await?;
+    let root_epoch = crate::commands::capture_root_epoch(state.inner())?;
     let question = parse_lab_question(&request.raw_question, request.answer_key.clone())
         .map_err(|error| error.to_string())?;
     let context_packet = build_context_packet(&state, &question, &request).await?;
     let settings = request.settings();
+    drop(root_guard);
 
     let installed = installed_ollama_model_ids(&state).await;
     let matrix = default_model_matrix(&installed);
@@ -257,6 +265,7 @@ pub async fn run_twin_eval_lab_stream(
     } else {
         Some(Arc::new(context_packet.system_prompt.clone()))
     };
+    let root_state = state.inner().clone();
 
     tauri::async_runtime::spawn(async move {
         let mut join_set = tokio::task::JoinSet::new();
@@ -268,6 +277,8 @@ pub async fn run_twin_eval_lab_stream(
             let context_packet = Arc::clone(&context_packet);
             let settings = Arc::clone(&settings);
             let system_prompt = system_prompt.clone();
+            let root_state = root_state.clone();
+            let root_epoch = root_epoch.clone();
 
             let is_base = model.training_stage.contains("base");
             let prompt = Arc::new(if is_base {
@@ -316,6 +327,23 @@ pub async fn run_twin_eval_lab_stream(
                         sycophancy_flag: false,
                         error: Some(error),
                     },
+                };
+                let _root_guard = match crate::commands::acquire_expected_root_epoch(
+                    &root_state,
+                    &root_epoch,
+                )
+                .await
+                {
+                    Ok(guard) => guard,
+                    Err(error) => {
+                        let _ = window.emit(
+                            "lab-stream",
+                            LabStreamEvent::Error {
+                                message: format!("Twin Eval result discarded after vault switch: {error}"),
+                            },
+                        );
+                        return;
+                    }
                 };
                 let _ = window.emit(
                     "lab-stream",

@@ -68,18 +68,25 @@ pub async fn apply_import(
     conversation_ids: Vec<String>,
     state: State<'_, AppState>,
 ) -> Result<ImportResult, String> {
+    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
     match parse_import_file(&file_path).await? {
         ParsedImport::Conversations {
             conversations,
             source_content,
             ..
         } => {
-            apply_conversation_import(conversations, conversation_ids, source_content, state).await
+            apply_conversation_import(
+                conversations,
+                conversation_ids,
+                source_content,
+                state.clone(),
+            )
+            .await
         }
         ParsedImport::Document {
             batch,
             source_content,
-        } => apply_document_import(batch, conversation_ids, source_content, state).await,
+        } => apply_document_import(batch, conversation_ids, source_content, state.clone()).await,
     }
 }
 

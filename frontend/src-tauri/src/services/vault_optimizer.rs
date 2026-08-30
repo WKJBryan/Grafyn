@@ -125,6 +125,14 @@ impl VaultOptimizerService {
         }
     }
 
+    pub(crate) fn reset_for_vault(&mut self, notes: &[Note]) {
+        self.state.queue.clear();
+        for note in notes.iter().filter(|note| !note.is_topic_hub()) {
+            self.enqueue_note(&note.id, "bootstrap");
+        }
+        let _ = self.persist_state();
+    }
+
     pub fn enqueue_note(&mut self, note_id: &str, reason: &str) {
         if self
             .state
@@ -1362,5 +1370,30 @@ mod tests {
         assert_eq!(inbox.len(), 1);
         assert_eq!(inbox[0].note_id.as_deref(), Some(note.id.as_str()));
         assert_eq!(inbox[0].status, "failed");
+    }
+
+    #[test]
+    fn root_retarget_discards_old_queue_and_bootstraps_only_new_vault_ids() {
+        let old_vault = tempdir().unwrap();
+        let new_vault = tempdir().unwrap();
+        let data = tempdir().unwrap();
+        let mut old_store = KnowledgeStore::new(
+            old_vault.path().to_path_buf(),
+            data.path().to_path_buf(),
+        );
+        let mut new_store = KnowledgeStore::new(
+            new_vault.path().to_path_buf(),
+            data.path().to_path_buf(),
+        );
+        let old_note = old_store.create_note(make_note_create("Old root")).unwrap();
+        let new_note = new_store.create_note(make_note_create("New root")).unwrap();
+        let mut service = VaultOptimizerService::new(data.path().to_path_buf());
+        service.bootstrap(std::slice::from_ref(&old_note));
+        assert_eq!(service.state.queue[0].note_id, old_note.id);
+
+        service.reset_for_vault(std::slice::from_ref(&new_note));
+        assert_eq!(service.state.queue.len(), 1);
+        assert_eq!(service.state.queue[0].note_id, new_note.id);
+        assert!(service.state.queue.iter().all(|entry| entry.note_id != old_note.id));
     }
 }

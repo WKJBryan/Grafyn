@@ -8,6 +8,7 @@ use tauri::State;
 /// List all notes (metadata only)
 #[tauri::command]
 pub async fn list_notes(state: State<'_, AppState>) -> Result<Vec<NoteMeta>, String> {
+    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
     let store = state.knowledge_store.read().await;
     store.list_notes().map_err(|e| e.to_string())
 }
@@ -15,6 +16,7 @@ pub async fn list_notes(state: State<'_, AppState>) -> Result<Vec<NoteMeta>, Str
 /// Get a single note by ID
 #[tauri::command]
 pub async fn get_note(id: String, state: State<'_, AppState>) -> Result<Note, String> {
+    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
     let store = state.knowledge_store.read().await;
     store.get_note(&id).map_err(|e| e.to_string())
 }
@@ -22,6 +24,7 @@ pub async fn get_note(id: String, state: State<'_, AppState>) -> Result<Note, St
 /// Create a new note
 #[tauri::command]
 pub async fn create_note(note: NoteCreate, state: State<'_, AppState>) -> Result<Note, String> {
+    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
     let mut store = state.knowledge_store.write().await;
     let created_note = store.create_note(note).map_err(|e| e.to_string())?;
     let created_id = created_note.id.clone();
@@ -55,6 +58,7 @@ pub async fn update_note(
     update: NoteUpdate,
     state: State<'_, AppState>,
 ) -> Result<Note, String> {
+    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
     let mut store = state.knowledge_store.write().await;
     let previous_status = store.get_note(&id).ok().map(|note| note.status);
     let updated_note = store.update_note(&id, update).map_err(|e| e.to_string())?;
@@ -87,6 +91,7 @@ pub async fn update_note(
 /// Delete a note
 #[tauri::command]
 pub async fn delete_note(id: String, state: State<'_, AppState>) -> Result<(), String> {
+    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
     let mut store = state.knowledge_store.write().await;
     store.delete_note(&id).map_err(|e| e.to_string())?;
     drop(store);

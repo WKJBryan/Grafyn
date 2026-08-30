@@ -23,6 +23,7 @@ pub struct CanvasStore {
     list_cache_ready: bool,
     pending_bases: HashMap<String, CanvasSession>,
     event_recorder: Arc<dyn crate::services::twin_events::EventRecorder>,
+    root_capability: Option<Arc<crate::services::twin_events::AnchoredRoot>>,
 }
 
 impl CanvasStore {
@@ -39,12 +40,16 @@ impl CanvasStore {
     ) -> Self {
         // Ensure directory exists
         std::fs::create_dir_all(&data_path).ok();
+        let root_capability = crate::services::twin_events::AnchoredRoot::open(&data_path)
+            .ok()
+            .map(Arc::new);
         Self {
             data_path,
             session_cache: HashMap::new(),
             list_cache_ready: false,
             pending_bases: HashMap::new(),
             event_recorder,
+            root_capability,
         }
     }
 
@@ -555,11 +560,32 @@ impl CanvasStore {
 
     /// Read and parse a session file
     fn read_session_file(&self, path: &std::path::Path) -> Result<CanvasSession> {
-        let content = std::fs::read_to_string(path)
-            .with_context(|| format!("Failed to read file: {:?}", path))?;
+        self.read_session_file_optional(path)?
+            .ok_or_else(|| anyhow::anyhow!("Failed to read file: {:?}", path))
+    }
 
-        serde_json::from_str(&content)
+    fn read_session_file_optional(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<Option<CanvasSession>> {
+        const CANVAS_JSON_LIMIT: usize = 16 * 1024 * 1024;
+        let relative = path
+            .strip_prefix(&self.data_path)
+            .map_err(|_| anyhow::anyhow!("Canvas read escaped the configured store root"))?
+            .to_string_lossy()
+            .replace('\\', "/");
+        let root = self.root_capability.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("Canvas store root capability could not be acquired")
+        })?;
+        let Some(bytes) = root
+            .read_bounded(&relative, CANVAS_JSON_LIMIT)
+            .map_err(anyhow::Error::new)?
+        else {
+            return Ok(None);
+        };
+        serde_json::from_slice(&bytes)
             .with_context(|| format!("Failed to parse session: {:?}", path))
+            .map(Some)
     }
 
     /// Write a session to file
@@ -587,11 +613,7 @@ impl CanvasStore {
         let path = self.session_path(&session.id);
         let candidate = session.clone();
         let cached_base = self.pending_bases.remove(&session.id);
-        let before_error_fallback = if path.exists() {
-            Some(self.read_session_file(&path)?)
-        } else {
-            None
-        };
+        let before_error_fallback = self.read_session_file_optional(&path)?;
         if self.event_recorder.is_noop() {
             if decision.is_some() {
                 anyhow::bail!("compound decision capture requires a mutation coordinator");
@@ -608,13 +630,11 @@ impl CanvasStore {
         let mut committed_session = None;
         let mut committed_decision_trace = None;
         let mut planner = || {
-            let durable_before = if path_for_plan.exists() {
-                Some(self.read_session_file(&path_for_plan).map_err(|error| {
+            let durable_before = self
+                .read_session_file_optional(&path_for_plan)
+                .map_err(|error| {
                     crate::services::twin_events::MutationError::Invalid(error.to_string())
-                })?)
-            } else {
-                None
-            };
+                })?;
             let after = match (&cached_base, &durable_before) {
                 (Some(base), Some(durable)) => {
                     merge_canvas_session_change(base, &candidate, durable).map_err(|error| {

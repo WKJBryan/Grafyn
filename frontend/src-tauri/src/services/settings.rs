@@ -1,27 +1,97 @@
 //! Settings service for managing user preferences
 
 use crate::models::settings::{SettingsStatus, SettingsUpdate, UserSettings};
-use crate::services::atomic_io::write_atomic;
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const KEYRING_SERVICE: &str = "com.grafyn.app";
 const OPENROUTER_KEY_ACCOUNT: &str = "openrouter_api_key";
 
+pub(crate) fn prepare_twin_data_path(data_path: &Path, vault_path: &Path) -> Result<PathBuf> {
+    crate::services::twin_events::validate_real_directory(data_path, "Grafyn data root")
+        .map_err(anyhow::Error::new)?;
+    crate::services::twin_events::validate_real_directory(vault_path, "Markdown vault root")
+        .map_err(anyhow::Error::new)?;
+    let current = crate::models::settings::twin_data_path_for_vault(data_path, vault_path)
+        .map_err(anyhow::Error::new)?;
+    let legacy = crate::models::settings::legacy_twin_data_path_for_vault(data_path, vault_path);
+    let current_name = current
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| anyhow::anyhow!("Twin namespace is not UTF-8"))?;
+    let legacy_name = legacy
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| anyhow::anyhow!("legacy Twin namespace is not UTF-8"))?;
+    let root = crate::services::twin_events::AnchoredRoot::open(data_path)
+        .map_err(anyhow::Error::new)?;
+    root.open_directory("twin", true)
+        .map_err(anyhow::Error::new)?;
+    let current_key = format!("twin/{current_name}");
+    let legacy_key = format!("twin/{legacy_name}");
+    let has_current = root
+        .directory_exists(&current_key)
+        .map_err(anyhow::Error::new)?;
+    let has_legacy = root
+        .directory_exists(&legacy_key)
+        .map_err(anyhow::Error::new)?;
+    if has_current && has_legacy {
+        anyhow::bail!("legacy and current Twin namespaces both exist; refusing to merge");
+    }
+    if has_legacy {
+        root.rename(&legacy_key, &current_key, false)
+            .map_err(anyhow::Error::new)?;
+    }
+    Ok(current)
+}
+
 /// Service for managing user settings
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SettingsService {
     config_path: PathBuf,
+    data_path: PathBuf,
     settings: UserSettings,
+    active_key_version: Option<String>,
+    secret_store: Arc<dyn crate::services::root_transition::VersionedSecretStore>,
 }
 
 impl SettingsService {
+    #[cfg(feature = "mcp")]
+    pub(crate) fn recover_root_transition_at(data_path: &Path) -> Result<()> {
+        let config_dir = dirs::config_dir()
+            .or_else(|| dirs::data_local_dir())
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("Grafyn");
+        std::fs::create_dir_all(&config_dir)
+            .context("Failed to create Grafyn config directory")?;
+        std::fs::create_dir_all(data_path).context("Failed to create Grafyn data directory")?;
+        let store = crate::services::root_transition::RootTransitionStore::new(
+            data_path,
+            config_dir.join("settings.json"),
+            Arc::new(crate::services::root_transition::KeyringVersionedSecretStore),
+        )
+        .map_err(anyhow::Error::new)?;
+        store.recover().map_err(anyhow::Error::new)?;
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(crate) fn for_test(config_path: PathBuf, settings: UserSettings) -> Self {
+        let data_path = config_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("data");
+        std::fs::create_dir_all(&data_path).expect("test data directory");
         Self {
             config_path,
+            data_path,
             settings,
+            active_key_version: None,
+            secret_store: Arc::new(
+                crate::services::root_transition::MemoryVersionedSecretStore::default(),
+            ),
         }
     }
 
@@ -42,7 +112,12 @@ impl SettingsService {
 
         Self {
             config_path: config_dir.join("settings.json"),
+            data_path: UserSettings::default().effective_data_path(),
             settings: UserSettings::default(),
+            active_key_version: None,
+            secret_store: Arc::new(
+                crate::services::root_transition::KeyringVersionedSecretStore,
+            ),
         }
     }
 
@@ -61,39 +136,60 @@ impl SettingsService {
             );
         }
         let config_path = config_dir.join("settings.json");
+        let data_path = UserSettings::default().effective_data_path();
+        std::fs::create_dir_all(&data_path).context("Failed to create Grafyn data directory")?;
+        let secret_store: Arc<dyn crate::services::root_transition::VersionedSecretStore> =
+            Arc::new(crate::services::root_transition::KeyringVersionedSecretStore);
+        let transition_store = crate::services::root_transition::RootTransitionStore::new(
+            &data_path,
+            &config_path,
+            secret_store.clone(),
+        )
+        .map_err(anyhow::Error::new)?;
+        transition_store.recover().map_err(anyhow::Error::new)?;
 
         let mut settings: UserSettings = load_settings_from_file(&config_path)?;
-
-        let mut migrated_legacy_plaintext_key = false;
-
-        // Prefer OS keychain storage for API keys.
-        if let Some(stored_key) = load_openrouter_api_key() {
-            settings.openrouter_api_key = Some(stored_key);
-        } else if let Some(legacy_key) = settings.openrouter_api_key.clone() {
-            if !legacy_key.is_empty() {
-                if let Err(error) = store_openrouter_api_key(&legacy_key) {
-                    log::warn!("Failed to migrate OpenRouter key to OS keychain: {}", error);
-                }
-                migrated_legacy_plaintext_key = true;
+        let mut active_key_version = transition_store
+            .active_key_version()
+            .map_err(anyhow::Error::new)?;
+        let legacy_plaintext = settings.openrouter_api_key.clone().filter(|key| !key.is_empty());
+        let legacy_keyring = load_openrouter_api_key()?;
+        if let Some(version) = active_key_version.as_deref() {
+            settings.openrouter_api_key = transition_store
+                .resolve_secret(Some(version))
+                .map_err(anyhow::Error::new)?;
+            if settings.openrouter_api_key.is_none() {
+                anyhow::bail!("active OpenRouter key version does not resolve");
             }
+            if legacy_plaintext.is_some() || legacy_keyring.is_some() {
+                transition_store
+                    .write_settings_guarded(
+                        &crate::services::root_transition::NonsecretSettingsV1::from_settings(
+                            settings.clone(),
+                        ),
+                    )
+                    .map_err(anyhow::Error::new)?;
+                clear_openrouter_api_key()?;
+            }
+        } else if let Some(legacy_key) = choose_legacy_authority(legacy_keyring, legacy_plaintext) {
+            let sanitized = crate::services::root_transition::NonsecretSettingsV1::from_settings(
+                settings.clone(),
+            );
+            let (version, resolved) = transition_store
+                .migrate_legacy_secret_authority(&sanitized, &legacy_key)
+                .map_err(anyhow::Error::new)?;
+            active_key_version = Some(version);
+            settings.openrouter_api_key = Some(resolved);
+            clear_openrouter_api_key()?;
         }
 
-        let service = Self {
+        Ok(Self {
             config_path,
+            data_path,
             settings,
-        };
-
-        // Re-save after migration so settings.json no longer contains plaintext API keys.
-        if migrated_legacy_plaintext_key {
-            if let Err(error) = service.save() {
-                log::warn!(
-                    "Failed to persist settings cleanup after key migration: {}",
-                    error
-                );
-            }
-        }
-
-        Ok(service)
+            active_key_version,
+            secret_store,
+        })
     }
 
     /// Get current settings
@@ -108,170 +204,54 @@ impl SettingsService {
 
     /// Update settings and persist to disk
     pub fn update(&mut self, update: SettingsUpdate) -> Result<UserSettings> {
-        let before = self.settings.clone();
-        // Apply updates
-        if let Some(vault_path) = update.vault_path {
-            let path = PathBuf::from(&vault_path);
-            crate::services::twin_events::validate_real_directory(&path, "vault directory")
-                .map_err(anyhow::Error::new)?;
-            self.settings.vault_path = Some(
-                std::fs::canonicalize(path)
-                    .context("Failed to canonicalize vault directory")?
-                    .to_string_lossy()
-                    .into_owned(),
-            );
+        if update.openrouter_api_key.is_some() {
+            anyhow::bail!("OpenRouter key updates require the coordinated settings boundary");
         }
-
-        if let Some(api_key) = update.openrouter_api_key {
-            self.settings.openrouter_api_key = if api_key.is_empty() {
-                if let Err(error) = clear_openrouter_api_key() {
-                    log::warn!(
-                        "Failed to clear OpenRouter API key from OS keychain: {}",
-                        error
-                    );
-                }
-                None
-            } else {
-                if let Err(error) = store_openrouter_api_key(&api_key) {
-                    log::warn!(
-                        "Failed to store OpenRouter API key in OS keychain: {}",
-                        error
-                    );
-                }
-                Some(api_key)
-            };
+        if update.vault_path.is_some() {
+            anyhow::bail!("vault changes require the coordinated settings boundary");
         }
-
-        if let Some(setup_completed) = update.setup_completed {
-            self.settings.setup_completed = setup_completed;
-        }
-
-        if let Some(theme) = update.theme {
-            self.settings.theme = theme;
-        }
-
-        if let Some(mcp_enabled) = update.mcp_enabled {
-            self.settings.mcp_enabled = mcp_enabled;
-        }
-
-        if let Some(llm_model) = update.llm_model {
-            self.settings.llm_model = if llm_model.is_empty() {
-                crate::models::settings::default_llm_model()
-            } else {
-                llm_model
-            };
-        }
-
-        if let Some(twin_llm_provider) = update.twin_llm_provider {
-            self.settings.twin_llm_provider =
-                match twin_llm_provider.trim().to_ascii_lowercase().as_str() {
-                    "ollama" => "ollama".to_string(),
-                    _ => "openrouter".to_string(),
-                };
-        }
-
-        if let Some(ollama_base_url) = update.ollama_base_url {
-            let trimmed = ollama_base_url.trim().trim_end_matches('/').to_string();
-            self.settings.ollama_base_url = if trimmed.is_empty() {
-                "http://localhost:11434".to_string()
-            } else {
-                trimmed
-            };
-        }
-
-        if let Some(ollama_model) = update.ollama_model {
-            self.settings.ollama_model = ollama_model.trim().to_string();
-        }
-
-        if let Some(smart_web_search) = update.smart_web_search {
-            self.settings.smart_web_search = smart_web_search;
-        }
-
-        if let Some(background_link_discovery_enabled) = update.background_link_discovery_enabled {
-            self.settings.background_link_discovery_enabled = background_link_discovery_enabled;
-        }
-
-        if let Some(background_link_discovery_llm_enabled) =
-            update.background_link_discovery_llm_enabled
-        {
-            self.settings.background_link_discovery_llm_enabled =
-                background_link_discovery_llm_enabled;
-        }
-
-        if let Some(background_vault_optimizer_enabled) = update.background_vault_optimizer_enabled
-        {
-            self.settings.background_vault_optimizer_enabled = background_vault_optimizer_enabled;
-        }
-
-        if let Some(background_vault_optimizer_llm_enabled) =
-            update.background_vault_optimizer_llm_enabled
-        {
-            self.settings.background_vault_optimizer_llm_enabled =
-                background_vault_optimizer_llm_enabled;
-        }
-
-        if let Some(background_vault_optimizer_budget_monthly) =
-            update.background_vault_optimizer_budget_monthly
-        {
-            self.settings.background_vault_optimizer_budget_monthly =
-                background_vault_optimizer_budget_monthly;
-        }
-
-        if let Some(background_vault_optimizer_max_daily_writes) =
-            update.background_vault_optimizer_max_daily_writes
-        {
-            self.settings.background_vault_optimizer_max_daily_writes =
-                background_vault_optimizer_max_daily_writes.max(1);
-        }
-
-        if let Some(background_vault_optimizer_edit_mode) =
-            update.background_vault_optimizer_edit_mode
-        {
-            self.settings.background_vault_optimizer_edit_mode =
-                if background_vault_optimizer_edit_mode.trim().is_empty() {
-                    "sidecar_first".to_string()
-                } else {
-                    background_vault_optimizer_edit_mode
-                };
-        }
-
-        if let Some(background_vault_optimizer_program_enabled) =
-            update.background_vault_optimizer_program_enabled
-        {
-            self.settings.background_vault_optimizer_program_enabled =
-                background_vault_optimizer_program_enabled;
-        }
-
-        if let Some(vault_optimizer_program_path) = update.vault_optimizer_program_path {
-            self.settings.vault_optimizer_program_path =
-                if vault_optimizer_program_path.trim().is_empty() {
-                    "_grafyn/program.md".to_string()
-                } else {
-                    vault_optimizer_program_path.replace('\\', "/")
-                };
-        }
-
-        if let Some(canvas_model_presets) = update.canvas_model_presets {
-            self.settings.canvas_model_presets = canvas_model_presets;
-        }
-
-        // Persist to disk
-        if let Err(error) = self.save() {
-            self.settings = before;
-            return Err(error);
-        }
-
+        let candidate = self.preview_update(&update)?;
+        self.root_transition_store()?
+            .write_settings_guarded(
+                &crate::services::root_transition::NonsecretSettingsV1::from_settings(
+                    candidate.clone(),
+                ),
+            )
+            .map_err(anyhow::Error::new)?;
+        self.settings = candidate;
         Ok(self.settings.clone())
     }
 
-    /// Save settings to disk
-    fn save(&self) -> Result<()> {
-        let json =
-            serde_json::to_string_pretty(&self.settings).context("Failed to serialize settings")?;
-        write_atomic(&self.config_path, json.as_bytes())
-            .context("Failed to write settings file")?;
-        log::info!("Settings saved to {:?}", self.config_path);
-        Ok(())
+    pub(crate) fn preview_update(&self, update: &SettingsUpdate) -> Result<UserSettings> {
+        let mut candidate = self.settings.clone();
+        apply_update_fields(&mut candidate, update)?;
+        Ok(candidate)
+    }
+
+    pub(crate) fn root_transition_store(
+        &self,
+    ) -> Result<crate::services::root_transition::RootTransitionStore> {
+        crate::services::root_transition::RootTransitionStore::new(
+            &self.data_path,
+            &self.config_path,
+            self.secret_store.clone(),
+        )
+        .map_err(anyhow::Error::new)
+    }
+
+    pub(crate) fn active_key_version(&self) -> Option<&str> {
+        self.active_key_version.as_deref()
+    }
+
+    pub(crate) fn publish_runtime_authority(
+        &mut self,
+        mut settings: UserSettings,
+        active_key_version: Option<String>,
+        resolved_secret: Option<String>,
+    ) {
+        settings.openrouter_api_key = resolved_secret;
+        self.settings = settings;
+        self.active_key_version = active_key_version;
     }
 
     /// Get the effective vault path
@@ -296,8 +276,17 @@ impl SettingsService {
 
     /// Mark setup as completed
     pub fn complete_setup(&mut self) -> Result<()> {
-        self.settings.setup_completed = true;
-        self.save()
+        let mut candidate = self.settings.clone();
+        candidate.setup_completed = true;
+        self.root_transition_store()?
+            .write_settings_guarded(
+                &crate::services::root_transition::NonsecretSettingsV1::from_settings(
+                    candidate.clone(),
+                ),
+            )
+            .map_err(anyhow::Error::new)?;
+        self.settings = candidate;
+        Ok(())
     }
 
     /// Check if MCP sidecar is enabled in settings
@@ -307,15 +296,107 @@ impl SettingsService {
 
     /// Clear the OpenRouter API key
     pub fn clear_openrouter_key(&mut self) -> Result<()> {
-        if let Err(error) = clear_openrouter_api_key() {
-            log::warn!(
-                "Failed to clear OpenRouter API key from OS keychain: {}",
-                error
-            );
-        }
-        self.settings.openrouter_api_key = None;
-        self.save()
+        anyhow::bail!("OpenRouter key clearing requires the coordinated settings boundary")
     }
+}
+
+fn choose_legacy_authority(
+    keychain: Option<String>,
+    plaintext: Option<String>,
+) -> Option<String> {
+    keychain.or(plaintext)
+}
+
+fn apply_update_fields(settings: &mut UserSettings, update: &SettingsUpdate) -> Result<()> {
+    if let Some(vault_path) = update.vault_path.as_deref() {
+        let path = PathBuf::from(vault_path);
+        crate::services::twin_events::validate_real_directory(&path, "vault directory")
+            .map_err(anyhow::Error::new)?;
+        settings.vault_path = Some(
+            std::fs::canonicalize(path)
+                .context("Failed to canonicalize vault directory")?
+                .to_string_lossy()
+                .into_owned(),
+        );
+    }
+    if let Some(api_key) = update.openrouter_api_key.as_deref() {
+        settings.openrouter_api_key = (!api_key.is_empty()).then(|| api_key.to_string());
+    }
+    if let Some(value) = update.setup_completed {
+        settings.setup_completed = value;
+    }
+    if let Some(value) = &update.theme {
+        settings.theme.clone_from(value);
+    }
+    if let Some(value) = update.mcp_enabled {
+        settings.mcp_enabled = value;
+    }
+    if let Some(value) = &update.llm_model {
+        settings.llm_model = if value.is_empty() {
+            crate::models::settings::default_llm_model()
+        } else {
+            value.clone()
+        };
+    }
+    if let Some(value) = &update.twin_llm_provider {
+        settings.twin_llm_provider = match value.trim().to_ascii_lowercase().as_str() {
+            "ollama" => "ollama".to_string(),
+            _ => "openrouter".to_string(),
+        };
+    }
+    if let Some(value) = &update.ollama_base_url {
+        let trimmed = value.trim().trim_end_matches('/').to_string();
+        settings.ollama_base_url = if trimmed.is_empty() {
+            "http://localhost:11434".to_string()
+        } else {
+            trimmed
+        };
+    }
+    if let Some(value) = &update.ollama_model {
+        settings.ollama_model = value.trim().to_string();
+    }
+    if let Some(value) = update.smart_web_search {
+        settings.smart_web_search = value;
+    }
+    if let Some(value) = update.background_link_discovery_enabled {
+        settings.background_link_discovery_enabled = value;
+    }
+    if let Some(value) = update.background_link_discovery_llm_enabled {
+        settings.background_link_discovery_llm_enabled = value;
+    }
+    if let Some(value) = update.background_vault_optimizer_enabled {
+        settings.background_vault_optimizer_enabled = value;
+    }
+    if let Some(value) = update.background_vault_optimizer_llm_enabled {
+        settings.background_vault_optimizer_llm_enabled = value;
+    }
+    if let Some(value) = update.background_vault_optimizer_budget_monthly {
+        settings.background_vault_optimizer_budget_monthly = value;
+    }
+    if let Some(value) = update.background_vault_optimizer_max_daily_writes {
+        settings.background_vault_optimizer_max_daily_writes = value.max(1);
+    }
+    if let Some(value) = &update.background_vault_optimizer_edit_mode {
+        settings.background_vault_optimizer_edit_mode = if value.trim().is_empty() {
+            "sidecar_first".to_string()
+        } else {
+            value.clone()
+        };
+    }
+    if let Some(value) = update.background_vault_optimizer_program_enabled {
+        settings.background_vault_optimizer_program_enabled = value;
+    }
+    if let Some(value) = &update.vault_optimizer_program_path {
+        settings.vault_optimizer_program_path = if value.trim().is_empty() {
+            "_grafyn/program.md".to_string()
+        } else {
+            value.replace('\\', "/")
+        };
+    }
+    if let Some(value) = &update.canvas_model_presets {
+        settings.canvas_model_presets.clone_from(value);
+    }
+    Ok(())
 }
 
 /// Load settings from `config_path`. If the file doesn't exist, returns defaults. If it
@@ -388,36 +469,23 @@ fn keyring_entry() -> Result<keyring::Entry> {
         .context("Failed to initialize OS keychain entry")
 }
 
-fn load_openrouter_api_key() -> Option<String> {
-    let entry = match keyring_entry() {
-        Ok(entry) => entry,
-        Err(error) => {
-            log::debug!("OpenRouter keychain unavailable: {}", error);
-            return None;
-        }
-    };
-    match entry.get_password() {
-        Ok(password) if !password.is_empty() => Some(password),
-        Ok(_) => None,
-        Err(error) => {
-            log::debug!("OpenRouter key not available in OS keychain: {}", error);
-            None
-        }
-    }
-}
-
-fn store_openrouter_api_key(api_key: &str) -> Result<()> {
+fn load_openrouter_api_key() -> Result<Option<String>> {
     let entry = keyring_entry()?;
-    entry
-        .set_password(api_key)
-        .context("Failed to store OpenRouter API key in OS keychain")
+    match entry.get_password() {
+        Ok(password) if !password.is_empty() => Ok(Some(password)),
+        Ok(_) | Err(keyring::Error::NoEntry) => Ok(None),
+        Err(error) => Err(anyhow::Error::new(error).context("Failed to read legacy OpenRouter key")),
+    }
 }
 
 fn clear_openrouter_api_key() -> Result<()> {
     let entry = keyring_entry()?;
-    entry
-        .delete_password()
-        .context("Failed to delete OpenRouter API key from OS keychain")
+    match entry.delete_password() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(error) => Err(
+            anyhow::Error::new(error).context("Failed to delete legacy OpenRouter API key")
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -425,6 +493,44 @@ mod tests {
     use super::*;
     use crate::models::settings::CanvasModelPreset;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn legacy_twin_path(data: &Path, vault: &Path) -> PathBuf {
+        let normalized = vault
+            .to_string_lossy()
+            .replace('\\', "/")
+            .to_ascii_lowercase();
+        let normalized = normalized.strip_prefix("//?/").unwrap_or(&normalized);
+        let mut hash = 0xcbf29ce484222325_u64;
+        for byte in normalized.as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        data.join("twin").join(format!("{hash:016x}"))
+    }
+
+    #[test]
+    fn legacy_twin_namespace_moves_once_without_merge() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let vault = temp.path().join("vault");
+        std::fs::create_dir_all(data.join("twin")).unwrap();
+        std::fs::create_dir(&vault).unwrap();
+        let legacy = legacy_twin_path(&data, &vault);
+        std::fs::create_dir(&legacy).unwrap();
+        std::fs::write(legacy.join("record.json"), "legacy").unwrap();
+
+        let current = prepare_twin_data_path(&data, &vault).unwrap();
+        assert!(!legacy.exists());
+        assert_eq!(
+            std::fs::read_to_string(current.join("record.json")).unwrap(),
+            "legacy"
+        );
+
+        std::fs::create_dir(&legacy).unwrap();
+        assert!(prepare_twin_data_path(&data, &vault).is_err());
+        assert!(legacy.exists());
+        assert!(current.exists());
+    }
 
     fn vault_update(path: impl Into<String>) -> SettingsUpdate {
         SettingsUpdate {
@@ -480,10 +586,7 @@ mod tests {
         std::fs::create_dir_all(&temp_dir).expect("temp dir should be created");
         let config_path = temp_dir.join("settings.json");
 
-        let mut service = SettingsService {
-            config_path: config_path.clone(),
-            settings: UserSettings::default(),
-        };
+        let mut service = SettingsService::for_test(config_path.clone(), UserSettings::default());
 
         let presets = vec![CanvasModelPreset {
             id: "preset-1".to_string(),
@@ -533,10 +636,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().expect("temp dir should be created");
         let config_path = temp_dir.path().join("settings.json");
 
-        let mut service = SettingsService {
-            config_path: config_path.clone(),
-            settings: UserSettings::default(),
-        };
+        let mut service = SettingsService::for_test(config_path.clone(), UserSettings::default());
 
         service
             .update(SettingsUpdate {
@@ -572,10 +672,7 @@ mod tests {
     fn vault_update_requires_an_existing_real_directory() {
         let temp = tempfile::tempdir().unwrap();
         let config_path = temp.path().join("settings.json");
-        let mut service = SettingsService {
-            config_path,
-            settings: UserSettings::default(),
-        };
+        let mut service = SettingsService::for_test(config_path, UserSettings::default());
         let missing = temp.path().join("missing");
         assert!(service
             .update(vault_update(missing.to_string_lossy()))
@@ -603,13 +700,40 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_settings_service_update_rejects_even_a_valid_vault_change() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("settings.json");
+        let vault = temp.path().join("vault");
+        std::fs::create_dir(&vault).unwrap();
+        let before = UserSettings::default();
+        let mut service = SettingsService::for_test(config_path, before.clone());
+
+        let error = service
+            .update(vault_update(vault.to_string_lossy()))
+            .expect_err("vault changes must use the coordinated command boundary");
+        assert!(error.to_string().contains("coordinated settings boundary"));
+        assert_eq!(service.get().vault_path, before.vault_path);
+        assert_eq!(service.get().theme, before.theme);
+    }
+
+    #[test]
+    fn legacy_secret_authority_prefers_keychain_over_stale_plaintext() {
+        assert_eq!(
+            choose_legacy_authority(Some("new-keychain".into()), Some("stale-file".into())),
+            Some("new-keychain".into())
+        );
+        assert_eq!(
+            choose_legacy_authority(None, Some("file-fallback".into())),
+            Some("file-fallback".into())
+        );
+    }
+
+    #[test]
     fn failed_settings_persistence_does_not_publish_runtime_values() {
         let temp = tempfile::tempdir().unwrap();
         let before = UserSettings::default();
-        let mut service = SettingsService {
-            config_path: temp.path().to_path_buf(),
-            settings: before.clone(),
-        };
+        let mut service =
+            SettingsService::for_test(temp.path().to_path_buf(), before.clone());
         let mut update = vault_update(temp.path().to_string_lossy());
         update.vault_path = None;
         update.theme = Some("dark".into());

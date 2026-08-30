@@ -9,6 +9,7 @@ pub async fn get_backlinks(
     note_id: String,
     state: State<'_, AppState>,
 ) -> Result<Vec<NoteMeta>, String> {
+    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
     let graph = state.graph_index.read().await;
     Ok(graph.get_backlinks(&note_id))
 }
@@ -19,6 +20,7 @@ pub async fn get_outgoing(
     note_id: String,
     state: State<'_, AppState>,
 ) -> Result<Vec<NoteMeta>, String> {
+    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
     let graph = state.graph_index.read().await;
     Ok(graph.get_outgoing(&note_id))
 }
@@ -29,6 +31,7 @@ pub async fn get_neighbors(
     note_id: String,
     state: State<'_, AppState>,
 ) -> Result<Vec<GraphNeighbor>, String> {
+    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
     let graph = state.graph_index.read().await;
     Ok(graph.get_neighbors(&note_id))
 }
@@ -36,6 +39,7 @@ pub async fn get_neighbors(
 /// Get notes with no incoming or outgoing links
 #[tauri::command]
 pub async fn get_unlinked(state: State<'_, AppState>) -> Result<Vec<NoteMeta>, String> {
+    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
     let graph = state.graph_index.read().await;
     Ok(graph.get_unlinked())
 }
@@ -43,6 +47,7 @@ pub async fn get_unlinked(state: State<'_, AppState>) -> Result<Vec<NoteMeta>, S
 /// Get the full graph structure (nodes + links) for visualization
 #[tauri::command]
 pub async fn get_full_graph(state: State<'_, AppState>) -> Result<FullGraph, String> {
+    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
     let graph = state.graph_index.read().await;
     Ok(graph.get_full_graph())
 }
@@ -50,6 +55,7 @@ pub async fn get_full_graph(state: State<'_, AppState>) -> Result<FullGraph, Str
 /// Rebuild the graph index from all notes
 #[tauri::command]
 pub async fn rebuild_graph(state: State<'_, AppState>) -> Result<GraphStats, String> {
+    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
     let notes = crate::commands::sync_topic_hubs(state.inner()).await?;
 
     // Rebuild graph

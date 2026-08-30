@@ -47,6 +47,8 @@ pub async fn send_prompt(
     mut request: PromptRequest,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
+    let _root_guard = crate::commands::acquire_root_epoch(state.inner()).await?;
+    let root_epoch = crate::commands::capture_root_epoch(state.inner())?;
     let tile_id = uuid::Uuid::new_v4().to_string();
     let now = Utc::now();
     let model_route = {
@@ -270,6 +272,8 @@ pub async fn send_prompt(
         .iter()
         .map(|gap| gap.id.clone())
         .collect::<Vec<_>>();
+    let stream_root_state = state.inner().clone();
+    let stream_root_epoch = root_epoch.clone();
 
     // Spawn async task for streaming (doesn't block the IPC response)
     tauri::async_runtime::spawn(async move {
@@ -413,6 +417,29 @@ pub async fn send_prompt(
             }
         }
 
+        let _root_guard = match crate::commands::acquire_expected_root_epoch(
+            &stream_root_state,
+            &stream_root_epoch,
+        )
+        .await
+        {
+            Ok(guard) => guard,
+            Err(error) => {
+                let model_ids = results
+                    .iter()
+                    .map(|(model_id, _, _, _, _)| model_id.clone())
+                    .collect::<Vec<_>>();
+                emit_persistence_error(
+                    &window,
+                    &session_id_clone,
+                    &tile_id_clone,
+                    &model_ids,
+                    &anyhow::anyhow!(error),
+                );
+                return;
+            }
+        };
+
         // Batch update store with all results in a single write
         let persistence_ok = {
             let mut store = canvas_store_arc.write().await;
@@ -504,6 +531,8 @@ pub async fn send_prompt(
                 .clone()
                 .unwrap_or_else(|| TWIN_CONTEXT_VERSION.to_string());
             tauri::async_runtime::spawn(run_sealed_twin_prediction(
+                state.inner().clone(),
+                root_epoch.clone(),
                 state.twin_store.clone(),
                 state.openrouter.clone(),
                 state.ollama.clone(),
@@ -533,6 +562,8 @@ pub async fn add_models_to_tile(
     request: AddModelsRequest,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
+    let _root_guard = crate::commands::acquire_root_epoch(state.inner()).await?;
+    let root_epoch = crate::commands::capture_root_epoch(state.inner())?;
     // Get the tile's prompt
     let mut store = state.canvas_store.write().await;
     let session = store.get_session(&session_id).map_err(|e| e.to_string())?;
@@ -630,6 +661,7 @@ pub async fn add_models_to_tile(
     let web_search_max_results = prompt_request.web_search_max_results;
     let reasoning_effort = prompt_request.reasoning_effort.clone();
     let provider_route = model_route.provider.clone();
+    let stream_root_state = state.inner().clone();
 
     tauri::async_runtime::spawn(async move {
         // Stream all new models concurrently using JoinSet
@@ -767,6 +799,29 @@ pub async fn add_models_to_tile(
             }
         }
 
+        let _root_guard = match crate::commands::acquire_expected_root_epoch(
+            &stream_root_state,
+            &root_epoch,
+        )
+        .await
+        {
+            Ok(guard) => guard,
+            Err(error) => {
+                let model_ids = results
+                    .iter()
+                    .map(|(model_id, _, _, _, _)| model_id.clone())
+                    .collect::<Vec<_>>();
+                emit_persistence_error(
+                    &window,
+                    &session_id,
+                    &tile_id,
+                    &model_ids,
+                    &anyhow::anyhow!(error),
+                );
+                return;
+            }
+        };
+
         // Batch update store
         let persistence_ok = {
             let mut store = canvas_store_arc.write().await;
@@ -822,6 +877,8 @@ pub async fn regenerate_response(
     model_id: String,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
+    let _root_guard = crate::commands::acquire_root_epoch(state.inner()).await?;
+    let root_epoch = crate::commands::capture_root_epoch(state.inner())?;
     // Get the tile's prompt
     let mut store = state.canvas_store.write().await;
     let session = store.get_session(&session_id).map_err(|e| e.to_string())?;
@@ -878,6 +935,7 @@ pub async fn regenerate_response(
     let web_search_max_results = request.web_search_max_results;
     let reasoning_effort = request.reasoning_effort.clone();
     let provider_route = model_route.provider.clone();
+    let stream_root_state = state.inner().clone();
 
     tauri::async_runtime::spawn(async move {
         let model_id = effective_model_id;
@@ -910,6 +968,24 @@ pub async fn regenerate_response(
             }
         };
 
+        let _root_guard = match crate::commands::acquire_expected_root_epoch(
+            &stream_root_state,
+            &root_epoch,
+        )
+        .await
+        {
+            Ok(guard) => guard,
+            Err(error) => {
+                emit_persistence_error(
+                    &window,
+                    &session_id,
+                    &tile_id,
+                    std::slice::from_ref(&model_id),
+                    &anyhow::anyhow!(error),
+                );
+                return;
+            }
+        };
         let mut persistence_ok = true;
 
         match stream_result {

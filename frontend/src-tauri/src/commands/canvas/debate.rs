@@ -30,6 +30,8 @@ pub async fn start_debate(
     mut request: DebateStartRequest,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
+    let _root_guard = crate::commands::acquire_root_epoch(state.inner()).await?;
+    let root_epoch = crate::commands::capture_root_epoch(state.inner())?;
     let debate_id = uuid::Uuid::new_v4().to_string();
     let now = Utc::now();
 
@@ -143,6 +145,7 @@ pub async fn start_debate(
     let provider_route = model_route.provider.clone();
     let debate_id_clone = debate_id.clone();
     let session_id_clone = session_id.clone();
+    let stream_root_state = state.inner().clone();
 
     tauri::async_runtime::spawn(async move {
         let mut debate_state = debate;
@@ -374,6 +377,26 @@ pub async fn start_debate(
             };
             debate_state.rounds.push(round);
 
+            let round_root_guard = match crate::commands::acquire_expected_root_epoch(
+                &stream_root_state,
+                &root_epoch,
+            )
+            .await
+            {
+                Ok(guard) => guard,
+                Err(error) => {
+                    emit_debate_persist_error(
+                        &window,
+                        &session_id_clone,
+                        &debate_id_clone,
+                        round_num,
+                        &debate_state,
+                        &anyhow::anyhow!(error),
+                    );
+                    return;
+                }
+            };
+
             // Persist after each round. If this fails, surface it instead of
             // silently continuing to stream rounds that will never survive a
             // session reopen.
@@ -398,6 +421,7 @@ pub async fn start_debate(
             if !round_persisted {
                 return;
             }
+            drop(round_root_guard);
         }
 
         // Mark debate as complete
@@ -407,6 +431,25 @@ pub async fn start_debate(
             .last()
             .map(|round| round.round_number)
             .unwrap_or(max_rounds);
+        let _root_guard = match crate::commands::acquire_expected_root_epoch(
+            &stream_root_state,
+            &root_epoch,
+        )
+        .await
+        {
+            Ok(guard) => guard,
+            Err(error) => {
+                emit_debate_persist_error(
+                    &window,
+                    &session_id_clone,
+                    &debate_id_clone,
+                    final_round_number,
+                    &debate_state,
+                    &anyhow::anyhow!(error),
+                );
+                return;
+            }
+        };
         let completion_persisted = {
             let mut store = canvas_store_arc.write().await;
             match store.update_debate(&session_id_clone, &debate_state) {
@@ -448,6 +491,8 @@ pub async fn continue_debate(
     request: DebateContinueRequest,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
+    let _root_guard = crate::commands::acquire_root_epoch(state.inner()).await?;
+    let root_epoch = crate::commands::capture_root_epoch(state.inner())?;
     let mut store = state.canvas_store.write().await;
     let session = store.get_session(&session_id).map_err(|e| e.to_string())?;
     drop(store);
@@ -497,6 +542,7 @@ pub async fn continue_debate(
     let models = effective_model_ids(&model_route, &debate.participating_models);
     let reasoning_effort = request.reasoning_effort.clone();
     let provider_route = model_route.provider.clone();
+    let stream_root_state = state.inner().clone();
 
     tauri::async_runtime::spawn(async move {
         let mut debate_state = debate;
@@ -720,6 +766,26 @@ pub async fn continue_debate(
             created_at: Utc::now(),
         };
         debate_state.rounds.push(round);
+
+        let _root_guard = match crate::commands::acquire_expected_root_epoch(
+            &stream_root_state,
+            &root_epoch,
+        )
+        .await
+        {
+            Ok(guard) => guard,
+            Err(error) => {
+                emit_debate_persist_error(
+                    &window,
+                    &session_id,
+                    &debate_id,
+                    round_num,
+                    &debate_state,
+                    &anyhow::anyhow!(error),
+                );
+                return;
+            }
+        };
 
         let persisted = {
             let mut store = canvas_store_arc.write().await;

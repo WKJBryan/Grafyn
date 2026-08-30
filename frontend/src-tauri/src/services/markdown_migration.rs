@@ -409,13 +409,11 @@ impl MarkdownMigrationService {
 
         let program_path = Path::new(&preview.vault_path).join(&preview.program_path);
         if !program_path.exists() {
-            if let Some(parent) = program_path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            write_atomic(
-                &program_path,
+            store.put_vault_file_target_only(
+                &preview.program_path,
                 default_program_file_contents(&preview.hub_folder, &preview.program_path)
                     .as_bytes(),
+                "migration",
             )?;
             manifest.created_files.push(preview.program_path.clone());
         }
@@ -548,7 +546,10 @@ impl MarkdownMigrationService {
                         }
                     }
                     Ok(None) => {
-                        if let Err(error) = std::fs::remove_file(&target_path) {
+                        if let Err(error) = store.delete_vault_file_target_only(
+                            relative_path,
+                            "migration",
+                        ) {
                             failures.push(format!(
                                 "failed to remove derived migration file '{}': {}",
                                 relative_path, error
@@ -996,6 +997,43 @@ mod tests {
     use super::*;
     use crate::services::atomic_io::assert_no_tmp_siblings;
     use tempfile::tempdir;
+
+    #[test]
+    fn migration_program_put_is_target_only_and_crash_recoverable() {
+        let vault_dir = tempdir().unwrap();
+        let data_dir = tempdir().unwrap();
+        let events = std::sync::Arc::new(
+            crate::services::twin_events::TwinEventStore::new(data_dir.path()),
+        );
+        events.initialize().unwrap();
+        let coordinator = std::sync::Arc::new(
+            crate::services::twin_events::MutationCoordinator::new(
+                data_dir.path(),
+                vault_dir.path(),
+                events.clone(),
+                std::sync::Arc::new(crate::services::twin_events::NoopMutationLifecycle),
+            )
+            .unwrap(),
+        );
+        let service = MarkdownMigrationService::new(data_dir.path().to_path_buf());
+        let request = MarkdownMigrationRequest::default();
+        let preview = service
+            .preview(vault_dir.path().to_path_buf(), request.clone())
+            .unwrap();
+        let mut store = KnowledgeStore::with_event_recorder(
+            vault_dir.path().to_path_buf(),
+            data_dir.path().to_path_buf(),
+            coordinator.clone(),
+        );
+        coordinator.fail_once_at(crate::services::twin_events::MutationFaultPoint::AfterStage);
+
+        assert!(service.apply(&preview.preview_id, request, &mut store).is_err());
+        assert!(!vault_dir.path().join("_grafyn/program.md").exists());
+        assert_eq!(coordinator.pending_count().unwrap(), 1);
+        assert_eq!(coordinator.recover_pending().unwrap(), 1);
+        assert!(vault_dir.path().join("_grafyn/program.md").is_file());
+        assert!(events.ordered_events().unwrap().is_empty());
+    }
 
     #[test]
     fn preview_writes_are_atomic_with_no_tmp_litter() {

@@ -116,7 +116,7 @@ impl TwinEventStore {
         Ok(())
     }
 
-    pub fn append(&self, mut event: TwinEvent) -> Result<AppendOutcome, StoreError> {
+    pub(crate) fn append(&self, mut event: TwinEvent) -> Result<AppendOutcome, StoreError> {
         let mut state = self
             .state
             .lock()
@@ -792,8 +792,6 @@ pub fn topological_order(events: &[TwinEvent]) -> Result<Vec<TwinEvent>, StoreEr
 }
 
 pub trait EventRecorder: Send + Sync {
-    fn record(&self, event: TwinEvent) -> Result<AppendOutcome, StoreError>;
-
     fn commit_mutation(
         &self,
         _origin: crate::services::twin_events::MutationOrigin,
@@ -832,6 +830,7 @@ pub trait EventRecorder: Send + Sync {
         Ok(0)
     }
 
+    #[cfg(test)]
     fn retarget_markdown_root(
         &self,
         _vault_path: &std::path::Path,
@@ -852,19 +851,9 @@ pub trait EventRecorder: Send + Sync {
     }
 }
 
-impl EventRecorder for TwinEventStore {
-    fn record(&self, event: TwinEvent) -> Result<AppendOutcome, StoreError> {
-        self.append(event)
-    }
-}
-
 #[derive(Debug, Default)]
 pub struct NoopEventRecorder;
 impl EventRecorder for NoopEventRecorder {
-    fn record(&self, _event: TwinEvent) -> Result<AppendOutcome, StoreError> {
-        Ok(AppendOutcome::Ignored)
-    }
-
     fn commit_mutation(
         &self,
         _origin: crate::services::twin_events::MutationOrigin,
@@ -882,6 +871,7 @@ impl EventRecorder for NoopEventRecorder {
         })
     }
 
+    #[cfg(test)]
     fn retarget_markdown_root(
         &self,
         _vault_path: &std::path::Path,
@@ -926,10 +916,6 @@ impl UnavailableEventRecorder {
 }
 
 impl EventRecorder for UnavailableEventRecorder {
-    fn record(&self, _event: TwinEvent) -> Result<AppendOutcome, StoreError> {
-        Err(StoreError::Invalid(self.reason.clone()))
-    }
-
     fn commit_mutation(
         &self,
         _origin: crate::services::twin_events::MutationOrigin,
@@ -946,6 +932,7 @@ impl EventRecorder for UnavailableEventRecorder {
         ))
     }
 
+    #[cfg(test)]
     fn retarget_markdown_root(
         &self,
         _vault_path: &std::path::Path,
@@ -967,6 +954,28 @@ mod tests {
     use crate::services::twin_events::test_support::{
         valid_event, valid_event_for_device, valid_event_for_device_and_stream,
     };
+
+    #[test]
+    fn event_recorder_has_no_raw_append_surface_or_store_implementation() {
+        let source = include_str!("store.rs");
+        assert!(!source.contains(&["fn rec", "ord(&self"].concat()));
+        assert!(!source.contains(
+            &["impl EventRecorder for ", "TwinEventStore"].concat()
+        ));
+    }
+
+    #[test]
+    fn production_surface_cannot_retarget_the_markdown_root_outside_the_wal() {
+        let recorder = include_str!("store.rs").replace("\r\n", "\n");
+        let coordinator = include_str!("mutation_coordinator.rs").replace("\r\n", "\n");
+        let knowledge = include_str!("../knowledge_store.rs").replace("\r\n", "\n");
+        assert!(recorder.contains("#[cfg(test)]\n    fn retarget_markdown_root("));
+        assert!(coordinator.contains(
+            "#[cfg(test)]\n    pub(crate) fn retarget_markdown_root("
+        ));
+        assert!(knowledge.contains("#[cfg(test)]\n    pub(crate) fn set_vault_path("));
+        assert!(!coordinator.contains("pub fn retarget_markdown_root("));
+    }
 
     fn write_event(path: &Path, event: &TwinEvent) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -1626,27 +1635,6 @@ mod tests {
         let event = valid_event(1, Vec::new());
         store.append(event.clone()).unwrap();
         assert!(canonical_path(&store, &event).is_file());
-    }
-
-    #[test]
-    fn plain_event_store_fails_closed_for_coordinated_mutations() {
-        let temp = tempfile::tempdir().unwrap();
-        let store = TwinEventStore::new(temp.path());
-        store.initialize().unwrap();
-
-        let result = EventRecorder::commit_mutation(
-            &store,
-            crate::services::twin_events::MutationOrigin::Local,
-            CausalStream::LocalOnly,
-            crate::models::twin_event::SourceChannel::parse("note_editor").unwrap(),
-            Vec::new(),
-            Vec::new(),
-        );
-
-        assert!(matches!(
-            result,
-            Err(crate::services::twin_events::MutationError::Invalid(_))
-        ));
     }
 
     #[test]

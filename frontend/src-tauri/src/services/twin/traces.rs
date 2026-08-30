@@ -1,6 +1,6 @@
 use super::shared::{
     excerpt, extract_event_model_id, extract_event_tile_id, first_payload_string,
-    load_or_quarantine, payload_string,
+    payload_string,
 };
 use super::TwinStore;
 use crate::models::twin::{
@@ -8,12 +8,11 @@ use crate::models::twin::{
 };
 #[cfg(test)]
 use crate::models::twin::{RecordOrigin, UserRecordCreate};
-use anyhow::{Context, Result};
+use anyhow::Result;
 use chrono::Utc;
 #[cfg(test)]
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use walkdir::WalkDir;
+use std::path::PathBuf;
 
 fn resolve_event_evidence(
     trace: &SessionTrace,
@@ -133,6 +132,43 @@ impl TwinStore {
         event_type: TraceEventType,
         payload: serde_json::Value,
     ) -> Result<TraceEvent> {
+        if !self.event_recorder.is_noop() {
+            Self::validate_file_id(session_id)?;
+            let recorder = self.event_recorder.clone();
+            let mut committed = None;
+            let mut planner = || {
+                let (event, trace) = self
+                    .plan_trace_event(session_id, event_type.clone(), payload.clone())
+                    .map_err(|error| {
+                        crate::services::twin_events::MutationError::Invalid(error.to_string())
+                    })?;
+                let target = self
+                    .serialized_trace_target(&trace)
+                    .and_then(|value| self.governed_json_targets(vec![value]))
+                    .map_err(|error| {
+                        crate::services::twin_events::MutationError::Invalid(error.to_string())
+                    })?;
+                committed = Some((event, trace));
+                Ok(Some(crate::services::twin_events::MutationPlan::new(
+                    crate::models::twin_event::CausalStream::LocalOnly,
+                    crate::models::twin_event::SourceChannel::parse("legacy_twin")
+                        .map_err(crate::services::twin_events::MutationError::Invalid)?,
+                    target,
+                    Vec::new(),
+                )))
+            };
+            if let Err(error) = recorder.commit_planned_mutation(
+                crate::services::twin_events::MutationOrigin::Local,
+                &mut planner,
+            ) {
+                self.invalidate_mutation_caches();
+                return Err(anyhow::Error::new(error));
+            }
+            let (event, trace) = committed
+                .ok_or_else(|| anyhow::anyhow!("trace append was not planned"))?;
+            self.cache_committed_trace(trace);
+            return Ok(event);
+        }
         let (event, trace) = self.plan_trace_event(session_id, event_type, payload)?;
         self.write_trace_file(&trace)?;
         self.cache_committed_trace(trace);
@@ -154,11 +190,9 @@ impl TwinStore {
             payload,
         };
         let path = self.trace_file_path(session_id);
-        let mut trace = if path.exists() {
-            self.read_trace_file(&path)?
-        } else {
-            SessionTrace::new(session_id)
-        };
+        let mut trace = self
+            .read_twin_json_bounded(&path)?
+            .unwrap_or_else(|| SessionTrace::new(session_id));
         trace.updated_at = now;
         trace.events.push(event.clone());
         Ok((event, trace))
@@ -185,36 +219,30 @@ impl TwinStore {
         }
 
         let path = self.trace_file_path(session_id);
-        if !path.exists() {
+        let Some(trace): Option<SessionTrace> = self.read_twin_json_bounded(&path)? else {
             let trace = SessionTrace::new(session_id);
             self.trace_cache
                 .insert(session_id.to_string(), trace.clone());
             return Ok(trace);
-        }
-
-        let trace = self.read_trace_file(&path)?;
+        };
         self.trace_cache
             .insert(session_id.to_string(), trace.clone());
         Ok(trace)
     }
 
     pub(super) fn list_session_traces(&mut self) -> Result<Vec<SessionTrace>> {
-        for entry in WalkDir::new(&self.traces_path)
-            .min_depth(1)
-            .max_depth(1)
-            .into_iter()
-            .filter_map(|entry| entry.ok())
-        {
-            let path = entry.path();
-            if path.extension().is_some_and(|ext| ext == "json") {
-                if let Some(trace) = load_or_quarantine::<SessionTrace>(path, "trace") {
-                    self.trace_cache.insert(trace.session_id.clone(), trace);
-                }
-            }
+        for trace in self.list_session_traces_durable()? {
+            self.trace_cache.insert(trace.session_id.clone(), trace);
         }
 
         let mut traces = self.trace_cache.values().cloned().collect::<Vec<_>>();
         traces.sort_by(|a, b| a.session_id.cmp(&b.session_id));
+        Ok(traces)
+    }
+
+    pub(super) fn list_session_traces_durable(&self) -> Result<Vec<SessionTrace>> {
+        let mut traces = self.list_twin_json_bounded("traces")?;
+        traces.sort_by(|a: &SessionTrace, b: &SessionTrace| a.session_id.cmp(&b.session_id));
         Ok(traces)
     }
 
@@ -245,15 +273,37 @@ impl TwinStore {
         Ok(resolved)
     }
 
-    pub(super) fn trace_file_path(&self, session_id: &str) -> PathBuf {
-        self.traces_path.join(format!("{}.json", session_id))
+    pub(super) fn resolve_evidence_refs_durable(
+        &self,
+        refs: &[EvidenceRef],
+    ) -> Result<Vec<ResolvedEvidenceRef>> {
+        let mut resolved = Vec::new();
+        for evidence_ref in refs {
+            let trace_id = if evidence_ref.trace_id.trim().is_empty() {
+                &evidence_ref.session_id
+            } else {
+                &evidence_ref.trace_id
+            };
+            let Some(trace) = self
+                .read_twin_json_bounded::<SessionTrace>(&self.trace_file_path(trace_id))?
+            else {
+                continue;
+            };
+            let Some(event) = trace
+                .events
+                .iter()
+                .find(|event| event.id == evidence_ref.event_id)
+            else {
+                continue;
+            };
+            resolved.push(resolve_event_evidence(&trace, event, evidence_ref));
+        }
+        resolved.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        Ok(resolved)
     }
 
-    pub(super) fn read_trace_file(&self, path: &Path) -> Result<SessionTrace> {
-        let content = std::fs::read_to_string(path)
-            .with_context(|| format!("Failed to read trace file: {}", path.display()))?;
-        serde_json::from_str(&content)
-            .with_context(|| format!("Failed to parse trace file: {}", path.display()))
+    pub(super) fn trace_file_path(&self, session_id: &str) -> PathBuf {
+        self.traces_path.join(format!("{}.json", session_id))
     }
 
     fn write_trace_file(&self, trace: &SessionTrace) -> Result<()> {
@@ -267,6 +317,38 @@ mod tests {
     use super::*;
     use crate::models::twin::{PromotionState, UserRecordKind};
     use tempfile::tempdir;
+
+    fn coordinated_store(
+        root: &std::path::Path,
+    ) -> (
+        TwinStore,
+        std::sync::Arc<crate::services::twin_events::MutationCoordinator>,
+    ) {
+        let data = root.join("data");
+        let vault = root.join("vault");
+        let twin_root = data.join("twin").join("scope-one");
+        std::fs::create_dir_all(&twin_root).unwrap();
+        std::fs::create_dir(&vault).unwrap();
+        let events = std::sync::Arc::new(crate::services::twin_events::TwinEventStore::new(&data));
+        events.initialize().unwrap();
+        let coordinator = std::sync::Arc::new(
+            crate::services::twin_events::MutationCoordinator::new(
+                &data,
+                &vault,
+                events,
+                std::sync::Arc::new(crate::services::twin_events::NoopMutationLifecycle),
+            )
+            .unwrap(),
+        );
+        (
+            TwinStore::with_event_recorder(
+                twin_root,
+                data.join("twin"),
+                coordinator.clone(),
+            ),
+            coordinator,
+        )
+    }
 
     #[test]
     fn evidence_resolution_returns_trace_session_model_and_excerpts() {
@@ -351,5 +433,32 @@ mod tests {
         assert_eq!(trace.events.len(), 1);
         assert_eq!(trace.events[0].id, event.id);
         assert_eq!(trace.events[0].event_type, TraceEventType::PromptSubmitted);
+    }
+
+    #[test]
+    fn interrupted_trace_append_is_recovered_before_the_next_fresh_plan() {
+        let root = tempdir().unwrap();
+        let (mut store, coordinator) = coordinated_store(root.path());
+        coordinator.fail_once_at(crate::services::twin_events::MutationFaultPoint::AfterStage);
+
+        assert!(store
+            .append_trace_event(
+                "session-1",
+                TraceEventType::PromptSubmitted,
+                serde_json::json!({ "prompt": "first" }),
+            )
+            .is_err());
+        let second = store
+            .append_trace_event(
+                "session-1",
+                TraceEventType::PromptSubmitted,
+                serde_json::json!({ "prompt": "second" }),
+            )
+            .unwrap();
+
+        let trace = store.get_session_trace("session-1").unwrap();
+        assert_eq!(trace.events.len(), 2);
+        assert_eq!(trace.events[1].id, second.id);
+        assert_eq!(coordinator.pending_count().unwrap(), 0);
     }
 }

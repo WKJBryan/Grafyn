@@ -10,6 +10,14 @@ use anyhow::{bail, Result};
 use serde_json::json;
 use std::collections::HashSet;
 
+type CanvasFeedbackMutationPlan = (
+    CanvasFeedbackResult,
+    crate::models::twin::SessionTrace,
+    crate::models::twin::UserRecord,
+    Vec<(std::path::PathBuf, String)>,
+    Vec<crate::services::twin_events::TwinEventDraft>,
+);
+
 impl TwinStore {
     pub fn record_canvas_feedback(
         &mut self,
@@ -17,17 +25,60 @@ impl TwinStore {
         request: CanvasFeedbackRequest,
     ) -> Result<CanvasFeedbackResult> {
         Self::validate_file_id(&session.id)?;
+        if !self.event_recorder.is_noop() {
+            let mut committed = None;
+            self.commit_planned_twin_mutation(|store| {
+                let durable_session = store
+                    .read_canvas_session_bounded(&session.id)?
+                    .ok_or_else(|| anyhow::anyhow!("Persisted Canvas session was not found"))?;
+                let (result, trace, record, values, drafts) =
+                    store.plan_canvas_feedback_mutation(&durable_session, &request)?;
+                let targets = store.governed_json_targets(values)?;
+                committed = Some((result, trace, record));
+                Ok(Some(crate::services::twin_events::MutationPlan::new(
+                    crate::models::twin_event::CausalStream::SyncEligible,
+                    SourceChannel::parse("canvas").map_err(anyhow::Error::msg)?,
+                    targets,
+                    drafts,
+                )))
+            })?;
+            let (result, trace, record) = committed
+                .ok_or_else(|| anyhow::anyhow!("Canvas feedback was not planned"))?;
+            self.cache_committed_trace(trace);
+            self.record_cache.insert(record.id.clone(), record);
+            self.records_cache_ready = true;
+            return Ok(result);
+        }
         self.ensure_record_cache()?;
-        validate_feedback_request(session, &request)?;
+        let (result, trace, record, values, drafts) =
+            self.plan_canvas_feedback_mutation(session, &request)?;
+        self.commit_governed_json_targets_with_source(
+            SourceChannel::parse("canvas").map_err(anyhow::Error::msg)?,
+            values,
+            drafts,
+        )?;
+        self.cache_committed_trace(trace);
+        self.record_cache.insert(record.id.clone(), record.clone());
+        Ok(result)
+    }
 
-        let payload = build_feedback_payload(session, &request)?;
+    fn plan_canvas_feedback_mutation(
+        &self,
+        session: &CanvasSession,
+        request: &CanvasFeedbackRequest,
+    ) -> Result<CanvasFeedbackMutationPlan> {
+        validate_feedback_request(session, request)?;
+        let payload = build_feedback_payload(session, request)?;
         let (trace_event, trace) = self.plan_trace_event(
             &session.id,
             trace_event_type(&request.feedback_type),
             payload,
         )?;
-        let record_create = build_record_from_feedback(session, &trace_event, &request)?;
-        let record = Self::materialize_user_record(record_create);
+        let record = Self::materialize_user_record(build_record_from_feedback(
+            session,
+            &trace_event,
+            request,
+        )?);
         let session_digest = crate::services::twin_events::digest_bytes(
             serde_json::to_string_pretty(session)?.as_bytes(),
         );
@@ -36,30 +87,23 @@ impl TwinStore {
             source_id: Identifier::parse(&session.id).map_err(anyhow::Error::msg)?,
             digest: Some(session_digest),
         };
-        let mut drafts = feedback_drafts(session, &trace_event, &request)?;
+        let mut drafts = feedback_drafts(session, &trace_event, request)?;
         for draft in &mut drafts {
             draft.evidence.push(canvas_evidence.clone());
         }
         drafts.push(self.record_observation_draft(&record, false, None)?);
-
-        self.commit_governed_json_targets_with_source(
-            SourceChannel::parse("canvas").map_err(anyhow::Error::msg)?,
-            vec![
-                self.serialized_trace_target(&trace)?,
-                (
-                    self.record_file_path(&record.id),
-                    serde_json::to_string_pretty(&record)?,
-                ),
-            ],
-            drafts,
-        )?;
-        self.cache_committed_trace(trace);
-        self.record_cache.insert(record.id.clone(), record.clone());
-
-        Ok(CanvasFeedbackResult {
+        let values = vec![
+            self.serialized_trace_target(&trace)?,
+            (
+                self.record_file_path(&record.id),
+                serde_json::to_string_pretty(&record)?,
+            ),
+        ];
+        let result = CanvasFeedbackResult {
             trace_event_id: trace_event.id,
-            created_record_ids: vec![record.id],
-        })
+            created_record_ids: vec![record.id.clone()],
+        };
+        Ok((result, trace, record, values, drafts))
     }
 }
 
@@ -511,11 +555,22 @@ mod tests {
         )
     }
 
+    fn persist_session(root: &std::path::Path, session: &CanvasSession) {
+        let canvas = root.join("data").join("canvas");
+        std::fs::create_dir_all(&canvas).unwrap();
+        std::fs::write(
+            canvas.join(format!("{}.json", session.id)),
+            serde_json::to_vec_pretty(session).unwrap(),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn feedback_targets_persisted_response_ids_and_preserves_ranking_order() {
         let root = tempdir().unwrap();
         let (mut store, events, _) = coordinated_store(root.path());
         let session = session();
+        persist_session(root.path(), &session);
 
         let accepted_result = store
             .record_canvas_feedback(
@@ -644,6 +699,7 @@ mod tests {
         let root = tempdir().unwrap();
         let (mut store, events, coordinator) = coordinated_store(root.path());
         let session = session();
+        persist_session(root.path(), &session);
         coordinator.fail_once_at(crate::services::twin_events::MutationFaultPoint::AfterTarget(0));
 
         assert!(store
@@ -684,5 +740,38 @@ mod tests {
             1
         );
         assert_eq!(restarted.list_user_records().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn canvas_feedback_validates_the_fresh_persisted_session_under_the_shared_lock() {
+        let root = tempdir().unwrap();
+        let (mut store, events, coordinator) = coordinated_store(root.path());
+        let stale_session = session();
+        let mut durable_session = stale_session.clone();
+        durable_session.prompt_tiles[0]
+            .responses
+            .get_mut("model-a")
+            .unwrap()
+            .status = ResponseStatus::Error;
+        persist_session(root.path(), &durable_session);
+
+        let result = store.record_canvas_feedback(
+            &stale_session,
+            CanvasFeedbackRequest {
+                feedback_type: CanvasFeedbackType::Accept,
+                response: Some(CanvasResponseRef {
+                    tile_id: "tile-feedback".to_string(),
+                    model_id: "model-a".to_string(),
+                }),
+                ..serde_json::from_value(serde_json::json!({
+                    "feedback_type": "accept"
+                }))
+                .unwrap()
+            },
+        );
+
+        assert!(result.is_err());
+        assert!(events.ordered_events().unwrap().is_empty());
+        assert_eq!(coordinator.pending_count().unwrap(), 0);
     }
 }

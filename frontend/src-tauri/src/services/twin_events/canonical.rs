@@ -287,6 +287,7 @@ fn encode_payload(out: &mut Encoder, payload: &TwinEventPayload) {
                 "review_date",
                 v.review_date.as_ref().map(BoundedLabel::as_str),
             );
+            encode_primitive_assessment(out, Some(&v.primitive_assessment));
         }
         TwinEventPayload::DecisionOutcomeRecorded(v) => {
             out.text("decision_id", v.decision_id.as_str());
@@ -314,6 +315,7 @@ fn encode_payload(out: &mut Encoder, payload: &TwinEventPayload) {
                 "missed_something",
                 v.missed_something.as_ref().map(BoundedContent::as_str),
             );
+            encode_primitive_assessment(out, v.primitive_assessment.as_ref());
         }
         TwinEventPayload::FeedbackRecorded(v) => {
             out.text("feedback_id", v.feedback_id.as_str());
@@ -328,6 +330,85 @@ fn encode_payload(out: &mut Encoder, payload: &TwinEventPayload) {
         }
         TwinEventPayload::RelationshipContextObserved(_) => {}
     }
+}
+
+fn encode_primitive_assessment(
+    out: &mut Encoder,
+    assessment: Option<&PrimitiveDecisionAssessmentPayload>,
+) {
+    let Some(assessment) = assessment else {
+        out.bool("primitive_assessment.present", false);
+        return;
+    };
+    out.bool("primitive_assessment.present", true);
+    out.optional_text(
+        "primitive_assessment.stakes",
+        assessment.stakes.as_ref().map(BoundedContent::as_str),
+    );
+    out.optional_text(
+        "primitive_assessment.reversibility",
+        assessment
+            .reversibility
+            .as_ref()
+            .map(BoundedContent::as_str),
+    );
+    out.optional_text(
+        "primitive_assessment.time_horizon",
+        assessment
+            .time_horizon
+            .as_ref()
+            .map(BoundedContent::as_str),
+    );
+    out.optional_text(
+        "primitive_assessment.uncertainty",
+        assessment.uncertainty.as_ref().map(BoundedContent::as_str),
+    );
+    out.optional_text(
+        "primitive_assessment.agency",
+        assessment.agency.as_ref().map(BoundedContent::as_str),
+    );
+    out.optional_text(
+        "primitive_assessment.value_tension",
+        assessment
+            .value_tension
+            .as_ref()
+            .map(BoundedContent::as_str),
+    );
+    out.optional_text(
+        "primitive_assessment.constraint_pressure",
+        assessment
+            .constraint_pressure
+            .as_ref()
+            .map(BoundedContent::as_str),
+    );
+    out.optional_text(
+        "primitive_assessment.taste_aesthetic_pull",
+        assessment
+            .taste_aesthetic_pull
+            .as_ref()
+            .map(BoundedContent::as_str),
+    );
+    out.optional_text(
+        "primitive_assessment.somatic_signal",
+        assessment
+            .somatic_signal
+            .as_ref()
+            .map(BoundedContent::as_str),
+    );
+    out.optional_text(
+        "primitive_assessment.action_gap_risk",
+        assessment
+            .action_gap_risk
+            .as_ref()
+            .map(BoundedContent::as_str),
+    );
+    out.optional_text(
+        "primitive_assessment.outcome_feedback",
+        assessment
+            .outcome_feedback
+            .as_ref()
+            .map(BoundedContent::as_str),
+    );
 }
 
 fn encode_claims(out: &mut Encoder, field: &str, claims: &[ClaimAssertion]) {
@@ -597,6 +678,84 @@ mod tests {
                 TwinEventPayload::DecisionOutcomeRecorded(changed)
             ))
         );
+    }
+
+    #[test]
+    fn every_primitive_assessment_field_and_outer_presence_are_semantic() {
+        use crate::models::twin_event::*;
+        use crate::services::twin_events::test_support::event_for_payload;
+
+        let field_names = [
+            "stakes",
+            "reversibility",
+            "time_horizon",
+            "uncertainty",
+            "agency",
+            "value_tension",
+            "constraint_pressure",
+            "taste_aesthetic_pull",
+            "somatic_signal",
+            "action_gap_risk",
+            "outcome_feedback",
+        ];
+        let variants = field_names.map(|field_name| {
+            let mut value = serde_json::to_value(PrimitiveDecisionAssessmentPayload::default())
+                .unwrap();
+            value[field_name] = serde_json::Value::String(format!("{field_name} value"));
+            serde_json::from_value::<PrimitiveDecisionAssessmentPayload>(value).unwrap()
+        });
+
+        let decision = |primitive_assessment| {
+            event_for_payload(TwinEventPayload::DecisionRecorded(DecisionRecorded {
+                decision_id: Identifier::parse("decision-primitive").unwrap(),
+                decision: BoundedContent::parse("choose").unwrap(),
+                options: vec![BoundedContent::parse("a").unwrap()],
+                stakes: None,
+                initial_leaning: None,
+                review_date: None,
+                primitive_assessment,
+            }))
+        };
+        let decision_baseline = super::derive_event_id(&decision(
+            PrimitiveDecisionAssessmentPayload::default(),
+        ));
+        for (field_name, variant) in field_names.into_iter().zip(variants.clone()) {
+            assert_ne!(
+                decision_baseline,
+                super::derive_event_id(&decision(variant)),
+                "DecisionRecorded omitted primitive field {field_name} from its identity"
+            );
+        }
+
+        let outcome = |primitive_assessment| {
+            event_for_payload(TwinEventPayload::DecisionOutcomeRecorded(
+                DecisionOutcomeRecorded {
+                    decision_id: Identifier::parse("decision-primitive").unwrap(),
+                    outcome: Some(BoundedContent::parse("done").unwrap()),
+                    chosen_option: None,
+                    selected_response_id: None,
+                    confidence_basis_points: None,
+                    review_date: None,
+                    correction_note: None,
+                    regret_score: None,
+                    lesson: None,
+                    missed_something: None,
+                    primitive_assessment,
+                },
+            ))
+        };
+        let absent = super::derive_event_id(&outcome(None));
+        let present_default = super::derive_event_id(&outcome(Some(
+            PrimitiveDecisionAssessmentPayload::default(),
+        )));
+        assert_ne!(absent, present_default);
+        for (field_name, variant) in field_names.into_iter().zip(variants) {
+            assert_ne!(
+                present_default,
+                super::derive_event_id(&outcome(Some(variant))),
+                "DecisionOutcomeRecorded omitted primitive field {field_name} from its identity"
+            );
+        }
     }
 
     #[test]

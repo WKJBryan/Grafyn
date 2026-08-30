@@ -56,7 +56,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
     // Resolve paths: CLI args > settings.json > defaults
-    let (vault_path, data_path) = resolve_paths(args.vault, args.data);
+    let (vault_path, data_path) = resolve_paths(args.vault, args.data)?;
 
     log::info!("Vault path: {}", vault_path.display());
     log::info!("Data path: {}", data_path.display());
@@ -168,16 +168,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Resolve vault and data paths from CLI args, settings file, or defaults.
-fn resolve_paths(cli_vault: Option<PathBuf>, cli_data: Option<PathBuf>) -> (PathBuf, PathBuf) {
-    // Try loading from settings if CLI args aren't provided
-    let settings = if cli_vault.is_none() || cli_data.is_none() {
-        SettingsService::load().ok()
-    } else {
-        None
-    };
+fn resolve_paths(
+    cli_vault: Option<PathBuf>,
+    cli_data: Option<PathBuf>,
+) -> Result<(PathBuf, PathBuf), Box<dyn std::error::Error>> {
+    if let Some(data_path) = cli_data.as_deref() {
+        SettingsService::recover_root_transition_at(data_path)?;
+    }
+    // Always recover/load settings before resolving a store root. Explicit CLI paths
+    // remain overrides, but a stale path will then fail the active-lease check.
+    let settings = SettingsService::load()?;
 
     let vault_path = cli_vault
-        .or_else(|| settings.as_ref().map(|s| s.vault_path()))
+        .or_else(|| Some(settings.vault_path()))
         .unwrap_or_else(|| {
             dirs::document_dir()
                 .unwrap_or_else(|| PathBuf::from("."))
@@ -186,7 +189,7 @@ fn resolve_paths(cli_vault: Option<PathBuf>, cli_data: Option<PathBuf>) -> (Path
         });
 
     let data_path = cli_data
-        .or_else(|| settings.as_ref().map(|s| s.data_path()))
+        .or_else(|| Some(settings.data_path()))
         .unwrap_or_else(|| {
             dirs::data_local_dir()
                 .unwrap_or_else(|| dirs::document_dir().unwrap_or_else(|| PathBuf::from(".")))
@@ -194,5 +197,5 @@ fn resolve_paths(cli_vault: Option<PathBuf>, cli_data: Option<PathBuf>) -> (Path
                 .join("data")
         });
 
-    (vault_path, data_path)
+    Ok((vault_path, data_path))
 }

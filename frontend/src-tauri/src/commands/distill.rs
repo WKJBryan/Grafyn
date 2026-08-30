@@ -747,6 +747,7 @@ pub async fn distill_note(
     request: DistillRequest,
     state: State<'_, AppState>,
 ) -> Result<DistillResponse, String> {
+    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
     // 1. Get the container note
     let note = {
         let store = state.knowledge_store.read().await;
@@ -1029,6 +1030,7 @@ pub async fn normalize_tags(
     id: String,
     state: State<'_, AppState>,
 ) -> Result<crate::models::note::Note, String> {
+    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
     // Get the note
     let note = {
         let store = state.knowledge_store.read().await;

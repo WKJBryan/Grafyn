@@ -1,6 +1,6 @@
 use super::shared::{
     event_text, evidence_note, excerpt, extract_event_model_id, extract_event_tile_id,
-    lexical_terms, load_or_quarantine, payload_string, text_contains_any, value_contains_key,
+    lexical_terms, payload_string, text_contains_any, value_contains_key,
 };
 use super::TwinStore;
 #[cfg(test)]
@@ -10,13 +10,12 @@ use crate::models::twin::{
     TraceEventType, TwinContextRecord, TwinInferenceRunSummary, TwinReviewRecord, UserRecord,
     UserRecordCreate, UserRecordKind, UserRecordUpdate,
 };
-use anyhow::{Context, Result};
+use anyhow::Result;
 use chrono::Utc;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use walkdir::WalkDir;
 
 const TWIN_INFERENCE_VERSION: &str = "local-signal-v1";
 const MAX_TWIN_CANDIDATE_CONTEXT_RECORDS: usize = 8;
@@ -688,12 +687,72 @@ impl TwinStore {
                 "governance state must be changed through the explicit promotion action"
             ));
         }
-        self.ensure_record_cache()?;
-        let record = Self::materialize_user_record(create);
-        let automatic = record.origin == RecordOrigin::Inferred;
-        self.write_record_observation(&record, automatic, automatic.then_some("legacy_inference"))?;
-        self.record_cache.insert(record.id.clone(), record.clone());
+        if self.event_recorder.is_noop() {
+            self.ensure_record_cache()?;
+            let record = Self::materialize_user_record(create);
+            let automatic = record.origin == RecordOrigin::Inferred;
+            self.write_record_observation(
+                &record,
+                automatic,
+                automatic.then_some("legacy_inference"),
+            )?;
+            self.record_cache.insert(record.id.clone(), record.clone());
+            return Ok(record);
+        }
 
+        let recorder = self.event_recorder.clone();
+        let mut committed = None;
+        let mut planner = || {
+            let record = loop {
+                let candidate = Self::materialize_user_record(create.clone());
+                let path = self.record_file_path(&candidate.id);
+                if self
+                    .read_twin_json_bounded::<UserRecord>(&path)
+                    .map_err(|error| {
+                        crate::services::twin_events::MutationError::Invalid(error.to_string())
+                    })?
+                    .is_none()
+                {
+                    break candidate;
+                }
+            };
+            let automatic = record.origin == RecordOrigin::Inferred;
+            let draft = self
+                .record_observation_draft(
+                    &record,
+                    automatic,
+                    automatic.then_some("legacy_inference"),
+                )
+                .map_err(|error| {
+                    crate::services::twin_events::MutationError::Invalid(error.to_string())
+                })?;
+            let content = serde_json::to_string_pretty(&record).map_err(|error| {
+                crate::services::twin_events::MutationError::Invalid(error.to_string())
+            })?;
+            let targets = self
+                .governed_json_targets(vec![(self.record_file_path(&record.id), content)])
+                .map_err(|error| {
+                    crate::services::twin_events::MutationError::Invalid(error.to_string())
+                })?;
+            committed = Some(record);
+            Ok(Some(crate::services::twin_events::MutationPlan::new(
+                crate::models::twin_event::CausalStream::SyncEligible,
+                crate::models::twin_event::SourceChannel::parse("legacy_twin")
+                    .map_err(crate::services::twin_events::MutationError::Invalid)?,
+                targets,
+                vec![draft],
+            )))
+        };
+        if let Err(error) = recorder.commit_planned_mutation(
+            crate::services::twin_events::MutationOrigin::Local,
+            &mut planner,
+        ) {
+            self.invalidate_mutation_caches();
+            return Err(anyhow::Error::new(error));
+        }
+        let record = committed.ok_or_else(|| anyhow::anyhow!("record create was not planned"))?;
+        self.record_cache.insert(record.id.clone(), record.clone());
+        self.records_cache_ready = true;
         Ok(record)
     }
 
@@ -778,7 +837,7 @@ impl TwinStore {
             crate::services::twin_events::MutationOrigin::Local,
             &mut planner,
         ) {
-            self.reload_record_cache()?;
+            self.invalidate_mutation_caches();
             return Err(anyhow::Error::new(error));
         }
         let record = committed.ok_or_else(|| anyhow::anyhow!("record update was not planned"))?;
@@ -788,6 +847,186 @@ impl TwinStore {
     }
 
     pub fn run_twin_inference(&mut self) -> Result<TwinInferenceRunSummary> {
+        if !self.event_recorder.is_noop() {
+            let recorder = self.event_recorder.clone();
+            let mut committed = None;
+            let mut planner = || {
+                let traces = self.list_session_traces_durable().map_err(|error| {
+                    crate::services::twin_events::MutationError::Invalid(error.to_string())
+                })?;
+                let scanned_events = traces.iter().map(|trace| trace.events.len()).sum::<usize>();
+                let inferred = infer_behavioral_records(&traces);
+                let records = self.list_user_records_durable().map_err(|error| {
+                    crate::services::twin_events::MutationError::Invalid(error.to_string())
+                })?;
+                let mut records_by_id = records
+                    .into_iter()
+                    .map(|record| (record.id.clone(), record))
+                    .collect::<HashMap<_, _>>();
+                let mut existing_by_key = HashMap::new();
+                let mut rejected_keys = HashSet::new();
+                for record in records_by_id.values() {
+                    if let Some(inference_key) = record
+                        .metadata
+                        .get("inference_key")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned)
+                    {
+                        existing_by_key.insert(inference_key.clone(), record.id.clone());
+                        if record.promotion_state == PromotionState::Rejected {
+                            rejected_keys.insert(inference_key);
+                        }
+                    }
+                }
+
+                let mut created_records = 0usize;
+                let mut updated_records = 0usize;
+                let mut skipped_rejected_records = 0usize;
+                let mut changed = Vec::new();
+                for draft in inferred {
+                    let mut metadata = build_inference_metadata(&draft, false);
+                    let record = if let Some(existing_id) =
+                        existing_by_key.get(&draft.inference_key).cloned()
+                    {
+                        let mut record = records_by_id.get(&existing_id).cloned().ok_or_else(|| {
+                            crate::services::twin_events::MutationError::Invalid(
+                                "inference record index is inconsistent".into(),
+                            )
+                        })?;
+                        let previous_state = record.promotion_state.clone();
+                        record.kind = draft.kind.clone();
+                        record.content = draft.content.clone();
+                        record.evidence_refs = draft.evidence_refs.clone();
+                        record.confidence = draft.confidence;
+                        record.origin = RecordOrigin::Inferred;
+                        if rejected_keys.contains(&draft.inference_key) {
+                            metadata.insert("auto_promoted".to_string(), Value::Bool(false));
+                            record.promotion_state = PromotionState::Rejected;
+                            skipped_rejected_records += 1;
+                        } else if record.promotion_state.effective() == PromotionState::Candidate {
+                            record.promotion_state = PromotionState::Candidate;
+                        }
+                        metadata = merge_promotion_history(record.metadata.clone(), metadata);
+                        if previous_state != record.promotion_state {
+                            append_promotion_history(
+                                &mut metadata,
+                                &previous_state,
+                                &record.promotion_state,
+                                Some("local signal inference threshold"),
+                                true,
+                            );
+                        }
+                        record.metadata = metadata;
+                        record.updated_at = Utc::now();
+                        updated_records += 1;
+                        record
+                    } else {
+                        let record = loop {
+                            let candidate = Self::materialize_user_record(UserRecordCreate {
+                                kind: draft.kind.clone(),
+                                content: draft.content.clone(),
+                                evidence_refs: draft.evidence_refs.clone(),
+                                confidence: draft.confidence,
+                                origin: RecordOrigin::Inferred,
+                                promotion_state: Some(PromotionState::Candidate),
+                                valid_from: None,
+                                valid_until: None,
+                                links: Vec::new(),
+                                metadata: metadata.clone(),
+                            });
+                            if !records_by_id.contains_key(&candidate.id) {
+                                break candidate;
+                            }
+                        };
+                        existing_by_key.insert(draft.inference_key.clone(), record.id.clone());
+                        created_records += 1;
+                        record
+                    };
+                    records_by_id.insert(record.id.clone(), record.clone());
+                    changed.push(record);
+                }
+                changed.sort_by(|left, right| left.id.cmp(&right.id));
+                if changed.len() > crate::services::twin_events::MAX_INTENT_TARGETS {
+                    return Err(crate::services::twin_events::MutationError::Invalid(
+                        "Twin inference can update at most 64 records per run".into(),
+                    ));
+                }
+                let candidate_records = records_by_id
+                    .values()
+                    .filter(|record| {
+                        record.origin == RecordOrigin::Inferred
+                            && matches!(
+                                record.promotion_state.effective(),
+                                PromotionState::AutoPromoted | PromotionState::Candidate
+                            )
+                    })
+                    .count();
+                let summary = TwinInferenceRunSummary {
+                    inference_version: TWIN_INFERENCE_VERSION.to_string(),
+                    scanned_traces: traces.len(),
+                    scanned_events,
+                    created_records,
+                    updated_records,
+                    auto_promoted_records: 0,
+                    candidate_records,
+                    skipped_rejected_records,
+                    generated_at: Utc::now(),
+                };
+                let all_records = records_by_id.into_values().collect::<Vec<_>>();
+                if changed.is_empty() {
+                    committed = Some((summary, all_records));
+                    return Ok(None);
+                }
+                let mut values = Vec::with_capacity(changed.len());
+                let mut event_drafts = Vec::with_capacity(changed.len());
+                for record in &changed {
+                    values.push((
+                        self.record_file_path(&record.id),
+                        serde_json::to_string_pretty(record).map_err(|error| {
+                            crate::services::twin_events::MutationError::Invalid(error.to_string())
+                        })?,
+                    ));
+                    event_drafts.push(
+                        self.record_observation_draft(
+                            record,
+                            true,
+                            Some("legacy_inference"),
+                        )
+                        .map_err(|error| {
+                            crate::services::twin_events::MutationError::Invalid(error.to_string())
+                        })?,
+                    );
+                }
+                let targets = self.governed_json_targets(values).map_err(|error| {
+                    crate::services::twin_events::MutationError::Invalid(error.to_string())
+                })?;
+                committed = Some((summary, all_records));
+                Ok(Some(crate::services::twin_events::MutationPlan::new(
+                    crate::models::twin_event::CausalStream::SyncEligible,
+                    crate::models::twin_event::SourceChannel::parse("legacy_twin")
+                        .map_err(crate::services::twin_events::MutationError::Invalid)?,
+                    targets,
+                    event_drafts,
+                )))
+            };
+            if let Err(error) = recorder.commit_planned_mutation(
+                crate::services::twin_events::MutationOrigin::Local,
+                &mut planner,
+            ) {
+                self.invalidate_mutation_caches();
+                return Err(anyhow::Error::new(error));
+            }
+            let (summary, records) = committed
+                .ok_or_else(|| anyhow::anyhow!("Twin inference was not planned"))?;
+            self.record_cache = records
+                .into_iter()
+                .map(|record| (record.id.clone(), record))
+                .collect();
+            self.records_cache_ready = true;
+            self.trace_cache.clear();
+            return Ok(summary);
+        }
+
         self.ensure_record_cache()?;
         let traces = self.list_session_traces()?;
         let scanned_events = traces.iter().map(|trace| trace.events.len()).sum::<usize>();
@@ -1062,7 +1301,7 @@ impl TwinStore {
             crate::services::twin_events::MutationOrigin::Local,
             &mut planner,
         ) {
-            self.reload_record_cache()?;
+            self.invalidate_mutation_caches();
             return Err(anyhow::Error::new(error));
         }
         let record = committed.ok_or_else(|| anyhow::anyhow!("promotion was not planned"))?;
@@ -1076,28 +1315,12 @@ impl TwinStore {
             return Ok(());
         }
 
-        for entry in WalkDir::new(&self.records_path)
-            .min_depth(1)
-            .max_depth(1)
-            .into_iter()
-            .filter_map(|entry| entry.ok())
-        {
-            let path = entry.path();
-            if path.extension().is_some_and(|ext| ext == "json") {
-                if let Some(record) = load_or_quarantine::<UserRecord>(path, "record") {
-                    self.record_cache.insert(record.id.clone(), record);
-                }
-            }
+        for record in self.list_user_records_durable()? {
+            self.record_cache.insert(record.id.clone(), record);
         }
 
         self.records_cache_ready = true;
         Ok(())
-    }
-
-    fn reload_record_cache(&mut self) -> Result<()> {
-        self.record_cache.clear();
-        self.records_cache_ready = false;
-        self.ensure_record_cache()
     }
 
     pub(super) fn record_file_path(&self, record_id: &str) -> PathBuf {
@@ -1105,10 +1328,13 @@ impl TwinStore {
     }
 
     fn read_record_file(&self, path: &Path) -> Result<UserRecord> {
-        let content = std::fs::read_to_string(path)
-            .with_context(|| format!("Failed to read record file: {}", path.display()))?;
-        serde_json::from_str(&content)
-            .with_context(|| format!("Failed to parse record file: {}", path.display()))
+        self.read_twin_json_bounded(path)?.ok_or_else(|| {
+            anyhow::anyhow!("Failed to read record file: {}", path.display())
+        })
+    }
+
+    pub(super) fn list_user_records_durable(&self) -> Result<Vec<UserRecord>> {
+        self.list_twin_json_bounded("records")
     }
 
     #[cfg(test)]

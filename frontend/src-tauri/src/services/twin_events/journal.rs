@@ -4,9 +4,7 @@ use crate::models::twin_event::{
 use crate::services::twin_events::{derive_event_id, MutationError};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use uuid::Uuid;
 
 fn required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
@@ -129,14 +127,19 @@ impl MutationIntentV1 {
                 "nonlocal mutation intents cannot contain local events".into(),
             ));
         }
-        if self.targets.is_empty() || self.targets.len() > MAX_INTENT_TARGETS {
+        if self.targets.len() > MAX_INTENT_TARGETS {
             return Err(MutationError::Invalid(
-                "mutation intent must contain 1..=64 targets".into(),
+                "mutation intent must contain at most 64 targets".into(),
             ));
         }
         if self.events.len() > MAX_INTENT_EVENTS {
             return Err(MutationError::Invalid(
                 "mutation intent must contain at most 64 events".into(),
+            ));
+        }
+        if self.targets.is_empty() && self.events.is_empty() {
+            return Err(MutationError::Invalid(
+                "mutation intent must contain a target or event".into(),
             ));
         }
         let has_markdown_target = self
@@ -366,55 +369,44 @@ fn is_windows_reserved_component(component: &str) -> bool {
             .is_some_and(|suffix| suffix.len() == 1 && matches!(suffix.as_bytes()[0], b'1'..=b'9'))
 }
 
+const PENDING_DIRECTORY: &str = "twin/mutations/pending/v1";
+const QUARANTINE_DIRECTORY: &str = "twin/mutations/quarantine/v1";
+const STAGING_DIRECTORY: &str = "twin/mutations/staging/v1";
+
 pub struct LocalMutationJournal {
-    pending_dir: PathBuf,
-    quarantine_dir: PathBuf,
-    staging_dir: PathBuf,
+    root: crate::services::twin_events::AnchoredRoot,
 }
 
 impl LocalMutationJournal {
     pub fn initialize(data_path: impl AsRef<Path>) -> Result<Self, MutationError> {
-        let twin = data_path.as_ref().join("twin");
-        crate::services::twin_events::validate_real_directory(&twin, "Twin directory")?;
-        let mutations =
-            crate::services::twin_events::ensure_real_child_directory(&twin, "mutations", false)?;
-        let pending = crate::services::twin_events::ensure_real_child_directory(
-            &mutations, "pending", false,
-        )?;
-        let pending_dir =
-            crate::services::twin_events::ensure_real_child_directory(&pending, "v1", false)?;
-        let quarantine = crate::services::twin_events::ensure_real_child_directory(
-            &mutations,
-            "quarantine",
-            false,
-        )?;
-        let quarantine_dir =
-            crate::services::twin_events::ensure_real_child_directory(&quarantine, "v1", false)?;
-        let staging = crate::services::twin_events::ensure_real_child_directory(
-            &mutations, "staging", false,
-        )?;
-        let staging_dir =
-            crate::services::twin_events::ensure_real_child_directory(&staging, "v1", false)?;
-        let journal = Self {
-            pending_dir,
-            quarantine_dir,
-            staging_dir,
-        };
-        journal.cleanup_orphan_temps()?;
-        Ok(journal)
+        let root = crate::services::twin_events::AnchoredRoot::open(data_path)?;
+        root.open_directory(PENDING_DIRECTORY, true)?;
+        root.open_directory(QUARANTINE_DIRECTORY, true)?;
+        root.open_directory(STAGING_DIRECTORY, true)?;
+        Ok(Self { root })
     }
 
-    pub fn pending_count(&self) -> Result<usize, MutationError> {
+    pub(crate) fn pending_count(
+        &self,
+        _lock: &crate::services::twin_events::CoordinatorProcessLock,
+    ) -> Result<usize, MutationError> {
         Ok(self.pending_paths()?.len())
     }
 
-    pub fn quarantine_count(&self) -> Result<usize, MutationError> {
-        count_real_json_files(&self.quarantine_dir)
+    pub(crate) fn quarantine_count(
+        &self,
+        _lock: &crate::services::twin_events::CoordinatorProcessLock,
+    ) -> Result<usize, MutationError> {
+        Ok(self.json_names(QUARANTINE_DIRECTORY)?.len())
     }
 
-    pub fn stage(&self, intent: &MutationIntentV1) -> Result<(), MutationError> {
+    pub(crate) fn stage(
+        &self,
+        _lock: &crate::services::twin_events::CoordinatorProcessLock,
+        intent: &MutationIntentV1,
+    ) -> Result<(), MutationError> {
         intent.validate()?;
-        if self.pending_count()? >= MAX_PENDING_INTENTS {
+        if self.pending_paths()?.len() >= MAX_PENDING_INTENTS {
             return Err(MutationError::Invalid(
                 "local mutation journal has reached 256 pending intents".into(),
             ));
@@ -428,8 +420,12 @@ impl LocalMutationJournal {
             ));
         }
         let path = self.path_for(&intent.mutation_id);
-        install_no_clobber(&path, &bytes, &self.staging_dir)?;
-        let existing = read_bounded_file(&path, MAX_SERIALIZED_INTENT_BYTES)?;
+        self.root
+            .install_no_clobber(&path, STAGING_DIRECTORY, &bytes)?;
+        let existing = self
+            .root
+            .read_bounded(&path, MAX_SERIALIZED_INTENT_BYTES)?
+            .ok_or_else(|| MutationError::Invalid("staged mutation intent disappeared".into()))?;
         if existing != bytes {
             return Err(MutationError::Invalid(
                 "mutation ID collision in local journal".into(),
@@ -438,11 +434,19 @@ impl LocalMutationJournal {
         Ok(())
     }
 
-    pub fn load_pending(&self) -> Result<Vec<(PathBuf, MutationIntentV1)>, MutationError> {
+    pub(crate) fn load_pending(
+        &self,
+        _lock: &crate::services::twin_events::CoordinatorProcessLock,
+    ) -> Result<Vec<(String, MutationIntentV1)>, MutationError> {
         let mut loaded = Vec::new();
         for path in self.pending_paths()? {
-            let bytes = match read_bounded_file(&path, MAX_SERIALIZED_INTENT_BYTES) {
-                Ok(bytes) => bytes,
+            let bytes = match self.root.read_bounded(&path, MAX_SERIALIZED_INTENT_BYTES) {
+                Ok(Some(bytes)) => bytes,
+                Ok(None) => {
+                    return Err(MutationError::Invalid(
+                        "pending mutation intent disappeared".into(),
+                    ));
+                }
                 Err(error) => {
                     self.quarantine_path(&path)?;
                     return Err(error);
@@ -472,27 +476,33 @@ impl LocalMutationJournal {
         Ok(loaded)
     }
 
-    pub fn remove(&self, intent: &MutationIntentV1) -> Result<(), MutationError> {
+    pub(crate) fn remove(
+        &self,
+        _lock: &crate::services::twin_events::CoordinatorProcessLock,
+        intent: &MutationIntentV1,
+    ) -> Result<(), MutationError> {
         let path = self.path_for(&intent.mutation_id);
-        match fs::remove_file(&path) {
-            Ok(()) => crate::services::twin_events::sync_directory(&self.pending_dir)?,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-        Ok(())
+        self.root.delete(&path)
     }
 
-    pub fn quarantine_intent(&self, intent: &MutationIntentV1) -> Result<(), MutationError> {
+    pub(crate) fn quarantine_intent(
+        &self,
+        _lock: &crate::services::twin_events::CoordinatorProcessLock,
+        intent: &MutationIntentV1,
+    ) -> Result<(), MutationError> {
         self.quarantine_path(&self.path_for(&intent.mutation_id))
     }
 
-    fn path_for(&self, id: &ContentDigest) -> PathBuf {
-        self.pending_dir.join(format!("{}.json", id.as_str()))
+    fn path_for(&self, id: &ContentDigest) -> String {
+        format!("{PENDING_DIRECTORY}/{}.json", id.as_str())
     }
 
-    fn pending_paths(&self) -> Result<Vec<PathBuf>, MutationError> {
-        self.cleanup_orphan_temps()?;
-        let mut paths = real_json_files(&self.pending_dir)?;
+    fn pending_paths(&self) -> Result<Vec<String>, MutationError> {
+        let mut paths = self
+            .json_names(PENDING_DIRECTORY)?
+            .into_iter()
+            .map(|name| format!("{PENDING_DIRECTORY}/{name}"))
+            .collect::<Vec<_>>();
         if paths.len() > MAX_PENDING_INTENTS {
             return Err(MutationError::Invalid(
                 "local mutation journal exceeds 256 pending intents".into(),
@@ -502,130 +512,35 @@ impl LocalMutationJournal {
         Ok(paths)
     }
 
-    fn quarantine_path(&self, source: &Path) -> Result<(), MutationError> {
-        crate::services::twin_events::validate_real_file(source, "mutation intent")?;
-        let name = source
-            .file_name()
-            .and_then(|value| value.to_str())
-            .unwrap_or("intent.json");
-        let target = self
-            .quarantine_dir
-            .join(format!("{}-{name}", Uuid::new_v4()));
-        fs::rename(source, target)?;
-        crate::services::twin_events::sync_directory(&self.pending_dir)?;
-        crate::services::twin_events::sync_directory(&self.quarantine_dir)?;
-        Ok(())
+    fn quarantine_path(&self, source: &str) -> Result<(), MutationError> {
+        let name = source.rsplit('/').next().unwrap_or("intent.json");
+        let target = format!("{QUARANTINE_DIRECTORY}/{}-{name}", Uuid::new_v4());
+        self.root.rename(source, &target, false)
     }
 
-    fn cleanup_orphan_temps(&self) -> Result<(), MutationError> {
-        for directory in [&self.pending_dir, &self.staging_dir] {
-            crate::services::twin_events::validate_real_directory(
-                directory,
-                "mutation journal temporary directory",
-            )?;
-            for entry in fs::read_dir(directory)? {
-                let entry = entry?;
-                let path = entry.path();
-                let name = entry.file_name();
-                let name = name.to_string_lossy();
+    pub(crate) fn cleanup_orphan_temps_locked(
+        &self,
+        _lock: &crate::services::twin_events::CoordinatorProcessLock,
+    ) -> Result<(), MutationError> {
+        for directory in [PENDING_DIRECTORY, STAGING_DIRECTORY] {
+            for name in self.root.regular_file_names(directory)? {
                 if name.starts_with('.') && name.ends_with(".tmp") {
-                    crate::services::twin_events::validate_real_file(
-                        &path,
-                        "orphan mutation journal temporary file",
-                    )?;
-                    fs::remove_file(&path)?;
-                    crate::services::twin_events::sync_directory(directory)?;
+                    self.root.delete(&format!("{directory}/{name}"))?;
                 }
             }
         }
         Ok(())
     }
-}
 
-fn read_bounded_file(path: &Path, limit: usize) -> Result<Vec<u8>, MutationError> {
-    crate::services::twin_events::validate_real_file(path, "mutation intent")?;
-    let mut file = File::open(path)?;
-    if !file.metadata()?.is_file() {
-        return Err(MutationError::Invalid(
-            "mutation intent is not a regular file".into(),
-        ));
-    }
-    let take_limit = u64::try_from(limit)
-        .map_err(|_| MutationError::Invalid("mutation intent limit overflow".into()))?
-        + 1;
-    let mut bytes = Vec::with_capacity(limit.min(64 * 1024));
-    Read::by_ref(&mut file)
-        .take(take_limit)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() > limit {
-        return Err(MutationError::Invalid(format!(
-            "serialized mutation intent exceeds the {limit}-byte limit"
-        )));
-    }
-    Ok(bytes)
-}
-
-fn count_real_json_files(directory: &Path) -> Result<usize, MutationError> {
-    Ok(real_json_files(directory)?.len())
-}
-
-fn real_json_files(directory: &Path) -> Result<Vec<PathBuf>, MutationError> {
-    crate::services::twin_events::validate_real_directory(directory, "mutation journal directory")?;
-    let mut paths = Vec::new();
-    for entry in fs::read_dir(directory)? {
-        let entry = entry?;
-        let path = entry.path();
-        let metadata = fs::symlink_metadata(&path)?;
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
+    fn json_names(&self, directory: &str) -> Result<Vec<String>, MutationError> {
+        let names = self.root.regular_file_names(directory)?;
+        if let Some(name) = names.iter().find(|name| !name.ends_with(".json")) {
             return Err(MutationError::Invalid(format!(
-                "mutation journal contains a non-regular entry: {}",
-                path.display()
+                "mutation journal contains a non-JSON entry: {name}"
             )));
         }
-        if path.extension().and_then(|value| value.to_str()) != Some("json") {
-            return Err(MutationError::Invalid(format!(
-                "mutation journal contains a non-JSON entry: {}",
-                path.display()
-            )));
-        }
-        paths.push(path);
+        Ok(names)
     }
-    Ok(paths)
-}
-
-fn install_no_clobber(path: &Path, bytes: &[u8], staging_dir: &Path) -> Result<(), MutationError> {
-    let directory = path
-        .parent()
-        .ok_or_else(|| MutationError::Invalid("journal path has no parent".into()))?;
-    crate::services::twin_events::validate_real_directory(directory, "mutation journal directory")?;
-    crate::services::twin_events::validate_real_directory(
-        staging_dir,
-        "mutation journal staging directory",
-    )?;
-    let temporary = staging_dir.join(format!(".{}.tmp", Uuid::new_v4()));
-    let result = (|| -> Result<(), MutationError> {
-        let mut file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&temporary)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        match fs::hard_link(&temporary, path) {
-            Ok(()) => crate::services::twin_events::sync_directory(directory)?,
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error.into()),
-        }
-        Ok(())
-    })();
-    let cleanup = fs::remove_file(&temporary);
-    if let Err(error) = cleanup {
-        if error.kind() != io::ErrorKind::NotFound {
-            return Err(error.into());
-        }
-    }
-    crate::services::twin_events::sync_directory(staging_dir)?;
-    crate::services::twin_events::sync_directory(directory)?;
-    result
 }
 
 #[cfg(test)]

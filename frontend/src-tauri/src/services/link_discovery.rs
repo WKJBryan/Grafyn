@@ -1174,6 +1174,18 @@ pub async fn discover_for_note(
     max_links: usize,
     allow_cache: bool,
 ) -> Result<DiscoverLinksResponse, String> {
+    discover_for_note_at_epoch(state, note_id, mode, max_links, allow_cache, None).await
+}
+
+#[cfg(feature = "tauri-app")]
+pub(crate) async fn discover_for_note_at_epoch(
+    state: &AppState,
+    note_id: &str,
+    mode: DiscoverMode,
+    max_links: usize,
+    allow_cache: bool,
+    expected_root_epoch: Option<&crate::services::twin_events::ActiveMarkdownRootLeaseV1>,
+) -> Result<DiscoverLinksResponse, String> {
     let total_started_at = Instant::now();
 
     if mode == DiscoverMode::Manual {
@@ -1187,6 +1199,17 @@ pub async fn discover_for_note(
             source: "fresh".to_string(),
         });
     }
+
+    let mut root_guard = Some(crate::commands::acquire_root_epoch(state).await?);
+    if let Some(expected) = expected_root_epoch {
+        state
+            .mutation_coordinator
+            .as_ref()
+            .ok_or_else(|| "mutation coordinator is unavailable".to_string())?
+            .validate_root_epoch(expected)
+            .map_err(|error| error.to_string())?;
+    }
+    let root_epoch = crate::commands::capture_root_epoch(state)?;
 
     if allow_cache {
         let discovery = state.link_discovery.read().await;
@@ -1301,6 +1324,7 @@ pub async fn discover_for_note(
         (ranked_links, exploratory_ranked)
     };
 
+    drop(root_guard.take());
     if mode.include_llm() {
         ranked_links =
             rerank_with_llm(state, &snapshot.source_profile, ranked_links, "strong", 8).await;
@@ -1337,6 +1361,7 @@ pub async fn discover_for_note(
         .map(|candidate| candidate.candidate.clone())
         .collect::<Vec<_>>();
 
+    let _root_guard = crate::commands::acquire_expected_root_epoch(state, &root_epoch).await?;
     let mut discovery = state.link_discovery.write().await;
     let stored = discovery
         .store_discovery_result(note_id, links.clone(), exploratory_links.clone())

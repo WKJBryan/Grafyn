@@ -962,6 +962,8 @@ fn build_twin_prediction_user_message(
 /// provider, then re-lock to attach.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn run_sealed_twin_prediction(
+    root_state: AppState,
+    root_epoch: crate::services::twin_events::ActiveMarkdownRootLeaseV1,
     twin_store: Arc<RwLock<TwinStore>>,
     openrouter: Arc<RwLock<OpenRouterService>>,
     ollama: Arc<RwLock<OllamaService>>,
@@ -976,6 +978,18 @@ pub(super) async fn run_sealed_twin_prediction(
     context_version: String,
     decision_metadata: Option<DecisionPromptMetadata>,
 ) {
+    let initial_root_guard = match crate::commands::acquire_expected_root_epoch(
+        &root_state,
+        &root_epoch,
+    )
+    .await
+    {
+        Ok(guard) => guard,
+        Err(error) => {
+            log::warn!("Sealed prediction abandoned after root transition: {error}");
+            return;
+        }
+    };
     let built = {
         let mut store = twin_store.write().await;
         let setup = match store.get_constitution_setup() {
@@ -1049,6 +1063,7 @@ pub(super) async fn run_sealed_twin_prediction(
         (system_prompt, user_message)
     };
     let (system_prompt, user_message) = built;
+    drop(initial_root_guard);
 
     let messages = vec![ChatMessage {
         role: "user".to_string(),
@@ -1078,6 +1093,15 @@ pub(super) async fn run_sealed_twin_prediction(
         }
     };
 
+    let _root_guard = match crate::commands::acquire_expected_root_epoch(&root_state, &root_epoch)
+        .await
+    {
+        Ok(guard) => guard,
+        Err(error) => {
+            log::warn!("Sealed prediction result discarded after root transition: {error}");
+            return;
+        }
+    };
     match result {
         Ok(raw) => {
             let draft = parse_twin_prediction(&raw, &options);
@@ -1835,7 +1859,7 @@ mod tests {
             serde_json::to_vec_pretty(&legacy).unwrap().as_slice(),
         )
         .unwrap();
-        let store = crate::services::twin::TwinStore::new(temp_dir.path().to_path_buf());
+        let mut store = crate::services::twin::TwinStore::new(temp_dir.path().to_path_buf());
         store
             .create_constitution_item(crate::models::twin::ConstitutionItemCreate {
                 claim: "LEGACY_CONSTITUTION_MUST_NOT_ENTER_CANVAS".to_string(),

@@ -121,7 +121,8 @@ impl KnowledgeStore {
     }
 
     /// Update the vault path at runtime (e.g., after settings change).
-    pub fn set_vault_path(&mut self, vault_path: PathBuf) -> Result<()> {
+    #[cfg(test)]
+    pub(crate) fn set_vault_path(&mut self, vault_path: PathBuf) -> Result<()> {
         crate::services::twin_events::validate_real_directory(&vault_path, "vault directory")
             .map_err(anyhow::Error::new)?;
         let vault_path = std::fs::canonicalize(&vault_path).with_context(|| {
@@ -134,6 +135,19 @@ impl KnowledgeStore {
             .retarget_markdown_root(&vault_path)
             .map_err(anyhow::Error::new)?;
         self.vault_path = vault_path;
+        self.refresh_cache();
+        Ok(())
+    }
+
+    pub(crate) fn adopt_coordinated_vault_path(&mut self, vault_path: PathBuf) -> Result<()> {
+        crate::services::twin_events::validate_real_directory(&vault_path, "vault directory")
+            .map_err(anyhow::Error::new)?;
+        self.vault_path = std::fs::canonicalize(&vault_path).with_context(|| {
+            format!(
+                "Failed to canonicalize vault directory {}",
+                vault_path.display()
+            )
+        })?;
         self.refresh_cache();
         Ok(())
     }
@@ -814,6 +828,82 @@ impl KnowledgeStore {
                     .expect("restore planner returned a note ID"),
             )
         }
+    }
+
+    pub(crate) fn put_vault_file_target_only(
+        &mut self,
+        relative_path: &str,
+        bytes: &[u8],
+        source: &str,
+    ) -> Result<()> {
+        let relative_path = normalize_note_relative_path(relative_path)?;
+        let after = std::str::from_utf8(bytes)
+            .with_context(|| format!("Markdown target is not UTF-8: {relative_path}"))?
+            .to_string();
+        if self.event_recorder.is_noop() {
+            let path = self.resolve_vault_relative_path(&relative_path)?;
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            write_atomic(&path, bytes)?;
+            self.refresh_cache();
+            return Ok(());
+        }
+        let recorder = self.event_recorder.clone();
+        let source_channel = crate::models::twin_event::SourceChannel::parse(source)
+            .map_err(anyhow::Error::msg)?;
+        let mut plan = Some(crate::services::twin_events::MutationPlan::new(
+            crate::models::twin_event::CausalStream::LocalOnly,
+            source_channel,
+            vec![crate::services::twin_events::TargetMutation::put(
+                crate::services::twin_events::TargetKind::Markdown,
+                relative_path,
+                after,
+            )],
+            Vec::new(),
+        ));
+        let result = recorder.commit_planned_mutation(
+            crate::services::twin_events::MutationOrigin::Local,
+            &mut || Ok(plan.take()),
+        );
+        self.refresh_cache();
+        result.map(|_| ()).map_err(anyhow::Error::new)
+    }
+
+    pub(crate) fn delete_vault_file_target_only(
+        &mut self,
+        relative_path: &str,
+        source: &str,
+    ) -> Result<()> {
+        let relative_path = normalize_note_relative_path(relative_path)?;
+        if self.event_recorder.is_noop() {
+            let path = self.resolve_vault_relative_path(&relative_path)?;
+            match std::fs::remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+            self.refresh_cache();
+            return Ok(());
+        }
+        let recorder = self.event_recorder.clone();
+        let source_channel = crate::models::twin_event::SourceChannel::parse(source)
+            .map_err(anyhow::Error::msg)?;
+        let mut plan = Some(crate::services::twin_events::MutationPlan::new(
+            crate::models::twin_event::CausalStream::LocalOnly,
+            source_channel,
+            vec![crate::services::twin_events::TargetMutation::tombstone(
+                crate::services::twin_events::TargetKind::Markdown,
+                relative_path,
+            )],
+            Vec::new(),
+        ));
+        let result = recorder.commit_planned_mutation(
+            crate::services::twin_events::MutationOrigin::Local,
+            &mut || Ok(plan.take()),
+        );
+        self.refresh_cache();
+        result.map(|_| ()).map_err(anyhow::Error::new)
     }
 
     pub fn delete_note(&mut self, id: &str) -> Result<()> {

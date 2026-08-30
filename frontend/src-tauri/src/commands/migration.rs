@@ -13,6 +13,7 @@ pub async fn preview_markdown_migration(
     request: MarkdownMigrationRequest,
     state: State<'_, AppState>,
 ) -> Result<MarkdownMigrationPreview, String> {
+    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
     let service = state.markdown_migration.read().await;
     service
         .preview(std::path::PathBuf::from(vault_path), request)
@@ -25,6 +26,7 @@ pub async fn apply_markdown_migration(
     request: MarkdownMigrationRequest,
     state: State<'_, AppState>,
 ) -> Result<MarkdownMigrationApplyResult, String> {
+    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
     let result = {
         let service = state.markdown_migration.read().await;
         let mut store = state.knowledge_store.write().await;
@@ -88,6 +90,7 @@ pub async fn get_markdown_migration_status(
     run_id: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<MarkdownMigrationStatus, String> {
+    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
     let service = state.markdown_migration.read().await;
     service
         .status(run_id.as_deref())
@@ -99,6 +102,7 @@ pub async fn rollback_markdown_migration(
     run_id: String,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
+    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
     // Rollback can fail after having already restored some files to disk. If we
     // `?`-return before rebuilding, the search/graph/chunk indexes stay pointed at
     // the pre-rollback state and disagree with the (partially) restored files. So:
@@ -123,6 +127,7 @@ pub async fn rollback_markdown_migration(
 pub async fn get_vault_optimizer_status(
     state: State<'_, AppState>,
 ) -> Result<VaultOptimizerStatus, String> {
+    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
     let settings = state.settings_service.read().await;
     let optimizer = state.vault_optimizer.read().await;
     Ok(optimizer.status(settings.get()))
@@ -133,6 +138,7 @@ pub async fn update_vault_optimizer_settings(
     update: VaultOptimizerSettingsUpdate,
     state: State<'_, AppState>,
 ) -> Result<crate::models::settings::UserSettings, String> {
+    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
     let mut settings = state.settings_service.write().await;
     settings
         .update(SettingsUpdate {
@@ -169,6 +175,7 @@ pub async fn list_vault_optimizer_decisions(
     _cursor: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<Vec<VaultOptimizerDecision>, String> {
+    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
     let optimizer = state.vault_optimizer.read().await;
     optimizer
         .list_decisions(limit.unwrap_or(20))
@@ -181,6 +188,7 @@ pub async fn get_vault_optimizer_inbox(
     limit: Option<usize>,
     state: State<'_, AppState>,
 ) -> Result<Vec<VaultOptimizerInboxEntry>, String> {
+    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
     let optimizer = state.vault_optimizer.read().await;
     optimizer
         .inbox(status.as_deref(), limit.unwrap_or(20))
@@ -192,6 +200,7 @@ pub async fn rollback_vault_optimizer_change(
     change_id: String,
     state: State<'_, AppState>,
 ) -> Result<VaultOptimizerRollbackResult, String> {
+    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
     let result = {
         // Lock order: knowledge_store before vault_optimizer (see commands/mod.rs
         // doc comment) — must match the background worker in main.rs to avoid

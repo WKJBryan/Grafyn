@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct CanvasModelPreset {
     pub id: String,
     pub name: String,
@@ -16,6 +17,7 @@ fn default_canvas_model_presets() -> Vec<CanvasModelPreset> {
 
 /// User-configurable settings for the desktop app
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UserSettings {
     /// Path to the vault (markdown notes folder)
     /// If None, uses default ~/Documents/Grafyn/vault
@@ -214,12 +216,22 @@ impl UserSettings {
             .join("data")
     }
 
-    pub fn effective_twin_data_path(&self) -> std::path::PathBuf {
+    pub fn effective_twin_data_path(
+        &self,
+    ) -> Result<std::path::PathBuf, crate::services::twin_events::MutationError> {
         twin_data_path_for_vault(&self.effective_data_path(), &self.effective_vault_path())
     }
 }
 
 pub fn twin_data_path_for_vault(
+    data_path: &std::path::Path,
+    vault_path: &std::path::Path,
+) -> Result<std::path::PathBuf, crate::services::twin_events::MutationError> {
+    let scope = crate::services::twin_events::root_identity_for_path(vault_path)?;
+    Ok(data_path.join("twin").join(scope.as_str()))
+}
+
+pub(crate) fn legacy_twin_data_path_for_vault(
     data_path: &std::path::Path,
     vault_path: &std::path::Path,
 ) -> std::path::PathBuf {
@@ -233,7 +245,7 @@ pub fn twin_data_path_for_vault(
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x100000001b3);
     }
-    data_path.join("twin").join(format!("{:016x}", hash))
+    data_path.join("twin").join(format!("{hash:016x}"))
 }
 
 /// Settings update request from frontend
@@ -370,17 +382,38 @@ mod tests {
 
     #[test]
     fn twin_data_path_is_scoped_by_vault_path() {
-        let data_path = std::path::PathBuf::from("C:/Users/bryan/AppData/Local/Grafyn/data");
-        let first = twin_data_path_for_vault(&data_path, std::path::Path::new("C:/Vault/A"));
-        let same_case_changed =
-            twin_data_path_for_vault(&data_path, std::path::Path::new("c:/vault/a"));
-        let second = twin_data_path_for_vault(&data_path, std::path::Path::new("C:/Vault/B"));
+        let temp = tempfile::tempdir().unwrap();
+        let data_path = temp.path().join("data");
+        let first_vault = temp.path().join("VaultA");
+        let second_vault = temp.path().join("VaultB");
+        std::fs::create_dir(&data_path).unwrap();
+        std::fs::create_dir(&first_vault).unwrap();
+        std::fs::create_dir(&second_vault).unwrap();
+        let first = twin_data_path_for_vault(&data_path, &first_vault).unwrap();
+        let second = twin_data_path_for_vault(&data_path, &second_vault).unwrap();
 
-        assert_eq!(first, same_case_changed);
         assert_ne!(first, second);
         assert_eq!(
             first.parent().map(std::path::Path::to_path_buf),
             Some(data_path.join("twin"))
+        );
+        assert_eq!(
+            first.file_name().and_then(|value| value.to_str()).unwrap().len(),
+            64
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_case_distinct_vaults_have_distinct_twin_namespaces() {
+        let temp = tempfile::tempdir().unwrap();
+        let upper = temp.path().join("A");
+        let lower = temp.path().join("a");
+        std::fs::create_dir(&upper).unwrap();
+        std::fs::create_dir(&lower).unwrap();
+        assert_ne!(
+            twin_data_path_for_vault(temp.path(), &upper).unwrap(),
+            twin_data_path_for_vault(temp.path(), &lower).unwrap()
         );
     }
 }

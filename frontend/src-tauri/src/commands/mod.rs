@@ -44,6 +44,188 @@ use crate::services::retrieval::RetrievalResult;
 use crate::AppState;
 use std::collections::HashSet;
 
+pub(crate) async fn acquire_root_epoch(
+    state: &AppState,
+) -> Result<tokio::sync::OwnedRwLockReadGuard<()>, String> {
+    let guard = state.vault_transition.clone().read_owned().await;
+    ensure_root_healthy(state).await?;
+    Ok(guard)
+}
+
+pub(crate) async fn ensure_root_healthy(state: &AppState) -> Result<(), String> {
+    if let Some(error) = state.mutation_startup_error.read().await.as_ref() {
+        return Err(format!("Grafyn storage is unavailable until restart: {error}"));
+    }
+    Ok(())
+}
+
+pub(crate) fn capture_root_epoch(
+    state: &AppState,
+) -> Result<crate::services::twin_events::ActiveMarkdownRootLeaseV1, String> {
+    state
+        .mutation_coordinator
+        .as_ref()
+        .ok_or_else(|| "mutation coordinator is unavailable".to_string())?
+        .current_root_epoch()
+        .map_err(|error| error.to_string())
+}
+
+pub(crate) async fn acquire_expected_root_epoch(
+    state: &AppState,
+    expected: &crate::services::twin_events::ActiveMarkdownRootLeaseV1,
+) -> Result<tokio::sync::OwnedRwLockReadGuard<()>, String> {
+    let guard = acquire_root_epoch(state).await?;
+    state
+        .mutation_coordinator
+        .as_ref()
+        .ok_or_else(|| "mutation coordinator is unavailable".to_string())?
+        .validate_root_epoch(expected)
+        .map_err(|error| error.to_string())?;
+    Ok(guard)
+}
+
+#[cfg(test)]
+mod root_epoch_source_guards {
+    fn function_body<'a>(source: &'a str, signature: &str, next_marker: &str) -> &'a str {
+        let start = source.find(signature).expect("command signature should exist");
+        let rest = &source[start..];
+        let end = rest
+            .find(next_marker)
+            .unwrap_or(rest.len());
+        &rest[..end]
+    }
+
+    #[test]
+    fn root_dependent_read_commands_take_the_transition_gate_before_service_locks() {
+        let retrieval = include_str!("retrieval.rs");
+        for (signature, next_marker) in [
+            ("pub async fn retrieve_relevant", "/// Get current retrieval configuration"),
+            ("pub async fn get_retrieval_config", "/// Update retrieval configuration"),
+            ("pub async fn update_retrieval_config", "\n}"),
+        ] {
+            let body = function_body(retrieval, signature, next_marker);
+            let gate = body
+                .find("acquire_root_epoch")
+                .expect("retrieval command must acquire the root transition gate");
+            let service = body
+                .find("retrieval_service")
+                .or_else(|| body.find("run_retrieval"))
+                .expect("retrieval command must access its root-dependent service");
+            assert!(gate < service, "root gate must precede retrieval service access");
+        }
+
+        let mcp = include_str!("mcp.rs");
+        for (signature, next_marker) in [
+            ("pub async fn get_mcp_status", "/// Get the Claude Desktop config snippet"),
+            ("pub async fn get_mcp_config_snippet", "/// Find the grafyn-mcp binary"),
+        ] {
+            let body = function_body(mcp, signature, next_marker);
+            let gate = body
+                .find("acquire_root_epoch")
+                .expect("MCP settings read must acquire the root transition gate");
+            let settings = body
+                .find("settings_service.read")
+                .expect("MCP command must read settings");
+            assert!(gate < settings, "root gate must precede MCP settings read");
+        }
+
+        let settings = include_str!("settings.rs");
+        let ollama = function_body(
+            settings,
+            "pub async fn get_ollama_status",
+            "#[tauri::command]\npub async fn list_ollama_models",
+        );
+        let gate = ollama
+            .find("acquire_root_epoch")
+            .expect("Ollama status settings read must acquire the root transition gate");
+        let settings_read = ollama
+            .find("settings_service.read")
+            .expect("Ollama status must read settings");
+        assert!(gate < settings_read);
+    }
+
+    fn assert_short_commands_are_gated(source: &str, family: &str, exempt: &[&str]) {
+        for command in source.split("#[tauri::command]").skip(1) {
+            let Some(signature) = command.find("pub async fn ") else {
+                continue;
+            };
+            let name = command[signature + "pub async fn ".len()..]
+                .split(|character: char| character == '(' || character.is_whitespace())
+                .next()
+                .expect("command name");
+            if exempt.contains(&name) {
+                continue;
+            }
+            let body = command.split("#[tauri::command]").next().unwrap_or(command);
+            assert!(
+                body.contains("acquire_root_epoch"),
+                "root-dependent {family} command {name} must acquire the transition gate"
+            );
+        }
+    }
+
+    #[test]
+    fn root_dependent_command_and_worker_inventory_uses_short_gates_or_epoch_revalidation() {
+        for (source, family, exempt) in [
+            (include_str!("twin.rs"), "Twin", &[][..]),
+            (include_str!("memory.rs"), "memory", &[][..]),
+            (include_str!("distill.rs"), "distill", &[][..]),
+            (include_str!("graph.rs"), "graph", &[][..]),
+            (include_str!("notes.rs"), "notes", &[][..]),
+            (include_str!("search.rs"), "search", &[][..]),
+            (include_str!("migration.rs"), "migration", &[][..]),
+            (include_str!("retrieval.rs"), "retrieval", &[][..]),
+            (
+                include_str!("canvas/session.rs"),
+                "Canvas session",
+                &["get_available_models"][..],
+            ),
+        ] {
+            assert_short_commands_are_gated(source, family, exempt);
+        }
+
+        for (source, family, minimum_pairs) in [
+            (include_str!("canvas/streaming.rs"), "Canvas streaming", 3),
+            (include_str!("canvas/debate.rs"), "Canvas debate", 2),
+            (include_str!("zettelkasten.rs"), "link application", 1),
+            (include_str!("twin_eval.rs"), "Twin evaluation", 2),
+        ] {
+            assert!(
+                source.matches("capture_root_epoch").count() >= minimum_pairs,
+                "long {family} workflows must capture the starting root epoch"
+            );
+            assert!(
+                source.matches("acquire_expected_root_epoch").count() >= minimum_pairs,
+                "long {family} workflows must revalidate before root-dependent publication"
+            );
+        }
+
+        let context = include_str!("canvas/context.rs");
+        assert!(
+            context.matches("acquire_expected_root_epoch").count() >= 2,
+            "sealed Twin prediction must validate before context reads and persisted results"
+        );
+
+        let discovery = include_str!("../services/link_discovery.rs");
+        assert!(discovery.contains("discover_for_note_at_epoch"));
+        assert!(discovery.contains("capture_root_epoch"));
+        assert!(discovery.contains("acquire_expected_root_epoch"));
+
+        let runtime = include_str!("../lib.rs");
+        for required in [
+            "acquire_warm_start_root_gate",
+            "discover_for_note_at_epoch",
+            "acquire_expected_root_epoch",
+            "start_vault_optimizer_worker",
+        ] {
+            assert!(
+                runtime.contains(required),
+                "root-dependent runtime worker is missing {required}"
+            );
+        }
+    }
+}
+
 /// Shared retrieval helper — acquires the 4 retrieval-pipeline read locks, calls
 /// `retrieval.retrieve()`, and releases all locks before returning. Used by
 /// `retrieve_relevant`, `recall_relevant`, and the canvas context resolvers to
@@ -470,7 +652,7 @@ pub(crate) async fn commit_note_delete(
 }
 
 #[cfg(test)]
-mod commit_note_write_tests {
+pub(crate) mod commit_note_write_tests {
     use super::*;
     use crate::models::boot::BootStatus;
     use crate::models::note::{NoteCreate, NoteStatus, NoteUpdate};
@@ -502,7 +684,7 @@ mod commit_note_write_tests {
     /// in the crate currently needs a whole `AppState`, and command-level
     /// tests can't cheaply construct `tauri::State` outside a running app, so
     /// this exercises `commit_note_write` directly against real services.
-    fn build_test_state() -> (AppState, TempDir, TempDir) {
+    pub(crate) fn build_test_state() -> (AppState, TempDir, TempDir) {
         let vault_dir = TempDir::new().expect("vault tempdir should be created");
         let data_dir = TempDir::new().expect("data tempdir should be created");
         let vault_path = vault_dir.path().to_path_buf();
@@ -537,8 +719,9 @@ mod commit_note_write_tests {
             twin_event_store: Arc::new(crate::services::twin_events::TwinEventStore::new(
                 data_path.clone(),
             )),
-            mutation_startup_error: None,
-            vault_transition: Arc::new(tokio::sync::Mutex::new(())),
+            mutation_coordinator: None,
+            mutation_startup_error: Arc::new(RwLock::new(None)),
+            vault_transition: Arc::new(tokio::sync::RwLock::new(())),
             memory_service: Arc::new(MemoryService::new()),
             boot_state: Arc::new(RwLock::new(BootStatus::default())),
         };

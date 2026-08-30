@@ -11,6 +11,7 @@ pub async fn recall_relevant(
     request: RecallRequest,
     state: State<'_, AppState>,
 ) -> Result<Vec<RecallResult>, String> {
+    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
     let results =
         run_retrieval(state.inner(), &request.query, request.limit, &request.context_note_ids)
             .await?;
@@ -35,12 +36,13 @@ pub async fn find_contradictions(
     note_id: String,
     state: State<'_, AppState>,
 ) -> Result<Vec<Contradiction>, String> {
+    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
+    let note = {
+        let store = state.knowledge_store.read().await;
+        store.get_note(&note_id).map_err(|error| error.to_string())?
+    };
     let search = state.search_service.read().await;
-    let store = state.knowledge_store.read().await;
-
-    state
-        .memory_service
-        .find_contradictions(&search, &store, &note_id)
+    state.memory_service.find_contradictions_for_note(&search, &note)
 }
 
 /// Extract claims from conversation
@@ -49,6 +51,7 @@ pub async fn extract_claims(
     request: ExtractRequest,
     state: State<'_, AppState>,
 ) -> Result<Vec<ExtractedClaim>, String> {
+    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
     Ok(state
         .memory_service
         .extract_from_conversation(&request.messages))
