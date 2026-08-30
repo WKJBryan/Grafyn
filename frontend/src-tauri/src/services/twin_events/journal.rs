@@ -72,6 +72,7 @@ pub struct TargetMutation {
     pub kind: TargetKind,
     pub relative_key: String,
     pub after: DesiredImage,
+    pub expected_before: Option<BeforeImage>,
 }
 
 impl TargetMutation {
@@ -84,6 +85,7 @@ impl TargetMutation {
             kind,
             relative_key: relative_key.into(),
             after: DesiredImage::Utf8Bytes(content.into()),
+            expected_before: None,
         }
     }
 
@@ -92,7 +94,13 @@ impl TargetMutation {
             kind,
             relative_key: relative_key.into(),
             after: DesiredImage::Tombstone,
+            expected_before: None,
         }
+    }
+
+    pub fn expecting(mut self, expected_before: BeforeImage) -> Self {
+        self.expected_before = Some(expected_before);
+        self
     }
 }
 

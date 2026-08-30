@@ -49,6 +49,12 @@ pub(crate) async fn acquire_root_epoch(
 ) -> Result<tokio::sync::OwnedRwLockReadGuard<()>, String> {
     let guard = state.vault_transition.clone().read_owned().await;
     ensure_root_healthy(state).await?;
+    state
+        .mutation_coordinator
+        .as_ref()
+        .ok_or_else(|| "mutation coordinator is unavailable".to_string())?
+        .require_namespace_ready()
+        .map_err(|error| error.to_string())?;
     Ok(guard)
 }
 
@@ -173,7 +179,11 @@ mod root_epoch_source_guards {
             (include_str!("graph.rs"), "graph", &[][..]),
             (include_str!("notes.rs"), "notes", &[][..]),
             (include_str!("search.rs"), "search", &[][..]),
-            (include_str!("migration.rs"), "migration", &[][..]),
+            (
+                include_str!("migration.rs"),
+                "migration",
+                &["update_vault_optimizer_settings"][..],
+            ),
             (include_str!("retrieval.rs"), "retrieval", &[][..]),
             (
                 include_str!("canvas/session.rs"),
@@ -183,6 +193,17 @@ mod root_epoch_source_guards {
         ] {
             assert_short_commands_are_gated(source, family, exempt);
         }
+
+        let migration = include_str!("migration.rs");
+        let optimizer_settings = function_body(
+            migration,
+            "pub async fn update_vault_optimizer_settings",
+            "#[tauri::command]\npub async fn list_vault_optimizer_decisions",
+        );
+        assert!(
+            optimizer_settings.contains("settings::apply_settings_update"),
+            "optimizer settings must delegate to the central write-gated settings boundary"
+        );
 
         for (source, family, minimum_pairs) in [
             (include_str!("canvas/streaming.rs"), "Canvas streaming", 3),

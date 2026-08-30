@@ -58,6 +58,7 @@ pub struct TwinStore {
     digest_path: PathBuf,
     exports_path: PathBuf,
     trace_cache: HashMap<String, SessionTrace>,
+    traces_cache_ready: bool,
     record_cache: HashMap<String, UserRecord>,
     records_cache_ready: bool,
     event_recorder: Arc<dyn crate::services::twin_events::EventRecorder>,
@@ -116,6 +117,7 @@ impl TwinStore {
             digest_path,
             exports_path,
             trace_cache: HashMap::new(),
+            traces_cache_ready: false,
             record_cache: HashMap::new(),
             records_cache_ready: false,
             event_recorder,
@@ -207,8 +209,8 @@ impl TwinStore {
                 Ok(Some(bytes)) => bytes,
                 Ok(None) => continue,
                 Err(error) => {
-                    log::error!("Skipping unreadable Twin JSON file {relative}: {error}");
-                    continue;
+                    return Err(anyhow::Error::new(error)
+                        .context(format!("Failed to read Twin JSON file {relative}")));
                 }
             };
             let value = match serde_json::from_slice(&bytes) {
@@ -218,11 +220,11 @@ impl TwinStore {
                         "Skipping corrupt Twin JSON file {relative}: {error} — quarantining"
                     );
                     let quarantine = format!("{relative}.corrupt-{}", uuid::Uuid::new_v4());
-                    if let Err(rename_error) = root.rename(&relative, &quarantine, false) {
-                        log::error!(
-                            "Failed to quarantine corrupt Twin JSON file {relative}: {rename_error}"
-                        );
-                    }
+                    root.rename(&relative, &quarantine, false)
+                        .map_err(anyhow::Error::new)
+                        .with_context(|| {
+                            format!("Failed to quarantine corrupt Twin JSON file {relative}")
+                        })?;
                     continue;
                 }
             };
@@ -254,8 +256,28 @@ impl TwinStore {
 
     fn invalidate_mutation_caches(&mut self) {
         self.trace_cache.clear();
+        self.traces_cache_ready = false;
         self.record_cache.clear();
         self.records_cache_ready = false;
+    }
+
+    pub(crate) fn rebuild_mutation_caches(&mut self) -> Result<()> {
+        self.invalidate_mutation_caches();
+        let records = self
+            .list_user_records_durable()?
+            .into_iter()
+            .map(|record| (record.id.clone(), record))
+            .collect::<HashMap<_, _>>();
+        let traces = self
+            .list_session_traces_durable()?
+            .into_iter()
+            .map(|trace| (trace.session_id.clone(), trace))
+            .collect::<HashMap<_, _>>();
+        self.record_cache = records;
+        self.trace_cache = traces;
+        self.records_cache_ready = true;
+        self.traces_cache_ready = true;
+        Ok(())
     }
 
     fn commit_planned_twin_mutation<F>(
@@ -278,7 +300,10 @@ impl TwinStore {
             )
         };
         match result {
-            Ok(commit) => Ok(commit),
+            Ok(commit) => {
+                self.invalidate_mutation_caches();
+                Ok(commit)
+            }
             Err(error) => {
                 self.invalidate_mutation_caches();
                 Err(anyhow::Error::new(error))
@@ -414,5 +439,93 @@ impl TwinStore {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+    use crate::models::twin::{
+        PromotionState, RecordOrigin, UserRecordCreate, UserRecordKind,
+    };
+    use std::collections::{HashMap, HashSet};
+    use tempfile::tempdir;
+
+    fn record(content: &str) -> UserRecord {
+        TwinStore::materialize_user_record(UserRecordCreate {
+            kind: UserRecordKind::Fact,
+            content: content.to_string(),
+            evidence_refs: Vec::new(),
+            confidence: 0.7,
+            origin: RecordOrigin::User,
+            promotion_state: Some(PromotionState::Candidate),
+            valid_from: None,
+            valid_until: None,
+            links: Vec::new(),
+            metadata: HashMap::new(),
+        })
+    }
+
+    #[test]
+    fn cache_rebuild_publishes_complete_durable_records_and_traces_together() {
+        let temp = tempdir().unwrap();
+        let mut store = TwinStore::new(temp.path().to_path_buf());
+        let first = record("first");
+        let second = record("second");
+        store.write_record_file(&first).unwrap();
+        store.write_record_file(&second).unwrap();
+        let first_trace = SessionTrace::new("session-a");
+        let second_trace = SessionTrace::new("session-b");
+        store
+            .write_pretty_json(&store.trace_file_path("session-a"), &first_trace)
+            .unwrap();
+        store
+            .write_pretty_json(&store.trace_file_path("session-b"), &second_trace)
+            .unwrap();
+
+        store.record_cache.insert("stale".to_string(), record("stale"));
+        store.trace_cache.insert(
+            "stale-session".to_string(),
+            SessionTrace::new("stale-session"),
+        );
+        store.records_cache_ready = true;
+        store.traces_cache_ready = true;
+
+        store.rebuild_mutation_caches().unwrap();
+
+        assert!(store.records_cache_ready);
+        assert!(store.traces_cache_ready);
+        assert_eq!(
+            store.record_cache.keys().cloned().collect::<HashSet<_>>(),
+            HashSet::from([first.id, second.id])
+        );
+        assert_eq!(
+            store.trace_cache.keys().cloned().collect::<HashSet<_>>(),
+            HashSet::from(["session-a".to_string(), "session-b".to_string()])
+        );
+    }
+
+    #[test]
+    fn cache_rebuild_failure_leaves_both_caches_invalid_and_empty() {
+        let temp = tempdir().unwrap();
+        let mut store = TwinStore::new(temp.path().to_path_buf());
+        store.record_cache.insert("stale".to_string(), record("stale"));
+        store.trace_cache.insert(
+            "stale-session".to_string(),
+            SessionTrace::new("stale-session"),
+        );
+        store.records_cache_ready = true;
+        store.traces_cache_ready = true;
+        std::fs::write(
+            store.records_path.join("oversized.json"),
+            vec![b'x'; 1024 * 1024 + 1],
+        )
+        .unwrap();
+
+        assert!(store.rebuild_mutation_caches().is_err());
+        assert!(!store.records_cache_ready);
+        assert!(!store.traces_cache_ready);
+        assert!(store.record_cache.is_empty());
+        assert!(store.trace_cache.is_empty());
     }
 }

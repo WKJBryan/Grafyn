@@ -157,10 +157,13 @@ impl TwinStore {
                 self.invalidate_mutation_caches();
                 return Err(anyhow::Error::new(error));
             }
-            return committed.ok_or_else(|| anyhow::anyhow!("memory digest was not planned"));
+            let pending = committed.ok_or_else(|| anyhow::anyhow!("memory digest was not planned"))?;
+            self.invalidate_mutation_caches();
+            return Ok(pending);
         }
         let (all_items, pending) = self.plan_memory_digest_items()?;
         self.write_memory_digest_file(&all_items)?;
+        self.invalidate_mutation_caches();
         Ok(pending)
     }
 
@@ -302,12 +305,9 @@ impl TwinStore {
                 self.invalidate_mutation_caches();
                 return Err(anyhow::Error::new(error));
             }
-            let (item, records) = committed
+            let (item, _records) = committed
                 .ok_or_else(|| anyhow::anyhow!("memory digest review was not planned"))?;
-            for record in records {
-                self.record_cache.insert(record.id.clone(), record);
-            }
-            self.records_cache_ready = true;
+            self.invalidate_mutation_caches();
             return Ok(item);
         }
         let mut items = self.read_memory_digest_file()?;
@@ -422,9 +422,7 @@ impl TwinStore {
             }
             draft.evidence.sort();
             self.commit_governed_json_targets(values, vec![draft])?;
-            for record in updated_records {
-                self.record_cache.insert(record.id.clone(), record);
-            }
+            self.invalidate_mutation_caches();
             return Ok(item);
         }
 

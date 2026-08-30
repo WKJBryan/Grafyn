@@ -4,27 +4,33 @@ use crate::models::twin_event::{
 };
 use crate::services::twin_events::{derive_event_id, StoreError, TwinEventStore};
 use chrono::{DateTime, Utc};
-use fs2::FileExt;
 use serde::{Deserialize, Serialize};
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::fs::{self, File};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use uuid::Uuid;
 
-pub(crate) struct CoordinatorProcessLock(File);
+pub(crate) struct CoordinatorProcessLock {
+    lock: crate::services::twin_events::AnchoredExclusiveLock,
+}
 
 impl std::ops::Deref for CoordinatorProcessLock {
     type Target = File;
 
     fn deref(&self) -> &Self::Target {
-        &self.0
+        &self.lock
     }
 }
 
 impl CoordinatorProcessLock {
     pub(crate) fn unlock(self) -> io::Result<()> {
-        FileExt::unlock(&self.0)
+        self.lock.unlock()
+    }
+
+    pub(crate) fn covers_data_path(&self, data_path: &Path) -> Result<bool, MutationError> {
+        let root = crate::services::twin_events::AnchoredRoot::open(data_path)?;
+        Ok(root.canonical_path() == self.lock.root_path())
     }
 }
 
@@ -129,14 +135,13 @@ pub struct PersistedMutationIdentityProvider {
 
 impl PersistedMutationIdentityProvider {
     pub fn load_or_create(data_path: impl AsRef<Path>) -> Result<Self, MutationError> {
-        let events_dir = data_path.as_ref().join("twin").join("events");
-        crate::services::twin_events::validate_real_directory(
-            &events_dir,
-            "Twin events directory for writer identity",
-        )?;
-        let path = events_dir.join("writer-v1.json");
-        if path.exists() {
-            return Self::load(&path);
+        const WRITER_KEY: &str = "twin/events/writer-v1.json";
+        const STAGING_KEY: &str = "twin/events/staging/v1";
+        let root = crate::services::twin_events::AnchoredRoot::open(data_path)?;
+        root.open_directory("twin/events", false)?;
+        root.open_directory(STAGING_KEY, true)?;
+        if let Some(bytes) = root.read_bounded(WRITER_KEY, WRITER_FILE_LIMIT as usize)? {
+            return Self::load(&bytes);
         }
 
         let identity = WriterIdentityV1 {
@@ -148,41 +153,17 @@ impl PersistedMutationIdentityProvider {
         let mut bytes = serde_json::to_vec_pretty(&identity)
             .map_err(|error| MutationError::Invalid(error.to_string()))?;
         bytes.push(b'\n');
-        let temporary = events_dir.join(format!(".writer-v1.{}.tmp", Uuid::new_v4()));
-        let result = (|| -> Result<(), MutationError> {
-            let mut file = OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(&temporary)?;
-            file.write_all(&bytes)?;
-            file.sync_all()?;
-            match fs::hard_link(&temporary, &path) {
-                Ok(()) => crate::services::twin_events::sync_directory(&events_dir)?,
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-                Err(error) => return Err(error.into()),
-            }
-            Ok(())
-        })();
-        let cleanup = fs::remove_file(&temporary);
-        if let Err(error) = cleanup {
-            if error.kind() != io::ErrorKind::NotFound {
-                return Err(error.into());
-            }
-        }
-        crate::services::twin_events::sync_directory(&events_dir)?;
-        result?;
-        Self::load(&path)
+        root.install_no_clobber(WRITER_KEY, STAGING_KEY, &bytes)?;
+        let installed = root
+            .read_bounded(WRITER_KEY, WRITER_FILE_LIMIT as usize)?
+            .ok_or_else(|| {
+                MutationError::RecoveryConflict("writer identity disappeared after install".into())
+            })?;
+        Self::load(&installed)
     }
 
-    fn load(path: &Path) -> Result<Self, MutationError> {
-        crate::services::twin_events::validate_real_file(path, "Twin writer identity")?;
-        let metadata = fs::symlink_metadata(path)?;
-        if metadata.len() > WRITER_FILE_LIMIT {
-            return Err(MutationError::Invalid(
-                "Twin writer identity exceeds its size limit".into(),
-            ));
-        }
-        let identity: WriterIdentityV1 = serde_json::from_slice(&fs::read(path)?)
+    fn load(bytes: &[u8]) -> Result<Self, MutationError> {
+        let identity: WriterIdentityV1 = serde_json::from_slice(bytes)
             .map_err(|error| MutationError::Invalid(format!("invalid writer identity: {error}")))?;
         if identity.schema_version != WRITER_SCHEMA_VERSION {
             return Err(MutationError::Invalid(
@@ -223,18 +204,8 @@ impl StoreEventGroupFinalizer {
         Self { store, identity }
     }
 
-    fn coordinator_lock_path(&self) -> PathBuf {
-        self.store
-            .data_path()
-            .join("twin")
-            .join("events")
-            .join("mutation-v1.lock")
-    }
-
-    pub(crate) fn acquire_coordinator_lock(
-        &self,
-    ) -> Result<CoordinatorProcessLock, MutationError> {
-        acquire_coordinator_process_lock_at(&self.coordinator_lock_path())
+    pub(crate) fn acquire_coordinator_lock(&self) -> Result<CoordinatorProcessLock, MutationError> {
+        acquire_shared_coordinator_process_lock(self.store.data_path())
     }
 
     pub(crate) fn finalize_locked(
@@ -316,45 +287,10 @@ impl StoreEventGroupFinalizer {
 pub(crate) fn acquire_shared_coordinator_process_lock(
     data_path: &Path,
 ) -> Result<CoordinatorProcessLock, MutationError> {
-    acquire_coordinator_process_lock_at(
-        &data_path
-            .join("twin")
-            .join("events")
-            .join("mutation-v1.lock"),
-    )
-}
-
-fn acquire_coordinator_process_lock_at(
-    path: &Path,
-) -> Result<CoordinatorProcessLock, MutationError> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| MutationError::Invalid("coordinator lock has no parent".into()))?;
-    crate::services::twin_events::validate_real_directory(
-        parent,
-        "Twin mutation coordinator directory",
-    )?;
-    let file = match OpenOptions::new()
-        .create_new(true)
-        .read(true)
-        .write(true)
-        .open(path)
-    {
-        Ok(file) => {
-            crate::services::twin_events::sync_directory(parent)?;
-            file
-        }
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            crate::services::twin_events::validate_real_file(
-                path,
-                "Twin mutation coordinator lock",
-            )?;
-            OpenOptions::new().read(true).write(true).open(path)?
-        }
-        Err(error) => return Err(error.into()),
-    };
-    file.lock_exclusive()?;
-    Ok(CoordinatorProcessLock(file))
+    let root = crate::services::twin_events::AnchoredRoot::open(data_path)?;
+    root.open_directory("twin/events", false)?;
+    let lock = root.lock_exclusive("twin/events/mutation-v1.lock")?;
+    Ok(CoordinatorProcessLock { lock })
 }
 
 impl EventGroupFinalizer for StoreEventGroupFinalizer {
@@ -525,6 +461,17 @@ impl MutationCoordinator {
         journal.cleanup_orphan_temps_locked(&process_lock)?;
         let root_scope = markdown_root_scope_for(&vault_path)?;
         let root_lease = load_or_create_active_root_lease(&data_root, root_scope)?;
+        crate::services::vault_namespace::initialize_locked(
+            &data_path,
+            &root_lease,
+            &process_lock,
+        )?;
+        #[cfg(test)]
+        crate::services::vault_namespace::publish_ready_locked(
+            &data_path,
+            &root_lease,
+            &process_lock,
+        )?;
         process_lock.unlock()?;
         Ok(Self {
             data_path,
@@ -736,6 +683,54 @@ impl MutationCoordinator {
         result
     }
 
+    pub(crate) fn current_namespace_path(&self) -> Result<PathBuf, MutationError> {
+        let lease = self.current_root_epoch()?;
+        Ok(crate::services::vault_namespace::scoped_data_path(
+            &self.data_path,
+            &lease.root_scope,
+        ))
+    }
+
+    pub(crate) fn data_path(&self) -> &Path {
+        &self.data_path
+    }
+
+    pub(crate) fn require_namespace_ready(&self) -> Result<(), MutationError> {
+        let lease = self.current_root_epoch()?;
+        crate::services::vault_namespace::require_ready(&self.data_path, &lease)
+    }
+
+    #[cfg(feature = "mcp")]
+    pub(crate) fn acquire_ready_namespace_guard(
+        &self,
+        expected: &ActiveMarkdownRootLeaseV1,
+    ) -> Result<CoordinatorProcessLock, MutationError> {
+        let process_lock = self.finalizer.acquire_coordinator_lock()?;
+        let result = (|| {
+            self.verify_root_lease_locked()?;
+            let current = self
+                .root_lease
+                .lock()
+                .map_err(|_| MutationError::Invalid("Markdown root lease lock poisoned".into()))?
+                .clone();
+            if &current != expected {
+                return Err(MutationError::RecoveryConflict(
+                    "root epoch changed while derived state was in flight".into(),
+                ));
+            }
+            crate::services::vault_namespace::require_ready_locked(
+                &self.data_path,
+                &current,
+                &process_lock,
+            )
+        })();
+        if let Err(error) = result {
+            process_lock.unlock()?;
+            return Err(error);
+        }
+        Ok(process_lock)
+    }
+
     pub(crate) fn validate_root_epoch(
         &self,
         expected: &ActiveMarkdownRootLeaseV1,
@@ -768,8 +763,7 @@ impl MutationCoordinator {
                 self.data_root.canonical_path().join("canvas").as_path(),
                 self.data_root.canonical_path().join("twin").as_path(),
             )?;
-            let new_root_capability =
-                crate::services::twin_events::AnchoredRoot::open(&new_root)?;
+            let new_root_capability = crate::services::twin_events::AnchoredRoot::open(&new_root)?;
             self.journal.cleanup_orphan_temps_locked(&process_lock)?;
             for (_, pending) in self.journal.load_pending(&process_lock)? {
                 self.replay_intent_locked(&process_lock, &pending, false)?;
@@ -864,6 +858,16 @@ impl MutationCoordinator {
             let after_digest = crate::services::twin_events::desired_digest(&target.after);
             if target_matches_after(&before, &target.after, &after_digest) {
                 continue;
+            }
+            if target
+                .expected_before
+                .as_ref()
+                .is_some_and(|expected| expected != &before)
+            {
+                return Err(MutationError::RecoveryConflict(format!(
+                    "conditional mutation target changed: {}",
+                    target.relative_key
+                )));
             }
             prepared_targets.push(crate::services::twin_events::MutationTargetV1 {
                 kind: target.kind,
@@ -1017,6 +1021,7 @@ impl MutationCoordinator {
             kind: target.kind,
             relative_key: target.relative_key.clone(),
             after: target.after.clone(),
+            expected_before: None,
         })
     }
 
@@ -1165,9 +1170,9 @@ impl MutationCoordinator {
                 .map_err(|_| MutationError::Invalid("Markdown root lock poisoned".into()))?
                 .delete(relative_key),
             crate::services::twin_events::TargetKind::TwinJson
-            | crate::services::twin_events::TargetKind::CanvasJson => self
-                .data_root
-                .delete(&self.target_key(kind, relative_key)?),
+            | crate::services::twin_events::TargetKind::CanvasJson => {
+                self.data_root.delete(&self.target_key(kind, relative_key)?)
+            }
         }
     }
 
@@ -1202,12 +1207,49 @@ impl MutationCoordinator {
 }
 
 impl MutationRootTransitionGuard<'_> {
+    pub(crate) fn process_lock(&self) -> &CoordinatorProcessLock {
+        &self._process_lock
+    }
+
     pub(crate) fn current_lease(&self) -> Result<ActiveMarkdownRootLeaseV1, MutationError> {
         self.coordinator
             .root_lease
             .lock()
             .map_err(|_| MutationError::Invalid("Markdown root lease lock poisoned".into()))
             .map(|lease| lease.clone())
+    }
+
+    pub(crate) fn initialize_namespace(
+        &self,
+        lease: &ActiveMarkdownRootLeaseV1,
+    ) -> Result<PathBuf, MutationError> {
+        crate::services::vault_namespace::initialize_locked(
+            &self.coordinator.data_path,
+            lease,
+            &self._process_lock,
+        )
+    }
+
+    pub(crate) fn invalidate_namespace(
+        &self,
+        lease: &ActiveMarkdownRootLeaseV1,
+    ) -> Result<(), MutationError> {
+        crate::services::vault_namespace::invalidate_locked(
+            &self.coordinator.data_path,
+            lease,
+            &self._process_lock,
+        )
+    }
+
+    pub(crate) fn publish_namespace_ready(
+        &self,
+        lease: &ActiveMarkdownRootLeaseV1,
+    ) -> Result<(), MutationError> {
+        crate::services::vault_namespace::publish_ready_locked(
+            &self.coordinator.data_path,
+            lease,
+            &self._process_lock,
+        )
     }
 
     pub(crate) fn current_vault_path(&self) -> Result<PathBuf, MutationError> {
@@ -1548,6 +1590,34 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_writer_identity_installers_converge_without_staging_litter() {
+        let temp = tempdir().unwrap();
+        let store = crate::services::twin_events::TwinEventStore::new(temp.path());
+        store.initialize().unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let mut threads = Vec::new();
+        for _ in 0..2 {
+            let barrier = barrier.clone();
+            let data_path = temp.path().to_path_buf();
+            threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                PersistedMutationIdentityProvider::load_or_create(data_path).unwrap()
+            }));
+        }
+        barrier.wait();
+        let first = threads.remove(0).join().unwrap();
+        let second = threads.remove(0).join().unwrap();
+        assert_eq!(first.actor_id(), second.actor_id());
+        assert_eq!(first.device_id(), second.device_id());
+        assert_eq!(
+            std::fs::read_dir(temp.path().join("twin/events/staging/v1"))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    #[test]
     fn restrictive_member_downgrades_the_entire_group_to_local_only() {
         let temp = tempdir().unwrap();
         let store = Arc::new(crate::services::twin_events::TwinEventStore::new(
@@ -1609,15 +1679,13 @@ mod tests {
         std::fs::create_dir(&vault).unwrap();
         let store = Arc::new(crate::services::twin_events::TwinEventStore::new(&data));
         store.initialize().unwrap();
-        let coordinator = MutationCoordinator::new(
-            &data,
-            &vault,
-            store,
-            Arc::new(NoopMutationLifecycle),
-        )
-        .unwrap();
+        let coordinator =
+            MutationCoordinator::new(&data, &vault, store, Arc::new(NoopMutationLifecycle))
+                .unwrap();
 
-        assert!(coordinator.retarget_markdown_root(&data.join("canvas")).is_err());
+        assert!(coordinator
+            .retarget_markdown_root(&data.join("canvas"))
+            .is_err());
         coordinator
             .commit_local(
                 CausalStream::SyncEligible,

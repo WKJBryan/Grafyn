@@ -14,9 +14,16 @@ pub async fn preview_markdown_migration(
     state: State<'_, AppState>,
 ) -> Result<MarkdownMigrationPreview, String> {
     let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
+    let epoch = crate::commands::capture_root_epoch(state.inner())?;
     let service = state.markdown_migration.read().await;
+    let store = state.knowledge_store.read().await;
+    let requested = std::fs::canonicalize(&vault_path).map_err(|error| error.to_string())?;
+    let current = std::fs::canonicalize(store.vault_path()).map_err(|error| error.to_string())?;
+    if requested != current {
+        return Err("migration preview must use the active vault".into());
+    }
     service
-        .preview(std::path::PathBuf::from(vault_path), request)
+        .preview_scoped(&store, epoch.root_scope, request)
         .map_err(|error| error.to_string())
 }
 
@@ -26,19 +33,26 @@ pub async fn apply_markdown_migration(
     request: MarkdownMigrationRequest,
     state: State<'_, AppState>,
 ) -> Result<MarkdownMigrationApplyResult, String> {
-    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
+    let root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
+    let expected_epoch = crate::commands::capture_root_epoch(state.inner())?;
     let result = {
         let service = state.markdown_migration.read().await;
         let mut store = state.knowledge_store.write().await;
         service
-            .apply(&preview_id, request.clone(), &mut store)
+            .apply_scoped(
+                &preview_id,
+                request.clone(),
+                &mut store,
+                &expected_epoch.root_scope,
+            )
             .map_err(|error| error.to_string())?
     };
+    drop(root_epoch);
 
     if request.start_optimizer.unwrap_or(true) || request.enable_llm.unwrap_or(false) {
-        let mut settings = state.settings_service.write().await;
-        settings
-            .update(SettingsUpdate {
+        crate::commands::settings::apply_settings_update(
+            state.inner(),
+            SettingsUpdate {
                 vault_path: None,
                 openrouter_api_key: None,
                 setup_completed: None,
@@ -64,10 +78,13 @@ pub async fn apply_markdown_migration(
                 background_vault_optimizer_program_enabled: Some(true),
                 vault_optimizer_program_path: request.program_path.clone(),
                 canvas_model_presets: None,
-            })
-            .map_err(|error| error.to_string())?;
+            },
+        )
+        .await?;
     }
 
+    let _root_epoch =
+        crate::commands::acquire_expected_root_epoch(state.inner(), &expected_epoch).await?;
     crate::commands::rebuild_all_indexes(state.inner()).await?;
 
     {
@@ -91,9 +108,10 @@ pub async fn get_markdown_migration_status(
     state: State<'_, AppState>,
 ) -> Result<MarkdownMigrationStatus, String> {
     let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
+    let epoch = crate::commands::capture_root_epoch(state.inner())?;
     let service = state.markdown_migration.read().await;
     service
-        .status(run_id.as_deref())
+        .status_scoped(run_id.as_deref(), &epoch.root_scope)
         .map_err(|error| error.to_string())
 }
 
@@ -103,6 +121,7 @@ pub async fn rollback_markdown_migration(
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
+    let epoch = crate::commands::capture_root_epoch(state.inner())?;
     // Rollback can fail after having already restored some files to disk. If we
     // `?`-return before rebuilding, the search/graph/chunk indexes stay pointed at
     // the pre-rollback state and disagree with the (partially) restored files. So:
@@ -113,7 +132,7 @@ pub async fn rollback_markdown_migration(
         let service = state.markdown_migration.read().await;
         let mut store = state.knowledge_store.write().await;
         service
-            .rollback(&run_id, &mut store)
+            .rollback_scoped(&run_id, &mut store, &epoch.root_scope)
             .map_err(|error| error.to_string())
     };
 
@@ -138,10 +157,9 @@ pub async fn update_vault_optimizer_settings(
     update: VaultOptimizerSettingsUpdate,
     state: State<'_, AppState>,
 ) -> Result<crate::models::settings::UserSettings, String> {
-    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
-    let mut settings = state.settings_service.write().await;
-    settings
-        .update(SettingsUpdate {
+    crate::commands::settings::apply_settings_update(
+        state.inner(),
+        SettingsUpdate {
             vault_path: None,
             openrouter_api_key: None,
             setup_completed: None,
@@ -165,8 +183,9 @@ pub async fn update_vault_optimizer_settings(
                 .background_vault_optimizer_program_enabled,
             vault_optimizer_program_path: update.vault_optimizer_program_path,
             canvas_model_presets: None,
-        })
-        .map_err(|error| error.to_string())
+        },
+    )
+    .await
 }
 
 #[tauri::command]

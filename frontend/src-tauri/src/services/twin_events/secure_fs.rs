@@ -1,7 +1,8 @@
 use crate::services::twin_events::{validate_relative_key, MutationError};
-use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
+use cap_fs_ext::{DirExt, FollowSymlinks, MetadataExt, OpenOptionsFollowExt};
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, OpenOptions};
+use fs2::FileExt;
 use std::ffi::{OsStr, OsString};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -10,6 +11,42 @@ use uuid::Uuid;
 pub(crate) struct AnchoredRoot {
     canonical_path: PathBuf,
     dir: Dir,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AnchoredEntryKind {
+    File,
+    Directory,
+}
+
+pub(crate) struct AnchoredExclusiveLock {
+    file: std::fs::File,
+    root: AnchoredRoot,
+    #[cfg(test)]
+    key: String,
+}
+
+impl std::ops::Deref for AnchoredExclusiveLock {
+    type Target = std::fs::File;
+
+    fn deref(&self) -> &Self::Target {
+        &self.file
+    }
+}
+
+impl AnchoredExclusiveLock {
+    pub(crate) fn unlock(self) -> io::Result<()> {
+        FileExt::unlock(&self.file)
+    }
+
+    pub(crate) fn root_path(&self) -> &Path {
+        self.root.canonical_path()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn key(&self) -> &str {
+        &self.key
+    }
 }
 
 impl AnchoredRoot {
@@ -33,6 +70,63 @@ impl AnchoredRoot {
 
     pub(crate) fn canonical_path(&self) -> &Path {
         &self.canonical_path
+    }
+
+    pub(crate) fn try_clone(&self) -> Result<Self, MutationError> {
+        Ok(Self {
+            canonical_path: self.canonical_path.clone(),
+            dir: self.dir.try_clone()?,
+        })
+    }
+
+    pub(crate) fn lock_exclusive(
+        &self,
+        relative_key: &str,
+    ) -> Result<AnchoredExclusiveLock, MutationError> {
+        self.lock_exclusive_inner(relative_key, || {})
+    }
+
+    #[cfg(test)]
+    pub(crate) fn lock_exclusive_with_hook(
+        &self,
+        relative_key: &str,
+        hook: impl FnOnce(),
+    ) -> Result<AnchoredExclusiveLock, MutationError> {
+        self.lock_exclusive_inner(relative_key, hook)
+    }
+
+    fn lock_exclusive_inner(
+        &self,
+        relative_key: &str,
+        hook: impl FnOnce(),
+    ) -> Result<AnchoredExclusiveLock, MutationError> {
+        validate_relative_key(relative_key)?;
+        let mut hook = Some(hook);
+        for _ in 0..4 {
+            let target = self.resolve_target(relative_key, true)?;
+            let file = target.open_lock_file()?;
+            file.lock_exclusive()?;
+            if let Some(hook) = hook.take() {
+                hook();
+            }
+            let current = self.resolve_target(relative_key, false)?.open_regular()?;
+            let Some(current) = current else {
+                FileExt::unlock(&file)?;
+                continue;
+            };
+            if same_file(&file, &current)? {
+                return Ok(AnchoredExclusiveLock {
+                    file,
+                    root: self.try_clone()?,
+                    #[cfg(test)]
+                    key: relative_key.to_string(),
+                });
+            }
+            FileExt::unlock(&file)?;
+        }
+        Err(MutationError::RecoveryConflict(
+            "capability lock entry changed during acquisition".into(),
+        ))
     }
 
     pub(crate) fn resolve_target(
@@ -171,6 +265,43 @@ impl AnchoredRoot {
         Ok(names)
     }
 
+    pub(crate) fn directory_entries(
+        &self,
+        relative_directory: &str,
+    ) -> Result<Vec<(String, AnchoredEntryKind)>, MutationError> {
+        validate_relative_key(relative_directory)?;
+        let directory = self.open_directory(relative_directory, false)?;
+        let mut entries = Vec::new();
+        for entry in directory.entries()? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let metadata = directory.symlink_metadata(&name)?;
+            if metadata.is_symlink() {
+                return Err(MutationError::Invalid(format!(
+                    "capability directory contains a symlink: {}",
+                    name.to_string_lossy()
+                )));
+            }
+            let kind = if metadata.is_file() {
+                AnchoredEntryKind::File
+            } else if metadata.is_dir() {
+                AnchoredEntryKind::Directory
+            } else {
+                return Err(MutationError::Invalid(format!(
+                    "capability directory contains an unsupported entry: {}",
+                    name.to_string_lossy()
+                )));
+            };
+            let name = name
+                .to_str()
+                .ok_or_else(|| MutationError::Invalid("filename is not UTF-8".into()))?;
+            validate_relative_key(name)?;
+            entries.push((name.to_string(), kind));
+        }
+        entries.sort_by(|left, right| left.0.cmp(&right.0));
+        Ok(entries)
+    }
+
     pub(crate) fn open_directory(
         &self,
         relative_directory: &str,
@@ -228,6 +359,39 @@ impl AnchoredTarget {
                 Ok(Some(file))
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn open_lock_file(&self) -> Result<std::fs::File, MutationError> {
+        let mut create = OpenOptions::new();
+        create
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .follow(FollowSymlinks::No);
+        configure_lock_sharing(&mut create);
+        match self.parent.open_with(&self.leaf, &create) {
+            Ok(file) => {
+                file.sync_all()?;
+                sync_dir(&self.parent)?;
+                Ok(file.into_std())
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                let mut existing = OpenOptions::new();
+                existing
+                    .read(true)
+                    .write(true)
+                    .follow(FollowSymlinks::No);
+                configure_lock_sharing(&mut existing);
+                let file = self.parent.open_with(&self.leaf, &existing)?;
+                if !file.metadata()?.is_file() {
+                    return Err(MutationError::Invalid(
+                        "capability lock target is not a regular file".into(),
+                    ));
+                }
+                Ok(file.into_std())
+            }
             Err(error) => Err(error.into()),
         }
     }
@@ -314,6 +478,24 @@ impl AnchoredTarget {
         }
     }
 }
+
+fn same_file(left: &std::fs::File, right: &cap_std::fs::File) -> Result<bool, MutationError> {
+    let left = cap_std::fs::File::from_std(left.try_clone()?);
+    let left = left.metadata()?;
+    let right = right.metadata()?;
+    Ok(left.dev() == right.dev() && left.ino() == right.ino())
+}
+
+#[cfg(windows)]
+fn configure_lock_sharing(options: &mut OpenOptions) {
+    use cap_std::fs::OpenOptionsExt;
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+    options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
+}
+
+#[cfg(not(windows))]
+fn configure_lock_sharing(_options: &mut OpenOptions) {}
 
 fn sync_dir(directory: &Dir) -> Result<(), MutationError> {
     #[cfg(windows)]

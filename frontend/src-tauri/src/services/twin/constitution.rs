@@ -2129,28 +2129,30 @@ impl TwinStore {
             .cloned()
             .collect::<Vec<_>>();
 
-        for record in &stale_records {
-            let digest = Self::governed_json_digest(record)?;
-            let draft = crate::services::twin_events::legacy_observation_draft(
-                &format!("legacy-pruned-{}", digest.as_str()),
-                &record.id,
-                digest,
-                Utc::now(),
-                crate::models::twin_event::SourceChannel::parse("legacy_twin")
-                    .map_err(anyhow::Error::msg)?,
-                Some(
-                    crate::models::twin_event::ActorId::parse("grafyn")
+        let result = (|| {
+            for record in &stale_records {
+                let digest = Self::governed_json_digest(record)?;
+                let draft = crate::services::twin_events::legacy_observation_draft(
+                    &format!("legacy-pruned-{}", digest.as_str()),
+                    &record.id,
+                    digest,
+                    Utc::now(),
+                    crate::models::twin_event::SourceChannel::parse("legacy_twin")
                         .map_err(anyhow::Error::msg)?,
-                ),
-                Some("legacy_pruned"),
-                crate::services::twin_events::standard_capture_governance(),
-            )
-            .map_err(anyhow::Error::msg)?;
-            self.delete_governed_json(&self.record_file_path(&record.id), vec![draft])?;
-            self.record_cache.remove(&record.id);
-        }
-
-        Ok(stale_records.len())
+                    Some(
+                        crate::models::twin_event::ActorId::parse("grafyn")
+                            .map_err(anyhow::Error::msg)?,
+                    ),
+                    Some("legacy_pruned"),
+                    crate::services::twin_events::standard_capture_governance(),
+                )
+                .map_err(anyhow::Error::msg)?;
+                self.delete_governed_json(&self.record_file_path(&record.id), vec![draft])?;
+            }
+            Ok(stale_records.len())
+        })();
+        self.invalidate_mutation_caches();
+        result
     }
 
     fn prune_stale_note_constitution_items(

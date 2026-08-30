@@ -44,9 +44,8 @@ impl TwinStore {
             })?;
             let (result, trace, record) = committed
                 .ok_or_else(|| anyhow::anyhow!("Canvas feedback was not planned"))?;
-            self.cache_committed_trace(trace);
-            self.record_cache.insert(record.id.clone(), record);
-            self.records_cache_ready = true;
+            let _ = (trace, record);
+            self.invalidate_mutation_caches();
             return Ok(result);
         }
         self.ensure_record_cache()?;
@@ -57,8 +56,8 @@ impl TwinStore {
             values,
             drafts,
         )?;
-        self.cache_committed_trace(trace);
-        self.record_cache.insert(record.id.clone(), record.clone());
+        let _ = (trace, record);
+        self.invalidate_mutation_caches();
         Ok(result)
     }
 

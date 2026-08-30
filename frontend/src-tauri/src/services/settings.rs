@@ -4,6 +4,7 @@ use crate::models::settings::{SettingsStatus, SettingsUpdate, UserSettings};
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+#[cfg(test)]
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const KEYRING_SERVICE: &str = "com.grafyn.app";
@@ -53,7 +54,9 @@ pub struct SettingsService {
     config_path: PathBuf,
     data_path: PathBuf,
     settings: UserSettings,
+    key_source: crate::services::root_transition::OpenRouterKeySource,
     active_key_version: Option<String>,
+    environment_runtime_secret: bool,
     secret_store: Arc<dyn crate::services::root_transition::VersionedSecretStore>,
 }
 
@@ -61,7 +64,7 @@ impl SettingsService {
     #[cfg(feature = "mcp")]
     pub(crate) fn recover_root_transition_at(data_path: &Path) -> Result<()> {
         let config_dir = dirs::config_dir()
-            .or_else(|| dirs::data_local_dir())
+            .or_else(dirs::data_local_dir)
             .unwrap_or_else(|| PathBuf::from("."))
             .join("Grafyn");
         std::fs::create_dir_all(&config_dir)
@@ -88,7 +91,9 @@ impl SettingsService {
             config_path,
             data_path,
             settings,
+            key_source: crate::services::root_transition::OpenRouterKeySource::Unset,
             active_key_version: None,
+            environment_runtime_secret: false,
             secret_store: Arc::new(
                 crate::services::root_transition::MemoryVersionedSecretStore::default(),
             ),
@@ -114,7 +119,9 @@ impl SettingsService {
             config_path: config_dir.join("settings.json"),
             data_path: UserSettings::default().effective_data_path(),
             settings: UserSettings::default(),
+            key_source: crate::services::root_transition::OpenRouterKeySource::Unset,
             active_key_version: None,
+            environment_runtime_secret: false,
             secret_store: Arc::new(
                 crate::services::root_transition::KeyringVersionedSecretStore,
             ),
@@ -146,48 +153,31 @@ impl SettingsService {
             secret_store.clone(),
         )
         .map_err(anyhow::Error::new)?;
-        transition_store.recover().map_err(anyhow::Error::new)?;
-
-        let mut settings: UserSettings = load_settings_from_file(&config_path)?;
-        let mut active_key_version = transition_store
-            .active_key_version()
+        let startup = transition_store
+            .load_startup_settings(
+                || {
+                    load_openrouter_api_key().map_err(|error| {
+                        crate::services::twin_events::MutationError::Io(error.to_string())
+                    })
+                },
+                || {
+                    clear_openrouter_api_key().map_err(|error| {
+                        crate::services::twin_events::MutationError::Io(error.to_string())
+                    })
+                },
+            )
             .map_err(anyhow::Error::new)?;
-        let legacy_plaintext = settings.openrouter_api_key.clone().filter(|key| !key.is_empty());
-        let legacy_keyring = load_openrouter_api_key()?;
-        if let Some(version) = active_key_version.as_deref() {
-            settings.openrouter_api_key = transition_store
-                .resolve_secret(Some(version))
-                .map_err(anyhow::Error::new)?;
-            if settings.openrouter_api_key.is_none() {
-                anyhow::bail!("active OpenRouter key version does not resolve");
-            }
-            if legacy_plaintext.is_some() || legacy_keyring.is_some() {
-                transition_store
-                    .write_settings_guarded(
-                        &crate::services::root_transition::NonsecretSettingsV1::from_settings(
-                            settings.clone(),
-                        ),
-                    )
-                    .map_err(anyhow::Error::new)?;
-                clear_openrouter_api_key()?;
-            }
-        } else if let Some(legacy_key) = choose_legacy_authority(legacy_keyring, legacy_plaintext) {
-            let sanitized = crate::services::root_transition::NonsecretSettingsV1::from_settings(
-                settings.clone(),
-            );
-            let (version, resolved) = transition_store
-                .migrate_legacy_secret_authority(&sanitized, &legacy_key)
-                .map_err(anyhow::Error::new)?;
-            active_key_version = Some(version);
-            settings.openrouter_api_key = Some(resolved);
-            clear_openrouter_api_key()?;
-        }
+        let settings = startup.settings;
+        let key_source = startup.key_source;
+        let active_key_version = startup.active_key_version;
 
         Ok(Self {
             config_path,
             data_path,
             settings,
+            key_source,
             active_key_version,
+            environment_runtime_secret: false,
             secret_store,
         })
     }
@@ -203,6 +193,7 @@ impl SettingsService {
     }
 
     /// Update settings and persist to disk
+    #[cfg(test)]
     pub fn update(&mut self, update: SettingsUpdate) -> Result<UserSettings> {
         if update.openrouter_api_key.is_some() {
             anyhow::bail!("OpenRouter key updates require the coordinated settings boundary");
@@ -210,22 +201,23 @@ impl SettingsService {
         if update.vault_path.is_some() {
             anyhow::bail!("vault changes require the coordinated settings boundary");
         }
-        let candidate = self.preview_update(&update)?;
-        self.root_transition_store()?
-            .write_settings_guarded(
-                &crate::services::root_transition::NonsecretSettingsV1::from_settings(
-                    candidate.clone(),
-                ),
-            )
+        let environment_runtime_secret = self.environment_runtime_secret();
+        let snapshot = self
+            .root_transition_store()?
+            .patch_settings_guarded(|fresh| {
+                apply_update_fields(fresh, &update)
+                    .map_err(|error| crate::services::twin_events::MutationError::Invalid(error.to_string()))
+            })
             .map_err(anyhow::Error::new)?;
-        self.settings = candidate;
+        self.settings = snapshot.settings;
+        self.key_source = snapshot.key_source;
+        if snapshot.key_source
+            == crate::services::root_transition::OpenRouterKeySource::Unset
+        {
+            self.settings.openrouter_api_key = environment_runtime_secret;
+        }
+        self.active_key_version = snapshot.active_key_version;
         Ok(self.settings.clone())
-    }
-
-    pub(crate) fn preview_update(&self, update: &SettingsUpdate) -> Result<UserSettings> {
-        let mut candidate = self.settings.clone();
-        apply_update_fields(&mut candidate, update)?;
-        Ok(candidate)
     }
 
     pub(crate) fn root_transition_store(
@@ -239,19 +231,38 @@ impl SettingsService {
         .map_err(anyhow::Error::new)
     }
 
-    pub(crate) fn active_key_version(&self) -> Option<&str> {
-        self.active_key_version.as_deref()
-    }
-
     pub(crate) fn publish_runtime_authority(
         &mut self,
         mut settings: UserSettings,
+        key_source: crate::services::root_transition::OpenRouterKeySource,
         active_key_version: Option<String>,
         resolved_secret: Option<String>,
     ) {
         settings.openrouter_api_key = resolved_secret;
         self.settings = settings;
+        self.key_source = key_source;
         self.active_key_version = active_key_version;
+        self.environment_runtime_secret = false;
+    }
+
+    pub(crate) fn adopt_environment_runtime_secret(&mut self, secret: String) {
+        if self.key_source == crate::services::root_transition::OpenRouterKeySource::Unset
+            && self.active_key_version.is_none()
+            && !secret.is_empty()
+        {
+            self.settings.openrouter_api_key = Some(secret);
+            self.environment_runtime_secret = true;
+        }
+    }
+
+    pub(crate) fn environment_runtime_secret(&self) -> Option<String> {
+        self.environment_runtime_secret
+            .then(|| self.settings.openrouter_api_key.clone())
+            .flatten()
+    }
+
+    pub(crate) fn allows_environment_fallback(&self) -> bool {
+        self.key_source == crate::services::root_transition::OpenRouterKeySource::Unset
     }
 
     /// Get the effective vault path
@@ -274,32 +285,14 @@ impl SettingsService {
         self.settings.needs_setup()
     }
 
-    /// Mark setup as completed
-    pub fn complete_setup(&mut self) -> Result<()> {
-        let mut candidate = self.settings.clone();
-        candidate.setup_completed = true;
-        self.root_transition_store()?
-            .write_settings_guarded(
-                &crate::services::root_transition::NonsecretSettingsV1::from_settings(
-                    candidate.clone(),
-                ),
-            )
-            .map_err(anyhow::Error::new)?;
-        self.settings = candidate;
-        Ok(())
-    }
-
     /// Check if MCP sidecar is enabled in settings
     pub fn mcp_enabled(&self) -> bool {
         self.settings.mcp_enabled
     }
 
-    /// Clear the OpenRouter API key
-    pub fn clear_openrouter_key(&mut self) -> Result<()> {
-        anyhow::bail!("OpenRouter key clearing requires the coordinated settings boundary")
-    }
 }
 
+#[cfg(test)]
 fn choose_legacy_authority(
     keychain: Option<String>,
     plaintext: Option<String>,
@@ -307,7 +300,7 @@ fn choose_legacy_authority(
     keychain.or(plaintext)
 }
 
-fn apply_update_fields(settings: &mut UserSettings, update: &SettingsUpdate) -> Result<()> {
+pub(crate) fn apply_update_fields(settings: &mut UserSettings, update: &SettingsUpdate) -> Result<()> {
     if let Some(vault_path) = update.vault_path.as_deref() {
         let path = PathBuf::from(vault_path);
         crate::services::twin_events::validate_real_directory(&path, "vault directory")
@@ -411,6 +404,7 @@ fn apply_update_fields(settings: &mut UserSettings, update: &SettingsUpdate) -> 
 ///
 /// Only parse failures are quarantined. An I/O read error (e.g. permissions) is
 /// propagated as before, since the file itself may be perfectly fine.
+#[cfg(test)]
 fn load_settings_from_file(config_path: &Path) -> Result<UserSettings> {
     if !config_path.exists() {
         return Ok(UserSettings::default());
@@ -434,6 +428,7 @@ fn load_settings_from_file(config_path: &Path) -> Result<UserSettings> {
 
 /// Rename a corrupt file to `{name}.corrupt-{unix-timestamp}` in the same directory.
 /// Best-effort: if the rename itself fails, log and leave the file in place.
+#[cfg(test)]
 fn quarantine_corrupt_file(path: &Path) {
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)

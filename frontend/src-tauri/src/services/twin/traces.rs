@@ -208,33 +208,21 @@ impl TwinStore {
         ))
     }
 
-    pub(crate) fn cache_committed_trace(&mut self, trace: SessionTrace) {
-        self.trace_cache.insert(trace.session_id.clone(), trace);
+    pub(crate) fn cache_committed_trace(&mut self, _trace: SessionTrace) {
+        self.invalidate_mutation_caches();
     }
 
     pub fn get_session_trace(&mut self, session_id: &str) -> Result<SessionTrace> {
         Self::validate_file_id(session_id)?;
+        self.ensure_trace_cache()?;
         if let Some(trace) = self.trace_cache.get(session_id) {
             return Ok(trace.clone());
         }
-
-        let path = self.trace_file_path(session_id);
-        let Some(trace): Option<SessionTrace> = self.read_twin_json_bounded(&path)? else {
-            let trace = SessionTrace::new(session_id);
-            self.trace_cache
-                .insert(session_id.to_string(), trace.clone());
-            return Ok(trace);
-        };
-        self.trace_cache
-            .insert(session_id.to_string(), trace.clone());
-        Ok(trace)
+        Ok(SessionTrace::new(session_id))
     }
 
     pub(super) fn list_session_traces(&mut self) -> Result<Vec<SessionTrace>> {
-        for trace in self.list_session_traces_durable()? {
-            self.trace_cache.insert(trace.session_id.clone(), trace);
-        }
-
+        self.ensure_trace_cache()?;
         let mut traces = self.trace_cache.values().cloned().collect::<Vec<_>>();
         traces.sort_by(|a, b| a.session_id.cmp(&b.session_id));
         Ok(traces)
@@ -244,6 +232,20 @@ impl TwinStore {
         let mut traces = self.list_twin_json_bounded("traces")?;
         traces.sort_by(|a: &SessionTrace, b: &SessionTrace| a.session_id.cmp(&b.session_id));
         Ok(traces)
+    }
+
+    fn ensure_trace_cache(&mut self) -> Result<()> {
+        if self.traces_cache_ready {
+            return Ok(());
+        }
+        let traces = self
+            .list_session_traces_durable()?
+            .into_iter()
+            .map(|trace| (trace.session_id.clone(), trace))
+            .collect();
+        self.trace_cache = traces;
+        self.traces_cache_ready = true;
+        Ok(())
     }
 
     pub(super) fn resolve_evidence_refs(

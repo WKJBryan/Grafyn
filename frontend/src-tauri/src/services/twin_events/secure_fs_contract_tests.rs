@@ -1,5 +1,7 @@
 use super::AnchoredRoot;
+use fs2::FileExt;
 use std::fs;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::path::Path;
 use tempfile::tempdir;
 
@@ -93,4 +95,54 @@ fn bounded_read_uses_the_single_opened_leaf_handle() {
         .unwrap();
     assert_eq!(bytes, b"before");
     assert_eq!(fs::read(&leaf).unwrap(), b"after!");
+}
+
+#[test]
+fn exclusive_lock_retries_or_denies_leaf_replacement_and_holds_the_current_entry() {
+    let temp = tempdir().unwrap();
+    let anchor = temp.path().join("anchor");
+    fs::create_dir_all(anchor.join("locks")).unwrap();
+    let root = AnchoredRoot::open(&anchor).unwrap();
+    let replaced = AtomicBool::new(false);
+    let lock = root
+        .lock_exclusive_with_hook("locks/mutation.lock", || {
+            let leaf = anchor.join("locks/mutation.lock");
+            if fs::rename(&leaf, anchor.join("locks/old.lock")).is_ok() {
+                fs::write(&leaf, b"replacement").unwrap();
+                replaced.store(true, Ordering::SeqCst);
+            }
+        })
+        .unwrap();
+    assert_eq!(lock.key(), "locks/mutation.lock");
+    let current = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(anchor.join("locks/mutation.lock"))
+        .unwrap();
+    assert!(current.try_lock_exclusive().is_err());
+    lock.unlock().unwrap();
+    current.try_lock_exclusive().unwrap();
+    FileExt::unlock(&current).unwrap();
+    if replaced.load(Ordering::SeqCst) {
+        assert_eq!(fs::read(anchor.join("locks/mutation.lock")).unwrap(), b"replacement");
+    }
+}
+
+#[test]
+fn exclusive_lock_parent_replacement_never_follows_outside_anchor() {
+    let temp = tempdir().unwrap();
+    let anchor = temp.path().join("anchor");
+    let outside = temp.path().join("outside");
+    fs::create_dir_all(anchor.join("locks")).unwrap();
+    fs::create_dir(&outside).unwrap();
+    let root = AnchoredRoot::open(&anchor).unwrap();
+    let result = root.lock_exclusive_with_hook("locks/mutation.lock", || {
+        if fs::rename(anchor.join("locks"), anchor.join("displaced-locks")).is_ok() {
+            let _ = symlink_dir(&outside, &anchor.join("locks"));
+        }
+    });
+    if let Ok(lock) = result {
+        lock.unlock().unwrap();
+    }
+    assert!(!outside.join("mutation.lock").exists());
 }

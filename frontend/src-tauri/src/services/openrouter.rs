@@ -9,10 +9,20 @@ use std::time::Duration;
 const OPENROUTER_API_URL: &str = "https://openrouter.ai/api/v1";
 
 /// Service for interacting with OpenRouter API
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct OpenRouterService {
     client: Client,
     api_key: String,
+}
+
+impl std::fmt::Debug for OpenRouterService {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OpenRouterService")
+            .field("client", &self.client)
+            .field("api_key", &"[REDACTED]")
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -597,5 +607,14 @@ mod tests {
         let chunk = r#"data: {"error":{"code":500}}"#;
         let result = parse_sse_chunk(chunk);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn debug_output_never_exposes_runtime_api_key() {
+        let secret = "environment-only-super-secret";
+        let service = OpenRouterService::new(secret.to_string());
+        let debug = format!("{service:?}");
+        assert!(!debug.contains(secret));
+        assert!(debug.contains("[REDACTED]"));
     }
 }

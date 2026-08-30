@@ -139,14 +139,37 @@ pub(crate) struct RootAuthorityV1 {
     pub(crate) root_scope: ContentDigest,
     pub(crate) lease: ActiveMarkdownRootLeaseV1,
     pub(crate) nonsecret_settings: NonsecretSettingsV1,
+    pub(crate) openrouter_key_source: OpenRouterKeySource,
     pub(crate) openrouter_key_version: Option<String>,
 }
 
 impl RootAuthorityV1 {
+    #[cfg(test)]
     pub(crate) fn new(
         vault_path: &Path,
         settings: UserSettings,
         lease: ActiveMarkdownRootLeaseV1,
+        openrouter_key_version: Option<String>,
+    ) -> Result<Self, MutationError> {
+        let key_source = if openrouter_key_version.is_some() {
+            OpenRouterKeySource::Versioned
+        } else {
+            OpenRouterKeySource::Unset
+        };
+        Self::new_with_key_source(
+            vault_path,
+            settings,
+            lease,
+            key_source,
+            openrouter_key_version,
+        )
+    }
+
+    pub(crate) fn new_with_key_source(
+        vault_path: &Path,
+        settings: UserSettings,
+        lease: ActiveMarkdownRootLeaseV1,
+        openrouter_key_source: OpenRouterKeySource,
         openrouter_key_version: Option<String>,
     ) -> Result<Self, MutationError> {
         let canonical = std::fs::canonicalize(vault_path)?;
@@ -160,6 +183,7 @@ impl RootAuthorityV1 {
             root_scope,
             lease,
             nonsecret_settings: NonsecretSettingsV1::from_settings(settings),
+            openrouter_key_source,
             openrouter_key_version,
         };
         authority.validate()?;
@@ -177,6 +201,10 @@ impl RootAuthorityV1 {
             ));
         }
         validate_key_version(self.openrouter_key_version.as_deref())?;
+        validate_key_authority(
+            self.openrouter_key_source,
+            self.openrouter_key_version.as_deref(),
+        )?;
         let canonical = std::fs::canonicalize(&self.canonical_vault_path)?;
         let settings_vault = std::fs::canonicalize(
             self.nonsecret_settings
@@ -194,6 +222,14 @@ impl RootAuthorityV1 {
         }
         Ok(())
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum OpenRouterKeySource {
+    Unset,
+    Versioned,
+    Cleared,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -256,6 +292,7 @@ impl RootTransitionV1 {
 #[serde(deny_unknown_fields)]
 struct OpenRouterKeyRefV1 {
     schema_version: u16,
+    source: OpenRouterKeySource,
     active_version: Option<String>,
 }
 
@@ -368,6 +405,23 @@ pub(crate) enum MarkCommittedResult {
     Uncertain(MutationError),
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct DurableSettingsSnapshot {
+    pub(crate) settings: UserSettings,
+    pub(crate) settings_generation: ContentDigest,
+    pub(crate) active_key_version: Option<String>,
+    pub(crate) key_source: OpenRouterKeySource,
+    pub(crate) resolved_secret: Option<String>,
+}
+
+#[derive(Clone)]
+pub(crate) struct DurableRootAuthoritySnapshot {
+    pub(crate) authority: RootAuthorityV1,
+    pub(crate) settings: UserSettings,
+    pub(crate) settings_generation: ContentDigest,
+    pub(crate) resolved_secret: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RootTransitionFaultPoint {
     AfterPrepared,
@@ -463,6 +517,69 @@ impl RootTransitionStore {
         if self.read_transition()?.as_ref() != Some(transition) {
             return Err(MutationError::RecoveryConflict(
                 "root-transition-create-collision".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn read_authority_locked(
+        &self,
+        process_lock: &crate::services::twin_events::CoordinatorProcessLock,
+    ) -> Result<DurableRootAuthoritySnapshot, MutationError> {
+        self.require_matching_process_lock(process_lock)?;
+        if self.read_transition()?.is_some() {
+            return Err(MutationError::RecoveryConflict(
+                "root-transition-already-pending".into(),
+            ));
+        }
+        let settings = self.read_settings_snapshot()?;
+        let lease = self.read_lease()?;
+        let authority = RootAuthorityV1::new_with_key_source(
+            &settings.settings.effective_vault_path(),
+            settings.settings.clone(),
+            lease,
+            settings.key_source,
+            settings.active_key_version.clone(),
+        )?;
+        Ok(DurableRootAuthoritySnapshot {
+            authority,
+            settings: settings.settings,
+            settings_generation: settings.settings_generation,
+            resolved_secret: settings.resolved_secret,
+        })
+    }
+
+    pub(crate) fn prepare_transition_cas_locked(
+        &self,
+        process_lock: &crate::services::twin_events::CoordinatorProcessLock,
+        expected: &DurableRootAuthoritySnapshot,
+        transition: &RootTransitionV1,
+    ) -> Result<(), MutationError> {
+        self.require_matching_process_lock(process_lock)?;
+        if transition.before != expected.authority {
+            return Err(MutationError::RecoveryConflict(
+                "root-transition-before-authority-mismatch".into(),
+            ));
+        }
+        let current = self.read_authority_locked(process_lock)?;
+        if current.authority != expected.authority
+            || current.settings_generation != expected.settings_generation
+            || current.resolved_secret != expected.resolved_secret
+        {
+            return Err(MutationError::RecoveryConflict(
+                "root-transition-authority-cas-failed".into(),
+            ));
+        }
+        self.prepare_transition(transition)
+    }
+
+    fn require_matching_process_lock(
+        &self,
+        process_lock: &crate::services::twin_events::CoordinatorProcessLock,
+    ) -> Result<(), MutationError> {
+        if !process_lock.covers_data_path(&self.data_path)? {
+            return Err(MutationError::Invalid(
+                "root transition lock token belongs to another data root".into(),
             ));
         }
         Ok(())
@@ -569,6 +686,7 @@ impl RootTransitionStore {
         self.config_root.put_atomic(&self.settings_key, &bytes)
     }
 
+    #[cfg(test)]
     pub(crate) fn write_settings_guarded(
         &self,
         settings: &NonsecretSettingsV1,
@@ -586,9 +704,119 @@ impl RootTransitionStore {
         result
     }
 
+    #[cfg(test)]
+    pub(crate) fn patch_settings_guarded<F>(
+        &self,
+        patch: F,
+    ) -> Result<DurableSettingsSnapshot, MutationError>
+    where
+        F: FnOnce(&mut UserSettings) -> Result<(), MutationError>,
+    {
+        let process_lock =
+            crate::services::twin_events::acquire_shared_coordinator_process_lock(&self.data_path)?;
+        let result = (|| {
+            if self.read_transition()?.is_some() {
+                return Err(MutationError::RecoveryConflict(
+                    "root-transition-already-pending".into(),
+                ));
+            }
+            let mut snapshot = self.read_settings_snapshot()?;
+            patch(&mut snapshot.settings)?;
+            let before_generation = snapshot.settings_generation.clone();
+            if self.read_settings_generation()? != before_generation {
+                return Err(MutationError::RecoveryConflict(
+                    "settings-generation-changed-before-publish".into(),
+                ));
+            }
+            self.write_settings(&NonsecretSettingsV1::from_settings(
+                snapshot.settings.clone(),
+            ))?;
+            let published = self.read_settings_snapshot()?;
+            if NonsecretSettingsV1::from_settings(published.settings.clone())
+                != NonsecretSettingsV1::from_settings(snapshot.settings.clone())
+            {
+                return Err(MutationError::RecoveryConflict(
+                    "settings-publish-readback-mismatch".into(),
+                ));
+            }
+            Ok(published)
+        })();
+        process_lock.unlock()?;
+        result
+    }
+
+    pub(crate) fn load_startup_settings<L, C>(
+        &self,
+        load_legacy_key: L,
+        clear_legacy_key: C,
+    ) -> Result<DurableSettingsSnapshot, MutationError>
+    where
+        L: FnOnce() -> Result<Option<String>, MutationError>,
+        C: FnOnce() -> Result<(), MutationError>,
+    {
+        let process_lock =
+            crate::services::twin_events::acquire_shared_coordinator_process_lock(&self.data_path)?;
+        let result = (|| {
+            self.recover_locked()?;
+            let raw_bytes = self.read_settings_bytes()?;
+            let raw_settings = match raw_bytes.as_deref() {
+                Some(bytes) => serde_json::from_slice::<UserSettings>(bytes).map_err(|error| {
+                    MutationError::Invalid(format!("invalid settings: {error}"))
+                })?,
+                None => UserSettings::default(),
+            };
+            let legacy_plaintext = raw_settings
+                .openrouter_api_key
+                .clone()
+                .filter(|secret| !secret.is_empty());
+            let legacy_keyring = load_legacy_key()?;
+            let key_ref = self.read_key_ref()?;
+            let legacy_present = legacy_plaintext.is_some() || legacy_keyring.is_some();
+
+            match key_ref.source {
+                OpenRouterKeySource::Versioned => {
+                    let version = key_ref.active_version.as_deref().ok_or_else(|| {
+                        MutationError::Invalid("versioned key authority has no version".into())
+                    })?;
+                    if self.secrets.get(version)?.is_none() {
+                        return Err(MutationError::RecoveryConflict(
+                            "active-openrouter-key-version-missing".into(),
+                        ));
+                    }
+                }
+                OpenRouterKeySource::Unset => {
+                    if let Some(legacy_secret) = legacy_keyring.or(legacy_plaintext) {
+                        match self.secrets.get(LEGACY_MIGRATION_KEY_VERSION)? {
+                            Some(existing) if existing == legacy_secret => {}
+                            Some(_) => {
+                                return Err(MutationError::RecoveryConflict(
+                                    "legacy-openrouter-migration-version-conflict".into(),
+                                ));
+                            }
+                            None => self.stage_secret(LEGACY_MIGRATION_KEY_VERSION, &legacy_secret)?,
+                        }
+                        self.write_key_authority(
+                            OpenRouterKeySource::Versioned,
+                            Some(LEGACY_MIGRATION_KEY_VERSION),
+                        )?;
+                    }
+                }
+                OpenRouterKeySource::Cleared => {}
+            }
+
+            if legacy_present {
+                self.write_settings(&NonsecretSettingsV1::from_settings(raw_settings))?;
+                clear_legacy_key()?;
+            }
+            self.read_settings_snapshot()
+        })();
+        process_lock.unlock()?;
+        result
+    }
+
+    #[cfg(test)]
     pub(crate) fn migrate_legacy_secret_authority(
         &self,
-        settings: &NonsecretSettingsV1,
         legacy_secret: &str,
     ) -> Result<(String, String), MutationError> {
         let process_lock =
@@ -599,8 +827,8 @@ impl RootTransitionStore {
                     "root-transition-already-pending".into(),
                 ));
             }
-            let current = self.read_key_ref()?.active_version;
-            let (version, secret) = if let Some(version) = current {
+            let current = self.read_key_ref()?;
+            let (version, secret) = if let Some(version) = current.active_version {
                 let secret = self.secrets.get(&version)?.ok_or_else(|| {
                     MutationError::RecoveryConflict("active-openrouter-key-version-missing".into())
                 })?;
@@ -615,10 +843,11 @@ impl RootTransitionStore {
                     }
                     None => self.stage_secret(&version, legacy_secret)?,
                 }
-                self.write_key_ref(Some(&version))?;
+                self.write_key_authority(OpenRouterKeySource::Versioned, Some(&version))?;
                 (version, legacy_secret.to_string())
             };
-            self.write_settings(settings)?;
+            let current_settings = self.read_settings()?;
+            self.write_settings(&current_settings)?;
             Ok((version, secret))
         })();
         process_lock.unlock()?;
@@ -645,8 +874,23 @@ impl RootTransitionStore {
         self.data_root.put_atomic(ACTIVE_ROOT_LEASE_KEY, &bytes)
     }
 
+    #[cfg(test)]
     pub(crate) fn write_key_ref(&self, version: Option<&str>) -> Result<(), MutationError> {
+        let source = if version.is_some() {
+            OpenRouterKeySource::Versioned
+        } else {
+            OpenRouterKeySource::Unset
+        };
+        self.write_key_authority(source, version)
+    }
+
+    pub(crate) fn write_key_authority(
+        &self,
+        source: OpenRouterKeySource,
+        version: Option<&str>,
+    ) -> Result<(), MutationError> {
         validate_key_version(version)?;
+        validate_key_authority(source, version)?;
         if let Some(version) = version {
             if self.secrets.get(version)?.is_none() {
                 return Err(MutationError::Invalid(
@@ -656,6 +900,7 @@ impl RootTransitionStore {
         }
         let key_ref = OpenRouterKeyRefV1 {
             schema_version: KEY_REF_SCHEMA_VERSION,
+            source,
             active_version: version.map(str::to_string),
         };
         let mut bytes = serde_json::to_vec_pretty(&key_ref)
@@ -664,10 +909,12 @@ impl RootTransitionStore {
         self.data_root.put_atomic(OPENROUTER_KEY_REF, &bytes)
     }
 
+    #[cfg(test)]
     pub(crate) fn active_key_version(&self) -> Result<Option<String>, MutationError> {
         Ok(self.read_key_ref()?.active_version)
     }
 
+    #[cfg(any(test, feature = "mcp"))]
     pub(crate) fn recover(&self) -> Result<RecoveryWork, MutationError> {
         let process_lock =
             crate::services::twin_events::acquire_shared_coordinator_process_lock(&self.data_path)?;
@@ -687,7 +934,10 @@ impl RootTransitionStore {
         self.require_exact_prepared_transition(transition)?;
         self.write_lease(&transition.rollback_lease)?;
         self.write_settings(&transition.before.nonsecret_settings)?;
-        self.write_key_ref(transition.before.openrouter_key_version.as_deref())?;
+        self.write_key_authority(
+            transition.before.openrouter_key_source,
+            transition.before.openrouter_key_version.as_deref(),
+        )?;
         Ok(())
     }
 
@@ -725,7 +975,7 @@ impl RootTransitionStore {
         transition.validate()?;
         let current_settings = self.read_settings()?;
         let current_lease = self.read_lease()?;
-        let current_key_ref = self.read_key_ref()?.active_version;
+        let current_key_ref = self.read_key_ref()?;
         classify_component(
             &current_settings,
             &transition.before.nonsecret_settings,
@@ -750,9 +1000,15 @@ impl RootTransitionStore {
             )?;
         }
         classify_component(
-            &current_key_ref,
-            &transition.before.openrouter_key_version,
-            &transition.after.openrouter_key_version,
+            &(current_key_ref.source, current_key_ref.active_version),
+            &(
+                transition.before.openrouter_key_source,
+                transition.before.openrouter_key_version.clone(),
+            ),
+            &(
+                transition.after.openrouter_key_source,
+                transition.after.openrouter_key_version.clone(),
+            ),
             "OpenRouter key reference",
         )?;
 
@@ -762,7 +1018,10 @@ impl RootTransitionStore {
                 self.checkpoint(RootTransitionFaultPoint::AfterRollbackLease)?;
                 self.write_settings(&transition.before.nonsecret_settings)?;
                 self.checkpoint(RootTransitionFaultPoint::AfterRollbackSettings)?;
-                self.write_key_ref(transition.before.openrouter_key_version.as_deref())?;
+                self.write_key_authority(
+                    transition.before.openrouter_key_source,
+                    transition.before.openrouter_key_version.as_deref(),
+                )?;
                 self.checkpoint(RootTransitionFaultPoint::AfterRollbackKeyRef)?;
                 if transition.after.openrouter_key_version
                     != transition.before.openrouter_key_version
@@ -788,7 +1047,10 @@ impl RootTransitionStore {
                 self.checkpoint(RootTransitionFaultPoint::AfterLease)?;
                 self.write_settings(&transition.after.nonsecret_settings)?;
                 self.checkpoint(RootTransitionFaultPoint::AfterSettings)?;
-                self.write_key_ref(transition.after.openrouter_key_version.as_deref())?;
+                self.write_key_authority(
+                    transition.after.openrouter_key_source,
+                    transition.after.openrouter_key_version.as_deref(),
+                )?;
                 self.checkpoint(RootTransitionFaultPoint::AfterKeyRef)?;
                 if transition.after.openrouter_key_version
                     != transition.before.openrouter_key_version
@@ -838,10 +1100,7 @@ impl RootTransitionStore {
     }
 
     fn read_settings(&self) -> Result<NonsecretSettingsV1, MutationError> {
-        let Some(bytes) = self
-            .config_root
-            .read_bounded(&self.settings_key, SETTINGS_LIMIT)?
-        else {
+        let Some(bytes) = self.read_settings_bytes()? else {
             return Ok(NonsecretSettingsV1::from_settings(UserSettings::default()));
         };
         let settings: UserSettings = serde_json::from_slice(&bytes)
@@ -849,6 +1108,48 @@ impl RootTransitionStore {
         let settings = NonsecretSettingsV1::from_settings(settings);
         settings.validate()?;
         Ok(settings)
+    }
+
+    fn read_settings_bytes(&self) -> Result<Option<Vec<u8>>, MutationError> {
+        self.config_root
+            .read_bounded(&self.settings_key, SETTINGS_LIMIT)
+    }
+
+    #[cfg(test)]
+    fn read_settings_generation(&self) -> Result<ContentDigest, MutationError> {
+        Ok(settings_generation(self.read_settings_bytes()?.as_deref()))
+    }
+
+    fn read_settings_snapshot(&self) -> Result<DurableSettingsSnapshot, MutationError> {
+        let bytes = self.read_settings_bytes()?;
+        let nonsecret_settings = match bytes.as_deref() {
+            Some(bytes) => {
+                let settings: UserSettings = serde_json::from_slice(bytes).map_err(|error| {
+                    MutationError::Invalid(format!("invalid settings: {error}"))
+                })?;
+                let settings = NonsecretSettingsV1::from_settings(settings);
+                settings.validate()?;
+                settings
+            }
+            None => NonsecretSettingsV1::from_settings(UserSettings::default()),
+        };
+        let key_ref = self.read_key_ref()?;
+        let active_key_version = key_ref.active_version.clone();
+        let resolved_secret = self.resolve_secret(active_key_version.as_deref())?;
+        if active_key_version.is_some() && resolved_secret.is_none() {
+            return Err(MutationError::RecoveryConflict(
+                "active-openrouter-key-version-missing".into(),
+            ));
+        }
+        let mut settings = nonsecret_settings.into_settings();
+        settings.openrouter_api_key = resolved_secret.clone();
+        Ok(DurableSettingsSnapshot {
+            settings,
+            settings_generation: settings_generation(bytes.as_deref()),
+            active_key_version,
+            key_source: key_ref.source,
+            resolved_secret,
+        })
     }
 
     fn read_lease(&self) -> Result<ActiveMarkdownRootLeaseV1, MutationError> {
@@ -873,6 +1174,7 @@ impl RootTransitionStore {
         else {
             return Ok(OpenRouterKeyRefV1 {
                 schema_version: KEY_REF_SCHEMA_VERSION,
+                source: OpenRouterKeySource::Unset,
                 active_version: None,
             });
         };
@@ -884,6 +1186,7 @@ impl RootTransitionStore {
             ));
         }
         validate_key_version(key_ref.active_version.as_deref())?;
+        validate_key_authority(key_ref.source, key_ref.active_version.as_deref())?;
         Ok(key_ref)
     }
 
@@ -901,7 +1204,10 @@ impl RootTransitionStore {
     fn write_authority_for_test(&self, authority: &RootAuthorityV1) -> Result<(), MutationError> {
         self.write_lease(&authority.lease)?;
         self.write_settings(&authority.nonsecret_settings)?;
-        self.write_key_ref(authority.openrouter_key_version.as_deref())
+        self.write_key_authority(
+            authority.openrouter_key_source,
+            authority.openrouter_key_version.as_deref(),
+        )
     }
 
     #[cfg(test)]
@@ -911,11 +1217,13 @@ impl RootTransitionStore {
             .vault_path
             .clone()
             .ok_or_else(|| MutationError::Invalid("test settings have no vault".into()))?;
-        RootAuthorityV1::new(
+        let key_ref = self.read_key_ref()?;
+        RootAuthorityV1::new_with_key_source(
             Path::new(&vault),
             settings.into_settings(),
             self.read_lease()?,
-            self.read_key_ref()?.active_version,
+            key_ref.source,
+            key_ref.active_version,
         )
     }
 
@@ -977,6 +1285,35 @@ fn validate_key_version(version: Option<&str>) -> Result<(), MutationError> {
     Ok(())
 }
 
+fn validate_key_authority(
+    source: OpenRouterKeySource,
+    version: Option<&str>,
+) -> Result<(), MutationError> {
+    let valid = match source {
+        OpenRouterKeySource::Versioned => version.is_some(),
+        OpenRouterKeySource::Unset | OpenRouterKeySource::Cleared => version.is_none(),
+    };
+    if !valid {
+        return Err(MutationError::Invalid(
+            "OpenRouter key source and version disagree".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn settings_generation(bytes: Option<&[u8]>) -> ContentDigest {
+    let mut domain = b"grafyn.settings_generation.v1".to_vec();
+    match bytes {
+        Some(bytes) => {
+            domain.push(1);
+            domain.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+            domain.extend_from_slice(bytes);
+        }
+        None => domain.push(0),
+    }
+    crate::services::twin_events::digest_bytes(&domain)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1023,6 +1360,51 @@ mod tests {
         .unwrap();
         let transition = RootTransitionV1::prepared(before, after).unwrap();
         (temp, store, transition)
+    }
+
+    #[test]
+    fn guarded_settings_patch_uses_fresh_durable_state_instead_of_stale_process_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let config = temp.path().join("config");
+        let vault = temp.path().join("vault");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::create_dir(&config).unwrap();
+        std::fs::create_dir(&vault).unwrap();
+        let secrets = Arc::new(MemoryVersionedSecretStore::default());
+        let first = RootTransitionStore::new(
+            &data,
+            config.join("settings.json"),
+            secrets.clone(),
+        )
+        .unwrap();
+        let stale = RootTransitionStore::new(&data, config.join("settings.json"), secrets).unwrap();
+        let initial = UserSettings {
+            vault_path: Some(vault.to_string_lossy().into_owned()),
+            theme: "light".into(),
+            mcp_enabled: false,
+            ..UserSettings::default()
+        };
+        first
+            .write_settings_guarded(&NonsecretSettingsV1::from_settings(initial))
+            .unwrap();
+
+        first
+            .patch_settings_guarded(|fresh| {
+                fresh.mcp_enabled = true;
+                Ok(())
+            })
+            .unwrap();
+        let patched = stale
+            .patch_settings_guarded(|fresh| {
+                fresh.theme = "dark".into();
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(patched.settings.theme, "dark");
+        assert!(patched.settings.mcp_enabled);
+        assert_eq!(patched.settings.effective_vault_path(), vault);
     }
 
     #[test]
@@ -1268,13 +1650,10 @@ mod tests {
 
     #[test]
     fn legacy_migration_uses_one_discoverable_version_and_sanitized_settings() {
-        let (_temp, store, transition) = fixture();
-        let mut settings = transition.before.nonsecret_settings.clone().into_settings();
-        settings.openrouter_api_key = Some("stale-plaintext".into());
-        let sanitized = NonsecretSettingsV1::from_settings(settings);
+        let (_temp, store, _transition) = fixture();
 
         let (version, secret) = store
-            .migrate_legacy_secret_authority(&sanitized, "new-keychain")
+            .migrate_legacy_secret_authority("new-keychain")
             .unwrap();
         assert_eq!(version, LEGACY_MIGRATION_KEY_VERSION);
         assert_eq!(secret, "new-keychain");
@@ -1293,7 +1672,7 @@ mod tests {
         );
 
         let repeated = store
-            .migrate_legacy_secret_authority(&sanitized, "new-keychain")
+            .migrate_legacy_secret_authority("new-keychain")
             .unwrap();
         assert_eq!(repeated, (version, "new-keychain".into()));
     }

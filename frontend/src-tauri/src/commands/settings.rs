@@ -53,17 +53,13 @@ async fn apply_settings_update_inner(
         .as_ref()
         .ok_or_else(|| "mutation coordinator is unavailable".to_string())?
         .clone();
-    let (before, candidate, before_key_version, transition_store) = {
+    let (transition_store, environment_runtime_secret) = {
         let settings = state.settings_service.read().await;
         (
-            settings.get().clone(),
-            settings
-                .preview_update(&update)
-                .map_err(|error| error.to_string())?,
-            settings.active_key_version().map(str::to_string),
             settings
                 .root_transition_store()
                 .map_err(|error| error.to_string())?,
+            settings.environment_runtime_secret(),
         )
     };
     #[cfg(test)]
@@ -73,77 +69,77 @@ async fn apply_settings_update_inner(
     #[cfg(not(test))]
     let _ = fault;
 
-    let candidate_vault = std::fs::canonicalize(candidate.effective_vault_path())
-        .map_err(|error| error.to_string())?;
-    let mut knowledge = state.knowledge_store.write().await;
-    let mut twin = state.twin_store.write().await;
-    let old_vault = std::fs::canonicalize(knowledge.vault_path())
-        .map_err(|error| error.to_string())?;
-    let old_twin = twin.root_path().to_path_buf();
-    let old_notes = knowledge
-        .list_full_notes()
-        .map_err(|error| error.to_string())?;
-    if crate::services::twin_events::root_identity_for_path(&before.effective_vault_path())
-        .map_err(|error| error.to_string())?
-        != crate::services::twin_events::root_identity_for_path(&old_vault)
-            .map_err(|error| error.to_string())?
-    {
-        return Err(
-            "vault runtime and persisted settings disagree; restart before switching".to_string(),
-        );
-    }
-    let data_path = twin
-        .target_root_path()
-        .parent()
-        .ok_or_else(|| "Twin target root has no data parent".to_string())?
-        .to_path_buf();
-    crate::models::settings::twin_data_path_for_vault(
-        &data_path,
-        &candidate_vault,
-    )
-    .map_err(|error| error.to_string())?;
-
     let root_guard = coordinator
         .begin_root_transition()
+        .map_err(|error| error.to_string())?;
+    let durable_before = transition_store
+        .read_authority_locked(root_guard.process_lock())
+        .map_err(|error| error.to_string())?;
+    let before = durable_before.settings.clone();
+    let mut candidate = before.clone();
+    crate::services::settings::apply_update_fields(&mut candidate, &update)
+        .map_err(|error| error.to_string())?;
+    let old_vault = std::path::PathBuf::from(&durable_before.authority.canonical_vault_path);
+    let candidate_vault = std::fs::canonicalize(candidate.effective_vault_path())
         .map_err(|error| error.to_string())?;
     if root_guard
         .current_vault_path()
         .map_err(|error| error.to_string())?
         != old_vault
     {
-        return Err("coordinator and Knowledge roots disagree".into());
+        return Err("coordinator and durable settings roots disagree; restart required".into());
     }
-    let before_lease = root_guard
-        .current_lease()
+
+    let mut knowledge = state.knowledge_store.write().await;
+    let mut twin = state.twin_store.write().await;
+    if std::fs::canonicalize(knowledge.vault_path()).map_err(|error| error.to_string())?
+        != old_vault
+    {
+        return Err("Knowledge and durable settings roots disagree; restart required".into());
+    }
+    let old_twin = twin.root_path().to_path_buf();
+    let old_notes = knowledge
+        .list_full_notes()
         .map_err(|error| error.to_string())?;
-    let before_authority = crate::services::root_transition::RootAuthorityV1::new(
-        &old_vault,
-        before.clone(),
-        before_lease.clone(),
-        before_key_version.clone(),
-    )
-    .map_err(|error| error.to_string())?;
-    let after_key_version = match update.openrouter_api_key.as_deref() {
-        None => before_key_version.clone(),
-        Some("") => None,
-        Some(_) => Some(uuid::Uuid::new_v4().to_string()),
+    let data_path = twin
+        .target_root_path()
+        .parent()
+        .ok_or_else(|| "Twin target root has no data parent".to_string())?
+        .to_path_buf();
+    crate::models::settings::twin_data_path_for_vault(&data_path, &candidate_vault)
+        .map_err(|error| error.to_string())?;
+
+    let (after_key_source, after_key_version) = match update.openrouter_api_key.as_deref() {
+        None => (
+            durable_before.authority.openrouter_key_source,
+            durable_before.authority.openrouter_key_version.clone(),
+        ),
+        Some("") => (
+            crate::services::root_transition::OpenRouterKeySource::Cleared,
+            None,
+        ),
+        Some(_) => (
+            crate::services::root_transition::OpenRouterKeySource::Versioned,
+            Some(uuid::Uuid::new_v4().to_string()),
+        ),
     };
     let after_scope = crate::services::twin_events::root_identity_for_path(&candidate_vault)
         .map_err(|error| error.to_string())?;
-    let after_lease = if after_scope == before_lease.root_scope {
-        before_lease
+    let after_lease = if after_scope == durable_before.authority.lease.root_scope {
+        durable_before.authority.lease.clone()
     } else {
         crate::services::twin_events::ActiveMarkdownRootLeaseV1::new(after_scope)
     };
-    let after_authority = crate::services::root_transition::RootAuthorityV1::new(
+    let after_authority = crate::services::root_transition::RootAuthorityV1::new_with_key_source(
         &candidate_vault,
         candidate.clone(),
         after_lease,
+        after_key_source,
         after_key_version.clone(),
     )
     .map_err(|error| error.to_string())?;
     let mut transition = crate::services::root_transition::RootTransitionV1::prepared(
-        before_authority,
+        durable_before.authority.clone(),
         after_authority,
     )
     .map_err(|error| error.to_string())?;
@@ -151,7 +147,11 @@ async fn apply_settings_update_inner(
     let mut commit_uncertain = false;
     let result = async {
         transition_store
-            .prepare_transition(&transition)
+            .prepare_transition_cas_locked(
+                root_guard.process_lock(),
+                &durable_before,
+                &transition,
+            )
             .map_err(|error| error.to_string())?;
         transition_store
             .checkpoint(crate::services::root_transition::RootTransitionFaultPoint::AfterPrepared)
@@ -186,8 +186,14 @@ async fn apply_settings_update_inner(
             transition_store
                 .checkpoint(crate::services::root_transition::RootTransitionFaultPoint::AfterLease)
                 .map_err(|error| error.to_string())?;
+            let candidate_namespace = root_guard
+                .initialize_namespace(&transition.after.lease)
+                .map_err(|error| error.to_string())?;
+            root_guard
+                .invalidate_namespace(&transition.after.lease)
+                .map_err(|error| error.to_string())?;
             knowledge
-                .adopt_coordinated_vault_path(candidate_vault.clone())
+                .adopt_coordinated_vault_path(candidate_vault.clone(), &candidate_namespace)
                 .map_err(|error| error.to_string())?;
             let candidate_twin = crate::services::settings::prepare_twin_data_path(
                 &data_path,
@@ -196,10 +202,12 @@ async fn apply_settings_update_inner(
             .map_err(|error| error.to_string())?;
             twin.replace_root_path(candidate_twin)
                 .map_err(|error| error.to_string())?;
+            twin.rebuild_mutation_caches()
+                .map_err(|error| error.to_string())?;
             let new_notes = knowledge
                 .list_full_notes()
                 .map_err(|error| error.to_string())?;
-            rebuild_indexes_from_notes(state, &new_notes).await?;
+            rebuild_indexes_from_notes(state, &candidate_namespace, &new_notes).await?;
         }
 
         transition_store
@@ -209,11 +217,19 @@ async fn apply_settings_update_inner(
             .checkpoint(crate::services::root_transition::RootTransitionFaultPoint::AfterSettings)
             .map_err(|error| error.to_string())?;
         transition_store
-            .write_key_ref(transition.after.openrouter_key_version.as_deref())
+            .write_key_authority(
+                transition.after.openrouter_key_source,
+                transition.after.openrouter_key_version.as_deref(),
+            )
             .map_err(|error| error.to_string())?;
-        let resolved_secret = transition_store
+        let durable_resolved_secret = transition_store
             .resolve_secret(transition.after.openrouter_key_version.as_deref())
             .map_err(|error| error.to_string())?;
+        let resolved_secret = runtime_secret_for_authority(
+            transition.after.openrouter_key_source,
+            durable_resolved_secret,
+            environment_runtime_secret.clone(),
+        );
         transition_store
             .checkpoint(crate::services::root_transition::RootTransitionFaultPoint::AfterKeyRef)
             .map_err(|error| error.to_string())?;
@@ -222,9 +238,17 @@ async fn apply_settings_update_inner(
             let mut settings = state.settings_service.write().await;
             settings.publish_runtime_authority(
                 candidate.clone(),
+                transition.after.openrouter_key_source,
                 transition.after.openrouter_key_version.clone(),
                 resolved_secret.clone(),
             );
+            if transition.after.openrouter_key_source
+                == crate::services::root_transition::OpenRouterKeySource::Unset
+            {
+                if let Some(secret) = resolved_secret.clone() {
+                    settings.adopt_environment_runtime_secret(secret);
+                }
+            }
         }
         state
             .openrouter
@@ -270,6 +294,11 @@ async fn apply_settings_update_inner(
         transition_store
             .checkpoint(crate::services::root_transition::RootTransitionFaultPoint::AfterWalDelete)
             .map_err(|error| error.to_string())?;
+        if transition.root_changed {
+            root_guard
+                .publish_namespace_ready(&transition.after.lease)
+                .map_err(|error| error.to_string())?;
+        }
         Ok::<_, String>(candidate.clone())
     }
     .await;
@@ -282,20 +311,48 @@ async fn apply_settings_update_inner(
                     root_guard
                         .adopt_durable_root(&old_vault, &transition.rollback_lease)
                         .map_err(|error| error.to_string())?;
+                    let old_namespace = root_guard
+                        .initialize_namespace(&transition.rollback_lease)
+                        .map_err(|error| error.to_string())?;
+                    root_guard
+                        .invalidate_namespace(&transition.rollback_lease)
+                        .map_err(|error| error.to_string())?;
                     knowledge
-                        .adopt_coordinated_vault_path(old_vault.clone())
+                        .adopt_coordinated_vault_path(old_vault.clone(), &old_namespace)
                         .map_err(|error| error.to_string())?;
                     twin.replace_root_path(old_twin.clone())
                         .map_err(|error| error.to_string())?;
-                    rebuild_indexes_from_notes(state, &old_notes).await?;
-                    let old_secret = transition_store
+                    twin.rebuild_mutation_caches()
+                        .map_err(|error| error.to_string())?;
+                    rebuild_indexes_from_notes(state, &old_namespace, &old_notes).await?;
+                    root_guard
+                        .publish_namespace_ready(&transition.rollback_lease)
+                        .map_err(|error| error.to_string())?;
+                    let durable_old_secret = transition_store
                         .resolve_secret(transition.before.openrouter_key_version.as_deref())
                         .map_err(|error| error.to_string())?;
+                    let old_secret = runtime_secret_for_authority(
+                        transition.before.openrouter_key_source,
+                        durable_old_secret,
+                        environment_runtime_secret.clone(),
+                    );
                     state.settings_service.write().await.publish_runtime_authority(
                         before.clone(),
+                        transition.before.openrouter_key_source,
                         transition.before.openrouter_key_version.clone(),
                         old_secret.clone(),
                     );
+                    if transition.before.openrouter_key_source
+                        == crate::services::root_transition::OpenRouterKeySource::Unset
+                    {
+                        if let Some(secret) = old_secret.clone() {
+                            state
+                                .settings_service
+                                .write()
+                                .await
+                                .adopt_environment_runtime_secret(secret);
+                        }
+                    }
                     state
                         .openrouter
                         .write()
@@ -313,8 +370,14 @@ async fn apply_settings_update_inner(
                     root_guard
                         .adopt_durable_root(&candidate_vault, &transition.after.lease)
                         .map_err(|error| error.to_string())?;
+                    let candidate_namespace = root_guard
+                        .initialize_namespace(&transition.after.lease)
+                        .map_err(|error| error.to_string())?;
+                    root_guard
+                        .invalidate_namespace(&transition.after.lease)
+                        .map_err(|error| error.to_string())?;
                     knowledge
-                        .adopt_coordinated_vault_path(candidate_vault.clone())
+                        .adopt_coordinated_vault_path(candidate_vault.clone(), &candidate_namespace)
                         .map_err(|error| error.to_string())?;
                     let candidate_twin = crate::services::settings::prepare_twin_data_path(
                         &data_path,
@@ -323,18 +386,40 @@ async fn apply_settings_update_inner(
                     .map_err(|error| error.to_string())?;
                     twin.replace_root_path(candidate_twin)
                         .map_err(|error| error.to_string())?;
+                    twin.rebuild_mutation_caches()
+                        .map_err(|error| error.to_string())?;
                     let new_notes = knowledge
                         .list_full_notes()
                         .map_err(|error| error.to_string())?;
-                    rebuild_indexes_from_notes(state, &new_notes).await?;
-                    let new_secret = transition_store
+                    rebuild_indexes_from_notes(state, &candidate_namespace, &new_notes).await?;
+                    root_guard
+                        .publish_namespace_ready(&transition.after.lease)
+                        .map_err(|error| error.to_string())?;
+                    let durable_new_secret = transition_store
                         .resolve_secret(transition.after.openrouter_key_version.as_deref())
                         .map_err(|error| error.to_string())?;
+                    let new_secret = runtime_secret_for_authority(
+                        transition.after.openrouter_key_source,
+                        durable_new_secret,
+                        environment_runtime_secret.clone(),
+                    );
                     state.settings_service.write().await.publish_runtime_authority(
                         candidate.clone(),
+                        transition.after.openrouter_key_source,
                         transition.after.openrouter_key_version.clone(),
                         new_secret.clone(),
                     );
+                    if transition.after.openrouter_key_source
+                        == crate::services::root_transition::OpenRouterKeySource::Unset
+                    {
+                        if let Some(secret) = new_secret.clone() {
+                            state
+                                .settings_service
+                                .write()
+                                .await
+                                .adopt_environment_runtime_secret(secret);
+                        }
+                    }
                     state
                         .openrouter
                         .write()
@@ -369,20 +454,48 @@ async fn apply_settings_update_inner(
                 root_guard
                     .adopt_durable_root(&old_vault, &transition.rollback_lease)
                     .map_err(|error| error.to_string())?;
+                let old_namespace = root_guard
+                    .initialize_namespace(&transition.rollback_lease)
+                    .map_err(|error| error.to_string())?;
+                root_guard
+                    .invalidate_namespace(&transition.rollback_lease)
+                    .map_err(|error| error.to_string())?;
                 knowledge
-                    .adopt_coordinated_vault_path(old_vault.clone())
+                    .adopt_coordinated_vault_path(old_vault.clone(), &old_namespace)
                     .map_err(|error| error.to_string())?;
                 twin.replace_root_path(old_twin.clone())
                     .map_err(|error| error.to_string())?;
-                rebuild_indexes_from_notes(state, &old_notes).await?;
-                let old_secret = transition_store
+                twin.rebuild_mutation_caches()
+                    .map_err(|error| error.to_string())?;
+                rebuild_indexes_from_notes(state, &old_namespace, &old_notes).await?;
+                root_guard
+                    .publish_namespace_ready(&transition.rollback_lease)
+                    .map_err(|error| error.to_string())?;
+                let durable_old_secret = transition_store
                     .resolve_secret(transition.before.openrouter_key_version.as_deref())
                     .map_err(|error| error.to_string())?;
+                let old_secret = runtime_secret_for_authority(
+                    transition.before.openrouter_key_source,
+                    durable_old_secret,
+                    environment_runtime_secret.clone(),
+                );
                 state.settings_service.write().await.publish_runtime_authority(
                     before.clone(),
+                    transition.before.openrouter_key_source,
                     transition.before.openrouter_key_version.clone(),
                     old_secret.clone(),
                 );
+                if transition.before.openrouter_key_source
+                    == crate::services::root_transition::OpenRouterKeySource::Unset
+                {
+                    if let Some(secret) = old_secret.clone() {
+                        state
+                            .settings_service
+                            .write()
+                            .await
+                            .adopt_environment_runtime_secret(secret);
+                    }
+                }
                 state
                     .openrouter
                     .write()
@@ -421,26 +534,119 @@ async fn apply_settings_update_inner(
     result
 }
 
-async fn rebuild_indexes_from_notes(state: &AppState, notes: &[Note]) -> Result<(), String> {
-    {
-        let mut search = state.search_service.write().await;
-        search
+async fn rebuild_indexes_from_notes(
+    state: &AppState,
+    derived_data_path: &std::path::Path,
+    notes: &[Note],
+) -> Result<(), String> {
+    let search_matches = state
+        .search_service
+        .read()
+        .await
+        .uses_data_path(derived_data_path);
+    let chunks_match = state
+        .chunk_index
+        .read()
+        .await
+        .uses_data_path(derived_data_path);
+    let links_match = state
+        .link_discovery
+        .read()
+        .await
+        .uses_data_path(derived_data_path);
+    let optimizer_matches = state
+        .vault_optimizer
+        .read()
+        .await
+        .uses_data_path(derived_data_path);
+    let migration_matches = state
+        .markdown_migration
+        .read()
+        .await
+        .uses_data_path(derived_data_path);
+    let reuse_current = search_matches
+        && chunks_match
+        && links_match
+        && optimizer_matches
+        && migration_matches;
+    if reuse_current {
+        state
+            .search_service
+            .write()
+            .await
             .reindex_all(notes)
             .map_err(|error| error.to_string())?;
-    }
-    {
-        let mut graph = state.graph_index.write().await;
-        graph.build_from_notes(notes);
-    }
-    {
-        let mut chunks = state.chunk_index.write().await;
-        chunks
+        state
+            .chunk_index
+            .write()
+            .await
             .reindex_all(notes)
             .map_err(|error| error.to_string())?;
+        state.graph_index.write().await.build_from_notes(notes);
+        state
+            .link_discovery
+            .write()
+            .await
+            .bootstrap_checked(notes)
+            .map_err(|error| error.to_string())?;
+        state
+            .vault_optimizer
+            .write()
+            .await
+            .reset_for_vault_checked(notes)
+            .map_err(|error| error.to_string())?;
+        return Ok(());
     }
-    crate::commands::rebuild_link_discovery(state, notes).await;
-    state.vault_optimizer.write().await.reset_for_vault(notes);
+    let mut search = crate::services::search::SearchService::new(derived_data_path.to_path_buf())
+        .map_err(|error| error.to_string())?;
+    search
+        .reindex_all(notes)
+        .map_err(|error| error.to_string())?;
+    let mut chunks = crate::services::chunk_index::ChunkIndex::new(derived_data_path.to_path_buf())
+        .map_err(|error| error.to_string())?;
+    chunks
+        .reindex_all(notes)
+        .map_err(|error| error.to_string())?;
+    let mut graph = crate::services::graph_index::GraphIndex::new();
+    graph.build_from_notes(notes);
+    let mut links = crate::services::link_discovery::LinkDiscoveryService::try_new(
+        derived_data_path.to_path_buf(),
+    )
+    .map_err(|error| error.to_string())?;
+    links
+        .bootstrap_checked(notes)
+        .map_err(|error| error.to_string())?;
+    let mut optimizer = crate::services::vault_optimizer::VaultOptimizerService::try_new(
+        derived_data_path.to_path_buf(),
+    )
+    .map_err(|error| error.to_string())?;
+    optimizer
+        .reset_for_vault_checked(notes)
+        .map_err(|error| error.to_string())?;
+    let migration = crate::services::markdown_migration::MarkdownMigrationService::try_new(
+        derived_data_path.to_path_buf(),
+    )
+    .map_err(|error| error.to_string())?;
+
+    *state.search_service.write().await = search;
+    *state.chunk_index.write().await = chunks;
+    *state.graph_index.write().await = graph;
+    *state.link_discovery.write().await = links;
+    *state.vault_optimizer.write().await = optimizer;
+    *state.markdown_migration.write().await = migration;
     Ok(())
+}
+
+fn runtime_secret_for_authority(
+    source: crate::services::root_transition::OpenRouterKeySource,
+    durable_secret: Option<String>,
+    environment_secret: Option<String>,
+) -> Option<String> {
+    match source {
+        crate::services::root_transition::OpenRouterKeySource::Versioned => durable_secret,
+        crate::services::root_transition::OpenRouterKeySource::Unset => environment_secret,
+        crate::services::root_transition::OpenRouterKeySource::Cleared => None,
+    }
 }
 
 /// Complete initial setup
@@ -450,9 +656,35 @@ pub async fn complete_setup(state: State<'_, AppState>) -> Result<(), String> {
 }
 
 async fn complete_setup_inner(state: &AppState) -> Result<(), String> {
-    let _root_epoch = crate::commands::acquire_root_epoch(state).await?;
-    let mut settings = state.settings_service.write().await;
-    settings.complete_setup().map_err(|e| e.to_string())
+    let mut update = vault_update_for_setup();
+    update.setup_completed = Some(true);
+    apply_settings_update(state, update).await.map(|_| ())
+}
+
+
+fn vault_update_for_setup() -> SettingsUpdate {
+    SettingsUpdate {
+        vault_path: None,
+        openrouter_api_key: None,
+        setup_completed: None,
+        theme: None,
+        mcp_enabled: None,
+        llm_model: None,
+        twin_llm_provider: None,
+        ollama_base_url: None,
+        ollama_model: None,
+        smart_web_search: None,
+        background_link_discovery_enabled: None,
+        background_link_discovery_llm_enabled: None,
+        background_vault_optimizer_enabled: None,
+        background_vault_optimizer_llm_enabled: None,
+        background_vault_optimizer_budget_monthly: None,
+        background_vault_optimizer_max_daily_writes: None,
+        background_vault_optimizer_edit_mode: None,
+        background_vault_optimizer_program_enabled: None,
+        vault_optimizer_program_path: None,
+        canvas_model_presets: None,
+    }
 }
 
 /// Open folder picker dialog for vault selection
@@ -633,6 +865,7 @@ mod tests {
             )
             .unwrap(),
         );
+        let derived_data = coordinator.current_namespace_path().unwrap();
         let user_settings = UserSettings {
             vault_path: Some(old_vault.to_string_lossy().into_owned()),
             ..Default::default()
@@ -646,19 +879,35 @@ mod tests {
         };
         let settings =
             crate::services::settings::SettingsService::for_test(config_path, user_settings);
-        let search = if readonly_search {
-            drop(crate::services::search::SearchService::new(data.clone()).unwrap());
-            crate::services::search::SearchService::new_readonly(data.clone()).unwrap()
-        } else {
-            crate::services::search::SearchService::new(data.clone()).unwrap()
-        };
+        if !settings_path_is_directory {
+            settings
+                .root_transition_store()
+                .unwrap()
+                .write_settings_guarded(
+                    &crate::services::root_transition::NonsecretSettingsV1::from_settings(
+                        settings.get().clone(),
+                    ),
+                )
+                .unwrap();
+        }
+        if readonly_search {
+            let candidate_scope =
+                crate::services::twin_events::root_identity_for_path(&new_vault).unwrap();
+            let candidate_derived = crate::services::vault_namespace::scoped_data_path(
+                &data,
+                &candidate_scope,
+            );
+            std::fs::create_dir_all(&candidate_derived).unwrap();
+            std::fs::write(candidate_derived.join("search_index"), b"not-a-directory").unwrap();
+        }
+        let search = crate::services::search::SearchService::new(derived_data.clone()).unwrap();
         let twin_root =
             crate::models::settings::twin_data_path_for_vault(&data, &old_vault).unwrap();
         let state = AppState {
             knowledge_store: Arc::new(RwLock::new(
                 crate::services::knowledge_store::KnowledgeStore::with_event_recorder(
                     old_vault.clone(),
-                    data.clone(),
+                    derived_data.clone(),
                     coordinator.clone(),
                 ),
             )),
@@ -687,16 +936,18 @@ mod tests {
                 crate::services::retrieval::RetrievalService::new(data.clone()),
             )),
             chunk_index: Arc::new(RwLock::new(
-                crate::services::chunk_index::ChunkIndex::new(data.clone()).unwrap(),
+                crate::services::chunk_index::ChunkIndex::new(derived_data.clone()).unwrap(),
             )),
             link_discovery: Arc::new(RwLock::new(
-                crate::services::link_discovery::LinkDiscoveryService::new(data.clone()),
+                crate::services::link_discovery::LinkDiscoveryService::new(derived_data.clone()),
             )),
             markdown_migration: Arc::new(RwLock::new(
-                crate::services::markdown_migration::MarkdownMigrationService::new(data.clone()),
+                crate::services::markdown_migration::MarkdownMigrationService::new(
+                    derived_data.clone(),
+                ),
             )),
             vault_optimizer: Arc::new(RwLock::new(
-                crate::services::vault_optimizer::VaultOptimizerService::new(data.clone()),
+                crate::services::vault_optimizer::VaultOptimizerService::new(derived_data),
             )),
             twin_store: Arc::new(RwLock::new(
                 crate::services::twin::TwinStore::with_event_recorder(
@@ -766,6 +1017,27 @@ mod tests {
             .unwrap()
         );
         drop(twin);
+        let namespace = state
+            .mutation_coordinator
+            .as_ref()
+            .unwrap()
+            .current_namespace_path()
+            .unwrap();
+        assert!(state.search_service.read().await.uses_data_path(&namespace));
+        assert!(state.chunk_index.read().await.uses_data_path(&namespace));
+        assert!(state.link_discovery.read().await.uses_data_path(&namespace));
+        assert!(state.vault_optimizer.read().await.uses_data_path(&namespace));
+        assert!(state
+            .markdown_migration
+            .read()
+            .await
+            .uses_data_path(&namespace));
+        state
+            .mutation_coordinator
+            .as_ref()
+            .unwrap()
+            .require_namespace_ready()
+            .unwrap();
         assert_ne!(comparable_path(old_vault), comparable_path(new_vault));
     }
 
@@ -792,6 +1064,12 @@ mod tests {
             comparable_path(old_vault)
         );
         assert_eq!(state.twin_store.read().await.root_path(), old_twin);
+        state
+            .mutation_coordinator
+            .as_ref()
+            .unwrap()
+            .require_namespace_ready()
+            .unwrap();
     }
 
     #[tokio::test]
@@ -1025,5 +1303,175 @@ mod tests {
         drop(transition);
         task.await.unwrap().unwrap();
         assert!(state.settings_service.read().await.get().setup_completed);
+    }
+
+    #[tokio::test]
+    async fn omitted_key_patch_preserves_environment_runtime_authority() {
+        let (state, root, _old_vault, _new_vault) = root_switch_state(false, false);
+        let runtime_secret = "environment-only-openrouter-secret".to_string();
+        {
+            let mut settings = state.settings_service.write().await;
+            settings.adopt_environment_runtime_secret(runtime_secret.clone());
+        }
+        state
+            .openrouter
+            .write()
+            .await
+            .set_api_key(runtime_secret.clone());
+        let mut update = vault_update(state.knowledge_store.read().await.vault_path());
+        update.vault_path = None;
+        update.theme = Some("dark".into());
+
+        apply_settings_update(&state, update).await.unwrap();
+
+        assert_eq!(
+            state
+                .settings_service
+                .read()
+                .await
+                .openrouter_api_key(),
+            Some(runtime_secret.as_str())
+        );
+        assert!(state
+            .openrouter
+            .read()
+            .await
+            .get_api_key_masked()
+            .is_some());
+        let persisted = std::fs::read_to_string(root.path().join("settings.json")).unwrap();
+        assert!(!persisted.contains(&runtime_secret));
+    }
+
+    #[tokio::test]
+    async fn omitted_key_patch_rollback_restores_environment_runtime_authority() {
+        use crate::services::root_transition::RootTransitionFaultPoint;
+        let (state, _root, _old_vault, new_vault) = root_switch_state(false, false);
+        let runtime_secret = "environment-only-rollback-secret".to_string();
+        {
+            let mut settings = state.settings_service.write().await;
+            settings.adopt_environment_runtime_secret(runtime_secret.clone());
+        }
+        state
+            .openrouter
+            .write()
+            .await
+            .set_api_key(runtime_secret.clone());
+
+        assert!(apply_settings_update_inner(
+            &state,
+            vault_update(&new_vault),
+            Some(RootTransitionFaultPoint::AfterSettings),
+        )
+        .await
+        .is_err());
+        assert_eq!(
+            state
+                .settings_service
+                .read()
+                .await
+                .openrouter_api_key(),
+            Some(runtime_secret.as_str())
+        );
+        assert!(state
+            .openrouter
+            .read()
+            .await
+            .get_api_key_masked()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn stale_process_root_switch_uses_fresh_peer_key_and_settings_authority() {
+        use crate::services::root_transition::{
+            MarkCommittedResult, OpenRouterKeySource, RecoveryWork, RootAuthorityV1,
+            RootTransitionV1,
+        };
+        let (state, _root, old_vault, new_vault) = root_switch_state(false, false);
+        let mut initial_key = vault_update(&old_vault);
+        initial_key.vault_path = None;
+        initial_key.openrouter_api_key = Some("process-one-key".into());
+        apply_settings_update(&state, initial_key).await.unwrap();
+
+        let transition_store = state
+            .settings_service
+            .read()
+            .await
+            .root_transition_store()
+            .unwrap();
+        let peer_events = Arc::new(crate::services::twin_events::TwinEventStore::new(
+            old_vault.parent().unwrap().join("data"),
+        ));
+        peer_events.initialize().unwrap();
+        let peer = crate::services::twin_events::MutationCoordinator::new(
+            old_vault.parent().unwrap().join("data"),
+            &old_vault,
+            peer_events,
+            Arc::new(crate::services::twin_events::NoopMutationLifecycle),
+        )
+        .unwrap();
+        let peer_guard = peer.begin_root_transition().unwrap();
+        let peer_before = transition_store
+            .read_authority_locked(peer_guard.process_lock())
+            .unwrap();
+        let old_key_version = peer_before
+            .authority
+            .openrouter_key_version
+            .clone()
+            .unwrap();
+        let new_key_version = uuid::Uuid::new_v4().to_string();
+        let mut peer_settings = peer_before.settings.clone();
+        peer_settings.mcp_enabled = true;
+        let peer_after = RootAuthorityV1::new_with_key_source(
+            &old_vault,
+            peer_settings,
+            peer_before.authority.lease.clone(),
+            OpenRouterKeySource::Versioned,
+            Some(new_key_version.clone()),
+        )
+        .unwrap();
+        let peer_transition =
+            RootTransitionV1::prepared(peer_before.authority.clone(), peer_after).unwrap();
+        transition_store
+            .prepare_transition_cas_locked(
+                peer_guard.process_lock(),
+                &peer_before,
+                &peer_transition,
+            )
+            .unwrap();
+        transition_store
+            .stage_secret(&new_key_version, "process-two-key")
+            .unwrap();
+        transition_store
+            .write_settings(&peer_transition.after.nonsecret_settings)
+            .unwrap();
+        transition_store
+            .write_key_authority(OpenRouterKeySource::Versioned, Some(&new_key_version))
+            .unwrap();
+        assert!(matches!(
+            transition_store.mark_committed(&peer_transition),
+            MarkCommittedResult::Committed(_)
+        ));
+        transition_store.delete_secret(&old_key_version).unwrap();
+        transition_store.remove_transition().unwrap();
+        drop(peer_guard);
+
+        let updated = apply_settings_update(&state, vault_update(&new_vault))
+            .await
+            .unwrap();
+        assert!(updated.mcp_enabled);
+        assert_eq!(
+            state.settings_service.read().await.openrouter_api_key(),
+            Some("process-two-key")
+        );
+        assert_eq!(
+            transition_store.active_key_version().unwrap().as_deref(),
+            Some(new_key_version.as_str())
+        );
+        assert!(transition_store
+            .resolve_secret(Some(&old_key_version))
+            .unwrap()
+            .is_none());
+        assert_eq!(transition_store.recover().unwrap(), RecoveryWork::None);
+        assert_eq!(transition_store.recover().unwrap(), RecoveryWork::None);
     }
 }

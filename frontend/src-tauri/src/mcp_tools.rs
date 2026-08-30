@@ -13,6 +13,9 @@ use crate::services::memory::MemoryService;
 use crate::services::priority::PriorityScoringService;
 use crate::services::retrieval::RetrievalService;
 use crate::services::search::SearchService;
+use crate::services::twin_events::{
+    ActiveMarkdownRootLeaseV1, CoordinatorProcessLock, MutationCoordinator, MutationError,
+};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, Content, ServerCapabilities, ServerInfo};
@@ -30,13 +33,21 @@ use zip::ZipArchive;
 #[derive(Clone)]
 pub struct GrafynMcpServer {
     pub knowledge_store: Arc<RwLock<KnowledgeStore>>,
-    pub search_service: Arc<RwLock<SearchService>>,
+    pub search_service: Option<Arc<RwLock<SearchService>>>,
     pub graph_index: Arc<RwLock<GraphIndex>>,
     pub memory_service: Arc<RwLock<MemoryService>>,
     pub chunk_index: Option<Arc<RwLock<ChunkIndex>>>,
     pub retrieval_service: Arc<RwLock<RetrievalService>>,
     pub priority_service: Arc<RwLock<PriorityScoringService>>,
+    derived_ready: bool,
+    derived_authority: DerivedAuthority,
     tool_router: ToolRouter<Self>,
+}
+
+#[derive(Clone)]
+struct DerivedAuthority {
+    coordinator: Arc<MutationCoordinator>,
+    expected_epoch: ActiveMarkdownRootLeaseV1,
 }
 
 // ── Tool parameter structs ───────────────────────────────────────────────────
@@ -292,16 +303,20 @@ fn extract_mcp_docx_text(bytes: &[u8]) -> Result<String, String> {
 
 #[tool_router]
 impl GrafynMcpServer {
-    pub fn new(
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_governed_derived_state(
         knowledge_store: Arc<RwLock<KnowledgeStore>>,
-        search_service: Arc<RwLock<SearchService>>,
+        search_service: Option<Arc<RwLock<SearchService>>>,
         graph_index: Arc<RwLock<GraphIndex>>,
         memory_service: Arc<RwLock<MemoryService>>,
         chunk_index: Option<Arc<RwLock<ChunkIndex>>>,
         retrieval_service: Arc<RwLock<RetrievalService>>,
         priority_service: Arc<RwLock<PriorityScoringService>>,
-    ) -> Self {
-        Self {
+        coordinator: Arc<MutationCoordinator>,
+        derived_ready: bool,
+    ) -> Result<Self, MutationError> {
+        let expected_epoch = coordinator.current_root_epoch()?;
+        Ok(Self {
             knowledge_store,
             search_service,
             graph_index,
@@ -309,8 +324,33 @@ impl GrafynMcpServer {
             chunk_index,
             retrieval_service,
             priority_service,
+            derived_ready,
+            derived_authority: DerivedAuthority {
+                coordinator,
+                expected_epoch,
+            },
             tool_router: Self::tool_router(),
+        })
+    }
+
+    fn require_derived_ready(&self) -> Result<CoordinatorProcessLock, CallToolResult> {
+        if !self.derived_ready {
+            return Err(err_result(
+                "Vault-derived indexes are unavailable until Grafyn rebuilds this vault namespace."
+                    .into(),
+            )
+            .expect("tool result construction is infallible"));
         }
+        self.derived_authority
+            .coordinator
+            .acquire_ready_namespace_guard(&self.derived_authority.expected_epoch)
+            .map_err(|_| {
+                err_result(
+                    "Vault-derived indexes are unavailable until Grafyn rebuilds this vault namespace."
+                        .into(),
+                )
+                .expect("tool result construction is infallible")
+            })
     }
 
     #[tool(
@@ -380,8 +420,8 @@ impl GrafynMcpServer {
         match ks.create_note_from_source(create, "mcp") {
             Ok(note) => {
                 // Update search index (if writable)
-                {
-                    let mut search = self.search_service.write().await;
+                if let Some(search_service) = &self.search_service {
+                    let mut search = search_service.write().await;
                     let _ = index_commit::index_note_for_search(&mut search, &note);
                     let _ = index_commit::commit_search(&mut search);
                 }
@@ -428,8 +468,8 @@ impl GrafynMcpServer {
         match ks.update_note_from_source(&id, update, "mcp") {
             Ok(note) => {
                 // Update search index (if writable)
-                {
-                    let mut search = self.search_service.write().await;
+                if let Some(search_service) = &self.search_service {
+                    let mut search = search_service.write().await;
                     let _ = index_commit::index_note_for_search(&mut search, &note);
                     let _ = index_commit::commit_search(&mut search);
                 }
@@ -462,8 +502,8 @@ impl GrafynMcpServer {
         match ks.delete_note_from_source(&params.id, "mcp") {
             Ok(()) => {
                 // Update search index (if writable)
-                {
-                    let mut search = self.search_service.write().await;
+                if let Some(search_service) = &self.search_service {
+                    let mut search = search_service.write().await;
                     let _ = index_commit::remove_note_for_search(&mut search, &params.id);
                     let _ = index_commit::commit_search(&mut search);
                 }
@@ -486,7 +526,14 @@ impl GrafynMcpServer {
         &self,
         Parameters(params): Parameters<SearchParams>,
     ) -> Result<CallToolResult, McpError> {
-        let search = self.search_service.read().await;
+        let _derived_guard = match self.require_derived_ready() {
+            Ok(guard) => guard,
+            Err(result) => return Ok(result),
+        };
+        let Some(search_service) = &self.search_service else {
+            return err_result("Vault-derived search index is unavailable.".into());
+        };
+        let search = search_service.read().await;
         match search.search(&params.query, params.limit) {
             Ok(results) => {
                 let response: Vec<serde_json::Value> = results
@@ -515,6 +562,10 @@ impl GrafynMcpServer {
         &self,
         Parameters(params): Parameters<BacklinksParams>,
     ) -> Result<CallToolResult, McpError> {
+        let _derived_guard = match self.require_derived_ready() {
+            Ok(guard) => guard,
+            Err(result) => return Ok(result),
+        };
         let graph = self.graph_index.read().await;
         let backlinks = graph.get_typed_backlinks(&params.note_id);
         let response: Vec<TypedNoteMetaResponse> = backlinks
@@ -537,6 +588,10 @@ impl GrafynMcpServer {
         &self,
         Parameters(params): Parameters<OutgoingParams>,
     ) -> Result<CallToolResult, McpError> {
+        let _derived_guard = match self.require_derived_ready() {
+            Ok(guard) => guard,
+            Err(result) => return Ok(result),
+        };
         let graph = self.graph_index.read().await;
         let outgoing = graph.get_typed_outgoing(&params.note_id);
         let response: Vec<TypedNoteMetaResponse> = outgoing
@@ -680,11 +735,13 @@ impl GrafynMcpServer {
             }
         }
         if !created_notes.is_empty() {
-            let mut search = self.search_service.write().await;
-            for note in &created_notes {
-                let _ = index_commit::index_note_for_search(&mut search, note);
+            if let Some(search_service) = &self.search_service {
+                let mut search = search_service.write().await;
+                for note in &created_notes {
+                    let _ = index_commit::index_note_for_search(&mut search, note);
+                }
+                let _ = index_commit::commit_search(&mut search);
             }
-            let _ = index_commit::commit_search(&mut search);
         }
         {
             let mut graph = self.graph_index.write().await;
@@ -713,6 +770,10 @@ impl GrafynMcpServer {
         &self,
         Parameters(params): Parameters<RecallParams>,
     ) -> Result<CallToolResult, McpError> {
+        let _derived_guard = match self.require_derived_ready() {
+            Ok(guard) => guard,
+            Err(result) => return Ok(result),
+        };
         // If token_budget is set and chunk index is available, use chunk retrieval
         if let (Some(budget), Some(chunk_index)) = (params.token_budget, &self.chunk_index) {
             let chunk_index = chunk_index.read().await;
@@ -747,7 +808,10 @@ impl GrafynMcpServer {
             }
         } else {
             // Note-level recall (original behavior)
-            let search = self.search_service.read().await;
+            let Some(search_service) = &self.search_service else {
+                return err_result("Vault-derived search index is unavailable.".into());
+            };
+            let search = search_service.read().await;
             let graph = self.graph_index.read().await;
             let memory = self.memory_service.read().await;
 
@@ -787,6 +851,10 @@ impl GrafynMcpServer {
         &self,
         Parameters(params): Parameters<SearchChunksParams>,
     ) -> Result<CallToolResult, McpError> {
+        let _derived_guard = match self.require_derived_ready() {
+            Ok(guard) => guard,
+            Err(result) => return Ok(result),
+        };
         let Some(chunk_index) = &self.chunk_index else {
             return err_result(
                 "Chunk index not available. Run the Grafyn app first to build it.".into(),
@@ -854,7 +922,14 @@ mod tests {
     };
     use tempfile::tempdir;
 
-    fn test_server(root: &Path) -> (GrafynMcpServer, Arc<TwinEventStore>, std::path::PathBuf) {
+    fn test_server(
+        root: &Path,
+    ) -> (
+        GrafynMcpServer,
+        Arc<TwinEventStore>,
+        std::path::PathBuf,
+        Arc<MutationCoordinator>,
+    ) {
         let vault = root.join("vault");
         let data = root.join("data");
         std::fs::create_dir(&vault).unwrap();
@@ -870,26 +945,31 @@ mod tests {
             )
             .unwrap(),
         );
-        let server = GrafynMcpServer::new(
+        let server = GrafynMcpServer::new_with_governed_derived_state(
             Arc::new(RwLock::new(KnowledgeStore::with_event_recorder(
                 vault,
                 data.clone(),
-                coordinator,
+                coordinator.clone(),
             ))),
-            Arc::new(RwLock::new(SearchService::new(data.clone()).unwrap())),
+            Some(Arc::new(RwLock::new(
+                SearchService::new(data.clone()).unwrap(),
+            ))),
             Arc::new(RwLock::new(GraphIndex::new())),
             Arc::new(RwLock::new(MemoryService::new())),
             None,
             Arc::new(RwLock::new(RetrievalService::new(data.clone()))),
             Arc::new(RwLock::new(PriorityScoringService::new(data.clone()))),
-        );
-        (server, events, data)
+            coordinator.clone(),
+            true,
+        )
+        .unwrap();
+        (server, events, data, coordinator)
     }
 
     #[tokio::test]
     async fn mcp_crud_and_import_share_coordinated_groups_without_duplicates() {
         let root = tempdir().unwrap();
-        let (server, events, data) = test_server(root.path());
+        let (server, events, data, _coordinator) = test_server(root.path());
 
         server
             .create_note(Parameters(CreateNoteParams {
@@ -953,5 +1033,112 @@ mod tests {
             .all(|event| event.context.source_channel.as_str() == "import"));
         assert_eq!(captured[3].device_sequence + 1, captured[4].device_sequence);
         assert!(captured[4].causal_parents.contains(&captured[3].event_id));
+    }
+
+    #[tokio::test]
+    async fn mismatched_namespace_allows_authoritative_notes_but_blocks_derived_tools() {
+        let root = tempdir().unwrap();
+        let (mut server, _events, _data, _coordinator) = test_server(root.path());
+        server.derived_ready = false;
+        server.search_service = None;
+
+        server
+            .create_note(Parameters(CreateNoteParams {
+                title: "Still authoritative".into(),
+                content: "durable bytes".into(),
+                tags: Vec::new(),
+                status: "draft".into(),
+            }))
+            .await
+            .unwrap();
+        let listed = server.list_notes().await.unwrap();
+        assert!(format!("{listed:?}").contains("still-authoritative"));
+
+        let search = server
+            .search_notes(Parameters(SearchParams {
+                query: "authoritative".into(),
+                limit: 10,
+            }))
+            .await
+            .unwrap();
+        let backlinks = server
+            .get_backlinks(Parameters(BacklinksParams {
+                note_id: "still-authoritative".into(),
+            }))
+            .await
+            .unwrap();
+        let recall = server
+            .recall_relevant(Parameters(RecallParams {
+                query: "authoritative".into(),
+                context_note_ids: Vec::new(),
+                limit: 10,
+                token_budget: None,
+            }))
+            .await
+            .unwrap();
+        for result in [search, backlinks, recall] {
+            assert!(format!("{result:?}").contains("Vault-derived indexes are unavailable"));
+        }
+    }
+
+    #[test]
+    fn mcp_server_has_no_static_derived_readiness_constructor() {
+        let source = include_str!("mcp_tools.rs");
+        assert!(!source.contains("    pub fn new(\n"));
+        assert!(source.contains("pub fn new_with_governed_derived_state("));
+    }
+
+    #[tokio::test]
+    async fn running_mcp_rejects_every_derived_read_after_the_root_epoch_changes() {
+        let root = tempdir().unwrap();
+        let (server, _events, _data, coordinator) = test_server(root.path());
+        server.require_derived_ready().unwrap();
+
+        let next_vault = root.path().join("next-vault");
+        std::fs::create_dir(&next_vault).unwrap();
+        coordinator.retarget_markdown_root(&next_vault).unwrap();
+
+        assert!(server.require_derived_ready().is_err());
+        let results = [
+            server
+                .search_notes(Parameters(SearchParams {
+                    query: "stale".into(),
+                    limit: 10,
+                }))
+                .await
+                .unwrap(),
+            server
+                .get_backlinks(Parameters(BacklinksParams {
+                    note_id: "stale".into(),
+                }))
+                .await
+                .unwrap(),
+            server
+                .get_outgoing(Parameters(OutgoingParams {
+                    note_id: "stale".into(),
+                }))
+                .await
+                .unwrap(),
+            server
+                .recall_relevant(Parameters(RecallParams {
+                    query: "stale".into(),
+                    context_note_ids: Vec::new(),
+                    limit: 10,
+                    token_budget: None,
+                }))
+                .await
+                .unwrap(),
+            server
+                .search_chunks(Parameters(SearchChunksParams {
+                    query: "stale".into(),
+                    token_budget: 100,
+                    context_note_ids: Vec::new(),
+                }))
+                .await
+                .unwrap(),
+        ];
+        assert!(results
+            .iter()
+            .all(|result| format!("{result:?}").contains("Vault-derived indexes are unavailable")));
     }
 }

@@ -75,47 +75,58 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::new(NoopMutationLifecycle),
     )?);
     mutation_coordinator.recover_pending()?;
+    let derived_data_path = mutation_coordinator.current_namespace_path()?;
+    let derived_ready = mutation_coordinator.require_namespace_ready().is_ok();
 
     // Initialize services
-    let knowledge_store =
-        KnowledgeStore::with_event_recorder(vault_path, data_path.clone(), mutation_coordinator);
+    let knowledge_store = KnowledgeStore::with_event_recorder(
+        vault_path,
+        derived_data_path.clone(),
+        mutation_coordinator.clone(),
+    );
 
-    // Try full SearchService first; fall back to read-only if writer lock is held
-    let search_service = match SearchService::new(data_path.clone()) {
-        Ok(s) => {
-            log::info!("Search service initialized with write access");
-            s
-        }
-        Err(e) => {
-            log::warn!(
-                "Could not acquire search writer (Grafyn app may be running): {}. \
-                 Falling back to read-only search.",
-                e
-            );
-            match SearchService::new_readonly(data_path.clone()) {
-                Ok(s) => {
-                    log::info!("Search service initialized in read-only mode");
-                    s
-                }
-                Err(e2) => {
-                    log::error!("Failed to open search index: {}", e2);
-                    log::info!("Starting without search — create/update will skip indexing");
-                    // Create a minimal writable service as last resort
-                    SearchService::new(data_path.clone())?
+    // A namespace without the matching durable readiness marker may still serve
+    // authoritative note CRUD, but must never expose global or stale indexes.
+    let search_service = if derived_ready {
+        match SearchService::new(derived_data_path.clone()) {
+            Ok(service) => {
+                log::info!("Search service initialized with write access");
+                Some(service)
+            }
+            Err(error) => {
+                log::warn!(
+                    "Could not acquire search writer (Grafyn app may be running): {}. \
+                     Falling back to read-only search.",
+                    error
+                );
+                match SearchService::new_readonly(derived_data_path.clone()) {
+                    Ok(service) => {
+                        log::info!("Search service initialized in read-only mode");
+                        Some(service)
+                    }
+                    Err(read_error) => {
+                        log::error!("Failed to open scoped search index: {}", read_error);
+                        None
+                    }
                 }
             }
         }
+    } else {
+        log::warn!("Vault-derived namespace is not ready; derived MCP tools are unavailable");
+        None
     };
 
-    // Build graph index from notes
+    // Graph data is derived and is admitted only with the same ready namespace.
     let mut graph_index = GraphIndex::new();
-    let notes_for_graph: Vec<_> = knowledge_store
-        .list_notes()
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|m| knowledge_store.get_note(&m.id).ok())
-        .collect();
-    graph_index.build_from_notes(&notes_for_graph);
+    if derived_ready {
+        let notes_for_graph: Vec<_> = knowledge_store
+            .list_notes()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|metadata| knowledge_store.get_note(&metadata.id).ok())
+            .collect();
+        graph_index.build_from_notes(&notes_for_graph);
+    }
     log::info!(
         "Graph index built: {} notes, {} links",
         graph_index.stats().total_notes,
@@ -127,30 +138,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let retrieval_service = RetrievalService::new(data_path.clone());
 
     // Try to open chunk index (read-only — Tauri app may hold the writer lock)
-    let chunk_index = match ChunkIndex::new_readonly(data_path.clone()) {
-        Ok(ci) => {
-            log::info!("Chunk index opened in read-only mode");
-            Some(Arc::new(RwLock::new(ci)))
-        }
-        Err(e) => {
-            log::warn!(
+    let chunk_index = if derived_ready {
+        match ChunkIndex::new_readonly(derived_data_path.clone()) {
+            Ok(ci) => {
+                log::info!("Chunk index opened in read-only mode");
+                Some(Arc::new(RwLock::new(ci)))
+            }
+            Err(e) => {
+                log::warn!(
                 "Chunk index not available: {}. search_chunks and chunk recall will be disabled.",
                 e
             );
-            None
+                None
+            }
         }
+    } else {
+        None
     };
 
     // Create MCP server
-    let server = GrafynMcpServer::new(
+    let server = GrafynMcpServer::new_with_governed_derived_state(
         Arc::new(RwLock::new(knowledge_store)),
-        Arc::new(RwLock::new(search_service)),
+        search_service.map(|service| Arc::new(RwLock::new(service))),
         Arc::new(RwLock::new(graph_index)),
         Arc::new(RwLock::new(memory_service)),
         chunk_index,
         Arc::new(RwLock::new(retrieval_service)),
         Arc::new(RwLock::new(priority_service)),
-    );
+        mutation_coordinator,
+        derived_ready,
+    )?;
 
     log::info!("Starting Grafyn MCP server on stdio...");
 

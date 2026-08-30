@@ -9,6 +9,7 @@ use crate::services::atomic_io::write_atomic;
 use crate::services::retrieval::RetrievalResult;
 use crate::services::similarity::{sparse_cosine, SimilarityProvider, TfIdfProvider};
 use crate::services::yake::{self, YakeConfig, STOPWORDS};
+use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use lazy_static::lazy_static;
 use regex::Regex;
@@ -194,10 +195,22 @@ pub struct LinkDiscoveryService {
 
 impl LinkDiscoveryService {
     pub fn new(data_path: PathBuf) -> Self {
+        Self::try_new(data_path).unwrap_or_else(|error| {
+            log::error!("Failed to initialize link discovery state: {error}");
+            Self::empty()
+        })
+    }
+
+    pub(crate) fn try_new(data_path: PathBuf) -> Result<Self> {
         let base_dir = data_path.join("link_discovery");
         let notes_dir = base_dir.join("notes");
         let queue_path = base_dir.join("queue.json");
-        let _ = std::fs::create_dir_all(&notes_dir);
+        std::fs::create_dir_all(&notes_dir).with_context(|| {
+            format!(
+                "Failed to create link discovery directory {}",
+                notes_dir.display()
+            )
+        })?;
 
         let mut service = Self {
             notes_dir,
@@ -209,11 +222,34 @@ impl LinkDiscoveryService {
             last_run_at: None,
             current_note_id: None,
         };
-        service.load_from_disk();
-        service
+        service.load_from_disk_checked()?;
+        Ok(service)
+    }
+
+    fn empty() -> Self {
+        Self {
+            notes_dir: PathBuf::new(),
+            queue_path: PathBuf::new(),
+            profiles: HashMap::new(),
+            stored_notes: HashMap::new(),
+            queue: Vec::new(),
+            sweep_cursor: 0,
+            last_run_at: None,
+            current_note_id: None,
+        }
+    }
+
+    pub(crate) fn uses_data_path(&self, data_path: &std::path::Path) -> bool {
+        self.notes_dir == data_path.join("link_discovery").join("notes")
     }
 
     pub fn bootstrap(&mut self, notes: &[Note]) {
+        if let Err(error) = self.bootstrap_checked(notes) {
+            log::error!("Failed to persist link discovery bootstrap: {error}");
+        }
+    }
+
+    pub(crate) fn bootstrap_checked(&mut self, notes: &[Note]) -> Result<()> {
         let actual_ids: HashSet<String> = notes.iter().map(|note| note.id.clone()).collect();
         let title_to_id = build_reference_index(notes);
 
@@ -244,7 +280,7 @@ impl LinkDiscoveryService {
 
             self.profiles.insert(note.id.clone(), profile.clone());
             self.stored_notes.insert(note.id.clone(), record.clone());
-            self.persist_note_record(&note.id);
+            self.persist_note_record_checked(&note.id)?;
 
             if content_changed {
                 self.enqueue(note.id.clone(), QueuePriority::Dirty);
@@ -263,10 +299,11 @@ impl LinkDiscoveryService {
             .cloned()
             .collect::<Vec<_>>();
         for note_id in deleted_ids {
-            self.remove_note(&note_id);
+            self.remove_note_checked(&note_id)?;
         }
 
-        self.persist_queue_state();
+        self.persist_queue_state_checked()?;
+        Ok(())
     }
 
     pub fn sync_note(&mut self, note: &Note) {
@@ -324,6 +361,12 @@ impl LinkDiscoveryService {
     }
 
     pub fn remove_note(&mut self, note_id: &str) {
+        if let Err(error) = self.remove_note_checked(note_id) {
+            log::error!("Failed to remove link discovery note '{note_id}': {error}");
+        }
+    }
+
+    fn remove_note_checked(&mut self, note_id: &str) -> Result<()> {
         self.profiles.remove(note_id);
         self.stored_notes.remove(note_id);
         self.queue.retain(|queued| queued.note_id != note_id);
@@ -333,9 +376,12 @@ impl LinkDiscoveryService {
             .filter(|current| current != note_id);
 
         let file_path = self.note_file_path(note_id);
-        if file_path.exists() {
-            let _ = std::fs::remove_file(&file_path);
+        match std::fs::remove_file(&file_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
         }
+        Ok(())
     }
 
     pub fn record_links_applied(&mut self, note_id: &str, target_ids: &[String]) {
@@ -720,48 +766,67 @@ impl LinkDiscoveryService {
         }
     }
 
-    fn load_from_disk(&mut self) {
-        if self.notes_dir.exists() {
-            if let Ok(entries) = std::fs::read_dir(&self.notes_dir) {
-                for entry in entries.flatten() {
+    fn load_from_disk_checked(&mut self) -> Result<()> {
+        match std::fs::read_dir(&self.notes_dir) {
+            Ok(entries) => {
+                for entry in entries {
+                    let entry = entry?;
                     let path = entry.path();
                     if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
                         continue;
                     }
-
-                    if let Ok(contents) = std::fs::read_to_string(&path) {
-                        if let Ok(record) = serde_json::from_str::<StoredDiscoveryNote>(&contents) {
-                            let note_id = record.profile.note_id.clone();
-                            self.profiles
-                                .insert(note_id.clone(), record.profile.clone());
-                            self.stored_notes.insert(note_id, record);
-                        }
-                    }
+                    let contents = std::fs::read_to_string(&path)
+                        .with_context(|| format!("Failed to read {}", path.display()))?;
+                    let record = serde_json::from_str::<StoredDiscoveryNote>(&contents)
+                        .with_context(|| format!("Invalid link discovery record {}", path.display()))?;
+                    let note_id = record.profile.note_id.clone();
+                    self.profiles
+                        .insert(note_id.clone(), record.profile.clone());
+                    self.stored_notes.insert(note_id, record);
                 }
             }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
         }
 
-        if self.queue_path.exists() {
-            if let Ok(contents) = std::fs::read_to_string(&self.queue_path) {
-                if let Ok(state) = serde_json::from_str::<PersistedQueueState>(&contents) {
-                    self.queue = state.queue;
-                    self.sweep_cursor = state.sweep_cursor;
-                    self.last_run_at = state.last_run_at;
-                }
+        match std::fs::read_to_string(&self.queue_path) {
+            Ok(contents) => {
+                let state = serde_json::from_str::<PersistedQueueState>(&contents).with_context(
+                    || format!("Invalid link discovery queue {}", self.queue_path.display()),
+                )?;
+                self.queue = state.queue;
+                self.sweep_cursor = state.sweep_cursor;
+                self.last_run_at = state.last_run_at;
             }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
         }
+        Ok(())
     }
 
     fn persist_note_record(&self, note_id: &str) {
-        if let Some(record) = self.stored_notes.get(note_id) {
-            let path = self.note_file_path(note_id);
-            if let Ok(contents) = serde_json::to_string_pretty(record) {
-                let _ = write_atomic(&path, contents.as_bytes());
-            }
+        if let Err(error) = self.persist_note_record_checked(note_id) {
+            log::error!("Failed to persist link discovery note '{note_id}': {error}");
         }
     }
 
+    fn persist_note_record_checked(&self, note_id: &str) -> Result<()> {
+        let Some(record) = self.stored_notes.get(note_id) else {
+            return Ok(());
+        };
+        let path = self.note_file_path(note_id);
+        let contents = serde_json::to_string_pretty(record)?;
+        write_atomic(&path, contents.as_bytes())?;
+        Ok(())
+    }
+
     fn persist_queue_state(&self) {
+        if let Err(error) = self.persist_queue_state_checked() {
+            log::error!("Failed to persist link discovery queue: {error}");
+        }
+    }
+
+    fn persist_queue_state_checked(&self) -> Result<()> {
         let state = PersistedQueueState {
             queue: self.queue.clone(),
             sweep_cursor: self.sweep_cursor,
@@ -769,12 +834,11 @@ impl LinkDiscoveryService {
         };
 
         if let Some(parent) = self.queue_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+            std::fs::create_dir_all(parent)?;
         }
-
-        if let Ok(contents) = serde_json::to_string_pretty(&state) {
-            let _ = write_atomic(&self.queue_path, contents.as_bytes());
-        }
+        let contents = serde_json::to_string_pretty(&state)?;
+        write_atomic(&self.queue_path, contents.as_bytes())?;
+        Ok(())
     }
 
     fn note_file_path(&self, note_id: &str) -> PathBuf {

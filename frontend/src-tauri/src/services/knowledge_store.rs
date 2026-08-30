@@ -139,13 +139,27 @@ impl KnowledgeStore {
         Ok(())
     }
 
-    pub(crate) fn adopt_coordinated_vault_path(&mut self, vault_path: PathBuf) -> Result<()> {
+    pub(crate) fn adopt_coordinated_vault_path(
+        &mut self,
+        vault_path: PathBuf,
+        derived_data_path: &Path,
+    ) -> Result<()> {
         crate::services::twin_events::validate_real_directory(&vault_path, "vault directory")
             .map_err(anyhow::Error::new)?;
         self.vault_path = std::fs::canonicalize(&vault_path).with_context(|| {
             format!(
                 "Failed to canonicalize vault directory {}",
                 vault_path.display()
+            )
+        })?;
+        self.overlay_notes_dir = derived_data_path
+            .join("vault_migration")
+            .join("overlay")
+            .join("notes");
+        std::fs::create_dir_all(&self.overlay_notes_dir).with_context(|| {
+            format!(
+                "Failed to prepare scoped overlay directory {}",
+                self.overlay_notes_dir.display()
             )
         })?;
         self.refresh_cache();
@@ -830,11 +844,12 @@ impl KnowledgeStore {
         }
     }
 
-    pub(crate) fn put_vault_file_target_only(
+    pub(crate) fn put_vault_file_target_only_expected(
         &mut self,
         relative_path: &str,
         bytes: &[u8],
         source: &str,
+        expected_before: Option<crate::services::twin_events::BeforeImage>,
     ) -> Result<()> {
         let relative_path = normalize_note_relative_path(relative_path)?;
         let after = std::str::from_utf8(bytes)
@@ -842,6 +857,19 @@ impl KnowledgeStore {
             .to_string();
         if self.event_recorder.is_noop() {
             let path = self.resolve_vault_relative_path(&relative_path)?;
+            if let Some(expected) = expected_before.as_ref() {
+                let current = before_image_for_path(&path)?;
+                if current
+                    == crate::services::twin_events::BeforeImage::Sha256(
+                        crate::services::twin_events::digest_bytes(bytes),
+                    )
+                {
+                    return Ok(());
+                }
+                if &current != expected {
+                    anyhow::bail!("conditional Markdown target changed: {relative_path}");
+                }
+            }
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
@@ -852,14 +880,19 @@ impl KnowledgeStore {
         let recorder = self.event_recorder.clone();
         let source_channel = crate::models::twin_event::SourceChannel::parse(source)
             .map_err(anyhow::Error::msg)?;
+        let target = crate::services::twin_events::TargetMutation::put(
+            crate::services::twin_events::TargetKind::Markdown,
+            relative_path,
+            after,
+        );
+        let target = match expected_before {
+            Some(expected) => target.expecting(expected),
+            None => target,
+        };
         let mut plan = Some(crate::services::twin_events::MutationPlan::new(
             crate::models::twin_event::CausalStream::LocalOnly,
             source_channel,
-            vec![crate::services::twin_events::TargetMutation::put(
-                crate::services::twin_events::TargetKind::Markdown,
-                relative_path,
-                after,
-            )],
+            vec![target],
             Vec::new(),
         ));
         let result = recorder.commit_planned_mutation(
@@ -875,9 +908,27 @@ impl KnowledgeStore {
         relative_path: &str,
         source: &str,
     ) -> Result<()> {
+        self.delete_vault_file_target_only_expected(relative_path, source, None)
+    }
+
+    pub(crate) fn delete_vault_file_target_only_expected(
+        &mut self,
+        relative_path: &str,
+        source: &str,
+        expected_before: Option<crate::services::twin_events::BeforeImage>,
+    ) -> Result<()> {
         let relative_path = normalize_note_relative_path(relative_path)?;
         if self.event_recorder.is_noop() {
             let path = self.resolve_vault_relative_path(&relative_path)?;
+            if let Some(expected) = expected_before.as_ref() {
+                let current = before_image_for_path(&path)?;
+                if current == crate::services::twin_events::BeforeImage::Absent {
+                    return Ok(());
+                }
+                if &current != expected {
+                    anyhow::bail!("conditional Markdown target changed: {relative_path}");
+                }
+            }
             match std::fs::remove_file(path) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -889,13 +940,18 @@ impl KnowledgeStore {
         let recorder = self.event_recorder.clone();
         let source_channel = crate::models::twin_event::SourceChannel::parse(source)
             .map_err(anyhow::Error::msg)?;
+        let target = crate::services::twin_events::TargetMutation::tombstone(
+            crate::services::twin_events::TargetKind::Markdown,
+            relative_path,
+        );
+        let target = match expected_before {
+            Some(expected) => target.expecting(expected),
+            None => target,
+        };
         let mut plan = Some(crate::services::twin_events::MutationPlan::new(
             crate::models::twin_event::CausalStream::LocalOnly,
             source_channel,
-            vec![crate::services::twin_events::TargetMutation::tombstone(
-                crate::services::twin_events::TargetKind::Markdown,
-                relative_path,
-            )],
+            vec![target],
             Vec::new(),
         ));
         let result = recorder.commit_planned_mutation(
@@ -904,6 +960,36 @@ impl KnowledgeStore {
         );
         self.refresh_cache();
         result.map(|_| ()).map_err(anyhow::Error::new)
+    }
+
+    pub(crate) fn validate_vault_file_target(
+        &mut self,
+        relative_path: &str,
+        expected: crate::services::twin_events::BeforeImage,
+    ) -> Result<()> {
+        let relative_path = normalize_note_relative_path(relative_path)?;
+        let recorder = self.event_recorder.clone();
+        let mut planner = || {
+            let path = self.resolve_vault_relative_path(&relative_path).map_err(|error| {
+                crate::services::twin_events::MutationError::Invalid(error.to_string())
+            })?;
+            let current = before_image_for_path(&path).map_err(|error| {
+                crate::services::twin_events::MutationError::Io(error.to_string())
+            })?;
+            if current != expected {
+                return Err(crate::services::twin_events::MutationError::RecoveryConflict(
+                    format!("conditional Markdown target changed: {relative_path}"),
+                ));
+            }
+            Ok(None)
+        };
+        recorder
+            .commit_planned_mutation(
+                crate::services::twin_events::MutationOrigin::Local,
+                &mut planner,
+            )
+            .map(|_| ())
+            .map_err(anyhow::Error::new)
     }
 
     pub fn delete_note(&mut self, id: &str) -> Result<()> {
@@ -1736,6 +1822,20 @@ fn normalize_note_relative_path(value: &str) -> Result<String> {
         Ok(normalized)
     } else {
         Ok(format!("{}.md", normalized))
+    }
+}
+
+fn before_image_for_path(
+    path: &Path,
+) -> Result<crate::services::twin_events::BeforeImage> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(crate::services::twin_events::BeforeImage::Sha256(
+            crate::services::twin_events::digest_bytes(&bytes),
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(crate::services::twin_events::BeforeImage::Absent)
+        }
+        Err(error) => Err(error.into()),
     }
 }
 

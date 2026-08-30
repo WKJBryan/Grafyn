@@ -8,6 +8,7 @@ use tantivy::{doc, Index, IndexReader, IndexWriter, ReloadPolicy};
 
 /// Full-text search service using Tantivy
 pub struct SearchService {
+    index_path: PathBuf,
     index: Index,
     reader: IndexReader,
     writer: Option<IndexWriter>,
@@ -54,6 +55,7 @@ impl SearchService {
             .context("Failed to create index writer")?;
 
         Ok(Self {
+            index_path,
             index,
             reader,
             writer: Some(writer),
@@ -101,6 +103,7 @@ impl SearchService {
             .context("Failed to create index reader")?;
 
         Ok(Self {
+            index_path,
             index,
             reader,
             writer: None, // No writer — read-only mode
@@ -110,6 +113,10 @@ impl SearchService {
             tags_field,
             status_field,
         })
+    }
+
+    pub(crate) fn uses_data_path(&self, data_path: &std::path::Path) -> bool {
+        self.index_path == data_path.join("search_index")
     }
 
     /// Whether this service has write capabilities (index updates).

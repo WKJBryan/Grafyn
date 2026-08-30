@@ -92,20 +92,32 @@ pub struct VaultOptimizerService {
 
 impl VaultOptimizerService {
     pub fn new(data_path: PathBuf) -> Self {
+        let fallback_path = data_path.clone();
+        Self::try_new(data_path).unwrap_or_else(|error| {
+            log::error!("Failed to initialize vault optimizer state: {error}");
+            Self::empty_at(fallback_path)
+        })
+    }
+
+    pub(crate) fn try_new(data_path: PathBuf) -> Result<Self> {
         let optimizer_dir = data_path.join("vault_migration").join("optimizer");
         let queue_path = optimizer_dir.join("queue.json");
         let decisions_path = optimizer_dir.join("decisions.json");
         let inbox_path = optimizer_dir.join("inbox.json");
         let events_path = optimizer_dir.join("events.jsonl");
         let changes_dir = optimizer_dir.join("changes");
-        let _ = std::fs::create_dir_all(&changes_dir);
+        std::fs::create_dir_all(&changes_dir)?;
 
-        let state = std::fs::read_to_string(&queue_path)
-            .ok()
-            .and_then(|content| serde_json::from_str::<OptimizerState>(&content).ok())
-            .unwrap_or_default();
+        let state = match std::fs::read_to_string(&queue_path) {
+            Ok(content) => serde_json::from_str::<OptimizerState>(&content)
+                .with_context(|| format!("Invalid optimizer queue {}", queue_path.display()))?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                OptimizerState::default()
+            }
+            Err(error) => return Err(error.into()),
+        };
 
-        Self {
+        let service = Self {
             optimizer_dir,
             queue_path,
             decisions_path,
@@ -113,24 +125,96 @@ impl VaultOptimizerService {
             events_path,
             changes_dir,
             state,
+        };
+        service.validate_persisted_state()?;
+        Ok(service)
+    }
+
+    fn empty_at(data_path: PathBuf) -> Self {
+        let optimizer_dir = data_path.join("vault_migration").join("optimizer");
+        Self {
+            queue_path: optimizer_dir.join("queue.json"),
+            decisions_path: optimizer_dir.join("decisions.json"),
+            inbox_path: optimizer_dir.join("inbox.json"),
+            events_path: optimizer_dir.join("events.jsonl"),
+            changes_dir: optimizer_dir.join("changes"),
+            optimizer_dir,
+            state: OptimizerState::default(),
         }
     }
 
+    pub(crate) fn uses_data_path(&self, data_path: &std::path::Path) -> bool {
+        self.optimizer_dir == data_path.join("vault_migration").join("optimizer")
+    }
+
     pub fn bootstrap(&mut self, notes: &[Note]) {
+        if let Err(error) = self.bootstrap_checked(notes) {
+            log::error!("Failed to persist vault optimizer bootstrap: {error}");
+        }
+    }
+
+    pub(crate) fn bootstrap_checked(&mut self, notes: &[Note]) -> Result<()> {
         if self.state.queue.is_empty() {
             for note in notes.iter().filter(|note| !note.is_topic_hub()) {
                 self.enqueue_note(&note.id, "bootstrap");
             }
-            let _ = self.persist_state();
+            self.persist_state()?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_for_vault(&mut self, notes: &[Note]) {
+        if let Err(error) = self.reset_for_vault_checked(notes) {
+            log::error!("Failed to reset vault optimizer state: {error}");
         }
     }
 
-    pub(crate) fn reset_for_vault(&mut self, notes: &[Note]) {
+    pub(crate) fn reset_for_vault_checked(&mut self, notes: &[Note]) -> Result<()> {
         self.state.queue.clear();
         for note in notes.iter().filter(|note| !note.is_topic_hub()) {
             self.enqueue_note(&note.id, "bootstrap");
         }
-        let _ = self.persist_state();
+        self.persist_state()
+    }
+
+    fn validate_persisted_state(&self) -> Result<()> {
+        for path in [&self.decisions_path, &self.inbox_path] {
+            match std::fs::read_to_string(path) {
+                Ok(content) => {
+                    serde_json::from_str::<Vec<Value>>(&content)
+                        .with_context(|| format!("Invalid optimizer state {}", path.display()))?;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        match std::fs::read_to_string(&self.events_path) {
+            Ok(content) => {
+                for (index, line) in content.lines().enumerate() {
+                    serde_json::from_str::<Value>(line).with_context(|| {
+                        format!(
+                            "Invalid optimizer event {} at line {}",
+                            self.events_path.display(),
+                            index + 1
+                        )
+                    })?;
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        for entry in std::fs::read_dir(&self.changes_dir)? {
+            let entry = entry?;
+            if entry.path().extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            let contents = std::fs::read_to_string(entry.path())?;
+            serde_json::from_str::<OptimizerChange>(&contents).with_context(|| {
+                format!("Invalid optimizer change {}", entry.path().display())
+            })?;
+        }
+        Ok(())
     }
 
     pub fn enqueue_note(&mut self, note_id: &str, reason: &str) {

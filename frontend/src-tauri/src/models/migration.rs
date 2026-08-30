@@ -1,4 +1,5 @@
 use chrono::{DateTime, Utc};
+use crate::models::twin_event::ContentDigest;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -104,6 +105,9 @@ pub struct MarkdownMigrationNoteProposal {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct MarkdownMigrationPreview {
     pub preview_id: String,
+    /// Required for current previews. `None` is reserved for audit-only legacy files.
+    #[serde(default)]
+    pub root_scope: Option<ContentDigest>,
     pub vault_path: String,
     #[serde(default)]
     pub created_at: Option<DateTime<Utc>>,
@@ -113,6 +117,12 @@ pub struct MarkdownMigrationPreview {
     pub hub_folder: String,
     #[serde(default)]
     pub program_path: String,
+    /// Program-file state observed by the preview. Missing means audit-only legacy data.
+    #[serde(default)]
+    pub expected_program_target: Option<ExpectedProgramTarget>,
+    /// Digest of the canonical program contents this preview would create.
+    #[serde(default)]
+    pub program_after_digest: Option<ContentDigest>,
     #[serde(default)]
     pub summary: MarkdownMigrationPreviewSummary,
     #[serde(default)]
@@ -121,6 +131,13 @@ pub struct MarkdownMigrationPreview {
     pub note_proposals: Vec<MarkdownMigrationNoteProposal>,
     #[serde(default)]
     pub ambiguous_titles: HashMap<String, Vec<String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ExpectedProgramTarget {
+    Absent,
+    Present { digest: ContentDigest },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

@@ -1,7 +1,7 @@
 use crate::models::migration::{
-    MarkdownMigrationApplyResult, MarkdownMigrationMode, MarkdownMigrationNoteProposal,
-    MarkdownMigrationPreview, MarkdownMigrationPreviewSummary, MarkdownMigrationRequest,
-    MarkdownMigrationStatus, MarkdownMigrationTopicCandidate,
+    ExpectedProgramTarget, MarkdownMigrationApplyResult, MarkdownMigrationMode,
+    MarkdownMigrationNoteProposal, MarkdownMigrationPreview, MarkdownMigrationPreviewSummary,
+    MarkdownMigrationRequest, MarkdownMigrationStatus, MarkdownMigrationTopicCandidate,
 };
 use crate::models::note::{
     Note, NoteCreate, NoteUpdate, CURRENT_NOTE_SCHEMA_VERSION, PROP_AUTO_INSERTED_LINK_IDS,
@@ -25,6 +25,8 @@ const MIGRATION_SOURCE_BACKFILL: &str = "grafyn_schema_backfill";
 struct StoredManifest {
     run_id: String,
     preview_id: String,
+    #[serde(default)]
+    root_scope: Option<crate::models::twin_event::ContentDigest>,
     vault_path: String,
     mode: MarkdownMigrationMode,
     created_at: DateTime<Utc>,
@@ -46,6 +48,12 @@ struct StoredManifest {
     /// and preserved verbatim (`Note::frontmatter_raw_fallback`).
     #[serde(default)]
     skipped_fallback_note_ids: Vec<String>,
+    #[serde(default)]
+    expected_program_target: Option<ExpectedProgramTarget>,
+    #[serde(default)]
+    program_after_digest: Option<crate::models::twin_event::ContentDigest>,
+    #[serde(default)]
+    program_path: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -56,14 +64,29 @@ pub struct MarkdownMigrationService {
 
 impl MarkdownMigrationService {
     pub fn new(data_path: PathBuf) -> Self {
+        let fallback = data_path.clone();
+        Self::try_new(data_path).unwrap_or_else(|error| {
+            log::error!("Failed to initialize Markdown migration state: {error}");
+            Self {
+                runs_dir: fallback.join("vault_migration").join("runs"),
+                data_path: fallback,
+            }
+        })
+    }
+
+    pub(crate) fn try_new(data_path: PathBuf) -> Result<Self> {
         let base_dir = data_path.join("vault_migration");
         let runs_dir = base_dir.join("runs");
-        let _ = std::fs::create_dir_all(&runs_dir);
-        let _ = std::fs::create_dir_all(base_dir.join("overlay").join("notes"));
-        Self {
+        std::fs::create_dir_all(&runs_dir)?;
+        std::fs::create_dir_all(base_dir.join("overlay").join("notes"))?;
+        Ok(Self {
             data_path,
             runs_dir,
-        }
+        })
+    }
+
+    pub(crate) fn uses_data_path(&self, data_path: &Path) -> bool {
+        self.data_path == data_path
     }
 
     pub fn preview(
@@ -72,6 +95,18 @@ impl MarkdownMigrationService {
         request: MarkdownMigrationRequest,
     ) -> Result<MarkdownMigrationPreview> {
         let store = KnowledgeStore::new(vault_path.clone(), self.data_path.clone());
+        let root_scope = crate::services::twin_events::root_identity_for_path(&vault_path)
+            .map_err(anyhow::Error::new)?;
+        self.preview_scoped(&store, root_scope, request)
+    }
+
+    pub(crate) fn preview_scoped(
+        &self,
+        store: &KnowledgeStore,
+        root_scope: crate::models::twin_event::ContentDigest,
+        request: MarkdownMigrationRequest,
+    ) -> Result<MarkdownMigrationPreview> {
+        let vault_path = store.vault_path().to_path_buf();
         let notes = store.list_full_notes()?;
         let created_at = Utc::now();
         let preview_id = Uuid::new_v4().to_string();
@@ -83,6 +118,18 @@ impl MarkdownMigrationService {
                 .as_deref()
                 .unwrap_or("_grafyn/program.md"),
         );
+        let program_contents = default_program_file_contents(&hub_folder, &program_path);
+        let program_after_digest =
+            crate::services::twin_events::digest_bytes(program_contents.as_bytes());
+        let expected_program_target = match std::fs::read(vault_path.join(&program_path)) {
+            Ok(bytes) => ExpectedProgramTarget::Present {
+                digest: crate::services::twin_events::digest_bytes(&bytes),
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                ExpectedProgramTarget::Absent
+            }
+            Err(error) => return Err(error.into()),
+        };
 
         let resolution_index = build_reference_index(&notes);
         let existing_hubs = notes
@@ -196,16 +243,22 @@ impl MarkdownMigrationService {
             .iter()
             .filter(|candidate| candidate.reuse_existing_hub_id.is_none())
             .count();
-        summary.files_to_create =
-            summary.proposed_hubs + usize::from(!vault_path.join(&program_path).exists());
+        summary.files_to_create = summary.proposed_hubs
+            + usize::from(matches!(
+                &expected_program_target,
+                ExpectedProgramTarget::Absent
+            ));
 
         let preview = MarkdownMigrationPreview {
             preview_id: preview_id.clone(),
+            root_scope: Some(root_scope),
             vault_path: vault_path.to_string_lossy().to_string(),
             created_at: Some(created_at),
             mode: request.mode,
             hub_folder,
             program_path,
+            expected_program_target: Some(expected_program_target),
+            program_after_digest: Some(program_after_digest),
             summary,
             topic_candidates,
             note_proposals,
@@ -228,7 +281,46 @@ impl MarkdownMigrationService {
         request: MarkdownMigrationRequest,
         store: &mut KnowledgeStore,
     ) -> Result<MarkdownMigrationApplyResult> {
+        let root_scope = crate::services::twin_events::root_identity_for_path(store.vault_path())
+            .map_err(anyhow::Error::new)?;
+        self.apply_scoped(preview_id, request, store, &root_scope)
+    }
+
+    pub(crate) fn apply_scoped(
+        &self,
+        preview_id: &str,
+        request: MarkdownMigrationRequest,
+        store: &mut KnowledgeStore,
+        expected_root_scope: &crate::models::twin_event::ContentDigest,
+    ) -> Result<MarkdownMigrationApplyResult> {
         let preview = self.load_preview(preview_id)?;
+        require_current_preview_scope(&preview, expected_root_scope, store.vault_path())?;
+        let expected_program_target = preview
+            .expected_program_target
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("legacy migration preview is audit-only"))?;
+        let expected_before = expected_program_before_image(&expected_program_target);
+        let program_contents =
+            default_program_file_contents(&preview.hub_folder, &preview.program_path);
+        let program_after_digest =
+            crate::services::twin_events::digest_bytes(program_contents.as_bytes());
+        if preview.program_after_digest.as_ref() != Some(&program_after_digest) {
+            anyhow::bail!("migration preview program digest is missing or invalid");
+        }
+
+        // This validation/conditional create is deliberately the first apply action.
+        // Its planner runs after journal recovery while the shared mutation lock is held.
+        let program_created = matches!(expected_program_target, ExpectedProgramTarget::Absent);
+        if program_created {
+            store.put_vault_file_target_only_expected(
+                &preview.program_path,
+                program_contents.as_bytes(),
+                "migration",
+                Some(expected_before),
+            )?;
+        } else {
+            store.validate_vault_file_target(&preview.program_path, expected_before)?;
+        }
         let run_id = preview.preview_id.clone();
         let run_dir = self.runs_dir.join(&run_id);
         std::fs::create_dir_all(run_dir.join("backups"))?;
@@ -236,13 +328,20 @@ impl MarkdownMigrationService {
         let mut manifest = StoredManifest {
             run_id: run_id.clone(),
             preview_id: preview.preview_id.clone(),
+            root_scope: preview.root_scope.clone(),
             vault_path: preview.vault_path.clone(),
             mode: request.mode.clone(),
             created_at: preview.created_at.unwrap_or_else(Utc::now),
             applied_at: Some(Utc::now()),
             status: "applied".to_string(),
+            expected_program_target: preview.expected_program_target.clone(),
+            program_after_digest: preview.program_after_digest.clone(),
+            program_path: Some(preview.program_path.clone()),
             ..Default::default()
         };
+        if program_created {
+            manifest.created_files.push(preview.program_path.clone());
+        }
 
         let mut touched_note_ids = Vec::new();
         let mut overlay_note_ids = Vec::new();
@@ -407,17 +506,6 @@ impl MarkdownMigrationService {
             manifest.created_files.push(created.relative_path.clone());
         }
 
-        let program_path = Path::new(&preview.vault_path).join(&preview.program_path);
-        if !program_path.exists() {
-            store.put_vault_file_target_only(
-                &preview.program_path,
-                default_program_file_contents(&preview.hub_folder, &preview.program_path)
-                    .as_bytes(),
-                "migration",
-            )?;
-            manifest.created_files.push(preview.program_path.clone());
-        }
-
         manifest.overlay_note_ids = overlay_note_ids.clone();
         manifest.touched_note_ids = touched_note_ids.clone();
         manifest.created_hub_note_ids = created_hub_note_ids.clone();
@@ -475,8 +563,76 @@ impl MarkdownMigrationService {
         })
     }
 
+    pub(crate) fn status_scoped(
+        &self,
+        run_id: Option<&str>,
+        expected_root_scope: &crate::models::twin_event::ContentDigest,
+    ) -> Result<MarkdownMigrationStatus> {
+        let target_id = match run_id {
+            Some(run_id) => Some(run_id.to_string()),
+            None => self.latest_run_id_for_scope(expected_root_scope)?,
+        };
+        let Some(target_id) = target_id else {
+            return Ok(MarkdownMigrationStatus {
+                status: "idle".into(),
+                ..Default::default()
+            });
+        };
+        let preview = self.load_preview(&target_id)?;
+        if preview.root_scope.is_none() {
+            return Ok(MarkdownMigrationStatus {
+                run_id: Some(target_id.clone()),
+                preview_id: Some(target_id),
+                status: "legacy_unscoped_audit_only".into(),
+                mode: Some(preview.mode),
+                created_at: preview.created_at,
+                rollback_available: false,
+                summary: Some(preview.summary),
+                ..Default::default()
+            });
+        }
+        if preview.root_scope.as_ref() != Some(expected_root_scope) {
+            anyhow::bail!("migration run belongs to another vault scope");
+        }
+        let manifest = self.load_manifest(&target_id).ok().filter(|manifest| {
+            manifest.root_scope.as_ref() == Some(expected_root_scope)
+        });
+        Ok(MarkdownMigrationStatus {
+            run_id: Some(target_id.clone()),
+            preview_id: Some(target_id),
+            status: manifest
+                .as_ref()
+                .map(|value| value.status.clone())
+                .unwrap_or_else(|| "previewed".into()),
+            mode: Some(preview.mode),
+            created_at: preview.created_at,
+            applied_at: manifest.as_ref().and_then(|value| value.applied_at),
+            rollback_available: manifest.is_some(),
+            summary: Some(preview.summary),
+        })
+    }
+
     pub fn rollback(&self, run_id: &str, store: &mut KnowledgeStore) -> Result<()> {
+        let root_scope = crate::services::twin_events::root_identity_for_path(store.vault_path())
+            .map_err(anyhow::Error::new)?;
+        self.rollback_scoped(run_id, store, &root_scope)
+    }
+
+    pub(crate) fn rollback_scoped(
+        &self,
+        run_id: &str,
+        store: &mut KnowledgeStore,
+        expected_root_scope: &crate::models::twin_event::ContentDigest,
+    ) -> Result<()> {
         let manifest = self.load_manifest(run_id)?;
+        if manifest.root_scope.as_ref() != Some(expected_root_scope) {
+            anyhow::bail!("legacy or cross-vault migration manifests are audit-only");
+        }
+        let manifest_vault = std::fs::canonicalize(&manifest.vault_path)?;
+        let current_vault = std::fs::canonicalize(store.vault_path())?;
+        if manifest_vault != current_vault {
+            anyhow::bail!("migration manifest vault does not match the active vault");
+        }
 
         // Guard against ever reporting a no-op rollback as success. `touched_note_ids` is
         // populated in `apply()` for every note that went through the backup+rewrite path
@@ -534,6 +690,26 @@ impl MarkdownMigrationService {
         }
 
         for relative_path in &manifest.created_files {
+            if manifest.program_path.as_deref() == Some(relative_path.as_str()) {
+                let Some(after_digest) = manifest.program_after_digest.clone() else {
+                    failures.push(format!(
+                        "program digest missing for created file '{}'",
+                        relative_path
+                    ));
+                    continue;
+                };
+                if let Err(error) = store.delete_vault_file_target_only_expected(
+                    relative_path,
+                    "migration",
+                    Some(crate::services::twin_events::BeforeImage::Sha256(after_digest)),
+                ) {
+                    failures.push(format!(
+                        "failed to remove created program file '{}': {}",
+                        relative_path, error
+                    ));
+                }
+                continue;
+            }
             let target_path = vault_path.join(relative_path);
             if target_path.exists() {
                 match store.find_note_by_relative_path(relative_path) {
@@ -683,6 +859,32 @@ impl MarkdownMigrationService {
         Ok(newest.map(|(_, id)| id))
     }
 
+    fn latest_run_id_for_scope(
+        &self,
+        expected_root_scope: &crate::models::twin_event::ContentDigest,
+    ) -> Result<Option<String>> {
+        let mut newest: Option<(std::time::SystemTime, String)> = None;
+        for entry in std::fs::read_dir(&self.runs_dir)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let id = entry.file_name().to_string_lossy().to_string();
+            let Ok(preview) = self.load_preview(&id) else {
+                continue;
+            };
+            if preview.root_scope.as_ref() != Some(expected_root_scope) {
+                continue;
+            }
+            let modified = entry.metadata()?.modified()?;
+            match &newest {
+                Some((current, _)) if current >= &modified => {}
+                _ => newest = Some((modified, id)),
+            }
+        }
+        Ok(newest.map(|(_, id)| id))
+    }
+
     fn load_preview(&self, preview_id: &str) -> Result<MarkdownMigrationPreview> {
         let path = self.runs_dir.join(preview_id).join("preview.json");
         let data = std::fs::read_to_string(&path)
@@ -723,6 +925,31 @@ impl MarkdownMigrationService {
         })?;
 
         Ok(true)
+    }
+}
+
+fn require_current_preview_scope(
+    preview: &MarkdownMigrationPreview,
+    expected_root_scope: &crate::models::twin_event::ContentDigest,
+    current_vault_path: &Path,
+) -> Result<()> {
+    if preview.root_scope.as_ref() != Some(expected_root_scope) {
+        anyhow::bail!("legacy or cross-vault migration previews are audit-only");
+    }
+    if std::fs::canonicalize(&preview.vault_path)? != std::fs::canonicalize(current_vault_path)? {
+        anyhow::bail!("migration preview vault does not match the active vault");
+    }
+    Ok(())
+}
+
+fn expected_program_before_image(
+    expected: &ExpectedProgramTarget,
+) -> crate::services::twin_events::BeforeImage {
+    match expected {
+        ExpectedProgramTarget::Absent => crate::services::twin_events::BeforeImage::Absent,
+        ExpectedProgramTarget::Present { digest } => {
+            crate::services::twin_events::BeforeImage::Sha256(digest.clone())
+        }
     }
 }
 
@@ -1057,7 +1284,151 @@ mod tests {
         let persisted = std::fs::read_to_string(run_dir.join("preview.json"))
             .expect("preview.json should exist");
         assert!(persisted.contains(&preview.preview_id));
+        assert_eq!(
+            preview.root_scope,
+            Some(
+                crate::services::twin_events::root_identity_for_path(vault_dir.path()).unwrap()
+            )
+        );
+        assert_eq!(
+            preview.expected_program_target,
+            Some(ExpectedProgramTarget::Absent)
+        );
+        assert_eq!(
+            preview.program_after_digest,
+            Some(crate::services::twin_events::digest_bytes(
+                default_program_file_contents(&preview.hub_folder, &preview.program_path)
+                    .as_bytes()
+            ))
+        );
+        let persisted_json: Value = serde_json::from_str(&persisted).unwrap();
+        for key in [
+            "root_scope",
+            "expected_program_target",
+            "program_after_digest",
+        ] {
+            assert!(persisted_json.get(key).is_some(), "missing {key}");
+        }
         assert_no_tmp_siblings(&run_dir);
+    }
+
+    #[test]
+    fn apply_rejects_program_changed_after_preview_before_any_migration_write() {
+        let root = tempdir().unwrap();
+        let vault = root.path().join("vault");
+        let data = root.path().join("data");
+        std::fs::create_dir(&vault).unwrap();
+        std::fs::create_dir(&data).unwrap();
+        let events = std::sync::Arc::new(crate::services::twin_events::TwinEventStore::new(&data));
+        events.initialize().unwrap();
+        let coordinator = std::sync::Arc::new(
+            crate::services::twin_events::MutationCoordinator::new(
+                &data,
+                &vault,
+                events,
+                std::sync::Arc::new(crate::services::twin_events::NoopMutationLifecycle),
+            )
+            .unwrap(),
+        );
+        let service = MarkdownMigrationService::new(data.clone());
+        let preview = service
+            .preview(vault.clone(), MarkdownMigrationRequest::default())
+            .unwrap();
+        std::fs::create_dir(vault.join("_grafyn")).unwrap();
+        std::fs::write(vault.join("_grafyn/program.md"), b"user edit").unwrap();
+        let mut store = KnowledgeStore::with_event_recorder(
+            vault.clone(),
+            data.clone(),
+            coordinator.clone(),
+        );
+
+        let error = service
+            .apply(
+                &preview.preview_id,
+                MarkdownMigrationRequest::default(),
+                &mut store,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("conditional mutation target changed"));
+        assert_eq!(
+            std::fs::read(vault.join("_grafyn/program.md")).unwrap(),
+            b"user edit"
+        );
+        assert!(!service
+            .runs_dir
+            .join(&preview.preview_id)
+            .join("manifest.json")
+            .exists());
+        assert_eq!(coordinator.pending_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn rollback_preserves_program_edited_after_apply() {
+        let root = tempdir().unwrap();
+        let vault = root.path().join("vault");
+        let data = root.path().join("data");
+        std::fs::create_dir(&vault).unwrap();
+        std::fs::create_dir(&data).unwrap();
+        let events = std::sync::Arc::new(crate::services::twin_events::TwinEventStore::new(&data));
+        events.initialize().unwrap();
+        let coordinator = std::sync::Arc::new(
+            crate::services::twin_events::MutationCoordinator::new(
+                &data,
+                &vault,
+                events,
+                std::sync::Arc::new(crate::services::twin_events::NoopMutationLifecycle),
+            )
+            .unwrap(),
+        );
+        let service = MarkdownMigrationService::new(data.clone());
+        let preview = service
+            .preview(vault.clone(), MarkdownMigrationRequest::default())
+            .unwrap();
+        let mut store = KnowledgeStore::with_event_recorder(
+            vault.clone(),
+            data,
+            coordinator.clone(),
+        );
+        let applied = service
+            .apply(
+                &preview.preview_id,
+                MarkdownMigrationRequest::default(),
+                &mut store,
+            )
+            .unwrap();
+        std::fs::write(vault.join("_grafyn/program.md"), b"user edit after apply").unwrap();
+
+        assert!(service.rollback(&applied.run_id, &mut store).is_err());
+        assert_eq!(
+            std::fs::read(vault.join("_grafyn/program.md")).unwrap(),
+            b"user edit after apply"
+        );
+        assert_eq!(coordinator.pending_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn preview_cannot_apply_to_another_vault_scope() {
+        let root = tempdir().unwrap();
+        let vault_a = root.path().join("vault-a");
+        let vault_b = root.path().join("vault-b");
+        let data = root.path().join("data");
+        std::fs::create_dir(&vault_a).unwrap();
+        std::fs::create_dir(&vault_b).unwrap();
+        std::fs::create_dir(&data).unwrap();
+        let service = MarkdownMigrationService::new(data.clone());
+        let preview = service
+            .preview(vault_a, MarkdownMigrationRequest::default())
+            .unwrap();
+        let mut store = KnowledgeStore::new(vault_b.clone(), data);
+
+        assert!(service
+            .apply(
+                &preview.preview_id,
+                MarkdownMigrationRequest::default(),
+                &mut store,
+            )
+            .is_err());
+        assert!(!vault_b.join("_grafyn/program.md").exists());
     }
 
     fn seed_two_notes(store: &mut KnowledgeStore) -> (Note, Note) {
@@ -1361,6 +1732,7 @@ mod tests {
             touched_note_ids: vec!["note-1".to_string()],
             created_hub_note_ids: Vec::new(),
             skipped_fallback_note_ids: Vec::new(),
+            ..Default::default()
         };
         write_atomic(
             &run_dir.join("manifest.json"),

@@ -555,18 +555,22 @@ impl TwinStore {
                 self.invalidate_mutation_caches();
                 return Err(anyhow::Error::new(error));
             }
-            return committed.ok_or_else(|| anyhow::anyhow!("config update was not planned"));
+            let config = committed.ok_or_else(|| anyhow::anyhow!("config update was not planned"))?;
+            self.invalidate_mutation_caches();
+            return Ok(config);
         }
         let mut config = self.get_decision_mirror_config()?;
         apply_decision_mirror_config_update(&mut config, &update);
 
         self.write_decision_mirror_config_file(&config)?;
+        self.invalidate_mutation_caches();
         Ok(config)
     }
 
     pub fn reset_decision_mirror_config(&mut self) -> Result<DecisionMirrorConfig> {
         let config = DecisionMirrorConfig::default();
         self.write_decision_mirror_config_file(&config)?;
+        self.invalidate_mutation_caches();
         Ok(config)
     }
 
@@ -850,6 +854,8 @@ impl TwinStore {
                 .ok_or_else(|| anyhow::anyhow!("decision outcome was not planned"))?;
             if let Some(trace) = trace {
                 self.cache_committed_trace(trace);
+            } else {
+                self.invalidate_mutation_caches();
             }
             return Ok(episode);
         }
@@ -859,6 +865,8 @@ impl TwinStore {
         if let Some((trace, values, drafts)) = mutation {
             self.commit_governed_json_targets(values, drafts)?;
             self.cache_committed_trace(trace);
+        } else {
+            self.invalidate_mutation_caches();
         }
         Ok(episode)
     }
@@ -1108,6 +1116,8 @@ impl TwinStore {
                 .ok_or_else(|| anyhow::anyhow!("Twin prediction was not planned"))?;
             if let Some(trace) = trace {
                 self.cache_committed_trace(trace);
+            } else {
+                self.invalidate_mutation_caches();
             }
             return Ok(episode);
         }
@@ -1118,6 +1128,8 @@ impl TwinStore {
         }
         if let Some(trace) = trace {
             self.cache_committed_trace(trace);
+        } else {
+            self.invalidate_mutation_caches();
         }
         Ok(episode)
     }
@@ -1226,6 +1238,7 @@ impl TwinStore {
                 self.invalidate_mutation_caches();
                 return Err(anyhow::Error::new(error));
             }
+            self.invalidate_mutation_caches();
             return Ok(());
         }
         let path = self.decision_file_path(episode_id);

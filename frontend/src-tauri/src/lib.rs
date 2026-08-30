@@ -78,7 +78,7 @@ pub fn run() {
         .setup(|app| {
             // Root/settings recovery is part of SettingsService::load and must fail closed
             // before any store constructs itself from a possibly split authority.
-            let settings_service = SettingsService::load()?;
+            let mut settings_service = SettingsService::load()?;
 
             let vault_path = settings_service.vault_path();
             let data_path = settings_service.data_path();
@@ -134,15 +134,24 @@ pub fn run() {
                         Some(error),
                     ),
                 };
+            let derived_data_path = if let Some(coordinator) = mutation_coordinator.as_ref() {
+                coordinator
+                    .current_namespace_path()
+                    .map_err(|error| error.to_string())?
+            } else {
+                let scope = crate::services::twin_events::root_identity_for_path(&vault_path)
+                    .map_err(|error| error.to_string())?;
+                crate::services::vault_namespace::scoped_data_path(&data_path, &scope)
+            };
 
             // Initialize services
             let knowledge_store = KnowledgeStore::with_event_recorder(
                 vault_path.clone(),
-                data_path.clone(),
+                derived_data_path.clone(),
                 event_recorder.clone(),
             );
             let graph_index = GraphIndex::new();
-            let search_service = match SearchService::new(data_path.clone()) {
+            let search_service = match SearchService::new(derived_data_path.clone()) {
                 Ok(s) => s,
                 Err(e) => {
                     log::error!(
@@ -150,31 +159,31 @@ pub fn run() {
                         e
                     );
                     // Try deleting corrupted index and retrying
-                    let index_path = data_path.join("search_index");
+                    let index_path = derived_data_path.join("search_index");
                     if index_path.exists() {
                         if let Err(rm_err) = std::fs::remove_dir_all(&index_path) {
                             log::error!("Failed to remove corrupted index: {}", rm_err);
                         }
                     }
-                    SearchService::new(data_path.clone()).unwrap_or_else(|e2| {
+                    SearchService::new(derived_data_path.clone()).unwrap_or_else(|e2| {
                         log::error!("Search service initialization failed after rebuild: {}", e2);
                         std::process::exit(1);
                     })
                 }
             };
             // Initialize chunk index (parallel to search index)
-            let chunk_index = match ChunkIndex::new(data_path.clone()) {
+            let chunk_index = match ChunkIndex::new(derived_data_path.clone()) {
                 Ok(c) => c,
                 Err(e) => {
                     log::error!(
                         "Failed to initialize chunk index: {}. Attempting rebuild.",
                         e
                     );
-                    let chunk_path = data_path.join("chunk_index");
+                    let chunk_path = derived_data_path.join("chunk_index");
                     if chunk_path.exists() {
                         let _ = std::fs::remove_dir_all(&chunk_path);
                     }
-                    ChunkIndex::new(data_path.clone()).unwrap_or_else(|e2| {
+                    ChunkIndex::new(derived_data_path.clone()).unwrap_or_else(|e2| {
                         log::error!("Chunk index initialization failed: {}", e2);
                         std::process::exit(1);
                     })
@@ -191,10 +200,18 @@ pub fn run() {
             );
 
             // Get OpenRouter API key from settings, fall back to environment
+            let environment_api_key = settings_service
+                .allows_environment_fallback()
+                .then(|| std::env::var("OPENROUTER_API_KEY").ok())
+                .flatten();
+            if settings_service.openrouter_api_key().is_none() {
+                if let Some(secret) = environment_api_key {
+                    settings_service.adopt_environment_runtime_secret(secret);
+                }
+            }
             let api_key = settings_service
                 .openrouter_api_key()
-                .map(|s| s.to_string())
-                .or_else(|| std::env::var("OPENROUTER_API_KEY").ok())
+                .map(str::to_string)
                 .unwrap_or_default();
             let openrouter = OpenRouterService::new(api_key);
             let ollama = OllamaService::new(settings_service.get().ollama_base_url.clone());
@@ -204,9 +221,12 @@ pub fn run() {
 
             // Initialize retrieval service
             let retrieval_service = RetrievalService::new(data_path.clone());
-            let link_discovery = LinkDiscoveryService::new(data_path.clone());
-            let markdown_migration = MarkdownMigrationService::new(data_path.clone());
-            let vault_optimizer = VaultOptimizerService::new(data_path.clone());
+            let link_discovery = LinkDiscoveryService::try_new(derived_data_path.clone())
+                .map_err(|error| error.to_string())?;
+            let markdown_migration = MarkdownMigrationService::try_new(derived_data_path.clone())
+                .map_err(|error| error.to_string())?;
+            let vault_optimizer = VaultOptimizerService::try_new(derived_data_path)
+                .map_err(|error| error.to_string())?;
 
             // Initialize feedback service using runtime environment only.
             // Release builds must not embed repository credentials.
@@ -407,26 +427,87 @@ pub fn run() {
         });
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WarmStartComponent {
+    Migration,
+    Overlay,
+    Graph,
+    Search,
+    Chunk,
+    LinkDiscovery,
+    Optimizer,
+    TwinCaches,
+}
+
+fn warm_start_component(
+    component: WarmStartComponent,
+    injected_failure: Option<WarmStartComponent>,
+) -> Result<(), String> {
+    if injected_failure == Some(component) {
+        return Err(format!("injected warm-start {component:?} failure"));
+    }
+    Ok(())
+}
+
+async fn maybe_publish_boot_phase(
+    app_handle: Option<&tauri::AppHandle>,
+    state: &AppState,
+    boot_started: &Instant,
+    status: BootStatus,
+) {
+    if let Some(app_handle) = app_handle {
+        publish_boot_phase(app_handle, state, boot_started, status).await;
+    }
+}
+
 async fn warm_start_services(app_handle: tauri::AppHandle, state: AppState) -> Result<(), String> {
-    let _root_epoch = acquire_warm_start_root_gate(&state).await?;
+    warm_start_services_inner(Some(&app_handle), &state, None).await
+}
+
+async fn warm_start_services_inner(
+    app_handle: Option<&tauri::AppHandle>,
+    state: &AppState,
+    injected_failure: Option<WarmStartComponent>,
+) -> Result<(), String> {
+    let _root_epoch = acquire_warm_start_root_gate(state).await?;
+    let coordinator = state
+        .mutation_coordinator
+        .as_ref()
+        .ok_or_else(|| "mutation coordinator is unavailable".to_string())?;
+    let (namespace_lease, namespace_path) = {
+        let namespace_guard = coordinator
+            .begin_root_transition()
+            .map_err(|error| error.to_string())?;
+        let namespace_lease = namespace_guard
+            .current_lease()
+            .map_err(|error| error.to_string())?;
+        let namespace_path = namespace_guard
+            .initialize_namespace(&namespace_lease)
+            .map_err(|error| error.to_string())?;
+        namespace_guard
+            .invalidate_namespace(&namespace_lease)
+            .map_err(|error| error.to_string())?;
+        (namespace_lease, namespace_path)
+    };
     let boot_started = Instant::now();
 
-    publish_boot_phase(
-        &app_handle,
-        &state,
+    maybe_publish_boot_phase(
+        app_handle,
+        state,
         &boot_started,
         BootStatus::new("opening_twin_events", "Opening governed Twin history"),
     )
     .await;
     initialize_twin_event_store_for_boot(&state.twin_event_store)?;
-    publish_boot_phase(
-        &app_handle,
-        &state,
+    maybe_publish_boot_phase(
+        app_handle,
+        state,
         &boot_started,
         BootStatus::new("opening_store", "Loading notes from your vault"),
     )
     .await;
 
+    warm_start_component(WarmStartComponent::Migration, injected_failure)?;
     {
         let migration = state.markdown_migration.read().await;
         let mut store = state.knowledge_store.write().await;
@@ -435,57 +516,98 @@ async fn warm_start_services(app_handle: tauri::AppHandle, state: AppState) -> R
             .map_err(|error| error.to_string())?;
     }
 
-    let full_notes = crate::commands::sync_topic_hubs(&state).await?;
+    warm_start_component(WarmStartComponent::Overlay, injected_failure)?;
+    let full_notes = crate::commands::sync_topic_hubs(state).await?;
 
-    publish_boot_phase(
-        &app_handle,
-        &state,
+    maybe_publish_boot_phase(
+        app_handle,
+        state,
         &boot_started,
         BootStatus::new("building_graph", "Building graph from your notes"),
     )
     .await;
 
+    warm_start_component(WarmStartComponent::Graph, injected_failure)?;
     {
         let mut graph = state.graph_index.write().await;
         graph.build_from_notes(&full_notes);
     }
 
-    publish_boot_phase(
-        &app_handle,
-        &state,
+    maybe_publish_boot_phase(
+        app_handle,
+        state,
         &boot_started,
         BootStatus::new("building_search_index", "Building search index"),
     )
     .await;
 
+    warm_start_component(WarmStartComponent::Search, injected_failure)?;
     {
         let mut search = state.search_service.write().await;
         search.reindex_all(&full_notes).map_err(|e| e.to_string())?;
     }
 
-    publish_boot_phase(
-        &app_handle,
-        &state,
+    maybe_publish_boot_phase(
+        app_handle,
+        state,
         &boot_started,
         BootStatus::new("building_chunk_index", "Building chunk index"),
     )
     .await;
 
+    warm_start_component(WarmStartComponent::Chunk, injected_failure)?;
     {
         let mut chunks = state.chunk_index.write().await;
-        if let Err(e) = chunks.reindex_all(&full_notes) {
-            log::error!("Failed to build chunk index: {}", e);
-        }
+        chunks
+            .reindex_all(&full_notes)
+            .map_err(|error| error.to_string())?;
     }
 
+    warm_start_component(WarmStartComponent::LinkDiscovery, injected_failure)?;
+    {
+        let mut discovery = state.link_discovery.write().await;
+        discovery
+            .bootstrap_checked(&full_notes)
+            .map_err(|error| error.to_string())?;
+    }
+
+    warm_start_component(WarmStartComponent::Optimizer, injected_failure)?;
     {
         let mut optimizer = state.vault_optimizer.write().await;
-        optimizer.bootstrap(&full_notes);
+        optimizer
+            .bootstrap_checked(&full_notes)
+            .map_err(|error| error.to_string())?;
     }
 
-    publish_boot_phase(
-        &app_handle,
-        &state,
+    warm_start_component(WarmStartComponent::TwinCaches, injected_failure)?;
+    state
+        .twin_store
+        .write()
+        .await
+        .rebuild_mutation_caches()
+        .map_err(|error| error.to_string())?;
+
+    let publish_guard = coordinator
+        .begin_root_transition()
+        .map_err(|error| error.to_string())?;
+    let current_lease = publish_guard
+        .current_lease()
+        .map_err(|error| error.to_string())?;
+    if current_lease != namespace_lease
+        || crate::services::vault_namespace::scoped_data_path(
+            coordinator.data_path(),
+            &current_lease.root_scope,
+        ) != namespace_path
+    {
+        return Err("vault authority changed while derived state was rebuilding".into());
+    }
+    publish_guard
+        .publish_namespace_ready(&namespace_lease)
+        .map_err(|error| error.to_string())?;
+
+    maybe_publish_boot_phase(
+        app_handle,
+        state,
         &boot_started,
         BootStatus::ready("Grafyn is ready"),
     )
@@ -497,7 +619,9 @@ async fn warm_start_services(app_handle: tauri::AppHandle, state: AppState) -> R
 async fn acquire_warm_start_root_gate(
     state: &AppState,
 ) -> Result<tokio::sync::OwnedRwLockReadGuard<()>, String> {
-    crate::commands::acquire_root_epoch(state).await
+    let guard = state.vault_transition.clone().read_owned().await;
+    crate::commands::ensure_root_healthy(state).await?;
+    Ok(guard)
 }
 
 fn initialize_twin_event_store_for_boot(store: &TwinEventStore) -> Result<(), String> {
@@ -687,6 +811,78 @@ fn start_vault_optimizer_worker(state: AppState) {
 mod tests {
     use super::*;
 
+    fn build_warm_start_state() -> (AppState, tempfile::TempDir, tempfile::TempDir) {
+        let (mut state, vault, data) =
+            crate::commands::commit_note_write_tests::build_test_state();
+        let discarded = data.path().join("discarded-derived");
+        state.search_service = Arc::new(RwLock::new(
+            crate::services::search::SearchService::new(discarded.clone()).unwrap(),
+        ));
+        state.chunk_index = Arc::new(RwLock::new(
+            crate::services::chunk_index::ChunkIndex::new(discarded.clone()).unwrap(),
+        ));
+        state.link_discovery = Arc::new(RwLock::new(
+            crate::services::link_discovery::LinkDiscoveryService::new(discarded.clone()),
+        ));
+        state.markdown_migration = Arc::new(RwLock::new(
+            crate::services::markdown_migration::MarkdownMigrationService::new(
+                discarded.clone(),
+            ),
+        ));
+        state.vault_optimizer = Arc::new(RwLock::new(
+            crate::services::vault_optimizer::VaultOptimizerService::new(discarded),
+        ));
+        let events = Arc::new(crate::services::twin_events::TwinEventStore::new(data.path()));
+        events.initialize().unwrap();
+        let coordinator = Arc::new(
+            crate::services::twin_events::MutationCoordinator::new(
+                data.path(),
+                vault.path(),
+                events.clone(),
+                Arc::new(crate::services::twin_events::NoopMutationLifecycle),
+            )
+            .unwrap(),
+        );
+        let namespace = coordinator.current_namespace_path().unwrap();
+        state.knowledge_store = Arc::new(RwLock::new(
+            crate::services::knowledge_store::KnowledgeStore::with_event_recorder(
+                vault.path().to_path_buf(),
+                namespace.clone(),
+                coordinator.clone(),
+            ),
+        ));
+        state.search_service = Arc::new(RwLock::new(
+            crate::services::search::SearchService::new(namespace.clone()).unwrap(),
+        ));
+        state.chunk_index = Arc::new(RwLock::new(
+            crate::services::chunk_index::ChunkIndex::new(namespace.clone()).unwrap(),
+        ));
+        state.link_discovery = Arc::new(RwLock::new(
+            crate::services::link_discovery::LinkDiscoveryService::try_new(namespace.clone())
+                .unwrap(),
+        ));
+        state.markdown_migration = Arc::new(RwLock::new(
+            crate::services::markdown_migration::MarkdownMigrationService::try_new(
+                namespace.clone(),
+            )
+            .unwrap(),
+        ));
+        state.vault_optimizer = Arc::new(RwLock::new(
+            crate::services::vault_optimizer::VaultOptimizerService::try_new(namespace).unwrap(),
+        ));
+        state.twin_store = Arc::new(RwLock::new(
+            crate::services::twin::TwinStore::with_event_recorder(
+                crate::models::settings::twin_data_path_for_vault(data.path(), vault.path())
+                    .unwrap(),
+                data.path().join("twin"),
+                coordinator.clone(),
+            ),
+        ));
+        state.twin_event_store = events;
+        state.mutation_coordinator = Some(coordinator);
+        (state, vault, data)
+    }
+
     #[tokio::test]
     async fn update_boot_state_replaces_existing_status() {
         let boot_state = Arc::new(RwLock::new(BootStatus::default()));
@@ -708,6 +904,33 @@ mod tests {
         assert!(!task.is_finished(), "warm start must wait behind root transition");
         drop(transition);
         drop(task.await.unwrap().unwrap());
+    }
+
+    #[tokio::test]
+    async fn every_readiness_component_failure_keeps_marker_absent_and_commands_unavailable() {
+        for component in [
+            WarmStartComponent::Migration,
+            WarmStartComponent::Overlay,
+            WarmStartComponent::Graph,
+            WarmStartComponent::Search,
+            WarmStartComponent::Chunk,
+            WarmStartComponent::LinkDiscovery,
+            WarmStartComponent::Optimizer,
+            WarmStartComponent::TwinCaches,
+        ] {
+            let (state, _vault, _data) = build_warm_start_state();
+            let coordinator = state.mutation_coordinator.as_ref().unwrap();
+            let namespace_path = coordinator.current_namespace_path().unwrap();
+
+            let error = warm_start_services_inner(None, &state, Some(component))
+                .await
+                .unwrap_err();
+
+            assert!(error.contains(&format!("{component:?}")));
+            assert!(!namespace_path.join("ready-v1.json").exists());
+            assert!(coordinator.require_namespace_ready().is_err());
+            assert!(crate::commands::acquire_root_epoch(&state).await.is_err());
+        }
     }
 
     #[test]

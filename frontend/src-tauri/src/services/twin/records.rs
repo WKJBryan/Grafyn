@@ -644,11 +644,9 @@ impl TwinStore {
     pub(super) fn artifact_has_only_legacy_auto_support(&self, record_ids: &[String]) -> bool {
         let mut saw_legacy_auto = false;
         for id in record_ids {
-            let record = self.record_cache.get(id).cloned().or_else(|| {
-                Self::validate_file_id(id)
-                    .ok()
-                    .and_then(|_| self.read_record_file(&self.record_file_path(id)).ok())
-            });
+            let record = Self::validate_file_id(id)
+                .ok()
+                .and_then(|_| self.read_record_file(&self.record_file_path(id)).ok());
             match record.map(|record| record.promotion_state) {
                 Some(PromotionState::Endorsed) => return false,
                 Some(PromotionState::AutoPromoted) => saw_legacy_auto = true,
@@ -667,14 +665,11 @@ impl TwinStore {
 
     pub fn get_user_record(&mut self, id: &str) -> Result<UserRecord> {
         Self::validate_file_id(id)?;
+        self.ensure_record_cache()?;
         if let Some(record) = self.record_cache.get(id) {
             return Ok(record.clone());
         }
-
-        let path = self.record_file_path(id);
-        let record = self.read_record_file(&path)?;
-        self.record_cache.insert(id.to_string(), record.clone());
-        Ok(record)
+        anyhow::bail!("User record not found: {id}")
     }
 
     pub fn create_user_record(&mut self, create: UserRecordCreate) -> Result<UserRecord> {
@@ -696,7 +691,7 @@ impl TwinStore {
                 automatic,
                 automatic.then_some("legacy_inference"),
             )?;
-            self.record_cache.insert(record.id.clone(), record.clone());
+            self.invalidate_mutation_caches();
             return Ok(record);
         }
 
@@ -751,8 +746,7 @@ impl TwinStore {
             return Err(anyhow::Error::new(error));
         }
         let record = committed.ok_or_else(|| anyhow::anyhow!("record create was not planned"))?;
-        self.record_cache.insert(record.id.clone(), record.clone());
-        self.records_cache_ready = true;
+        self.invalidate_mutation_caches();
         Ok(record)
     }
 
@@ -792,7 +786,7 @@ impl TwinStore {
             let record = apply_user_record_update(self.get_user_record(id)?, &update)?;
             if record.updated_at != self.get_user_record(id)?.updated_at {
                 self.write_record_observation(&record, false, None)?;
-                self.record_cache.insert(record.id.clone(), record.clone());
+                self.invalidate_mutation_caches();
             }
             return Ok(record);
         }
@@ -841,8 +835,7 @@ impl TwinStore {
             return Err(anyhow::Error::new(error));
         }
         let record = committed.ok_or_else(|| anyhow::anyhow!("record update was not planned"))?;
-        self.record_cache.insert(record.id.clone(), record.clone());
-        self.records_cache_ready = true;
+        self.invalidate_mutation_caches();
         Ok(record)
     }
 
@@ -1016,14 +1009,9 @@ impl TwinStore {
                 self.invalidate_mutation_caches();
                 return Err(anyhow::Error::new(error));
             }
-            let (summary, records) = committed
+            let (summary, _records) = committed
                 .ok_or_else(|| anyhow::anyhow!("Twin inference was not planned"))?;
-            self.record_cache = records
-                .into_iter()
-                .map(|record| (record.id.clone(), record))
-                .collect();
-            self.records_cache_ready = true;
-            self.trace_cache.clear();
+            self.invalidate_mutation_caches();
             return Ok(summary);
         }
 
@@ -1091,7 +1079,7 @@ impl TwinStore {
                 record.metadata = metadata;
                 record.updated_at = Utc::now();
                 self.write_record_observation(&record, true, Some("legacy_inference"))?;
-                self.record_cache.insert(record.id.clone(), record.clone());
+                self.invalidate_mutation_caches();
                 updated_records += 1;
             } else {
                 self.create_user_record(UserRecordCreate {
@@ -1110,6 +1098,7 @@ impl TwinStore {
             }
         }
 
+        self.ensure_record_cache()?;
         for record in self.record_cache.values() {
             if record.origin != RecordOrigin::Inferred {
                 continue;
@@ -1262,7 +1251,7 @@ impl TwinStore {
                 rationale.as_deref(),
             );
             self.write_record_feedback(&record, action, rationale.as_deref())?;
-            self.record_cache.insert(record.id.clone(), record.clone());
+            self.invalidate_mutation_caches();
             return Ok(record);
         }
 
@@ -1305,8 +1294,7 @@ impl TwinStore {
             return Err(anyhow::Error::new(error));
         }
         let record = committed.ok_or_else(|| anyhow::anyhow!("promotion was not planned"))?;
-        self.record_cache.insert(record.id.clone(), record.clone());
-        self.records_cache_ready = true;
+        self.invalidate_mutation_caches();
         Ok(record)
     }
 
@@ -1315,10 +1303,12 @@ impl TwinStore {
             return Ok(());
         }
 
-        for record in self.list_user_records_durable()? {
-            self.record_cache.insert(record.id.clone(), record);
-        }
-
+        let records = self
+            .list_user_records_durable()?
+            .into_iter()
+            .map(|record| (record.id.clone(), record))
+            .collect();
+        self.record_cache = records;
         self.records_cache_ready = true;
         Ok(())
     }

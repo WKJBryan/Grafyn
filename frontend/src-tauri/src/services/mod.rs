@@ -24,5 +24,6 @@ pub mod twin;
 pub mod twin_eval;
 pub mod twin_events;
 pub mod utf8_chunk;
+pub mod vault_namespace;
 pub mod vault_optimizer;
 pub mod yake;
