@@ -8,17 +8,27 @@ use tauri::State;
 /// List all notes (metadata only)
 #[tauri::command]
 pub async fn list_notes(state: State<'_, AppState>) -> Result<Vec<NoteMeta>, String> {
-    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
-    let store = state.knowledge_store.read().await;
-    store.list_notes().map_err(|e| e.to_string())
+    let root_ticket = crate::commands::acquire_root_epoch(state.inner()).await?;
+    let result = {
+        let mut store = state.knowledge_store.write().await;
+        store.reload_authoritative_state();
+        store.list_notes().map_err(|e| e.to_string())?
+    };
+    root_ticket.finish(state.inner()).await?;
+    Ok(result)
 }
 
 /// Get a single note by ID
 #[tauri::command]
 pub async fn get_note(id: String, state: State<'_, AppState>) -> Result<Note, String> {
-    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
-    let store = state.knowledge_store.read().await;
-    store.get_note(&id).map_err(|e| e.to_string())
+    let root_ticket = crate::commands::acquire_root_epoch(state.inner()).await?;
+    let result = {
+        let mut store = state.knowledge_store.write().await;
+        store.reload_authoritative_state();
+        store.get_note(&id).map_err(|e| e.to_string())?
+    };
+    root_ticket.finish(state.inner()).await?;
+    Ok(result)
 }
 
 /// Create a new note

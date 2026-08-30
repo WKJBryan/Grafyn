@@ -13,18 +13,32 @@ use tauri::State;
 
 #[tauri::command]
 pub async fn list_user_records(state: State<'_, AppState>) -> Result<Vec<UserRecord>, String> {
-    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
-    let mut store = state.twin_store.write().await;
-    store.list_user_records().map_err(|error| error.to_string())
+    let root_ticket = crate::commands::acquire_root_epoch(state.inner()).await?;
+    let result = {
+        let mut store = state.twin_store.write().await;
+        store
+            .rebuild_mutation_caches()
+            .map_err(|error| error.to_string())?;
+        store.list_user_records().map_err(|error| error.to_string())?
+    };
+    root_ticket.finish(state.inner()).await?;
+    Ok(result)
 }
 
 #[tauri::command]
 pub async fn get_user_record(id: String, state: State<'_, AppState>) -> Result<UserRecord, String> {
-    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
-    let mut store = state.twin_store.write().await;
-    store
-        .get_user_record(&id)
-        .map_err(|error| error.to_string())
+    let root_ticket = crate::commands::acquire_root_epoch(state.inner()).await?;
+    let result = {
+        let mut store = state.twin_store.write().await;
+        store
+            .rebuild_mutation_caches()
+            .map_err(|error| error.to_string())?;
+        store
+            .get_user_record(&id)
+            .map_err(|error| error.to_string())?
+    };
+    root_ticket.finish(state.inner()).await?;
+    Ok(result)
 }
 
 #[tauri::command]
@@ -57,11 +71,15 @@ pub async fn get_session_trace(
     session_id: String,
     state: State<'_, AppState>,
 ) -> Result<SessionTrace, String> {
-    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
-    let mut store = state.twin_store.write().await;
-    store
-        .get_session_trace(&session_id)
-        .map_err(|error| error.to_string())
+    let root_ticket = crate::commands::acquire_derived_root_epoch(state.inner()).await?;
+    let result = {
+        let mut store = state.twin_store.write().await;
+        store
+            .get_session_trace(&session_id)
+            .map_err(|error| error.to_string())?
+    };
+    root_ticket.finish(state.inner()).await?;
+    Ok(result)
 }
 
 #[tauri::command]
@@ -77,9 +95,13 @@ pub async fn run_twin_inference(
 
 #[tauri::command]
 pub async fn get_twin_review(state: State<'_, AppState>) -> Result<Vec<TwinReviewRecord>, String> {
-    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
-    let mut store = state.twin_store.write().await;
-    store.get_twin_review().map_err(|error| error.to_string())
+    let root_ticket = crate::commands::acquire_derived_root_epoch(state.inner()).await?;
+    let result = {
+        let mut store = state.twin_store.write().await;
+        store.get_twin_review().map_err(|error| error.to_string())?
+    };
+    root_ticket.finish(state.inner()).await?;
+    Ok(result)
 }
 
 #[tauri::command]
@@ -87,11 +109,15 @@ pub async fn resolve_user_record_evidence(
     id: String,
     state: State<'_, AppState>,
 ) -> Result<Vec<ResolvedEvidenceRef>, String> {
-    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
-    let mut store = state.twin_store.write().await;
-    store
-        .resolve_user_record_evidence(&id)
-        .map_err(|error| error.to_string())
+    let root_ticket = crate::commands::acquire_derived_root_epoch(state.inner()).await?;
+    let result = {
+        let mut store = state.twin_store.write().await;
+        store
+            .resolve_user_record_evidence(&id)
+            .map_err(|error| error.to_string())?
+    };
+    root_ticket.finish(state.inner()).await?;
+    Ok(result)
 }
 
 #[tauri::command]
@@ -113,22 +139,30 @@ pub async fn export_twin_data(
     request: TwinExportRequest,
     state: State<'_, AppState>,
 ) -> Result<crate::models::twin::ExportBundle, String> {
-    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
-    let mut store = state.twin_store.write().await;
-    store
-        .export_bundle(request)
-        .map_err(|error| error.to_string())
+    let root_ticket = crate::commands::acquire_derived_root_epoch(state.inner()).await?;
+    let result = {
+        let mut store = state.twin_store.write().await;
+        store
+            .export_bundle(request)
+            .map_err(|error| error.to_string())?
+    };
+    root_ticket.finish(state.inner()).await?;
+    Ok(result)
 }
 
 #[tauri::command]
 pub async fn list_decision_episodes(
     state: State<'_, AppState>,
 ) -> Result<Vec<DecisionEpisodeWithReflections>, String> {
-    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
-    let store = state.twin_store.read().await;
-    store
-        .list_decision_episodes_with_reflections()
-        .map_err(|error| error.to_string())
+    let root_ticket = crate::commands::acquire_derived_root_epoch(state.inner()).await?;
+    let result = {
+        let store = state.twin_store.read().await;
+        store
+            .list_decision_episodes_with_reflections()
+            .map_err(|error| error.to_string())?
+    };
+    root_ticket.finish(state.inner()).await?;
+    Ok(result)
 }
 
 #[tauri::command]
@@ -183,11 +217,15 @@ fn resolve_persisted_response_id(
 pub async fn get_decision_mirror_config(
     state: State<'_, AppState>,
 ) -> Result<DecisionMirrorConfig, String> {
-    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
-    let store = state.twin_store.read().await;
-    store
-        .get_decision_mirror_config()
-        .map_err(|error| error.to_string())
+    let root_ticket = crate::commands::acquire_derived_root_epoch(state.inner()).await?;
+    let result = {
+        let store = state.twin_store.read().await;
+        store
+            .get_decision_mirror_config()
+            .map_err(|error| error.to_string())?
+    };
+    root_ticket.finish(state.inner()).await?;
+    Ok(result)
 }
 
 #[tauri::command]
@@ -244,11 +282,15 @@ pub async fn review_memory_digest_item(
 pub async fn list_constitution_items(
     state: State<'_, AppState>,
 ) -> Result<Vec<ConstitutionItem>, String> {
-    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
-    let store = state.twin_store.read().await;
-    store
-        .list_constitution_items()
-        .map_err(|error| error.to_string())
+    let root_ticket = crate::commands::acquire_derived_root_epoch(state.inner()).await?;
+    let result = {
+        let store = state.twin_store.read().await;
+        store
+            .list_constitution_items()
+            .map_err(|error| error.to_string())?
+    };
+    root_ticket.finish(state.inner()).await?;
+    Ok(result)
 }
 
 #[tauri::command]
@@ -297,9 +339,13 @@ pub async fn review_constitution_item(
 
 #[tauri::command]
 pub async fn list_action_gaps(state: State<'_, AppState>) -> Result<Vec<ActionGap>, String> {
-    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
-    let store = state.twin_store.read().await;
-    store.list_action_gaps().map_err(|error| error.to_string())
+    let root_ticket = crate::commands::acquire_derived_root_epoch(state.inner()).await?;
+    let result = {
+        let store = state.twin_store.read().await;
+        store.list_action_gaps().map_err(|error| error.to_string())?
+    };
+    root_ticket.finish(state.inner()).await?;
+    Ok(result)
 }
 
 #[tauri::command]
@@ -319,11 +365,15 @@ pub async fn review_action_gap(
 pub async fn get_constitution_setup(
     state: State<'_, AppState>,
 ) -> Result<ConstitutionSetup, String> {
-    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
-    let store = state.twin_store.read().await;
-    store
-        .get_constitution_setup()
-        .map_err(|error| error.to_string())
+    let root_ticket = crate::commands::acquire_derived_root_epoch(state.inner()).await?;
+    let result = {
+        let store = state.twin_store.read().await;
+        store
+            .get_constitution_setup()
+            .map_err(|error| error.to_string())?
+    };
+    root_ticket.finish(state.inner()).await?;
+    Ok(result)
 }
 
 #[tauri::command]

@@ -36,9 +36,15 @@ struct QueuedOptimizerNote {
 /// entry (e.g. a note whose overlay path can never be written) can't spin
 /// forever and starve the rest of the queue.
 const MAX_OPTIMIZER_ATTEMPTS: u32 = 3;
+const OPTIMIZER_STATE_SCHEMA_VERSION: u16 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct OptimizerState {
+    #[serde(default)]
+    schema_version: u16,
+    #[serde(default)]
+    state_revision: u64,
     #[serde(default)]
     queue: Vec<QueuedOptimizerNote>,
     #[serde(default)]
@@ -126,6 +132,12 @@ impl VaultOptimizerService {
             changes_dir,
             state,
         };
+        if service.state.schema_version > OPTIMIZER_STATE_SCHEMA_VERSION {
+            anyhow::bail!(
+                "unsupported vault optimizer state schema {}",
+                service.state.schema_version
+            );
+        }
         service.validate_persisted_state()?;
         Ok(service)
     }
@@ -145,6 +157,42 @@ impl VaultOptimizerService {
 
     pub(crate) fn uses_data_path(&self, data_path: &std::path::Path) -> bool {
         self.optimizer_dir == data_path.join("vault_migration").join("optimizer")
+    }
+
+    pub(crate) fn state_revision(&self) -> u64 {
+        self.state.state_revision
+    }
+
+    pub(crate) fn with_locked_fresh_state<T>(
+        &mut self,
+        action: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        let root = crate::services::twin_events::AnchoredRoot::open(&self.optimizer_dir)
+            .map_err(anyhow::Error::new)?;
+        let lock = root
+            .lock_exclusive("state.lock")
+            .map_err(anyhow::Error::new)?;
+        let result = self.reload_from_disk_checked().and_then(|()| action(self));
+        lock.unlock()?;
+        result
+    }
+
+    fn reload_from_disk_checked(&mut self) -> Result<()> {
+        self.state = match std::fs::read_to_string(&self.queue_path) {
+            Ok(content) => serde_json::from_str::<OptimizerState>(&content)
+                .with_context(|| format!("Invalid optimizer queue {}", self.queue_path.display()))?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                OptimizerState::default()
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if self.state.schema_version > OPTIMIZER_STATE_SCHEMA_VERSION {
+            anyhow::bail!(
+                "unsupported vault optimizer state schema {}",
+                self.state.schema_version
+            );
+        }
+        self.validate_persisted_state()
     }
 
     pub fn bootstrap(&mut self, notes: &[Note]) {
@@ -235,6 +283,16 @@ impl VaultOptimizerService {
         });
     }
 
+    pub(crate) fn enqueue_note_checked(&mut self, note_id: &str, reason: &str) -> Result<bool> {
+        let before = self.state.queue.len();
+        self.enqueue_note(note_id, reason);
+        if self.state.queue.len() == before {
+            return Ok(false);
+        }
+        self.persist_state()?;
+        Ok(true)
+    }
+
     pub fn status(&self, settings: &UserSettings) -> VaultOptimizerStatus {
         let decisions = self.load_decisions().unwrap_or_default();
         let inbox = self.load_inbox().unwrap_or_default();
@@ -318,12 +376,12 @@ impl VaultOptimizerService {
         }
 
         self.state.rollback_count += 1;
-        self.persist_state()?;
         self.append_event(json!({
             "type": "rollback",
             "change_id": change_id,
             "at": Utc::now(),
         }))?;
+        self.persist_state()?;
 
         Ok(VaultOptimizerRollbackResult {
             change_id: change_id.to_string(),
@@ -747,12 +805,23 @@ impl VaultOptimizerService {
         }
     }
 
-    fn persist_state(&self) -> Result<()> {
+    fn persist_state(&mut self) -> Result<()> {
         std::fs::create_dir_all(&self.optimizer_dir)?;
-        write_atomic(
+        let previous_revision = self.state.state_revision;
+        self.state.schema_version = OPTIMIZER_STATE_SCHEMA_VERSION;
+        self.state.state_revision = self
+            .state
+            .state_revision
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("vault optimizer state revision exhausted"))?;
+        let result = write_atomic(
             &self.queue_path,
             serde_json::to_string_pretty(&self.state)?.as_bytes(),
-        )?;
+        );
+        if let Err(error) = result {
+            self.state.state_revision = previous_revision;
+            return Err(error.into());
+        }
         Ok(())
     }
 
@@ -1049,6 +1118,39 @@ mod tests {
             std::fs::read_to_string(&service.queue_path).expect("queue.json should exist");
         assert!(persisted.contains("note-1"));
         assert_no_tmp_siblings(&service.optimizer_dir);
+    }
+
+    #[test]
+    fn peer_instances_reload_revision_before_enqueuing() {
+        let data_dir = tempdir().expect("temp dir should be created");
+        let mut first = VaultOptimizerService::new(data_dir.path().to_path_buf());
+        let mut peer = VaultOptimizerService::new(data_dir.path().to_path_buf());
+
+        first
+            .with_locked_fresh_state(|service| {
+                service.enqueue_note_checked("note-a", "first").map(|_| ())
+            })
+            .unwrap();
+        let first_revision = first.state_revision();
+        peer.with_locked_fresh_state(|service| {
+            service.enqueue_note_checked("note-b", "peer").map(|_| ())
+        })
+        .unwrap();
+        let peer_revision = peer.state_revision();
+        let queued = first
+            .with_locked_fresh_state(|service| {
+                Ok(service
+                    .state
+                    .queue
+                    .iter()
+                    .map(|entry| entry.note_id.clone())
+                    .collect::<std::collections::BTreeSet<_>>())
+            })
+            .unwrap();
+
+        assert_eq!(queued, ["note-a".to_string(), "note-b".to_string()].into());
+        assert!(peer_revision > first_revision);
+        assert_eq!(first.state_revision(), peer_revision);
     }
 
     #[test]

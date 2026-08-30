@@ -212,7 +212,7 @@ pub async fn apply_links(
     request: ApplyLinksRequest,
 ) -> Result<ApplyLinksResponse, String> {
     let mut root_guard = Some(crate::commands::acquire_root_epoch(state.inner()).await?);
-    let root_epoch = crate::commands::capture_root_epoch(state.inner())?;
+    let mut root_epoch = crate::commands::capture_root_epoch(state.inner())?;
     let requested_candidates = if !request.candidates.is_empty() {
         deduplicate_links(request.candidates.clone())
     } else {
@@ -240,7 +240,7 @@ pub async fn apply_links(
             .filter(|c| requested.contains(&c.target_id))
             .collect()
     };
-    let _root_guard = match root_guard {
+    let root_guard = match root_guard {
         Some(guard) => guard,
         None => crate::commands::acquire_expected_root_epoch(state.inner(), &root_epoch).await?,
     };
@@ -270,15 +270,20 @@ pub async fn apply_links(
             {
                 drop(store);
                 let mut store = state.knowledge_store.write().await;
-                store
-                    .update_note(
+                let (_, commit) = store
+                    .update_note_expecting_authority(
                         &noteId,
                         NoteUpdate {
                             content: Some(new_content),
                             ..Default::default()
                         },
+                        "note_editor",
+                        root_epoch.clone(),
                     )
                     .map_err(|e| e.to_string())?;
+                root_epoch = commit
+                    .authority_token
+                    .unwrap_or_else(|| root_epoch.clone());
                 true
             } else {
                 false
@@ -300,15 +305,25 @@ pub async fn apply_links(
                 add_wikilink_to_content(&target_content, &source_title, &reverse_type)
             {
                 let mut store = state.knowledge_store.write().await;
-                target_updated = store
-                    .update_note(
+                target_updated = match store
+                    .update_note_expecting_authority(
                         &candidate.target_id,
                         NoteUpdate {
                             content: Some(new_content),
                             ..Default::default()
                         },
+                        "note_editor",
+                        root_epoch.clone(),
                     )
-                    .is_ok();
+                {
+                    Ok((_, commit)) => {
+                        root_epoch = commit
+                            .authority_token
+                            .unwrap_or_else(|| root_epoch.clone());
+                        true
+                    }
+                    Err(_) => false,
+                };
             }
         }
 
@@ -322,6 +337,13 @@ pub async fn apply_links(
     }
 
     if !dirty_note_ids.is_empty() {
+        state
+            .mutation_coordinator
+            .as_ref()
+            .ok_or_else(|| "mutation coordinator is unavailable".to_string())?
+            .validate_authority_token(&root_epoch, false)
+            .map_err(|error| error.to_string())?;
+        drop(root_guard);
         let dirty_ids: Vec<String> = dirty_note_ids.iter().cloned().collect();
         commit_note_writes(state.inner(), &dirty_ids, "links_applied").await?;
     }
@@ -341,7 +363,8 @@ pub async fn create_link(
     #[allow(non_snake_case)] targetId: String,
     #[allow(non_snake_case)] linkType: Option<String>,
 ) -> Result<CreateLinkResponse, String> {
-    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
+    let root_ticket = crate::commands::acquire_root_epoch(state.inner()).await?;
+    let mut root_epoch = root_ticket.authority().clone();
     let link_type = linkType.unwrap_or_else(|| "related".to_string());
     let mut dirty_note_ids: HashSet<String> = HashSet::new();
 
@@ -363,15 +386,20 @@ pub async fn create_link(
         {
             drop(store);
             let mut store = state.knowledge_store.write().await;
-            store
-                .update_note(
+            let (_, commit) = store
+                .update_note_expecting_authority(
                     &sourceId,
                     NoteUpdate {
                         content: Some(new_content),
                         ..Default::default()
                     },
+                    "note_editor",
+                    root_epoch.clone(),
                 )
                 .map_err(|e| e.to_string())?;
+            root_epoch = commit
+                .authority_token
+                .unwrap_or_else(|| root_epoch.clone());
             dirty_note_ids.insert(sourceId.clone());
         }
     }
@@ -386,18 +414,31 @@ pub async fn create_link(
         {
             drop(store);
             let mut store = state.knowledge_store.write().await;
-            let _ = store.update_note(
+            if let Ok((_, commit)) = store.update_note_expecting_authority(
                 &targetId,
                 NoteUpdate {
                     content: Some(new_content),
                     ..Default::default()
                 },
-            );
-            dirty_note_ids.insert(targetId.clone());
+                "note_editor",
+                root_epoch.clone(),
+            ) {
+                root_epoch = commit
+                    .authority_token
+                    .unwrap_or_else(|| root_epoch.clone());
+                dirty_note_ids.insert(targetId.clone());
+            }
         }
     }
 
     if !dirty_note_ids.is_empty() {
+        state
+            .mutation_coordinator
+            .as_ref()
+            .ok_or_else(|| "mutation coordinator is unavailable".to_string())?
+            .validate_authority_token(&root_epoch, false)
+            .map_err(|error| error.to_string())?;
+        drop(root_ticket);
         let dirty_ids: Vec<String> = dirty_note_ids.iter().cloned().collect();
         commit_note_writes(state.inner(), &dirty_ids, "link_created").await?;
     }
@@ -423,9 +464,23 @@ pub async fn list_link_suggestion_queue(
     status: Option<String>,
     limit: Option<usize>,
 ) -> Result<Vec<LinkSuggestionQueueEntry>, String> {
-    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
-    let discovery = state.link_discovery.read().await;
-    Ok(discovery.list_queue_entries(status.as_deref(), limit.unwrap_or(25)))
+    let root_ticket = crate::commands::acquire_derived_root_epoch(state.inner()).await?;
+    let result = {
+        let mut discovery = state.link_discovery.write().await;
+        state
+            .mutation_coordinator
+            .as_ref()
+            .ok_or_else(|| "mutation coordinator is unavailable".to_string())?
+            .with_locked_derived_state(root_ticket.authority(), true, || {
+                discovery.reload_from_disk_checked().map_err(|error| {
+                    crate::services::twin_events::MutationError::Invalid(error.to_string())
+                })?;
+                Ok(discovery.list_queue_entries(status.as_deref(), limit.unwrap_or(25)))
+            })
+            .map_err(|error| error.to_string())?
+    };
+    root_ticket.finish(state.inner()).await?;
+    Ok(result)
 }
 
 /// Dismiss a cached suggestion so it does not reappear until the note changes again.
@@ -435,11 +490,27 @@ pub async fn dismiss_link_suggestion(
     #[allow(non_snake_case)] noteId: String,
     #[allow(non_snake_case)] targetId: String,
 ) -> Result<DismissLinkSuggestionResponse, String> {
-    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
-    let mut discovery = state.link_discovery.write().await;
-    let response = discovery.dismiss_suggestion(&noteId, &targetId);
-    drop(discovery);
-    enqueue_vault_optimizer_note(state.inner(), &noteId, "link_dismissed").await;
+    let root_ticket = crate::commands::acquire_derived_root_epoch(state.inner()).await?;
+    let response = {
+        let mut discovery = state.link_discovery.write().await;
+        state
+            .mutation_coordinator
+            .as_ref()
+            .ok_or_else(|| "mutation coordinator is unavailable".to_string())?
+            .with_locked_derived_state(root_ticket.authority(), true, || {
+                discovery.reload_from_disk_checked().map_err(|error| {
+                    crate::services::twin_events::MutationError::Invalid(error.to_string())
+                })?;
+                discovery
+                    .dismiss_suggestion_checked(&noteId, &targetId)
+                    .map_err(|error| {
+                        crate::services::twin_events::MutationError::Invalid(error.to_string())
+                    })
+            })
+            .map_err(|error| error.to_string())?
+    };
+    enqueue_vault_optimizer_note(state.inner(), &noteId, "link_dismissed").await?;
+    root_ticket.finish(state.inner()).await?;
     Ok(response)
 }
 
@@ -448,8 +519,25 @@ pub async fn dismiss_link_suggestion(
 pub async fn get_link_discovery_status(
     state: State<'_, AppState>,
 ) -> Result<LinkDiscoveryStatus, String> {
-    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
-    let settings = state.settings_service.read().await;
-    let discovery = state.link_discovery.read().await;
-    Ok(discovery.status(settings.get()))
+    let root_ticket = crate::commands::acquire_derived_root_epoch(state.inner()).await?;
+    let result = {
+        let settings = {
+            let settings_service = state.settings_service.read().await;
+            settings_service.get().clone()
+        };
+        let mut discovery = state.link_discovery.write().await;
+        state
+            .mutation_coordinator
+            .as_ref()
+            .ok_or_else(|| "mutation coordinator is unavailable".to_string())?
+            .with_locked_derived_state(root_ticket.authority(), true, || {
+                discovery.reload_from_disk_checked().map_err(|error| {
+                    crate::services::twin_events::MutationError::Invalid(error.to_string())
+                })?;
+                Ok(discovery.status(&settings))
+            })
+            .map_err(|error| error.to_string())?
+    };
+    root_ticket.finish(state.inner()).await?;
+    Ok(result)
 }

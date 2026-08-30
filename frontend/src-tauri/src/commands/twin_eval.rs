@@ -59,10 +59,12 @@ pub async fn preview_twin_eval_context(
     state: State<'_, AppState>,
     request: TwinEvalRunRequest,
 ) -> Result<TwinEvalContextPacket, String> {
-    let _root_guard = crate::commands::acquire_root_epoch(state.inner()).await?;
+    let root_ticket = crate::commands::acquire_derived_root_epoch(state.inner()).await?;
     let question = parse_lab_question(&request.raw_question, request.answer_key.clone())
         .map_err(|error| error.to_string())?;
-    build_context_packet(&state, &question, &request).await
+    let packet = build_context_packet(&state, &question, &request).await?;
+    root_ticket.finish(state.inner()).await?;
+    Ok(packet)
 }
 
 #[tauri::command]
@@ -70,13 +72,13 @@ pub async fn run_twin_eval_lab(
     state: State<'_, AppState>,
     request: TwinEvalRunRequest,
 ) -> Result<TwinEvalRunReport, String> {
-    let root_guard = crate::commands::acquire_root_epoch(state.inner()).await?;
-    let root_epoch = crate::commands::capture_root_epoch(state.inner())?;
+    let root_ticket = crate::commands::acquire_derived_root_epoch(state.inner()).await?;
+    let root_epoch = root_ticket.authority().clone();
     let question = parse_lab_question(&request.raw_question, request.answer_key.clone())
         .map_err(|error| error.to_string())?;
     let context_packet = build_context_packet(&state, &question, &request).await?;
     let settings = request.settings();
-    drop(root_guard);
+    root_ticket.finish(state.inner()).await?;
 
     let installed = installed_ollama_model_ids(&state).await;
     let matrix = default_model_matrix(&installed);
@@ -187,13 +189,13 @@ pub async fn run_twin_eval_lab_stream(
     state: State<'_, AppState>,
     request: TwinEvalRunRequest,
 ) -> Result<(), String> {
-    let root_guard = crate::commands::acquire_root_epoch(state.inner()).await?;
-    let root_epoch = crate::commands::capture_root_epoch(state.inner())?;
+    let root_ticket = crate::commands::acquire_derived_root_epoch(state.inner()).await?;
+    let root_epoch = root_ticket.authority().clone();
     let question = parse_lab_question(&request.raw_question, request.answer_key.clone())
         .map_err(|error| error.to_string())?;
     let context_packet = build_context_packet(&state, &question, &request).await?;
     let settings = request.settings();
-    drop(root_guard);
+    root_ticket.finish(state.inner()).await?;
 
     let installed = installed_ollama_model_ids(&state).await;
     let matrix = default_model_matrix(&installed);

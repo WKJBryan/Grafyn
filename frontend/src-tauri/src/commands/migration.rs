@@ -13,18 +13,23 @@ pub async fn preview_markdown_migration(
     request: MarkdownMigrationRequest,
     state: State<'_, AppState>,
 ) -> Result<MarkdownMigrationPreview, String> {
-    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
+    let root_ticket = crate::commands::acquire_derived_root_epoch(state.inner()).await?;
     let epoch = crate::commands::capture_root_epoch(state.inner())?;
-    let service = state.markdown_migration.read().await;
-    let store = state.knowledge_store.read().await;
-    let requested = std::fs::canonicalize(&vault_path).map_err(|error| error.to_string())?;
-    let current = std::fs::canonicalize(store.vault_path()).map_err(|error| error.to_string())?;
-    if requested != current {
-        return Err("migration preview must use the active vault".into());
-    }
-    service
-        .preview_scoped(&store, epoch.root_scope, request)
-        .map_err(|error| error.to_string())
+    let result = {
+        let service = state.markdown_migration.read().await;
+        let store = state.knowledge_store.read().await;
+        let requested = std::fs::canonicalize(&vault_path).map_err(|error| error.to_string())?;
+        let current =
+            std::fs::canonicalize(store.vault_path()).map_err(|error| error.to_string())?;
+        if requested != current {
+            return Err("migration preview must use the active vault".into());
+        }
+        service
+            .preview_scoped(&store, epoch.root_scope, request)
+            .map_err(|error| error.to_string())?
+    };
+    root_ticket.finish(state.inner()).await?;
+    Ok(result)
 }
 
 #[tauri::command]
@@ -107,12 +112,16 @@ pub async fn get_markdown_migration_status(
     run_id: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<MarkdownMigrationStatus, String> {
-    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
+    let root_ticket = crate::commands::acquire_derived_root_epoch(state.inner()).await?;
     let epoch = crate::commands::capture_root_epoch(state.inner())?;
-    let service = state.markdown_migration.read().await;
-    service
-        .status_scoped(run_id.as_deref(), &epoch.root_scope)
-        .map_err(|error| error.to_string())
+    let result = {
+        let service = state.markdown_migration.read().await;
+        service
+            .status_scoped(run_id.as_deref(), &epoch.root_scope)
+            .map_err(|error| error.to_string())?
+    };
+    root_ticket.finish(state.inner()).await?;
+    Ok(result)
 }
 
 #[tauri::command]
@@ -146,10 +155,19 @@ pub async fn rollback_markdown_migration(
 pub async fn get_vault_optimizer_status(
     state: State<'_, AppState>,
 ) -> Result<VaultOptimizerStatus, String> {
-    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
-    let settings = state.settings_service.read().await;
-    let optimizer = state.vault_optimizer.read().await;
-    Ok(optimizer.status(settings.get()))
+    let root_ticket = crate::commands::acquire_derived_root_epoch(state.inner()).await?;
+    let result = {
+        let settings = {
+            let settings = state.settings_service.read().await;
+            settings.get().clone()
+        };
+        let mut optimizer = state.vault_optimizer.write().await;
+        optimizer
+            .with_locked_fresh_state(|optimizer| Ok(optimizer.status(&settings)))
+            .map_err(|error| error.to_string())?
+    };
+    root_ticket.finish(state.inner()).await?;
+    Ok(result)
 }
 
 #[tauri::command]
@@ -194,11 +212,15 @@ pub async fn list_vault_optimizer_decisions(
     _cursor: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<Vec<VaultOptimizerDecision>, String> {
-    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
-    let optimizer = state.vault_optimizer.read().await;
-    optimizer
-        .list_decisions(limit.unwrap_or(20))
-        .map_err(|error| error.to_string())
+    let root_ticket = crate::commands::acquire_derived_root_epoch(state.inner()).await?;
+    let result = {
+        let mut optimizer = state.vault_optimizer.write().await;
+        optimizer
+            .with_locked_fresh_state(|optimizer| optimizer.list_decisions(limit.unwrap_or(20)))
+            .map_err(|error| error.to_string())?
+    };
+    root_ticket.finish(state.inner()).await?;
+    Ok(result)
 }
 
 #[tauri::command]
@@ -207,11 +229,17 @@ pub async fn get_vault_optimizer_inbox(
     limit: Option<usize>,
     state: State<'_, AppState>,
 ) -> Result<Vec<VaultOptimizerInboxEntry>, String> {
-    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
-    let optimizer = state.vault_optimizer.read().await;
-    optimizer
-        .inbox(status.as_deref(), limit.unwrap_or(20))
-        .map_err(|error| error.to_string())
+    let root_ticket = crate::commands::acquire_derived_root_epoch(state.inner()).await?;
+    let result = {
+        let mut optimizer = state.vault_optimizer.write().await;
+        optimizer
+            .with_locked_fresh_state(|optimizer| {
+                optimizer.inbox(status.as_deref(), limit.unwrap_or(20))
+            })
+            .map_err(|error| error.to_string())?
+    };
+    root_ticket.finish(state.inner()).await?;
+    Ok(result)
 }
 
 #[tauri::command]
@@ -227,7 +255,9 @@ pub async fn rollback_vault_optimizer_change(
         let mut store = state.knowledge_store.write().await;
         let mut optimizer = state.vault_optimizer.write().await;
         optimizer
-            .rollback_change(&change_id, &mut store)
+            .with_locked_fresh_state(|optimizer| {
+                optimizer.rollback_change(&change_id, &mut store)
+            })
             .map_err(|error| error.to_string())?
     };
     crate::commands::rebuild_all_indexes(state.inner()).await?;

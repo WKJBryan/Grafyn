@@ -360,7 +360,7 @@ impl MarkdownMigrationService {
                         PROP_INFERRED_LINK_IDS: proposal.inferred_link_ids,
                     }
                 });
-                store.write_overlay(&proposal.note_id, &overlay)?;
+                store.write_overlay_from_source(&proposal.note_id, &overlay, "migration")?;
                 overlay_note_ids.push(proposal.note_id.clone());
                 continue;
             }
@@ -741,7 +741,7 @@ impl MarkdownMigrationService {
         }
 
         for note_id in &manifest.overlay_note_ids {
-            if let Err(error) = store.delete_overlay(note_id) {
+            if let Err(error) = store.delete_overlay_from_source(note_id, "migration") {
                 failures.push(format!(
                     "failed to delete overlay for note '{}': {}",
                     note_id, error

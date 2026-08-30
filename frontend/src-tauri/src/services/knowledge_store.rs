@@ -225,6 +225,10 @@ impl KnowledgeStore {
         self.meta_cache = notes;
     }
 
+    pub(crate) fn reload_authoritative_state(&mut self) {
+        self.refresh_cache();
+    }
+
     pub fn list_notes(&self) -> Result<Vec<NoteMeta>> {
         Ok(self.meta_cache.clone())
     }
@@ -274,7 +278,21 @@ impl KnowledgeStore {
     }
 
     pub fn create_note_from_source(&mut self, create: NoteCreate, source: &str) -> Result<Note> {
-        self.create_note_with_context(create, NoteMutationContext::local(source)?)
+        self.create_note_with_context(create, NoteMutationContext::local(source)?, None)
+            .map(|(note, _)| note)
+    }
+
+    pub(crate) fn create_note_expecting_authority(
+        &mut self,
+        create: NoteCreate,
+        source: &str,
+        expected: crate::services::vault_namespace::VaultAuthorityTokenV1,
+    ) -> Result<(Note, crate::services::twin_events::MutationCommit)> {
+        self.create_note_with_context(
+            create,
+            NoteMutationContext::local(source)?,
+            Some(expected),
+        )
     }
 
     pub fn import_note_container(
@@ -422,9 +440,10 @@ impl KnowledgeStore {
         &mut self,
         create: NoteCreate,
         context: NoteMutationContext,
-    ) -> Result<Note> {
+        expected: Option<crate::services::vault_namespace::VaultAuthorityTokenV1>,
+    ) -> Result<(Note, crate::services::twin_events::MutationCommit)> {
         if !self.event_recorder.is_noop() {
-            return self.create_note_with_locked_plan(create, context);
+            return self.create_note_with_locked_plan(create, context, expected);
         }
         let id = self.generate_note_id(&create.title);
         let relative_path = match create.relative_path {
@@ -465,14 +484,22 @@ impl KnowledgeStore {
             return Err(error);
         }
         self.refresh_cache();
-        self.get_note(&note.id)
+        Ok((
+            self.get_note(&note.id)?,
+            crate::services::twin_events::MutationCommit {
+                mutation_id: None,
+                events: Vec::new(),
+                authority_token: None,
+            },
+        ))
     }
 
     fn create_note_with_locked_plan(
         &mut self,
         create: NoteCreate,
         context: NoteMutationContext,
-    ) -> Result<Note> {
+        expected: Option<crate::services::vault_namespace::VaultAuthorityTokenV1>,
+    ) -> Result<(Note, crate::services::twin_events::MutationCommit)> {
         let recorder = self.event_recorder.clone();
         let mut planned_id = None;
         let mut planner = || {
@@ -507,7 +534,7 @@ impl KnowledgeStore {
             };
             note.wikilinks = self.extract_wikilinks(&note.content);
             note.parsed_links = self.extract_links(&note.content, &note.relative_path);
-            let plan = self
+            let mut plan = self
                 .plan_note_change(
                     &note,
                     None,
@@ -517,6 +544,9 @@ impl KnowledgeStore {
                 .map_err(|error| {
                     crate::services::twin_events::MutationError::Invalid(error.to_string())
                 })?;
+            if let Some(expected) = expected.clone() {
+                plan = plan.expecting_authority(expected);
+            }
             planned_id = Some(id);
             Ok(Some(plan))
         };
@@ -525,8 +555,11 @@ impl KnowledgeStore {
             &mut planner,
         );
         self.refresh_cache();
-        result.map_err(anyhow::Error::new)?;
-        self.get_note(planned_id.as_deref().expect("planner returned a note ID"))
+        let commit = result.map_err(anyhow::Error::new)?;
+        Ok((
+            self.get_note(planned_id.as_deref().expect("planner returned a note ID"))?,
+            commit,
+        ))
     }
 
     pub fn update_note(&mut self, id: &str, update: NoteUpdate) -> Result<Note> {
@@ -539,7 +572,24 @@ impl KnowledgeStore {
         update: NoteUpdate,
         source: &str,
     ) -> Result<Note> {
-        self.update_note_with_options(id, update, true, NoteMutationContext::local(source)?)
+        self.update_note_with_options(id, update, true, NoteMutationContext::local(source)?, None)
+            .map(|(note, _)| note)
+    }
+
+    pub(crate) fn update_note_expecting_authority(
+        &mut self,
+        id: &str,
+        update: NoteUpdate,
+        source: &str,
+        expected: crate::services::vault_namespace::VaultAuthorityTokenV1,
+    ) -> Result<(Note, crate::services::twin_events::MutationCommit)> {
+        self.update_note_with_options(
+            id,
+            update,
+            true,
+            NoteMutationContext::local(source)?,
+            Some(expected),
+        )
     }
 
     /// Same as `update_note`, but when `bump_updated_at` is false the note's existing
@@ -554,14 +604,28 @@ impl KnowledgeStore {
         update: NoteUpdate,
         bump_updated_at: bool,
         context: NoteMutationContext,
-    ) -> Result<Note> {
+        expected: Option<crate::services::vault_namespace::VaultAuthorityTokenV1>,
+    ) -> Result<(Note, crate::services::twin_events::MutationCommit)> {
         if !self.event_recorder.is_noop() {
-            return self.update_note_with_locked_plan(id, update, bump_updated_at, context);
+            return self.update_note_with_locked_plan(
+                id,
+                update,
+                bump_updated_at,
+                context,
+                expected,
+            );
         }
         Self::validate_note_id(id)?;
         let mut note = self.get_note(id)?;
         if !note_update_changes(&note, &update)? {
-            return Ok(note);
+            return Ok((
+                note,
+                crate::services::twin_events::MutationCommit {
+                    mutation_id: None,
+                    events: Vec::new(),
+                    authority_token: None,
+                },
+            ));
         }
         let old_path = self.note_path(id)?;
 
@@ -633,7 +697,14 @@ impl KnowledgeStore {
         }
 
         self.refresh_cache();
-        self.get_note(&note.id)
+        Ok((
+            self.get_note(&note.id)?,
+            crate::services::twin_events::MutationCommit {
+                mutation_id: None,
+                events: Vec::new(),
+                authority_token: None,
+            },
+        ))
     }
 
     fn update_note_with_locked_plan(
@@ -642,7 +713,8 @@ impl KnowledgeStore {
         update: NoteUpdate,
         bump_updated_at: bool,
         context: NoteMutationContext,
-    ) -> Result<Note> {
+        expected: Option<crate::services::vault_namespace::VaultAuthorityTokenV1>,
+    ) -> Result<(Note, crate::services::twin_events::MutationCommit)> {
         Self::validate_note_id(id)?;
         let note_id = id.to_string();
         let recorder = self.event_recorder.clone();
@@ -665,7 +737,7 @@ impl KnowledgeStore {
                 .map_err(|error| {
                     crate::services::twin_events::MutationError::Invalid(error.to_string())
                 })?;
-            let plan = self
+            let mut plan = self
                 .plan_note_change(
                     &note,
                     Some(&old_path),
@@ -675,6 +747,9 @@ impl KnowledgeStore {
                 .map_err(|error| {
                     crate::services::twin_events::MutationError::Invalid(error.to_string())
                 })?;
+            if let Some(expected) = expected.clone() {
+                plan = plan.expecting_authority(expected);
+            }
             planned_id = Some(note.id.clone());
             Ok(Some(plan))
         };
@@ -683,8 +758,11 @@ impl KnowledgeStore {
             &mut planner,
         );
         self.refresh_cache();
-        result.map_err(anyhow::Error::new)?;
-        self.get_note(planned_id.as_deref().expect("planner returned a note ID"))
+        let commit = result.map_err(anyhow::Error::new)?;
+        Ok((
+            self.get_note(planned_id.as_deref().expect("planner returned a note ID"))?,
+            commit,
+        ))
     }
 
     fn apply_note_update(
@@ -750,7 +828,14 @@ impl KnowledgeStore {
         id: &str,
         update: NoteUpdate,
     ) -> Result<Note> {
-        self.update_note_with_options(id, update, false, NoteMutationContext::local("migration")?)
+        self.update_note_with_options(
+            id,
+            update,
+            false,
+            NoteMutationContext::local("migration")?,
+            None,
+        )
+        .map(|(note, _)| note)
     }
 
     pub(crate) fn restore_note_bytes_from_source(
@@ -1028,9 +1113,11 @@ impl KnowledgeStore {
                 return Err(anyhow::Error::new(error));
             }
         }
-        let overlay_path = self.overlay_path(id);
-        if overlay_path.exists() {
-            let _ = std::fs::remove_file(&overlay_path);
+        if self.event_recorder.is_noop() {
+            let overlay_path = self.overlay_path(id);
+            if overlay_path.exists() {
+                let _ = std::fs::remove_file(&overlay_path);
+            }
         }
         self.refresh_cache();
         Ok(())
@@ -1041,19 +1128,74 @@ impl KnowledgeStore {
     }
 
     pub fn write_overlay(&self, note_id: &str, overlay: &serde_json::Value) -> Result<()> {
+        self.write_overlay_from_source(note_id, overlay, "vault_optimizer")
+    }
+
+    pub fn write_overlay_from_source(
+        &self,
+        note_id: &str,
+        overlay: &serde_json::Value,
+        source: &str,
+    ) -> Result<()> {
         Self::validate_note_id(note_id)?;
+        let content = serde_json::to_string_pretty(overlay)?;
+        if !self.event_recorder.is_noop() {
+            let source_channel = crate::models::twin_event::SourceChannel::parse(source)
+                .map_err(anyhow::Error::msg)?;
+            let target_key = format!("{note_id}.json");
+            let mut plan = Some(crate::services::twin_events::MutationPlan::new(
+                crate::models::twin_event::CausalStream::LocalOnly,
+                source_channel,
+                vec![crate::services::twin_events::TargetMutation::put(
+                    crate::services::twin_events::TargetKind::OverlayJson,
+                    target_key,
+                    content,
+                )],
+                Vec::new(),
+            ));
+            self.event_recorder
+                .commit_planned_mutation(
+                    crate::services::twin_events::MutationOrigin::Local,
+                    &mut || Ok(plan.take()),
+                )
+                .map_err(anyhow::Error::new)?;
+            return Ok(());
+        }
         if let Some(parent) = self.overlay_path(note_id).parent() {
             std::fs::create_dir_all(parent)?;
         }
-        write_atomic(
-            &self.overlay_path(note_id),
-            serde_json::to_string_pretty(overlay)?.as_bytes(),
-        )
+        write_atomic(&self.overlay_path(note_id), content.as_bytes())
         .with_context(|| format!("Failed to write overlay for '{}'", note_id))?;
         Ok(())
     }
 
     pub fn delete_overlay(&self, note_id: &str) -> Result<()> {
+        self.delete_overlay_from_source(note_id, "vault_optimizer")
+    }
+
+    pub fn delete_overlay_from_source(&self, note_id: &str, source: &str) -> Result<()> {
+        Self::validate_note_id(note_id)?;
+        if !self.event_recorder.is_noop() {
+            let source_channel = crate::models::twin_event::SourceChannel::parse(source)
+                .map_err(anyhow::Error::msg)?;
+            let target_key = format!("{note_id}.json");
+            let mut plan = Some(crate::services::twin_events::MutationPlan::new(
+                crate::models::twin_event::CausalStream::LocalOnly,
+                source_channel,
+                vec![crate::services::twin_events::TargetMutation::tombstone(
+                    crate::services::twin_events::TargetKind::OverlayJson,
+                    target_key,
+                )],
+                Vec::new(),
+            ));
+            self.event_recorder
+                .commit_planned_mutation(
+                    crate::services::twin_events::MutationOrigin::Local,
+                    &mut || Ok(plan.take()),
+                )
+                .map_err(anyhow::Error::new)?;
+            return Ok(());
+        }
         let path = self.overlay_path(note_id);
         if path.exists() {
             std::fs::remove_file(path)?;
@@ -1451,13 +1593,18 @@ impl KnowledgeStore {
         } else {
             Vec::new()
         };
+        let mut targets = vec![crate::services::twin_events::TargetMutation::tombstone(
+            crate::services::twin_events::TargetKind::Markdown,
+            normalize_relative_path_for_output(&key),
+        )];
+        targets.push(crate::services::twin_events::TargetMutation::tombstone(
+            crate::services::twin_events::TargetKind::OverlayJson,
+            format!("{}.json", note.id),
+        ));
         Ok(crate::services::twin_events::MutationPlan::new(
             crate::models::twin_event::CausalStream::SyncEligible,
             context.source_channel,
-            vec![crate::services::twin_events::TargetMutation::tombstone(
-                crate::services::twin_events::TargetKind::Markdown,
-                normalize_relative_path_for_output(&key),
-            )],
+            targets,
             drafts,
         ))
     }

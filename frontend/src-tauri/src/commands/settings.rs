@@ -141,10 +141,12 @@ async fn apply_settings_update_inner(
     let mut transition = crate::services::root_transition::RootTransitionV1::prepared(
         durable_before.authority.clone(),
         after_authority,
+        transition_store.authority_binding(),
     )
     .map_err(|error| error.to_string())?;
 
     let mut commit_uncertain = false;
+    let mut rebuilt_authority = None;
     let result = async {
         transition_store
             .prepare_transition_cas_locked(
@@ -177,6 +179,7 @@ async fn apply_settings_update_inner(
             .map_err(|error| error.to_string())?;
 
         if transition.root_changed {
+            *state.loaded_authority.write().await = None;
             transition_store
                 .write_lease(&transition.after.lease)
                 .map_err(|error| error.to_string())?;
@@ -195,13 +198,16 @@ async fn apply_settings_update_inner(
             knowledge
                 .adopt_coordinated_vault_path(candidate_vault.clone(), &candidate_namespace)
                 .map_err(|error| error.to_string())?;
-            let candidate_twin = crate::services::settings::prepare_twin_data_path(
-                &data_path,
-                &candidate_vault,
-            )
-            .map_err(|error| error.to_string())?;
+            let candidate_twin = root_guard
+                .prepare_twin_data_path(&candidate_vault, &transition.after.lease)
+                .map_err(|error| error.to_string())?;
             twin.replace_root_path(candidate_twin)
                 .map_err(|error| error.to_string())?;
+            rebuilt_authority = Some(
+                root_guard
+                    .capture_authority_token(&transition.after.lease)
+                    .map_err(|error| error.to_string())?,
+            );
             twin.rebuild_mutation_caches()
                 .map_err(|error| error.to_string())?;
             let new_notes = knowledge
@@ -295,9 +301,13 @@ async fn apply_settings_update_inner(
             .checkpoint(crate::services::root_transition::RootTransitionFaultPoint::AfterWalDelete)
             .map_err(|error| error.to_string())?;
         if transition.root_changed {
+            let token = rebuilt_authority.as_ref().ok_or_else(|| {
+                "root transition rebuilt without capturing its authority token".to_string()
+            })?;
             root_guard
-                .publish_namespace_ready(&transition.after.lease)
+                .publish_namespace_ready(token)
                 .map_err(|error| error.to_string())?;
+            *state.loaded_authority.write().await = Some(token.clone());
         }
         Ok::<_, String>(candidate.clone())
     }
@@ -308,6 +318,7 @@ async fn apply_settings_update_inner(
             let recovery = transition_store.recover_while_process_locked();
             let runtime_recovery = match recovery {
                 Ok(crate::services::root_transition::RecoveryWork::RolledBack) => async {
+                    *state.loaded_authority.write().await = None;
                     root_guard
                         .adopt_durable_root(&old_vault, &transition.rollback_lease)
                         .map_err(|error| error.to_string())?;
@@ -322,12 +333,16 @@ async fn apply_settings_update_inner(
                         .map_err(|error| error.to_string())?;
                     twin.replace_root_path(old_twin.clone())
                         .map_err(|error| error.to_string())?;
+                    let rebuilt_token = root_guard
+                        .capture_authority_token(&transition.rollback_lease)
+                        .map_err(|error| error.to_string())?;
                     twin.rebuild_mutation_caches()
                         .map_err(|error| error.to_string())?;
                     rebuild_indexes_from_notes(state, &old_namespace, &old_notes).await?;
                     root_guard
-                        .publish_namespace_ready(&transition.rollback_lease)
+                        .publish_namespace_ready(&rebuilt_token)
                         .map_err(|error| error.to_string())?;
+                    *state.loaded_authority.write().await = Some(rebuilt_token);
                     let durable_old_secret = transition_store
                         .resolve_secret(transition.before.openrouter_key_version.as_deref())
                         .map_err(|error| error.to_string())?;
@@ -367,6 +382,7 @@ async fn apply_settings_update_inner(
                 }
                 .await,
                 Ok(crate::services::root_transition::RecoveryWork::RolledForward) => async {
+                    *state.loaded_authority.write().await = None;
                     root_guard
                         .adopt_durable_root(&candidate_vault, &transition.after.lease)
                         .map_err(|error| error.to_string())?;
@@ -379,12 +395,13 @@ async fn apply_settings_update_inner(
                     knowledge
                         .adopt_coordinated_vault_path(candidate_vault.clone(), &candidate_namespace)
                         .map_err(|error| error.to_string())?;
-                    let candidate_twin = crate::services::settings::prepare_twin_data_path(
-                        &data_path,
-                        &candidate_vault,
-                    )
-                    .map_err(|error| error.to_string())?;
+                    let candidate_twin = root_guard
+                        .prepare_twin_data_path(&candidate_vault, &transition.after.lease)
+                        .map_err(|error| error.to_string())?;
                     twin.replace_root_path(candidate_twin)
+                        .map_err(|error| error.to_string())?;
+                    let rebuilt_token = root_guard
+                        .capture_authority_token(&transition.after.lease)
                         .map_err(|error| error.to_string())?;
                     twin.rebuild_mutation_caches()
                         .map_err(|error| error.to_string())?;
@@ -393,8 +410,9 @@ async fn apply_settings_update_inner(
                         .map_err(|error| error.to_string())?;
                     rebuild_indexes_from_notes(state, &candidate_namespace, &new_notes).await?;
                     root_guard
-                        .publish_namespace_ready(&transition.after.lease)
+                        .publish_namespace_ready(&rebuilt_token)
                         .map_err(|error| error.to_string())?;
+                    *state.loaded_authority.write().await = Some(rebuilt_token);
                     let durable_new_secret = transition_store
                         .resolve_secret(transition.after.openrouter_key_version.as_deref())
                         .map_err(|error| error.to_string())?;
@@ -451,6 +469,7 @@ async fn apply_settings_update_inner(
         {
             let durable_rollback = transition_store.restore_prepared_authorities(&transition);
             let runtime_rollback = async {
+                *state.loaded_authority.write().await = None;
                 root_guard
                     .adopt_durable_root(&old_vault, &transition.rollback_lease)
                     .map_err(|error| error.to_string())?;
@@ -465,12 +484,16 @@ async fn apply_settings_update_inner(
                     .map_err(|error| error.to_string())?;
                 twin.replace_root_path(old_twin.clone())
                     .map_err(|error| error.to_string())?;
+                let rebuilt_token = root_guard
+                    .capture_authority_token(&transition.rollback_lease)
+                    .map_err(|error| error.to_string())?;
                 twin.rebuild_mutation_caches()
                     .map_err(|error| error.to_string())?;
                 rebuild_indexes_from_notes(state, &old_namespace, &old_notes).await?;
                 root_guard
-                    .publish_namespace_ready(&transition.rollback_lease)
+                    .publish_namespace_ready(&rebuilt_token)
                     .map_err(|error| error.to_string())?;
+                *state.loaded_authority.write().await = Some(rebuilt_token);
                 let durable_old_secret = transition_store
                     .resolve_secret(transition.before.openrouter_key_version.as_deref())
                     .map_err(|error| error.to_string())?;
@@ -903,6 +926,7 @@ mod tests {
         let search = crate::services::search::SearchService::new(derived_data.clone()).unwrap();
         let twin_root =
             crate::models::settings::twin_data_path_for_vault(&data, &old_vault).unwrap();
+        let loaded_authority = coordinator.current_authority_token().unwrap();
         let state = AppState {
             knowledge_store: Arc::new(RwLock::new(
                 crate::services::knowledge_store::KnowledgeStore::with_event_recorder(
@@ -959,6 +983,7 @@ mod tests {
             twin_event_store: events,
             mutation_coordinator: Some(coordinator),
             mutation_startup_error: Arc::new(RwLock::new(None)),
+            loaded_authority: Arc::new(RwLock::new(Some(loaded_authority))),
             vault_transition: Arc::new(tokio::sync::RwLock::new(())),
             memory_service: Arc::new(crate::services::memory::MemoryService::new()),
             boot_state: Arc::new(RwLock::new(crate::models::boot::BootStatus::default())),
@@ -1009,12 +1034,14 @@ mod tests {
         );
         let twin = state.twin_store.read().await;
         assert_eq!(
-            twin.root_path(),
-            crate::models::settings::twin_data_path_for_vault(
-                twin.target_root_path().parent().unwrap(),
-                &new_vault,
+            comparable_path(twin.root_path().to_path_buf()),
+            comparable_path(
+                crate::models::settings::twin_data_path_for_vault(
+                    twin.target_root_path().parent().unwrap(),
+                    &new_vault,
+                )
+                .unwrap()
             )
-            .unwrap()
         );
         drop(twin);
         let namespace = state
@@ -1157,7 +1184,36 @@ mod tests {
         let error = crate::commands::acquire_expected_root_epoch(&state, &captured)
             .await
             .expect_err("an in-flight Canvas/Twin result must not cross a root switch");
-        assert!(error.contains("root epoch changed"));
+        assert!(error.contains("root authority changed"));
+    }
+
+    #[tokio::test]
+    async fn authoritative_read_ticket_rejects_a_peer_generation_change() {
+        let (state, _root, _old_vault, _new_vault) = root_switch_state(false, false);
+        let ticket = crate::commands::acquire_root_epoch(&state).await.unwrap();
+        let _snapshot = state.knowledge_store.read().await.list_notes().unwrap();
+
+        state
+            .mutation_coordinator
+            .as_ref()
+            .unwrap()
+            .commit_local(
+                crate::models::twin_event::CausalStream::LocalOnly,
+                crate::models::twin_event::SourceChannel::parse("note_editor").unwrap(),
+                vec![crate::services::twin_events::TargetMutation::put(
+                    crate::services::twin_events::TargetKind::Markdown,
+                    "peer-write.md",
+                    "peer generation",
+                )],
+                Vec::new(),
+            )
+            .unwrap();
+
+        let error = ticket
+            .finish(&state)
+            .await
+            .expect_err("a peer mutation must invalidate the captured authoritative snapshot");
+        assert!(error.contains("authority"));
     }
 
     #[tokio::test]
@@ -1429,8 +1485,12 @@ mod tests {
             Some(new_key_version.clone()),
         )
         .unwrap();
-        let peer_transition =
-            RootTransitionV1::prepared(peer_before.authority.clone(), peer_after).unwrap();
+        let peer_transition = RootTransitionV1::prepared(
+            peer_before.authority.clone(),
+            peer_after,
+            transition_store.authority_binding(),
+        )
+        .unwrap();
         transition_store
             .prepare_transition_cas_locked(
                 peer_guard.process_lock(),

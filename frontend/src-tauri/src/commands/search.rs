@@ -10,14 +10,18 @@ pub async fn search_notes(
     limit: Option<usize>,
     state: State<'_, AppState>,
 ) -> Result<Vec<SearchResult>, String> {
-    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
-    let search = state.search_service.read().await;
+    let root_ticket = crate::commands::acquire_derived_root_epoch(state.inner()).await?;
     let limit = limit.unwrap_or(20);
-    let mut results = search.search(&query, limit).map_err(|e| e.to_string())?;
+    let mut results = {
+        let search = state.search_service.read().await;
+        search.search(&query, limit).map_err(|e| e.to_string())?
+    };
 
     // Apply priority scoring (recency, status, tag boosts)
     let priority = state.priority_service.read().await;
     priority.score_results(&mut results);
+    drop(priority);
+    root_ticket.finish(state.inner()).await?;
 
     Ok(results)
 }
@@ -29,7 +33,7 @@ pub async fn find_similar(
     limit: Option<usize>,
     state: State<'_, AppState>,
 ) -> Result<Vec<SearchResult>, String> {
-    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
+    let root_ticket = crate::commands::acquire_derived_root_epoch(state.inner()).await?;
     let limit = limit.unwrap_or(10);
 
     // Get the note content for keyword extraction
@@ -49,25 +53,28 @@ pub async fn find_similar(
         .collect();
 
     if query_words.is_empty() {
+        root_ticket.finish(state.inner()).await?;
         return Ok(Vec::new());
     }
 
     let query_str = query_words.join(" ");
 
     // Use retrieval pipeline with the source note as context
-    let search = state.search_service.read().await;
-    let graph = state.graph_index.read().await;
-    let priority = state.priority_service.read().await;
-    let retrieval = state.retrieval_service.read().await;
+    let results = {
+        let search = state.search_service.read().await;
+        let graph = state.graph_index.read().await;
+        let priority = state.priority_service.read().await;
+        let retrieval = state.retrieval_service.read().await;
 
-    let results = retrieval.retrieve(
-        &search,
-        &graph,
-        &priority,
-        &query_str,
-        limit + 1,
-        &[note_id.clone()],
-    )?;
+        retrieval.retrieve(
+            &search,
+            &graph,
+            &priority,
+            &query_str,
+            limit + 1,
+            &[note_id.clone()],
+        )?
+    };
 
     // Convert RetrievalResult → SearchResult, filtering out the source note
     let search_results: Vec<SearchResult> = results
@@ -84,6 +91,7 @@ pub async fn find_similar(
             },
         })
         .collect();
+    root_ticket.finish(state.inner()).await?;
 
     Ok(search_results)
 }
@@ -91,7 +99,8 @@ pub async fn find_similar(
 /// Reindex all notes
 #[tauri::command]
 pub async fn reindex(state: State<'_, AppState>) -> Result<(), String> {
-    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
+    let root_ticket = crate::commands::acquire_derived_root_epoch(state.inner()).await?;
     rebuild_all_indexes(state.inner()).await?;
+    root_ticket.finish(state.inner()).await?;
     Ok(())
 }

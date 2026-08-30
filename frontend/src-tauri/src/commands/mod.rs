@@ -44,18 +44,69 @@ use crate::services::retrieval::RetrievalResult;
 use crate::AppState;
 use std::collections::HashSet;
 
+#[derive(Debug)]
+pub(crate) struct RootReadTicket {
+    _transition_guard: tokio::sync::OwnedRwLockReadGuard<()>,
+    authority: crate::services::vault_namespace::VaultAuthorityTokenV1,
+    require_ready: bool,
+}
+
+impl RootReadTicket {
+    pub(crate) fn authority(&self) -> &crate::services::vault_namespace::VaultAuthorityTokenV1 {
+        &self.authority
+    }
+
+    pub(crate) async fn validate(&self, state: &AppState) -> Result<(), String> {
+        let loaded = state.loaded_authority.read().await.clone();
+        if self.require_ready && loaded.as_ref() != Some(&self.authority) {
+            return Err("Grafyn derived state changed while this read was running".into());
+        }
+        state
+            .mutation_coordinator
+            .as_ref()
+            .ok_or_else(|| "mutation coordinator is unavailable".to_string())?
+            .validate_authority_token(&self.authority, self.require_ready)
+            .map_err(|error| error.to_string())
+    }
+
+    pub(crate) async fn finish(self, state: &AppState) -> Result<(), String> {
+        self.validate(state).await
+    }
+}
+
 pub(crate) async fn acquire_root_epoch(
     state: &AppState,
-) -> Result<tokio::sync::OwnedRwLockReadGuard<()>, String> {
+) -> Result<RootReadTicket, String> {
     let guard = state.vault_transition.clone().read_owned().await;
     ensure_root_healthy(state).await?;
-    state
+    let coordinator = state
         .mutation_coordinator
         .as_ref()
-        .ok_or_else(|| "mutation coordinator is unavailable".to_string())?
-        .require_namespace_ready()
+        .ok_or_else(|| "mutation coordinator is unavailable".to_string())?;
+    let authority = coordinator.current_authority_token().map_err(|error| error.to_string())?;
+    Ok(RootReadTicket {
+        _transition_guard: guard,
+        authority,
+        require_ready: false,
+    })
+}
+
+pub(crate) async fn acquire_derived_root_epoch(
+    state: &AppState,
+) -> Result<RootReadTicket, String> {
+    let mut ticket = acquire_root_epoch(state).await?;
+    let coordinator = state
+        .mutation_coordinator
+        .as_ref()
+        .ok_or_else(|| "mutation coordinator is unavailable".to_string())?;
+    coordinator
+        .validate_authority_token(&ticket.authority, true)
         .map_err(|error| error.to_string())?;
-    Ok(guard)
+    if state.loaded_authority.read().await.as_ref() != Some(&ticket.authority) {
+        return Err("Grafyn derived state is not loaded for the current authority".into());
+    }
+    ticket.require_ready = true;
+    Ok(ticket)
 }
 
 pub(crate) async fn ensure_root_healthy(state: &AppState) -> Result<(), String> {
@@ -67,19 +118,19 @@ pub(crate) async fn ensure_root_healthy(state: &AppState) -> Result<(), String> 
 
 pub(crate) fn capture_root_epoch(
     state: &AppState,
-) -> Result<crate::services::twin_events::ActiveMarkdownRootLeaseV1, String> {
+) -> Result<crate::services::vault_namespace::VaultAuthorityTokenV1, String> {
     state
         .mutation_coordinator
         .as_ref()
         .ok_or_else(|| "mutation coordinator is unavailable".to_string())?
-        .current_root_epoch()
+        .current_authority_token()
         .map_err(|error| error.to_string())
 }
 
 pub(crate) async fn acquire_expected_root_epoch(
     state: &AppState,
-    expected: &crate::services::twin_events::ActiveMarkdownRootLeaseV1,
-) -> Result<tokio::sync::OwnedRwLockReadGuard<()>, String> {
+    expected: &crate::services::vault_namespace::VaultAuthorityTokenV1,
+) -> Result<RootReadTicket, String> {
     let guard = acquire_root_epoch(state).await?;
     state
         .mutation_coordinator
@@ -88,6 +139,17 @@ pub(crate) async fn acquire_expected_root_epoch(
         .validate_root_epoch(expected)
         .map_err(|error| error.to_string())?;
     Ok(guard)
+}
+
+pub(crate) async fn acquire_expected_derived_root_epoch(
+    state: &AppState,
+    expected: &crate::services::vault_namespace::VaultAuthorityTokenV1,
+) -> Result<RootReadTicket, String> {
+    let ticket = acquire_derived_root_epoch(state).await?;
+    if ticket.authority() != expected {
+        return Err("Grafyn authority changed while derived work was in flight".into());
+    }
+    Ok(ticket)
 }
 
 #[cfg(test)]
@@ -101,6 +163,127 @@ mod root_epoch_source_guards {
         &rest[..end]
     }
 
+    fn tauri_command_body<'a>(source: &'a str, name: &str) -> &'a str {
+        let signature = format!("pub async fn {name}");
+        let start = source
+            .find(&signature)
+            .unwrap_or_else(|| panic!("command {name} should exist"));
+        let rest = &source[start..];
+        let end = rest
+            .find("\n#[tauri::command]")
+            .unwrap_or(rest.len());
+        &rest[..end]
+    }
+
+    #[test]
+    fn every_derived_desktop_command_uses_an_exact_before_and_after_authority_ticket() {
+        let inventories = [
+            (
+                include_str!("search.rs"),
+                &["search_notes", "find_similar"][..],
+            ),
+            (
+                include_str!("graph.rs"),
+                &[
+                    "get_backlinks",
+                    "get_outgoing",
+                    "get_neighbors",
+                    "get_unlinked",
+                    "get_full_graph",
+                ][..],
+            ),
+            (
+                include_str!("retrieval.rs"),
+                &["retrieve_relevant"][..],
+            ),
+            (
+                include_str!("memory.rs"),
+                &["recall_relevant", "find_contradictions"][..],
+            ),
+            (
+                include_str!("migration.rs"),
+                &[
+                    "preview_markdown_migration",
+                    "get_markdown_migration_status",
+                    "get_vault_optimizer_status",
+                    "list_vault_optimizer_decisions",
+                    "get_vault_optimizer_inbox",
+                ][..],
+            ),
+            (
+                include_str!("zettelkasten.rs"),
+                &[
+                    "list_link_suggestion_queue",
+                    "get_link_discovery_status",
+                ][..],
+            ),
+            (
+                include_str!("twin.rs"),
+                &[
+                    "get_session_trace",
+                    "get_twin_review",
+                    "resolve_user_record_evidence",
+                    "export_twin_data",
+                    "list_decision_episodes",
+                    "get_decision_mirror_config",
+                    "list_constitution_items",
+                    "list_action_gaps",
+                    "get_constitution_setup",
+                ][..],
+            ),
+        ];
+
+        for (source, commands) in inventories {
+            for name in commands {
+                let body = tauri_command_body(source, name);
+                assert!(
+                    body.contains("acquire_derived_root_epoch"),
+                    "derived command {name} must validate exact ready authority before reading"
+                );
+                assert!(
+                    body.contains(".finish(state.inner()).await?"),
+                    "derived command {name} must validate authority after releasing service guards"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn authoritative_note_and_twin_reads_use_before_and_after_authority_tickets() {
+        for (source, commands) in [
+            (include_str!("notes.rs"), &["list_notes", "get_note"][..]),
+            (
+                include_str!("twin.rs"),
+                &["list_user_records", "get_user_record"][..],
+            ),
+        ] {
+            for name in commands {
+                let body = tauri_command_body(source, name);
+                assert!(
+                    body.contains("acquire_root_epoch"),
+                    "authoritative command {name} must capture authority before reading"
+                );
+                assert!(
+                    !body.contains("acquire_derived_root_epoch"),
+                    "authoritative command {name} must not depend on derived readiness"
+                );
+                assert!(
+                    body.contains(".finish(state.inner()).await?"),
+                    "authoritative command {name} must revalidate authority after reading"
+                );
+                let reload = if *name == "list_notes" || *name == "get_note" {
+                    "reload_authoritative_state"
+                } else {
+                    "rebuild_mutation_caches"
+                };
+                assert!(
+                    body.contains(reload),
+                    "authoritative command {name} must refresh durable state after capturing authority"
+                );
+            }
+        }
+    }
+
     #[test]
     fn root_dependent_read_commands_take_the_transition_gate_before_service_locks() {
         let retrieval = include_str!("retrieval.rs");
@@ -112,6 +295,7 @@ mod root_epoch_source_guards {
             let body = function_body(retrieval, signature, next_marker);
             let gate = body
                 .find("acquire_root_epoch")
+                .or_else(|| body.find("acquire_derived_root_epoch"))
                 .expect("retrieval command must acquire the root transition gate");
             let service = body
                 .find("retrieval_service")
@@ -164,7 +348,10 @@ mod root_epoch_source_guards {
             }
             let body = command.split("#[tauri::command]").next().unwrap_or(command);
             assert!(
-                body.contains("acquire_root_epoch"),
+                body.contains("acquire_root_epoch")
+                    || body.contains("acquire_derived_root_epoch")
+                    || body.contains("acquire_expected_root_epoch")
+                    || body.contains("acquire_expected_derived_root_epoch"),
                 "root-dependent {family} command {name} must acquire the transition gate"
             );
         }
@@ -211,8 +398,10 @@ mod root_epoch_source_guards {
             (include_str!("zettelkasten.rs"), "link application", 1),
             (include_str!("twin_eval.rs"), "Twin evaluation", 2),
         ] {
+            let captures = source.matches("capture_root_epoch").count()
+                + source.matches("authority().clone()").count();
             assert!(
-                source.matches("capture_root_epoch").count() >= minimum_pairs,
+                captures >= minimum_pairs,
                 "long {family} workflows must capture the starting root epoch"
             );
             assert!(
@@ -223,20 +412,24 @@ mod root_epoch_source_guards {
 
         let context = include_str!("canvas/context.rs");
         assert!(
-            context.matches("acquire_expected_root_epoch").count() >= 2,
+            context.matches("acquire_expected_root_epoch").count()
+                + context
+                    .matches("acquire_expected_derived_root_epoch")
+                    .count()
+                >= 2,
             "sealed Twin prediction must validate before context reads and persisted results"
         );
 
         let discovery = include_str!("../services/link_discovery.rs");
         assert!(discovery.contains("discover_for_note_at_epoch"));
-        assert!(discovery.contains("capture_root_epoch"));
-        assert!(discovery.contains("acquire_expected_root_epoch"));
+        assert!(discovery.contains("acquire_derived_root_epoch"));
+        assert!(discovery.contains("acquire_expected_derived_root_epoch"));
 
         let runtime = include_str!("../lib.rs");
         for required in [
             "acquire_warm_start_root_gate",
             "discover_for_note_at_epoch",
-            "acquire_expected_root_epoch",
+            "acquire_expected_derived_root_epoch",
             "start_vault_optimizer_worker",
         ] {
             assert!(
@@ -244,6 +437,77 @@ mod root_epoch_source_guards {
                 "root-dependent runtime worker is missing {required}"
             );
         }
+    }
+
+    #[test]
+    fn long_workflows_chain_exact_authority_tokens_across_their_own_mutations() {
+        let streaming = include_str!("canvas/streaming.rs");
+        for required in [
+            "add_tile_expecting_authority",
+            "add_decision_tile_expecting_authority",
+            "batch_update_tile_responses_expecting_authority",
+            "append_canvas_trace_expecting_authority",
+            ".authority_token",
+        ] {
+            assert!(
+                streaming.contains(required),
+                "Canvas streaming must carry its exact post-mutation authority via {required}"
+            );
+        }
+
+        let debate = include_str!("canvas/debate.rs");
+        for required in [
+            "append_canvas_trace_expecting_authority",
+            "update_debate_expecting_authority",
+            "mut root_epoch",
+            ".authority_token",
+        ] {
+            assert!(
+                debate.contains(required),
+                "Canvas debate must carry its exact post-mutation authority via {required}"
+            );
+        }
+
+        let twin_eval = include_str!("twin_eval.rs");
+        assert!(
+            twin_eval.matches("acquire_derived_root_epoch").count() >= 2,
+            "Twin evaluation must validate ready derived input before network work"
+        );
+        assert!(
+            twin_eval.matches(".finish(state.inner()).await?").count() >= 2,
+            "Twin evaluation must discard stale derived input before network work"
+        );
+
+        let distill = include_str!("distill.rs");
+        for required in [
+            "create_note_expecting_authority",
+            "update_note_expecting_authority",
+            ".authority_token",
+            "validate_authority_token(&root_epoch",
+        ] {
+            assert!(
+                distill.contains(required),
+                "distillation must chain governed note mutations via {required}"
+            );
+        }
+
+        let links = include_str!("zettelkasten.rs");
+        for required in [
+            "update_note_expecting_authority",
+            ".authority_token",
+            "validate_authority_token(&root_epoch",
+        ] {
+            assert!(
+                links.contains(required),
+                "link application must chain governed note mutations via {required}"
+            );
+        }
+
+        assert!(
+            streaming.contains("sealed_epoch_receiver.await")
+                && streaming.contains("sealed_epoch_sender.send(published_epoch)"),
+            "sealed prediction must start from the visible-response publication token"
+        );
     }
 }
 
@@ -294,24 +558,75 @@ pub(crate) async fn remove_note_chunks_from_index(state: &AppState, note_id: &st
     }
 }
 
-pub(crate) async fn rebuild_link_discovery(state: &AppState, notes: &[Note]) {
+pub(crate) async fn rebuild_link_discovery(
+    state: &AppState,
+    notes: &[Note],
+) -> Result<(), String> {
+    let coordinator = state
+        .mutation_coordinator
+        .as_ref()
+        .ok_or_else(|| "mutation coordinator is unavailable".to_string())?;
+    let token = coordinator
+        .current_authority_token()
+        .map_err(|error| error.to_string())?;
     let mut discovery = state.link_discovery.write().await;
-    discovery.bootstrap(notes);
+    coordinator
+        .with_locked_derived_state(&token, false, || {
+            discovery.reload_from_disk_checked().map_err(|error| {
+                crate::services::twin_events::MutationError::Invalid(error.to_string())
+            })?;
+            discovery.bootstrap_checked(notes).map_err(|error| {
+                crate::services::twin_events::MutationError::Invalid(error.to_string())
+            })
+        })
+        .map_err(|error| error.to_string())
 }
 
-pub(crate) async fn bootstrap_vault_optimizer(state: &AppState, notes: &[Note]) {
+pub(crate) async fn bootstrap_vault_optimizer(
+    state: &AppState,
+    notes: &[Note],
+) -> Result<(), String> {
     let mut optimizer = state.vault_optimizer.write().await;
-    optimizer.bootstrap(notes);
+    optimizer
+        .with_locked_fresh_state(|optimizer| optimizer.bootstrap_checked(notes))
+        .map_err(|error| error.to_string())
 }
 
-pub(crate) async fn enqueue_vault_optimizer_note(state: &AppState, note_id: &str, reason: &str) {
+pub(crate) async fn enqueue_vault_optimizer_note(
+    state: &AppState,
+    note_id: &str,
+    reason: &str,
+) -> Result<(), String> {
     let mut optimizer = state.vault_optimizer.write().await;
-    optimizer.enqueue_note(note_id, reason);
+    optimizer
+        .with_locked_fresh_state(|optimizer| {
+            optimizer.enqueue_note_checked(note_id, reason).map(|_| ())
+        })
+        .map_err(|error| error.to_string())
 }
 
-pub(crate) async fn remove_link_discovery_note(state: &AppState, note_id: &str) {
+pub(crate) async fn remove_link_discovery_note(
+    state: &AppState,
+    note_id: &str,
+) -> Result<(), String> {
+    let coordinator = state
+        .mutation_coordinator
+        .as_ref()
+        .ok_or_else(|| "mutation coordinator is unavailable".to_string())?;
+    let token = coordinator
+        .current_authority_token()
+        .map_err(|error| error.to_string())?;
     let mut discovery = state.link_discovery.write().await;
-    discovery.remove_note(note_id);
+    coordinator
+        .with_locked_derived_state(&token, false, || {
+            discovery.reload_from_disk_checked().map_err(|error| {
+                crate::services::twin_events::MutationError::Invalid(error.to_string())
+            })?;
+            discovery.remove_note_checked(note_id).map_err(|error| {
+                crate::services::twin_events::MutationError::Invalid(error.to_string())
+            })
+        })
+        .map_err(|error| error.to_string())
 }
 
 pub(crate) async fn sync_topic_hubs(state: &AppState) -> Result<Vec<Note>, String> {
@@ -335,7 +650,7 @@ pub(crate) async fn sync_topic_hubs(state: &AppState) -> Result<Vec<Note>, Strin
 
     for removed_note_id in &sync_result.removed_note_ids {
         remove_note_chunks_from_index(state, removed_note_id).await;
-        remove_link_discovery_note(state, removed_note_id).await;
+        remove_link_discovery_note(state, removed_note_id).await?;
 
         let mut search = state.search_service.write().await;
         if let Err(error) = index_commit::remove_note_for_search(&mut search, removed_note_id) {
@@ -374,8 +689,8 @@ pub(crate) async fn sync_topic_hubs(state: &AppState) -> Result<Vec<Note>, Strin
         graph.build_from_notes(&sync_result.all_notes);
     }
 
-    rebuild_link_discovery(state, &sync_result.all_notes).await;
-    bootstrap_vault_optimizer(state, &sync_result.all_notes).await;
+    rebuild_link_discovery(state, &sync_result.all_notes).await?;
+    bootstrap_vault_optimizer(state, &sync_result.all_notes).await?;
 
     Ok(sync_result.all_notes)
 }
@@ -402,8 +717,65 @@ pub(crate) async fn rebuild_all_indexes(state: &AppState) -> Result<Vec<Note>, S
         }
     }
 
-    bootstrap_vault_optimizer(state, &notes).await;
+    bootstrap_vault_optimizer(state, &notes).await?;
     Ok(notes)
+}
+
+/// Rebuild every derived reader against one exact authority generation and
+/// publish readiness only if that generation is still current.
+pub(crate) async fn rebuild_and_publish_current_authority(
+    state: &AppState,
+    expected: &crate::services::vault_namespace::VaultAuthorityTokenV1,
+) -> Result<crate::services::vault_namespace::VaultAuthorityTokenV1, String> {
+    let coordinator = state
+        .mutation_coordinator
+        .as_ref()
+        .ok_or_else(|| "mutation coordinator is unavailable".to_string())?;
+    coordinator
+        .validate_authority_token(expected, false)
+        .map_err(|error| error.to_string())?;
+    *state.loaded_authority.write().await = None;
+
+    // Topic-hub normalization is authoritative. Run it before capturing the
+    // generation used by the rebuild, then fence every derived publication by
+    // the exact post-normalization token.
+    let notes = sync_topic_hubs(state).await?;
+    let token = coordinator
+        .current_authority_token()
+        .map_err(|error| error.to_string())?;
+
+    {
+        let mut search = state.search_service.write().await;
+        search.reindex_all(&notes).map_err(|error| error.to_string())?;
+    }
+    {
+        let mut chunks = state.chunk_index.write().await;
+        chunks
+            .reindex_all(&notes)
+            .map_err(|error| error.to_string())?;
+    }
+    {
+        let mut graph = state.graph_index.write().await;
+        graph.build_from_notes(&notes);
+    }
+    rebuild_link_discovery(state, &notes).await?;
+    bootstrap_vault_optimizer(state, &notes).await?;
+    state
+        .twin_store
+        .write()
+        .await
+        .rebuild_mutation_caches()
+        .map_err(|error| error.to_string())?;
+
+    let guard = coordinator
+        .begin_root_transition()
+        .map_err(|error| error.to_string())?;
+    guard
+        .publish_namespace_ready(&token)
+        .map_err(|error| error.to_string())?;
+    drop(guard);
+    *state.loaded_authority.write().await = Some(token.clone());
+    Ok(token)
 }
 
 /// Single chokepoint for "a note was just created or edited on disk and needs to
@@ -493,13 +865,27 @@ pub(crate) async fn commit_note_writes(
     }
 
     sync_chunk_index_for_notes(state, &notes).await;
-    let all_notes = sync_topic_hubs(state).await?;
+    sync_topic_hubs(state).await?;
 
     for note_id in note_ids {
-        enqueue_vault_optimizer_note(state, note_id, reason).await;
+        enqueue_vault_optimizer_note(state, note_id, reason).await?;
     }
-
-    Ok(all_notes)
+    let coordinator = state
+        .mutation_coordinator
+        .as_ref()
+        .ok_or_else(|| "mutation coordinator is unavailable".to_string())?;
+    let expected = coordinator
+        .current_authority_token()
+        .map_err(|error| error.to_string())?;
+    let published = rebuild_and_publish_current_authority(state, &expected).await?;
+    let ticket = acquire_expected_root_epoch(state, &published).await?;
+    let fresh_notes = {
+        let mut store = state.knowledge_store.write().await;
+        store.reload_authoritative_state();
+        store.list_full_notes().map_err(|error| error.to_string())?
+    };
+    ticket.finish(state).await?;
+    Ok(fresh_notes)
 }
 
 /// Refreshes search + chunk + topic-hub/graph state for a note that the
@@ -665,9 +1051,9 @@ pub(crate) async fn commit_note_delete(
     }
 
     remove_note_chunks_from_index(state, note_id).await;
-    remove_link_discovery_note(state, note_id).await;
+    remove_link_discovery_note(state, note_id).await?;
     sync_topic_hubs(state).await?;
-    enqueue_vault_optimizer_note(state, note_id, reason).await;
+    enqueue_vault_optimizer_note(state, note_id, reason).await?;
 
     Ok(())
 }
@@ -711,11 +1097,31 @@ pub(crate) mod commit_note_write_tests {
         let vault_path = vault_dir.path().to_path_buf();
         let data_path = data_dir.path().to_path_buf();
 
-        let knowledge_store = KnowledgeStore::new(vault_path, data_path.clone());
+        std::fs::create_dir_all(data_path.join("canvas"))
+            .expect("canvas directory should initialize");
+        let twin_event_store = Arc::new(
+            crate::services::twin_events::TwinEventStore::new(data_path.clone()),
+        );
+        twin_event_store
+            .initialize()
+            .expect("event store should initialize");
+        let mutation_coordinator = Arc::new(
+            crate::services::twin_events::MutationCoordinator::new(
+                &data_path,
+                &vault_path,
+                twin_event_store.clone(),
+                Arc::new(crate::services::twin_events::NoopMutationLifecycle),
+            )
+            .expect("mutation coordinator should initialize"),
+        );
+        let namespace = mutation_coordinator
+            .current_namespace_path()
+            .expect("vault namespace should initialize");
+        let knowledge_store = KnowledgeStore::new(vault_path, namespace.clone());
         let search_service =
-            SearchService::new(data_path.clone()).expect("search service should initialize");
+            SearchService::new(namespace.clone()).expect("search service should initialize");
         let chunk_index =
-            ChunkIndex::new(data_path.clone()).expect("chunk index should initialize");
+            ChunkIndex::new(namespace.clone()).expect("chunk index should initialize");
 
         let state = AppState {
             knowledge_store: Arc::new(RwLock::new(knowledge_store)),
@@ -731,17 +1137,16 @@ pub(crate) mod commit_note_write_tests {
             priority_service: Arc::new(RwLock::new(PriorityScoringService::new(data_path.clone()))),
             retrieval_service: Arc::new(RwLock::new(RetrievalService::new(data_path.clone()))),
             chunk_index: Arc::new(RwLock::new(chunk_index)),
-            link_discovery: Arc::new(RwLock::new(LinkDiscoveryService::new(data_path.clone()))),
+            link_discovery: Arc::new(RwLock::new(LinkDiscoveryService::new(namespace.clone()))),
             markdown_migration: Arc::new(RwLock::new(MarkdownMigrationService::new(
-                data_path.clone(),
+                namespace.clone(),
             ))),
-            vault_optimizer: Arc::new(RwLock::new(VaultOptimizerService::new(data_path.clone()))),
+            vault_optimizer: Arc::new(RwLock::new(VaultOptimizerService::new(namespace))),
             twin_store: Arc::new(RwLock::new(TwinStore::new(data_path.join("twin")))),
-            twin_event_store: Arc::new(crate::services::twin_events::TwinEventStore::new(
-                data_path.clone(),
-            )),
-            mutation_coordinator: None,
+            twin_event_store,
+            mutation_coordinator: Some(mutation_coordinator),
             mutation_startup_error: Arc::new(RwLock::new(None)),
+            loaded_authority: Arc::new(RwLock::new(None)),
             vault_transition: Arc::new(tokio::sync::RwLock::new(())),
             memory_service: Arc::new(MemoryService::new()),
             boot_state: Arc::new(RwLock::new(BootStatus::default())),

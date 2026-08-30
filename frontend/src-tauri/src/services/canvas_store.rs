@@ -10,6 +10,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use walkdir::WalkDir;
 
+pub type TileResponseUpdate = (
+    String,
+    String,
+    crate::models::canvas::ResponseStatus,
+    Option<String>,
+    Option<f64>,
+);
+
 /// Service for managing canvas sessions (JSON file storage) with in-memory cache.
 ///
 /// The cache eliminates repeated disk reads — every get_session/list_sessions call
@@ -257,12 +265,31 @@ impl CanvasStore {
 
     /// Add a prompt tile to a session
     pub fn add_tile(&mut self, session_id: &str, tile: PromptTile) -> Result<CanvasSession> {
+        self.add_tile_internal(session_id, tile, None)
+            .map(|(session, _)| session)
+    }
+
+    pub(crate) fn add_tile_expecting_authority(
+        &mut self,
+        session_id: &str,
+        tile: PromptTile,
+        expected: crate::services::vault_namespace::VaultAuthorityTokenV1,
+    ) -> Result<(CanvasSession, crate::services::twin_events::MutationCommit)> {
+        self.add_tile_internal(session_id, tile, Some(expected))
+    }
+
+    fn add_tile_internal(
+        &mut self,
+        session_id: &str,
+        tile: PromptTile,
+        expected: Option<crate::services::vault_namespace::VaultAuthorityTokenV1>,
+    ) -> Result<(CanvasSession, crate::services::twin_events::MutationCommit)> {
         let session = self.get_session_mut(session_id)?;
         session.prompt_tiles.push(tile);
         session.updated_at = Utc::now();
         let session = session.clone();
-        self.write_session_file(&session)?;
-        Ok(session)
+        let commit = self.write_session_file_internal(&session, None, expected)?;
+        Ok((session, commit))
     }
 
     pub fn add_decision_tile(
@@ -272,12 +299,39 @@ impl CanvasStore {
         twin_store: &mut crate::services::twin::TwinStore,
         decision: crate::models::twin::DecisionEpisodeCreate,
     ) -> Result<CanvasSession> {
+        self.add_decision_tile_internal(session_id, tile, twin_store, decision, None)
+            .map(|(session, _)| session)
+    }
+
+    pub(crate) fn add_decision_tile_expecting_authority(
+        &mut self,
+        session_id: &str,
+        tile: PromptTile,
+        twin_store: &mut crate::services::twin::TwinStore,
+        decision: crate::models::twin::DecisionEpisodeCreate,
+        expected: crate::services::vault_namespace::VaultAuthorityTokenV1,
+    ) -> Result<(CanvasSession, crate::services::twin_events::MutationCommit)> {
+        self.add_decision_tile_internal(session_id, tile, twin_store, decision, Some(expected))
+    }
+
+    fn add_decision_tile_internal(
+        &mut self,
+        session_id: &str,
+        tile: PromptTile,
+        twin_store: &mut crate::services::twin::TwinStore,
+        decision: crate::models::twin::DecisionEpisodeCreate,
+        expected: Option<crate::services::vault_namespace::VaultAuthorityTokenV1>,
+    ) -> Result<(CanvasSession, crate::services::twin_events::MutationCommit)> {
         let session = self.get_session_mut(session_id)?;
         session.prompt_tiles.push(tile);
         session.updated_at = Utc::now();
         let session = session.clone();
-        self.write_session_file_with_decision(&session, twin_store, decision)?;
-        Ok(session)
+        let commit = self.write_session_file_internal(
+            &session,
+            Some((twin_store, decision)),
+            expected,
+        )?;
+        Ok((session, commit))
     }
 
     /// Delete a prompt tile and its children from a session
@@ -454,16 +508,52 @@ impl CanvasStore {
 
     /// Add a debate to a session
     pub fn add_debate(&mut self, session_id: &str, debate: Debate) -> Result<()> {
+        self.add_debate_internal(session_id, debate, None).map(|_| ())
+    }
+
+    pub(crate) fn add_debate_expecting_authority(
+        &mut self,
+        session_id: &str,
+        debate: Debate,
+        expected: crate::services::vault_namespace::VaultAuthorityTokenV1,
+    ) -> Result<crate::services::twin_events::MutationCommit> {
+        self.add_debate_internal(session_id, debate, Some(expected))
+    }
+
+    fn add_debate_internal(
+        &mut self,
+        session_id: &str,
+        debate: Debate,
+        expected: Option<crate::services::vault_namespace::VaultAuthorityTokenV1>,
+    ) -> Result<crate::services::twin_events::MutationCommit> {
         let session = self.get_session_mut(session_id)?;
         session.debates.push(debate);
         session.updated_at = Utc::now();
         let session = session.clone();
-        self.write_session_file(&session)?;
-        Ok(())
+        self.write_session_file_internal(&session, None, expected)
     }
 
     /// Update a debate's rounds
     pub fn update_debate(&mut self, session_id: &str, debate: &Debate) -> Result<()> {
+        self.update_debate_internal(session_id, debate, None)
+            .map(|_| ())
+    }
+
+    pub(crate) fn update_debate_expecting_authority(
+        &mut self,
+        session_id: &str,
+        debate: &Debate,
+        expected: crate::services::vault_namespace::VaultAuthorityTokenV1,
+    ) -> Result<crate::services::twin_events::MutationCommit> {
+        self.update_debate_internal(session_id, debate, Some(expected))
+    }
+
+    fn update_debate_internal(
+        &mut self,
+        session_id: &str,
+        debate: &Debate,
+        expected: Option<crate::services::vault_namespace::VaultAuthorityTokenV1>,
+    ) -> Result<crate::services::twin_events::MutationCommit> {
         let session = self.get_session_mut(session_id)?;
 
         if let Some(existing) = session.debates.iter_mut().find(|d| d.id == debate.id) {
@@ -472,8 +562,7 @@ impl CanvasStore {
 
         session.updated_at = Utc::now();
         let session = session.clone();
-        self.write_session_file(&session)?;
-        Ok(())
+        self.write_session_file_internal(&session, None, expected)
     }
 
     /// Batch update multiple tile responses in a single read/write cycle.
@@ -482,14 +571,29 @@ impl CanvasStore {
         &mut self,
         session_id: &str,
         tile_id: &str,
-        updates: &[(
-            String,
-            String,
-            crate::models::canvas::ResponseStatus,
-            Option<String>,
-            Option<f64>,
-        )],
+        updates: &[TileResponseUpdate],
     ) -> Result<()> {
+        self.batch_update_tile_responses_internal(session_id, tile_id, updates, None)
+            .map(|_| ())
+    }
+
+    pub(crate) fn batch_update_tile_responses_expecting_authority(
+        &mut self,
+        session_id: &str,
+        tile_id: &str,
+        updates: &[TileResponseUpdate],
+        expected: crate::services::vault_namespace::VaultAuthorityTokenV1,
+    ) -> Result<crate::services::twin_events::MutationCommit> {
+        self.batch_update_tile_responses_internal(session_id, tile_id, updates, Some(expected))
+    }
+
+    fn batch_update_tile_responses_internal(
+        &mut self,
+        session_id: &str,
+        tile_id: &str,
+        updates: &[TileResponseUpdate],
+        expected: Option<crate::services::vault_namespace::VaultAuthorityTokenV1>,
+    ) -> Result<crate::services::twin_events::MutationCommit> {
         let session = self.get_session_mut(session_id)?;
 
         if let Some(tile) = session.prompt_tiles.iter_mut().find(|t| t.id == tile_id) {
@@ -504,8 +608,7 @@ impl CanvasStore {
         }
 
         let session = session.clone();
-        self.write_session_file(&session)?;
-        Ok(())
+        self.write_session_file_internal(&session, None, expected)
     }
 
     /// Update a tile's response content (for streaming)
@@ -519,6 +622,55 @@ impl CanvasStore {
         error: Option<&str>,
         cost_usd: Option<f64>,
     ) -> Result<()> {
+        self.update_tile_response_internal(
+            session_id,
+            tile_id,
+            model_id,
+            content,
+            status,
+            error,
+            cost_usd,
+            None,
+        )
+        .map(|_| ())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn update_tile_response_expecting_authority(
+        &mut self,
+        session_id: &str,
+        tile_id: &str,
+        model_id: &str,
+        content: &str,
+        status: crate::models::canvas::ResponseStatus,
+        error: Option<&str>,
+        cost_usd: Option<f64>,
+        expected: crate::services::vault_namespace::VaultAuthorityTokenV1,
+    ) -> Result<crate::services::twin_events::MutationCommit> {
+        self.update_tile_response_internal(
+            session_id,
+            tile_id,
+            model_id,
+            content,
+            status,
+            error,
+            cost_usd,
+            Some(expected),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn update_tile_response_internal(
+        &mut self,
+        session_id: &str,
+        tile_id: &str,
+        model_id: &str,
+        content: &str,
+        status: crate::models::canvas::ResponseStatus,
+        error: Option<&str>,
+        cost_usd: Option<f64>,
+        expected: Option<crate::services::vault_namespace::VaultAuthorityTokenV1>,
+    ) -> Result<crate::services::twin_events::MutationCommit> {
         let session = self.get_session_mut(session_id)?;
 
         if let Some(tile) = session.prompt_tiles.iter_mut().find(|t| t.id == tile_id) {
@@ -531,18 +683,33 @@ impl CanvasStore {
         }
 
         let session = session.clone();
-        self.write_session_file(&session)?;
-        Ok(())
+        self.write_session_file_internal(&session, None, expected)
     }
 
     /// Save a full session object (used after streaming completes)
     pub fn save_session(&mut self, session: &CanvasSession) -> Result<()> {
+        self.save_session_internal(session, None).map(|_| ())
+    }
+
+    pub(crate) fn save_session_expecting_authority(
+        &mut self,
+        session: &CanvasSession,
+        expected: crate::services::vault_namespace::VaultAuthorityTokenV1,
+    ) -> Result<crate::services::twin_events::MutationCommit> {
+        self.save_session_internal(session, Some(expected))
+    }
+
+    fn save_session_internal(
+        &mut self,
+        session: &CanvasSession,
+        expected: Option<crate::services::vault_namespace::VaultAuthorityTokenV1>,
+    ) -> Result<crate::services::twin_events::MutationCommit> {
         if let Some(base) = self.session_cache.get(&session.id).cloned() {
             self.pending_bases.insert(session.id.clone(), base);
         }
         self.session_cache
             .insert(session.id.clone(), session.clone());
-        self.write_session_file(session)
+        self.write_session_file_internal(session, None, expected)
     }
 
     /// Validate that a session ID doesn't contain path traversal sequences
@@ -590,16 +757,8 @@ impl CanvasStore {
 
     /// Write a session to file
     fn write_session_file(&mut self, session: &CanvasSession) -> Result<()> {
-        self.write_session_file_internal(session, None)
-    }
-
-    fn write_session_file_with_decision(
-        &mut self,
-        session: &CanvasSession,
-        twin_store: &mut crate::services::twin::TwinStore,
-        decision: crate::models::twin::DecisionEpisodeCreate,
-    ) -> Result<()> {
-        self.write_session_file_internal(session, Some((twin_store, decision)))
+        self.write_session_file_internal(session, None, None)
+            .map(|_| ())
     }
 
     fn write_session_file_internal(
@@ -609,7 +768,8 @@ impl CanvasStore {
             &mut crate::services::twin::TwinStore,
             crate::models::twin::DecisionEpisodeCreate,
         )>,
-    ) -> Result<()> {
+        expected_authority: Option<crate::services::vault_namespace::VaultAuthorityTokenV1>,
+    ) -> Result<crate::services::twin_events::MutationCommit> {
         let path = self.session_path(&session.id);
         let candidate = session.clone();
         let cached_base = self.pending_bases.remove(&session.id);
@@ -621,7 +781,11 @@ impl CanvasStore {
             let content = serde_json::to_string_pretty(&candidate)?;
             write_atomic(&path, content.as_bytes())
                 .with_context(|| format!("Failed to write session: {:?}", path))?;
-            return Ok(());
+            return Ok(crate::services::twin_events::MutationCommit {
+                mutation_id: None,
+                events: Vec::new(),
+                authority_token: None,
+            });
         }
 
         let recorder = self.event_recorder.clone();
@@ -672,19 +836,25 @@ impl CanvasStore {
                 committed_decision_trace = Some(trace);
             }
             committed_session = Some(after);
-            Ok(Some(crate::services::twin_events::MutationPlan::new(
+            let mut plan = crate::services::twin_events::MutationPlan::new(
                 crate::models::twin_event::CausalStream::SyncEligible,
                 crate::models::twin_event::SourceChannel::parse("canvas")
                     .map_err(crate::services::twin_events::MutationError::Invalid)?,
                 targets,
                 drafts,
-            )))
+            );
+            if let Some(expected) = expected_authority.clone() {
+                plan = plan.expecting_authority(expected);
+            }
+            Ok(Some(plan))
         };
         let persist = recorder.commit_planned_mutation(
             crate::services::twin_events::MutationOrigin::Local,
             &mut planner,
         );
-        if let Err(error) = persist {
+        let commit = match persist {
+            Ok(commit) => commit,
+            Err(error) => {
             match self.read_session_file(&path) {
                 Ok(durable) => {
                     self.session_cache.insert(session.id.clone(), durable);
@@ -698,7 +868,8 @@ impl CanvasStore {
                 }
             }
             return Err(anyhow::Error::new(error));
-        }
+            }
+        };
         if let Some(committed) = committed_session {
             self.session_cache.insert(session.id.clone(), committed);
         }
@@ -706,7 +877,7 @@ impl CanvasStore {
         {
             twin_store.cache_committed_trace(trace);
         }
-        Ok(())
+        Ok(commit)
     }
 }
 
@@ -1279,6 +1450,147 @@ mod tests {
             .iter()
             .any(|event| event.event_type
                 == crate::models::twin::TraceEventType::DecisionEpisodeCreated));
+    }
+
+    #[test]
+    fn visible_decision_response_precedes_sealed_prediction_or_explicit_failure() {
+        let root = tempdir().unwrap();
+        let data = root.path().join("data");
+        let vault = root.path().join("vault");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::create_dir(&vault).unwrap();
+        let event_store =
+            std::sync::Arc::new(crate::services::twin_events::TwinEventStore::new(&data));
+        event_store.initialize().unwrap();
+        let coordinator = std::sync::Arc::new(
+            crate::services::twin_events::MutationCoordinator::new(
+                &data,
+                &vault,
+                event_store,
+                std::sync::Arc::new(crate::services::twin_events::NoopMutationLifecycle),
+            )
+            .unwrap(),
+        );
+        let mut canvas = CanvasStore::with_event_recorder(data.join("canvas"), coordinator.clone());
+        let mut twin = crate::services::twin::TwinStore::with_event_recorder(
+            data.join("twin/scope-one"),
+            data.join("twin"),
+            coordinator.clone(),
+        );
+        let session = canvas
+            .create_session(SessionCreate {
+                title: "Sequenced prediction".into(),
+                description: None,
+                tags: Vec::new(),
+            })
+            .unwrap();
+
+        for (suffix, prediction_succeeds) in [("sealed", true), ("failed", false)] {
+            let tile_id = format!("tile-{suffix}");
+            let episode_id = format!("episode-{suffix}");
+            let mut tile = PromptTile {
+                id: tile_id.clone(),
+                prompt_type: crate::models::canvas::PromptType::Decision,
+                prompt: "Ship?".into(),
+                models: vec!["model-a".into()],
+                decision_episode_id: Some(episode_id.clone()),
+                ..PromptTile::default()
+            };
+            tile.responses.insert(
+                "model-a".into(),
+                ModelResponse {
+                    id: format!("response-{suffix}"),
+                    model_id: "model-a".into(),
+                    model_name: "Model A".into(),
+                    status: ResponseStatus::Pending,
+                    ..ModelResponse::default()
+                },
+            );
+            let create = crate::models::twin::DecisionEpisodeCreate {
+                id: episode_id.clone(),
+                session_id: session.id.clone(),
+                tile_id: tile_id.clone(),
+                decision: "Ship?".into(),
+                options: vec!["Ship".into(), "Wait".into()],
+                stakes: None,
+                initial_leaning: None,
+                review_date: None,
+                primitive_assessment: Default::default(),
+                context_version: Some("test-v1".into()),
+            };
+            let expected = coordinator.current_authority_token().unwrap();
+            let (_, prompt_commit) = canvas
+                .add_decision_tile_expecting_authority(
+                    &session.id,
+                    tile,
+                    &mut twin,
+                    create,
+                    expected,
+                )
+                .unwrap();
+            let prompt_epoch = prompt_commit.authority_token.unwrap();
+            let response_commit = canvas
+                .batch_update_tile_responses_expecting_authority(
+                    &session.id,
+                    &tile_id,
+                    &[(
+                        "model-a".into(),
+                        format!("visible-{suffix}"),
+                        ResponseStatus::Completed,
+                        None,
+                        None,
+                    )],
+                    prompt_epoch,
+                )
+                .unwrap();
+            let response_epoch = response_commit.authority_token.unwrap();
+
+            if prediction_succeeds {
+                let (_, commit) = twin
+                    .attach_twin_prediction_expecting_authority(
+                        &episode_id,
+                        crate::models::twin::TwinPredictionDraft {
+                            predicted_option: "Ship".into(),
+                            matched_option_index: Some(0),
+                            confidence: Some(0.8),
+                            rationale: Some("evidence".into()),
+                            parse_mode: "strict_json".into(),
+                        },
+                        "model-a",
+                        "test-v1",
+                        response_epoch,
+                    )
+                    .unwrap();
+                assert!(commit.authority_token.is_some());
+            } else {
+                let commit = twin
+                    .mark_twin_prediction_failed_expecting_authority(
+                        &episode_id,
+                        response_epoch,
+                    )
+                    .unwrap();
+                assert!(commit.authority_token.is_some());
+            }
+
+            let durable_session = canvas.get_session(&session.id).unwrap();
+            assert_eq!(
+                durable_session
+                    .prompt_tiles
+                    .iter()
+                    .find(|tile| tile.id == tile_id)
+                    .unwrap()
+                    .responses["model-a"]
+                    .content,
+                format!("visible-{suffix}")
+            );
+            let episode = twin.get_decision_episode(&episode_id).unwrap();
+            if prediction_succeeds {
+                assert!(episode.twin_prediction.is_some());
+            } else {
+                assert_eq!(episode.prediction_status.as_deref(), Some("failed"));
+                assert!(episode.twin_prediction.is_none());
+            }
+        }
     }
 
     #[test]

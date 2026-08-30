@@ -129,6 +129,22 @@ pub(super) async fn append_canvas_trace(
     }
 }
 
+pub(super) async fn append_canvas_trace_expecting_authority(
+    twin_store_arc: Arc<RwLock<TwinStore>>,
+    session_id: &str,
+    event_type: TraceEventType,
+    payload: serde_json::Value,
+    expected: crate::services::vault_namespace::VaultAuthorityTokenV1,
+) -> Result<crate::services::vault_namespace::VaultAuthorityTokenV1, String> {
+    let mut twin_store = twin_store_arc.write().await;
+    let (_, commit) = twin_store
+        .append_trace_event_expecting_authority(session_id, event_type, payload, expected)
+        .map_err(|error| error.to_string())?;
+    commit.authority_token.ok_or_else(|| {
+        "Twin trace mutation did not advance the content authority generation".to_string()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

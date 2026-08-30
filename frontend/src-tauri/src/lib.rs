@@ -53,6 +53,8 @@ pub struct AppState {
     pub twin_event_store: Arc<TwinEventStore>,
     pub mutation_coordinator: Option<Arc<MutationCoordinator>>,
     pub mutation_startup_error: Arc<RwLock<Option<String>>>,
+    pub(crate) loaded_authority:
+        Arc<RwLock<Option<crate::services::vault_namespace::VaultAuthorityTokenV1>>>,
     pub vault_transition: Arc<RwLock<()>>,
     /// MemoryService is stateless — no lock needed, just Arc for shared ownership
     pub memory_service: Arc<MemoryService>,
@@ -135,6 +137,16 @@ pub fn run() {
                     ),
                 };
             let derived_data_path = if let Some(coordinator) = mutation_coordinator.as_ref() {
+                let guard = coordinator
+                    .begin_root_transition()
+                    .map_err(|error| error.to_string())?;
+                let lease = guard.current_lease().map_err(|error| error.to_string())?;
+                guard
+                    .initialize_namespace(&lease)
+                    .map_err(|error| error.to_string())?;
+                guard
+                    .invalidate_namespace(&lease)
+                    .map_err(|error| error.to_string())?;
                 coordinator
                     .current_namespace_path()
                     .map_err(|error| error.to_string())?
@@ -153,9 +165,9 @@ pub fn run() {
             let graph_index = GraphIndex::new();
             let search_service = match SearchService::new(derived_data_path.clone()) {
                 Ok(s) => s,
-                Err(e) => {
+                Err(e) if e.is_corrupt_or_incompatible() => {
                     log::error!(
-                        "Failed to initialize search service: {}. Attempting index rebuild.",
+                        "Search index is explicitly corrupt or incompatible: {}. Attempting rebuild.",
                         e
                     );
                     // Try deleting corrupted index and retrying
@@ -170,6 +182,7 @@ pub fn run() {
                         std::process::exit(1);
                     })
                 }
+                Err(e) => return Err(e.into()),
             };
             // Initialize chunk index (parallel to search index)
             let chunk_index = match ChunkIndex::new(derived_data_path.clone()) {
@@ -192,9 +205,20 @@ pub fn run() {
 
             let canvas_store =
                 CanvasStore::with_event_recorder(data_path.join("canvas"), event_recorder.clone());
+            let twin_data_path = if let Some(coordinator) = mutation_coordinator.as_ref() {
+                let guard = coordinator
+                    .begin_root_transition()
+                    .map_err(|error| error.to_string())?;
+                let lease = guard.current_lease().map_err(|error| error.to_string())?;
+                guard
+                    .prepare_twin_data_path(&vault_path, &lease)
+                    .map_err(|error| error.to_string())?
+            } else {
+                crate::models::settings::twin_data_path_for_vault(&data_path, &vault_path)
+                    .map_err(|error| error.to_string())?
+            };
             let twin_store = TwinStore::with_event_recorder(
-                crate::services::settings::prepare_twin_data_path(&data_path, &vault_path)
-                    .map_err(|error| error.to_string())?,
+                twin_data_path,
                 data_path.join("twin"),
                 event_recorder.clone(),
             );
@@ -253,6 +277,7 @@ pub fn run() {
                 twin_event_store,
                 mutation_coordinator,
                 mutation_startup_error: Arc::new(RwLock::new(mutation_startup_error)),
+                loaded_authority: Arc::new(RwLock::new(None)),
                 vault_transition: Arc::new(RwLock::new(())),
                 memory_service: Arc::new(MemoryService::new()),
                 boot_state,
@@ -518,6 +543,18 @@ async fn warm_start_services_inner(
 
     warm_start_component(WarmStartComponent::Overlay, injected_failure)?;
     let full_notes = crate::commands::sync_topic_hubs(state).await?;
+    let namespace_token = {
+        let guard = coordinator
+            .begin_root_transition()
+            .map_err(|error| error.to_string())?;
+        let current_lease = guard.current_lease().map_err(|error| error.to_string())?;
+        if current_lease != namespace_lease {
+            return Err("vault authority changed before derived rebuild".into());
+        }
+        guard
+            .capture_authority_token(&current_lease)
+            .map_err(|error| error.to_string())?
+    };
 
     maybe_publish_boot_phase(
         app_handle,
@@ -602,8 +639,9 @@ async fn warm_start_services_inner(
         return Err("vault authority changed while derived state was rebuilding".into());
     }
     publish_guard
-        .publish_namespace_ready(&namespace_lease)
+        .publish_namespace_ready(&namespace_token)
         .map_err(|error| error.to_string())?;
+    *state.loaded_authority.write().await = Some(namespace_token);
 
     maybe_publish_boot_phase(
         app_handle,
@@ -659,20 +697,14 @@ fn start_link_discovery_worker(state: AppState) {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(12)).await;
 
-            let root_guard = match crate::commands::acquire_root_epoch(&state).await {
+            let root_guard = match crate::commands::acquire_derived_root_epoch(&state).await {
                 Ok(guard) => guard,
                 Err(error) => {
                     log::warn!("Background link discovery paused: {error}");
                     continue;
                 }
             };
-            let root_epoch = match crate::commands::capture_root_epoch(&state) {
-                Ok(epoch) => epoch,
-                Err(error) => {
-                    log::warn!("Background link discovery could not capture root epoch: {error}");
-                    continue;
-                }
-            };
+            let root_epoch = root_guard.authority().clone();
 
             let settings = {
                 let settings = state.settings_service.read().await;
@@ -681,10 +713,33 @@ fn start_link_discovery_worker(state: AppState) {
 
             let job = {
                 let mut discovery = state.link_discovery.write().await;
-                discovery.next_background_job(&settings)
+                state
+                    .mutation_coordinator
+                    .as_ref()
+                    .expect("coordinator was required by the root ticket")
+                    .with_locked_derived_state(&root_epoch, true, || {
+                        discovery.reload_from_disk_checked().map_err(|error| {
+                            crate::services::twin_events::MutationError::Invalid(
+                                error.to_string(),
+                            )
+                        })?;
+                        discovery
+                            .next_background_job_checked(&settings)
+                            .map_err(|error| {
+                                crate::services::twin_events::MutationError::Invalid(
+                                    error.to_string(),
+                                )
+                            })
+                    })
             };
 
-            let Some(job) = job else {
+            let Some(job) = (match job {
+                Ok(job) => job,
+                Err(error) => {
+                    log::warn!("Background link discovery state unavailable: {error}");
+                    continue;
+                }
+            }) else {
                 continue;
             };
             drop(root_guard);
@@ -699,7 +754,7 @@ fn start_link_discovery_worker(state: AppState) {
             )
             .await;
 
-            let _root_guard = match crate::commands::acquire_expected_root_epoch(
+            let completion_ticket = match crate::commands::acquire_expected_derived_root_epoch(
                 &state,
                 &root_epoch,
             )
@@ -712,9 +767,8 @@ fn start_link_discovery_worker(state: AppState) {
                 }
             };
 
-            let mut discovery = state.link_discovery.write().await;
-            match result {
-                Ok(_) => discovery.complete_background_job(&job.note_id, None),
+            let requeue = match &result {
+                Ok(_) => None,
                 Err(error) => {
                     log::warn!(
                         "Background link discovery failed for '{}' ({}): {}",
@@ -722,8 +776,36 @@ fn start_link_discovery_worker(state: AppState) {
                         job.priority,
                         error
                     );
-                    discovery.complete_background_job(&job.note_id, Some("stale"));
+                    Some("stale")
                 }
+            };
+            let completion = {
+                let mut discovery = state.link_discovery.write().await;
+                state
+                    .mutation_coordinator
+                    .as_ref()
+                    .expect("coordinator was required by the root ticket")
+                    .with_locked_derived_state(&root_epoch, true, || {
+                        discovery.reload_from_disk_checked().map_err(|error| {
+                            crate::services::twin_events::MutationError::Invalid(
+                                error.to_string(),
+                            )
+                        })?;
+                        discovery
+                            .complete_background_job_checked(&job.note_id, requeue)
+                            .map_err(|error| {
+                                crate::services::twin_events::MutationError::Invalid(
+                                    error.to_string(),
+                                )
+                            })
+                    })
+            };
+            if let Err(error) = completion {
+                log::warn!("Background link discovery completion was not persisted: {error}");
+                continue;
+            }
+            if let Err(error) = completion_ticket.finish(&state).await {
+                log::warn!("Background link discovery completion became stale: {error}");
             }
         }
     });
@@ -734,7 +816,7 @@ fn start_vault_optimizer_worker(state: AppState) {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
 
-            let _root_guard = match crate::commands::acquire_root_epoch(&state).await {
+            let root_guard = match crate::commands::acquire_derived_root_epoch(&state).await {
                 Ok(guard) => guard,
                 Err(error) => {
                     log::warn!("Background vault optimizer paused: {error}");
@@ -754,10 +836,14 @@ fn start_vault_optimizer_worker(state: AppState) {
             // lock, so LLM/network work (once added) and disk I/O here never
             // block other note/search/canvas commands that need
             // `knowledge_store.write()`.
-            let tick = {
+            let (tick, prepared_optimizer_revision) = {
                 let store = state.knowledge_store.read().await;
                 let mut optimizer = state.vault_optimizer.write().await;
-                optimizer.prepare_next(&store, &settings)
+                let tick = optimizer.with_locked_fresh_state(|optimizer| {
+                    optimizer.prepare_next(&store, &settings)
+                });
+                let revision = optimizer.state_revision();
+                (tick, revision)
             };
 
             // Whichever branch below reindexes a note, it does so only AFTER
@@ -776,7 +862,14 @@ fn start_vault_optimizer_worker(state: AppState) {
                     let result = {
                         let mut store = state.knowledge_store.write().await;
                         let mut optimizer = state.vault_optimizer.write().await;
-                        optimizer.apply_pending(&mut store, *pending)
+                        optimizer.with_locked_fresh_state(|optimizer| {
+                            if optimizer.state_revision() != prepared_optimizer_revision {
+                                anyhow::bail!(
+                                    "vault optimizer state changed before pending apply"
+                                );
+                            }
+                            optimizer.apply_pending(&mut store, *pending)
+                        })
                     };
                     match result {
                         Ok(applied_note_id) => applied_note_id,
@@ -802,6 +895,9 @@ fn start_vault_optimizer_worker(state: AppState) {
                         error
                     );
                 }
+            }
+            if let Err(error) = root_guard.finish(&state).await {
+                log::warn!("Background vault optimizer result became stale: {error}");
             }
         }
     });
@@ -832,17 +928,11 @@ mod tests {
         state.vault_optimizer = Arc::new(RwLock::new(
             crate::services::vault_optimizer::VaultOptimizerService::new(discarded),
         ));
-        let events = Arc::new(crate::services::twin_events::TwinEventStore::new(data.path()));
-        events.initialize().unwrap();
-        let coordinator = Arc::new(
-            crate::services::twin_events::MutationCoordinator::new(
-                data.path(),
-                vault.path(),
-                events.clone(),
-                Arc::new(crate::services::twin_events::NoopMutationLifecycle),
-            )
-            .unwrap(),
-        );
+        let coordinator = state
+            .mutation_coordinator
+            .as_ref()
+            .expect("test state should include a mutation coordinator")
+            .clone();
         let namespace = coordinator.current_namespace_path().unwrap();
         state.knowledge_store = Arc::new(RwLock::new(
             crate::services::knowledge_store::KnowledgeStore::with_event_recorder(
@@ -878,7 +968,6 @@ mod tests {
                 coordinator.clone(),
             ),
         ));
-        state.twin_event_store = events;
         state.mutation_coordinator = Some(coordinator);
         (state, vault, data)
     }
@@ -907,7 +996,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn every_readiness_component_failure_keeps_marker_absent_and_commands_unavailable() {
+    async fn every_readiness_component_failure_keeps_marker_unready_and_commands_unavailable() {
         for component in [
             WarmStartComponent::Migration,
             WarmStartComponent::Overlay,
@@ -926,10 +1015,17 @@ mod tests {
                 .await
                 .unwrap_err();
 
-            assert!(error.contains(&format!("{component:?}")));
-            assert!(!namespace_path.join("ready-v1.json").exists());
+            assert!(
+                error.contains(&format!("{component:?}")),
+                "expected injected {component:?} failure, got: {error}"
+            );
+            let marker = std::fs::read_to_string(namespace_path.join("ready-v1.json"))
+                .expect("failed rebuild should retain the durable unready marker");
+            assert!(marker.contains("\"ready\": false"));
             assert!(coordinator.require_namespace_ready().is_err());
-            assert!(crate::commands::acquire_root_epoch(&state).await.is_err());
+            assert!(crate::commands::acquire_derived_root_epoch(&state)
+                .await
+                .is_err());
         }
     }
 

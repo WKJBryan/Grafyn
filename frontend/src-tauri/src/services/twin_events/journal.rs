@@ -29,6 +29,7 @@ pub const MAX_SERIALIZED_INTENT_BYTES: usize = 32 * 1024 * 1024;
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum TargetKind {
     Markdown,
+    OverlayJson,
     TwinJson,
     CanvasJson,
 }
@@ -116,6 +117,8 @@ pub struct MutationIntentV1 {
     pub source_channel: SourceChannel,
     #[serde(deserialize_with = "required_option")]
     pub markdown_root_scope: Option<ContentDigest>,
+    #[serde(default = "missing_content_authority_generation")]
+    pub content_authority_generation: Option<u64>,
     pub targets: Vec<MutationTargetV1>,
     pub events: Vec<TwinEvent>,
     pub created_at: chrono::DateTime<chrono::Utc>,
@@ -123,7 +126,7 @@ pub struct MutationIntentV1 {
 
 impl MutationIntentV1 {
     pub fn validate(&self) -> Result<(), MutationError> {
-        if self.schema_version != 1 {
+        if !matches!(self.schema_version, 1 | 2) {
             return Err(MutationError::Invalid(
                 "unsupported local mutation journal schema".into(),
             ));
@@ -150,14 +153,41 @@ impl MutationIntentV1 {
                 "mutation intent must contain a target or event".into(),
             ));
         }
-        let has_markdown_target = self
+        let has_vault_scoped_target = self
             .targets
             .iter()
-            .any(|target| target.kind == TargetKind::Markdown);
-        if self.markdown_root_scope.is_some() != has_markdown_target {
+            .any(|target| matches!(target.kind, TargetKind::Markdown | TargetKind::OverlayJson));
+        if self.markdown_root_scope.is_some() != has_vault_scoped_target {
             return Err(MutationError::Invalid(
-                "Markdown mutations must carry exactly one root scope digest".into(),
+                "vault-scoped mutations must carry exactly one root scope digest".into(),
             ));
+        }
+        let changes_authority = !self.events.is_empty()
+            || self.targets.iter().any(|target| {
+                matches!(
+                    target.kind,
+                    TargetKind::Markdown | TargetKind::OverlayJson | TargetKind::TwinJson
+                )
+            });
+        match self.schema_version {
+            1 if self.content_authority_generation == Some(u64::MAX) => {}
+            1 if self.content_authority_generation.is_none() => {}
+            1 => {
+                return Err(MutationError::Invalid(
+                    "legacy mutation intent cannot carry content authority generation".into(),
+                ));
+            }
+            2 if changes_authority
+                && self
+                    .content_authority_generation
+                    .is_some_and(|generation| generation != u64::MAX) => {}
+            2 if !changes_authority && self.content_authority_generation.is_none() => {}
+            2 => {
+                return Err(MutationError::Invalid(
+                    "mutation intent content authority generation is invalid".into(),
+                ));
+            }
+            _ => unreachable!(),
         }
         let mut target_order = self
             .targets
@@ -187,7 +217,7 @@ impl MutationIntentV1 {
         }
         let mut total_after = 0usize;
         for target in &self.targets {
-            validate_relative_key(&target.relative_key)?;
+            validate_target_key(target.kind, &target.relative_key)?;
             let expected = desired_digest(&target.after);
             if target.after_digest != expected {
                 return Err(MutationError::Invalid(
@@ -197,7 +227,9 @@ impl MutationIntentV1 {
             if let DesiredImage::Utf8Bytes(content) = &target.after {
                 let length = content.len();
                 let limit = match target.kind {
-                    TargetKind::Markdown | TargetKind::TwinJson => MAX_MARKDOWN_TWIN_BYTES,
+                    TargetKind::Markdown | TargetKind::OverlayJson | TargetKind::TwinJson => {
+                        MAX_MARKDOWN_TWIN_BYTES
+                    }
                     TargetKind::CanvasJson => MAX_CANVAS_BYTES,
                 };
                 if length > limit {
@@ -301,6 +333,16 @@ pub fn derive_mutation_id(intent: &MutationIntentV1) -> ContentDigest {
         }
         None => frame(&mut hasher, b"no_markdown_root_scope"),
     }
+    if intent.schema_version >= 2 {
+        match intent.content_authority_generation {
+            Some(generation) if generation != u64::MAX => {
+                frame(&mut hasher, b"content_authority_generation");
+                frame(&mut hasher, &generation.to_be_bytes());
+            }
+            Some(_) => frame(&mut hasher, b"missing_content_authority_generation"),
+            None => frame(&mut hasher, b"no_content_authority_generation"),
+        }
+    }
     for event in &intent.events {
         frame(&mut hasher, event.event_id.as_str().as_bytes());
     }
@@ -309,6 +351,7 @@ pub fn derive_mutation_id(intent: &MutationIntentV1) -> ContentDigest {
             &mut hasher,
             match target.kind {
                 TargetKind::Markdown => b"markdown",
+                TargetKind::OverlayJson => b"overlay_json",
                 TargetKind::TwinJson => b"twin_json",
                 TargetKind::CanvasJson => b"canvas_json",
             },
@@ -322,6 +365,10 @@ pub fn derive_mutation_id(intent: &MutationIntentV1) -> ContentDigest {
     }
     ContentDigest::parse(format!("{:x}", hasher.finalize()))
         .expect("SHA-256 is a valid mutation ID")
+}
+
+fn missing_content_authority_generation() -> Option<u64> {
+    Some(u64::MAX)
 }
 
 pub fn validate_relative_key(key: &str) -> Result<(), MutationError> {
@@ -354,13 +401,29 @@ pub fn validate_relative_key(key: &str) -> Result<(), MutationError> {
 }
 
 pub fn physical_target_key(kind: TargetKind, key: &str) -> Result<String, MutationError> {
-    validate_relative_key(key)?;
+    validate_target_key(kind, key)?;
     let prefix = match kind {
         TargetKind::Markdown => "markdown",
+        TargetKind::OverlayJson => "overlay_json",
         TargetKind::TwinJson => "twin_json",
         TargetKind::CanvasJson => "canvas_json",
     };
     Ok(format!("{prefix}:{}", key.to_lowercase()))
+}
+
+pub fn validate_target_key(kind: TargetKind, key: &str) -> Result<(), MutationError> {
+    validate_relative_key(key)?;
+    if kind == TargetKind::OverlayJson
+        && (key.contains('/')
+            || key.contains('\\')
+            || !key.ends_with(".json")
+            || key.len() == ".json".len())
+    {
+        return Err(MutationError::Invalid(
+            "overlay target must be one canonical note-ID JSON leaf".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn is_windows_reserved_component(component: &str) -> bool {
@@ -589,6 +652,76 @@ mod tests {
     }
 
     #[test]
+    fn schema_two_authority_generation_is_required_and_changes_mutation_identity() {
+        let temp = tempdir().unwrap();
+        let vault = temp.path().join("vault");
+        std::fs::create_dir(&vault).unwrap();
+        let store = Arc::new(TwinEventStore::new(temp.path()));
+        store.initialize().unwrap();
+        let coordinator = MutationCoordinator::new(
+            temp.path(),
+            &vault,
+            store,
+            Arc::new(NoopMutationLifecycle),
+        )
+        .unwrap();
+        coordinator.fail_once_at(MutationFaultPoint::AfterStage);
+        assert!(coordinator
+            .commit_local(
+                CausalStream::LocalOnly,
+                SourceChannel::parse("note_editor").unwrap(),
+                vec![TargetMutation::put(
+                    TargetKind::Markdown,
+                    "generation.md",
+                    "after",
+                )],
+                vec![draft("generation")],
+            )
+            .is_err());
+
+        let pending = temp.path().join(PENDING_DIRECTORY);
+        let path = std::fs::read_dir(&pending)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let bytes = std::fs::read(path).unwrap();
+        let intent: MutationIntentV1 = serde_json::from_slice(&bytes).unwrap();
+        intent.validate().unwrap();
+        let original_id = intent.mutation_id.clone();
+
+        let mut next = intent.clone();
+        next.content_authority_generation = Some(
+            intent
+                .content_authority_generation
+                .unwrap()
+                .checked_add(1)
+                .unwrap(),
+        );
+        next.mutation_id = derive_mutation_id(&next);
+        next.validate().unwrap();
+        assert_ne!(next.mutation_id, original_id);
+
+        let mut missing: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        missing
+            .as_object_mut()
+            .unwrap()
+            .remove("content_authority_generation");
+        let missing: MutationIntentV1 = serde_json::from_value(missing).unwrap();
+        assert!(missing.validate().is_err());
+
+        let mut legacy_value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let object = legacy_value.as_object_mut().unwrap();
+        object.insert("schema_version".into(), serde_json::json!(1));
+        object.remove("content_authority_generation");
+        let mut legacy: MutationIntentV1 = serde_json::from_value(legacy_value).unwrap();
+        legacy.mutation_id = derive_mutation_id(&legacy);
+        legacy.validate().unwrap();
+        assert_eq!(legacy.content_authority_generation, Some(u64::MAX));
+    }
+
+    #[test]
     fn staged_mixed_targets_and_partial_events_recover_idempotently() {
         let temp = tempdir().unwrap();
         let vault = temp.path().join("vault");
@@ -699,6 +832,23 @@ mod tests {
             .is_err());
         assert_eq!(coordinator.pending_count().unwrap(), 0);
         assert!(!temp.path().join("escape.md").exists());
+    }
+
+    #[test]
+    fn overlay_target_accepts_only_a_note_id_json_leaf() {
+        assert!(validate_target_key(TargetKind::OverlayJson, "note-1.json").is_ok());
+        for key in [
+            "ready-v1.json/escape.json",
+            "overlay/notes/note.json",
+            "../ready-v1.json",
+            "note.md",
+            ".json",
+        ] {
+            assert!(
+                validate_target_key(TargetKind::OverlayJson, key).is_err(),
+                "accepted overlay alias {key}"
+            );
+        }
     }
 
     #[test]

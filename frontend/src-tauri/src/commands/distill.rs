@@ -519,17 +519,15 @@ fn extract_candidates_algorithm(content: &str, tags: &[String]) -> Vec<AtomicCan
 /// Check for existing notes with the same or very similar title.
 /// Returns (id, title) of the matching note if found.
 async fn find_duplicate(title: &str, state: &AppState) -> Option<(String, String)> {
-    let search = state.search_service.read().await;
-    // Strip "Atomic: " prefix for broader matching
-    let query = title.trim_start_matches("Atomic: ");
-    if let Ok(results) = search.search(query, 5) {
-        let candidate_lower = title.to_lowercase();
-        let candidate_core = candidate_lower.trim_start_matches("atomic: ");
-        for result in results {
-            let existing_lower = result.note.title.to_lowercase();
+    let store = state.knowledge_store.read().await;
+    let candidate_lower = title.to_lowercase();
+    let candidate_core = candidate_lower.trim_start_matches("atomic: ");
+    if let Ok(notes) = store.list_full_notes() {
+        for note in notes {
+            let existing_lower = note.title.to_lowercase();
             let existing_core = existing_lower.trim_start_matches("atomic: ");
             if existing_core == candidate_core {
-                return Some((result.note.id.clone(), result.note.title.clone()));
+                return Some((note.id, note.title));
             }
         }
     }
@@ -747,7 +745,8 @@ pub async fn distill_note(
     request: DistillRequest,
     state: State<'_, AppState>,
 ) -> Result<DistillResponse, String> {
-    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
+    let root_ticket = crate::commands::acquire_root_epoch(state.inner()).await?;
+    let mut root_epoch = root_ticket.authority().clone();
     // 1. Get the container note
     let note = {
         let store = state.knowledge_store.read().await;
@@ -821,6 +820,7 @@ pub async fn distill_note(
             .map(|existing| existing.id)
             .collect::<std::collections::HashSet<_>>()
     };
+    root_ticket.validate(state.inner()).await?;
 
     // 4. Apply hub policy — determine which candidates get hubs
     let hub_assignments = apply_hub_policy(&candidates, &request.hub_policy);
@@ -871,10 +871,20 @@ pub async fn distill_note(
 
                         let updated = {
                             let mut store = state.knowledge_store.write().await;
-                            store.update_note(&existing_id, update).ok()
+                            store
+                                .update_note_expecting_authority(
+                                    &existing_id,
+                                    update,
+                                    "note_editor",
+                                    root_epoch.clone(),
+                                )
+                                .ok()
                         };
 
-                        if let Some(updated_note) = updated {
+                        if let Some((updated_note, commit)) = updated {
+                            root_epoch = commit
+                                .authority_token
+                                .unwrap_or_else(|| root_epoch.clone());
                             touched_ids.push(updated_note.id);
                         }
                     }
@@ -932,10 +942,19 @@ pub async fn distill_note(
         };
 
         // Create the note
-        let created = {
+        let (created, commit) = {
             let mut store = state.knowledge_store.write().await;
-            store.create_note(note_create).map_err(|e| e.to_string())?
+            store
+                .create_note_expecting_authority(
+                    note_create,
+                    "note_editor",
+                    root_epoch.clone(),
+                )
+                .map_err(|e| e.to_string())?
         };
+        root_epoch = commit
+            .authority_token
+            .unwrap_or_else(|| root_epoch.clone());
 
         touched_ids.push(created.id.clone());
         created_ids.push(created.id.clone());
@@ -979,10 +998,20 @@ pub async fn distill_note(
 
         let updated = {
             let mut store = state.knowledge_store.write().await;
-            store.update_note(&id, update).ok()
+            store
+                .update_note_expecting_authority(
+                    &id,
+                    update,
+                    "note_editor",
+                    root_epoch.clone(),
+                )
+                .ok()
         };
 
-        if let Some(updated_note) = updated {
+        if let Some((updated_note, commit)) = updated {
+            root_epoch = commit
+                .authority_token
+                .unwrap_or_else(|| root_epoch.clone());
             touched_ids.push(updated_note.id);
             true
         } else {
@@ -992,6 +1021,13 @@ pub async fn distill_note(
         false
     };
 
+    state
+        .mutation_coordinator
+        .as_ref()
+        .ok_or_else(|| "mutation coordinator is unavailable".to_string())?
+        .validate_authority_token(&root_epoch, false)
+        .map_err(|error| error.to_string())?;
+    drop(root_ticket);
     let synced_notes = commit_note_writes(state.inner(), &touched_ids, "distill_note").await?;
     hub_updates = build_topic_hub_updates(&synced_notes, &created_ids, &existing_hub_ids);
 

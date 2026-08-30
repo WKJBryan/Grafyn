@@ -11,10 +11,12 @@ pub async fn retrieve_relevant(
     context_note_ids: Option<Vec<String>>,
     state: State<'_, AppState>,
 ) -> Result<Vec<RetrievalResult>, String> {
-    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
+    let root_ticket = crate::commands::acquire_derived_root_epoch(state.inner()).await?;
     let limit = limit.unwrap_or(10);
     let context_ids = context_note_ids.unwrap_or_default();
-    run_retrieval(state.inner(), &query, limit, &context_ids).await
+    let result = run_retrieval(state.inner(), &query, limit, &context_ids).await?;
+    root_ticket.finish(state.inner()).await?;
+    Ok(result)
 }
 
 /// Get current retrieval configuration

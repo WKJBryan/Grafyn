@@ -1,6 +1,7 @@
 use super::context::{resolve_prompt_context, run_sealed_twin_prediction, TWIN_CONTEXT_VERSION};
 use super::shared::{
-    append_canvas_trace, effective_model_ids, resolve_model_route, ModelProviderRoute,
+    append_canvas_trace_expecting_authority, effective_model_ids, is_vault_context_prompt,
+    resolve_model_route, ModelProviderRoute,
 };
 use crate::models::canvas::{
     AddModelsRequest, CanvasStreamEvent, ContextMode, ModelResponse, PromptRequest, PromptTile,
@@ -47,8 +48,12 @@ pub async fn send_prompt(
     mut request: PromptRequest,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
-    let _root_guard = crate::commands::acquire_root_epoch(state.inner()).await?;
-    let root_epoch = crate::commands::capture_root_epoch(state.inner())?;
+    let root_ticket = if is_vault_context_prompt(&request.prompt_type, &request.context_mode) {
+        crate::commands::acquire_derived_root_epoch(state.inner()).await?
+    } else {
+        crate::commands::acquire_root_epoch(state.inner()).await?
+    };
+    let input_root_epoch = root_ticket.authority().clone();
     let tile_id = uuid::Uuid::new_v4().to_string();
     let now = Utc::now();
     let model_route = {
@@ -74,6 +79,7 @@ pub async fn send_prompt(
         store.get_session(&session_id).map_err(|e| e.to_string())?
     };
     let resolved_context = resolve_prompt_context(state.inner(), &session, &request).await?;
+    root_ticket.validate(state.inner()).await?;
     let decision_episode_id = if request.prompt_type == PromptType::Decision {
         Some(uuid::Uuid::new_v4().to_string())
     } else {
@@ -170,22 +176,37 @@ pub async fn send_prompt(
 
     // A decision tile, its decision episode, and the decision trace are one
     // coordinated mutation. Ordinary prompts use the same Canvas boundary.
-    {
+    let initial_commit = {
         let mut store = state.canvas_store.write().await;
         if let Some(create) = decision_create {
             let mut twin_store = state.twin_store.write().await;
             store
-                .add_decision_tile(&session_id, tile.clone(), &mut twin_store, create)
-                .map_err(|error| error.to_string())?;
+                .add_decision_tile_expecting_authority(
+                    &session_id,
+                    tile.clone(),
+                    &mut twin_store,
+                    create,
+                    input_root_epoch.clone(),
+                )
+                .map_err(|error| error.to_string())?
+                .1
         } else {
             store
-                .add_tile(&session_id, tile.clone())
-                .map_err(|error| error.to_string())?;
+                .add_tile_expecting_authority(
+                    &session_id,
+                    tile.clone(),
+                    input_root_epoch.clone(),
+                )
+                .map_err(|error| error.to_string())?
+                .1
         }
-    }
+    };
+    let mut root_epoch = initial_commit.authority_token.ok_or_else(|| {
+        "Canvas prompt mutation did not advance the content authority generation".to_string()
+    })?;
 
     if decision_episode_id.is_none() {
-        append_canvas_trace(
+        root_epoch = append_canvas_trace_expecting_authority(
             state.twin_store.clone(),
             &session_id,
             TraceEventType::PromptSubmitted,
@@ -210,9 +231,16 @@ pub async fn send_prompt(
                 "web_search": tile.web_search,
                 "web_search_max_results": tile.web_search_max_results,
             }),
+            root_epoch,
         )
-        .await;
+        .await?;
     }
+    root_epoch = crate::commands::rebuild_and_publish_current_authority(
+        state.inner(),
+        &root_epoch,
+    )
+    .await?;
+    drop(root_ticket);
 
     // Emit TileCreated event
     let _ = window.emit(
@@ -274,6 +302,7 @@ pub async fn send_prompt(
         .collect::<Vec<_>>();
     let stream_root_state = state.inner().clone();
     let stream_root_epoch = root_epoch.clone();
+    let (sealed_epoch_sender, sealed_epoch_receiver) = tokio::sync::oneshot::channel();
 
     // Spawn async task for streaming (doesn't block the IPC response)
     tauri::async_runtime::spawn(async move {
@@ -417,7 +446,7 @@ pub async fn send_prompt(
             }
         }
 
-        let _root_guard = match crate::commands::acquire_expected_root_epoch(
+        let root_guard = match crate::commands::acquire_expected_root_epoch(
             &stream_root_state,
             &stream_root_epoch,
         )
@@ -441,10 +470,15 @@ pub async fn send_prompt(
         };
 
         // Batch update store with all results in a single write
-        let persistence_ok = {
+        let response_commit = {
             let mut store = canvas_store_arc.write().await;
-            match store.batch_update_tile_responses(&session_id_clone, &tile_id_clone, &results) {
-                Ok(()) => true,
+            match store.batch_update_tile_responses_expecting_authority(
+                &session_id_clone,
+                &tile_id_clone,
+                &results,
+                stream_root_epoch.clone(),
+            ) {
+                Ok(commit) => commit,
                 Err(error) => {
                     let model_ids: Vec<String> = results
                         .iter()
@@ -457,19 +491,31 @@ pub async fn send_prompt(
                         &model_ids,
                         &error,
                     );
-                    false
+                    return;
                 }
             }
         };
+        let mut publication_epoch = response_commit
+            .authority_token
+            .unwrap_or_else(|| stream_root_epoch.clone());
+        drop(root_guard);
 
-        append_model_result_traces(
+        publication_epoch = match append_model_result_traces(
             twin_store_arc.clone(),
             &session_id_clone,
             &tile_id_clone,
             "send_prompt",
             &results,
+            publication_epoch,
         )
-        .await;
+        .await
+        {
+            Ok(epoch) => epoch,
+            Err(error) => {
+                log::error!("Failed to append governed Canvas result trace: {error}");
+                return;
+            }
+        };
 
         if let Some(decision_episode_id) = decision_episode_id_for_reflection {
             let mut twin_store = twin_store_arc.write().await;
@@ -478,7 +524,7 @@ pub async fn send_prompt(
                     continue;
                 }
 
-                let _ = twin_store.record_reflection_card(ReflectionCardCreate {
+                let (_, commit) = match twin_store.record_reflection_card_expecting_authority(ReflectionCardCreate {
                     decision_episode_id: decision_episode_id.clone(),
                     session_id: session_id_clone.clone(),
                     tile_id: tile_id_clone.clone(),
@@ -489,22 +535,47 @@ pub async fn send_prompt(
                     cited_constitution_item_ids: reflection_constitution_item_ids.clone(),
                     cited_action_gap_ids: reflection_action_gap_ids.clone(),
                     evidence_packet: None,
-                });
+                }, publication_epoch.clone()) {
+                    Ok(committed) => committed,
+                    Err(error) => {
+                        log::error!("Failed to persist governed reflection card: {error}");
+                        return;
+                    }
+                };
+                publication_epoch = match commit.authority_token {
+                    Some(epoch) => epoch,
+                    None => {
+                        log::error!("Reflection-card mutation did not advance authority");
+                        return;
+                    }
+                };
             }
         }
+
+        let published_epoch = match crate::commands::rebuild_and_publish_current_authority(
+            &stream_root_state,
+            &publication_epoch,
+        )
+        .await
+        {
+            Ok(epoch) => epoch,
+            Err(error) => {
+                log::error!("Failed to publish Canvas response authority: {error}");
+                return;
+            }
+        };
+        let _ = sealed_epoch_sender.send(published_epoch);
 
         // Emit session saved after all models complete — but only if the
         // batch persist above actually succeeded. If it failed, per-model
         // Error events were already emitted and the frontend must not
         // believe the (in-memory only) responses were saved to disk.
-        if persistence_ok {
-            let _ = window.emit(
-                "canvas-stream",
-                CanvasStreamEvent::SessionSaved {
-                    session_id: session_id_clone,
-                },
-            );
-        }
+        let _ = window.emit(
+            "canvas-stream",
+            CanvasStreamEvent::SessionSaved {
+                session_id: session_id_clone,
+            },
+        );
     });
 
     // Sealed twin prediction: one hidden, non-streaming call per decision
@@ -530,23 +601,39 @@ pub async fn send_prompt(
                 .context_version
                 .clone()
                 .unwrap_or_else(|| TWIN_CONTEXT_VERSION.to_string());
-            tauri::async_runtime::spawn(run_sealed_twin_prediction(
-                state.inner().clone(),
-                root_epoch.clone(),
-                state.twin_store.clone(),
-                state.openrouter.clone(),
-                state.ollama.clone(),
-                model_route.provider.clone(),
-                prediction_model,
-                episode_id,
-                tile.prompt.clone(),
-                decision,
-                metadata.options.clone(),
-                metadata.stakes.clone(),
-                resolved_context.twin_context_prompt.clone(),
-                context_version,
-                tile.decision_metadata.clone(),
-            ));
+            let prediction_state = state.inner().clone();
+            let prediction_store = state.twin_store.clone();
+            let prediction_openrouter = state.openrouter.clone();
+            let prediction_ollama = state.ollama.clone();
+            let prediction_provider = model_route.provider.clone();
+            let prediction_prompt = tile.prompt.clone();
+            let prediction_options = metadata.options.clone();
+            let prediction_stakes = metadata.stakes.clone();
+            let prediction_context = resolved_context.twin_context_prompt.clone();
+            let prediction_metadata = tile.decision_metadata.clone();
+            tauri::async_runtime::spawn(async move {
+                let Ok(root_epoch) = sealed_epoch_receiver.await else {
+                    return;
+                };
+                run_sealed_twin_prediction(
+                    prediction_state,
+                    root_epoch,
+                    prediction_store,
+                    prediction_openrouter,
+                    prediction_ollama,
+                    prediction_provider,
+                    prediction_model,
+                    episode_id,
+                    prediction_prompt,
+                    decision,
+                    prediction_options,
+                    prediction_stakes,
+                    prediction_context,
+                    context_version,
+                    prediction_metadata,
+                )
+                .await;
+            });
         }
     }
 
@@ -562,8 +649,8 @@ pub async fn add_models_to_tile(
     request: AddModelsRequest,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let _root_guard = crate::commands::acquire_root_epoch(state.inner()).await?;
-    let root_epoch = crate::commands::capture_root_epoch(state.inner())?;
+    let root_ticket = crate::commands::acquire_derived_root_epoch(state.inner()).await?;
+    let root_epoch = root_ticket.authority().clone();
     // Get the tile's prompt
     let mut store = state.canvas_store.write().await;
     let session = store.get_session(&session_id).map_err(|e| e.to_string())?;
@@ -595,6 +682,7 @@ pub async fn add_models_to_tile(
     };
     let prompt_request = prompt_request_from_tile(&tile, model_ids.clone(), 0.7);
     let resolved_context = resolve_prompt_context(state.inner(), &session, &prompt_request).await?;
+    root_ticket.validate(state.inner()).await?;
 
     let now = Utc::now();
 
@@ -636,9 +724,12 @@ pub async fn add_models_to_tile(
                 t.responses.insert(model_id.clone(), response);
             }
             session.updated_at = Utc::now();
-            store.save_session(&session).map_err(|e| e.to_string())?;
+            store
+                .save_session_expecting_authority(&session, root_epoch.clone())
+                .map_err(|e| e.to_string())?;
         }
     }
+    drop(root_ticket);
 
     // Notify frontend about new responses before streaming starts
     let _ = window.emit(
@@ -799,7 +890,7 @@ pub async fn add_models_to_tile(
             }
         }
 
-        let _root_guard = match crate::commands::acquire_expected_root_epoch(
+        let root_guard = match crate::commands::acquire_expected_root_epoch(
             &stream_root_state,
             &root_epoch,
         )
@@ -823,22 +914,31 @@ pub async fn add_models_to_tile(
         };
 
         // Batch update store
-        let persistence_ok = {
+        let response_commit = {
             let mut store = canvas_store_arc.write().await;
-            match store.batch_update_tile_responses(&session_id, &tile_id, &results) {
-                Ok(()) => true,
+            match store.batch_update_tile_responses_expecting_authority(
+                &session_id,
+                &tile_id,
+                &results,
+                root_epoch.clone(),
+            ) {
+                Ok(commit) => commit,
                 Err(error) => {
                     let model_ids: Vec<String> = results
                         .iter()
                         .map(|(model_id, _, _, _, _)| model_id.clone())
                         .collect();
                     emit_persistence_error(&window, &session_id, &tile_id, &model_ids, &error);
-                    false
+                    return;
                 }
             }
         };
+        let mut publication_epoch = response_commit
+            .authority_token
+            .unwrap_or_else(|| root_epoch.clone());
+        drop(root_guard);
 
-        append_canvas_trace(
+        publication_epoch = match append_canvas_trace_expecting_authority(
             twin_store_arc.clone(),
             &session_id,
             TraceEventType::ModelsAdded,
@@ -846,23 +946,46 @@ pub async fn add_models_to_tile(
                 "tile_id": tile_id.clone(),
                 "model_ids": results.iter().map(|(model_id, _, _, _, _)| model_id.clone()).collect::<Vec<_>>(),
             }),
+            publication_epoch,
         )
-        .await;
-        append_model_result_traces(
+        .await
+        {
+            Ok(epoch) => epoch,
+            Err(error) => {
+                log::error!("Failed to persist governed models-added trace: {error}");
+                return;
+            }
+        };
+        publication_epoch = match append_model_result_traces(
             twin_store_arc.clone(),
             &session_id,
             &tile_id,
             "add_models_to_tile",
             &results,
+            publication_epoch,
         )
-        .await;
+        .await
+        {
+            Ok(epoch) => epoch,
+            Err(error) => {
+                log::error!("Failed to persist governed added-model result trace: {error}");
+                return;
+            }
+        };
 
-        if persistence_ok {
-            let _ = window.emit(
-                "canvas-stream",
-                CanvasStreamEvent::SessionSaved { session_id },
-            );
+        if let Err(error) = crate::commands::rebuild_and_publish_current_authority(
+            &stream_root_state,
+            &publication_epoch,
+        )
+        .await
+        {
+            log::error!("Failed to publish added-model authority: {error}");
+            return;
         }
+        let _ = window.emit(
+            "canvas-stream",
+            CanvasStreamEvent::SessionSaved { session_id },
+        );
     });
 
     Ok(())
@@ -877,8 +1000,8 @@ pub async fn regenerate_response(
     model_id: String,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let _root_guard = crate::commands::acquire_root_epoch(state.inner()).await?;
-    let root_epoch = crate::commands::capture_root_epoch(state.inner())?;
+    let root_ticket = crate::commands::acquire_derived_root_epoch(state.inner()).await?;
+    let root_epoch = root_ticket.authority().clone();
     // Get the tile's prompt
     let mut store = state.canvas_store.write().await;
     let session = store.get_session(&session_id).map_err(|e| e.to_string())?;
@@ -910,20 +1033,25 @@ pub async fn regenerate_response(
 
     let request = prompt_request_from_tile(tile, vec![effective_model_id.clone()], 0.7);
     let resolved_context = resolve_prompt_context(state.inner(), &session, &request).await?;
+    root_ticket.validate(state.inner()).await?;
 
     // Reset response to streaming
     {
         let mut store = state.canvas_store.write().await;
-        let _ = store.update_tile_response(
-            &session_id,
-            &tile_id,
-            &effective_model_id,
-            "",
-            ResponseStatus::Streaming,
-            None,
-            None,
-        );
+        store
+            .update_tile_response_expecting_authority(
+                &session_id,
+                &tile_id,
+                &effective_model_id,
+                "",
+                ResponseStatus::Streaming,
+                None,
+                None,
+                root_epoch.clone(),
+            )
+            .map_err(|error| error.to_string())?;
     }
+    drop(root_ticket);
 
     let openrouter_arc = state.openrouter.clone();
     let ollama_arc = state.ollama.clone();
@@ -968,27 +1096,7 @@ pub async fn regenerate_response(
             }
         };
 
-        let _root_guard = match crate::commands::acquire_expected_root_epoch(
-            &stream_root_state,
-            &root_epoch,
-        )
-        .await
-        {
-            Ok(guard) => guard,
-            Err(error) => {
-                emit_persistence_error(
-                    &window,
-                    &session_id,
-                    &tile_id,
-                    std::slice::from_ref(&model_id),
-                    &anyhow::anyhow!(error),
-                );
-                return;
-            }
-        };
-        let mut persistence_ok = true;
-
-        match stream_result {
+        let (final_content, final_status, final_error, cost_usd) = match stream_result {
             Ok(stream) => {
                 let mut stream = stream;
                 let mut full_content = String::new();
@@ -1045,88 +1153,96 @@ pub async fn regenerate_response(
                     (update.1, update.2)
                 };
 
-                {
-                    let mut store = canvas_store_arc.write().await;
-                    if let Err(persist_error) = store.update_tile_response(
-                        &session_id,
-                        &tile_id,
-                        &model_id,
-                        &final_content,
-                        final_status.clone(),
-                        final_error.as_deref(),
-                        cost_usd,
-                    ) {
-                        emit_persistence_error(
-                            &window,
-                            &session_id,
-                            &tile_id,
-                            std::slice::from_ref(&model_id),
-                            &persist_error,
-                        );
-                        persistence_ok = false;
-                    }
-                }
-
-                append_canvas_trace(
-                    twin_store_arc.clone(),
-                    &session_id,
-                    TraceEventType::ResponseRegenerated,
-                    json!({
-                        "tile_id": tile_id.clone(),
-                        "model_id": model_id.clone(),
-                        "status": final_status,
-                        "error": final_error.clone(),
-                        "content": final_content.clone(),
-                    }),
-                )
-                .await;
+                (final_content, final_status, final_error, cost_usd)
             }
             Err(e) => {
                 let error = e.to_string();
-                {
-                    let mut store = canvas_store_arc.write().await;
-                    if let Err(persist_error) = store.update_tile_response(
+                emit_canvas_error(&window, &session_id, &tile_id, &model_id, &error);
+                (String::new(), ResponseStatus::Error, Some(error), None)
+            }
+        };
+
+        let root_guard = match crate::commands::acquire_expected_root_epoch(
+            &stream_root_state,
+            &root_epoch,
+        )
+        .await
+        {
+            Ok(guard) => guard,
+            Err(error) => {
+                emit_persistence_error(
+                    &window,
+                    &session_id,
+                    &tile_id,
+                    std::slice::from_ref(&model_id),
+                    &anyhow::anyhow!(error),
+                );
+                return;
+            }
+        };
+        let response_commit = {
+            let mut store = canvas_store_arc.write().await;
+            match store.update_tile_response_expecting_authority(
+                &session_id,
+                &tile_id,
+                &model_id,
+                &final_content,
+                final_status.clone(),
+                final_error.as_deref(),
+                cost_usd,
+                root_epoch.clone(),
+            ) {
+                Ok(commit) => commit,
+                Err(error) => {
+                    emit_persistence_error(
+                        &window,
                         &session_id,
                         &tile_id,
-                        &model_id,
-                        "",
-                        ResponseStatus::Error,
-                        Some(error.as_str()),
-                        None,
-                    ) {
-                        emit_persistence_error(
-                            &window,
-                            &session_id,
-                            &tile_id,
-                            std::slice::from_ref(&model_id),
-                            &persist_error,
-                        );
-                        persistence_ok = false;
-                    }
+                        std::slice::from_ref(&model_id),
+                        &error,
+                    );
+                    return;
                 }
-                emit_canvas_error(&window, &session_id, &tile_id, &model_id, &error);
-                append_canvas_trace(
-                    twin_store_arc.clone(),
-                    &session_id,
-                    TraceEventType::ResponseRegenerated,
-                    json!({
-                        "tile_id": tile_id.clone(),
-                        "model_id": model_id.clone(),
-                        "status": ResponseStatus::Error,
-                        "error": error,
-                        "content": "",
-                    }),
-                )
-                .await;
             }
+        };
+        let publication_epoch = response_commit
+            .authority_token
+            .unwrap_or_else(|| root_epoch.clone());
+        drop(root_guard);
+        let publication_epoch = match append_canvas_trace_expecting_authority(
+            twin_store_arc,
+            &session_id,
+            TraceEventType::ResponseRegenerated,
+            json!({
+                "tile_id": tile_id.clone(),
+                "model_id": model_id.clone(),
+                "status": final_status,
+                "error": final_error,
+                "content": final_content,
+            }),
+            publication_epoch,
+        )
+        .await
+        {
+            Ok(epoch) => epoch,
+            Err(error) => {
+                log::error!("Failed to persist governed regeneration trace: {error}");
+                return;
+            }
+        };
+        if let Err(error) = crate::commands::rebuild_and_publish_current_authority(
+            &stream_root_state,
+            &publication_epoch,
+        )
+        .await
+        {
+            log::error!("Failed to publish regenerated-response authority: {error}");
+            return;
         }
-
-        if persistence_ok {
-            let _ = window.emit(
-                "canvas-stream",
-                CanvasStreamEvent::SessionSaved { session_id },
-            );
-        }
+        let _ = window.emit(
+            "canvas-stream",
+            CanvasStreamEvent::SessionSaved { session_id },
+        );
     });
 
     Ok(())
@@ -1164,7 +1280,8 @@ async fn append_model_result_traces(
     tile_id: &str,
     trigger: &str,
     results: &[StreamedResponseUpdate],
-) {
+    mut expected: crate::services::vault_namespace::VaultAuthorityTokenV1,
+) -> Result<crate::services::vault_namespace::VaultAuthorityTokenV1, String> {
     for (model_id, content, status, error, _) in results {
         let event_type = if *status == ResponseStatus::Error {
             TraceEventType::ResponseErrored
@@ -1172,7 +1289,7 @@ async fn append_model_result_traces(
             TraceEventType::ResponseCompleted
         };
 
-        append_canvas_trace(
+        expected = append_canvas_trace_expecting_authority(
             twin_store_arc.clone(),
             session_id,
             event_type,
@@ -1184,9 +1301,11 @@ async fn append_model_result_traces(
                 "content": content,
                 "error": error,
             }),
+            expected,
         )
-        .await;
+        .await?;
     }
+    Ok(expected)
 }
 
 fn emit_canvas_error(

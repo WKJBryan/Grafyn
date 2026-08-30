@@ -193,6 +193,62 @@ fn interrupted_note_target_refreshes_cache_from_durable_bytes_before_recovery() 
 }
 
 #[test]
+fn interrupted_note_delete_recovers_markdown_overlay_and_generation_together() {
+    let root = tempdir().unwrap();
+    let vault = root.path().join("vault");
+    let data = root.path().join("data");
+    std::fs::create_dir(&vault).unwrap();
+    std::fs::create_dir(&data).unwrap();
+    let event_store = std::sync::Arc::new(crate::services::twin_events::TwinEventStore::new(&data));
+    event_store.initialize().unwrap();
+    let coordinator = std::sync::Arc::new(
+        crate::services::twin_events::MutationCoordinator::new(
+            &data,
+            &vault,
+            event_store.clone(),
+            std::sync::Arc::new(crate::services::twin_events::NoopMutationLifecycle),
+        )
+        .unwrap(),
+    );
+    let scoped_data = coordinator.current_namespace_path().unwrap();
+    let mut store = KnowledgeStore::with_event_recorder(
+        vault.clone(),
+        scoped_data,
+        coordinator.clone(),
+    );
+    let created = store
+        .create_note(task_seven_note_create("Compound delete", "body", "compound.md"))
+        .unwrap();
+    store
+        .write_overlay(
+            &created.id,
+            &serde_json::json!({"aliases": ["Compound Alias"]}),
+        )
+        .unwrap();
+    let overlay_path = store.overlay_path(&created.id);
+    assert!(overlay_path.is_file());
+    let before_delete = coordinator.current_authority_token().unwrap();
+
+    coordinator.fail_once_at(crate::services::twin_events::MutationFaultPoint::AfterTarget(0));
+    assert!(store.delete_note(&created.id).is_err());
+    let staged = coordinator.current_authority_token().unwrap();
+    assert_eq!(
+        staged.authority_generation,
+        before_delete.authority_generation + 1
+    );
+    assert!(!vault.join("compound.md").exists());
+    assert!(overlay_path.exists());
+    assert_eq!(coordinator.pending_count().unwrap(), 1);
+
+    assert_eq!(coordinator.recover_pending().unwrap(), 1);
+    assert!(!overlay_path.exists());
+    assert_eq!(event_store.ordered_events().unwrap().len(), 2);
+    assert_eq!(coordinator.current_authority_token().unwrap(), staged);
+    assert_eq!(coordinator.recover_pending().unwrap(), 0);
+    assert_eq!(coordinator.current_authority_token().unwrap(), staged);
+}
+
+#[test]
 fn pending_update_is_recovered_before_fresh_note_fields_are_planned() {
     let root = tempdir().unwrap();
     let vault = root.path().join("vault");
@@ -642,6 +698,47 @@ fn note_and_overlay_writes_are_atomic_with_no_tmp_litter() {
         std::fs::read_to_string(store.overlay_path(&note.id)).expect("overlay file should exist");
     assert!(overlay.contains("Adoption Alias"));
     assert_no_tmp_siblings(&store.overlay_notes_dir);
+}
+
+#[test]
+fn coordinated_overlay_write_invalidates_authority_without_emitting_an_event() {
+    let root = tempdir().unwrap();
+    let vault = root.path().join("vault");
+    let data = root.path().join("data");
+    std::fs::create_dir(&vault).unwrap();
+    std::fs::create_dir(&data).unwrap();
+    let event_store = std::sync::Arc::new(crate::services::twin_events::TwinEventStore::new(&data));
+    event_store.initialize().unwrap();
+    let coordinator = std::sync::Arc::new(
+        crate::services::twin_events::MutationCoordinator::new(
+            &data,
+            &vault,
+            event_store.clone(),
+            std::sync::Arc::new(crate::services::twin_events::NoopMutationLifecycle),
+        )
+        .unwrap(),
+    );
+    let before = coordinator.current_authority_token().unwrap();
+    let scoped_data =
+        crate::services::vault_namespace::scoped_data_path(&data, &before.root_scope);
+    let store = KnowledgeStore::with_event_recorder(
+        vault,
+        scoped_data,
+        coordinator.clone(),
+    );
+
+    store
+        .write_overlay(
+            "captured-overlay",
+            &serde_json::json!({"aliases": ["Captured Alias"]}),
+        )
+        .unwrap();
+
+    let after = coordinator.current_authority_token().unwrap();
+    assert_eq!(after.authority_generation, before.authority_generation + 1);
+    assert!(coordinator.require_namespace_ready().is_err());
+    assert_eq!(event_store.ordered_events().unwrap().len(), 0);
+    assert!(store.overlay_path("captured-overlay").is_file());
 }
 
 #[test]

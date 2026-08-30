@@ -10,7 +10,33 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const KEYRING_SERVICE: &str = "com.grafyn.app";
 const OPENROUTER_KEY_ACCOUNT: &str = "openrouter_api_key";
 
-pub(crate) fn prepare_twin_data_path(data_path: &Path, vault_path: &Path) -> Result<PathBuf> {
+const LEGACY_TWIN_ASSIGNMENT_KEY: &str = "twin/legacy-assignment-v1.json";
+const LEGACY_TWIN_ASSIGNMENT_LIMIT: usize = 4096;
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum LegacyTwinAssignmentState {
+    Prepared,
+    Committed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyTwinAssignmentV1 {
+    schema_version: u16,
+    root_scope: crate::models::twin_event::ContentDigest,
+    lease_epoch_uuid: String,
+    legacy_name: String,
+    current_name: String,
+    state: LegacyTwinAssignmentState,
+}
+
+pub(crate) fn prepare_twin_data_path_locked(
+    data_path: &Path,
+    vault_path: &Path,
+    lease: &crate::services::twin_events::ActiveMarkdownRootLeaseV1,
+    process_lock: &crate::services::twin_events::CoordinatorProcessLock,
+) -> Result<PathBuf> {
     crate::services::twin_events::validate_real_directory(data_path, "Grafyn data root")
         .map_err(anyhow::Error::new)?;
     crate::services::twin_events::validate_real_directory(vault_path, "Markdown vault root")
@@ -28,6 +54,25 @@ pub(crate) fn prepare_twin_data_path(data_path: &Path, vault_path: &Path) -> Res
         .ok_or_else(|| anyhow::anyhow!("legacy Twin namespace is not UTF-8"))?;
     let root = crate::services::twin_events::AnchoredRoot::open(data_path)
         .map_err(anyhow::Error::new)?;
+    if !process_lock
+        .covers_data_path(data_path)
+        .map_err(anyhow::Error::new)?
+    {
+        anyhow::bail!("legacy Twin assignment lock belongs to another data root");
+    }
+    let expected_scope = crate::services::twin_events::root_identity_for_path(vault_path)
+        .map_err(anyhow::Error::new)?;
+    let durable_lease: crate::services::twin_events::ActiveMarkdownRootLeaseV1 =
+        serde_json::from_slice(
+            &root
+                .read_bounded("twin/events/active-markdown-root-v1.json", 4096)
+                .map_err(anyhow::Error::new)?
+                .ok_or_else(|| anyhow::anyhow!("active Markdown root lease is missing"))?,
+        )
+        .context("invalid active Markdown root lease")?;
+    if &durable_lease != lease || lease.root_scope != expected_scope {
+        anyhow::bail!("legacy Twin assignment lease changed");
+    }
     root.open_directory("twin", true)
         .map_err(anyhow::Error::new)?;
     let current_key = format!("twin/{current_name}");
@@ -38,14 +83,85 @@ pub(crate) fn prepare_twin_data_path(data_path: &Path, vault_path: &Path) -> Res
     let has_legacy = root
         .directory_exists(&legacy_key)
         .map_err(anyhow::Error::new)?;
+    let assignment = match root
+        .read_bounded(LEGACY_TWIN_ASSIGNMENT_KEY, LEGACY_TWIN_ASSIGNMENT_LIMIT)
+        .map_err(anyhow::Error::new)?
+    {
+        Some(bytes) => Some(
+            serde_json::from_slice::<LegacyTwinAssignmentV1>(&bytes)
+                .context("invalid legacy Twin assignment")?,
+        ),
+        None => None,
+    };
+    if let Some(assignment) = &assignment {
+        if assignment.schema_version != 1
+            || assignment.root_scope != lease.root_scope
+            || assignment.lease_epoch_uuid != lease.epoch_uuid
+            || assignment.legacy_name != legacy_name
+            || assignment.current_name != current_name
+        {
+            if has_legacy {
+                anyhow::bail!("legacy Twin namespace belongs to another root authority");
+            }
+            return Ok(current);
+        }
+    }
     if has_current && has_legacy {
         anyhow::bail!("legacy and current Twin namespaces both exist; refusing to merge");
     }
     if has_legacy {
+        #[cfg(not(windows))]
+        anyhow::bail!(
+            "legacy Twin namespace uses a case-folded root hash and is ambiguous on this platform"
+        );
+        #[cfg(windows)]
+        {
+            let prepared = LegacyTwinAssignmentV1 {
+                schema_version: 1,
+                root_scope: lease.root_scope.clone(),
+                lease_epoch_uuid: lease.epoch_uuid.clone(),
+                legacy_name: legacy_name.to_string(),
+                current_name: current_name.to_string(),
+                state: LegacyTwinAssignmentState::Prepared,
+            };
+            if assignment.is_none() {
+                write_legacy_twin_assignment(&root, &prepared)?;
+            }
+        }
         root.rename(&legacy_key, &current_key, false)
             .map_err(anyhow::Error::new)?;
     }
+    if assignment
+        .as_ref()
+        .is_some_and(|assignment| assignment.state == LegacyTwinAssignmentState::Prepared)
+        || has_legacy
+    {
+        write_legacy_twin_assignment(
+            &root,
+            &LegacyTwinAssignmentV1 {
+                schema_version: 1,
+                root_scope: lease.root_scope.clone(),
+                lease_epoch_uuid: lease.epoch_uuid.clone(),
+                legacy_name: legacy_name.to_string(),
+                current_name: current_name.to_string(),
+                state: LegacyTwinAssignmentState::Committed,
+            },
+        )?;
+    }
     Ok(current)
+}
+
+fn write_legacy_twin_assignment(
+    root: &crate::services::twin_events::AnchoredRoot,
+    assignment: &LegacyTwinAssignmentV1,
+) -> Result<()> {
+    let mut bytes = serde_json::to_vec_pretty(assignment)?;
+    bytes.push(b'\n');
+    if bytes.len() > LEGACY_TWIN_ASSIGNMENT_LIMIT {
+        anyhow::bail!("legacy Twin assignment exceeds its size limit");
+    }
+    root.put_atomic(LEGACY_TWIN_ASSIGNMENT_KEY, &bytes)
+        .map_err(anyhow::Error::new)
 }
 
 /// Service for managing user settings
@@ -514,7 +630,25 @@ mod tests {
         std::fs::create_dir(&legacy).unwrap();
         std::fs::write(legacy.join("record.json"), "legacy").unwrap();
 
-        let current = prepare_twin_data_path(&data, &vault).unwrap();
+        let events = Arc::new(crate::services::twin_events::TwinEventStore::new(&data));
+        events.initialize().unwrap();
+        let coordinator = crate::services::twin_events::MutationCoordinator::new(
+            &data,
+            &vault,
+            events,
+            Arc::new(crate::services::twin_events::NoopMutationLifecycle),
+        )
+        .unwrap();
+        let guard = coordinator.begin_root_transition().unwrap();
+        let lease = guard.current_lease().unwrap();
+
+        #[cfg(not(windows))]
+        {
+            assert!(guard.prepare_twin_data_path(&vault, &lease).is_err());
+            return;
+        }
+        #[cfg(windows)]
+        let current = guard.prepare_twin_data_path(&vault, &lease).unwrap();
         assert!(!legacy.exists());
         assert_eq!(
             std::fs::read_to_string(current.join("record.json")).unwrap(),
@@ -522,7 +656,7 @@ mod tests {
         );
 
         std::fs::create_dir(&legacy).unwrap();
-        assert!(prepare_twin_data_path(&data, &vault).is_err());
+        assert!(guard.prepare_twin_data_path(&vault, &lease).is_err());
         assert!(legacy.exists());
         assert!(current.exists());
     }

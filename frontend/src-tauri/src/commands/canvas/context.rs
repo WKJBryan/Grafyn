@@ -963,7 +963,7 @@ fn build_twin_prediction_user_message(
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn run_sealed_twin_prediction(
     root_state: AppState,
-    root_epoch: crate::services::twin_events::ActiveMarkdownRootLeaseV1,
+    root_epoch: crate::services::vault_namespace::VaultAuthorityTokenV1,
     twin_store: Arc<RwLock<TwinStore>>,
     openrouter: Arc<RwLock<OpenRouterService>>,
     ollama: Arc<RwLock<OllamaService>>,
@@ -978,7 +978,7 @@ pub(super) async fn run_sealed_twin_prediction(
     context_version: String,
     decision_metadata: Option<DecisionPromptMetadata>,
 ) {
-    let initial_root_guard = match crate::commands::acquire_expected_root_epoch(
+    let initial_root_guard = match crate::commands::acquire_expected_derived_root_epoch(
         &root_state,
         &root_epoch,
     )
@@ -990,26 +990,21 @@ pub(super) async fn run_sealed_twin_prediction(
             return;
         }
     };
-    let built = {
+    let built: Result<(String, String), String> = {
         let mut store = twin_store.write().await;
-        let setup = match store.get_constitution_setup() {
-            Ok(setup) => setup,
-            Err(error) => {
-                log::warn!("Sealed prediction setup load failed for {episode_id}: {error}");
-                let _ = store.mark_twin_prediction_failed(&episode_id);
-                return;
-            }
-        };
+        (|| {
+            let setup = store
+                .get_constitution_setup()
+                .map_err(|error| format!("sealed prediction setup load failed: {error}"))?;
 
-        let system_prompt = if let Some(prompt) = twin_context_prompt {
-            prompt
-        } else {
-            // Non-Twin-context decision tile: build a twin-only context on
-            // the spot so predictions cover every decision, not just
-            // Twin-mode ones (skipping them would bias the eval sample).
-            let query = decision_context_query(&prompt, decision_metadata.as_ref());
-            let selections =
-                store
+            let system_prompt = if let Some(prompt) = twin_context_prompt {
+                prompt
+            } else {
+                // Non-Twin-context decision tile: build a twin-only context on
+                // the spot so predictions cover every decision, not just
+                // Twin-mode ones (skipping them would bias the eval sample).
+                let query = decision_context_query(&prompt, decision_metadata.as_ref());
+                let (approved, candidates, constitution_items, action_gaps, cases) = store
                     .select_context_records(&prompt)
                     .and_then(|(approved, candidates)| {
                         let (constitution_items, action_gaps) =
@@ -1020,50 +1015,76 @@ pub(super) async fn run_sealed_twin_prediction(
                             MAX_TWIN_CASE_CONTEXT,
                         )?;
                         Ok((approved, candidates, constitution_items, action_gaps, cases))
-                    });
-            match selections {
-                Ok((approved, candidates, constitution_items, action_gaps, cases)) => {
-                    let selection = apply_twin_context_budget(
-                        cases,
-                        constitution_items,
-                        approved,
-                        candidates,
-                        action_gaps,
-                        Vec::new(),
-                        TWIN_CONTEXT_TOKEN_BUDGET,
-                    );
-                    let answer_mode = if has_twin_identity(&setup) {
-                        TwinAnswerMode::Simulation
-                    } else {
-                        TwinAnswerMode::Advisor
-                    };
-                    build_twin_context_prompt(
-                        &setup,
-                        &selection.cases,
-                        &selection.notes,
-                        &selection.approved,
-                        &selection.candidates,
-                        &selection.constitution_items,
-                        &selection.action_gaps,
-                        &answer_mode,
-                        &PromptType::Decision,
-                        decision_metadata.as_ref(),
-                    )
-                }
+                    })
+                    .map_err(|error| format!("sealed prediction context build failed: {error}"))?;
+                let selection = apply_twin_context_budget(
+                    cases,
+                    constitution_items,
+                    approved,
+                    candidates,
+                    action_gaps,
+                    Vec::new(),
+                    TWIN_CONTEXT_TOKEN_BUDGET,
+                );
+                let answer_mode = if has_twin_identity(&setup) {
+                    TwinAnswerMode::Simulation
+                } else {
+                    TwinAnswerMode::Advisor
+                };
+                build_twin_context_prompt(
+                    &setup,
+                    &selection.cases,
+                    &selection.notes,
+                    &selection.approved,
+                    &selection.candidates,
+                    &selection.constitution_items,
+                    &selection.action_gaps,
+                    &answer_mode,
+                    &PromptType::Decision,
+                    decision_metadata.as_ref(),
+                )
+            };
+
+            let user_message =
+                build_twin_prediction_user_message(&setup, &decision, &options, stakes.as_deref());
+            Ok((system_prompt, user_message))
+        })()
+    };
+    let (system_prompt, user_message) = match built {
+        Ok(built) => built,
+        Err(error) => {
+            log::warn!("Sealed prediction input failed for {episode_id}: {error}");
+            let mut store = twin_store.write().await;
+            let commit = match store.mark_twin_prediction_failed_expecting_authority(
+                &episode_id,
+                root_epoch.clone(),
+            ) {
+                Ok(commit) => commit,
                 Err(error) => {
-                    log::warn!("Sealed prediction context build failed for {episode_id}: {error}");
-                    let _ = store.mark_twin_prediction_failed(&episode_id);
+                    log::warn!("Failed to record sealed-prediction input failure: {error}");
                     return;
                 }
+            };
+            let Some(publication_epoch) = commit.authority_token else {
+                return;
+            };
+            drop(store);
+            drop(initial_root_guard);
+            if let Err(error) = crate::commands::rebuild_and_publish_current_authority(
+                &root_state,
+                &publication_epoch,
+            )
+            .await
+            {
+                log::warn!("Failed to publish prediction-input failure authority: {error}");
             }
-        };
-
-        let user_message =
-            build_twin_prediction_user_message(&setup, &decision, &options, stakes.as_deref());
-        (system_prompt, user_message)
+            return;
+        }
     };
-    let (system_prompt, user_message) = built;
-    drop(initial_root_guard);
+    if let Err(error) = initial_root_guard.finish(&root_state).await {
+        log::warn!("Sealed prediction context discarded after authority change: {error}");
+        return;
+    }
 
     let messages = vec![ChatMessage {
         role: "user".to_string(),
@@ -1093,7 +1114,7 @@ pub(super) async fn run_sealed_twin_prediction(
         }
     };
 
-    let _root_guard = match crate::commands::acquire_expected_root_epoch(&root_state, &root_epoch)
+    let root_guard = match crate::commands::acquire_expected_root_epoch(&root_state, &root_epoch)
         .await
     {
         Ok(guard) => guard,
@@ -1106,19 +1127,59 @@ pub(super) async fn run_sealed_twin_prediction(
         Ok(raw) => {
             let draft = parse_twin_prediction(&raw, &options);
             let mut store = twin_store.write().await;
-            if let Err(error) = store.attach_twin_prediction(
+            let commit = match store.attach_twin_prediction_expecting_authority(
                 &episode_id,
                 draft,
                 &prediction_model,
                 &context_version,
+                root_epoch.clone(),
             ) {
-                log::warn!("Failed to seal twin prediction for {episode_id}: {error}");
+                Ok((_, commit)) => commit,
+                Err(error) => {
+                    log::warn!("Failed to seal twin prediction for {episode_id}: {error}");
+                    return;
+                }
+            };
+            let Some(publication_epoch) = commit.authority_token else {
+                return;
+            };
+            drop(store);
+            drop(root_guard);
+            if let Err(error) = crate::commands::rebuild_and_publish_current_authority(
+                &root_state,
+                &publication_epoch,
+            )
+            .await
+            {
+                log::warn!("Failed to publish sealed prediction authority: {error}");
             }
         }
         Err(error) => {
             log::warn!("Sealed twin prediction call failed for {episode_id}: {error}");
             let mut store = twin_store.write().await;
-            let _ = store.mark_twin_prediction_failed(&episode_id);
+            let commit = match store.mark_twin_prediction_failed_expecting_authority(
+                &episode_id,
+                root_epoch.clone(),
+            ) {
+                Ok(commit) => commit,
+                Err(error) => {
+                    log::warn!("Failed to record sealed-prediction failure: {error}");
+                    return;
+                }
+            };
+            let Some(publication_epoch) = commit.authority_token else {
+                return;
+            };
+            drop(store);
+            drop(root_guard);
+            if let Err(error) = crate::commands::rebuild_and_publish_current_authority(
+                &root_state,
+                &publication_epoch,
+            )
+            .await
+            {
+                log::warn!("Failed to publish prediction-failure authority: {error}");
+            }
         }
     }
 }

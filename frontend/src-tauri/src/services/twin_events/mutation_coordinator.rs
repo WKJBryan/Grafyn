@@ -335,6 +335,8 @@ pub struct MutationPlan {
     pub source_channel: crate::models::twin_event::SourceChannel,
     pub targets: Vec<crate::services::twin_events::TargetMutation>,
     pub drafts: Vec<TwinEventDraft>,
+    pub(crate) expected_authority:
+        Option<crate::services::vault_namespace::VaultAuthorityTokenV1>,
 }
 
 impl MutationPlan {
@@ -349,12 +351,22 @@ impl MutationPlan {
             source_channel,
             targets,
             drafts,
+            expected_authority: None,
         }
+    }
+
+    pub(crate) fn expecting_authority(
+        mut self,
+        expected: crate::services::vault_namespace::VaultAuthorityTokenV1,
+    ) -> Self {
+        self.expected_authority = Some(expected);
+        self
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MutationFaultPoint {
+    AfterAuthorityAdvance,
     AfterStage,
     AfterTarget(usize),
     AfterTargets,
@@ -389,6 +401,8 @@ impl MutationLifecycle for NoopMutationLifecycle {}
 pub struct MutationCommit {
     pub mutation_id: Option<crate::models::twin_event::ContentDigest>,
     pub events: Vec<TwinEvent>,
+    pub(crate) authority_token:
+        Option<crate::services::vault_namespace::VaultAuthorityTokenV1>,
 }
 
 pub struct MutationCoordinator {
@@ -466,14 +480,8 @@ impl MutationCoordinator {
             &root_lease,
             &process_lock,
         )?;
-        #[cfg(test)]
-        crate::services::vault_namespace::publish_ready_locked(
-            &data_path,
-            &root_lease,
-            &process_lock,
-        )?;
-        process_lock.unlock()?;
-        Ok(Self {
+        ensure_overlay_target_root(&data_root, &root_lease.root_scope)?;
+        let coordinator = Self {
             data_path,
             data_root,
             vault_root: std::sync::Mutex::new(vault_root),
@@ -484,7 +492,30 @@ impl MutationCoordinator {
             in_process: std::sync::Mutex::new(()),
             fault_once: std::sync::Mutex::new(None),
             root_lease: std::sync::Mutex::new(root_lease),
-        })
+        };
+        // Version-1 intents predate content generations. Replay them first so an
+        // upgrade cannot advance authority ahead of a still-pending mutation.
+        for (_, pending) in coordinator.journal.load_pending(&process_lock)? {
+            if pending.schema_version == 1 {
+                coordinator.replay_intent_locked(&process_lock, &pending, false)?;
+            }
+        }
+        crate::services::vault_namespace::initialize_authority_locked(
+            &coordinator.data_path,
+            &process_lock,
+        )?;
+        #[cfg(test)]
+        crate::services::vault_namespace::publish_ready_locked(
+            &coordinator.data_path,
+            &coordinator
+                .root_lease
+                .lock()
+                .map_err(|_| MutationError::Invalid("Markdown root lease lock poisoned".into()))?
+                .clone(),
+            &process_lock,
+        )?;
+        process_lock.unlock()?;
+        Ok(coordinator)
     }
 
     #[cfg(test)]
@@ -543,9 +574,33 @@ impl MutationCoordinator {
             return Ok(MutationCommit {
                 mutation_id: None,
                 events: Vec::new(),
+                authority_token: None,
             });
         };
+        if let Some(expected) = plan.expected_authority.as_ref() {
+            let lease = self
+                .root_lease
+                .lock()
+                .map_err(|_| MutationError::Invalid("Markdown root lease lock poisoned".into()))?
+                .clone();
+            let current = crate::services::vault_namespace::capture_authority_token_locked(
+                &self.data_path,
+                &lease,
+                &process_lock,
+            )?;
+            if &current != expected {
+                process_lock.unlock()?;
+                let error = MutationError::RecoveryConflict(
+                    "root authority changed while mutation was in flight".into(),
+                );
+                if origin == MutationOrigin::Local {
+                    self.lifecycle.known_failure(None, &error.to_string());
+                }
+                return Err(error);
+            }
+        }
         let prepared = match self.prepare_intent(
+            &process_lock,
             origin,
             plan.requested_stream,
             plan.source_channel,
@@ -558,6 +613,7 @@ impl MutationCoordinator {
                 return Ok(MutationCommit {
                     mutation_id: None,
                     events: Vec::new(),
+                    authority_token: None,
                 });
             }
             Err(error) => {
@@ -575,6 +631,51 @@ impl MutationCoordinator {
                 process_lock.unlock()?;
                 self.lifecycle
                     .known_failure(Some(prepared.mutation_id.as_str()), &error.to_string());
+                return Err(error);
+            }
+        }
+        let mut authority_token = None;
+        if intent_changes_authority(&prepared) {
+            let lease = self
+                .root_lease
+                .lock()
+                .map_err(|_| MutationError::Invalid("Markdown root lease lock poisoned".into()))?
+                .clone();
+            let advanced = match crate::services::vault_namespace::advance_authority_locked(
+                &self.data_path,
+                &lease,
+                &process_lock,
+            ) {
+                Ok(advanced) => advanced,
+                Err(error) => {
+                    process_lock.unlock()?;
+                    if invoke_lifecycle {
+                        self.lifecycle.known_failure(
+                            Some(prepared.mutation_id.as_str()),
+                            &error.to_string(),
+                        );
+                    }
+                    return Err(error);
+                }
+            };
+            if advanced.authority_generation != prepared.content_authority_generation.unwrap() {
+                process_lock.unlock()?;
+                let error = MutationError::RecoveryConflict(
+                    "content-authority-generation-cas-failed".into(),
+                );
+                if invoke_lifecycle {
+                    self.lifecycle
+                        .known_failure(Some(prepared.mutation_id.as_str()), &error.to_string());
+                }
+                return Err(error);
+            }
+            authority_token = Some(advanced);
+            if let Err(error) = self.inject(MutationFaultPoint::AfterAuthorityAdvance) {
+                process_lock.unlock()?;
+                if invoke_lifecycle {
+                    self.lifecycle
+                        .known_failure(Some(prepared.mutation_id.as_str()), &error.to_string());
+                }
                 return Err(error);
             }
         }
@@ -606,6 +707,7 @@ impl MutationCoordinator {
         Ok(MutationCommit {
             mutation_id: Some(prepared.mutation_id.clone()),
             events: prepared.events,
+            authority_token,
         })
     }
 
@@ -695,30 +797,61 @@ impl MutationCoordinator {
         &self.data_path
     }
 
+    pub(crate) fn current_authority_token(
+        &self,
+    ) -> Result<crate::services::vault_namespace::VaultAuthorityTokenV1, MutationError> {
+        let _in_process = self
+            .in_process
+            .lock()
+            .map_err(|_| MutationError::Invalid("mutation coordinator lock poisoned".into()))?;
+        let process_lock = self.finalizer.acquire_coordinator_lock()?;
+        let result = (|| {
+            self.verify_root_lease_locked()?;
+            let lease = self
+                .root_lease
+                .lock()
+                .map_err(|_| MutationError::Invalid("Markdown root lease lock poisoned".into()))?
+                .clone();
+            crate::services::vault_namespace::capture_authority_token_locked(
+                &self.data_path,
+                &lease,
+                &process_lock,
+            )
+        })();
+        process_lock.unlock()?;
+        result
+    }
+
+    #[cfg(any(test, feature = "mcp"))]
     pub(crate) fn require_namespace_ready(&self) -> Result<(), MutationError> {
-        let lease = self.current_root_epoch()?;
-        crate::services::vault_namespace::require_ready(&self.data_path, &lease)
+        let token = self.current_authority_token()?;
+        self.validate_authority_token(&token, true)
     }
 
     #[cfg(feature = "mcp")]
     pub(crate) fn acquire_ready_namespace_guard(
         &self,
-        expected: &ActiveMarkdownRootLeaseV1,
+        expected: &crate::services::vault_namespace::VaultAuthorityTokenV1,
     ) -> Result<CoordinatorProcessLock, MutationError> {
         let process_lock = self.finalizer.acquire_coordinator_lock()?;
         let result = (|| {
             self.verify_root_lease_locked()?;
-            let current = self
+            let lease = self
                 .root_lease
                 .lock()
                 .map_err(|_| MutationError::Invalid("Markdown root lease lock poisoned".into()))?
                 .clone();
+            let current = crate::services::vault_namespace::capture_authority_token_locked(
+                &self.data_path,
+                &lease,
+                &process_lock,
+            )?;
             if &current != expected {
                 return Err(MutationError::RecoveryConflict(
-                    "root epoch changed while derived state was in flight".into(),
+                    "root authority changed while derived state was in flight".into(),
                 ));
             }
-            crate::services::vault_namespace::require_ready_locked(
+            crate::services::vault_namespace::require_ready_token_locked(
                 &self.data_path,
                 &current,
                 &process_lock,
@@ -733,15 +866,99 @@ impl MutationCoordinator {
 
     pub(crate) fn validate_root_epoch(
         &self,
-        expected: &ActiveMarkdownRootLeaseV1,
+        expected: &crate::services::vault_namespace::VaultAuthorityTokenV1,
     ) -> Result<(), MutationError> {
-        let current = self.current_root_epoch()?;
-        if &current != expected {
+        self.validate_authority_token(expected, false)
+    }
+
+    pub(crate) fn validate_authority_token(
+        &self,
+        expected: &crate::services::vault_namespace::VaultAuthorityTokenV1,
+        require_ready: bool,
+    ) -> Result<(), MutationError> {
+        let _in_process = self
+            .in_process
+            .lock()
+            .map_err(|_| MutationError::Invalid("mutation coordinator lock poisoned".into()))?;
+        let process_lock = self.finalizer.acquire_coordinator_lock()?;
+        let result = (|| {
+            self.verify_root_lease_locked()?;
+            let lease = self
+                .root_lease
+                .lock()
+                .map_err(|_| MutationError::Invalid("Markdown root lease lock poisoned".into()))?
+                .clone();
+            let current = crate::services::vault_namespace::capture_authority_token_locked(
+                &self.data_path,
+                &lease,
+                &process_lock,
+            )?;
+            if &current != expected {
+                return Err(MutationError::RecoveryConflict(
+                    "root authority changed while work was in flight".into(),
+                ));
+            }
+            if require_ready {
+                crate::services::vault_namespace::require_ready_token_locked(
+                    &self.data_path,
+                    &current,
+                    &process_lock,
+                )?;
+            }
+            Ok(())
+        })();
+        process_lock.unlock()?;
+        if let Err(error) = result {
             return Err(MutationError::RecoveryConflict(
-                "root epoch changed while work was in flight".into(),
+                error.to_string(),
             ));
         }
         Ok(())
+    }
+
+    pub(crate) fn with_locked_derived_state<T>(
+        &self,
+        expected: &crate::services::vault_namespace::VaultAuthorityTokenV1,
+        require_ready: bool,
+        action: impl FnOnce() -> Result<T, MutationError>,
+    ) -> Result<T, MutationError> {
+        let _in_process = self
+            .in_process
+            .lock()
+            .map_err(|_| MutationError::Invalid("mutation coordinator lock poisoned".into()))?;
+        let process_lock = self.finalizer.acquire_coordinator_lock()?;
+        let result = (|| {
+            self.verify_root_lease_locked()?;
+            self.journal.cleanup_orphan_temps_locked(&process_lock)?;
+            for (_, pending) in self.journal.load_pending(&process_lock)? {
+                self.replay_intent_locked(&process_lock, &pending, false)?;
+            }
+            let lease = self
+                .root_lease
+                .lock()
+                .map_err(|_| MutationError::Invalid("Markdown root lease lock poisoned".into()))?
+                .clone();
+            let current = crate::services::vault_namespace::capture_authority_token_locked(
+                &self.data_path,
+                &lease,
+                &process_lock,
+            )?;
+            if &current != expected {
+                return Err(MutationError::RecoveryConflict(
+                    "root authority changed before derived-state access".into(),
+                ));
+            }
+            if require_ready {
+                crate::services::vault_namespace::require_ready_token_locked(
+                    &self.data_path,
+                    &current,
+                    &process_lock,
+                )?;
+            }
+            action()
+        })();
+        process_lock.unlock()?;
+        result
     }
 
     #[cfg(test)]
@@ -773,6 +990,12 @@ impl MutationCoordinator {
                 root_scope: markdown_root_scope_for(&new_root)?,
                 epoch_uuid: Uuid::new_v4().to_string(),
             };
+            crate::services::vault_namespace::initialize_locked(
+                &self.data_path,
+                &next_lease,
+                &process_lock,
+            )?;
+            ensure_overlay_target_root(&self.data_root, &next_lease.root_scope)?;
             write_active_root_lease(&self.data_root, &next_lease)?;
             *self
                 .vault_root
@@ -821,6 +1044,7 @@ impl MutationCoordinator {
 
     fn prepare_intent(
         &self,
+        process_lock: &CoordinatorProcessLock,
         origin: MutationOrigin,
         requested_stream: CausalStream,
         source_channel: crate::models::twin_event::SourceChannel,
@@ -853,7 +1077,10 @@ impl MutationCoordinator {
         }
         let mut prepared_targets = Vec::new();
         for target in targets {
-            crate::services::twin_events::validate_relative_key(&target.relative_key)?;
+            crate::services::twin_events::validate_target_key(
+                target.kind,
+                &target.relative_key,
+            )?;
             let before = self.before_image(target.kind, &target.relative_key)?;
             let after_digest = crate::services::twin_events::desired_digest(&target.after);
             if target_matches_after(&before, &target.after, &after_digest) {
@@ -902,14 +1129,46 @@ impl MutationCoordinator {
             .map_or(requested_stream, |event| event.causal_stream);
         let markdown_root_scope = if prepared_targets
             .iter()
-            .any(|target| target.kind == crate::services::twin_events::TargetKind::Markdown)
+            .any(|target| {
+                matches!(
+                    target.kind,
+                    crate::services::twin_events::TargetKind::Markdown
+                        | crate::services::twin_events::TargetKind::OverlayJson
+                )
+            })
         {
             Some(self.current_markdown_root_scope()?)
         } else {
             None
         };
+        let changes_authority = !events.is_empty()
+            || prepared_targets.iter().any(|target| {
+                matches!(
+                    target.kind,
+                    crate::services::twin_events::TargetKind::Markdown
+                        | crate::services::twin_events::TargetKind::OverlayJson
+                        | crate::services::twin_events::TargetKind::TwinJson
+                )
+            });
+        let content_authority_generation = if changes_authority {
+            let lease = self
+                .root_lease
+                .lock()
+                .map_err(|_| MutationError::Invalid("Markdown root lease lock poisoned".into()))?
+                .clone();
+            let current = crate::services::vault_namespace::capture_authority_token_locked(
+                &self.data_path,
+                &lease,
+                process_lock,
+            )?;
+            Some(current.authority_generation.checked_add(1).ok_or_else(|| {
+                MutationError::RecoveryConflict("authority-generation-exhausted".into())
+            })?)
+        } else {
+            None
+        };
         let mut intent = crate::services::twin_events::MutationIntentV1 {
-            schema_version: 1,
+            schema_version: 2,
             mutation_id: crate::services::twin_events::digest_bytes(b"placeholder"),
             origin,
             actor_id: self.finalizer.actor_id(),
@@ -917,6 +1176,7 @@ impl MutationCoordinator {
             causal_stream: stream,
             source_channel,
             markdown_root_scope,
+            content_authority_generation,
             targets: prepared_targets,
             events,
             created_at: Utc::now(),
@@ -944,6 +1204,24 @@ impl MutationCoordinator {
         self.store.preflight_append_group(&intent.events)?;
         if let Some(intent_scope) = &intent.markdown_root_scope {
             if &self.current_markdown_root_scope()? != intent_scope {
+                self.journal.quarantine_intent(process_lock, intent)?;
+                return Err(MutationError::RecoveryConflict(
+                    intent.mutation_id.as_str().to_string(),
+                ));
+            }
+        }
+        if intent.schema_version == 2 && intent_changes_authority(intent) {
+            let lease = self
+                .root_lease
+                .lock()
+                .map_err(|_| MutationError::Invalid("Markdown root lease lock poisoned".into()))?
+                .clone();
+            let current = crate::services::vault_namespace::capture_authority_token_locked(
+                &self.data_path,
+                &lease,
+                process_lock,
+            )?;
+            if Some(current.authority_generation) != intent.content_authority_generation {
                 self.journal.quarantine_intent(process_lock, intent)?;
                 return Err(MutationError::RecoveryConflict(
                     intent.mutation_id.as_str().to_string(),
@@ -1029,7 +1307,7 @@ impl MutationCoordinator {
         &self,
         target: &crate::services::twin_events::TargetMutation,
     ) -> Result<(), MutationError> {
-        crate::services::twin_events::validate_relative_key(&target.relative_key)?;
+        crate::services::twin_events::validate_target_key(target.kind, &target.relative_key)?;
         match &target.after {
             crate::services::twin_events::DesiredImage::Utf8Bytes(content) => {
                 self.put_target(target.kind, &target.relative_key, content.as_bytes())?;
@@ -1052,6 +1330,22 @@ impl MutationCoordinator {
                 .map_err(|_| MutationError::Invalid("Markdown root lock poisoned".into()))?
                 .canonical_path()
                 .to_path_buf(),
+            crate::services::twin_events::TargetKind::OverlayJson => {
+                let lease = self
+                    .root_lease
+                    .lock()
+                    .map_err(|_| {
+                        MutationError::Invalid("Markdown root lease lock poisoned".into())
+                    })?
+                    .clone();
+                crate::services::vault_namespace::scoped_data_path(
+                    &self.data_path,
+                    &lease.root_scope,
+                )
+                .join("vault_migration")
+                .join("overlay")
+                .join("notes")
+            }
             crate::services::twin_events::TargetKind::TwinJson => self.data_path.join("twin"),
             crate::services::twin_events::TargetKind::CanvasJson => self.data_path.join("canvas"),
         })
@@ -1085,9 +1379,20 @@ impl MutationCoordinator {
         kind: crate::services::twin_events::TargetKind,
         relative_key: &str,
     ) -> Result<String, MutationError> {
-        crate::services::twin_events::validate_relative_key(relative_key)?;
+        crate::services::twin_events::validate_target_key(kind, relative_key)?;
         Ok(match kind {
             crate::services::twin_events::TargetKind::Markdown => relative_key.to_string(),
+            crate::services::twin_events::TargetKind::OverlayJson => {
+                let root = self.target_root(kind)?;
+                let relative_root = root.strip_prefix(&self.data_path).map_err(|_| {
+                    MutationError::Invalid("overlay target root escaped app data".into())
+                })?;
+                format!(
+                    "{}/{}",
+                    relative_root.to_string_lossy().replace('\\', "/"),
+                    relative_key
+                )
+            }
             crate::services::twin_events::TargetKind::TwinJson => {
                 format!("twin/{relative_key}")
             }
@@ -1104,6 +1409,7 @@ impl MutationCoordinator {
     ) -> Result<crate::services::twin_events::BeforeImage, MutationError> {
         let limit = match kind {
             crate::services::twin_events::TargetKind::Markdown
+            | crate::services::twin_events::TargetKind::OverlayJson
             | crate::services::twin_events::TargetKind::TwinJson => {
                 crate::services::twin_events::MAX_MARKDOWN_TWIN_BYTES
             }
@@ -1132,7 +1438,8 @@ impl MutationCoordinator {
                 .lock()
                 .map_err(|_| MutationError::Invalid("Markdown root lock poisoned".into()))?
                 .read_bounded(relative_key, limit),
-            crate::services::twin_events::TargetKind::TwinJson
+            crate::services::twin_events::TargetKind::OverlayJson
+            | crate::services::twin_events::TargetKind::TwinJson
             | crate::services::twin_events::TargetKind::CanvasJson => self
                 .data_root
                 .read_bounded(&self.target_key(kind, relative_key)?, limit),
@@ -1151,7 +1458,8 @@ impl MutationCoordinator {
                 .lock()
                 .map_err(|_| MutationError::Invalid("Markdown root lock poisoned".into()))?
                 .put_atomic(relative_key, bytes),
-            crate::services::twin_events::TargetKind::TwinJson
+            crate::services::twin_events::TargetKind::OverlayJson
+            | crate::services::twin_events::TargetKind::TwinJson
             | crate::services::twin_events::TargetKind::CanvasJson => self
                 .data_root
                 .put_atomic(&self.target_key(kind, relative_key)?, bytes),
@@ -1169,7 +1477,8 @@ impl MutationCoordinator {
                 .lock()
                 .map_err(|_| MutationError::Invalid("Markdown root lock poisoned".into()))?
                 .delete(relative_key),
-            crate::services::twin_events::TargetKind::TwinJson
+            crate::services::twin_events::TargetKind::OverlayJson
+            | crate::services::twin_events::TargetKind::TwinJson
             | crate::services::twin_events::TargetKind::CanvasJson => {
                 self.data_root.delete(&self.target_key(kind, relative_key)?)
             }
@@ -1181,7 +1490,7 @@ impl MutationCoordinator {
         kind: crate::services::twin_events::TargetKind,
         relative_key: &str,
     ) -> Result<Vec<u8>, MutationError> {
-        crate::services::twin_events::validate_relative_key(relative_key)?;
+        crate::services::twin_events::validate_target_key(kind, relative_key)?;
         let mut target = platform_canonical_path_bytes(&self.target_root(kind)?)?;
         target.push(b'/');
         #[cfg(windows)]
@@ -1204,6 +1513,18 @@ impl MutationCoordinator {
         }
         Ok(())
     }
+}
+
+fn intent_changes_authority(intent: &crate::services::twin_events::MutationIntentV1) -> bool {
+    !intent.events.is_empty()
+        || intent.targets.iter().any(|target| {
+            matches!(
+                target.kind,
+                crate::services::twin_events::TargetKind::Markdown
+                    | crate::services::twin_events::TargetKind::OverlayJson
+                    | crate::services::twin_events::TargetKind::TwinJson
+            )
+        })
 }
 
 impl MutationRootTransitionGuard<'_> {
@@ -1230,6 +1551,20 @@ impl MutationRootTransitionGuard<'_> {
         )
     }
 
+    pub(crate) fn prepare_twin_data_path(
+        &self,
+        vault_path: &Path,
+        lease: &ActiveMarkdownRootLeaseV1,
+    ) -> Result<PathBuf, MutationError> {
+        crate::services::settings::prepare_twin_data_path_locked(
+            &self.coordinator.data_path,
+            vault_path,
+            lease,
+            &self._process_lock,
+        )
+        .map_err(|error| MutationError::Invalid(error.to_string()))
+    }
+
     pub(crate) fn invalidate_namespace(
         &self,
         lease: &ActiveMarkdownRootLeaseV1,
@@ -1243,9 +1578,20 @@ impl MutationRootTransitionGuard<'_> {
 
     pub(crate) fn publish_namespace_ready(
         &self,
-        lease: &ActiveMarkdownRootLeaseV1,
+        token: &crate::services::vault_namespace::VaultAuthorityTokenV1,
     ) -> Result<(), MutationError> {
-        crate::services::vault_namespace::publish_ready_locked(
+        crate::services::vault_namespace::publish_ready_token_locked(
+            &self.coordinator.data_path,
+            token,
+            &self._process_lock,
+        )
+    }
+
+    pub(crate) fn capture_authority_token(
+        &self,
+        lease: &ActiveMarkdownRootLeaseV1,
+    ) -> Result<crate::services::vault_namespace::VaultAuthorityTokenV1, MutationError> {
+        crate::services::vault_namespace::capture_authority_token_locked(
             &self.coordinator.data_path,
             lease,
             &self._process_lock,
@@ -1290,6 +1636,12 @@ impl MutationRootTransitionGuard<'_> {
             ));
         }
         let capability = crate::services::twin_events::AnchoredRoot::open(&canonical)?;
+        crate::services::vault_namespace::initialize_locked(
+            &self.coordinator.data_path,
+            lease,
+            &self._process_lock,
+        )?;
+        ensure_overlay_target_root(&self.coordinator.data_root, &lease.root_scope)?;
         *self
             .coordinator
             .vault_root
@@ -1304,6 +1656,20 @@ impl MutationRootTransitionGuard<'_> {
             lease.clone();
         Ok(())
     }
+}
+
+fn ensure_overlay_target_root(
+    data_root: &crate::services::twin_events::AnchoredRoot,
+    root_scope: &crate::models::twin_event::ContentDigest,
+) -> Result<(), MutationError> {
+    data_root.open_directory(
+        &format!(
+            "vault_derived/v1/{}/vault_migration/overlay/notes",
+            root_scope.as_str()
+        ),
+        true,
+    )?;
+    Ok(())
 }
 
 fn markdown_root_scope_for(
@@ -1485,6 +1851,7 @@ impl crate::services::twin_events::EventRecorder for MutationCoordinator {
                 Ok(MutationCommit {
                     mutation_id: None,
                     events: Vec::new(),
+                    authority_token: None,
                 })
             }
         }
@@ -1758,6 +2125,293 @@ mod tests {
         assert_eq!(committed.events.len(), 2);
         assert_ne!(committed.events[0].event_id, committed.events[1].event_id);
         assert_eq!(store.ordered_events().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn authority_mutations_invalidate_ready_before_journal_stage_but_canvas_layout_does_not() {
+        let temp = tempdir().unwrap();
+        let data = temp.path().join("data");
+        let vault = temp.path().join("vault");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::create_dir(&vault).unwrap();
+        let store = Arc::new(TwinEventStore::new(&data));
+        store.initialize().unwrap();
+        let coordinator = MutationCoordinator::new(
+            &data,
+            &vault,
+            store,
+            Arc::new(NoopMutationLifecycle),
+        )
+        .unwrap();
+        coordinator.require_namespace_ready().unwrap();
+        let before = coordinator.current_authority_token().unwrap();
+
+        coordinator
+            .apply_nonlocal(
+                MutationOrigin::Recovery,
+                vec![crate::services::twin_events::TargetMutation::put(
+                    crate::services::twin_events::TargetKind::CanvasJson,
+                    "layout.json",
+                    "{}",
+                )],
+            )
+            .unwrap();
+        coordinator.require_namespace_ready().unwrap();
+
+        coordinator.fail_once_at(MutationFaultPoint::AfterStage);
+        assert!(coordinator
+            .commit_local(
+                CausalStream::LocalOnly,
+                crate::models::twin_event::SourceChannel::parse("note_editor").unwrap(),
+                vec![crate::services::twin_events::TargetMutation::put(
+                    crate::services::twin_events::TargetKind::Markdown,
+                    "authority.md",
+                    "changed",
+                )],
+                vec![draft("authority")],
+            )
+            .is_err());
+        assert!(coordinator.require_namespace_ready().is_err());
+        assert!(!vault.join("authority.md").exists());
+        let staged = coordinator.current_authority_token().unwrap();
+        assert_eq!(
+            staged.authority_generation,
+            before.authority_generation + 1
+        );
+
+        coordinator.recover_pending().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(vault.join("authority.md")).unwrap(),
+            "changed"
+        );
+        assert!(coordinator.require_namespace_ready().is_err());
+        assert_eq!(coordinator.current_authority_token().unwrap(), staged);
+    }
+
+    #[test]
+    fn commit_returns_the_exact_post_mutation_authority_token() {
+        let temp = tempdir().unwrap();
+        let data = temp.path().join("data");
+        let vault = temp.path().join("vault");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::create_dir(&vault).unwrap();
+        let store = Arc::new(TwinEventStore::new(&data));
+        store.initialize().unwrap();
+        let coordinator = MutationCoordinator::new(
+            &data,
+            &vault,
+            store,
+            Arc::new(NoopMutationLifecycle),
+        )
+        .unwrap();
+
+        let canvas = coordinator
+            .commit_local(
+                CausalStream::LocalOnly,
+                crate::models::twin_event::SourceChannel::parse("canvas").unwrap(),
+                vec![crate::services::twin_events::TargetMutation::put(
+                    crate::services::twin_events::TargetKind::CanvasJson,
+                    "layout.json",
+                    "{}",
+                )],
+                Vec::new(),
+            )
+            .unwrap();
+        assert!(canvas.authority_token.is_none());
+
+        let authority = coordinator
+            .commit_local(
+                CausalStream::LocalOnly,
+                crate::models::twin_event::SourceChannel::parse("note_editor").unwrap(),
+                vec![crate::services::twin_events::TargetMutation::put(
+                    crate::services::twin_events::TargetKind::Markdown,
+                    "token.md",
+                    "changed",
+                )],
+                Vec::new(),
+            )
+            .unwrap();
+        assert_eq!(
+            authority.authority_token.as_ref(),
+            Some(&coordinator.current_authority_token().unwrap())
+        );
+    }
+
+    #[test]
+    fn planned_mutation_rejects_a_stale_expected_authority_before_staging() {
+        let temp = tempdir().unwrap();
+        let data = temp.path().join("data");
+        let vault = temp.path().join("vault");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::create_dir(&vault).unwrap();
+        let store = Arc::new(TwinEventStore::new(&data));
+        store.initialize().unwrap();
+        let coordinator = MutationCoordinator::new(
+            &data,
+            &vault,
+            store,
+            Arc::new(NoopMutationLifecycle),
+        )
+        .unwrap();
+        let stale = coordinator.current_authority_token().unwrap();
+        coordinator
+            .commit_local(
+                CausalStream::LocalOnly,
+                crate::models::twin_event::SourceChannel::parse("note_editor").unwrap(),
+                vec![crate::services::twin_events::TargetMutation::put(
+                    crate::services::twin_events::TargetKind::Markdown,
+                    "peer.md",
+                    "peer",
+                )],
+                Vec::new(),
+            )
+            .unwrap();
+
+        let mut plan = Some(
+            MutationPlan::new(
+                CausalStream::LocalOnly,
+                crate::models::twin_event::SourceChannel::parse("canvas").unwrap(),
+                vec![crate::services::twin_events::TargetMutation::put(
+                    crate::services::twin_events::TargetKind::CanvasJson,
+                    "stale.json",
+                    "{}",
+                )],
+                Vec::new(),
+            )
+            .expecting_authority(stale),
+        );
+        let error = coordinator
+            .commit_planned(MutationOrigin::Local, &mut || Ok(plan.take()))
+            .unwrap_err();
+        assert!(error.to_string().contains("authority changed"));
+        assert!(!data.join("canvas/stale.json").exists());
+        assert_eq!(
+            std::fs::read_dir(data.join("twin/mutations/pending/v1"))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn overlay_target_recovery_uses_the_staged_generation_once() {
+        let temp = tempdir().unwrap();
+        let data = temp.path().join("data");
+        let vault = temp.path().join("vault");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::create_dir(&vault).unwrap();
+        let store = Arc::new(TwinEventStore::new(&data));
+        store.initialize().unwrap();
+        let coordinator = MutationCoordinator::new(
+            &data,
+            &vault,
+            store.clone(),
+            Arc::new(NoopMutationLifecycle),
+        )
+        .unwrap();
+        let before = coordinator.current_authority_token().unwrap();
+        coordinator.fail_once_at(MutationFaultPoint::AfterStage);
+        assert!(coordinator
+            .commit_local(
+                CausalStream::LocalOnly,
+                crate::models::twin_event::SourceChannel::parse("vault_optimizer").unwrap(),
+                vec![crate::services::twin_events::TargetMutation::put(
+                    crate::services::twin_events::TargetKind::OverlayJson,
+                    "captured.json",
+                    "{}",
+                )],
+                Vec::new(),
+            )
+            .is_err());
+        let staged = coordinator.current_authority_token().unwrap();
+        assert_eq!(staged.authority_generation, before.authority_generation + 1);
+        let overlay = crate::services::vault_namespace::scoped_data_path(
+            &data,
+            &staged.root_scope,
+        )
+        .join("vault_migration/overlay/notes/captured.json");
+        assert!(!overlay.exists());
+        let pending_path = std::fs::read_dir(data.join("twin/mutations/pending/v1"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let pending: crate::services::twin_events::MutationIntentV1 =
+            serde_json::from_slice(&std::fs::read(pending_path).unwrap()).unwrap();
+        assert_eq!(pending.markdown_root_scope.as_ref(), Some(&staged.root_scope));
+        assert!(pending.targets.iter().all(|target| {
+            target.kind == crate::services::twin_events::TargetKind::OverlayJson
+        }));
+
+        assert_eq!(coordinator.recover_pending().unwrap(), 1);
+        assert_eq!(std::fs::read_to_string(&overlay).unwrap(), "{}");
+        assert_eq!(coordinator.current_authority_token().unwrap(), staged);
+        assert_eq!(coordinator.recover_pending().unwrap(), 0);
+        assert_eq!(coordinator.current_authority_token().unwrap(), staged);
+
+        drop(coordinator);
+        let restarted = MutationCoordinator::new(
+            &data,
+            &vault,
+            store,
+            Arc::new(NoopMutationLifecycle),
+        )
+        .unwrap();
+        assert_eq!(restarted.recover_pending().unwrap(), 0);
+        assert_eq!(restarted.current_authority_token().unwrap(), staged);
+        assert_eq!(std::fs::read_to_string(overlay).unwrap(), "{}");
+    }
+
+    #[test]
+    fn crash_after_authority_advance_before_wal_is_false_dirty_and_restart_has_zero_work() {
+        let temp = tempdir().unwrap();
+        let data = temp.path().join("data");
+        let vault = temp.path().join("vault");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::create_dir(&vault).unwrap();
+        let store = Arc::new(TwinEventStore::new(&data));
+        store.initialize().unwrap();
+        let coordinator = MutationCoordinator::new(
+            &data,
+            &vault,
+            store.clone(),
+            Arc::new(NoopMutationLifecycle),
+        )
+        .unwrap();
+        let before = coordinator.current_authority_token().unwrap();
+
+        coordinator.fail_once_at(MutationFaultPoint::AfterAuthorityAdvance);
+        assert!(coordinator
+            .commit_local(
+                CausalStream::LocalOnly,
+                crate::models::twin_event::SourceChannel::parse("note_editor").unwrap(),
+                vec![crate::services::twin_events::TargetMutation::put(
+                    crate::services::twin_events::TargetKind::Markdown,
+                    "false-dirty.md",
+                    "not staged",
+                )],
+                vec![draft("false-dirty")],
+            )
+            .is_err());
+        let dirty = coordinator.current_authority_token().unwrap();
+        assert_eq!(dirty.authority_generation, before.authority_generation + 1);
+        assert!(coordinator.require_namespace_ready().is_err());
+        assert_eq!(coordinator.pending_count().unwrap(), 0);
+        assert!(!vault.join("false-dirty.md").exists());
+        assert_eq!(coordinator.recover_pending().unwrap(), 0);
+
+        drop(coordinator);
+        let restarted = MutationCoordinator::new(
+            &data,
+            &vault,
+            store,
+            Arc::new(NoopMutationLifecycle),
+        )
+        .unwrap();
+        assert_eq!(restarted.current_authority_token().unwrap(), dirty);
+        assert_eq!(restarted.recover_pending().unwrap(), 0);
+        assert!(!vault.join("false-dirty.md").exists());
     }
 
     #[test]

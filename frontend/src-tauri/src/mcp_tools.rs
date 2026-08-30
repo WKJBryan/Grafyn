@@ -7,14 +7,13 @@ use crate::models::note::{NoteCreate, NoteStatus, NoteUpdate, CURRENT_NOTE_SCHEM
 use crate::services::chunk_index::ChunkIndex;
 use crate::services::graph_index::GraphIndex;
 use crate::services::import;
-use crate::services::index_commit;
 use crate::services::knowledge_store::KnowledgeStore;
 use crate::services::memory::MemoryService;
 use crate::services::priority::PriorityScoringService;
 use crate::services::retrieval::RetrievalService;
 use crate::services::search::SearchService;
 use crate::services::twin_events::{
-    ActiveMarkdownRootLeaseV1, CoordinatorProcessLock, MutationCoordinator, MutationError,
+    MutationCoordinator, MutationError,
 };
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -47,7 +46,33 @@ pub struct GrafynMcpServer {
 #[derive(Clone)]
 struct DerivedAuthority {
     coordinator: Arc<MutationCoordinator>,
-    expected_epoch: ActiveMarkdownRootLeaseV1,
+    authoritative_token:
+        Arc<std::sync::Mutex<crate::services::vault_namespace::VaultAuthorityTokenV1>>,
+    derived_token: crate::services::vault_namespace::VaultAuthorityTokenV1,
+}
+
+struct McpAuthorityReadTicket {
+    coordinator: Arc<MutationCoordinator>,
+    expected: crate::services::vault_namespace::VaultAuthorityTokenV1,
+    require_ready: bool,
+}
+
+impl McpAuthorityReadTicket {
+    fn finish(self) -> Result<(), MutationError> {
+        self.coordinator
+            .validate_authority_token(&self.expected, self.require_ready)
+    }
+}
+
+fn finish_mcp_read(
+    ticket: McpAuthorityReadTicket,
+    result: Result<CallToolResult, McpError>,
+    unavailable: &str,
+) -> Result<CallToolResult, McpError> {
+    if ticket.finish().is_err() {
+        return err_result(unavailable.to_string());
+    }
+    result
 }
 
 // ── Tool parameter structs ───────────────────────────────────────────────────
@@ -315,7 +340,7 @@ impl GrafynMcpServer {
         coordinator: Arc<MutationCoordinator>,
         derived_ready: bool,
     ) -> Result<Self, MutationError> {
-        let expected_epoch = coordinator.current_root_epoch()?;
+        let expected_token = coordinator.current_authority_token()?;
         Ok(Self {
             knowledge_store,
             search_service,
@@ -327,13 +352,14 @@ impl GrafynMcpServer {
             derived_ready,
             derived_authority: DerivedAuthority {
                 coordinator,
-                expected_epoch,
+                authoritative_token: Arc::new(std::sync::Mutex::new(expected_token.clone())),
+                derived_token: expected_token,
             },
             tool_router: Self::tool_router(),
         })
     }
 
-    fn require_derived_ready(&self) -> Result<CoordinatorProcessLock, CallToolResult> {
+    fn require_derived_ready(&self) -> Result<McpAuthorityReadTicket, CallToolResult> {
         if !self.derived_ready {
             return Err(err_result(
                 "Vault-derived indexes are unavailable until Grafyn rebuilds this vault namespace."
@@ -343,22 +369,74 @@ impl GrafynMcpServer {
         }
         self.derived_authority
             .coordinator
-            .acquire_ready_namespace_guard(&self.derived_authority.expected_epoch)
+            .validate_authority_token(&self.derived_authority.derived_token, true)
             .map_err(|_| {
                 err_result(
                     "Vault-derived indexes are unavailable until Grafyn rebuilds this vault namespace."
                         .into(),
                 )
                 .expect("tool result construction is infallible")
-            })
+            })?;
+        Ok(McpAuthorityReadTicket {
+            coordinator: self.derived_authority.coordinator.clone(),
+            expected: self.derived_authority.derived_token.clone(),
+            require_ready: true,
+        })
+    }
+
+    fn begin_authoritative_read(&self) -> Result<McpAuthorityReadTicket, CallToolResult> {
+        let expected = self
+            .derived_authority
+            .authoritative_token
+            .lock()
+            .map_err(|_| {
+                err_result("Vault authority is unavailable until restart.".into())
+                    .expect("tool result construction is infallible")
+            })?
+            .clone();
+        self.derived_authority
+            .coordinator
+            .validate_authority_token(&expected, false)
+            .map_err(|_| {
+                err_result("Vault authority changed; restart this MCP server.".into())
+                    .expect("tool result construction is infallible")
+            })?;
+        Ok(McpAuthorityReadTicket {
+            coordinator: self.derived_authority.coordinator.clone(),
+            expected,
+            require_ready: false,
+        })
+    }
+
+    fn refresh_authoritative_after_write(
+        &self,
+        store: &mut KnowledgeStore,
+    ) -> Result<(), MutationError> {
+        let token = self.derived_authority.coordinator.current_authority_token()?;
+        store.reload_authoritative_state();
+        self.derived_authority
+            .coordinator
+            .validate_authority_token(&token, false)?;
+        *self
+            .derived_authority
+            .authoritative_token
+            .lock()
+            .map_err(|_| MutationError::Invalid("MCP authority token lock poisoned".into()))? =
+            token;
+        Ok(())
     }
 
     #[tool(
         description = "List all notes in the knowledge base with metadata (title, status, tags). Returns JSON array sorted by last updated."
     )]
     async fn list_notes(&self) -> Result<CallToolResult, McpError> {
-        let ks = self.knowledge_store.read().await;
-        match ks.list_notes() {
+        let ticket = match self.begin_authoritative_read() {
+            Ok(ticket) => ticket,
+            Err(result) => return Ok(result),
+        };
+        let result = {
+            let ks = self.knowledge_store.read().await;
+            match ks.list_notes() {
             Ok(notes) => {
                 let response: Vec<NoteMetaResponse> = notes
                     .into_iter()
@@ -372,7 +450,13 @@ impl GrafynMcpServer {
                 json_result(&response)
             }
             Err(e) => err_result(format!("Failed to list notes: {}", e)),
-        }
+            }
+        };
+        finish_mcp_read(
+            ticket,
+            result,
+            "Vault authority changed; restart this MCP server.",
+        )
     }
 
     #[tool(
@@ -382,8 +466,13 @@ impl GrafynMcpServer {
         &self,
         Parameters(params): Parameters<GetNoteParams>,
     ) -> Result<CallToolResult, McpError> {
-        let ks = self.knowledge_store.read().await;
-        match ks.get_note(&params.id) {
+        let ticket = match self.begin_authoritative_read() {
+            Ok(ticket) => ticket,
+            Err(result) => return Ok(result),
+        };
+        let result = {
+            let ks = self.knowledge_store.read().await;
+            match ks.get_note(&params.id) {
             Ok(note) => json_result(&NoteResponse {
                 id: note.id,
                 title: note.title,
@@ -392,7 +481,13 @@ impl GrafynMcpServer {
                 content: note.content,
             }),
             Err(e) => err_result(format!("Note not found: {}", e)),
-        }
+            }
+        };
+        finish_mcp_read(
+            ticket,
+            result,
+            "Vault authority changed; restart this MCP server.",
+        )
     }
 
     #[tool(
@@ -419,18 +514,11 @@ impl GrafynMcpServer {
         let mut ks = self.knowledge_store.write().await;
         match ks.create_note_from_source(create, "mcp") {
             Ok(note) => {
-                // Update search index (if writable)
-                if let Some(search_service) = &self.search_service {
-                    let mut search = search_service.write().await;
-                    let _ = index_commit::index_note_for_search(&mut search, &note);
-                    let _ = index_commit::commit_search(&mut search);
+                if let Err(error) = self.refresh_authoritative_after_write(&mut ks) {
+                    return err_result(format!(
+                        "Note was committed, but MCP authority refresh failed: {error}"
+                    ));
                 }
-                // Update graph index
-                {
-                    let mut graph = self.graph_index.write().await;
-                    graph.update_note(&note);
-                }
-
                 json_result(&NoteResponse {
                     id: note.id,
                     title: note.title,
@@ -467,18 +555,11 @@ impl GrafynMcpServer {
         let mut ks = self.knowledge_store.write().await;
         match ks.update_note_from_source(&id, update, "mcp") {
             Ok(note) => {
-                // Update search index (if writable)
-                if let Some(search_service) = &self.search_service {
-                    let mut search = search_service.write().await;
-                    let _ = index_commit::index_note_for_search(&mut search, &note);
-                    let _ = index_commit::commit_search(&mut search);
+                if let Err(error) = self.refresh_authoritative_after_write(&mut ks) {
+                    return err_result(format!(
+                        "Note was committed, but MCP authority refresh failed: {error}"
+                    ));
                 }
-                // Update graph index
-                {
-                    let mut graph = self.graph_index.write().await;
-                    graph.update_note(&note);
-                }
-
                 json_result(&NoteResponse {
                     id: note.id,
                     title: note.title,
@@ -501,18 +582,11 @@ impl GrafynMcpServer {
         let mut ks = self.knowledge_store.write().await;
         match ks.delete_note_from_source(&params.id, "mcp") {
             Ok(()) => {
-                // Update search index (if writable)
-                if let Some(search_service) = &self.search_service {
-                    let mut search = search_service.write().await;
-                    let _ = index_commit::remove_note_for_search(&mut search, &params.id);
-                    let _ = index_commit::commit_search(&mut search);
+                if let Err(error) = self.refresh_authoritative_after_write(&mut ks) {
+                    return err_result(format!(
+                        "Note was committed, but MCP authority refresh failed: {error}"
+                    ));
                 }
-                // Update graph index
-                {
-                    let mut graph = self.graph_index.write().await;
-                    graph.remove_note(&params.id);
-                }
-
                 text_result(format!("Note '{}' deleted successfully.", params.id))
             }
             Err(e) => err_result(format!("Failed to delete note: {}", e)),
@@ -526,15 +600,16 @@ impl GrafynMcpServer {
         &self,
         Parameters(params): Parameters<SearchParams>,
     ) -> Result<CallToolResult, McpError> {
-        let _derived_guard = match self.require_derived_ready() {
-            Ok(guard) => guard,
+        let ticket = match self.require_derived_ready() {
+            Ok(ticket) => ticket,
             Err(result) => return Ok(result),
         };
         let Some(search_service) = &self.search_service else {
             return err_result("Vault-derived search index is unavailable.".into());
         };
-        let search = search_service.read().await;
-        match search.search(&params.query, params.limit) {
+        let result = {
+            let search = search_service.read().await;
+            match search.search(&params.query, params.limit) {
             Ok(results) => {
                 let response: Vec<serde_json::Value> = results
                     .into_iter()
@@ -552,7 +627,13 @@ impl GrafynMcpServer {
                 json_result(&response)
             }
             Err(e) => err_result(format!("Search failed: {}", e)),
-        }
+            }
+        };
+        finish_mcp_read(
+            ticket,
+            result,
+            "Vault-derived indexes changed while this search was running.",
+        )
     }
 
     #[tool(
@@ -562,23 +643,30 @@ impl GrafynMcpServer {
         &self,
         Parameters(params): Parameters<BacklinksParams>,
     ) -> Result<CallToolResult, McpError> {
-        let _derived_guard = match self.require_derived_ready() {
-            Ok(guard) => guard,
+        let ticket = match self.require_derived_ready() {
+            Ok(ticket) => ticket,
             Err(result) => return Ok(result),
         };
-        let graph = self.graph_index.read().await;
-        let backlinks = graph.get_typed_backlinks(&params.note_id);
-        let response: Vec<TypedNoteMetaResponse> = backlinks
-            .into_iter()
-            .map(|(n, relation)| TypedNoteMetaResponse {
-                id: n.id,
-                title: n.title,
-                status: n.status.to_string(),
-                tags: n.tags,
-                relation: relation.to_string(),
-            })
-            .collect();
-        json_result(&response)
+        let result = {
+            let graph = self.graph_index.read().await;
+            let backlinks = graph.get_typed_backlinks(&params.note_id);
+            let response: Vec<TypedNoteMetaResponse> = backlinks
+                .into_iter()
+                .map(|(n, relation)| TypedNoteMetaResponse {
+                    id: n.id,
+                    title: n.title,
+                    status: n.status.to_string(),
+                    tags: n.tags,
+                    relation: relation.to_string(),
+                })
+                .collect();
+            json_result(&response)
+        };
+        finish_mcp_read(
+            ticket,
+            result,
+            "Vault-derived indexes changed while backlinks were read.",
+        )
     }
 
     #[tool(
@@ -588,23 +676,30 @@ impl GrafynMcpServer {
         &self,
         Parameters(params): Parameters<OutgoingParams>,
     ) -> Result<CallToolResult, McpError> {
-        let _derived_guard = match self.require_derived_ready() {
-            Ok(guard) => guard,
+        let ticket = match self.require_derived_ready() {
+            Ok(ticket) => ticket,
             Err(result) => return Ok(result),
         };
-        let graph = self.graph_index.read().await;
-        let outgoing = graph.get_typed_outgoing(&params.note_id);
-        let response: Vec<TypedNoteMetaResponse> = outgoing
-            .into_iter()
-            .map(|(n, relation)| TypedNoteMetaResponse {
-                id: n.id,
-                title: n.title,
-                status: n.status.to_string(),
-                tags: n.tags,
-                relation: relation.to_string(),
-            })
-            .collect();
-        json_result(&response)
+        let result = {
+            let graph = self.graph_index.read().await;
+            let outgoing = graph.get_typed_outgoing(&params.note_id);
+            let response: Vec<TypedNoteMetaResponse> = outgoing
+                .into_iter()
+                .map(|(n, relation)| TypedNoteMetaResponse {
+                    id: n.id,
+                    title: n.title,
+                    status: n.status.to_string(),
+                    tags: n.tags,
+                    relation: relation.to_string(),
+                })
+                .collect();
+            json_result(&response)
+        };
+        finish_mcp_read(
+            ticket,
+            result,
+            "Vault-derived indexes changed while outgoing links were read.",
+        )
     }
 
     #[tool(
@@ -735,18 +830,11 @@ impl GrafynMcpServer {
             }
         }
         if !created_notes.is_empty() {
-            if let Some(search_service) = &self.search_service {
-                let mut search = search_service.write().await;
-                for note in &created_notes {
-                    let _ = index_commit::index_note_for_search(&mut search, note);
-                }
-                let _ = index_commit::commit_search(&mut search);
-            }
-        }
-        {
-            let mut graph = self.graph_index.write().await;
-            for note in &created_notes {
-                graph.update_note(note);
+            let mut ks = self.knowledge_store.write().await;
+            if let Err(error) = self.refresh_authoritative_after_write(&mut ks) {
+                errors.push(format!(
+                    "Notes were committed, but MCP authority refresh failed: {error}"
+                ));
             }
         }
         let created_ids = created_notes
@@ -770,12 +858,14 @@ impl GrafynMcpServer {
         &self,
         Parameters(params): Parameters<RecallParams>,
     ) -> Result<CallToolResult, McpError> {
-        let _derived_guard = match self.require_derived_ready() {
-            Ok(guard) => guard,
+        let ticket = match self.require_derived_ready() {
+            Ok(ticket) => ticket,
             Err(result) => return Ok(result),
         };
         // If token_budget is set and chunk index is available, use chunk retrieval
-        if let (Some(budget), Some(chunk_index)) = (params.token_budget, &self.chunk_index) {
+        let result = if let (Some(budget), Some(chunk_index)) =
+            (params.token_budget, &self.chunk_index)
+        {
             let chunk_index = chunk_index.read().await;
             let graph = self.graph_index.read().await;
             let priority = self.priority_service.read().await;
@@ -841,7 +931,12 @@ impl GrafynMcpServer {
                 }
                 Err(e) => err_result(format!("Recall failed: {}", e)),
             }
-        }
+        };
+        finish_mcp_read(
+            ticket,
+            result,
+            "Vault-derived indexes changed while recall was running.",
+        )
     }
 
     #[tool(
@@ -851,8 +946,8 @@ impl GrafynMcpServer {
         &self,
         Parameters(params): Parameters<SearchChunksParams>,
     ) -> Result<CallToolResult, McpError> {
-        let _derived_guard = match self.require_derived_ready() {
-            Ok(guard) => guard,
+        let ticket = match self.require_derived_ready() {
+            Ok(ticket) => ticket,
             Err(result) => return Ok(result),
         };
         let Some(chunk_index) = &self.chunk_index else {
@@ -861,19 +956,20 @@ impl GrafynMcpServer {
             );
         };
 
-        let chunk_index = chunk_index.read().await;
-        let graph = self.graph_index.read().await;
-        let priority = self.priority_service.read().await;
-        let retrieval = self.retrieval_service.read().await;
+        let result = {
+            let chunk_index = chunk_index.read().await;
+            let graph = self.graph_index.read().await;
+            let priority = self.priority_service.read().await;
+            let retrieval = self.retrieval_service.read().await;
 
-        match retrieval.retrieve_chunks(
-            &chunk_index,
-            &graph,
-            &priority,
-            &params.query,
-            params.token_budget,
-            &params.context_note_ids,
-        ) {
+            match retrieval.retrieve_chunks(
+                &chunk_index,
+                &graph,
+                &priority,
+                &params.query,
+                params.token_budget,
+                &params.context_note_ids,
+            ) {
             Ok(chunks) => {
                 let total_tokens: usize = chunks.iter().map(|c| c.token_estimate).sum();
                 let response = serde_json::json!({
@@ -892,7 +988,13 @@ impl GrafynMcpServer {
                 json_result(&response)
             }
             Err(e) => err_result(format!("Chunk search failed: {}", e)),
-        }
+            }
+        };
+        finish_mcp_read(
+            ticket,
+            result,
+            "Vault-derived indexes changed while chunk search was running.",
+        )
     }
 }
 
@@ -945,14 +1047,15 @@ mod tests {
             )
             .unwrap(),
         );
+        let namespace = coordinator.current_namespace_path().unwrap();
         let server = GrafynMcpServer::new_with_governed_derived_state(
             Arc::new(RwLock::new(KnowledgeStore::with_event_recorder(
                 vault,
-                data.clone(),
+                namespace.clone(),
                 coordinator.clone(),
             ))),
             Some(Arc::new(RwLock::new(
-                SearchService::new(data.clone()).unwrap(),
+                SearchService::new(namespace).unwrap(),
             ))),
             Arc::new(RwLock::new(GraphIndex::new())),
             Arc::new(RwLock::new(MemoryService::new())),
@@ -1140,5 +1243,38 @@ mod tests {
         assert!(results
             .iter()
             .all(|result| format!("{result:?}").contains("Vault-derived indexes are unavailable")));
+    }
+
+    #[tokio::test]
+    async fn authoritative_list_is_optimistically_fenced_and_local_writes_refresh_its_token() {
+        let root = tempdir().unwrap();
+        let (server, _events, _data, coordinator) = test_server(root.path());
+
+        server
+            .create_note(Parameters(CreateNoteParams {
+                title: "Local authority".into(),
+                content: "durable".into(),
+                tags: Vec::new(),
+                status: "draft".into(),
+            }))
+            .await
+            .unwrap();
+        let listed = server.list_notes().await.unwrap();
+        assert!(format!("{listed:?}").contains("local-authority"));
+
+        coordinator
+            .commit_local(
+                crate::models::twin_event::CausalStream::LocalOnly,
+                crate::models::twin_event::SourceChannel::parse("mcp").unwrap(),
+                vec![crate::services::twin_events::TargetMutation::put(
+                    crate::services::twin_events::TargetKind::Markdown,
+                    "peer.md",
+                    "peer",
+                )],
+                Vec::new(),
+            )
+            .unwrap();
+        let stale = server.list_notes().await.unwrap();
+        assert!(format!("{stale:?}").contains("Vault authority changed"));
     }
 }

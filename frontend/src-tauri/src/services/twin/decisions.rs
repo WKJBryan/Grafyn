@@ -1075,6 +1075,47 @@ impl TwinStore {
         model_id: &str,
         context_version: &str,
     ) -> Result<DecisionEpisode> {
+        self.attach_twin_prediction_internal(
+            episode_id,
+            draft,
+            model_id,
+            context_version,
+            None,
+        )
+        .map(|(episode, _)| episode)
+    }
+
+    pub(crate) fn attach_twin_prediction_expecting_authority(
+        &mut self,
+        episode_id: &str,
+        draft: TwinPredictionDraft,
+        model_id: &str,
+        context_version: &str,
+        expected: crate::services::vault_namespace::VaultAuthorityTokenV1,
+    ) -> Result<(
+        DecisionEpisode,
+        crate::services::twin_events::MutationCommit,
+    )> {
+        self.attach_twin_prediction_internal(
+            episode_id,
+            draft,
+            model_id,
+            context_version,
+            Some(expected),
+        )
+    }
+
+    fn attach_twin_prediction_internal(
+        &mut self,
+        episode_id: &str,
+        draft: TwinPredictionDraft,
+        model_id: &str,
+        context_version: &str,
+        expected: Option<crate::services::vault_namespace::VaultAuthorityTokenV1>,
+    ) -> Result<(
+        DecisionEpisode,
+        crate::services::twin_events::MutationCommit,
+    )> {
         Self::validate_file_id(episode_id)?;
         if !self.event_recorder.is_noop() {
             let recorder = self.event_recorder.clone();
@@ -1097,21 +1138,28 @@ impl TwinStore {
                 let targets = self.governed_json_targets(values).map_err(|error| {
                     crate::services::twin_events::MutationError::Invalid(error.to_string())
                 })?;
-                Ok(Some(crate::services::twin_events::MutationPlan::new(
+                let mut plan = crate::services::twin_events::MutationPlan::new(
                     crate::models::twin_event::CausalStream::LocalOnly,
                     crate::models::twin_event::SourceChannel::parse("legacy_twin")
                         .map_err(crate::services::twin_events::MutationError::Invalid)?,
                     targets,
                     Vec::new(),
-                )))
+                );
+                if let Some(expected) = expected.clone() {
+                    plan = plan.expecting_authority(expected);
+                }
+                Ok(Some(plan))
             };
-            if let Err(error) = recorder.commit_planned_mutation(
+            let commit = match recorder.commit_planned_mutation(
                 crate::services::twin_events::MutationOrigin::Local,
                 &mut planner,
             ) {
-                self.invalidate_mutation_caches();
-                return Err(anyhow::Error::new(error));
-            }
+                Ok(commit) => commit,
+                Err(error) => {
+                    self.invalidate_mutation_caches();
+                    return Err(anyhow::Error::new(error));
+                }
+            };
             let (episode, trace) = committed
                 .ok_or_else(|| anyhow::anyhow!("Twin prediction was not planned"))?;
             if let Some(trace) = trace {
@@ -1119,7 +1167,7 @@ impl TwinStore {
             } else {
                 self.invalidate_mutation_caches();
             }
-            return Ok(episode);
+            return Ok((episode, commit));
         }
         let (episode, trace, values) =
             self.plan_twin_prediction_mutation(episode_id, &draft, model_id, context_version)?;
@@ -1131,7 +1179,14 @@ impl TwinStore {
         } else {
             self.invalidate_mutation_caches();
         }
-        Ok(episode)
+        Ok((
+            episode,
+            crate::services::twin_events::MutationCommit {
+                mutation_id: None,
+                events: Vec::new(),
+                authority_token: None,
+            },
+        ))
     }
 
     fn plan_twin_prediction_mutation(
@@ -1202,6 +1257,23 @@ impl TwinStore {
     /// distinguish "no prediction because the call failed" from "agreed to
     /// not predict" — silent gaps would inflate measured accuracy.
     pub fn mark_twin_prediction_failed(&mut self, episode_id: &str) -> Result<()> {
+        self.mark_twin_prediction_failed_internal(episode_id, None)
+            .map(|_| ())
+    }
+
+    pub(crate) fn mark_twin_prediction_failed_expecting_authority(
+        &mut self,
+        episode_id: &str,
+        expected: crate::services::vault_namespace::VaultAuthorityTokenV1,
+    ) -> Result<crate::services::twin_events::MutationCommit> {
+        self.mark_twin_prediction_failed_internal(episode_id, Some(expected))
+    }
+
+    fn mark_twin_prediction_failed_internal(
+        &mut self,
+        episode_id: &str,
+        expected: Option<crate::services::vault_namespace::VaultAuthorityTokenV1>,
+    ) -> Result<crate::services::twin_events::MutationCommit> {
         Self::validate_file_id(episode_id)?;
         if !self.event_recorder.is_noop() {
             let recorder = self.event_recorder.clone();
@@ -1223,32 +1295,48 @@ impl TwinStore {
                     .map_err(|error| {
                         crate::services::twin_events::MutationError::Invalid(error.to_string())
                     })?;
-                Ok(Some(crate::services::twin_events::MutationPlan::new(
+                let mut plan = crate::services::twin_events::MutationPlan::new(
                     crate::models::twin_event::CausalStream::LocalOnly,
                     crate::models::twin_event::SourceChannel::parse("legacy_twin")
                         .map_err(crate::services::twin_events::MutationError::Invalid)?,
                     targets,
                     Vec::new(),
-                )))
+                );
+                if let Some(expected) = expected.clone() {
+                    plan = plan.expecting_authority(expected);
+                }
+                Ok(Some(plan))
             };
-            if let Err(error) = recorder.commit_planned_mutation(
+            let commit = match recorder.commit_planned_mutation(
                 crate::services::twin_events::MutationOrigin::Local,
                 &mut planner,
             ) {
-                self.invalidate_mutation_caches();
-                return Err(anyhow::Error::new(error));
-            }
+                Ok(commit) => commit,
+                Err(error) => {
+                    self.invalidate_mutation_caches();
+                    return Err(anyhow::Error::new(error));
+                }
+            };
             self.invalidate_mutation_caches();
-            return Ok(());
+            return Ok(commit);
         }
         let path = self.decision_file_path(episode_id);
         let mut episode = self.read_decision_file(&path)?;
         if episode.twin_prediction.is_some() || episode.chosen_option.is_some() {
-            return Ok(());
+            return Ok(crate::services::twin_events::MutationCommit {
+                mutation_id: None,
+                events: Vec::new(),
+                authority_token: None,
+            });
         }
         episode.prediction_status = Some("failed".to_string());
         episode.updated_at = Utc::now();
-        self.write_decision_file(&episode)
+        self.write_decision_file(&episode)?;
+        Ok(crate::services::twin_events::MutationCommit {
+            mutation_id: None,
+            events: Vec::new(),
+            authority_token: None,
+        })
     }
 
     fn constitution_citation_is_supported(&self, id: &str) -> bool {
@@ -1313,6 +1401,29 @@ impl TwinStore {
         &mut self,
         create: ReflectionCardCreate,
     ) -> Result<ReflectionCard> {
+        self.record_reflection_card_internal(create, None)
+            .map(|(card, _)| card)
+    }
+
+    pub(crate) fn record_reflection_card_expecting_authority(
+        &mut self,
+        create: ReflectionCardCreate,
+        expected: crate::services::vault_namespace::VaultAuthorityTokenV1,
+    ) -> Result<(
+        ReflectionCard,
+        crate::services::twin_events::MutationCommit,
+    )> {
+        self.record_reflection_card_internal(create, Some(expected))
+    }
+
+    fn record_reflection_card_internal(
+        &mut self,
+        create: ReflectionCardCreate,
+        expected: Option<crate::services::vault_namespace::VaultAuthorityTokenV1>,
+    ) -> Result<(
+        ReflectionCard,
+        crate::services::twin_events::MutationCommit,
+    )> {
         if !self.event_recorder.is_noop() {
             let recorder = self.event_recorder.clone();
             let mut committed = None;
@@ -1326,30 +1437,44 @@ impl TwinStore {
                     crate::services::twin_events::MutationError::Invalid(error.to_string())
                 })?;
                 committed = Some((card, trace));
-                Ok(Some(crate::services::twin_events::MutationPlan::new(
+                let mut plan = crate::services::twin_events::MutationPlan::new(
                     crate::models::twin_event::CausalStream::LocalOnly,
                     crate::models::twin_event::SourceChannel::parse("legacy_twin")
                         .map_err(crate::services::twin_events::MutationError::Invalid)?,
                     targets,
                     Vec::new(),
-                )))
+                );
+                if let Some(expected) = expected.clone() {
+                    plan = plan.expecting_authority(expected);
+                }
+                Ok(Some(plan))
             };
-            if let Err(error) = recorder.commit_planned_mutation(
+            let commit = match recorder.commit_planned_mutation(
                 crate::services::twin_events::MutationOrigin::Local,
                 &mut planner,
             ) {
-                self.invalidate_mutation_caches();
-                return Err(anyhow::Error::new(error));
-            }
+                Ok(commit) => commit,
+                Err(error) => {
+                    self.invalidate_mutation_caches();
+                    return Err(anyhow::Error::new(error));
+                }
+            };
             let (card, trace) = committed
                 .ok_or_else(|| anyhow::anyhow!("reflection card was not planned"))?;
             self.cache_committed_trace(trace);
-            return Ok(card);
+            return Ok((card, commit));
         }
         let (card, trace, values) = self.plan_reflection_card_mutation(create)?;
         self.commit_governed_json_targets(values, Vec::new())?;
         self.cache_committed_trace(trace);
-        Ok(card)
+        Ok((
+            card,
+            crate::services::twin_events::MutationCommit {
+                mutation_id: None,
+                events: Vec::new(),
+                authority_token: None,
+            },
+        ))
     }
 
     fn plan_reflection_card_mutation(

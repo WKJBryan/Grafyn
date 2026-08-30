@@ -56,7 +56,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
     // Resolve paths: CLI args > settings.json > defaults
-    let (vault_path, data_path) = resolve_paths(args.vault, args.data)?;
+    let paths = resolve_paths(args.vault, args.data)?;
+    let vault_path = paths.vault_path;
+    let data_path = paths.data_path;
 
     log::info!("Vault path: {}", vault_path.display());
     log::info!("Data path: {}", data_path.display());
@@ -64,6 +66,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Ensure directories exist
     std::fs::create_dir_all(&vault_path)?;
     std::fs::create_dir_all(&data_path)?;
+    if paths.custom_data {
+        crate::services::root_transition::reject_custom_transition_wal(&data_path)?;
+    }
 
     // Recover the same canonical mutation journal as desktop before stdio is served.
     let twin_event_store = Arc::new(TwinEventStore::new(&data_path));
@@ -88,27 +93,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // A namespace without the matching durable readiness marker may still serve
     // authoritative note CRUD, but must never expose global or stale indexes.
     let search_service = if derived_ready {
-        match SearchService::new(derived_data_path.clone()) {
+        match SearchService::new_readonly(derived_data_path.clone()) {
             Ok(service) => {
-                log::info!("Search service initialized with write access");
+                log::info!("Search service initialized in read-only mode");
                 Some(service)
             }
             Err(error) => {
-                log::warn!(
-                    "Could not acquire search writer (Grafyn app may be running): {}. \
-                     Falling back to read-only search.",
-                    error
-                );
-                match SearchService::new_readonly(derived_data_path.clone()) {
-                    Ok(service) => {
-                        log::info!("Search service initialized in read-only mode");
-                        Some(service)
-                    }
-                    Err(read_error) => {
-                        log::error!("Failed to open scoped search index: {}", read_error);
-                        None
-                    }
-                }
+                log::error!("Failed to open scoped search index read-only: {}", error);
+                None
             }
         }
     } else {
@@ -185,15 +177,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Resolve vault and data paths from CLI args, settings file, or defaults.
+#[derive(Debug)]
+struct ResolvedMcpPaths {
+    vault_path: PathBuf,
+    data_path: PathBuf,
+    custom_data: bool,
+}
+
 fn resolve_paths(
     cli_vault: Option<PathBuf>,
     cli_data: Option<PathBuf>,
-) -> Result<(PathBuf, PathBuf), Box<dyn std::error::Error>> {
-    if let Some(data_path) = cli_data.as_deref() {
-        SettingsService::recover_root_transition_at(data_path)?;
+) -> Result<ResolvedMcpPaths, Box<dyn std::error::Error>> {
+    if let Some(data_path) = cli_data {
+        let vault_path = cli_vault.ok_or(
+            "--data defines an isolated MCP authority and therefore requires --vault",
+        )?;
+        crate::services::root_transition::reject_custom_transition_wal(&data_path)?;
+        return Ok(ResolvedMcpPaths {
+            vault_path,
+            data_path,
+            custom_data: true,
+        });
     }
-    // Always recover/load settings before resolving a store root. Explicit CLI paths
-    // remain overrides, but a stale path will then fail the active-lease check.
+    // The default authority performs global settings/key/WAL recovery exactly once.
     let settings = SettingsService::load()?;
 
     let vault_path = cli_vault
@@ -205,14 +211,34 @@ fn resolve_paths(
                 .join("vault")
         });
 
-    let data_path = cli_data
-        .or_else(|| Some(settings.data_path()))
-        .unwrap_or_else(|| {
-            dirs::data_local_dir()
-                .unwrap_or_else(|| dirs::document_dir().unwrap_or_else(|| PathBuf::from(".")))
-                .join("Grafyn")
-                .join("data")
-        });
+    Ok(ResolvedMcpPaths {
+        vault_path,
+        data_path: settings.data_path(),
+        custom_data: false,
+    })
+}
 
-    Ok((vault_path, data_path))
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn custom_data_requires_an_explicit_vault_and_rejects_transition_wal() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("custom-data");
+        let vault = temp.path().join("custom-vault");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::create_dir(&vault).unwrap();
+        let missing = resolve_paths(None, Some(data.clone())).unwrap_err();
+        assert!(missing.to_string().contains("requires --vault"));
+
+        std::fs::create_dir_all(data.join("twin/events")).unwrap();
+        std::fs::write(
+            data.join("twin/events/root-transition-v1.json"),
+            b"foreign authority",
+        )
+        .unwrap();
+        let error = resolve_paths(Some(vault), Some(data)).unwrap_err();
+        assert!(error.to_string().contains("root-transition"));
+    }
 }

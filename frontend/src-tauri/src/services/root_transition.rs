@@ -23,6 +23,24 @@ const KEYRING_SERVICE: &str = "com.grafyn.app";
 const VERSIONED_KEY_PREFIX: &str = "openrouter_api_key/";
 const LEGACY_MIGRATION_KEY_VERSION: &str = "00000000-0000-4000-8000-000000000001";
 
+#[cfg(feature = "mcp")]
+pub(crate) fn reject_custom_transition_wal(data_path: &Path) -> Result<(), MutationError> {
+    if !data_path.exists() {
+        return Ok(());
+    }
+    crate::services::twin_events::validate_real_directory(data_path, "custom MCP data root")?;
+    let root = AnchoredRoot::open(data_path)?;
+    if root
+        .read_bounded(ROOT_TRANSITION_KEY, ROOT_TRANSITION_LIMIT)?
+        .is_some()
+    {
+        return Err(MutationError::RecoveryConflict(
+            "custom-mcp-root-transition-requires-default-authority-recovery".into(),
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct NonsecretSettingsV1 {
@@ -245,6 +263,7 @@ pub(crate) struct RootTransitionV1 {
     pub(crate) schema_version: u16,
     pub(crate) transaction_id: String,
     pub(crate) decision: RootTransitionDecision,
+    pub(crate) authority_binding: ContentDigest,
     pub(crate) root_changed: bool,
     pub(crate) before: RootAuthorityV1,
     pub(crate) after: RootAuthorityV1,
@@ -255,12 +274,14 @@ impl RootTransitionV1 {
     pub(crate) fn prepared(
         before: RootAuthorityV1,
         after: RootAuthorityV1,
+        authority_binding: ContentDigest,
     ) -> Result<Self, MutationError> {
         let rollback_lease = ActiveMarkdownRootLeaseV1::new(before.root_scope.clone());
         let transition = Self {
             schema_version: ROOT_TRANSITION_SCHEMA_VERSION,
             transaction_id: Uuid::new_v4().to_string(),
             decision: RootTransitionDecision::Prepared,
+            authority_binding,
             root_changed: before.root_scope != after.root_scope,
             before,
             after,
@@ -447,6 +468,7 @@ pub(crate) struct RootTransitionStore {
     data_root: AnchoredRoot,
     config_root: AnchoredRoot,
     settings_key: String,
+    authority_binding: ContentDigest,
     secrets: Arc<dyn VersionedSecretStore>,
     fault_once: Mutex<Option<RootTransitionFaultPoint>>,
 }
@@ -470,14 +492,21 @@ impl RootTransitionStore {
             .ok_or_else(|| MutationError::Invalid("settings filename must be UTF-8".into()))?
             .to_string();
         crate::services::twin_events::validate_relative_key(&settings_key)?;
+        let config_root = AnchoredRoot::open(config_parent)?;
+        let authority_binding = root_authority_binding(&data_path, config_parent, &settings_key)?;
         Ok(Self {
             data_path,
             data_root,
-            config_root: AnchoredRoot::open(config_parent)?,
+            config_root,
             settings_key,
+            authority_binding,
             secrets,
             fault_once: Mutex::new(None),
         })
+    }
+
+    pub(crate) fn authority_binding(&self) -> ContentDigest {
+        self.authority_binding.clone()
     }
 
     fn encoded_transition(&self, transition: &RootTransitionV1) -> Result<Vec<u8>, MutationError> {
@@ -500,6 +529,11 @@ impl RootTransitionStore {
         if transition.decision != RootTransitionDecision::Prepared {
             return Err(MutationError::Invalid(
                 "new root transition must be prepared".into(),
+            ));
+        }
+        if transition.authority_binding != self.authority_binding {
+            return Err(MutationError::RecoveryConflict(
+                "root-transition-authority-binding-mismatch".into(),
             ));
         }
         let bytes = self.encoded_transition(transition)?;
@@ -1096,6 +1130,11 @@ impl RootTransitionStore {
         let transition: RootTransitionV1 = serde_json::from_slice(&bytes)
             .map_err(|error| MutationError::Invalid(format!("invalid root transition: {error}")))?;
         transition.validate()?;
+        if transition.authority_binding != self.authority_binding {
+            return Err(MutationError::RecoveryConflict(
+                "root-transition-authority-binding-mismatch".into(),
+            ));
+        }
         Ok(Some(transition))
     }
 
@@ -1314,6 +1353,27 @@ fn settings_generation(bytes: Option<&[u8]>) -> ContentDigest {
     crate::services::twin_events::digest_bytes(&domain)
 }
 
+fn root_authority_binding(
+    data_path: &Path,
+    config_path: &Path,
+    settings_key: &str,
+) -> Result<ContentDigest, MutationError> {
+    let data_scope = root_identity_for_path(data_path)?;
+    let config_scope = root_identity_for_path(config_path)?;
+    let mut domain = b"grafyn.root_transition_authority.v1".to_vec();
+    for value in [
+        data_scope.as_str(),
+        config_scope.as_str(),
+        settings_key,
+        KEYRING_SERVICE,
+        VERSIONED_KEY_PREFIX,
+    ] {
+        domain.extend_from_slice(&(value.len() as u64).to_be_bytes());
+        domain.extend_from_slice(value.as_bytes());
+    }
+    Ok(crate::services::twin_events::digest_bytes(&domain))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1358,7 +1418,8 @@ mod tests {
             Some(new_key),
         )
         .unwrap();
-        let transition = RootTransitionV1::prepared(before, after).unwrap();
+        let transition =
+            RootTransitionV1::prepared(before, after, store.authority_binding()).unwrap();
         (temp, store, transition)
     }
 
@@ -1405,6 +1466,27 @@ mod tests {
         assert_eq!(patched.settings.theme, "dark");
         assert!(patched.settings.mcp_enabled);
         assert_eq!(patched.settings.effective_vault_path(), vault);
+    }
+
+    #[test]
+    fn copied_transition_wal_cannot_act_for_another_data_config_or_key_authority() {
+        let (_fixture, source, transition) = fixture();
+        let other = tempfile::tempdir().unwrap();
+        let data = other.path().join("data");
+        let config = other.path().join("config");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::create_dir(&config).unwrap();
+        let destination = RootTransitionStore::new(
+            &data,
+            config.join("settings.json"),
+            Arc::new(MemoryVersionedSecretStore::default()),
+        )
+        .unwrap();
+
+        assert_ne!(source.authority_binding(), destination.authority_binding());
+        let error = destination.prepare_transition(&transition).unwrap_err();
+        assert!(error.to_string().contains("authority-binding"));
+        assert!(!destination.transition_exists_for_test().unwrap());
     }
 
     #[test]

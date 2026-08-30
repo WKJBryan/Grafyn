@@ -132,6 +132,33 @@ impl TwinStore {
         event_type: TraceEventType,
         payload: serde_json::Value,
     ) -> Result<TraceEvent> {
+        self.append_trace_event_internal(session_id, event_type, payload, None)
+            .map(|(event, _)| event)
+    }
+
+    pub(crate) fn append_trace_event_expecting_authority(
+        &mut self,
+        session_id: &str,
+        event_type: TraceEventType,
+        payload: serde_json::Value,
+        expected: crate::services::vault_namespace::VaultAuthorityTokenV1,
+    ) -> Result<(
+        TraceEvent,
+        crate::services::twin_events::MutationCommit,
+    )> {
+        self.append_trace_event_internal(session_id, event_type, payload, Some(expected))
+    }
+
+    fn append_trace_event_internal(
+        &mut self,
+        session_id: &str,
+        event_type: TraceEventType,
+        payload: serde_json::Value,
+        expected: Option<crate::services::vault_namespace::VaultAuthorityTokenV1>,
+    ) -> Result<(
+        TraceEvent,
+        crate::services::twin_events::MutationCommit,
+    )> {
         if !self.event_recorder.is_noop() {
             Self::validate_file_id(session_id)?;
             let recorder = self.event_recorder.clone();
@@ -149,30 +176,44 @@ impl TwinStore {
                         crate::services::twin_events::MutationError::Invalid(error.to_string())
                     })?;
                 committed = Some((event, trace));
-                Ok(Some(crate::services::twin_events::MutationPlan::new(
+                let mut plan = crate::services::twin_events::MutationPlan::new(
                     crate::models::twin_event::CausalStream::LocalOnly,
                     crate::models::twin_event::SourceChannel::parse("legacy_twin")
                         .map_err(crate::services::twin_events::MutationError::Invalid)?,
                     target,
                     Vec::new(),
-                )))
+                );
+                if let Some(expected) = expected.clone() {
+                    plan = plan.expecting_authority(expected);
+                }
+                Ok(Some(plan))
             };
-            if let Err(error) = recorder.commit_planned_mutation(
+            let commit = match recorder.commit_planned_mutation(
                 crate::services::twin_events::MutationOrigin::Local,
                 &mut planner,
             ) {
-                self.invalidate_mutation_caches();
-                return Err(anyhow::Error::new(error));
-            }
+                Ok(commit) => commit,
+                Err(error) => {
+                    self.invalidate_mutation_caches();
+                    return Err(anyhow::Error::new(error));
+                }
+            };
             let (event, trace) = committed
                 .ok_or_else(|| anyhow::anyhow!("trace append was not planned"))?;
             self.cache_committed_trace(trace);
-            return Ok(event);
+            return Ok((event, commit));
         }
         let (event, trace) = self.plan_trace_event(session_id, event_type, payload)?;
         self.write_trace_file(&trace)?;
         self.cache_committed_trace(trace);
-        Ok(event)
+        Ok((
+            event,
+            crate::services::twin_events::MutationCommit {
+                mutation_id: None,
+                events: Vec::new(),
+                authority_token: None,
+            },
+        ))
     }
 
     pub(super) fn plan_trace_event(

@@ -831,6 +831,7 @@ impl EventRecorder for NoopEventRecorder {
         Ok(crate::services::twin_events::MutationCommit {
             mutation_id: None,
             events: Vec::new(),
+            authority_token: None,
         })
     }
 
@@ -857,6 +858,7 @@ impl EventRecorder for NoopEventRecorder {
         Ok(crate::services::twin_events::MutationCommit {
             mutation_id: None,
             events: Vec::new(),
+            authority_token: None,
         })
     }
 
