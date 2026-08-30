@@ -4,6 +4,9 @@ import App from '@/App.vue'
 
 const tauriPlugins = vi.hoisted(() => ({
   openExternal: vi.fn().mockResolvedValue(undefined),
+  listen: vi.fn(),
+  unlisten: vi.fn(),
+  toastWarning: vi.fn(),
   confirm: vi.fn(),
   check: vi.fn(),
   downloadAndInstall: vi.fn(),
@@ -22,7 +25,14 @@ vi.mock('@/api/client', () => ({
 
 vi.mock('@/api/transport', () => ({
   getRuntimeProfile: () => ({ platform: tauriPlugins.runtime.platform }),
-  getTransport: () => ({ openExternal: tauriPlugins.openExternal }),
+  getTransport: () => ({
+    listen: tauriPlugins.listen,
+    openExternal: tauriPlugins.openExternal,
+  }),
+}))
+
+vi.mock('@/composables/useToast', () => ({
+  useToast: () => ({ warning: tauriPlugins.toastWarning }),
 }))
 
 vi.mock('@tauri-apps/plugin-dialog', () => ({
@@ -80,6 +90,90 @@ describe('desktop Tauri shell', () => {
     tauriPlugins.runtime.isDesktop = true
     tauriPlugins.runtime.platform = 'windows'
     tauriPlugins.check.mockResolvedValue(null)
+    tauriPlugins.listen.mockResolvedValue(tauriPlugins.unlisten)
+  })
+
+  it('registers one committed-warning listener for the app lifetime', async () => {
+    const wrapper = mountApp()
+    await flushPromises()
+
+    expect(tauriPlugins.listen).toHaveBeenCalledOnce()
+    expect(tauriPlugins.listen).toHaveBeenCalledWith(
+      'grafyn://committed-warning',
+      expect.any(Function),
+    )
+
+    wrapper.unmount()
+  })
+
+  it('deduplicates the current warning DTO and distinguishes optional operations', async () => {
+    const wrapper = mountApp()
+    await flushPromises()
+    const handleWarning = tauriPlugins.listen.mock.calls[0][1]
+    const warning = {
+      code: 'derived_state_unavailable',
+      message: 'Your change was saved, but derived views are temporarily unavailable.',
+    }
+
+    handleWarning({ payload: warning })
+    handleWarning({ payload: { ...warning } })
+    handleWarning({ payload: { ...warning, operation: 'update_note' } })
+
+    expect(tauriPlugins.toastWarning).toHaveBeenCalledTimes(2)
+    expect(tauriPlugins.toastWarning).toHaveBeenNthCalledWith(
+      1,
+      'Your change was saved, but derived views are temporarily unavailable.',
+    )
+    expect(tauriPlugins.toastWarning).toHaveBeenNthCalledWith(
+      2,
+      'Your change was saved, but derived views are temporarily unavailable.',
+    )
+
+    wrapper.unmount()
+  })
+
+  it('never displays text supplied by the warning payload', async () => {
+    const wrapper = mountApp()
+    await flushPromises()
+    const handleWarning = tauriPlugins.listen.mock.calls[0][1]
+
+    handleWarning({
+      payload: {
+        code: 'derived_state_unavailable',
+        message: 'internal backend detail',
+      },
+    })
+
+    expect(tauriPlugins.toastWarning).toHaveBeenCalledWith(
+      'Your change was saved, but derived views are temporarily unavailable.',
+    )
+    expect(tauriPlugins.toastWarning).not.toHaveBeenCalledWith('internal backend detail')
+
+    wrapper.unmount()
+  })
+
+  it('unlistens when the app is torn down', async () => {
+    const wrapper = mountApp()
+    await flushPromises()
+
+    wrapper.unmount()
+
+    expect(tauriPlugins.unlisten).toHaveBeenCalledOnce()
+  })
+
+  it('unlistens if teardown wins the asynchronous registration race', async () => {
+    let resolveListen
+    tauriPlugins.listen.mockReturnValue(new Promise((resolve) => {
+      resolveListen = resolve
+    }))
+    const wrapper = mountApp()
+
+    expect(tauriPlugins.listen).toHaveBeenCalledOnce()
+    wrapper.unmount()
+    resolveListen(tauriPlugins.unlisten)
+    await flushPromises()
+
+    expect(tauriPlugins.unlisten).toHaveBeenCalledOnce()
   })
 
   it('opens external links with the opener plugin', async () => {

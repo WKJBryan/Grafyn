@@ -25,10 +25,61 @@ import { isDesktopApp, isTauriApp } from '@/api/client'
 import { getRuntimeProfile, getTransport } from '@/api/transport'
 import { useBootStore } from '@/stores/boot'
 import { useGuide } from '@/composables/useGuide'
+import { useToast } from '@/composables/useToast'
+
+const COMMITTED_WARNING_EVENT = 'grafyn://committed-warning'
+const DEGRADED_READINESS_MESSAGE =
+  'Your change was saved, but derived views are temporarily unavailable.'
 
 const route = useRoute()
 const guide = useGuide()
 const boot = useBootStore()
+const toast = useToast()
+
+const seenCommittedWarnings = new Set()
+let committedWarningRegistrationStarted = false
+let committedWarningUnlisten = null
+let appUnmounted = false
+
+function committedWarningIdentity(payload) {
+  const warning = payload?.warning ?? payload
+  return JSON.stringify({
+    operation: payload?.operation ?? warning?.operation ?? null,
+    code: warning?.code ?? null,
+    message: warning?.message ?? null,
+  })
+}
+
+function handleCommittedWarning(event) {
+  if (appUnmounted) return
+
+  const identity = committedWarningIdentity(event?.payload)
+  if (seenCommittedWarnings.has(identity)) return
+
+  seenCommittedWarnings.add(identity)
+  toast.warning(DEGRADED_READINESS_MESSAGE)
+}
+
+async function registerCommittedWarningListener() {
+  if (committedWarningRegistrationStarted) return
+  committedWarningRegistrationStarted = true
+
+  try {
+    const unlisten = await getTransport().listen(
+      COMMITTED_WARNING_EVENT,
+      handleCommittedWarning,
+    )
+    if (appUnmounted) {
+      unlisten()
+      return
+    }
+    committedWarningUnlisten = unlisten
+  } catch (error) {
+    if (!appUnmounted) {
+      console.error('Failed to listen for committed mutation warnings:', error)
+    }
+  }
+}
 
 function handleExternalLinkClick(event) {
   let el = event.target
@@ -84,6 +135,7 @@ onMounted(() => {
 
   if (isTauriApp()) {
     document.addEventListener('click', handleExternalLinkClick)
+    void registerCommittedWarningListener()
   }
   if (isDesktopApp()) {
     void checkForDesktopUpdate()
@@ -100,8 +152,13 @@ watch(() => route.path, (path) => {
 })
 
 onBeforeUnmount(() => {
+  appUnmounted = true
   boot.cleanup()
   document.removeEventListener('click', handleExternalLinkClick)
+  if (typeof committedWarningUnlisten === 'function') {
+    committedWarningUnlisten()
+    committedWarningUnlisten = null
+  }
 })
 </script>
 
