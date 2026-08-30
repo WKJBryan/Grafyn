@@ -174,21 +174,27 @@ fn interrupted_note_target_refreshes_cache_from_durable_bytes_before_recovery() 
     );
     let mut store = KnowledgeStore::with_event_recorder(vault.clone(), data, coordinator.clone());
     coordinator.fail_once_at(crate::services::twin_events::MutationFaultPoint::AfterTarget(0));
-    assert!(store
+    let created = store
         .create_note(task_seven_note_create(
             "Durable before event",
             "survives restart",
             "durable-before-event.md",
         ))
-        .is_err());
+        .expect("the exact durable note effect must converge in-call");
+    let commit = store.take_last_mutation_commit().unwrap();
+    assert!(commit.postcommit_warning);
+    assert!(commit.mutation_id.is_some());
+    assert!(commit.authority_token.is_some());
+    assert_eq!(commit.events.len(), 1);
+    assert_eq!(created.id, "durable-before-event");
 
     assert!(vault.join("durable-before-event.md").exists());
     let cached = store.list_notes().unwrap();
     assert_eq!(cached.len(), 1);
     assert_eq!(cached[0].id, "durable-before-event");
-    assert!(event_store.ordered_events().unwrap().is_empty());
-    assert_eq!(coordinator.pending_count().unwrap(), 1);
-    assert_eq!(coordinator.recover_pending().unwrap(), 1);
+    assert_eq!(event_store.ordered_events().unwrap().len(), 1);
+    assert_eq!(coordinator.pending_count().unwrap(), 0);
+    assert_eq!(coordinator.recover_pending().unwrap(), 0);
     assert_eq!(event_store.ordered_events().unwrap().len(), 1);
 }
 
@@ -211,13 +217,14 @@ fn interrupted_note_delete_recovers_markdown_overlay_and_generation_together() {
         .unwrap(),
     );
     let scoped_data = coordinator.current_namespace_path().unwrap();
-    let mut store = KnowledgeStore::with_event_recorder(
-        vault.clone(),
-        scoped_data,
-        coordinator.clone(),
-    );
+    let mut store =
+        KnowledgeStore::with_event_recorder(vault.clone(), scoped_data, coordinator.clone());
     let created = store
-        .create_note(task_seven_note_create("Compound delete", "body", "compound.md"))
+        .create_note(task_seven_note_create(
+            "Compound delete",
+            "body",
+            "compound.md",
+        ))
         .unwrap();
     store
         .write_overlay(
@@ -230,22 +237,28 @@ fn interrupted_note_delete_recovers_markdown_overlay_and_generation_together() {
     let before_delete = coordinator.current_authority_token().unwrap();
 
     coordinator.fail_once_at(crate::services::twin_events::MutationFaultPoint::AfterTarget(0));
-    assert!(store.delete_note(&created.id).is_err());
-    let staged = coordinator.current_authority_token().unwrap();
+    store
+        .delete_note(&created.id)
+        .expect("the exact partial delete must converge in-call");
+    let commit = store.take_last_mutation_commit().unwrap();
+    assert!(commit.postcommit_warning);
+    assert!(commit.mutation_id.is_some());
+    assert_eq!(commit.events.len(), 1);
+    let committed = commit.authority_token.unwrap();
     assert_eq!(
-        staged.authority_generation,
+        committed.authority_generation,
         before_delete.authority_generation + 1
     );
     assert!(!vault.join("compound.md").exists());
-    assert!(overlay_path.exists());
-    assert_eq!(coordinator.pending_count().unwrap(), 1);
+    assert!(!overlay_path.exists());
+    assert_eq!(coordinator.pending_count().unwrap(), 0);
 
-    assert_eq!(coordinator.recover_pending().unwrap(), 1);
+    assert_eq!(coordinator.recover_pending().unwrap(), 0);
     assert!(!overlay_path.exists());
     assert_eq!(event_store.ordered_events().unwrap().len(), 2);
-    assert_eq!(coordinator.current_authority_token().unwrap(), staged);
+    assert_eq!(coordinator.current_authority_token().unwrap(), committed);
     assert_eq!(coordinator.recover_pending().unwrap(), 0);
-    assert_eq!(coordinator.current_authority_token().unwrap(), staged);
+    assert_eq!(coordinator.current_authority_token().unwrap(), committed);
 }
 
 #[test]
@@ -278,7 +291,7 @@ fn pending_update_is_recovered_before_fresh_note_fields_are_planned() {
     let mut stale = KnowledgeStore::with_event_recorder(vault.clone(), data, coordinator.clone());
 
     coordinator.fail_once_at(crate::services::twin_events::MutationFaultPoint::AfterStage);
-    assert!(first
+    let first_update = first
         .update_note(
             &created.id,
             NoteUpdate {
@@ -286,7 +299,15 @@ fn pending_update_is_recovered_before_fresh_note_fields_are_planned() {
                 ..Default::default()
             },
         )
-        .is_err());
+        .expect("the staged update must converge in-call");
+    assert_eq!(first_update.content, "recovered content");
+    let commit = first.take_last_mutation_commit().unwrap();
+    assert!(commit.postcommit_warning);
+    assert!(commit.mutation_id.is_some());
+    assert!(commit.authority_token.is_some());
+    assert_eq!(commit.events.len(), 1);
+    assert_eq!(coordinator.pending_count().unwrap(), 0);
+    assert_eq!(coordinator.recover_pending().unwrap(), 0);
     let updated = stale
         .update_note(
             &created.id,
@@ -325,13 +346,20 @@ fn pending_same_title_create_allocates_a_fresh_id_after_recovery() {
     let mut stale = KnowledgeStore::with_event_recorder(vault.clone(), data, coordinator.clone());
 
     coordinator.fail_once_at(crate::services::twin_events::MutationFaultPoint::AfterStage);
-    assert!(first
+    let first_created = first
         .create_note(task_seven_note_create(
             "Same title",
             "first",
-            "same-title.md"
+            "same-title.md",
         ))
-        .is_err());
+        .expect("the staged create must converge in-call");
+    let commit = first.take_last_mutation_commit().unwrap();
+    assert!(commit.postcommit_warning);
+    assert!(commit.mutation_id.is_some());
+    assert!(commit.authority_token.is_some());
+    assert_eq!(commit.events.len(), 1);
+    assert_eq!(coordinator.pending_count().unwrap(), 0);
+    assert_eq!(coordinator.recover_pending().unwrap(), 0);
     let second = stale
         .create_note(task_seven_note_create(
             "Same title",
@@ -345,6 +373,7 @@ fn pending_same_title_create_allocates_a_fresh_id_after_recovery() {
     assert_ne!(notes[0].id, notes[1].id);
     assert!(notes.iter().any(|note| note.content == "first"));
     assert!(notes.iter().any(|note| note.content == "second"));
+    assert_eq!(first_created.relative_path, "same-title.md");
     assert_ne!(second.relative_path, "same-title.md");
     assert_eq!(event_store.ordered_events().unwrap().len(), 2);
 }
@@ -372,9 +401,16 @@ fn pending_create_is_recovered_before_import_allocates_ids_and_paths() {
     let mut stale = KnowledgeStore::with_event_recorder(vault, data, coordinator.clone());
 
     coordinator.fail_once_at(crate::services::twin_events::MutationFaultPoint::AfterStage);
-    assert!(first
+    let first_created = first
         .create_note(task_seven_note_create("Shared title", "first", "shared.md"))
-        .is_err());
+        .expect("the staged create must converge in-call");
+    let commit = first.take_last_mutation_commit().unwrap();
+    assert!(commit.postcommit_warning);
+    assert!(commit.mutation_id.is_some());
+    assert!(commit.authority_token.is_some());
+    assert_eq!(commit.events.len(), 1);
+    assert_eq!(coordinator.pending_count().unwrap(), 0);
+    assert_eq!(coordinator.recover_pending().unwrap(), 0);
     let imported = stale
         .import_note_container(
             vec![task_seven_note_create(
@@ -390,6 +426,7 @@ fn pending_create_is_recovered_before_import_allocates_ids_and_paths() {
     let notes = stale.list_full_notes().unwrap();
     assert_eq!(notes.len(), 2);
     assert_ne!(notes[0].id, notes[1].id);
+    assert_eq!(first_created.relative_path, "shared.md");
     assert_ne!(imported[0].relative_path, "shared.md");
     assert!(notes.iter().any(|note| note.content == "first"));
     assert!(notes.iter().any(|note| note.content == "imported"));
@@ -423,7 +460,7 @@ fn pending_move_is_recovered_before_delete_resolves_the_durable_path() {
     let mut stale = KnowledgeStore::with_event_recorder(vault.clone(), data, coordinator.clone());
 
     coordinator.fail_once_at(crate::services::twin_events::MutationFaultPoint::AfterStage);
-    assert!(first
+    let moved = first
         .update_note(
             &created.id,
             NoteUpdate {
@@ -431,7 +468,17 @@ fn pending_move_is_recovered_before_delete_resolves_the_durable_path() {
                 ..Default::default()
             },
         )
-        .is_err());
+        .expect("the staged move must converge in-call");
+    let commit = first.take_last_mutation_commit().unwrap();
+    assert!(commit.postcommit_warning);
+    assert!(commit.mutation_id.is_some());
+    assert!(commit.authority_token.is_some());
+    assert_eq!(commit.events.len(), 1);
+    assert_eq!(moved.relative_path, "moved/new.md");
+    assert!(!vault.join("old.md").exists());
+    assert!(vault.join("moved/new.md").exists());
+    assert_eq!(coordinator.pending_count().unwrap(), 0);
+    assert_eq!(coordinator.recover_pending().unwrap(), 0);
     stale.delete_note(&created.id).unwrap();
 
     assert!(!vault.join("old.md").exists());
@@ -470,10 +517,11 @@ fn pending_update_is_recovered_before_restore_records_fresh_evidence() {
         .unwrap();
     let original = std::fs::read_to_string(vault.join("restore.md")).unwrap();
     let restored = original.replace("original body", "restored body");
-    let mut stale = KnowledgeStore::with_event_recorder(vault, data.clone(), coordinator.clone());
+    let mut stale =
+        KnowledgeStore::with_event_recorder(vault.clone(), data.clone(), coordinator.clone());
 
     coordinator.fail_once_at(crate::services::twin_events::MutationFaultPoint::AfterStage);
-    assert!(first
+    let updated = first
         .update_note(
             &created.id,
             NoteUpdate {
@@ -481,16 +529,18 @@ fn pending_update_is_recovered_before_restore_records_fresh_evidence() {
                 ..Default::default()
             },
         )
-        .is_err());
-    let pending_path = std::fs::read_dir(data.join("twin/mutations/pending/v1"))
-        .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path();
-    let pending: crate::services::twin_events::MutationIntentV1 =
-        serde_json::from_slice(&std::fs::read(pending_path).unwrap()).unwrap();
-    let recovered_digest = pending.targets[0].after_digest.clone();
+        .expect("the staged update must converge in-call");
+    assert_eq!(updated.content, "pending recovered body");
+    let commit = first.take_last_mutation_commit().unwrap();
+    assert!(commit.postcommit_warning);
+    assert!(commit.mutation_id.is_some());
+    assert!(commit.authority_token.is_some());
+    assert_eq!(commit.events.len(), 1);
+    let recovered_digest = crate::services::twin_events::digest_bytes(
+        &std::fs::read(vault.join("restore.md")).unwrap(),
+    );
+    assert_eq!(coordinator.pending_count().unwrap(), 0);
+    assert_eq!(coordinator.recover_pending().unwrap(), 0);
 
     let note = stale
         .restore_note_bytes_from_source("restore.md", restored.as_bytes(), "migration")
@@ -701,6 +751,53 @@ fn note_and_overlay_writes_are_atomic_with_no_tmp_litter() {
 }
 
 #[test]
+fn optimizer_provenanced_overlay_is_ignored_after_markdown_source_changes() {
+    let vault_dir = tempdir().expect("vault tempdir");
+    let data_dir = tempdir().expect("data tempdir");
+    let mut store = KnowledgeStore::new(
+        vault_dir.path().to_path_buf(),
+        data_dir.path().to_path_buf(),
+    );
+    let note = store
+        .create_note(task_seven_note_create(
+            "Bound Overlay",
+            "Original source",
+            "bound-overlay.md",
+        ))
+        .unwrap();
+    let markdown_path = vault_dir.path().join(&note.relative_path);
+    let original = std::fs::read(&markdown_path).unwrap();
+    let source_digest = crate::services::twin_events::digest_bytes(&original);
+    store
+        .write_overlay(
+            &note.id,
+            &serde_json::json!({
+                "tags": ["optimizer-bound"],
+                "_grafyn_optimizer_source_v1": {
+                    "relative_path": note.relative_path,
+                    "sha256": source_digest,
+                }
+            }),
+        )
+        .unwrap();
+    assert!(store
+        .get_note(&note.id)
+        .unwrap()
+        .tags
+        .contains(&"optimizer-bound".to_string()));
+
+    let mut edited = original;
+    edited.extend_from_slice(b"\nExternal edit.\n");
+    std::fs::write(&markdown_path, edited).unwrap();
+
+    assert!(!store
+        .get_note(&note.id)
+        .unwrap()
+        .tags
+        .contains(&"optimizer-bound".to_string()));
+}
+
+#[test]
 fn coordinated_overlay_write_invalidates_authority_without_emitting_an_event() {
     let root = tempdir().unwrap();
     let vault = root.path().join("vault");
@@ -719,13 +816,8 @@ fn coordinated_overlay_write_invalidates_authority_without_emitting_an_event() {
         .unwrap(),
     );
     let before = coordinator.current_authority_token().unwrap();
-    let scoped_data =
-        crate::services::vault_namespace::scoped_data_path(&data, &before.root_scope);
-    let store = KnowledgeStore::with_event_recorder(
-        vault,
-        scoped_data,
-        coordinator.clone(),
-    );
+    let scoped_data = crate::services::vault_namespace::scoped_data_path(&data, &before.root_scope);
+    let store = KnowledgeStore::with_event_recorder(vault, scoped_data, coordinator.clone());
 
     store
         .write_overlay(

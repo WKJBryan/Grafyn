@@ -334,11 +334,8 @@ impl CanvasStore {
         session.prompt_tiles.push(tile);
         session.updated_at = Utc::now();
         let session = session.clone();
-        let commit = self.write_session_file_internal(
-            &session,
-            Some((twin_store, decision)),
-            expected,
-        )?;
+        let commit =
+            self.write_session_file_internal(&session, Some((twin_store, decision)), expected)?;
         Ok((session, commit))
     }
 
@@ -516,7 +513,8 @@ impl CanvasStore {
 
     /// Add a debate to a session
     pub fn add_debate(&mut self, session_id: &str, debate: Debate) -> Result<()> {
-        self.add_debate_internal(session_id, debate, None).map(|_| ())
+        self.add_debate_internal(session_id, debate, None)
+            .map(|_| ())
     }
 
     pub(crate) fn add_debate_expecting_authority(
@@ -631,14 +629,7 @@ impl CanvasStore {
         cost_usd: Option<f64>,
     ) -> Result<()> {
         self.update_tile_response_internal(
-            session_id,
-            tile_id,
-            model_id,
-            content,
-            status,
-            error,
-            cost_usd,
-            None,
+            session_id, tile_id, model_id, content, status, error, cost_usd, None,
         )
         .map(|_| ())
     }
@@ -739,19 +730,17 @@ impl CanvasStore {
             .ok_or_else(|| anyhow::anyhow!("Failed to read file: {:?}", path))
     }
 
-    fn read_session_file_optional(
-        &self,
-        path: &std::path::Path,
-    ) -> Result<Option<CanvasSession>> {
+    fn read_session_file_optional(&self, path: &std::path::Path) -> Result<Option<CanvasSession>> {
         const CANVAS_JSON_LIMIT: usize = 16 * 1024 * 1024;
         let relative = path
             .strip_prefix(&self.data_path)
             .map_err(|_| anyhow::anyhow!("Canvas read escaped the configured store root"))?
             .to_string_lossy()
             .replace('\\', "/");
-        let root = self.root_capability.as_ref().ok_or_else(|| {
-            anyhow::anyhow!("Canvas store root capability could not be acquired")
-        })?;
+        let root = self
+            .root_capability
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Canvas store root capability could not be acquired"))?;
         let Some(bytes) = root
             .read_bounded(&relative, CANVAS_JSON_LIMIT)
             .map_err(anyhow::Error::new)?
@@ -793,6 +782,7 @@ impl CanvasStore {
                 mutation_id: None,
                 events: Vec::new(),
                 authority_token: None,
+                postcommit_warning: false,
             });
         }
 
@@ -802,11 +792,11 @@ impl CanvasStore {
         let mut committed_session = None;
         let mut committed_decision_trace = None;
         let mut planner = || {
-            let durable_before = self
-                .read_session_file_optional(&path_for_plan)
-                .map_err(|error| {
-                    crate::services::twin_events::MutationError::Invalid(error.to_string())
-                })?;
+            let durable_before =
+                self.read_session_file_optional(&path_for_plan)
+                    .map_err(|error| {
+                        crate::services::twin_events::MutationError::Invalid(error.to_string())
+                    })?;
             let after = match (&cached_base, &durable_before) {
                 (Some(base), Some(durable)) => {
                     merge_canvas_session_change(base, &candidate, durable).map_err(|error| {
@@ -863,19 +853,19 @@ impl CanvasStore {
         let commit = match persist {
             Ok(commit) => commit,
             Err(error) => {
-            match self.read_session_file(&path) {
-                Ok(durable) => {
-                    self.session_cache.insert(session.id.clone(), durable);
-                }
-                Err(_) => {
-                    if let Some(before) = before_error_fallback {
-                        self.session_cache.insert(session.id.clone(), before);
-                    } else {
-                        self.session_cache.remove(&session.id);
+                match self.read_session_file(&path) {
+                    Ok(durable) => {
+                        self.session_cache.insert(session.id.clone(), durable);
+                    }
+                    Err(_) => {
+                        if let Some(before) = before_error_fallback {
+                            self.session_cache.insert(session.id.clone(), before);
+                        } else {
+                            self.session_cache.remove(&session.id);
+                        }
                     }
                 }
-            }
-            return Err(anyhow::Error::new(error));
+                return Err(anyhow::Error::new(error));
             }
         };
         if let Some(committed) = committed_session {
@@ -1599,10 +1589,7 @@ mod tests {
                 assert!(commit.authority_token.is_some());
             } else {
                 let commit = twin
-                    .mark_twin_prediction_failed_expecting_authority(
-                        &episode_id,
-                        response_epoch,
-                    )
+                    .mark_twin_prediction_failed_expecting_authority(&episode_id, response_epoch)
                     .unwrap();
                 assert!(commit.authority_token.is_some());
             }
@@ -1632,7 +1619,10 @@ mod tests {
                     )
                     .unwrap();
                 assert!(duplicate.authority_token.is_none());
-                assert_eq!(coordinator.current_authority_token().unwrap(), after_failure);
+                assert_eq!(
+                    coordinator.current_authority_token().unwrap(),
+                    after_failure
+                );
             }
         }
     }

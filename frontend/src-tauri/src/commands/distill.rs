@@ -881,9 +881,8 @@ pub async fn distill_note(
                         };
 
                         if let Some((_updated_note, commit)) = updated {
-                            root_epoch = commit
-                                .authority_token
-                                .unwrap_or_else(|| root_epoch.clone());
+                            root_epoch =
+                                commit.authority_token.unwrap_or_else(|| root_epoch.clone());
                         }
                     }
 
@@ -943,16 +942,10 @@ pub async fn distill_note(
         let (created, commit) = {
             let mut store = state.knowledge_store.write().await;
             store
-                .create_note_expecting_authority(
-                    note_create,
-                    "note_editor",
-                    root_epoch.clone(),
-                )
+                .create_note_expecting_authority(note_create, "note_editor", root_epoch.clone())
                 .map_err(|e| e.to_string())?
         };
-        root_epoch = commit
-            .authority_token
-            .unwrap_or_else(|| root_epoch.clone());
+        root_epoch = commit.authority_token.unwrap_or_else(|| root_epoch.clone());
 
         created_ids.push(created.id.clone());
     }
@@ -996,19 +989,12 @@ pub async fn distill_note(
         let updated = {
             let mut store = state.knowledge_store.write().await;
             store
-                .update_note_expecting_authority(
-                    &id,
-                    update,
-                    "note_editor",
-                    root_epoch.clone(),
-                )
+                .update_note_expecting_authority(&id, update, "note_editor", root_epoch.clone())
                 .ok()
         };
 
         if let Some((_updated_note, commit)) = updated {
-            root_epoch = commit
-                .authority_token
-                .unwrap_or_else(|| root_epoch.clone());
+            root_epoch = commit.authority_token.unwrap_or_else(|| root_epoch.clone());
             true
         } else {
             false
@@ -1053,7 +1039,7 @@ pub async fn distill_note(
         parts.push(fallback);
     }
     if let crate::commands::PostAuthorityRepair::Unavailable(warning) = repair {
-        parts.push(warning);
+        parts.push(warning.to_string());
     }
     let message = parts.join(", ");
 

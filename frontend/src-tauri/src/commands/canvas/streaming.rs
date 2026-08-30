@@ -35,11 +35,18 @@ const LLM_NODE_X_GAP: f64 = 80.0;
 
 type StreamedResponseUpdate = (String, String, ResponseStatus, Option<String>, Option<f64>);
 
-fn no_cost_stream<S>(stream: S) -> std::pin::Pin<Box<dyn futures::Stream<Item = anyhow::Result<StreamUpdate>> + Send>>
+fn no_cost_stream<S>(
+    stream: S,
+) -> std::pin::Pin<Box<dyn futures::Stream<Item = anyhow::Result<StreamUpdate>> + Send>>
 where
     S: futures::Stream<Item = anyhow::Result<String>> + Send + 'static,
 {
-    Box::pin(stream.map(|result| result.map(|content| StreamUpdate { content, cost_usd: None })))
+    Box::pin(stream.map(|result| {
+        result.map(|content| StreamUpdate {
+            content,
+            cost_usd: None,
+        })
+    }))
 }
 
 /// Send a prompt to multiple models with streaming responses via Tauri events.
@@ -196,11 +203,7 @@ pub async fn send_prompt(
                 .1
         } else {
             store
-                .add_tile_expecting_authority(
-                    &session_id,
-                    tile.clone(),
-                    input_root_epoch.clone(),
-                )
+                .add_tile_expecting_authority(&session_id, tile.clone(), input_root_epoch.clone())
                 .map_err(|error| error.to_string())?
                 .1
         }
@@ -296,7 +299,7 @@ pub async fn send_prompt(
                 },
             );
             for model_id in &request.models {
-                emit_canvas_error(&window, &session_id, &tile_id, model_id, &warning);
+                emit_canvas_error(&window, &session_id, &tile_id, model_id, &warning.message);
             }
             return Ok(tile_id);
         }
@@ -426,7 +429,15 @@ pub async fn send_prompt(
                             )
                             .await;
                         drop(openrouter);
-                        result.map(|stream| Box::pin(stream) as std::pin::Pin<Box<dyn futures::Stream<Item = anyhow::Result<StreamUpdate>> + Send>>)
+                        result.map(|stream| {
+                            Box::pin(stream)
+                                as std::pin::Pin<
+                                    Box<
+                                        dyn futures::Stream<Item = anyhow::Result<StreamUpdate>>
+                                            + Send,
+                                    >,
+                                >
+                        })
                     }
                 };
 
@@ -507,7 +518,13 @@ pub async fn send_prompt(
                     Err(e) => {
                         let error = e.to_string();
                         emit_canvas_error(&window, &session_id, &tile_id, &model_id, &error);
-                        (model_id, String::new(), ResponseStatus::Error, Some(error), None)
+                        (
+                            model_id,
+                            String::new(),
+                            ResponseStatus::Error,
+                            Some(error),
+                            None,
+                        )
                     }
                 }
             });
@@ -631,18 +648,21 @@ pub async fn send_prompt(
                     continue;
                 }
 
-                let (_, commit) = match twin_store.record_reflection_card_expecting_authority(ReflectionCardCreate {
-                    decision_episode_id: decision_episode_id.to_string(),
-                    session_id: session_id_clone.clone(),
-                    tile_id: tile_id_clone.clone(),
-                    model_id: model_id.clone(),
-                    content: content.clone(),
-                    cited_note_ids: reflection_note_ids.clone(),
-                    cited_user_record_ids: reflection_user_record_ids.clone(),
-                    cited_constitution_item_ids: reflection_constitution_item_ids.clone(),
-                    cited_action_gap_ids: reflection_action_gap_ids.clone(),
-                    evidence_packet: None,
-                }, publication_epoch.clone()) {
+                let (_, commit) = match twin_store.record_reflection_card_expecting_authority(
+                    ReflectionCardCreate {
+                        decision_episode_id: decision_episode_id.to_string(),
+                        session_id: session_id_clone.clone(),
+                        tile_id: tile_id_clone.clone(),
+                        model_id: model_id.clone(),
+                        content: content.clone(),
+                        cited_note_ids: reflection_note_ids.clone(),
+                        cited_user_record_ids: reflection_user_record_ids.clone(),
+                        cited_constitution_item_ids: reflection_constitution_item_ids.clone(),
+                        cited_action_gap_ids: reflection_action_gap_ids.clone(),
+                        evidence_packet: None,
+                    },
+                    publication_epoch.clone(),
+                ) {
                     Ok(committed) => committed,
                     Err(error) => {
                         log::error!("Failed to persist governed reflection card: {error}");
@@ -967,7 +987,15 @@ pub async fn add_models_to_tile(
                             )
                             .await;
                         drop(openrouter);
-                        result.map(|stream| Box::pin(stream) as std::pin::Pin<Box<dyn futures::Stream<Item = anyhow::Result<StreamUpdate>> + Send>>)
+                        result.map(|stream| {
+                            Box::pin(stream)
+                                as std::pin::Pin<
+                                    Box<
+                                        dyn futures::Stream<Item = anyhow::Result<StreamUpdate>>
+                                            + Send,
+                                    >,
+                                >
+                        })
                     }
                 };
 
@@ -1048,7 +1076,13 @@ pub async fn add_models_to_tile(
                     Err(e) => {
                         let error = e.to_string();
                         emit_canvas_error(&window, &session_id, &tile_id, &model_id, &error);
-                        (model_id, String::new(), ResponseStatus::Error, Some(error), None)
+                        (
+                            model_id,
+                            String::new(),
+                            ResponseStatus::Error,
+                            Some(error),
+                            None,
+                        )
                     }
                 }
             });
@@ -1062,28 +1096,26 @@ pub async fn add_models_to_tile(
             }
         }
 
-        let root_guard = match crate::commands::acquire_expected_root_epoch(
-            &stream_root_state,
-            &root_epoch,
-        )
-        .await
-        {
-            Ok(guard) => guard,
-            Err(error) => {
-                let model_ids = results
-                    .iter()
-                    .map(|(model_id, _, _, _, _)| model_id.clone())
-                    .collect::<Vec<_>>();
-                emit_persistence_error(
-                    &window,
-                    &session_id,
-                    &tile_id,
-                    &model_ids,
-                    &anyhow::anyhow!(error),
-                );
-                return;
-            }
-        };
+        let root_guard =
+            match crate::commands::acquire_expected_root_epoch(&stream_root_state, &root_epoch)
+                .await
+            {
+                Ok(guard) => guard,
+                Err(error) => {
+                    let model_ids = results
+                        .iter()
+                        .map(|(model_id, _, _, _, _)| model_id.clone())
+                        .collect::<Vec<_>>();
+                    emit_persistence_error(
+                        &window,
+                        &session_id,
+                        &tile_id,
+                        &model_ids,
+                        &anyhow::anyhow!(error),
+                    );
+                    return;
+                }
+            };
 
         // Batch update store
         let response_commit = {
@@ -1267,7 +1299,12 @@ pub async fn regenerate_response(
                     )
                     .await;
                 drop(openrouter);
-                result.map(|stream| Box::pin(stream) as std::pin::Pin<Box<dyn futures::Stream<Item = anyhow::Result<StreamUpdate>> + Send>>)
+                result.map(|stream| {
+                    Box::pin(stream)
+                        as std::pin::Pin<
+                            Box<dyn futures::Stream<Item = anyhow::Result<StreamUpdate>> + Send>,
+                        >
+                })
             }
         };
 
@@ -1337,24 +1374,22 @@ pub async fn regenerate_response(
             }
         };
 
-        let root_guard = match crate::commands::acquire_expected_root_epoch(
-            &stream_root_state,
-            &root_epoch,
-        )
-        .await
-        {
-            Ok(guard) => guard,
-            Err(error) => {
-                emit_persistence_error(
-                    &window,
-                    &session_id,
-                    &tile_id,
-                    std::slice::from_ref(&model_id),
-                    &anyhow::anyhow!(error),
-                );
-                return;
-            }
-        };
+        let root_guard =
+            match crate::commands::acquire_expected_root_epoch(&stream_root_state, &root_epoch)
+                .await
+            {
+                Ok(guard) => guard,
+                Err(error) => {
+                    emit_persistence_error(
+                        &window,
+                        &session_id,
+                        &tile_id,
+                        std::slice::from_ref(&model_id),
+                        &anyhow::anyhow!(error),
+                    );
+                    return;
+                }
+            };
         let response_commit = {
             let mut store = canvas_store_arc.write().await;
             match store.update_tile_response_expecting_authority(
@@ -1407,11 +1442,11 @@ pub async fn regenerate_response(
         };
         if !matches!(
             crate::commands::repair_after_authority_token(
-            &stream_root_state,
-            &publication_epoch,
-            "Canvas response regeneration",
-        )
-        .await,
+                &stream_root_state,
+                &publication_epoch,
+                "Canvas response regeneration",
+            )
+            .await,
             crate::commands::PostAuthorityRepair::Ready(_)
         ) {
             return;
@@ -1529,7 +1564,13 @@ fn emit_persistence_error(
     }
 }
 
-fn emit_canvas_complete(window: &tauri::WebviewWindow, session_id: &str, tile_id: &str, model_id: &str, cost_usd: Option<f64>) {
+fn emit_canvas_complete(
+    window: &tauri::WebviewWindow,
+    session_id: &str,
+    tile_id: &str,
+    model_id: &str,
+    cost_usd: Option<f64>,
+) {
     let _ = window.emit(
         "canvas-stream",
         CanvasStreamEvent::Complete {
@@ -1574,7 +1615,13 @@ fn classify_streamed_model_response(
             None,
         )
     } else {
-        (model_id, full_content, ResponseStatus::Completed, None, None)
+        (
+            model_id,
+            full_content,
+            ResponseStatus::Completed,
+            None,
+            None,
+        )
     }
 }
 

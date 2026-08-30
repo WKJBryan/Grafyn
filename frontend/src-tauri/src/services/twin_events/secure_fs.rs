@@ -13,6 +13,15 @@ pub(crate) struct AnchoredRoot {
     dir: Dir,
 }
 
+impl std::fmt::Debug for AnchoredRoot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AnchoredRoot")
+            .field("canonical_path", &self.canonical_path)
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AnchoredEntryKind {
     File,
@@ -226,7 +235,10 @@ impl AnchoredRoot {
                     sync_dir(&destination.parent)?;
                     Ok(())
                 }
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    sync_dir(&destination.parent)?;
+                    Ok(())
+                }
                 Err(error) => Err(error.into()),
             };
         let cleanup = staging.parent.remove_file_or_symlink(&staging.leaf);
@@ -379,10 +391,7 @@ impl AnchoredTarget {
             }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                 let mut existing = OpenOptions::new();
-                existing
-                    .read(true)
-                    .write(true)
-                    .follow(FollowSymlinks::No);
+                existing.read(true).write(true).follow(FollowSymlinks::No);
                 configure_lock_sharing(&mut existing);
                 let file = self.parent.open_with(&self.leaf, &existing)?;
                 if !file.metadata()?.is_file() {
@@ -473,7 +482,7 @@ impl AnchoredTarget {
             Ok(_) => Err(MutationError::Invalid(
                 "capability target is not a regular file or symlink".into(),
             )),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => sync_dir(&self.parent),
             Err(error) => Err(error.into()),
         }
     }

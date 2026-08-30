@@ -1,5 +1,5 @@
-use chrono::{DateTime, Utc};
 use crate::models::twin_event::ContentDigest;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -190,7 +190,8 @@ pub struct VaultOptimizerSettingsUpdate {
     pub vault_optimizer_program_path: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct VaultOptimizerDecision {
     pub id: String,
     #[serde(default)]
@@ -209,7 +210,8 @@ pub struct VaultOptimizerDecision {
     pub change_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct VaultOptimizerInboxEntry {
     pub id: String,
     #[serde(default)]

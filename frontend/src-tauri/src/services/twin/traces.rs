@@ -1,6 +1,5 @@
 use super::shared::{
-    excerpt, extract_event_model_id, extract_event_tile_id, first_payload_string,
-    payload_string,
+    excerpt, extract_event_model_id, extract_event_tile_id, first_payload_string, payload_string,
 };
 use super::TwinStore;
 use crate::models::twin::{
@@ -142,10 +141,7 @@ impl TwinStore {
         event_type: TraceEventType,
         payload: serde_json::Value,
         expected: crate::services::vault_namespace::VaultAuthorityTokenV1,
-    ) -> Result<(
-        TraceEvent,
-        crate::services::twin_events::MutationCommit,
-    )> {
+    ) -> Result<(TraceEvent, crate::services::twin_events::MutationCommit)> {
         self.append_trace_event_internal(session_id, event_type, payload, Some(expected))
     }
 
@@ -155,10 +151,7 @@ impl TwinStore {
         event_type: TraceEventType,
         payload: serde_json::Value,
         expected: Option<crate::services::vault_namespace::VaultAuthorityTokenV1>,
-    ) -> Result<(
-        TraceEvent,
-        crate::services::twin_events::MutationCommit,
-    )> {
+    ) -> Result<(TraceEvent, crate::services::twin_events::MutationCommit)> {
         if !self.event_recorder.is_noop() {
             Self::validate_file_id(session_id)?;
             let recorder = self.event_recorder.clone();
@@ -193,8 +186,8 @@ impl TwinStore {
                 &mut planner,
             );
             let commit = self.finish_mutation_commit(result)?;
-            let (event, trace) = committed
-                .ok_or_else(|| anyhow::anyhow!("trace append was not planned"))?;
+            let (event, trace) =
+                committed.ok_or_else(|| anyhow::anyhow!("trace append was not planned"))?;
             self.cache_committed_trace(trace);
             return Ok((event, commit));
         }
@@ -207,6 +200,7 @@ impl TwinStore {
                 mutation_id: None,
                 events: Vec::new(),
                 authority_token: None,
+                postcommit_warning: false,
             },
         ))
     }
@@ -322,8 +316,8 @@ impl TwinStore {
             } else {
                 &evidence_ref.trace_id
             };
-            let Some(trace) = self
-                .read_twin_json_bounded::<SessionTrace>(&self.trace_file_path(trace_id))?
+            let Some(trace) =
+                self.read_twin_json_bounded::<SessionTrace>(&self.trace_file_path(trace_id))?
             else {
                 continue;
             };
@@ -379,11 +373,7 @@ mod tests {
             .unwrap(),
         );
         (
-            TwinStore::with_event_recorder(
-                twin_root,
-                data.join("twin"),
-                coordinator.clone(),
-            ),
+            TwinStore::with_event_recorder(twin_root, data.join("twin"), coordinator.clone()),
             coordinator,
         )
     }

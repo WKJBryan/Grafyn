@@ -44,7 +44,8 @@ struct AuthorityGenerationV1 {
     authority_generation: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct VaultAuthorityTokenV1 {
     pub(crate) root_scope: ContentDigest,
     pub(crate) lease_epoch_uuid: String,
@@ -454,14 +455,13 @@ fn initialize_authority_generation(root: &AnchoredRoot) -> Result<(), MutationEr
     read_authority_generation(root).map(|_| ())
 }
 
-fn read_authority_generation(
-    root: &AnchoredRoot,
-) -> Result<AuthorityGenerationV1, MutationError> {
+fn read_authority_generation(root: &AnchoredRoot) -> Result<AuthorityGenerationV1, MutationError> {
     let bytes = root
         .read_bounded(AUTHORITY_GENERATION_KEY, MARKER_LIMIT)?
         .ok_or_else(|| MutationError::Invalid("authority generation is missing".into()))?;
-    let generation: AuthorityGenerationV1 = serde_json::from_slice(&bytes)
-        .map_err(|error| MutationError::Invalid(format!("invalid authority generation: {error}")))?;
+    let generation: AuthorityGenerationV1 = serde_json::from_slice(&bytes).map_err(|error| {
+        MutationError::Invalid(format!("invalid authority generation: {error}"))
+    })?;
     if generation.schema_version != AUTHORITY_SCHEMA_VERSION {
         return Err(MutationError::Invalid(
             "unsupported authority generation schema".into(),

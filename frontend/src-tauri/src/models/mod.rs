@@ -5,6 +5,7 @@ pub mod import;
 pub mod link_discovery;
 pub mod memory;
 pub mod migration;
+pub mod mutation;
 pub mod note;
 pub mod settings;
 pub mod twin;

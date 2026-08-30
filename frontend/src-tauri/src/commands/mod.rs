@@ -43,6 +43,7 @@ use crate::services::index_commit;
 use crate::services::retrieval::RetrievalResult;
 use crate::AppState;
 use std::collections::HashSet;
+use tauri::Emitter;
 
 #[derive(Debug)]
 pub(crate) struct RootReadTicket {
@@ -74,16 +75,16 @@ impl RootReadTicket {
     }
 }
 
-pub(crate) async fn acquire_root_epoch(
-    state: &AppState,
-) -> Result<RootReadTicket, String> {
+pub(crate) async fn acquire_root_epoch(state: &AppState) -> Result<RootReadTicket, String> {
     let guard = state.vault_transition.clone().read_owned().await;
     ensure_root_healthy(state).await?;
     let coordinator = state
         .mutation_coordinator
         .as_ref()
         .ok_or_else(|| "mutation coordinator is unavailable".to_string())?;
-    let authority = coordinator.current_authority_token().map_err(|error| error.to_string())?;
+    let authority = coordinator
+        .current_authority_token()
+        .map_err(|error| error.to_string())?;
     Ok(RootReadTicket {
         _transition_guard: guard,
         authority,
@@ -91,9 +92,7 @@ pub(crate) async fn acquire_root_epoch(
     })
 }
 
-pub(crate) async fn acquire_derived_root_epoch(
-    state: &AppState,
-) -> Result<RootReadTicket, String> {
+pub(crate) async fn acquire_derived_root_epoch(state: &AppState) -> Result<RootReadTicket, String> {
     let mut ticket = acquire_root_epoch(state).await?;
     let coordinator = state
         .mutation_coordinator
@@ -111,7 +110,9 @@ pub(crate) async fn acquire_derived_root_epoch(
 
 pub(crate) async fn ensure_root_healthy(state: &AppState) -> Result<(), String> {
     if let Some(error) = state.mutation_startup_error.read().await.as_ref() {
-        return Err(format!("Grafyn storage is unavailable until restart: {error}"));
+        return Err(format!(
+            "Grafyn storage is unavailable until restart: {error}"
+        ));
     }
     Ok(())
 }
@@ -155,11 +156,11 @@ pub(crate) async fn acquire_expected_derived_root_epoch(
 #[cfg(test)]
 mod root_epoch_source_guards {
     fn function_body<'a>(source: &'a str, signature: &str, next_marker: &str) -> &'a str {
-        let start = source.find(signature).expect("command signature should exist");
+        let start = source
+            .find(signature)
+            .expect("command signature should exist");
         let rest = &source[start..];
-        let end = rest
-            .find(next_marker)
-            .unwrap_or(rest.len());
+        let end = rest.find(next_marker).unwrap_or(rest.len());
         &rest[..end]
     }
 
@@ -169,9 +170,7 @@ mod root_epoch_source_guards {
             .find(&signature)
             .unwrap_or_else(|| panic!("command {name} should exist"));
         let rest = &source[start..];
-        let end = rest
-            .find("\n#[tauri::command]")
-            .unwrap_or(rest.len());
+        let end = rest.find("\n#[tauri::command]").unwrap_or(rest.len());
         &rest[..end]
     }
 
@@ -192,10 +191,7 @@ mod root_epoch_source_guards {
                     "get_full_graph",
                 ][..],
             ),
-            (
-                include_str!("retrieval.rs"),
-                &["retrieve_relevant"][..],
-            ),
+            (include_str!("retrieval.rs"), &["retrieve_relevant"][..]),
             (
                 include_str!("memory.rs"),
                 &["recall_relevant", "find_contradictions"][..],
@@ -212,10 +208,7 @@ mod root_epoch_source_guards {
             ),
             (
                 include_str!("zettelkasten.rs"),
-                &[
-                    "list_link_suggestion_queue",
-                    "get_link_discovery_status",
-                ][..],
+                &["list_link_suggestion_queue", "get_link_discovery_status"][..],
             ),
             (
                 include_str!("twin.rs"),
@@ -288,8 +281,14 @@ mod root_epoch_source_guards {
     fn root_dependent_read_commands_take_the_transition_gate_before_service_locks() {
         let retrieval = include_str!("retrieval.rs");
         for (signature, next_marker) in [
-            ("pub async fn retrieve_relevant", "/// Get current retrieval configuration"),
-            ("pub async fn get_retrieval_config", "/// Update retrieval configuration"),
+            (
+                "pub async fn retrieve_relevant",
+                "/// Get current retrieval configuration",
+            ),
+            (
+                "pub async fn get_retrieval_config",
+                "/// Update retrieval configuration",
+            ),
             ("pub async fn update_retrieval_config", "\n}"),
         ] {
             let body = function_body(retrieval, signature, next_marker);
@@ -301,13 +300,22 @@ mod root_epoch_source_guards {
                 .find("retrieval_service")
                 .or_else(|| body.find("run_retrieval"))
                 .expect("retrieval command must access its root-dependent service");
-            assert!(gate < service, "root gate must precede retrieval service access");
+            assert!(
+                gate < service,
+                "root gate must precede retrieval service access"
+            );
         }
 
         let mcp = include_str!("mcp.rs");
         for (signature, next_marker) in [
-            ("pub async fn get_mcp_status", "/// Get the Claude Desktop config snippet"),
-            ("pub async fn get_mcp_config_snippet", "/// Find the grafyn-mcp binary"),
+            (
+                "pub async fn get_mcp_status",
+                "/// Get the Claude Desktop config snippet",
+            ),
+            (
+                "pub async fn get_mcp_config_snippet",
+                "/// Find the grafyn-mcp binary",
+            ),
         ] {
             let body = function_body(mcp, signature, next_marker);
             let gate = body
@@ -680,10 +688,7 @@ pub(crate) async fn remove_note_chunks_from_index(state: &AppState, note_id: &st
     }
 }
 
-pub(crate) async fn rebuild_link_discovery(
-    state: &AppState,
-    notes: &[Note],
-) -> Result<(), String> {
+pub(crate) async fn rebuild_link_discovery(state: &AppState, notes: &[Note]) -> Result<(), String> {
     let coordinator = state
         .mutation_coordinator
         .as_ref()
@@ -763,12 +768,15 @@ pub(crate) async fn remove_link_discovery_note(
         .map_err(|error| error.to_string())
 }
 
+async fn normalize_topic_hubs_only(
+    state: &AppState,
+) -> Result<crate::services::topic_hub::TopicHubSyncResult, String> {
+    let mut store = state.knowledge_store.write().await;
+    crate::services::topic_hub::sync_topic_hubs(&mut store).map_err(|error| error.to_string())
+}
+
 pub(crate) async fn sync_topic_hubs(state: &AppState) -> Result<Vec<Note>, String> {
-    let sync_result = {
-        let mut store = state.knowledge_store.write().await;
-        crate::services::topic_hub::sync_topic_hubs(&mut store)
-            .map_err(|error| error.to_string())?
-    };
+    let sync_result = normalize_topic_hubs_only(state).await?;
 
     let changed_ids = sync_result
         .changed_note_ids
@@ -857,80 +865,227 @@ pub(crate) async fn rebuild_all_indexes(state: &AppState) -> Result<Vec<Note>, S
 
 /// Rebuild every derived reader against one exact authority generation and
 /// publish readiness only if that generation is still current.
-pub(crate) async fn rebuild_and_publish_current_authority(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AuthorityRepairStep {
+    Normalized,
+    Captured,
+    TwinCaches,
+    Search,
+    Chunk,
+    Graph,
+    LinkDiscovery,
+    Optimizer,
+}
+
+/// Every local guard used by a complete rebuild. They are acquired before the
+/// cross-process coordinator guard so a note/Twin mutation that already holds
+/// its service lock while committing cannot form an ABBA deadlock with repair.
+pub(crate) struct AuthorityRepairGuards<'a> {
+    knowledge: tokio::sync::RwLockWriteGuard<'a, crate::services::knowledge_store::KnowledgeStore>,
+    twin: tokio::sync::RwLockWriteGuard<'a, crate::services::twin::TwinStore>,
+    search: tokio::sync::RwLockWriteGuard<'a, crate::services::search::SearchService>,
+    chunks: tokio::sync::RwLockWriteGuard<'a, crate::services::chunk_index::ChunkIndex>,
+    graph: tokio::sync::RwLockWriteGuard<'a, crate::services::graph_index::GraphIndex>,
+    discovery:
+        tokio::sync::RwLockWriteGuard<'a, crate::services::link_discovery::LinkDiscoveryService>,
+    optimizer:
+        tokio::sync::RwLockWriteGuard<'a, crate::services::vault_optimizer::VaultOptimizerService>,
+    _optimizer_state_lock: crate::services::twin_events::AnchoredExclusiveLock,
+    loaded: tokio::sync::RwLockWriteGuard<
+        'a,
+        Option<crate::services::vault_namespace::VaultAuthorityTokenV1>,
+    >,
+}
+
+pub(crate) async fn acquire_authority_repair_guards(
     state: &AppState,
-    expected: &crate::services::vault_namespace::VaultAuthorityTokenV1,
+) -> Result<AuthorityRepairGuards<'_>, String> {
+    // Canonical order. In particular Knowledge always precedes Optimizer.
+    let knowledge = state.knowledge_store.write().await;
+    let twin = state.twin_store.write().await;
+    let search = state.search_service.write().await;
+    let chunks = state.chunk_index.write().await;
+    let graph = state.graph_index.write().await;
+    let discovery = state.link_discovery.write().await;
+    let optimizer = state.vault_optimizer.write().await;
+    let optimizer_state_lock = optimizer
+        .acquire_state_lock()
+        .map_err(|error| error.to_string())?;
+    let loaded = state.loaded_authority.write().await;
+    Ok(AuthorityRepairGuards {
+        knowledge,
+        twin,
+        search,
+        chunks,
+        graph,
+        discovery,
+        optimizer,
+        _optimizer_state_lock: optimizer_state_lock,
+        loaded,
+    })
+}
+
+/// Rebuilds and publishes while `guard` continuously owns the shared process
+/// lock. This function is deliberately synchronous: all Tokio service guards
+/// were acquired first, and no local lock await is permitted after this point.
+pub(crate) fn rebuild_authority_with_retained_guard(
+    guards: &mut AuthorityRepairGuards<'_>,
+    guard: &crate::services::twin_events::MutationRootTransitionGuard<'_>,
+    expected_root: &crate::services::vault_namespace::VaultAuthorityTokenV1,
+    mut checkpoint: impl FnMut(AuthorityRepairStep) -> Result<(), String>,
 ) -> Result<crate::services::vault_namespace::VaultAuthorityTokenV1, String> {
-    let coordinator = state
-        .mutation_coordinator
-        .as_ref()
-        .ok_or_else(|| "mutation coordinator is unavailable".to_string())?;
-    coordinator
-        .validate_authority_token(expected, false)
+    let lease = guard.current_lease().map_err(|error| error.to_string())?;
+    let token = guard
+        .capture_authority_token(&lease)
         .map_err(|error| error.to_string())?;
-    *state.loaded_authority.write().await = None;
-
-    // Topic-hub normalization is authoritative. Run it before capturing the
-    // generation used by the rebuild, then fence every derived publication by
-    // the exact post-normalization token.
-    sync_topic_hubs(state).await?;
-    let token = coordinator
-        .current_authority_token()
+    if token.root_scope != expected_root.root_scope
+        || token.lease_epoch_uuid != expected_root.lease_epoch_uuid
+    {
+        return Err("vault root changed before authority repair".into());
+    }
+    if guards.loaded.as_ref().is_some_and(|loaded| {
+        loaded.root_scope == token.root_scope
+            && loaded.lease_epoch_uuid == token.lease_epoch_uuid
+            && loaded.authority_generation > token.authority_generation
+    }) {
+        return Err("loaded authority is newer than the durable repair token".into());
+    }
+    *guards.loaded = None;
+    guard
+        .invalidate_namespace(&lease)
         .map_err(|error| error.to_string())?;
+    checkpoint(AuthorityRepairStep::Captured)?;
 
-    // The normalization above may have raced a peer writer after reading its
-    // input. Reload every authoritative source only after the exact rebuild
-    // token is captured, then reject any peer change before publishing.
-    let notes = {
-        let mut knowledge = state.knowledge_store.write().await;
-        knowledge.reload_authoritative_state();
-        knowledge
-            .list_full_notes()
-            .map_err(|error| error.to_string())?
-    };
-    state
-        .twin_store
-        .write()
-        .await
+    guards.knowledge.reload_authoritative_state();
+    let notes = guards
+        .knowledge
+        .list_full_notes()
+        .map_err(|error| error.to_string())?;
+    guards
+        .twin
         .rebuild_mutation_caches()
         .map_err(|error| error.to_string())?;
-    coordinator
+    checkpoint(AuthorityRepairStep::TwinCaches)?;
+    guard
         .validate_authority_token(&token, false)
         .map_err(|error| error.to_string())?;
 
-    {
-        let mut search = state.search_service.write().await;
-        search.reindex_all(&notes).map_err(|error| error.to_string())?;
-    }
-    {
-        let mut chunks = state.chunk_index.write().await;
-        chunks
-            .reindex_all(&notes)
-            .map_err(|error| error.to_string())?;
-    }
-    {
-        let mut graph = state.graph_index.write().await;
-        graph.build_from_notes(&notes);
-    }
-    rebuild_link_discovery_at(state, &notes, &token).await?;
-    bootstrap_vault_optimizer(state, &notes).await?;
+    guards
+        .search
+        .reindex_all(&notes)
+        .map_err(|error| error.to_string())?;
+    checkpoint(AuthorityRepairStep::Search)?;
+    guards
+        .chunks
+        .reindex_all(&notes)
+        .map_err(|error| error.to_string())?;
+    checkpoint(AuthorityRepairStep::Chunk)?;
+    guards.graph.build_from_notes(&notes);
+    checkpoint(AuthorityRepairStep::Graph)?;
+    guards
+        .discovery
+        .reload_from_disk_checked()
+        .map_err(|error| error.to_string())?;
+    guards
+        .discovery
+        .bootstrap_checked(&notes)
+        .map_err(|error| error.to_string())?;
+    checkpoint(AuthorityRepairStep::LinkDiscovery)?;
+    guards
+        .optimizer
+        .reload_from_disk_checked()
+        .map_err(|error| error.to_string())?;
+    guards
+        .optimizer
+        .recover_pending_publications_locked(&guards.knowledge, guard)
+        .map_err(|error| error.to_string())?;
+    guards
+        .optimizer
+        .bootstrap_checked(&notes)
+        .map_err(|error| error.to_string())?;
+    checkpoint(AuthorityRepairStep::Optimizer)?;
 
-    let guard = coordinator
-        .begin_root_transition()
+    guard
+        .validate_authority_token(&token, false)
         .map_err(|error| error.to_string())?;
     guard
         .publish_namespace_ready(&token)
         .map_err(|error| error.to_string())?;
-    drop(guard);
-    *state.loaded_authority.write().await = Some(token.clone());
+    *guards.loaded = Some(token.clone());
     Ok(token)
 }
 
+async fn rebuild_and_publish_current_authority_inner(
+    state: &AppState,
+    expected: &crate::services::vault_namespace::VaultAuthorityTokenV1,
+    mut checkpoint: impl FnMut(AuthorityRepairStep) -> Result<(), String>,
+) -> Result<crate::services::vault_namespace::VaultAuthorityTokenV1, String> {
+    let _repair = state.authority_repair.lock().await;
+    let coordinator = state
+        .mutation_coordinator
+        .as_ref()
+        .ok_or_else(|| "mutation coordinator is unavailable".to_string())?;
+
+    // Fail closed before WAL replay and authoritative normalization. A replay
+    // failure must never leave an old ready marker visible to another process.
+    // Normalization may itself commit, so no process guard is retained across
+    // it; unlike `sync_topic_hubs`, this path publishes no derived state.
+    {
+        let mut loaded = state.loaded_authority.write().await;
+        *loaded = None;
+        coordinator
+            .invalidate_namespace_before_recovery(expected)
+            .map_err(|error| error.to_string())?;
+    }
+    coordinator
+        .recover_pending()
+        .map_err(|error| error.to_string())?;
+    normalize_topic_hubs_only(state).await?;
+    checkpoint(AuthorityRepairStep::Normalized)?;
+    let mut guards = acquire_authority_repair_guards(state).await?;
+    let process_guard = coordinator
+        .begin_root_transition()
+        .map_err(|error| error.to_string())?;
+    rebuild_authority_with_retained_guard(&mut guards, &process_guard, expected, checkpoint)
+}
+
+pub(crate) async fn rebuild_and_publish_current_authority(
+    state: &AppState,
+    expected: &crate::services::vault_namespace::VaultAuthorityTokenV1,
+) -> Result<crate::services::vault_namespace::VaultAuthorityTokenV1, String> {
+    rebuild_and_publish_current_authority_inner(state, expected, |_| Ok(())).await
+}
+
+#[cfg(test)]
+pub(crate) async fn rebuild_and_publish_current_authority_with_checkpoint(
+    state: &AppState,
+    expected: &crate::services::vault_namespace::VaultAuthorityTokenV1,
+    checkpoint: impl FnMut(AuthorityRepairStep) -> Result<(), String>,
+) -> Result<crate::services::vault_namespace::VaultAuthorityTokenV1, String> {
+    rebuild_and_publish_current_authority_inner(state, expected, checkpoint).await
+}
+
+#[must_use = "committed mutations must inspect and propagate repair readiness"]
 #[derive(Debug)]
 pub(crate) enum PostAuthorityRepair {
     NotRequired,
     Ready(crate::services::vault_namespace::VaultAuthorityTokenV1),
-    Unavailable(String),
+    Unavailable(crate::models::mutation::CommittedMutationWarningV1),
+}
+
+pub(crate) fn publish_committed_warning(
+    state: &AppState,
+) -> crate::models::mutation::CommittedMutationWarningV1 {
+    let warning = crate::models::mutation::CommittedMutationWarningV1::derived_state_unavailable();
+    if let Some(app) = state.committed_warning_app.as_ref() {
+        if let Err(error) = app.emit(
+            crate::models::mutation::COMMITTED_WARNING_EVENT,
+            warning.clone(),
+        ) {
+            log::warn!("Failed to emit committed mutation warning: {error}");
+        }
+    }
+    warning
 }
 
 /// Repairs every desktop derived reader after a durable authority mutation.
@@ -945,12 +1100,17 @@ pub(crate) async fn repair_after_authority_token(
     match rebuild_and_publish_current_authority(state, expected).await {
         Ok(token) => PostAuthorityRepair::Ready(token),
         Err(error) => {
-            *state.loaded_authority.write().await = None;
-            let warning = format!(
-                "{operation} was committed, but derived state is unavailable until rebuild: {error}"
+            // A prior repair may fail after a newer repair has already
+            // published. Never clear that newer loaded token.
+            let mut loaded = state.loaded_authority.write().await;
+            if loaded.as_ref() == Some(expected) {
+                *loaded = None;
+            }
+            drop(loaded);
+            log::error!(
+                "{operation} committed but authority repair failed; readiness remains unavailable: {error}"
             );
-            log::error!("{warning}");
-            PostAuthorityRepair::Unavailable(warning)
+            PostAuthorityRepair::Unavailable(publish_committed_warning(state))
         }
     }
 }
@@ -1291,9 +1451,9 @@ pub(crate) mod commit_note_write_tests {
 
         std::fs::create_dir_all(data_path.join("canvas"))
             .expect("canvas directory should initialize");
-        let twin_event_store = Arc::new(
-            crate::services::twin_events::TwinEventStore::new(data_path.clone()),
-        );
+        let twin_event_store = Arc::new(crate::services::twin_events::TwinEventStore::new(
+            data_path.clone(),
+        ));
         twin_event_store
             .initialize()
             .expect("event store should initialize");
@@ -1339,12 +1499,373 @@ pub(crate) mod commit_note_write_tests {
             mutation_coordinator: Some(mutation_coordinator),
             mutation_startup_error: Arc::new(RwLock::new(None)),
             loaded_authority: Arc::new(RwLock::new(None)),
+            authority_repair: Arc::new(tokio::sync::Mutex::new(())),
+            committed_warning_app: None,
             vault_transition: Arc::new(tokio::sync::RwLock::new(())),
             memory_service: Arc::new(MemoryService::new()),
             boot_state: Arc::new(RwLock::new(BootStatus::default())),
         };
 
         (state, vault_dir, data_dir)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn authority_rebuild_retains_process_lock_through_derived_publication() {
+        let (state, _vault_dir, _data_dir) = build_test_state();
+        let coordinator = state.mutation_coordinator.as_ref().unwrap().clone();
+        let expected = coordinator.current_authority_token().unwrap();
+        *state.loaded_authority.write().await = Some(expected.clone());
+
+        // Pause only after the rebuild owns every local service guard and the
+        // coordinator process guard. A peer process-lock acquisition must stay
+        // blocked until the retained window reaches ready publication.
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let hook_entered = entered.clone();
+        let hook_release = release.clone();
+        let repair_state = state.clone();
+        let rebuild = tokio::spawn(async move {
+            rebuild_and_publish_current_authority_with_checkpoint(
+                &repair_state,
+                &expected,
+                move |step| {
+                    if step == AuthorityRepairStep::Captured {
+                        hook_entered.wait();
+                        hook_release.wait();
+                    }
+                    Ok(())
+                },
+            )
+            .await
+        });
+        tokio::task::spawn_blocking(move || entered.wait())
+            .await
+            .unwrap();
+
+        let mut peer = tokio::task::spawn_blocking(move || coordinator.current_authority_token());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut peer)
+                .await
+                .is_err(),
+            "a peer acquired the mutation process lock while derived publication was incomplete"
+        );
+
+        tokio::task::spawn_blocking(move || release.wait())
+            .await
+            .unwrap();
+        rebuild
+            .await
+            .expect("rebuild task should not panic")
+            .expect("rebuild should complete after the graph lock is released");
+        peer.await
+            .expect("peer task should not panic")
+            .expect("peer should acquire after rebuild publication");
+    }
+
+    #[tokio::test]
+    async fn same_generation_rebuild_failure_leaves_durable_namespace_unready() {
+        let (state, _vault_dir, _data_dir) = build_test_state();
+        let coordinator = state.mutation_coordinator.as_ref().unwrap().clone();
+        coordinator.require_namespace_ready().unwrap();
+        let expected = coordinator.current_authority_token().unwrap();
+        *state.loaded_authority.write().await = Some(expected.clone());
+
+        let result =
+            rebuild_and_publish_current_authority_with_checkpoint(&state, &expected, |step| {
+                if step == AuthorityRepairStep::Search {
+                    return Err("injected mid-rebuild failure".into());
+                }
+                Ok(())
+            })
+            .await;
+
+        assert!(result.is_err());
+        assert!(coordinator.require_namespace_ready().is_err());
+        assert!(state.loaded_authority.read().await.is_none());
+        assert_eq!(coordinator.current_authority_token().unwrap(), expected);
+    }
+
+    #[tokio::test]
+    async fn normalization_prelude_failure_leaves_durable_namespace_unready() {
+        let (state, _vault_dir, _data_dir) = build_test_state();
+        let coordinator = state.mutation_coordinator.as_ref().unwrap().clone();
+        coordinator.require_namespace_ready().unwrap();
+        let expected = coordinator.current_authority_token().unwrap();
+        *state.loaded_authority.write().await = Some(expected.clone());
+
+        let result =
+            rebuild_and_publish_current_authority_with_checkpoint(&state, &expected, |step| {
+                if step == AuthorityRepairStep::Normalized {
+                    return Err("injected post-normalization failure".into());
+                }
+                Ok(())
+            })
+            .await;
+
+        assert!(result.is_err());
+        assert!(coordinator.require_namespace_ready().is_err());
+        assert!(state.loaded_authority.read().await.is_none());
+        assert_eq!(coordinator.current_authority_token().unwrap(), expected);
+    }
+
+    #[tokio::test]
+    async fn authority_rebuild_recovers_wal_only_after_fail_closed_invalidation() {
+        let (state, _vault_dir, _data_dir) = build_test_state();
+        let coordinator = state.mutation_coordinator.as_ref().unwrap().clone();
+        let expected = coordinator.current_authority_token().unwrap();
+        *state.loaded_authority.write().await = Some(expected.clone());
+        coordinator
+            .fail_once_at(crate::services::twin_events::MutationFaultPoint::BeforePendingRecovery);
+
+        let result = rebuild_and_publish_current_authority(&state, &expected).await;
+
+        assert!(
+            result.is_err(),
+            "rebuild must execute canonical WAL recovery"
+        );
+        assert!(coordinator.require_namespace_ready().is_err());
+        assert!(state.loaded_authority.read().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn live_rebuild_replays_optimizer_wal_before_witness_recovery() {
+        let (state, vault_dir, _data_dir) = build_test_state();
+        let coordinator = state.mutation_coordinator.as_ref().unwrap().clone();
+        let namespace = coordinator.current_namespace_path().unwrap();
+        *state.knowledge_store.write().await = KnowledgeStore::with_event_recorder(
+            vault_dir.path().to_path_buf(),
+            namespace.clone(),
+            coordinator.clone(),
+        );
+        let created = {
+            let mut store = state.knowledge_store.write().await;
+            store
+                .create_note(NoteCreate {
+                    title: "Prepared WAL Recovery".to_string(),
+                    content: "A staged optimizer mutation must keep its audit owner.".to_string(),
+                    relative_path: None,
+                    aliases: Vec::new(),
+                    status: NoteStatus::Draft,
+                    tags: Vec::new(),
+                    schema_version: crate::models::note::CURRENT_NOTE_SCHEMA_VERSION,
+                    migration_source: None,
+                    optimizer_managed: false,
+                    properties: Default::default(),
+                })
+                .unwrap()
+        };
+        commit_note_write(&state, &created.id, "test_note_created")
+            .await
+            .unwrap();
+        let expected = coordinator.current_authority_token().unwrap();
+        let settings = UserSettings::default();
+        let pending = {
+            let store = state.knowledge_store.read().await;
+            let mut optimizer = state.vault_optimizer.write().await;
+            match optimizer
+                .prepare_next_expecting_authority(&store, &settings, expected)
+                .unwrap()
+            {
+                crate::services::vault_optimizer::OptimizerTick::Pending(pending) => *pending,
+                other => panic!("expected a pending optimizer write, got {other:?}"),
+            }
+        };
+        let original_queue: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(namespace.join("vault_migration/optimizer/queue.json")).unwrap(),
+        )
+        .unwrap();
+        let original_job_id = original_queue["queue"][0]["job_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        coordinator.fail_next_replays_before_targets(2);
+        let apply = {
+            let mut store = state.knowledge_store.write().await;
+            let mut optimizer = state.vault_optimizer.write().await;
+            optimizer.apply_pending(&mut store, pending)
+        };
+        assert!(apply.is_err());
+        assert_eq!(coordinator.pending_count().unwrap(), 1);
+        assert!(!state
+            .knowledge_store
+            .read()
+            .await
+            .overlay_path(&created.id)
+            .exists());
+
+        let repair_token = coordinator.current_authority_token().unwrap();
+        rebuild_and_publish_current_authority(&state, &repair_token)
+            .await
+            .unwrap();
+
+        assert_eq!(coordinator.pending_count().unwrap(), 0);
+        assert!(state
+            .knowledge_store
+            .read()
+            .await
+            .overlay_path(&created.id)
+            .exists());
+        let optimizer = state.vault_optimizer.read().await;
+        let status = optimizer.status(&settings);
+        assert_eq!(status.accepted_count, 1);
+        assert_eq!(optimizer.list_decisions(10).unwrap().len(), 1);
+        assert_eq!(optimizer.inbox(None, 10).unwrap().len(), 1);
+        drop(optimizer);
+        let queue: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(namespace.join("vault_migration/optimizer/queue.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(queue["queue"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|job| { job["job_id"].as_str() != Some(original_job_id.as_str()) }));
+        let pending_dir = namespace.join("vault_migration/optimizer/pending-publications-v1");
+        assert_eq!(std::fs::read_dir(pending_dir).unwrap().count(), 0);
+        coordinator.require_namespace_ready().unwrap();
+    }
+
+    #[tokio::test]
+    async fn post_cas_guard_abort_retires_optimizer_owner_before_ready_repair() {
+        let (state, vault_dir, data_dir) = build_test_state();
+        let coordinator = state.mutation_coordinator.as_ref().unwrap().clone();
+        let namespace = coordinator.current_namespace_path().unwrap();
+        *state.knowledge_store.write().await = KnowledgeStore::with_event_recorder(
+            vault_dir.path().to_path_buf(),
+            namespace.clone(),
+            coordinator.clone(),
+        );
+        let created = {
+            let mut store = state.knowledge_store.write().await;
+            store
+                .create_note(NoteCreate {
+                    title: "Post CAS Guard Abort".to_string(),
+                    content: "The source guard changes after authority advances.".to_string(),
+                    relative_path: None,
+                    aliases: Vec::new(),
+                    status: NoteStatus::Draft,
+                    tags: Vec::new(),
+                    schema_version: crate::models::note::CURRENT_NOTE_SCHEMA_VERSION,
+                    migration_source: None,
+                    optimizer_managed: false,
+                    properties: Default::default(),
+                })
+                .unwrap()
+        };
+        commit_note_write(&state, &created.id, "test_note_created")
+            .await
+            .unwrap();
+        let before = coordinator.current_authority_token().unwrap();
+        coordinator.require_namespace_ready().unwrap();
+        let settings = UserSettings::default();
+        let pending = {
+            let store = state.knowledge_store.read().await;
+            let mut optimizer = state.vault_optimizer.write().await;
+            match optimizer
+                .prepare_next_expecting_authority(&store, &settings, before.clone())
+                .unwrap()
+            {
+                crate::services::vault_optimizer::OptimizerTick::Pending(pending) => *pending,
+                other => panic!("expected a pending optimizer write, got {other:?}"),
+            }
+        };
+        let original_job_id = serde_json::from_slice::<serde_json::Value>(
+            &std::fs::read(namespace.join("vault_migration/optimizer/queue.json")).unwrap(),
+        )
+        .unwrap()["queue"][0]["job_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let resume = Arc::new(std::sync::Barrier::new(2));
+        coordinator.pause_after_authority_advance_once(entered.clone(), resume.clone());
+        let knowledge = state.knowledge_store.clone();
+        let optimizer = state.vault_optimizer.clone();
+        let owner = std::thread::spawn(move || {
+            let mut store = knowledge.blocking_write();
+            let mut optimizer = optimizer.blocking_write();
+            optimizer.apply_pending(&mut store, pending)
+        });
+
+        entered.wait();
+        let pending_dir = namespace.join("vault_migration/optimizer/pending-publications-v1");
+        let witness: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(
+                std::fs::read_dir(&pending_dir)
+                    .unwrap()
+                    .next()
+                    .unwrap()
+                    .unwrap()
+                    .path(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(witness["phase"], "prepared");
+        let markdown_path = vault_dir.path().join(&created.relative_path);
+        let mut edited = std::fs::read(&markdown_path).unwrap();
+        edited.extend_from_slice(b"\nExternal edit after authority CAS.\n");
+        std::fs::write(&markdown_path, &edited).unwrap();
+        resume.wait();
+
+        assert!(owner.join().unwrap().is_err());
+        let advanced = coordinator.current_authority_token().unwrap();
+        assert_eq!(
+            advanced.authority_generation,
+            before.authority_generation + 1
+        );
+        assert!(coordinator.require_namespace_ready().is_err());
+        assert_eq!(coordinator.pending_count().unwrap(), 0);
+        assert_eq!(std::fs::read_dir(&pending_dir).unwrap().count(), 0);
+        assert!(!state
+            .knowledge_store
+            .read()
+            .await
+            .overlay_path(&created.id)
+            .exists());
+        assert_eq!(std::fs::read(&markdown_path).unwrap(), edited);
+        {
+            let optimizer = state.vault_optimizer.read().await;
+            assert!(optimizer.list_decisions(10).unwrap().is_empty());
+            assert!(optimizer.inbox(None, 10).unwrap().is_empty());
+            let queue: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(namespace.join("vault_migration/optimizer/queue.json")).unwrap(),
+            )
+            .unwrap();
+            let job = queue["queue"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|job| job["job_id"].as_str() == Some(original_job_id.as_str()))
+                .unwrap();
+            assert_eq!(job["attempts"], 1);
+        }
+        assert_eq!(
+            std::fs::read_dir(data_dir.path().join("twin/mutations/receipts/v1"))
+                .unwrap()
+                .count(),
+            0
+        );
+
+        rebuild_and_publish_current_authority(&state, &advanced)
+            .await
+            .unwrap();
+        coordinator.require_namespace_ready().unwrap();
+        assert_eq!(
+            state.loaded_authority.read().await.as_ref(),
+            Some(&advanced)
+        );
+        assert_eq!(coordinator.pending_count().unwrap(), 0);
+        assert_eq!(std::fs::read_dir(&pending_dir).unwrap().count(), 0);
+        let _restarted = VaultOptimizerService::try_new(namespace.clone()).unwrap();
+        assert_eq!(std::fs::read_dir(&pending_dir).unwrap().count(), 0);
+        let queue: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(namespace.join("vault_migration/optimizer/queue.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(queue["queue"].as_array().unwrap().iter().any(|job| {
+            job["job_id"].as_str() == Some(original_job_id.as_str()) && job["attempts"] == 1
+        }));
     }
 
     #[tokio::test]
@@ -1628,10 +2149,9 @@ pub(crate) mod commit_note_write_tests {
             "this test exercises the sidecar_first path specifically"
         );
 
-        // One worker tick, mirroring `main.rs::start_vault_optimizer_worker`
-        // exactly: `sidecar_first` applies the overlay write inline inside
-        // `prepare_next` (under a read lock on knowledge_store), which
-        // reports back which note needs reindexing.
+        // One worker tick, mirroring `start_vault_optimizer_worker`:
+        // preparation is read-only and returns an exact pending write, then
+        // application runs under the knowledge-store write lock.
         let tick = {
             let store = state.knowledge_store.read().await;
             let mut optimizer = state.vault_optimizer.write().await;
@@ -1639,12 +2159,25 @@ pub(crate) mod commit_note_write_tests {
                 .prepare_next(&store, &settings)
                 .expect("prepare_next should not error")
         };
-        let applied_note_id = match tick {
-            crate::services::vault_optimizer::OptimizerTick::Applied(note_id) => note_id,
-            other => panic!(
-                "expected sidecar_first mode to apply inline, got {:?}",
-                other
-            ),
+        let pending = match tick {
+            crate::services::vault_optimizer::OptimizerTick::Pending(pending) => pending,
+            other => panic!("sidecar_first mode must return a pending write, got {other:?}"),
+        };
+        let applied_note_id = {
+            let mut store = state.knowledge_store.write().await;
+            let mut optimizer = state.vault_optimizer.write().await;
+            match optimizer
+                .apply_pending(&mut store, *pending)
+                .expect("apply_pending should not error")
+            {
+                crate::services::vault_optimizer::OptimizerMutationResult::Committed {
+                    result,
+                    ..
+                } => result.note_id().to_string(),
+                crate::services::vault_optimizer::OptimizerMutationResult::NoWrite => {
+                    panic!("sidecar_first apply should report the committed note")
+                }
+            }
         };
 
         // The locks taken above are released by now (the block ended) —
@@ -1726,10 +2259,18 @@ pub(crate) mod commit_note_write_tests {
         let applied_note_id = {
             let mut store = state.knowledge_store.write().await;
             let mut optimizer = state.vault_optimizer.write().await;
-            optimizer
+            match optimizer
                 .apply_pending(&mut store, *pending)
                 .expect("apply_pending should not error")
-                .expect("full_rewrite apply should report the written note id")
+            {
+                crate::services::vault_optimizer::OptimizerMutationResult::Committed {
+                    result,
+                    ..
+                } => result.note_id().to_string(),
+                crate::services::vault_optimizer::OptimizerMutationResult::NoWrite => {
+                    panic!("full_rewrite apply should report the committed note")
+                }
+            }
         };
 
         // The locks taken above are released by now (the block ended) —

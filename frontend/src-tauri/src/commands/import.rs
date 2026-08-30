@@ -206,10 +206,9 @@ async fn apply_conversation_import(
         .take_last_mutation_commit();
     if let Some(commit) = commit {
         if let crate::commands::PostAuthorityRepair::Unavailable(warning) =
-            crate::commands::repair_after_authority_mutation(state.inner(), &commit, "import")
-                .await
+            crate::commands::repair_after_authority_mutation(state.inner(), &commit, "import").await
         {
-            errors.push(warning);
+            errors.push(warning.to_string());
         }
     }
 
@@ -301,10 +300,9 @@ async fn apply_document_import(
         .take_last_mutation_commit();
     if let Some(commit) = commit {
         if let crate::commands::PostAuthorityRepair::Unavailable(warning) =
-            crate::commands::repair_after_authority_mutation(state.inner(), &commit, "import")
-                .await
+            crate::commands::repair_after_authority_mutation(state.inner(), &commit, "import").await
         {
-            errors.push(warning);
+            errors.push(warning.to_string());
         }
     }
 

@@ -486,6 +486,9 @@ fn store_capability_error(error: super::MutationError) -> StoreError {
         super::MutationError::Io(message) => StoreError::Io(message),
         super::MutationError::Invalid(message) => StoreError::Invalid(message),
         super::MutationError::RecoveryConflict(message) => StoreError::Invalid(message),
+        super::MutationError::AbortedPrecondition { mutation_id, .. } => {
+            StoreError::Invalid(mutation_id)
+        }
     }
 }
 
@@ -787,6 +790,35 @@ pub trait EventRecorder: Send + Sync {
         ))
     }
 
+    /// Commits a locked mutation while bracketing the durable authority
+    /// effect with caller-owned publication witnesses. The prepared hook runs
+    /// after the exact intent has been finalized but before authority
+    /// generation, journal, target, or event writes. The committed hook runs
+    /// after replay completes but before the shared process lock is released.
+    fn commit_planned_mutation_with_hooks(
+        &self,
+        _origin: crate::services::twin_events::MutationOrigin,
+        _planner: &mut dyn FnMut() -> Result<
+            Option<crate::services::twin_events::MutationPlan>,
+            crate::services::twin_events::MutationError,
+        >,
+        _prepared: &mut dyn FnMut(
+            &crate::services::twin_events::MutationIntentV1,
+        )
+            -> Result<(), crate::services::twin_events::MutationError>,
+        _committed: &mut dyn FnMut(
+            &crate::services::twin_events::MutationCommit,
+        )
+            -> Result<(), crate::services::twin_events::MutationError>,
+    ) -> Result<
+        crate::services::twin_events::MutationCommit,
+        crate::services::twin_events::MutationError,
+    > {
+        Err(crate::services::twin_events::MutationError::Invalid(
+            "event recorder does not support witnessed coordinated mutations".into(),
+        ))
+    }
+
     fn recover_pending_mutations(
         &self,
     ) -> Result<usize, crate::services::twin_events::MutationError> {
@@ -832,6 +864,7 @@ impl EventRecorder for NoopEventRecorder {
             mutation_id: None,
             events: Vec::new(),
             authority_token: None,
+            postcommit_warning: false,
         })
     }
 
@@ -859,6 +892,7 @@ impl EventRecorder for NoopEventRecorder {
             mutation_id: None,
             events: Vec::new(),
             authority_token: None,
+            postcommit_warning: false,
         })
     }
 

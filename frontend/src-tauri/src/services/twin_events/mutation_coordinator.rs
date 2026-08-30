@@ -43,6 +43,10 @@ pub enum MutationError {
     Io(String),
     Invalid(String),
     RecoveryConflict(String),
+    AbortedPrecondition {
+        mutation_id: String,
+        authority_advanced: bool,
+    },
 }
 
 impl std::fmt::Display for MutationError {
@@ -52,6 +56,12 @@ impl std::fmt::Display for MutationError {
             Self::Io(message) | Self::Invalid(message) => formatter.write_str(message),
             Self::RecoveryConflict(id) => {
                 write!(formatter, "recoverable local mutation conflict: {id}")
+            }
+            Self::AbortedPrecondition { mutation_id, .. } => {
+                write!(
+                    formatter,
+                    "retained mutation precondition changed: {mutation_id}"
+                )
             }
         }
     }
@@ -335,8 +345,8 @@ pub struct MutationPlan {
     pub source_channel: crate::models::twin_event::SourceChannel,
     pub targets: Vec<crate::services::twin_events::TargetMutation>,
     pub drafts: Vec<TwinEventDraft>,
-    pub(crate) expected_authority:
-        Option<crate::services::vault_namespace::VaultAuthorityTokenV1>,
+    pub(crate) expected_authority: Option<crate::services::vault_namespace::VaultAuthorityTokenV1>,
+    pub(crate) retain_commit_receipt: bool,
 }
 
 impl MutationPlan {
@@ -352,7 +362,13 @@ impl MutationPlan {
             targets,
             drafts,
             expected_authority: None,
+            retain_commit_receipt: false,
         }
+    }
+
+    pub(crate) fn retaining_commit_receipt(mut self) -> Self {
+        self.retain_commit_receipt = true;
+        self
     }
 
     pub(crate) fn expecting_authority(
@@ -371,6 +387,8 @@ pub enum MutationFaultPoint {
     AfterTarget(usize),
     AfterTargets,
     AfterEvent(usize),
+    BeforeDurabilityClassification,
+    BeforePendingRecovery,
     BeforeCleanup,
     AfterCleanupBeforeFanout,
 }
@@ -397,12 +415,13 @@ pub trait MutationLifecycle: Send + Sync {
 pub struct NoopMutationLifecycle;
 impl MutationLifecycle for NoopMutationLifecycle {}
 
+#[must_use = "a committed mutation may carry the exact authority token required for repair"]
 #[derive(Debug, Clone)]
 pub struct MutationCommit {
     pub mutation_id: Option<crate::models::twin_event::ContentDigest>,
     pub events: Vec<TwinEvent>,
-    pub(crate) authority_token:
-        Option<crate::services::vault_namespace::VaultAuthorityTokenV1>,
+    pub(crate) authority_token: Option<crate::services::vault_namespace::VaultAuthorityTokenV1>,
+    pub(crate) postcommit_warning: bool,
 }
 
 pub struct MutationCoordinator {
@@ -415,12 +434,27 @@ pub struct MutationCoordinator {
     lifecycle: Arc<dyn MutationLifecycle>,
     in_process: std::sync::Mutex<()>,
     fault_once: std::sync::Mutex<Option<MutationFaultPoint>>,
+    #[cfg(test)]
+    replay_failures_before_targets: std::sync::Mutex<usize>,
+    #[cfg(test)]
+    pause_after_authority_advance_once: std::sync::Mutex<
+        Option<(
+            std::sync::Arc<std::sync::Barrier>,
+            std::sync::Arc<std::sync::Barrier>,
+        )>,
+    >,
     root_lease: std::sync::Mutex<ActiveMarkdownRootLeaseV1>,
 }
 
 pub(crate) struct MutationRootTransitionGuard<'a> {
     coordinator: &'a MutationCoordinator,
     _process_lock: CoordinatorProcessLock,
+}
+
+#[derive(Debug)]
+pub(crate) enum WitnessedMutationRecovery {
+    NotCommitted,
+    Committed(MutationCommit),
 }
 
 const ACTIVE_ROOT_LEASE_SCHEMA_VERSION: u16 = 1;
@@ -545,13 +579,17 @@ impl MutationCoordinator {
             lifecycle,
             in_process: std::sync::Mutex::new(()),
             fault_once: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            replay_failures_before_targets: std::sync::Mutex::new(0),
+            #[cfg(test)]
+            pause_after_authority_advance_once: std::sync::Mutex::new(None),
             root_lease: std::sync::Mutex::new(root_lease),
         };
         // Version-1 intents predate content generations. Replay them first so an
         // upgrade cannot advance authority ahead of a still-pending mutation.
         for (_, pending) in coordinator.journal.load_pending(&process_lock)? {
             if pending.schema_version == 1 {
-                coordinator.replay_intent_locked(&process_lock, &pending, false)?;
+                coordinator.replay_intent_locked(&process_lock, &pending, false, true)?;
             }
         }
         crate::services::vault_namespace::initialize_authority_locked(
@@ -577,6 +615,26 @@ impl MutationCoordinator {
         *self.fault_once.lock().expect("fault lock") = Some(point);
     }
 
+    #[cfg(test)]
+    pub(crate) fn fail_next_replays_before_targets(&self, count: usize) {
+        *self
+            .replay_failures_before_targets
+            .lock()
+            .expect("replay fault lock") = count;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_after_authority_advance_once(
+        &self,
+        entered: std::sync::Arc<std::sync::Barrier>,
+        resume: std::sync::Arc<std::sync::Barrier>,
+    ) {
+        *self
+            .pause_after_authority_advance_once
+            .lock()
+            .expect("authority pause lock") = Some((entered, resume));
+    }
+
     pub fn commit_local(
         &self,
         requested_stream: CausalStream,
@@ -598,6 +656,18 @@ impl MutationCoordinator {
         origin: MutationOrigin,
         planner: &mut dyn FnMut() -> Result<Option<MutationPlan>, MutationError>,
     ) -> Result<MutationCommit, MutationError> {
+        self.commit_planned_with_hooks(origin, planner, &mut |_| Ok(()), &mut |_| Ok(()))
+    }
+
+    pub(crate) fn commit_planned_with_hooks(
+        &self,
+        origin: MutationOrigin,
+        planner: &mut dyn FnMut() -> Result<Option<MutationPlan>, MutationError>,
+        prepared_hook: &mut dyn FnMut(
+            &crate::services::twin_events::MutationIntentV1,
+        ) -> Result<(), MutationError>,
+        committed_hook: &mut dyn FnMut(&MutationCommit) -> Result<(), MutationError>,
+    ) -> Result<MutationCommit, MutationError> {
         let _in_process = self
             .in_process
             .lock()
@@ -609,7 +679,7 @@ impl MutationCoordinator {
         }
         self.journal.cleanup_orphan_temps_locked(&process_lock)?;
         for (_, pending) in self.journal.load_pending(&process_lock)? {
-            if let Err(error) = self.replay_intent_locked(&process_lock, &pending, false) {
+            if let Err(error) = self.replay_intent_locked(&process_lock, &pending, false, true) {
                 process_lock.unlock()?;
                 return Err(error);
             }
@@ -629,6 +699,7 @@ impl MutationCoordinator {
                 mutation_id: None,
                 events: Vec::new(),
                 authority_token: None,
+                postcommit_warning: false,
             });
         };
         if let Some(expected) = plan.expected_authority.as_ref() {
@@ -660,6 +731,7 @@ impl MutationCoordinator {
             plan.source_channel,
             plan.targets,
             plan.drafts,
+            plan.retain_commit_receipt,
         ) {
             Ok(Some(intent)) => intent,
             Ok(None) => {
@@ -668,6 +740,7 @@ impl MutationCoordinator {
                     mutation_id: None,
                     events: Vec::new(),
                     authority_token: None,
+                    postcommit_warning: false,
                 });
             }
             Err(error) => {
@@ -680,6 +753,57 @@ impl MutationCoordinator {
         };
 
         let invoke_lifecycle = origin == MutationOrigin::Local && !prepared.events.is_empty();
+        if prepared.retain_commit_receipt {
+            let lease = self
+                .root_lease
+                .lock()
+                .map_err(|_| MutationError::Invalid("Markdown root lease lock poisoned".into()))?
+                .clone();
+            let current = crate::services::vault_namespace::capture_authority_token_locked(
+                &self.data_path,
+                &lease,
+                &process_lock,
+            )?;
+            let receipt_authority = crate::services::vault_namespace::VaultAuthorityTokenV1 {
+                root_scope: current.root_scope,
+                lease_epoch_uuid: current.lease_epoch_uuid,
+                authority_generation: current.authority_generation.checked_add(1).ok_or_else(
+                    || MutationError::RecoveryConflict("authority-generation-exhausted".into()),
+                )?,
+            };
+            if prepared.content_authority_generation != Some(receipt_authority.authority_generation)
+            {
+                process_lock.unlock()?;
+                return Err(MutationError::RecoveryConflict(
+                    "retained receipt generation does not match finalized intent".into(),
+                ));
+            }
+            self.journal.preflight_commit_receipt_slot(
+                &process_lock,
+                &prepared,
+                &receipt_authority,
+            )?;
+        }
+        if let Err(error) = prepared_hook(&prepared) {
+            process_lock.unlock()?;
+            if origin == MutationOrigin::Local {
+                self.lifecycle
+                    .known_failure(Some(prepared.mutation_id.as_str()), &error.to_string());
+            }
+            return Err(error);
+        }
+        // Exact guards are validated after the optimizer Prepared hook but
+        // before lifecycle staging. Schema-3 validation forbids combining a
+        // retained guard with events, so this abort path can never orphan a
+        // staged lifecycle record.
+        if let Err(error) = self.validate_exact_preconditions_locked(&prepared) {
+            process_lock.unlock()?;
+            if invoke_lifecycle {
+                self.lifecycle
+                    .known_failure(Some(prepared.mutation_id.as_str()), &error.to_string());
+            }
+            return Err(error);
+        }
         if invoke_lifecycle {
             if let Err(error) = self.lifecycle.stage_before_local(&prepared) {
                 process_lock.unlock()?;
@@ -704,10 +828,8 @@ impl MutationCoordinator {
                 Err(error) => {
                     process_lock.unlock()?;
                     if invoke_lifecycle {
-                        self.lifecycle.known_failure(
-                            Some(prepared.mutation_id.as_str()),
-                            &error.to_string(),
-                        );
+                        self.lifecycle
+                            .known_failure(Some(prepared.mutation_id.as_str()), &error.to_string());
                     }
                     return Err(error);
                 }
@@ -724,6 +846,18 @@ impl MutationCoordinator {
                 return Err(error);
             }
             authority_token = Some(advanced);
+            #[cfg(test)]
+            let pause_after_authority_advance = {
+                self.pause_after_authority_advance_once
+                    .lock()
+                    .map_err(|_| MutationError::Invalid("authority pause lock poisoned".into()))?
+                    .take()
+            };
+            #[cfg(test)]
+            if let Some((entered, resume)) = pause_after_authority_advance {
+                entered.wait();
+                resume.wait();
+            }
             if let Err(error) = self.inject(MutationFaultPoint::AfterAuthorityAdvance) {
                 process_lock.unlock()?;
                 if invoke_lifecycle {
@@ -741,28 +875,115 @@ impl MutationCoordinator {
             }
             return Err(error);
         }
-        let committed = self
+        let first_replay = self
             .inject(MutationFaultPoint::AfterStage)
-            .and_then(|()| self.replay_intent_locked(&process_lock, &prepared, true));
-        let unlock = process_lock.unlock();
-        if let Err(error) = unlock {
-            return Err(error.into());
-        }
-        if let Err(error) = committed {
+            .and_then(|()| self.replay_intent_locked(&process_lock, &prepared, true, false));
+        if let Err(error @ MutationError::AbortedPrecondition { .. }) = first_replay {
+            process_lock.unlock()?;
             if invoke_lifecycle {
                 self.lifecycle
                     .known_failure(Some(prepared.mutation_id.as_str()), &error.to_string());
             }
             return Err(error);
         }
-        if invoke_lifecycle {
-            self.lifecycle.committed(&prepared)?;
+        let mut postcommit_warning = first_replay.is_err();
+        let mut replay_complete = first_replay.is_ok();
+        if !replay_complete {
+            if let Err(error) = self.replay_intent_locked(&process_lock, &prepared, false, false) {
+                if matches!(error, MutationError::AbortedPrecondition { .. }) {
+                    process_lock.unlock()?;
+                    if invoke_lifecycle {
+                        self.lifecycle
+                            .known_failure(Some(prepared.mutation_id.as_str()), &error.to_string());
+                    }
+                    return Err(error);
+                }
+                match self
+                    .inject(MutationFaultPoint::BeforeDurabilityClassification)
+                    .and_then(|()| self.intent_effects_are_durable(&prepared))
+                {
+                    Ok(false) => {
+                        process_lock.unlock()?;
+                        if invoke_lifecycle {
+                            self.lifecycle.known_failure(
+                                Some(prepared.mutation_id.as_str()),
+                                &error.to_string(),
+                            );
+                        }
+                        return Err(error);
+                    }
+                    Ok(true) => {}
+                    Err(classification_error) => {
+                        process_lock.unlock()?;
+                        if invoke_lifecycle {
+                            self.lifecycle.known_failure(
+                                Some(prepared.mutation_id.as_str()),
+                                &classification_error.to_string(),
+                            );
+                        }
+                        return Err(classification_error);
+                    }
+                }
+                // The authoritative targets/events are exact and durable, but
+                // receipt retention or another post-effect step could not be
+                // completed. Keep the journal plus Prepared witness for
+                // guarded recovery and return a non-retryable committed
+                // warning to the caller.
+                log::error!(
+                    "mutation {} committed its authoritative effect but post-effect recovery remains pending: {error}",
+                    prepared.mutation_id.as_str()
+                );
+            } else {
+                replay_complete = true;
+            }
         }
-        Ok(MutationCommit {
+        let mut commit = MutationCommit {
             mutation_id: Some(prepared.mutation_id.clone()),
-            events: prepared.events,
+            events: prepared.events.clone(),
             authority_token,
-        })
+            postcommit_warning,
+        };
+        if !replay_complete {
+            if let Err(error) = process_lock.unlock() {
+                log::error!("committed mutation process-lock release failed: {error}");
+            }
+            commit.postcommit_warning = true;
+            return Ok(commit);
+        }
+        match committed_hook(&commit) {
+            Ok(()) => {}
+            Err(error) => {
+                log::error!("postcommit mutation publication failed: {error}");
+                postcommit_warning = true;
+            }
+        };
+        match self.journal.remove(&process_lock, &prepared) {
+            Ok(()) => {}
+            Err(error) => {
+                log::error!("committed mutation journal cleanup failed: {error}");
+                postcommit_warning = true;
+            }
+        };
+        // Retained receipts are consumed only by the owner after its
+        // idempotent audit/queue publication has completed under this same
+        // process-lock domain. Coordinator cleanup alone cannot prove that
+        // external publication finished.
+        if let Err(error) = self.inject(MutationFaultPoint::AfterCleanupBeforeFanout) {
+            log::error!("committed mutation post-cleanup fault: {error}");
+            postcommit_warning = true;
+        }
+        if let Err(error) = process_lock.unlock() {
+            log::error!("committed mutation process-lock release failed: {error}");
+            postcommit_warning = true;
+        }
+        if invoke_lifecycle {
+            if let Err(error) = self.lifecycle.committed(&prepared) {
+                log::error!("committed mutation lifecycle publication failed: {error}");
+                postcommit_warning = true;
+            }
+        }
+        commit.postcommit_warning = postcommit_warning;
+        Ok(commit)
     }
 
     pub fn apply_nonlocal(
@@ -800,9 +1021,13 @@ impl MutationCoordinator {
         self.verify_root_lease_locked()?;
         self.journal.cleanup_orphan_temps_locked(&process_lock)?;
         let pending = self.journal.load_pending(&process_lock)?;
+        if let Err(error) = self.inject(MutationFaultPoint::BeforePendingRecovery) {
+            process_lock.unlock()?;
+            return Err(error);
+        }
         let mut recovered = 0usize;
         for (_, intent) in pending {
-            if let Err(error) = self.replay_intent_locked(&process_lock, &intent, false) {
+            if let Err(error) = self.replay_intent_locked(&process_lock, &intent, false, true) {
                 process_lock.unlock()?;
                 return Err(error);
             }
@@ -963,9 +1188,7 @@ impl MutationCoordinator {
         })();
         process_lock.unlock()?;
         if let Err(error) = result {
-            return Err(MutationError::RecoveryConflict(
-                error.to_string(),
-            ));
+            return Err(MutationError::RecoveryConflict(error.to_string()));
         }
         Ok(())
     }
@@ -985,7 +1208,7 @@ impl MutationCoordinator {
             self.verify_root_lease_locked()?;
             self.journal.cleanup_orphan_temps_locked(&process_lock)?;
             for (_, pending) in self.journal.load_pending(&process_lock)? {
-                self.replay_intent_locked(&process_lock, &pending, false)?;
+                self.replay_intent_locked(&process_lock, &pending, false, true)?;
             }
             let lease = self
                 .root_lease
@@ -1037,7 +1260,7 @@ impl MutationCoordinator {
             let new_root_capability = crate::services::twin_events::AnchoredRoot::open(&new_root)?;
             self.journal.cleanup_orphan_temps_locked(&process_lock)?;
             for (_, pending) in self.journal.load_pending(&process_lock)? {
-                self.replay_intent_locked(&process_lock, &pending, false)?;
+                self.replay_intent_locked(&process_lock, &pending, false, true)?;
             }
             let next_lease = ActiveMarkdownRootLeaseV1 {
                 schema_version: ACTIVE_ROOT_LEASE_SCHEMA_VERSION,
@@ -1073,7 +1296,7 @@ impl MutationCoordinator {
             self.verify_root_lease_locked()?;
             self.journal.cleanup_orphan_temps_locked(&process_lock)?;
             for (_, pending) in self.journal.load_pending(&process_lock)? {
-                self.replay_intent_locked(&process_lock, &pending, false)?;
+                self.replay_intent_locked(&process_lock, &pending, false, true)?;
             }
             self.verify_root_lease_locked()
         })();
@@ -1085,6 +1308,47 @@ impl MutationCoordinator {
             coordinator: self,
             _process_lock: process_lock,
         })
+    }
+
+    /// Clears durable readiness before a repair attempts WAL replay. Unlike
+    /// `begin_root_transition`, this deliberately does not replay pending
+    /// intents first: a replay failure must leave every peer fail-closed.
+    pub(crate) fn invalidate_namespace_before_recovery(
+        &self,
+        expected: &crate::services::vault_namespace::VaultAuthorityTokenV1,
+    ) -> Result<(), MutationError> {
+        let _in_process = self
+            .in_process
+            .lock()
+            .map_err(|_| MutationError::Invalid("mutation coordinator lock poisoned".into()))?;
+        let process_lock = self.finalizer.acquire_coordinator_lock()?;
+        let result = (|| {
+            self.verify_root_lease_locked()?;
+            let lease = self
+                .root_lease
+                .lock()
+                .map_err(|_| MutationError::Invalid("Markdown root lease lock poisoned".into()))?
+                .clone();
+            let current = crate::services::vault_namespace::capture_authority_token_locked(
+                &self.data_path,
+                &lease,
+                &process_lock,
+            )?;
+            if current.root_scope != expected.root_scope
+                || current.lease_epoch_uuid != expected.lease_epoch_uuid
+            {
+                return Err(MutationError::RecoveryConflict(
+                    "vault root changed before authority recovery".into(),
+                ));
+            }
+            crate::services::vault_namespace::invalidate_locked(
+                &self.data_path,
+                &lease,
+                &process_lock,
+            )
+        })();
+        process_lock.unlock()?;
+        result
     }
 
     pub fn quarantine_count(&self) -> Result<usize, MutationError> {
@@ -1104,6 +1368,7 @@ impl MutationCoordinator {
         source_channel: crate::models::twin_event::SourceChannel,
         targets: Vec<crate::services::twin_events::TargetMutation>,
         drafts: Vec<TwinEventDraft>,
+        retain_commit_receipt: bool,
     ) -> Result<Option<crate::services::twin_events::MutationIntentV1>, MutationError> {
         if targets.len() > crate::services::twin_events::MAX_INTENT_TARGETS {
             return Err(MutationError::Invalid(
@@ -1130,14 +1395,13 @@ impl MutationCoordinator {
             }
         }
         let mut prepared_targets = Vec::new();
+        let mut has_writable_target = false;
         for target in targets {
-            crate::services::twin_events::validate_target_key(
-                target.kind,
-                &target.relative_key,
-            )?;
+            crate::services::twin_events::validate_target_key(target.kind, &target.relative_key)?;
             let before = self.before_image(target.kind, &target.relative_key)?;
             let after_digest = crate::services::twin_events::desired_digest(&target.after);
-            if target_matches_after(&before, &target.after, &after_digest) {
+            let matches_after = target_matches_after(&before, &target.after, &after_digest);
+            if matches_after && !target.retain_exact_precondition {
                 continue;
             }
             if target
@@ -1150,6 +1414,16 @@ impl MutationCoordinator {
                     target.relative_key
                 )));
             }
+            if target.retain_exact_precondition {
+                if !retain_commit_receipt || !matches_after {
+                    return Err(MutationError::Invalid(
+                        "exact mutation preconditions require a retained schema-3 intent and an unchanged source"
+                            .into(),
+                    ));
+                }
+            } else {
+                has_writable_target = true;
+            }
             prepared_targets.push(crate::services::twin_events::MutationTargetV1 {
                 kind: target.kind,
                 relative_key: target.relative_key,
@@ -1159,6 +1433,9 @@ impl MutationCoordinator {
             });
         }
         if prepared_targets.is_empty() && !event_only {
+            return Ok(None);
+        }
+        if !has_writable_target && drafts.is_empty() {
             return Ok(None);
         }
         if origin != MutationOrigin::Local && !drafts.is_empty() {
@@ -1181,16 +1458,13 @@ impl MutationCoordinator {
         let stream = events
             .first()
             .map_or(requested_stream, |event| event.causal_stream);
-        let markdown_root_scope = if prepared_targets
-            .iter()
-            .any(|target| {
-                matches!(
-                    target.kind,
-                    crate::services::twin_events::TargetKind::Markdown
-                        | crate::services::twin_events::TargetKind::OverlayJson
-                )
-            })
-        {
+        let markdown_root_scope = if prepared_targets.iter().any(|target| {
+            matches!(
+                target.kind,
+                crate::services::twin_events::TargetKind::Markdown
+                    | crate::services::twin_events::TargetKind::OverlayJson
+            )
+        }) {
             Some(self.current_markdown_root_scope()?)
         } else {
             None
@@ -1222,7 +1496,7 @@ impl MutationCoordinator {
             None
         };
         let mut intent = crate::services::twin_events::MutationIntentV1 {
-            schema_version: 2,
+            schema_version: if retain_commit_receipt { 3 } else { 2 },
             mutation_id: crate::services::twin_events::digest_bytes(b"placeholder"),
             origin,
             actor_id: self.finalizer.actor_id(),
@@ -1231,6 +1505,7 @@ impl MutationCoordinator {
             source_channel,
             markdown_root_scope,
             content_authority_generation,
+            retain_commit_receipt,
             targets: prepared_targets,
             events,
             created_at: Utc::now(),
@@ -1253,6 +1528,7 @@ impl MutationCoordinator {
         process_lock: &CoordinatorProcessLock,
         intent: &crate::services::twin_events::MutationIntentV1,
         inject_faults: bool,
+        cleanup: bool,
     ) -> Result<(), MutationError> {
         intent.validate()?;
         self.store.preflight_append_group(&intent.events)?;
@@ -1264,7 +1540,7 @@ impl MutationCoordinator {
                 ));
             }
         }
-        if intent.schema_version == 2 && intent_changes_authority(intent) {
+        if matches!(intent.schema_version, 2 | 3) && intent_changes_authority(intent) {
             let lease = self
                 .root_lease
                 .lock()
@@ -1282,6 +1558,19 @@ impl MutationCoordinator {
                 ));
             }
         }
+        #[cfg(test)]
+        {
+            let mut remaining = self
+                .replay_failures_before_targets
+                .lock()
+                .map_err(|_| MutationError::Invalid("replay fault lock poisoned".into()))?;
+            if *remaining > 0 {
+                *remaining -= 1;
+                return Err(MutationError::Io(
+                    "injected mutation replay failure before targets".into(),
+                ));
+            }
+        }
         let mut classifications = Vec::with_capacity(intent.targets.len());
         for target in &intent.targets {
             let current = self.before_image(target.kind, &target.relative_key)?;
@@ -1294,11 +1583,42 @@ impl MutationCoordinator {
             };
             classifications.push(classification);
         }
-        if classifications.contains(&TargetClassification::Third) {
+        let writable_targets = intent
+            .targets
+            .iter()
+            .enumerate()
+            .filter(|(_, target)| !target_is_exact_precondition(intent, target))
+            .collect::<Vec<_>>();
+        if writable_targets
+            .iter()
+            .any(|(index, _)| classifications[*index] == TargetClassification::Third)
+        {
             self.journal.quarantine_intent(process_lock, intent)?;
             return Err(MutationError::RecoveryConflict(
                 intent.mutation_id.as_str().to_string(),
             ));
+        }
+        let any_writable_after = writable_targets
+            .iter()
+            .any(|(index, _)| classifications[*index] == TargetClassification::After);
+        if !any_writable_after
+            && intent.targets.iter().enumerate().any(|(index, target)| {
+                target_is_exact_precondition(intent, target)
+                    && classifications[index] != TargetClassification::Before
+            })
+        {
+            // No authoritative target was applied, so a drifted read guard
+            // proves this staged optimizer intent is safely abortable. Remove
+            // the WAL durably; its Prepared owner will classify exact-before
+            // as NotCommitted during the fail-closed authority repair.
+            self.journal.remove(process_lock, intent)?;
+            if cleanup {
+                return Ok(());
+            }
+            return Err(MutationError::AbortedPrecondition {
+                mutation_id: intent.mutation_id.as_str().to_string(),
+                authority_advanced: true,
+            });
         }
 
         let mut application_order = intent
@@ -1306,14 +1626,16 @@ impl MutationCoordinator {
             .iter()
             .enumerate()
             .filter(|(index, target)| {
-                classifications[*index] == TargetClassification::Before
+                !target_is_exact_precondition(intent, target)
+                    && classifications[*index] == TargetClassification::Before
                     && !matches!(
                         target.after,
                         crate::services::twin_events::DesiredImage::Tombstone
                     )
             })
             .chain(intent.targets.iter().enumerate().filter(|(index, target)| {
-                classifications[*index] == TargetClassification::Before
+                !target_is_exact_precondition(intent, target)
+                    && classifications[*index] == TargetClassification::Before
                     && matches!(
                         target.after,
                         crate::services::twin_events::DesiredImage::Tombstone
@@ -1335,14 +1657,80 @@ impl MutationCoordinator {
                 self.inject(MutationFaultPoint::AfterEvent(index))?;
             }
         }
+        if intent.retain_commit_receipt {
+            let lease = self
+                .root_lease
+                .lock()
+                .map_err(|_| MutationError::Invalid("Markdown root lease lock poisoned".into()))?
+                .clone();
+            let authority = crate::services::vault_namespace::capture_authority_token_locked(
+                &self.data_path,
+                &lease,
+                process_lock,
+            )?;
+            self.journal
+                .retain_committed_receipt(process_lock, intent, &authority)?;
+        }
         if inject_faults {
             self.inject(MutationFaultPoint::BeforeCleanup)?;
         }
-        self.journal.remove(process_lock, intent)?;
-        if inject_faults {
-            self.inject(MutationFaultPoint::AfterCleanupBeforeFanout)?;
+        if cleanup {
+            self.journal.remove(process_lock, intent)?;
+            if inject_faults {
+                self.inject(MutationFaultPoint::AfterCleanupBeforeFanout)?;
+            }
         }
         Ok(())
+    }
+
+    fn validate_exact_preconditions_locked(
+        &self,
+        intent: &crate::services::twin_events::MutationIntentV1,
+    ) -> Result<(), MutationError> {
+        for target in intent
+            .targets
+            .iter()
+            .filter(|target| target_is_exact_precondition(intent, target))
+        {
+            let current = self.before_image(target.kind, &target.relative_key)?;
+            if current != target.before {
+                return Err(MutationError::AbortedPrecondition {
+                    mutation_id: intent.mutation_id.as_str().to_string(),
+                    authority_advanced: false,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn intent_effects_are_durable(
+        &self,
+        intent: &crate::services::twin_events::MutationIntentV1,
+    ) -> Result<bool, MutationError> {
+        for target in intent
+            .targets
+            .iter()
+            .filter(|target| !target_is_exact_precondition(intent, target))
+        {
+            let current = self.before_image(target.kind, &target.relative_key)?;
+            if !target_matches_after(&current, &target.after, &target.after_digest) {
+                return Ok(false);
+            }
+        }
+        if intent.events.is_empty() {
+            return Ok(true);
+        }
+        let durable = self.store.ordered_events()?;
+        let durable = durable
+            .into_iter()
+            .map(|event| (event.event_id.clone(), event))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        Ok(intent.events.iter().all(|expected| {
+            durable.get(&expected.event_id).is_some_and(|event| {
+                crate::services::twin_events::semantic_bytes(event)
+                    == crate::services::twin_events::semantic_bytes(expected)
+            })
+        }))
     }
 
     fn apply_intent_target(
@@ -1354,7 +1742,84 @@ impl MutationCoordinator {
             relative_key: target.relative_key.clone(),
             after: target.after.clone(),
             expected_before: None,
+            retain_exact_precondition: false,
         })
+    }
+
+    fn classify_witnessed_mutation_locked(
+        &self,
+        process_lock: &CoordinatorProcessLock,
+        mutation_id: &crate::models::twin_event::ContentDigest,
+        expected_authority: &crate::services::vault_namespace::VaultAuthorityTokenV1,
+        target_kind: crate::services::twin_events::TargetKind,
+        target_key: &str,
+        expected_before: &crate::services::twin_events::BeforeImage,
+        expected_after: &crate::models::twin_event::ContentDigest,
+    ) -> Result<WitnessedMutationRecovery, MutationError> {
+        self.verify_root_lease_locked()?;
+        let lease = self
+            .root_lease
+            .lock()
+            .map_err(|_| MutationError::Invalid("Markdown root lease lock poisoned".into()))?
+            .clone();
+        let current_authority = crate::services::vault_namespace::capture_authority_token_locked(
+            &self.data_path,
+            &lease,
+            process_lock,
+        )?;
+        if current_authority.root_scope != expected_authority.root_scope
+            || current_authority.lease_epoch_uuid != expected_authority.lease_epoch_uuid
+        {
+            return Err(MutationError::RecoveryConflict(
+                "witnessed mutation belongs to another vault authority".into(),
+            ));
+        }
+        let current_target = self.before_image(target_kind, target_key)?;
+        let after_matches = matches!(
+            &current_target,
+            crate::services::twin_events::BeforeImage::Sha256(digest)
+                if digest == expected_after
+        );
+        let committed_generation = expected_authority
+            .authority_generation
+            .checked_add(1)
+            .ok_or_else(|| {
+                MutationError::RecoveryConflict("authority-generation-exhausted".into())
+            })?;
+        if let Some(receipt) = self
+            .journal
+            .load_committed_receipt(process_lock, mutation_id)?
+        {
+            if receipt.root_scope != expected_authority.root_scope
+                || receipt.lease_epoch_uuid != expected_authority.lease_epoch_uuid
+                || receipt.authority_generation != committed_generation
+                || current_authority.authority_generation < receipt.authority_generation
+                || (current_authority.authority_generation == receipt.authority_generation
+                    && !after_matches)
+            {
+                return Err(MutationError::RecoveryConflict(
+                    "retained mutation receipt does not match its exact authority effect".into(),
+                ));
+            }
+            return Ok(WitnessedMutationRecovery::Committed(MutationCommit {
+                mutation_id: Some(mutation_id.clone()),
+                events: Vec::new(),
+                authority_token: Some(crate::services::vault_namespace::VaultAuthorityTokenV1 {
+                    root_scope: receipt.root_scope,
+                    lease_epoch_uuid: receipt.lease_epoch_uuid,
+                    authority_generation: receipt.authority_generation,
+                }),
+                postcommit_warning: true,
+            }));
+        }
+        if &current_target == expected_before
+            && current_authority.authority_generation >= expected_authority.authority_generation
+        {
+            return Ok(WitnessedMutationRecovery::NotCommitted);
+        }
+        Err(MutationError::RecoveryConflict(
+            "prepared mutation lacks an exact committed receipt".into(),
+        ))
     }
 
     fn apply_target_mutation(
@@ -1652,6 +2117,62 @@ impl MutationRootTransitionGuard<'_> {
         )
     }
 
+    /// Validates an authority token while retaining the already-acquired
+    /// coordinator process lock. Rebuild code must use this helper instead of
+    /// calling `MutationCoordinator::validate_authority_token`, which would
+    /// recursively try to acquire the same cross-process lock.
+    pub(crate) fn validate_authority_token(
+        &self,
+        expected: &crate::services::vault_namespace::VaultAuthorityTokenV1,
+        require_ready: bool,
+    ) -> Result<(), MutationError> {
+        self.coordinator.verify_root_lease_locked()?;
+        let lease = self.current_lease()?;
+        let current = self.capture_authority_token(&lease)?;
+        if &current != expected {
+            return Err(MutationError::RecoveryConflict(
+                "root authority changed while retained work was in flight".into(),
+            ));
+        }
+        if require_ready {
+            crate::services::vault_namespace::require_ready_token_locked(
+                &self.coordinator.data_path,
+                &current,
+                &self._process_lock,
+            )?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn classify_witnessed_mutation(
+        &self,
+        mutation_id: &crate::models::twin_event::ContentDigest,
+        expected_authority: &crate::services::vault_namespace::VaultAuthorityTokenV1,
+        target_kind: crate::services::twin_events::TargetKind,
+        target_key: &str,
+        expected_before: &crate::services::twin_events::BeforeImage,
+        expected_after: &crate::models::twin_event::ContentDigest,
+    ) -> Result<WitnessedMutationRecovery, MutationError> {
+        self.coordinator.classify_witnessed_mutation_locked(
+            &self._process_lock,
+            mutation_id,
+            expected_authority,
+            target_kind,
+            target_key,
+            expected_before,
+            expected_after,
+        )
+    }
+
+    pub(crate) fn consume_witnessed_mutation_receipt(
+        &self,
+        mutation_id: &crate::models::twin_event::ContentDigest,
+    ) -> Result<(), MutationError> {
+        self.coordinator
+            .journal
+            .consume_committed_receipt(&self._process_lock, mutation_id)
+    }
+
     pub(crate) fn current_vault_path(&self) -> Result<PathBuf, MutationError> {
         self.coordinator
             .vault_root
@@ -1871,6 +2392,21 @@ enum TargetClassification {
     Third,
 }
 
+fn target_is_exact_precondition(
+    intent: &crate::services::twin_events::MutationIntentV1,
+    target: &crate::services::twin_events::MutationTargetV1,
+) -> bool {
+    intent.schema_version == 3
+        && intent.retain_commit_receipt
+        && matches!(
+            (&target.before, &target.after),
+            (
+                crate::services::twin_events::BeforeImage::Sha256(before),
+                crate::services::twin_events::DesiredImage::Utf8Bytes(_),
+            ) if before == &target.after_digest
+        )
+}
+
 fn target_matches_after(
     current: &crate::services::twin_events::BeforeImage,
     desired: &crate::services::twin_events::DesiredImage,
@@ -1906,6 +2442,7 @@ impl crate::services::twin_events::EventRecorder for MutationCoordinator {
                     mutation_id: None,
                     events: Vec::new(),
                     authority_token: None,
+                    postcommit_warning: false,
                 })
             }
         }
@@ -1917,6 +2454,18 @@ impl crate::services::twin_events::EventRecorder for MutationCoordinator {
         planner: &mut dyn FnMut() -> Result<Option<MutationPlan>, MutationError>,
     ) -> Result<MutationCommit, MutationError> {
         self.commit_planned(origin, planner)
+    }
+
+    fn commit_planned_mutation_with_hooks(
+        &self,
+        origin: MutationOrigin,
+        planner: &mut dyn FnMut() -> Result<Option<MutationPlan>, MutationError>,
+        prepared: &mut dyn FnMut(
+            &crate::services::twin_events::MutationIntentV1,
+        ) -> Result<(), MutationError>,
+        committed: &mut dyn FnMut(&MutationCommit) -> Result<(), MutationError>,
+    ) -> Result<MutationCommit, MutationError> {
+        self.commit_planned_with_hooks(origin, planner, prepared, committed)
     }
 
     fn recover_pending_mutations(&self) -> Result<usize, MutationError> {
@@ -2190,13 +2739,9 @@ mod tests {
         std::fs::create_dir(&vault).unwrap();
         let store = Arc::new(TwinEventStore::new(&data));
         store.initialize().unwrap();
-        let coordinator = MutationCoordinator::new(
-            &data,
-            &vault,
-            store,
-            Arc::new(NoopMutationLifecycle),
-        )
-        .unwrap();
+        let coordinator =
+            MutationCoordinator::new(&data, &vault, store, Arc::new(NoopMutationLifecycle))
+                .unwrap();
         coordinator.require_namespace_ready().unwrap();
         let before = coordinator.current_authority_token().unwrap();
 
@@ -2213,7 +2758,7 @@ mod tests {
         coordinator.require_namespace_ready().unwrap();
 
         coordinator.fail_once_at(MutationFaultPoint::AfterStage);
-        assert!(coordinator
+        let commit = coordinator
             .commit_local(
                 CausalStream::LocalOnly,
                 crate::models::twin_event::SourceChannel::parse("note_editor").unwrap(),
@@ -2224,20 +2769,17 @@ mod tests {
                 )],
                 vec![draft("authority")],
             )
-            .is_err());
+            .expect("the exact staged authority mutation must converge in-call");
+        assert!(commit.postcommit_warning);
         assert!(coordinator.require_namespace_ready().is_err());
-        assert!(!vault.join("authority.md").exists());
-        let staged = coordinator.current_authority_token().unwrap();
-        assert_eq!(
-            staged.authority_generation,
-            before.authority_generation + 1
-        );
-
-        coordinator.recover_pending().unwrap();
         assert_eq!(
             std::fs::read_to_string(vault.join("authority.md")).unwrap(),
             "changed"
         );
+        let staged = coordinator.current_authority_token().unwrap();
+        assert_eq!(staged.authority_generation, before.authority_generation + 1);
+
+        assert_eq!(coordinator.recover_pending().unwrap(), 0);
         assert!(coordinator.require_namespace_ready().is_err());
         assert_eq!(coordinator.current_authority_token().unwrap(), staged);
     }
@@ -2251,13 +2793,9 @@ mod tests {
         std::fs::create_dir(&vault).unwrap();
         let store = Arc::new(TwinEventStore::new(&data));
         store.initialize().unwrap();
-        let coordinator = MutationCoordinator::new(
-            &data,
-            &vault,
-            store,
-            Arc::new(NoopMutationLifecycle),
-        )
-        .unwrap();
+        let coordinator =
+            MutationCoordinator::new(&data, &vault, store, Arc::new(NoopMutationLifecycle))
+                .unwrap();
 
         let canvas = coordinator
             .commit_local(
@@ -2300,13 +2838,9 @@ mod tests {
         std::fs::create_dir(&vault).unwrap();
         let store = Arc::new(TwinEventStore::new(&data));
         store.initialize().unwrap();
-        let coordinator = MutationCoordinator::new(
-            &data,
-            &vault,
-            store,
-            Arc::new(NoopMutationLifecycle),
-        )
-        .unwrap();
+        let coordinator =
+            MutationCoordinator::new(&data, &vault, store, Arc::new(NoopMutationLifecycle))
+                .unwrap();
         let stale = coordinator.current_authority_token().unwrap();
         coordinator
             .commit_local(
@@ -2348,6 +2882,415 @@ mod tests {
     }
 
     #[test]
+    fn retained_read_guard_drift_before_authority_aborts_without_wal_or_effect() {
+        let temp = tempdir().unwrap();
+        let data = temp.path().join("data");
+        let vault = temp.path().join("vault");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::create_dir(&vault).unwrap();
+        std::fs::write(vault.join("guard.md"), b"guard-before").unwrap();
+        let store = Arc::new(TwinEventStore::new(&data));
+        store.initialize().unwrap();
+        let coordinator =
+            MutationCoordinator::new(&data, &vault, store, Arc::new(NoopMutationLifecycle))
+                .unwrap();
+        let before = coordinator.current_authority_token().unwrap();
+        let guard_digest = crate::services::twin_events::digest_bytes(b"guard-before");
+        let mut plan = Some(
+            MutationPlan::new(
+                CausalStream::LocalOnly,
+                crate::models::twin_event::SourceChannel::parse("vault_optimizer").unwrap(),
+                vec![
+                    crate::services::twin_events::TargetMutation::put(
+                        crate::services::twin_events::TargetKind::Markdown,
+                        "guard.md",
+                        "guard-before",
+                    )
+                    .expecting(crate::services::twin_events::BeforeImage::Sha256(
+                        guard_digest,
+                    ))
+                    .retaining_exact_precondition(),
+                    crate::services::twin_events::TargetMutation::put(
+                        crate::services::twin_events::TargetKind::OverlayJson,
+                        "guard.json",
+                        "{\"bound\":true}",
+                    ),
+                ],
+                Vec::new(),
+            )
+            .expecting_authority(before.clone())
+            .retaining_commit_receipt(),
+        );
+        let mut prepared = |_: &crate::services::twin_events::MutationIntentV1| {
+            std::fs::write(vault.join("guard.md"), b"guard-edited").unwrap();
+            Ok(())
+        };
+        let result = coordinator.commit_planned_with_hooks(
+            MutationOrigin::Local,
+            &mut || Ok(plan.take()),
+            &mut prepared,
+            &mut |_| Ok(()),
+        );
+
+        assert!(matches!(
+            result,
+            Err(MutationError::AbortedPrecondition {
+                authority_advanced: false,
+                ..
+            })
+        ));
+        assert_eq!(coordinator.current_authority_token().unwrap(), before);
+        assert_eq!(coordinator.pending_count().unwrap(), 0);
+        assert!(!coordinator
+            .current_namespace_path()
+            .unwrap()
+            .join("vault_migration/overlay/notes/guard.json")
+            .exists());
+        assert_eq!(
+            std::fs::read_dir(data.join("twin/mutations/receipts/v1"))
+                .unwrap()
+                .count(),
+            0
+        );
+        assert_eq!(
+            std::fs::read(vault.join("guard.md")).unwrap(),
+            b"guard-edited"
+        );
+    }
+
+    #[test]
+    fn restart_recovery_resolves_drifted_guard_with_all_writes_before_in_one_pass() {
+        let temp = tempdir().unwrap();
+        let data = temp.path().join("data");
+        let vault = temp.path().join("vault");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::create_dir(&vault).unwrap();
+        std::fs::write(vault.join("guard.md"), b"guard-before").unwrap();
+        let store = Arc::new(TwinEventStore::new(&data));
+        store.initialize().unwrap();
+        let coordinator = MutationCoordinator::new(
+            &data,
+            &vault,
+            store.clone(),
+            Arc::new(NoopMutationLifecycle),
+        )
+        .unwrap();
+        let expected = coordinator.current_authority_token().unwrap();
+        let process_lock = coordinator.finalizer.acquire_coordinator_lock().unwrap();
+        let intent = coordinator
+            .prepare_intent(
+                &process_lock,
+                MutationOrigin::Local,
+                CausalStream::LocalOnly,
+                crate::models::twin_event::SourceChannel::parse("vault_optimizer").unwrap(),
+                vec![
+                    crate::services::twin_events::TargetMutation::put(
+                        crate::services::twin_events::TargetKind::Markdown,
+                        "guard.md",
+                        "guard-before",
+                    )
+                    .expecting(crate::services::twin_events::BeforeImage::Sha256(
+                        crate::services::twin_events::digest_bytes(b"guard-before"),
+                    ))
+                    .retaining_exact_precondition(),
+                    crate::services::twin_events::TargetMutation::put(
+                        crate::services::twin_events::TargetKind::OverlayJson,
+                        "guard.json",
+                        "{\"bound\":true}",
+                    ),
+                ],
+                Vec::new(),
+                true,
+            )
+            .unwrap()
+            .unwrap();
+        let lease = coordinator.root_lease.lock().unwrap().clone();
+        let advanced = crate::services::vault_namespace::advance_authority_locked(
+            &data,
+            &lease,
+            &process_lock,
+        )
+        .unwrap();
+        assert_eq!(
+            advanced.authority_generation,
+            expected.authority_generation + 1
+        );
+        coordinator.journal.stage(&process_lock, &intent).unwrap();
+        process_lock.unlock().unwrap();
+        std::fs::write(vault.join("guard.md"), b"guard-edited").unwrap();
+        drop(coordinator);
+
+        let restarted =
+            MutationCoordinator::new(&data, &vault, store, Arc::new(NoopMutationLifecycle))
+                .unwrap();
+        assert_eq!(restarted.recover_pending().unwrap(), 1);
+        assert_eq!(restarted.pending_count().unwrap(), 0);
+        assert!(!restarted
+            .current_namespace_path()
+            .unwrap()
+            .join("vault_migration/overlay/notes/guard.json")
+            .exists());
+        assert_eq!(
+            std::fs::read_dir(data.join("twin/mutations/receipts/v1"))
+                .unwrap()
+                .count(),
+            0
+        );
+        assert_eq!(
+            std::fs::read(vault.join("guard.md")).unwrap(),
+            b"guard-edited"
+        );
+        assert_eq!(restarted.recover_pending().unwrap(), 0);
+    }
+
+    #[test]
+    fn recovery_ignores_late_guard_drift_after_one_write_and_finishes_once() {
+        let temp = tempdir().unwrap();
+        let data = temp.path().join("data");
+        let vault = temp.path().join("vault");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::create_dir(&vault).unwrap();
+        std::fs::write(vault.join("guard.md"), b"guard-before").unwrap();
+        let store = Arc::new(TwinEventStore::new(&data));
+        store.initialize().unwrap();
+        let coordinator =
+            MutationCoordinator::new(&data, &vault, store, Arc::new(NoopMutationLifecycle))
+                .unwrap();
+        let process_lock = coordinator.finalizer.acquire_coordinator_lock().unwrap();
+        let intent = coordinator
+            .prepare_intent(
+                &process_lock,
+                MutationOrigin::Local,
+                CausalStream::LocalOnly,
+                crate::models::twin_event::SourceChannel::parse("vault_optimizer").unwrap(),
+                vec![
+                    crate::services::twin_events::TargetMutation::put(
+                        crate::services::twin_events::TargetKind::Markdown,
+                        "guard.md",
+                        "guard-before",
+                    )
+                    .expecting(crate::services::twin_events::BeforeImage::Sha256(
+                        crate::services::twin_events::digest_bytes(b"guard-before"),
+                    ))
+                    .retaining_exact_precondition(),
+                    crate::services::twin_events::TargetMutation::put(
+                        crate::services::twin_events::TargetKind::OverlayJson,
+                        "first.json",
+                        "{\"first\":true}",
+                    ),
+                    crate::services::twin_events::TargetMutation::put(
+                        crate::services::twin_events::TargetKind::OverlayJson,
+                        "second.json",
+                        "{\"second\":true}",
+                    ),
+                ],
+                Vec::new(),
+                true,
+            )
+            .unwrap()
+            .unwrap();
+        let lease = coordinator.root_lease.lock().unwrap().clone();
+        crate::services::vault_namespace::advance_authority_locked(&data, &lease, &process_lock)
+            .unwrap();
+        coordinator.journal.stage(&process_lock, &intent).unwrap();
+        process_lock.unlock().unwrap();
+        let first = intent
+            .targets
+            .iter()
+            .find(|target| target.relative_key == "first.json")
+            .unwrap();
+        coordinator.apply_intent_target(first).unwrap();
+        std::fs::write(vault.join("guard.md"), b"guard-edited-after-write").unwrap();
+
+        assert_eq!(coordinator.recover_pending().unwrap(), 1);
+        let namespace = coordinator.current_namespace_path().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(namespace.join("vault_migration/overlay/notes/first.json"))
+                .unwrap(),
+            "{\"first\":true}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(namespace.join("vault_migration/overlay/notes/second.json"))
+                .unwrap(),
+            "{\"second\":true}"
+        );
+        assert_eq!(
+            std::fs::read(vault.join("guard.md")).unwrap(),
+            b"guard-edited-after-write"
+        );
+        assert_eq!(coordinator.pending_count().unwrap(), 0);
+        assert_eq!(
+            std::fs::read_dir(data.join("twin/mutations/receipts/v1"))
+                .unwrap()
+                .count(),
+            1
+        );
+        assert_eq!(coordinator.recover_pending().unwrap(), 0);
+    }
+
+    #[test]
+    fn retained_exact_guards_reject_lifecycle_events() {
+        let temp = tempdir().unwrap();
+        let data = temp.path().join("data");
+        let vault = temp.path().join("vault");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::create_dir(&vault).unwrap();
+        std::fs::write(vault.join("guard.md"), b"guard-before").unwrap();
+        let store = Arc::new(TwinEventStore::new(&data));
+        store.initialize().unwrap();
+        let coordinator =
+            MutationCoordinator::new(&data, &vault, store, Arc::new(NoopMutationLifecycle))
+                .unwrap();
+        let before = coordinator.current_authority_token().unwrap();
+        let mut plan = Some(
+            MutationPlan::new(
+                CausalStream::LocalOnly,
+                crate::models::twin_event::SourceChannel::parse("vault_optimizer").unwrap(),
+                vec![
+                    crate::services::twin_events::TargetMutation::put(
+                        crate::services::twin_events::TargetKind::Markdown,
+                        "guard.md",
+                        "guard-before",
+                    )
+                    .expecting(crate::services::twin_events::BeforeImage::Sha256(
+                        crate::services::twin_events::digest_bytes(b"guard-before"),
+                    ))
+                    .retaining_exact_precondition(),
+                    crate::services::twin_events::TargetMutation::put(
+                        crate::services::twin_events::TargetKind::OverlayJson,
+                        "guard.json",
+                        "{}",
+                    ),
+                ],
+                vec![draft("guard-event")],
+            )
+            .expecting_authority(before.clone())
+            .retaining_commit_receipt(),
+        );
+        let error = coordinator
+            .commit_planned(MutationOrigin::Local, &mut || Ok(plan.take()))
+            .unwrap_err();
+        assert!(error.to_string().contains("lifecycle events"));
+        assert_eq!(coordinator.current_authority_token().unwrap(), before);
+        assert_eq!(coordinator.pending_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn retained_receipt_failure_after_exact_effect_returns_committed_warning() {
+        let temp = tempdir().unwrap();
+        let data = temp.path().join("data");
+        let vault = temp.path().join("vault");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::create_dir(&vault).unwrap();
+        let store = Arc::new(TwinEventStore::new(&data));
+        store.initialize().unwrap();
+        let coordinator =
+            MutationCoordinator::new(&data, &vault, store, Arc::new(NoopMutationLifecycle))
+                .unwrap();
+        let expected = coordinator.current_authority_token().unwrap();
+        let receipts = data.join("twin/mutations/receipts/v1");
+        let mut plan = Some(
+            MutationPlan::new(
+                CausalStream::LocalOnly,
+                crate::models::twin_event::SourceChannel::parse("vault_optimizer").unwrap(),
+                vec![crate::services::twin_events::TargetMutation::put(
+                    crate::services::twin_events::TargetKind::Markdown,
+                    "receipt-warning.md",
+                    "committed",
+                )],
+                Vec::new(),
+            )
+            .expecting_authority(expected)
+            .retaining_commit_receipt(),
+        );
+        let mut prepared = |_: &crate::services::twin_events::MutationIntentV1| {
+            std::fs::remove_dir(&receipts).unwrap();
+            std::fs::write(&receipts, b"block receipt retention").unwrap();
+            Ok(())
+        };
+        let mut committed_called = false;
+        let commit = coordinator
+            .commit_planned_with_hooks(
+                MutationOrigin::Local,
+                &mut || Ok(plan.take()),
+                &mut prepared,
+                &mut |_| {
+                    committed_called = true;
+                    Ok(())
+                },
+            )
+            .expect("an exact durable effect must not escape as retryable failure");
+
+        assert!(commit.postcommit_warning);
+        assert!(commit.authority_token.is_some());
+        assert!(!committed_called);
+        assert_eq!(
+            std::fs::read_to_string(vault.join("receipt-warning.md")).unwrap(),
+            "committed"
+        );
+        assert_eq!(
+            std::fs::read_dir(data.join("twin/mutations/pending/v1"))
+                .unwrap()
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn durability_classifier_error_does_not_claim_a_committed_result() {
+        let temp = tempdir().unwrap();
+        let data = temp.path().join("data");
+        let vault = temp.path().join("vault");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::create_dir(&vault).unwrap();
+        let store = Arc::new(TwinEventStore::new(&data));
+        store.initialize().unwrap();
+        let coordinator =
+            MutationCoordinator::new(&data, &vault, store, Arc::new(NoopMutationLifecycle))
+                .unwrap();
+        let expected = coordinator.current_authority_token().unwrap();
+        let receipts = data.join("twin/mutations/receipts/v1");
+        coordinator.fail_once_at(MutationFaultPoint::BeforeDurabilityClassification);
+        let mut plan = Some(
+            MutationPlan::new(
+                CausalStream::LocalOnly,
+                crate::models::twin_event::SourceChannel::parse("vault_optimizer").unwrap(),
+                vec![crate::services::twin_events::TargetMutation::put(
+                    crate::services::twin_events::TargetKind::Markdown,
+                    "classifier-error.md",
+                    "committed-but-unclassified",
+                )],
+                Vec::new(),
+            )
+            .expecting_authority(expected)
+            .retaining_commit_receipt(),
+        );
+        let mut prepared = |_: &crate::services::twin_events::MutationIntentV1| {
+            std::fs::remove_dir(&receipts).unwrap();
+            std::fs::write(&receipts, b"block receipt retention").unwrap();
+            Ok(())
+        };
+        let result = coordinator.commit_planned_with_hooks(
+            MutationOrigin::Local,
+            &mut || Ok(plan.take()),
+            &mut prepared,
+            &mut |_| Ok(()),
+        );
+
+        assert!(result.is_err());
+        assert_eq!(
+            std::fs::read_to_string(vault.join("classifier-error.md")).unwrap(),
+            "committed-but-unclassified"
+        );
+        assert_eq!(
+            std::fs::read_dir(data.join("twin/mutations/pending/v1"))
+                .unwrap()
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn overlay_target_recovery_uses_the_staged_generation_once() {
         let temp = tempdir().unwrap();
         let data = temp.path().join("data");
@@ -2365,7 +3308,7 @@ mod tests {
         .unwrap();
         let before = coordinator.current_authority_token().unwrap();
         coordinator.fail_once_at(MutationFaultPoint::AfterStage);
-        assert!(coordinator
+        let commit = coordinator
             .commit_local(
                 CausalStream::LocalOnly,
                 crate::models::twin_event::SourceChannel::parse("vault_optimizer").unwrap(),
@@ -2376,42 +3319,22 @@ mod tests {
                 )],
                 Vec::new(),
             )
-            .is_err());
+            .expect("the exact staged overlay mutation must converge in-call");
+        assert!(commit.postcommit_warning);
         let staged = coordinator.current_authority_token().unwrap();
         assert_eq!(staged.authority_generation, before.authority_generation + 1);
-        let overlay = crate::services::vault_namespace::scoped_data_path(
-            &data,
-            &staged.root_scope,
-        )
-        .join("vault_migration/overlay/notes/captured.json");
-        assert!(!overlay.exists());
-        let pending_path = std::fs::read_dir(data.join("twin/mutations/pending/v1"))
-            .unwrap()
-            .next()
-            .unwrap()
-            .unwrap()
-            .path();
-        let pending: crate::services::twin_events::MutationIntentV1 =
-            serde_json::from_slice(&std::fs::read(pending_path).unwrap()).unwrap();
-        assert_eq!(pending.markdown_root_scope.as_ref(), Some(&staged.root_scope));
-        assert!(pending.targets.iter().all(|target| {
-            target.kind == crate::services::twin_events::TargetKind::OverlayJson
-        }));
-
-        assert_eq!(coordinator.recover_pending().unwrap(), 1);
+        let overlay = crate::services::vault_namespace::scoped_data_path(&data, &staged.root_scope)
+            .join("vault_migration/overlay/notes/captured.json");
         assert_eq!(std::fs::read_to_string(&overlay).unwrap(), "{}");
         assert_eq!(coordinator.current_authority_token().unwrap(), staged);
+        assert_eq!(coordinator.pending_count().unwrap(), 0);
         assert_eq!(coordinator.recover_pending().unwrap(), 0);
         assert_eq!(coordinator.current_authority_token().unwrap(), staged);
 
         drop(coordinator);
-        let restarted = MutationCoordinator::new(
-            &data,
-            &vault,
-            store,
-            Arc::new(NoopMutationLifecycle),
-        )
-        .unwrap();
+        let restarted =
+            MutationCoordinator::new(&data, &vault, store, Arc::new(NoopMutationLifecycle))
+                .unwrap();
         assert_eq!(restarted.recover_pending().unwrap(), 0);
         assert_eq!(restarted.current_authority_token().unwrap(), staged);
         assert_eq!(std::fs::read_to_string(overlay).unwrap(), "{}");
@@ -2456,16 +3379,92 @@ mod tests {
         assert_eq!(coordinator.recover_pending().unwrap(), 0);
 
         drop(coordinator);
-        let restarted = MutationCoordinator::new(
-            &data,
-            &vault,
-            store,
-            Arc::new(NoopMutationLifecycle),
-        )
-        .unwrap();
+        let restarted =
+            MutationCoordinator::new(&data, &vault, store, Arc::new(NoopMutationLifecycle))
+                .unwrap();
         assert_eq!(restarted.current_authority_token().unwrap(), dirty);
         assert_eq!(restarted.recover_pending().unwrap(), 0);
         assert!(!vault.join("false-dirty.md").exists());
+    }
+
+    #[test]
+    fn witnessed_prepared_write_is_not_committed_after_later_authority_advances() {
+        let temp = tempdir().unwrap();
+        let data = temp.path().join("data");
+        let vault = temp.path().join("vault");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::create_dir(&vault).unwrap();
+        let store = Arc::new(TwinEventStore::new(&data));
+        store.initialize().unwrap();
+        let coordinator =
+            MutationCoordinator::new(&data, &vault, store, Arc::new(NoopMutationLifecycle))
+                .unwrap();
+        let expected = coordinator.current_authority_token().unwrap();
+        let target_key = "prepared-before-wal.md";
+        let target_bytes = b"not staged";
+        let mut plan = Some(
+            MutationPlan::new(
+                CausalStream::LocalOnly,
+                crate::models::twin_event::SourceChannel::parse("vault_optimizer").unwrap(),
+                vec![crate::services::twin_events::TargetMutation::put(
+                    crate::services::twin_events::TargetKind::Markdown,
+                    target_key,
+                    std::str::from_utf8(target_bytes).unwrap(),
+                )],
+                Vec::new(),
+            )
+            .expecting_authority(expected.clone())
+            .retaining_commit_receipt(),
+        );
+        let mut mutation_id = None;
+        coordinator.fail_once_at(MutationFaultPoint::AfterAuthorityAdvance);
+        let result = coordinator.commit_planned_with_hooks(
+            MutationOrigin::Local,
+            &mut || Ok(plan.take()),
+            &mut |intent| {
+                mutation_id = Some(intent.mutation_id.clone());
+                Ok(())
+            },
+            &mut |_| Ok(()),
+        );
+        assert!(result.is_err());
+        assert!(!vault.join(target_key).exists());
+
+        let _ = coordinator
+            .commit_local(
+                CausalStream::LocalOnly,
+                crate::models::twin_event::SourceChannel::parse("note_editor").unwrap(),
+                vec![crate::services::twin_events::TargetMutation::put(
+                    crate::services::twin_events::TargetKind::Markdown,
+                    "later-peer.md",
+                    "peer",
+                )],
+                Vec::new(),
+            )
+            .unwrap();
+        assert_eq!(
+            coordinator
+                .current_authority_token()
+                .unwrap()
+                .authority_generation,
+            expected.authority_generation + 2
+        );
+
+        let guard = coordinator.begin_root_transition().unwrap();
+        let classification = guard
+            .classify_witnessed_mutation(
+                &mutation_id.unwrap(),
+                &expected,
+                crate::services::twin_events::TargetKind::Markdown,
+                target_key,
+                &crate::services::twin_events::BeforeImage::Absent,
+                &crate::services::twin_events::digest_bytes(target_bytes),
+            )
+            .unwrap();
+        assert!(matches!(
+            classification,
+            WitnessedMutationRecovery::NotCommitted
+        ));
     }
 
     #[test]

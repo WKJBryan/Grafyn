@@ -55,6 +55,11 @@ pub struct AppState {
     pub mutation_startup_error: Arc<RwLock<Option<String>>>,
     pub(crate) loaded_authority:
         Arc<RwLock<Option<crate::services::vault_namespace::VaultAuthorityTokenV1>>>,
+    /// Serializes complete derived-state repairs inside this desktop process.
+    /// Cross-process serialization is provided by the coordinator guard that
+    /// every repair holds for its entire capture/reload/build/publish window.
+    pub(crate) authority_repair: Arc<tokio::sync::Mutex<()>>,
+    pub(crate) committed_warning_app: Option<tauri::AppHandle>,
     pub vault_transition: Arc<RwLock<()>>,
     /// MemoryService is stateless — no lock needed, just Arc for shared ownership
     pub memory_service: Arc<MemoryService>,
@@ -278,6 +283,8 @@ pub fn run() {
                 mutation_coordinator,
                 mutation_startup_error: Arc::new(RwLock::new(mutation_startup_error)),
                 loaded_authority: Arc::new(RwLock::new(None)),
+                authority_repair: Arc::new(tokio::sync::Mutex::new(())),
+                committed_warning_app: Some(app.handle().clone()),
                 vault_transition: Arc::new(RwLock::new(())),
                 memory_service: Arc::new(MemoryService::new()),
                 boot_state,
@@ -495,6 +502,7 @@ async fn warm_start_services_inner(
     injected_failure: Option<WarmStartComponent>,
 ) -> Result<(), String> {
     let _root_epoch = acquire_warm_start_root_gate(state).await?;
+    let _authority_repair = state.authority_repair.lock().await;
     let coordinator = state
         .mutation_coordinator
         .as_ref()
@@ -545,40 +553,6 @@ async fn warm_start_services_inner(
     // Finish every authoritative normalization before selecting the rebuild
     // generation. `sync_topic_hubs` may itself commit canonical Markdown.
     crate::commands::sync_topic_hubs(state).await?;
-    let namespace_token = {
-        let guard = coordinator
-            .begin_root_transition()
-            .map_err(|error| error.to_string())?;
-        let current_lease = guard.current_lease().map_err(|error| error.to_string())?;
-        if current_lease != namespace_lease {
-            return Err("vault authority changed before derived rebuild".into());
-        }
-        guard
-            .capture_authority_token(&current_lease)
-            .map_err(|error| error.to_string())?
-    };
-
-    // Reload authoritative inputs only after the exact generation is captured;
-    // notes returned by normalization and previously populated Twin caches may
-    // belong to an older peer generation.
-    let full_notes = {
-        let mut knowledge = state.knowledge_store.write().await;
-        knowledge.reload_authoritative_state();
-        knowledge
-            .list_full_notes()
-            .map_err(|error| error.to_string())?
-    };
-    warm_start_component(WarmStartComponent::TwinCaches, injected_failure)?;
-    state
-        .twin_store
-        .write()
-        .await
-        .rebuild_mutation_caches()
-        .map_err(|error| error.to_string())?;
-    coordinator
-        .validate_authority_token(&namespace_token, false)
-        .map_err(|error| error.to_string())?;
-
     maybe_publish_boot_phase(
         app_handle,
         state,
@@ -586,12 +560,6 @@ async fn warm_start_services_inner(
         BootStatus::new("building_graph", "Building graph from your notes"),
     )
     .await;
-
-    warm_start_component(WarmStartComponent::Graph, injected_failure)?;
-    {
-        let mut graph = state.graph_index.write().await;
-        graph.build_from_notes(&full_notes);
-    }
 
     maybe_publish_boot_phase(
         app_handle,
@@ -601,12 +569,6 @@ async fn warm_start_services_inner(
     )
     .await;
 
-    warm_start_component(WarmStartComponent::Search, injected_failure)?;
-    {
-        let mut search = state.search_service.write().await;
-        search.reindex_all(&full_notes).map_err(|e| e.to_string())?;
-    }
-
     maybe_publish_boot_phase(
         app_handle,
         state,
@@ -615,34 +577,14 @@ async fn warm_start_services_inner(
     )
     .await;
 
-    warm_start_component(WarmStartComponent::Chunk, injected_failure)?;
-    {
-        let mut chunks = state.chunk_index.write().await;
-        chunks
-            .reindex_all(&full_notes)
-            .map_err(|error| error.to_string())?;
-    }
-
-    warm_start_component(WarmStartComponent::LinkDiscovery, injected_failure)?;
-    {
-        let mut discovery = state.link_discovery.write().await;
-        discovery
-            .bootstrap_checked(&full_notes)
-            .map_err(|error| error.to_string())?;
-    }
-
-    warm_start_component(WarmStartComponent::Optimizer, injected_failure)?;
-    {
-        let mut optimizer = state.vault_optimizer.write().await;
-        optimizer
-            .bootstrap_checked(&full_notes)
-            .map_err(|error| error.to_string())?;
-    }
-
-    let publish_guard = coordinator
+    // Acquire every local service guard in canonical order before retaining
+    // the cross-process guard. The shared inner seam then performs the exact
+    // capture/reload/build/ready publication without another local lock await.
+    let mut repair_guards = crate::commands::acquire_authority_repair_guards(state).await?;
+    let rebuild_guard = coordinator
         .begin_root_transition()
         .map_err(|error| error.to_string())?;
-    let current_lease = publish_guard
+    let current_lease = rebuild_guard
         .current_lease()
         .map_err(|error| error.to_string())?;
     if current_lease != namespace_lease
@@ -651,12 +593,31 @@ async fn warm_start_services_inner(
             &current_lease.root_scope,
         ) != namespace_path
     {
-        return Err("vault authority changed while derived state was rebuilding".into());
+        return Err("vault authority changed before derived rebuild".into());
     }
-    publish_guard
-        .publish_namespace_ready(&namespace_token)
+    let expected = rebuild_guard
+        .capture_authority_token(&current_lease)
         .map_err(|error| error.to_string())?;
-    *state.loaded_authority.write().await = Some(namespace_token);
+    crate::commands::rebuild_authority_with_retained_guard(
+        &mut repair_guards,
+        &rebuild_guard,
+        &expected,
+        |step| {
+            let component = match step {
+                crate::commands::AuthorityRepairStep::Normalized
+                | crate::commands::AuthorityRepairStep::Captured => return Ok(()),
+                crate::commands::AuthorityRepairStep::TwinCaches => WarmStartComponent::TwinCaches,
+                crate::commands::AuthorityRepairStep::Search => WarmStartComponent::Search,
+                crate::commands::AuthorityRepairStep::Chunk => WarmStartComponent::Chunk,
+                crate::commands::AuthorityRepairStep::Graph => WarmStartComponent::Graph,
+                crate::commands::AuthorityRepairStep::LinkDiscovery => {
+                    WarmStartComponent::LinkDiscovery
+                }
+                crate::commands::AuthorityRepairStep::Optimizer => WarmStartComponent::Optimizer,
+            };
+            warm_start_component(component, injected_failure)
+        },
+    )?;
 
     maybe_publish_boot_phase(
         app_handle,
@@ -734,9 +695,7 @@ fn start_link_discovery_worker(state: AppState) {
                     .expect("coordinator was required by the root ticket")
                     .with_locked_derived_state(&root_epoch, true, || {
                         discovery.reload_from_disk_checked().map_err(|error| {
-                            crate::services::twin_events::MutationError::Invalid(
-                                error.to_string(),
-                            )
+                            crate::services::twin_events::MutationError::Invalid(error.to_string())
                         })?;
                         discovery
                             .next_background_job_checked(&settings)
@@ -769,18 +728,16 @@ fn start_link_discovery_worker(state: AppState) {
             )
             .await;
 
-            let completion_ticket = match crate::commands::acquire_expected_derived_root_epoch(
-                &state,
-                &root_epoch,
-            )
-            .await
-            {
-                Ok(guard) => guard,
-                Err(error) => {
-                    log::warn!("Background link discovery discarded stale result: {error}");
-                    continue;
-                }
-            };
+            let completion_ticket =
+                match crate::commands::acquire_expected_derived_root_epoch(&state, &root_epoch)
+                    .await
+                {
+                    Ok(guard) => guard,
+                    Err(error) => {
+                        log::warn!("Background link discovery discarded stale result: {error}");
+                        continue;
+                    }
+                };
 
             let requeue = match &result {
                 Ok(_) => None,
@@ -802,9 +759,7 @@ fn start_link_discovery_worker(state: AppState) {
                     .expect("coordinator was required by the root ticket")
                     .with_locked_derived_state(&root_epoch, true, || {
                         discovery.reload_from_disk_checked().map_err(|error| {
-                            crate::services::twin_events::MutationError::Invalid(
-                                error.to_string(),
-                            )
+                            crate::services::twin_events::MutationError::Invalid(error.to_string())
                         })?;
                         discovery
                             .complete_background_job_checked(&job.note_id, requeue)
@@ -851,20 +806,16 @@ fn start_vault_optimizer_worker(state: AppState) {
             // lock, so LLM/network work (once added) and disk I/O here never
             // block other note/search/canvas commands that need
             // `knowledge_store.write()`.
-            let (tick, prepared_optimizer_revision, prepared_commit) = {
+            let tick = {
                 let store = state.knowledge_store.read().await;
-                store.clear_last_mutation_commit();
                 let mut optimizer = state.vault_optimizer.write().await;
-                let tick = optimizer.with_locked_fresh_state(|optimizer| {
+                optimizer.with_locked_fresh_state(|optimizer| {
                     optimizer.prepare_next_expecting_authority(
                         &store,
                         &settings,
                         root_guard.authority().clone(),
                     )
-                });
-                let revision = optimizer.state_revision();
-                let commit = store.take_last_mutation_commit();
-                (tick, revision, commit)
+                })
             };
 
             // Whichever branch below reindexes a note, it does so only AFTER
@@ -873,54 +824,123 @@ fn start_vault_optimizer_worker(state: AppState) {
             // `commit_note_index_refresh` reacquires `knowledge_store` itself
             // (see its doc comment in `commands/mod.rs` for why this can't
             // just be a call to `commit_note_write`).
-            let (applied_note_id, mutation_commit) = match tick {
-                Ok(OptimizerTick::Idle) => (None, None),
-                Ok(OptimizerTick::Applied(note_id)) => (Some(note_id), prepared_commit),
-                Ok(OptimizerTick::Pending(pending)) => {
-                    // Only non-`sidecar_first` edit modes reach here, and only
-                    // for the narrow `update_note` write itself — acquire the
-                    // write lock just for this, in the same canonical order.
-                    let result = {
-                        let mut store = state.knowledge_store.write().await;
-                        store.clear_last_mutation_commit();
-                        let mut optimizer = state.vault_optimizer.write().await;
-                        let result = optimizer.with_locked_fresh_state(|optimizer| {
-                            if optimizer.state_revision() != prepared_optimizer_revision {
-                                anyhow::bail!(
-                                    "vault optimizer state changed before pending apply"
-                                );
-                            }
-                            optimizer.apply_pending(&mut store, *pending)
-                        });
-                        let commit = store.take_last_mutation_commit();
-                        (result, commit)
-                    };
-                    match result {
-                        (Ok(applied_note_id), commit) => (applied_note_id, commit),
-                        (Err(error), _) => {
-                            log::warn!("Background vault optimizer failed to apply: {}", error);
-                            (None, None)
+            let mut apply_failed = false;
+            let committed =
+                match tick {
+                    Ok(OptimizerTick::NoWrite) => None,
+                    Ok(OptimizerTick::Committed {
+                        result,
+                        commit,
+                        warning,
+                    }) => Some((result, commit, warning)),
+                    Ok(OptimizerTick::RetryFenced(pending)) => {
+                        let result = {
+                            let mut store = state.knowledge_store.write().await;
+                            let mut optimizer = state.vault_optimizer.write().await;
+                            optimizer.apply_retry_fenced(&mut store, *pending)
+                        };
+                        match result {
+                        Ok(crate::services::vault_optimizer::OptimizerMutationResult::Committed {
+                            result,
+                            commit,
+                            warning,
+                        }) => Some((result, commit, warning)),
+                        Ok(crate::services::vault_optimizer::OptimizerMutationResult::NoWrite) => {
+                            None
+                        }
+                        Err(error) => {
+                            log::warn!(
+                                "Background vault optimizer failed to resume retry fence: {}",
+                                error
+                            );
+                            apply_failed = true;
+                            None
                         }
                     }
-                }
-                Err(error) => {
-                    log::warn!("Background vault optimizer failed to prepare: {}", error);
-                    (None, None)
-                }
-            };
+                    }
+                    Ok(OptimizerTick::Pending(pending)) => {
+                        // Only non-`sidecar_first` edit modes reach here, and only
+                        // for the narrow `update_note` write itself — acquire the
+                        // write lock just for this, in the same canonical order.
+                        let result = {
+                            let mut store = state.knowledge_store.write().await;
+                            let mut optimizer = state.vault_optimizer.write().await;
+                            optimizer.apply_pending(&mut store, *pending)
+                        };
+                        match result {
+                        Ok(crate::services::vault_optimizer::OptimizerMutationResult::Committed {
+                            result,
+                            commit,
+                            warning,
+                        }) => Some((result, commit, warning)),
+                        Ok(crate::services::vault_optimizer::OptimizerMutationResult::NoWrite) => {
+                            None
+                        }
+                        Err(error) => {
+                            log::warn!("Background vault optimizer failed to apply: {}", error);
+                            apply_failed = true;
+                            None
+                        }
+                    }
+                    }
+                    Err(error) => {
+                        log::warn!("Background vault optimizer failed to prepare: {}", error);
+                        None
+                    }
+                };
 
-            if let Some(commit) = mutation_commit {
-                crate::commands::repair_after_authority_mutation(
+            if apply_failed {
+                // `apply_pending` may have durably published Prepared before
+                // returning an uncertain coordinator error. Release the root
+                // read ticket, then force a complete authority rebuild so the
+                // witness is classified before this queue job can run again.
+                drop(root_guard);
+                let token = state
+                    .mutation_coordinator
+                    .as_ref()
+                    .ok_or_else(|| "mutation coordinator is unavailable".to_string())
+                    .and_then(|coordinator| {
+                        coordinator
+                            .current_authority_token()
+                            .map_err(|error| error.to_string())
+                    });
+                match token {
+                    Ok(token) => match crate::commands::repair_after_authority_token(
+                        &state,
+                        &token,
+                        "vault optimizer failed apply",
+                    )
+                    .await
+                    {
+                        crate::commands::PostAuthorityRepair::NotRequired
+                        | crate::commands::PostAuthorityRepair::Ready(_) => {}
+                        crate::commands::PostAuthorityRepair::Unavailable(_) => {}
+                    },
+                    Err(error) => log::error!(
+                        "Vault optimizer failure could not capture recovery authority: {error}"
+                    ),
+                }
+                continue;
+            }
+
+            if let Some((result, commit, service_warning)) = committed {
+                let repair = crate::commands::repair_after_authority_mutation(
                     &state,
                     &commit,
                     "vault optimizer",
                 )
                 .await;
-            } else if let Some(note_id) = applied_note_id {
-                log::error!(
-                    "Vault optimizer changed note '{}' without exposing its mutation commit",
-                    note_id
+                if service_warning.is_some()
+                    && !matches!(repair, crate::commands::PostAuthorityRepair::Unavailable(_))
+                {
+                    crate::commands::publish_committed_warning(&state);
+                }
+                log::debug!(
+                    "Vault optimizer committed change {} for note {}",
+                    result.change_id(),
+                    result.note_id()
                 );
+                continue;
             }
             if let Err(error) = root_guard.finish(&state).await {
                 log::warn!("Background vault optimizer result became stale: {error}");
@@ -934,8 +954,7 @@ mod tests {
     use super::*;
 
     fn build_warm_start_state() -> (AppState, tempfile::TempDir, tempfile::TempDir) {
-        let (mut state, vault, data) =
-            crate::commands::commit_note_write_tests::build_test_state();
+        let (mut state, vault, data) = crate::commands::commit_note_write_tests::build_test_state();
         let discarded = data.path().join("discarded-derived");
         state.search_service = Arc::new(RwLock::new(
             crate::services::search::SearchService::new(discarded.clone()).unwrap(),
@@ -947,9 +966,7 @@ mod tests {
             crate::services::link_discovery::LinkDiscoveryService::new(discarded.clone()),
         ));
         state.markdown_migration = Arc::new(RwLock::new(
-            crate::services::markdown_migration::MarkdownMigrationService::new(
-                discarded.clone(),
-            ),
+            crate::services::markdown_migration::MarkdownMigrationService::new(discarded.clone()),
         ));
         state.vault_optimizer = Arc::new(RwLock::new(
             crate::services::vault_optimizer::VaultOptimizerService::new(discarded),
@@ -1010,13 +1027,15 @@ mod tests {
 
     #[tokio::test]
     async fn warm_start_waits_behind_root_transition_before_reading_services() {
-        let (state, _vault, _data) =
-            crate::commands::commit_note_write_tests::build_test_state();
+        let (state, _vault, _data) = crate::commands::commit_note_write_tests::build_test_state();
         let transition = state.vault_transition.write().await;
         let task_state = state.clone();
         let task = tokio::spawn(async move { acquire_warm_start_root_gate(&task_state).await });
         tokio::task::yield_now().await;
-        assert!(!task.is_finished(), "warm start must wait behind root transition");
+        assert!(
+            !task.is_finished(),
+            "warm start must wait behind root transition"
+        );
         drop(transition);
         drop(task.await.unwrap().unwrap());
     }
