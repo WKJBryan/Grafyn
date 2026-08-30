@@ -116,23 +116,38 @@ impl TwinStore {
         }
     }
 
-    pub fn replace_root_path(&mut self, root_path: PathBuf) {
+    pub fn replace_root_path(&mut self, root_path: PathBuf) -> Result<()> {
+        std::fs::create_dir_all(&root_path)
+            .with_context(|| format!("Failed to create Twin root: {}", root_path.display()))?;
+        crate::services::twin_events::validate_real_directory(&root_path, "Twin root")
+            .map_err(anyhow::Error::new)?;
         *self = Self::with_event_recorder(
             root_path,
             self.target_root_path.clone(),
             self.event_recorder.clone(),
         );
+        Ok(())
+    }
+
+    pub fn root_path(&self) -> &Path {
+        &self.root_path
+    }
+
+    pub fn target_root_path(&self) -> &Path {
+        &self.target_root_path
     }
 
     fn write_pretty_json<T: Serialize>(&self, path: &Path, value: &T) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("Failed to create directory: {}", parent.display()))?;
-        }
-
         let content = serde_json::to_string_pretty(value)?;
-        write_atomic(path, content.as_bytes())
-            .with_context(|| format!("Failed to write JSON file: {}", path.display()))
+        if self.event_recorder.is_noop() {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("Failed to create directory: {}", parent.display()))?;
+            }
+            return write_atomic(path, content.as_bytes())
+                .with_context(|| format!("Failed to write JSON file: {}", path.display()));
+        }
+        self.commit_governed_json_targets(vec![(path.to_path_buf(), content)], Vec::new())
     }
 
     fn governed_json_digest<T: Serialize>(
@@ -214,7 +229,24 @@ impl TwinStore {
             }
             return Ok(());
         }
-        let targets = values
+        let targets = self.governed_json_targets(values)?;
+        self.event_recorder
+            .commit_mutation(
+                crate::services::twin_events::MutationOrigin::Local,
+                crate::models::twin_event::CausalStream::SyncEligible,
+                source_channel,
+                targets,
+                drafts,
+            )
+            .map_err(anyhow::Error::new)?;
+        Ok(())
+    }
+
+    pub(crate) fn governed_json_targets(
+        &self,
+        values: Vec<(PathBuf, String)>,
+    ) -> Result<Vec<crate::services::twin_events::TargetMutation>> {
+        values
             .into_iter()
             .map(|(path, content)| {
                 let relative = path
@@ -230,17 +262,7 @@ impl TwinStore {
                     content,
                 ))
             })
-            .collect::<Result<Vec<_>>>()?;
-        self.event_recorder
-            .commit_mutation(
-                crate::services::twin_events::MutationOrigin::Local,
-                crate::models::twin_event::CausalStream::SyncEligible,
-                source_channel,
-                targets,
-                drafts,
-            )
-            .map_err(anyhow::Error::new)?;
-        Ok(())
+            .collect::<Result<Vec<_>>>()
     }
 
     fn validate_file_id(id: &str) -> Result<()> {

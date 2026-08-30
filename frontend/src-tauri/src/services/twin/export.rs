@@ -383,8 +383,11 @@ impl TwinStore {
         if !content.is_empty() {
             content.push('\n');
         }
-        write_atomic(path, content.as_bytes())
-            .with_context(|| format!("Failed to write JSONL file: {}", path.display()))
+        if self.event_recorder.is_noop() {
+            return write_atomic(path, content.as_bytes())
+                .with_context(|| format!("Failed to write JSONL file: {}", path.display()));
+        }
+        self.commit_governed_json_targets(vec![(path.to_path_buf(), content)], Vec::new())
     }
 }
 
@@ -399,20 +402,23 @@ mod tests {
         let temp_dir = tempdir().expect("temp dir should be created");
         let mut store = TwinStore::new(temp_dir.path().to_path_buf());
 
-        store
+        let approved = store
             .create_user_record(UserRecordCreate {
                 kind: UserRecordKind::Fact,
                 content: "Approved".to_string(),
                 origin: RecordOrigin::User,
                 evidence_refs: Vec::new(),
                 confidence: 0.9,
-                promotion_state: Some(PromotionState::Endorsed),
+                promotion_state: Some(PromotionState::Candidate),
                 valid_from: None,
                 valid_until: None,
                 links: Vec::new(),
                 metadata: HashMap::new(),
             })
             .expect("approved record should be created");
+        store
+            .set_user_record_promotion(&approved.id, PromotionState::Endorsed, None)
+            .expect("approved record should be endorsed explicitly");
         store
             .create_user_record(UserRecordCreate {
                 kind: UserRecordKind::Preference,
@@ -427,20 +433,23 @@ mod tests {
                 metadata: HashMap::new(),
             })
             .expect("candidate record should be created");
-        store
+        let rejected = store
             .create_user_record(UserRecordCreate {
                 kind: UserRecordKind::ReasoningPattern,
                 content: "Rejected".to_string(),
                 origin: RecordOrigin::Inferred,
                 evidence_refs: Vec::new(),
                 confidence: 0.8,
-                promotion_state: Some(PromotionState::Rejected),
+                promotion_state: Some(PromotionState::Candidate),
                 valid_from: None,
                 valid_until: None,
                 links: Vec::new(),
                 metadata: HashMap::new(),
             })
             .expect("rejected record should be created");
+        store
+            .set_user_record_promotion(&rejected.id, PromotionState::Rejected, None)
+            .expect("record should be rejected explicitly");
 
         let bundle = store
             .export_bundle(TwinExportRequest::default())
@@ -628,7 +637,7 @@ mod tests {
                 json!({"ranking": ["a", "b"]}),
             )
             .expect("event should append");
-        store
+        let private = store
             .create_user_record(UserRecordCreate {
                 kind: UserRecordKind::Preference,
                 content: "Private claim".to_string(),
@@ -647,13 +656,16 @@ mod tests {
                     speaker_role: None,
                 }],
                 confidence: default_record_confidence(),
-                promotion_state: Some(PromotionState::Private),
+                promotion_state: Some(PromotionState::Candidate),
                 valid_from: None,
                 valid_until: None,
                 links: Vec::new(),
                 metadata: HashMap::new(),
             })
             .expect("private record should be created");
+        store
+            .set_user_record_promotion(&private.id, PromotionState::Private, None)
+            .expect("record should be made private explicitly");
 
         let bundle = store
             .export_bundle(TwinExportRequest::default())

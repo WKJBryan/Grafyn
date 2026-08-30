@@ -707,6 +707,7 @@ impl TwinEventPayload {
                     && value.regret_score.is_none()
                     && value.lesson.is_none()
                     && value.missed_something.is_none()
+                    && value.primitive_assessment.is_none()
                 {
                     return Err("decision outcome requires at least one supplied field".into());
                 }
@@ -862,6 +863,56 @@ pub enum MemoryReviewDecision {
     Supersede,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrimitiveDecisionAssessmentPayload {
+    #[serde(deserialize_with = "required_option")]
+    pub stakes: Option<BoundedContent>,
+    #[serde(deserialize_with = "required_option")]
+    pub reversibility: Option<BoundedContent>,
+    #[serde(deserialize_with = "required_option")]
+    pub time_horizon: Option<BoundedContent>,
+    #[serde(deserialize_with = "required_option")]
+    pub uncertainty: Option<BoundedContent>,
+    #[serde(deserialize_with = "required_option")]
+    pub agency: Option<BoundedContent>,
+    #[serde(deserialize_with = "required_option")]
+    pub value_tension: Option<BoundedContent>,
+    #[serde(deserialize_with = "required_option")]
+    pub constraint_pressure: Option<BoundedContent>,
+    #[serde(deserialize_with = "required_option")]
+    pub taste_aesthetic_pull: Option<BoundedContent>,
+    #[serde(deserialize_with = "required_option")]
+    pub somatic_signal: Option<BoundedContent>,
+    #[serde(deserialize_with = "required_option")]
+    pub action_gap_risk: Option<BoundedContent>,
+    #[serde(deserialize_with = "required_option")]
+    pub outcome_feedback: Option<BoundedContent>,
+}
+
+impl PrimitiveDecisionAssessmentPayload {
+    pub fn from_legacy(
+        value: &crate::models::twin::PrimitiveDecisionAssessment,
+    ) -> Result<Self, String> {
+        fn bounded(value: &Option<String>) -> Result<Option<BoundedContent>, String> {
+            value.as_deref().map(BoundedContent::parse).transpose()
+        }
+        Ok(Self {
+            stakes: bounded(&value.stakes)?,
+            reversibility: bounded(&value.reversibility)?,
+            time_horizon: bounded(&value.time_horizon)?,
+            uncertainty: bounded(&value.uncertainty)?,
+            agency: bounded(&value.agency)?,
+            value_tension: bounded(&value.value_tension)?,
+            constraint_pressure: bounded(&value.constraint_pressure)?,
+            taste_aesthetic_pull: bounded(&value.taste_aesthetic_pull)?,
+            somatic_signal: bounded(&value.somatic_signal)?,
+            action_gap_risk: bounded(&value.action_gap_risk)?,
+            outcome_feedback: bounded(&value.outcome_feedback)?,
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DecisionRecorded {
@@ -874,6 +925,7 @@ pub struct DecisionRecorded {
     pub initial_leaning: Option<BoundedContent>,
     #[serde(deserialize_with = "required_option")]
     pub review_date: Option<BoundedLabel>,
+    pub primitive_assessment: PrimitiveDecisionAssessmentPayload,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -898,6 +950,8 @@ pub struct DecisionOutcomeRecorded {
     pub lesson: Option<BoundedContent>,
     #[serde(deserialize_with = "required_option")]
     pub missed_something: Option<BoundedContent>,
+    #[serde(deserialize_with = "required_option")]
+    pub primitive_assessment: Option<PrimitiveDecisionAssessmentPayload>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1204,6 +1258,7 @@ mod tests {
                 stakes: None,
                 initial_leaning: None,
                 review_date: None,
+                primitive_assessment: PrimitiveDecisionAssessmentPayload::default(),
             })
         };
         let event = crate::services::twin_events::test_support::event_for_payload(payload(
@@ -1229,13 +1284,16 @@ mod tests {
                 crate::services::twin_events::test_support::event_for_payload(payload.clone());
             let value = serde_json::to_value(event).unwrap();
             let required = match payload {
-                TwinEventPayload::DecisionRecorded(_) => vec!["review_date"],
+                TwinEventPayload::DecisionRecorded(_) => {
+                    vec!["review_date", "primitive_assessment"]
+                }
                 TwinEventPayload::DecisionOutcomeRecorded(_) => vec![
                     "outcome",
                     "selected_response_id",
                     "confidence_basis_points",
                     "review_date",
                     "correction_note",
+                    "primitive_assessment",
                 ],
                 TwinEventPayload::FeedbackRecorded(_) => vec!["content", "rank"],
                 _ => unreachable!(),
@@ -1266,6 +1324,7 @@ mod tests {
                 regret_score: None,
                 lesson: None,
                 missed_something: None,
+                primitive_assessment: None,
             })
         };
         assert!(
@@ -1330,5 +1389,69 @@ mod tests {
             .validate()
             .is_err()
         );
+    }
+
+    #[test]
+    fn primitive_assessment_is_canonical_bounded_and_valid_as_the_only_outcome_field() {
+        let mut decision = serde_json::to_value(
+            crate::services::twin_events::test_support::event_for_payload(
+                TwinEventPayload::DecisionRecorded(DecisionRecorded {
+                    decision_id: Identifier::parse("decision-primitive").unwrap(),
+                    decision: BoundedContent::parse("Choose deliberately").unwrap(),
+                    options: vec![BoundedContent::parse("Proceed").unwrap()],
+                    stakes: None,
+                    initial_leaning: None,
+                    review_date: None,
+                    primitive_assessment: PrimitiveDecisionAssessmentPayload::default(),
+                }),
+            ),
+        )
+        .unwrap();
+        let assessment = serde_json::json!({
+            "stakes": "high",
+            "reversibility": "reversible",
+            "time_horizon": "one year",
+            "uncertainty": "medium",
+            "agency": "direct",
+            "value_tension": "speed versus quality",
+            "constraint_pressure": "budget",
+            "taste_aesthetic_pull": "simple",
+            "somatic_signal": "calm",
+            "action_gap_risk": "low",
+            "outcome_feedback": "none yet"
+        });
+        decision["payload"]["data"]["primitive_assessment"] = assessment.clone();
+        let parsed: TwinEvent = serde_json::from_value(decision).unwrap();
+        assert_eq!(
+            serde_json::to_value(parsed).unwrap()["payload"]["data"]["primitive_assessment"],
+            assessment
+        );
+
+        let mut outcome = serde_json::to_value(
+            crate::services::twin_events::test_support::event_for_payload(
+                TwinEventPayload::DecisionOutcomeRecorded(DecisionOutcomeRecorded {
+                    decision_id: Identifier::parse("decision-primitive").unwrap(),
+                    outcome: None,
+                    chosen_option: None,
+                    selected_response_id: None,
+                    confidence_basis_points: None,
+                    review_date: None,
+                    correction_note: None,
+                    regret_score: None,
+                    lesson: None,
+                    missed_something: None,
+                    primitive_assessment: None,
+                }),
+            ),
+        )
+        .unwrap();
+        outcome["payload"]["data"]["primitive_assessment"] = assessment;
+        let parsed: TwinEvent = serde_json::from_value(outcome).unwrap();
+        assert!(parsed.validate().is_ok());
+
+        let mut oversized = serde_json::to_value(parsed).unwrap();
+        oversized["payload"]["data"]["primitive_assessment"]["stakes"] =
+            serde_json::Value::String("x".repeat(32_769));
+        assert!(serde_json::from_value::<TwinEvent>(oversized).is_err());
     }
 }

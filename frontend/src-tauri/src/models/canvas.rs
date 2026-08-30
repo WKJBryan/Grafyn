@@ -231,6 +231,10 @@ pub struct ModelResponse {
     pub tokens_used: Option<u32>,
     #[serde(default)]
     pub cost_usd: Option<f64>,
+    #[serde(default, deserialize_with = "deserialize_optional_response_label")]
+    pub provider: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_response_label")]
+    pub provenance: Option<String>,
     pub created_at: DateTime<Utc>,
     #[serde(default)]
     pub position: TilePosition,
@@ -247,6 +251,8 @@ impl Default for ModelResponse {
             error: None,
             tokens_used: None,
             cost_usd: None,
+            provider: None,
+            provenance: None,
             created_at: Utc::now(),
             position: TilePosition {
                 x: 0.0,
@@ -328,6 +334,68 @@ pub struct DebateResponse {
     pub stance: Option<String>,
     #[serde(default)]
     pub cost_usd: Option<f64>,
+    #[serde(default, deserialize_with = "deserialize_optional_response_label")]
+    pub provider: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_response_label")]
+    pub provenance: Option<String>,
+}
+
+#[cfg(test)]
+mod task_seven_response_metadata_tests {
+    use super::*;
+
+    #[test]
+    fn response_provider_and_provenance_round_trip_and_are_bounded() {
+        let model_json = serde_json::json!({
+            "id": "response-1",
+            "model_id": "openai/gpt",
+            "model_name": "GPT",
+            "content": "answer",
+            "status": "completed",
+            "error": null,
+            "tokens_used": 4,
+            "cost_usd": 0.01,
+            "provider": "openrouter",
+            "provenance": "canvas_openrouter",
+            "created_at": "2026-08-30T00:00:00Z",
+            "position": {"x": 0.0, "y": 0.0, "width": 280.0, "height": 200.0}
+        });
+        let model: ModelResponse = serde_json::from_value(model_json).unwrap();
+        let round_trip = serde_json::to_value(&model).unwrap();
+        assert_eq!(round_trip["provider"], "openrouter");
+        assert_eq!(round_trip["provenance"], "canvas_openrouter");
+
+        let debate_json = serde_json::json!({
+            "model_id": "local-model",
+            "model_name": "Local",
+            "content": "position",
+            "stance": null,
+            "cost_usd": null,
+            "provider": "ollama",
+            "provenance": "canvas_debate_ollama"
+        });
+        let debate: DebateResponse = serde_json::from_value(debate_json).unwrap();
+        let round_trip = serde_json::to_value(&debate).unwrap();
+        assert_eq!(round_trip["provider"], "ollama");
+        assert_eq!(round_trip["provenance"], "canvas_debate_ollama");
+
+        let legacy_model: ModelResponse = serde_json::from_value(serde_json::json!({
+            "id": "legacy",
+            "model_id": "legacy-model",
+            "model_name": "Legacy",
+            "content": "old",
+            "status": "completed",
+            "created_at": "2026-08-30T00:00:00Z"
+        }))
+        .unwrap();
+        let legacy = serde_json::to_value(legacy_model).unwrap();
+        assert!(legacy["provider"].is_null());
+        assert!(legacy["provenance"].is_null());
+
+        let mut oversized = serde_json::to_value(&model).unwrap();
+        oversized["provider"] = serde_json::Value::String("x".repeat(129));
+        assert!(serde_json::from_value::<ModelResponse>(oversized).is_err());
+    }
 }
 
 /// Request to create a new session
@@ -663,4 +731,19 @@ pub struct LLMNodePositionUpdate {
     pub width: Option<f64>,
     #[serde(default)]
     pub height: Option<f64>,
+}
+fn deserialize_optional_response_label<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<String>::deserialize(deserializer)?;
+    if value
+        .as_ref()
+        .is_some_and(|value| value.trim().is_empty() || value.len() > 128)
+    {
+        return Err(serde::de::Error::custom(
+            "response metadata labels must contain 1..=128 bytes",
+        ));
+    }
+    Ok(value)
 }

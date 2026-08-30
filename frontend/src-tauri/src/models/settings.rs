@@ -227,6 +227,7 @@ pub fn twin_data_path_for_vault(
         .to_string_lossy()
         .replace('\\', "/")
         .to_ascii_lowercase();
+    let normalized = normalized.strip_prefix("//?/").unwrap_or(&normalized);
     let mut hash = 0xcbf29ce484222325_u64;
     for byte in normalized.as_bytes() {
         hash ^= u64::from(*byte);

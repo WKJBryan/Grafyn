@@ -153,15 +153,11 @@ impl TwinStore {
             created_at: now,
             payload,
         };
-        let mut trace = if let Some(trace) = self.trace_cache.get(session_id) {
-            trace.clone()
+        let path = self.trace_file_path(session_id);
+        let mut trace = if path.exists() {
+            self.read_trace_file(&path)?
         } else {
-            let path = self.trace_file_path(session_id);
-            if path.exists() {
-                self.read_trace_file(&path)?
-            } else {
-                SessionTrace::new(session_id)
-            }
+            SessionTrace::new(session_id)
         };
         trace.updated_at = now;
         trace.events.push(event.clone());
@@ -178,7 +174,7 @@ impl TwinStore {
         ))
     }
 
-    pub(super) fn cache_committed_trace(&mut self, trace: SessionTrace) {
+    pub(crate) fn cache_committed_trace(&mut self, trace: SessionTrace) {
         self.trace_cache.insert(trace.session_id.clone(), trace);
     }
 

@@ -122,8 +122,13 @@ impl KnowledgeStore {
 
     /// Update the vault path at runtime (e.g., after settings change).
     pub fn set_vault_path(&mut self, vault_path: PathBuf) -> Result<()> {
-        std::fs::create_dir_all(&vault_path).with_context(|| {
-            format!("Failed to create vault directory {}", vault_path.display())
+        crate::services::twin_events::validate_real_directory(&vault_path, "vault directory")
+            .map_err(anyhow::Error::new)?;
+        let vault_path = std::fs::canonicalize(&vault_path).with_context(|| {
+            format!(
+                "Failed to canonicalize vault directory {}",
+                vault_path.display()
+            )
         })?;
         self.event_recorder
             .retarget_markdown_root(&vault_path)
@@ -131,6 +136,10 @@ impl KnowledgeStore {
         self.vault_path = vault_path;
         self.refresh_cache();
         Ok(())
+    }
+
+    pub fn vault_path(&self) -> &std::path::Path {
+        &self.vault_path
     }
 
     /// Rebuild the metadata cache and lookups from disk.
@@ -256,111 +265,126 @@ impl KnowledgeStore {
                 .collect();
         }
 
-        let now = Utc::now();
-        let mut reserved_ids = self
-            .meta_cache
-            .iter()
-            .map(|note| note.id.clone())
-            .collect::<HashSet<_>>();
-        let mut reserved_paths = self
-            .meta_cache
-            .iter()
-            .map(|note| normalize_lookup_key(&note.relative_path))
-            .collect::<HashSet<_>>();
-        let mut planned = Vec::with_capacity(creates.len());
-        for create in creates {
-            let id = self.generate_note_id_with_reserved(&create.title, &reserved_ids);
-            reserved_ids.insert(id.clone());
-            let preferred_path = match create.relative_path {
-                Some(path) => normalize_note_relative_path(&path)?,
-                None => format!("{id}.md"),
-            };
-            let relative_path =
-                self.make_unique_relative_path_with_reserved(&preferred_path, &reserved_paths);
-            reserved_paths.insert(normalize_lookup_key(&relative_path));
-            let mut note = Note {
-                id,
-                title: create.title,
-                content: create.content,
-                relative_path,
-                aliases: dedupe_strings(create.aliases),
-                status: create.status,
-                tags: dedupe_strings(create.tags),
-                created_at: now,
-                updated_at: now,
-                schema_version: create.schema_version.max(CURRENT_NOTE_SCHEMA_VERSION),
-                migration_source: create.migration_source,
-                optimizer_managed: create.optimizer_managed,
-                wikilinks: Vec::new(),
-                parsed_links: Vec::new(),
-                properties: create.properties,
-                frontmatter_raw_fallback: None,
-            };
-            note.wikilinks = self.extract_wikilinks(&note.content);
-            note.parsed_links = self.extract_links(&note.content, &note.relative_path);
-            planned.push(note);
-        }
-
-        let return_ids = planned
-            .iter()
-            .map(|note| note.id.clone())
-            .collect::<Vec<_>>();
-        planned.sort_by(|left, right| left.id.cmp(&right.id));
         let source_digest = crate::services::twin_events::digest_bytes(source_bytes);
         let container_digest = crate::services::twin_events::digest_bytes(
             format!("{container_id}\0{}", source_digest.as_str()).as_bytes(),
         );
         let import_id = format!("import-{}", container_digest.as_str());
         let observation_id = format!("import-observation-{}", container_digest.as_str());
-        let source = crate::models::twin_event::SourceChannel::parse("import")
-            .map_err(anyhow::Error::msg)?;
-        let mut targets = Vec::with_capacity(planned.len());
-        let mut drafts = Vec::with_capacity(planned.len() + 1);
-        let mut note_evidence = Vec::with_capacity(planned.len());
-        for note in &planned {
-            let (relative_path, bytes) = self.serialize_note_file(note)?;
-            let digest = crate::services::twin_events::digest_bytes(&bytes);
-            targets.push(crate::services::twin_events::TargetMutation::put(
-                crate::services::twin_events::TargetKind::Markdown,
-                relative_path,
-                String::from_utf8(bytes).expect("Markdown serialization is UTF-8"),
-            ));
-            drafts.push(
-                crate::services::twin_events::note_changed_draft(
-                    &note.id,
-                    crate::models::twin_event::NoteChangeKind::Created,
-                    digest.clone(),
-                    digest.clone(),
-                    note.updated_at,
-                    source.clone(),
-                    note_capture_governance(note, "import"),
-                )
-                .map_err(anyhow::Error::msg)?,
+        let recorder = self.event_recorder.clone();
+        let mut return_ids = None;
+        let mut planner = || {
+            self.refresh_cache();
+            let now = Utc::now();
+            let mut reserved_ids = self
+                .meta_cache
+                .iter()
+                .map(|note| note.id.clone())
+                .collect::<HashSet<_>>();
+            let mut reserved_paths = self
+                .meta_cache
+                .iter()
+                .map(|note| normalize_lookup_key(&note.relative_path))
+                .collect::<HashSet<_>>();
+            let mut planned = Vec::with_capacity(creates.len());
+            for create in &creates {
+                let id = self.generate_note_id_with_reserved(&create.title, &reserved_ids);
+                reserved_ids.insert(id.clone());
+                let preferred_path = match &create.relative_path {
+                    Some(path) => normalize_note_relative_path(path).map_err(|error| {
+                        crate::services::twin_events::MutationError::Invalid(error.to_string())
+                    })?,
+                    None => format!("{id}.md"),
+                };
+                let relative_path =
+                    self.make_unique_relative_path_with_reserved(&preferred_path, &reserved_paths);
+                reserved_paths.insert(normalize_lookup_key(&relative_path));
+                let mut note = Note {
+                    id,
+                    title: create.title.clone(),
+                    content: create.content.clone(),
+                    relative_path,
+                    aliases: dedupe_strings(create.aliases.clone()),
+                    status: create.status.clone(),
+                    tags: dedupe_strings(create.tags.clone()),
+                    created_at: now,
+                    updated_at: now,
+                    schema_version: create.schema_version.max(CURRENT_NOTE_SCHEMA_VERSION),
+                    migration_source: create.migration_source.clone(),
+                    optimizer_managed: create.optimizer_managed,
+                    wikilinks: Vec::new(),
+                    parsed_links: Vec::new(),
+                    properties: create.properties.clone(),
+                    frontmatter_raw_fallback: None,
+                };
+                note.wikilinks = self.extract_wikilinks(&note.content);
+                note.parsed_links = self.extract_links(&note.content, &note.relative_path);
+                planned.push(note);
+            }
+
+            return_ids = Some(
+                planned
+                    .iter()
+                    .map(|note| note.id.clone())
+                    .collect::<Vec<_>>(),
             );
-            note_evidence.push((note.id.clone(), digest));
-        }
-        drafts.push(
-            crate::services::twin_events::import_container_observation_draft_for_notes(
-                &observation_id,
-                &import_id,
-                source_digest,
-                &note_evidence,
-                now,
-            )
-            .map_err(anyhow::Error::msg)?,
-        );
-        if let Err(error) = self.event_recorder.commit_mutation(
+            planned.sort_by(|left, right| left.id.cmp(&right.id));
+            let source = crate::models::twin_event::SourceChannel::parse("import")
+                .map_err(crate::services::twin_events::MutationError::Invalid)?;
+            let mut targets = Vec::with_capacity(planned.len());
+            let mut drafts = Vec::with_capacity(planned.len() + 1);
+            let mut note_evidence = Vec::with_capacity(planned.len());
+            for note in &planned {
+                let (relative_path, bytes) = self.serialize_note_file(note).map_err(|error| {
+                    crate::services::twin_events::MutationError::Invalid(error.to_string())
+                })?;
+                let digest = crate::services::twin_events::digest_bytes(&bytes);
+                targets.push(crate::services::twin_events::TargetMutation::put(
+                    crate::services::twin_events::TargetKind::Markdown,
+                    relative_path,
+                    String::from_utf8(bytes).expect("Markdown serialization is UTF-8"),
+                ));
+                drafts.push(
+                    crate::services::twin_events::note_changed_draft(
+                        &note.id,
+                        crate::models::twin_event::NoteChangeKind::Created,
+                        digest.clone(),
+                        digest.clone(),
+                        note.updated_at,
+                        source.clone(),
+                        note_capture_governance(note, "import"),
+                    )
+                    .map_err(crate::services::twin_events::MutationError::Invalid)?,
+                );
+                note_evidence.push((note.id.clone(), digest));
+            }
+            drafts.push(
+                crate::services::twin_events::import_container_observation_draft_for_notes(
+                    &observation_id,
+                    &import_id,
+                    source_digest.clone(),
+                    &note_evidence,
+                    now,
+                )
+                .map_err(crate::services::twin_events::MutationError::Invalid)?,
+            );
+            Ok(Some(crate::services::twin_events::MutationPlan::new(
+                crate::models::twin_event::CausalStream::SyncEligible,
+                source,
+                targets,
+                drafts,
+            )))
+        };
+        if let Err(error) = recorder.commit_planned_mutation(
             crate::services::twin_events::MutationOrigin::Local,
-            crate::models::twin_event::CausalStream::SyncEligible,
-            source,
-            targets,
-            drafts,
+            &mut planner,
         ) {
             self.refresh_cache();
             return Err(anyhow::Error::new(error));
         }
         self.refresh_cache();
         return_ids
+            .expect("import planner returned note IDs")
             .iter()
             .map(|note_id| self.get_note(note_id))
             .collect()
@@ -371,6 +395,9 @@ impl KnowledgeStore {
         create: NoteCreate,
         context: NoteMutationContext,
     ) -> Result<Note> {
+        if !self.event_recorder.is_noop() {
+            return self.create_note_with_locked_plan(create, context);
+        }
         let id = self.generate_note_id(&create.title);
         let relative_path = match create.relative_path {
             Some(path) => self.make_unique_relative_path(&normalize_note_relative_path(&path)?),
@@ -413,6 +440,67 @@ impl KnowledgeStore {
         self.get_note(&note.id)
     }
 
+    fn create_note_with_locked_plan(
+        &mut self,
+        create: NoteCreate,
+        context: NoteMutationContext,
+    ) -> Result<Note> {
+        let recorder = self.event_recorder.clone();
+        let mut planned_id = None;
+        let mut planner = || {
+            self.refresh_cache();
+            let id = self.generate_note_id(&create.title);
+            let relative_path = match &create.relative_path {
+                Some(path) => self.make_unique_relative_path(
+                    &normalize_note_relative_path(path).map_err(|error| {
+                        crate::services::twin_events::MutationError::Invalid(error.to_string())
+                    })?,
+                ),
+                None => self.make_unique_relative_path(&format!("{id}.md")),
+            };
+            let now = Utc::now();
+            let mut note = Note {
+                id: id.clone(),
+                title: create.title.clone(),
+                content: create.content.clone(),
+                relative_path,
+                aliases: dedupe_strings(create.aliases.clone()),
+                status: create.status.clone(),
+                tags: dedupe_strings(create.tags.clone()),
+                created_at: now,
+                updated_at: now,
+                schema_version: create.schema_version.max(CURRENT_NOTE_SCHEMA_VERSION),
+                migration_source: create.migration_source.clone(),
+                optimizer_managed: create.optimizer_managed,
+                wikilinks: Vec::new(),
+                parsed_links: Vec::new(),
+                properties: create.properties.clone(),
+                frontmatter_raw_fallback: None,
+            };
+            note.wikilinks = self.extract_wikilinks(&note.content);
+            note.parsed_links = self.extract_links(&note.content, &note.relative_path);
+            let plan = self
+                .plan_note_change(
+                    &note,
+                    None,
+                    crate::models::twin_event::NoteChangeKind::Created,
+                    context.clone(),
+                )
+                .map_err(|error| {
+                    crate::services::twin_events::MutationError::Invalid(error.to_string())
+                })?;
+            planned_id = Some(id);
+            Ok(Some(plan))
+        };
+        let result = recorder.commit_planned_mutation(
+            crate::services::twin_events::MutationOrigin::Local,
+            &mut planner,
+        );
+        self.refresh_cache();
+        result.map_err(anyhow::Error::new)?;
+        self.get_note(planned_id.as_deref().expect("planner returned a note ID"))
+    }
+
     pub fn update_note(&mut self, id: &str, update: NoteUpdate) -> Result<Note> {
         self.update_note_from_source(id, update, "note_editor")
     }
@@ -439,6 +527,9 @@ impl KnowledgeStore {
         bump_updated_at: bool,
         context: NoteMutationContext,
     ) -> Result<Note> {
+        if !self.event_recorder.is_noop() {
+            return self.update_note_with_locked_plan(id, update, bump_updated_at, context);
+        }
         Self::validate_note_id(id)?;
         let mut note = self.get_note(id)?;
         if !note_update_changes(&note, &update)? {
@@ -517,6 +608,112 @@ impl KnowledgeStore {
         self.get_note(&note.id)
     }
 
+    fn update_note_with_locked_plan(
+        &mut self,
+        id: &str,
+        update: NoteUpdate,
+        bump_updated_at: bool,
+        context: NoteMutationContext,
+    ) -> Result<Note> {
+        Self::validate_note_id(id)?;
+        let note_id = id.to_string();
+        let recorder = self.event_recorder.clone();
+        let mut planned_id = None;
+        let mut planner = || {
+            self.refresh_cache();
+            let mut note = self.get_note(&note_id).map_err(|error| {
+                crate::services::twin_events::MutationError::Invalid(error.to_string())
+            })?;
+            if !note_update_changes(&note, &update).map_err(|error| {
+                crate::services::twin_events::MutationError::Invalid(error.to_string())
+            })? {
+                planned_id = Some(note.id.clone());
+                return Ok(None);
+            }
+            let old_path = self.note_path(&note_id).map_err(|error| {
+                crate::services::twin_events::MutationError::Invalid(error.to_string())
+            })?;
+            self.apply_note_update(&mut note, update.clone(), bump_updated_at)
+                .map_err(|error| {
+                    crate::services::twin_events::MutationError::Invalid(error.to_string())
+                })?;
+            let plan = self
+                .plan_note_change(
+                    &note,
+                    Some(&old_path),
+                    crate::models::twin_event::NoteChangeKind::Updated,
+                    context.clone(),
+                )
+                .map_err(|error| {
+                    crate::services::twin_events::MutationError::Invalid(error.to_string())
+                })?;
+            planned_id = Some(note.id.clone());
+            Ok(Some(plan))
+        };
+        let result = recorder.commit_planned_mutation(
+            crate::services::twin_events::MutationOrigin::Local,
+            &mut planner,
+        );
+        self.refresh_cache();
+        result.map_err(anyhow::Error::new)?;
+        self.get_note(planned_id.as_deref().expect("planner returned a note ID"))
+    }
+
+    fn apply_note_update(
+        &self,
+        note: &mut Note,
+        update: NoteUpdate,
+        bump_updated_at: bool,
+    ) -> Result<()> {
+        let explicit_frontmatter_edit = update.title.is_some()
+            || update.aliases.is_some()
+            || update.status.is_some()
+            || update.tags.is_some()
+            || update.schema_version.is_some()
+            || update.migration_source.is_some()
+            || update.optimizer_managed.is_some()
+            || update.properties.is_some();
+        if let Some(title) = update.title {
+            note.title = title;
+        }
+        if let Some(content) = update.content {
+            note.content = content;
+        }
+        if let Some(relative_path) = update.relative_path {
+            note.relative_path = normalize_note_relative_path(&relative_path)?;
+        }
+        if let Some(aliases) = update.aliases {
+            note.aliases = dedupe_strings(aliases);
+        }
+        if let Some(status) = update.status {
+            note.status = status;
+        }
+        if let Some(tags) = update.tags {
+            note.tags = dedupe_strings(tags);
+        }
+        if let Some(schema_version) = update.schema_version {
+            note.schema_version = schema_version.max(CURRENT_NOTE_SCHEMA_VERSION);
+        }
+        if update.migration_source.is_some() {
+            note.migration_source = update.migration_source;
+        }
+        if let Some(optimizer_managed) = update.optimizer_managed {
+            note.optimizer_managed = optimizer_managed;
+        }
+        if let Some(properties) = update.properties {
+            note.properties = properties;
+        }
+        if explicit_frontmatter_edit {
+            note.frontmatter_raw_fallback = None;
+        }
+        if bump_updated_at {
+            note.updated_at = Utc::now();
+        }
+        note.wikilinks = self.extract_wikilinks(&note.content);
+        note.parsed_links = self.extract_links(&note.content, &note.relative_path);
+        Ok(())
+    }
+
     /// Administrative variant of `update_note` that preserves the note's existing
     /// `updated_at` timestamp. See `backfill_legacy_grafyn_notes` for the motivating
     /// case: schema/provenance bookkeeping writes should not bump recency ranking.
@@ -535,50 +732,88 @@ impl KnowledgeStore {
         source: &str,
     ) -> Result<Note> {
         let relative_path = normalize_note_relative_path(relative_path)?;
-        let path = self.resolve_vault_relative_path(&relative_path)?;
-        let note = self
-            .find_note_by_relative_path(&relative_path)?
-            .ok_or_else(|| anyhow::anyhow!("note to restore is not indexed: {relative_path}"))?;
-        let before = std::fs::read(&path)?;
-        if before == bytes {
-            return Ok(note);
-        }
         let after = std::str::from_utf8(bytes)
-            .with_context(|| format!("restored Markdown is not UTF-8: {relative_path}"))?;
-        let after_digest = crate::services::twin_events::digest_bytes(bytes);
-        let before_digest = crate::services::twin_events::digest_bytes(&before);
+            .with_context(|| format!("restored Markdown is not UTF-8: {relative_path}"))?
+            .to_string();
         if self.event_recorder.is_noop() {
+            let path = self.resolve_vault_relative_path(&relative_path)?;
+            let note = self
+                .find_note_by_relative_path(&relative_path)?
+                .ok_or_else(|| {
+                    anyhow::anyhow!("note to restore is not indexed: {relative_path}")
+                })?;
+            let before = std::fs::read(&path)?;
+            if before == bytes {
+                return Ok(note);
+            }
             write_atomic(&path, bytes)?;
+            self.refresh_cache();
+            self.get_note(&note.id)
         } else {
-            let source_channel = crate::models::twin_event::SourceChannel::parse(source)
-                .map_err(anyhow::Error::msg)?;
-            let draft = crate::services::twin_events::note_changed_draft(
-                &note.id,
-                crate::models::twin_event::NoteChangeKind::Updated,
-                after_digest,
-                before_digest,
-                Utc::now(),
-                source_channel.clone(),
-                note_capture_governance(&note, source),
-            )
-            .map_err(anyhow::Error::msg)?;
-            if let Err(error) = self.event_recorder.commit_mutation(
+            let recorder = self.event_recorder.clone();
+            let source = source.to_string();
+            let mut restored_note_id = None;
+            let mut planner = || {
+                self.refresh_cache();
+                let path = self
+                    .resolve_vault_relative_path(&relative_path)
+                    .map_err(|error| {
+                        crate::services::twin_events::MutationError::Invalid(error.to_string())
+                    })?;
+                let note = self
+                    .find_note_by_relative_path(&relative_path)
+                    .map_err(|error| {
+                        crate::services::twin_events::MutationError::Invalid(error.to_string())
+                    })?
+                    .ok_or_else(|| {
+                        crate::services::twin_events::MutationError::Invalid(format!(
+                            "note to restore is not indexed: {relative_path}"
+                        ))
+                    })?;
+                restored_note_id = Some(note.id.clone());
+                let before = std::fs::read(&path).map_err(|error| {
+                    crate::services::twin_events::MutationError::Io(error.to_string())
+                })?;
+                if before == bytes {
+                    return Ok(None);
+                }
+                let source_channel = crate::models::twin_event::SourceChannel::parse(&source)
+                    .map_err(crate::services::twin_events::MutationError::Invalid)?;
+                let draft = crate::services::twin_events::note_changed_draft(
+                    &note.id,
+                    crate::models::twin_event::NoteChangeKind::Updated,
+                    crate::services::twin_events::digest_bytes(bytes),
+                    crate::services::twin_events::digest_bytes(&before),
+                    Utc::now(),
+                    source_channel.clone(),
+                    note_capture_governance(&note, &source),
+                )
+                .map_err(crate::services::twin_events::MutationError::Invalid)?;
+                Ok(Some(crate::services::twin_events::MutationPlan::new(
+                    crate::models::twin_event::CausalStream::SyncEligible,
+                    source_channel,
+                    vec![crate::services::twin_events::TargetMutation::put(
+                        crate::services::twin_events::TargetKind::Markdown,
+                        relative_path.clone(),
+                        after.clone(),
+                    )],
+                    vec![draft],
+                )))
+            };
+            if let Err(error) = recorder.commit_planned_mutation(
                 crate::services::twin_events::MutationOrigin::Local,
-                crate::models::twin_event::CausalStream::SyncEligible,
-                source_channel,
-                vec![crate::services::twin_events::TargetMutation::put(
-                    crate::services::twin_events::TargetKind::Markdown,
-                    relative_path,
-                    after,
-                )],
-                vec![draft],
+                &mut planner,
             ) {
                 self.refresh_cache();
                 return Err(anyhow::Error::new(error));
             }
+            self.refresh_cache();
+            self.get_note(
+                restored_note_id
+                    .as_deref()
+                    .expect("restore planner returned a note ID"),
+            )
         }
-        self.refresh_cache();
-        self.get_note(&note.id)
     }
 
     pub fn delete_note(&mut self, id: &str) -> Result<()> {
@@ -587,13 +822,35 @@ impl KnowledgeStore {
 
     pub fn delete_note_from_source(&mut self, id: &str, source: &str) -> Result<()> {
         Self::validate_note_id(id)?;
-        let path = self.note_path(id)?;
-        let note = self.get_note(id)?;
-        if let Err(error) =
-            self.persist_note_delete(&note, &path, NoteMutationContext::local(source)?)
-        {
-            self.refresh_cache();
-            return Err(error);
+        let context = NoteMutationContext::local(source)?;
+        if self.event_recorder.is_noop() {
+            let path = self.note_path(id)?;
+            let note = self.get_note(id)?;
+            self.persist_note_delete(&note, &path, context)?;
+        } else {
+            let recorder = self.event_recorder.clone();
+            let note_id = id.to_string();
+            let mut planner = || {
+                self.refresh_cache();
+                let note = self.get_note(&note_id).map_err(|error| {
+                    crate::services::twin_events::MutationError::Invalid(error.to_string())
+                })?;
+                let path = self.note_path(&note_id).map_err(|error| {
+                    crate::services::twin_events::MutationError::Invalid(error.to_string())
+                })?;
+                self.plan_note_delete(&note, &path, context.clone())
+                    .map(Some)
+                    .map_err(|error| {
+                        crate::services::twin_events::MutationError::Invalid(error.to_string())
+                    })
+            };
+            if let Err(error) = recorder.commit_planned_mutation(
+                crate::services::twin_events::MutationOrigin::Local,
+                &mut planner,
+            ) {
+                self.refresh_cache();
+                return Err(anyhow::Error::new(error));
+            }
         }
         let overlay_path = self.overlay_path(id);
         if overlay_path.exists() {
@@ -890,13 +1147,13 @@ impl KnowledgeStore {
         }
     }
 
-    fn persist_note_change(
+    fn plan_note_change(
         &self,
         note: &Note,
         old_path: Option<&Path>,
         change: crate::models::twin_event::NoteChangeKind,
         context: NoteMutationContext,
-    ) -> Result<()> {
+    ) -> Result<crate::services::twin_events::MutationPlan> {
         let (relative_path, after_bytes) = self.serialize_note_file(note)?;
         let after_digest = crate::services::twin_events::digest_bytes(&after_bytes);
         let old_bytes = old_path
@@ -910,7 +1167,7 @@ impl KnowledgeStore {
         let mut targets = vec![crate::services::twin_events::TargetMutation::put(
             crate::services::twin_events::TargetKind::Markdown,
             normalize_relative_path_for_output(&relative_path),
-            String::from_utf8(after_bytes.clone()).expect("Markdown serialization is UTF-8"),
+            String::from_utf8(after_bytes).expect("Markdown serialization is UTF-8"),
         )];
         if let Some(old_path) = old_path {
             let new_path = self.resolve_vault_relative_path(&relative_path)?;
@@ -925,23 +1182,6 @@ impl KnowledgeStore {
                 ));
             }
         }
-
-        if self.event_recorder.is_noop() {
-            self.write_note_file(note)?;
-            if let Some(old_path) = old_path {
-                let new_path = self.resolve_vault_relative_path(&relative_path)?;
-                if old_path != new_path && old_path.exists() {
-                    std::fs::remove_file(old_path).with_context(|| {
-                        format!(
-                            "Failed to remove original note after move: {}",
-                            old_path.display()
-                        )
-                    })?;
-                }
-            }
-            return Ok(());
-        }
-
         let drafts = if context.origin == crate::services::twin_events::MutationOrigin::Local
             && context.capture_event
         {
@@ -959,15 +1199,37 @@ impl KnowledgeStore {
         } else {
             Vec::new()
         };
-        self.event_recorder
-            .commit_mutation(
-                context.origin,
-                crate::models::twin_event::CausalStream::SyncEligible,
-                context.source_channel,
-                targets,
-                drafts,
-            )
-            .map_err(anyhow::Error::new)?;
+        Ok(crate::services::twin_events::MutationPlan::new(
+            crate::models::twin_event::CausalStream::SyncEligible,
+            context.source_channel,
+            targets,
+            drafts,
+        ))
+    }
+
+    fn persist_note_change(
+        &self,
+        note: &Note,
+        old_path: Option<&Path>,
+        _change: crate::models::twin_event::NoteChangeKind,
+        _context: NoteMutationContext,
+    ) -> Result<()> {
+        if !self.event_recorder.is_noop() {
+            anyhow::bail!("coordinated note persistence requires a locked planner");
+        }
+        let (relative_path, _) = self.serialize_note_file(note)?;
+        self.write_note_file(note)?;
+        if let Some(old_path) = old_path {
+            let new_path = self.resolve_vault_relative_path(&relative_path)?;
+            if old_path != new_path && old_path.exists() {
+                std::fs::remove_file(old_path).with_context(|| {
+                    format!(
+                        "Failed to remove original note after move: {}",
+                        old_path.display()
+                    )
+                })?;
+            }
+        }
         Ok(())
     }
 
@@ -975,19 +1237,28 @@ impl KnowledgeStore {
         &self,
         note: &Note,
         path: &Path,
-        context: NoteMutationContext,
+        _context: NoteMutationContext,
     ) -> Result<()> {
+        if !self.event_recorder.is_noop() {
+            anyhow::bail!("coordinated note deletion requires a locked planner");
+        }
+        std::fs::remove_file(path)
+            .with_context(|| format!("Failed to delete note: {}", note.id))?;
+        Ok(())
+    }
+
+    fn plan_note_delete(
+        &self,
+        note: &Note,
+        path: &Path,
+        context: NoteMutationContext,
+    ) -> Result<crate::services::twin_events::MutationPlan> {
         let before_bytes = std::fs::read(path)?;
         let before_digest = crate::services::twin_events::digest_bytes(&before_bytes);
         let key = path
             .strip_prefix(&self.vault_path)
             .map_err(|_| anyhow::anyhow!("note path escaped the vault"))?
             .to_string_lossy();
-        if self.event_recorder.is_noop() {
-            std::fs::remove_file(path)
-                .with_context(|| format!("Failed to delete note: {}", note.id))?;
-            return Ok(());
-        }
         let drafts = if context.origin == crate::services::twin_events::MutationOrigin::Local
             && context.capture_event
         {
@@ -1004,19 +1275,15 @@ impl KnowledgeStore {
         } else {
             Vec::new()
         };
-        self.event_recorder
-            .commit_mutation(
-                context.origin,
-                crate::models::twin_event::CausalStream::SyncEligible,
-                context.source_channel,
-                vec![crate::services::twin_events::TargetMutation::tombstone(
-                    crate::services::twin_events::TargetKind::Markdown,
-                    normalize_relative_path_for_output(&key),
-                )],
-                drafts,
-            )
-            .map_err(anyhow::Error::new)?;
-        Ok(())
+        Ok(crate::services::twin_events::MutationPlan::new(
+            crate::models::twin_event::CausalStream::SyncEligible,
+            context.source_channel,
+            vec![crate::services::twin_events::TargetMutation::tombstone(
+                crate::services::twin_events::TargetKind::Markdown,
+                normalize_relative_path_for_output(&key),
+            )],
+            drafts,
+        ))
     }
 
     fn write_note_file(&self, note: &Note) -> Result<()> {
@@ -1458,797 +1725,5 @@ where
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::models::note::NoteStatus;
-    use crate::services::atomic_io::assert_no_tmp_siblings;
-    use tempfile::tempdir;
-
-    fn task_seven_note_create(title: &str, content: &str, relative_path: &str) -> NoteCreate {
-        NoteCreate {
-            title: title.into(),
-            content: content.into(),
-            relative_path: Some(relative_path.into()),
-            aliases: Vec::new(),
-            status: crate::models::note::NoteStatus::Draft,
-            tags: Vec::new(),
-            schema_version: crate::models::note::CURRENT_NOTE_SCHEMA_VERSION,
-            migration_source: None,
-            optimizer_managed: false,
-            properties: HashMap::new(),
-        }
-    }
-
-    #[test]
-    fn coordinated_note_crud_emits_once_and_move_is_one_compound_event() {
-        let root = tempdir().unwrap();
-        let vault = root.path().join("vault");
-        let data = root.path().join("data");
-        std::fs::create_dir(&vault).unwrap();
-        std::fs::create_dir(&data).unwrap();
-        let event_store =
-            std::sync::Arc::new(crate::services::twin_events::TwinEventStore::new(&data));
-        event_store.initialize().unwrap();
-        let coordinator = std::sync::Arc::new(
-            crate::services::twin_events::MutationCoordinator::new(
-                &data,
-                &vault,
-                event_store.clone(),
-                std::sync::Arc::new(crate::services::twin_events::NoopMutationLifecycle),
-            )
-            .unwrap(),
-        );
-        let mut store = KnowledgeStore::with_event_recorder(vault.clone(), data, coordinator);
-        let created = store
-            .create_note(task_seven_note_create("Captured", "one", "captured.md"))
-            .unwrap();
-        assert_eq!(event_store.ordered_events().unwrap().len(), 1);
-        store
-            .update_note(
-                &created.id,
-                NoteUpdate {
-                    content: Some("two".into()),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        assert_eq!(event_store.ordered_events().unwrap().len(), 2);
-        store
-            .update_note(
-                &created.id,
-                NoteUpdate {
-                    content: Some("two".into()),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        assert_eq!(event_store.ordered_events().unwrap().len(), 2);
-        store
-            .update_note(
-                &created.id,
-                NoteUpdate {
-                    relative_path: Some("moved/captured.md".into()),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        assert_eq!(event_store.ordered_events().unwrap().len(), 3);
-        assert!(!vault.join("captured.md").exists());
-        assert!(vault.join("moved/captured.md").exists());
-        store.delete_note(&created.id).unwrap();
-        let events = event_store.ordered_events().unwrap();
-        assert_eq!(events.len(), 4);
-        assert!(matches!(
-            events.last().unwrap().payload,
-            crate::models::twin_event::TwinEventPayload::NoteChanged(
-                crate::models::twin_event::NoteChanged {
-                    change: crate::models::twin_event::NoteChangeKind::Deleted,
-                    ..
-                }
-            )
-        ));
-    }
-
-    #[test]
-    fn coordinated_vault_switch_retargets_markdown_mutations_before_store_path() {
-        let root = tempdir().unwrap();
-        let vault_a = root.path().join("vault-a");
-        let vault_b = root.path().join("vault-b");
-        let data = root.path().join("data");
-        std::fs::create_dir(&vault_a).unwrap();
-        std::fs::create_dir(&vault_b).unwrap();
-        std::fs::create_dir(&data).unwrap();
-        let event_store =
-            std::sync::Arc::new(crate::services::twin_events::TwinEventStore::new(&data));
-        event_store.initialize().unwrap();
-        let coordinator = std::sync::Arc::new(
-            crate::services::twin_events::MutationCoordinator::new(
-                &data,
-                &vault_a,
-                event_store.clone(),
-                std::sync::Arc::new(crate::services::twin_events::NoopMutationLifecycle),
-            )
-            .unwrap(),
-        );
-        let mut store = KnowledgeStore::with_event_recorder(vault_a.clone(), data, coordinator);
-
-        store.set_vault_path(vault_b.clone()).unwrap();
-        store
-            .create_note(task_seven_note_create(
-                "After switch",
-                "new vault only",
-                "switched.md",
-            ))
-            .unwrap();
-
-        assert!(!vault_a.join("switched.md").exists());
-        assert!(vault_b.join("switched.md").exists());
-        assert_eq!(event_store.ordered_events().unwrap().len(), 1);
-    }
-
-    #[test]
-    fn coordinated_persistence_failure_leaves_cache_and_events_unchanged() {
-        let root = tempdir().unwrap();
-        let vault = root.path().join("vault");
-        let data = root.path().join("data");
-        std::fs::create_dir(&vault).unwrap();
-        std::fs::create_dir(&data).unwrap();
-        std::fs::write(vault.join("blocked"), "regular file").unwrap();
-        let event_store =
-            std::sync::Arc::new(crate::services::twin_events::TwinEventStore::new(&data));
-        event_store.initialize().unwrap();
-        let coordinator = std::sync::Arc::new(
-            crate::services::twin_events::MutationCoordinator::new(
-                &data,
-                &vault,
-                event_store.clone(),
-                std::sync::Arc::new(crate::services::twin_events::NoopMutationLifecycle),
-            )
-            .unwrap(),
-        );
-        let mut store = KnowledgeStore::with_event_recorder(vault, data, coordinator);
-        assert!(store
-            .create_note(task_seven_note_create(
-                "Must fail",
-                "never committed",
-                "blocked/note.md",
-            ))
-            .is_err());
-        assert!(store.list_notes().unwrap().is_empty());
-        assert!(event_store.ordered_events().unwrap().is_empty());
-    }
-
-    #[test]
-    fn interrupted_note_target_refreshes_cache_from_durable_bytes_before_recovery() {
-        let root = tempdir().unwrap();
-        let vault = root.path().join("vault");
-        let data = root.path().join("data");
-        std::fs::create_dir(&vault).unwrap();
-        std::fs::create_dir(&data).unwrap();
-        let event_store =
-            std::sync::Arc::new(crate::services::twin_events::TwinEventStore::new(&data));
-        event_store.initialize().unwrap();
-        let coordinator = std::sync::Arc::new(
-            crate::services::twin_events::MutationCoordinator::new(
-                &data,
-                &vault,
-                event_store.clone(),
-                std::sync::Arc::new(crate::services::twin_events::NoopMutationLifecycle),
-            )
-            .unwrap(),
-        );
-        let mut store =
-            KnowledgeStore::with_event_recorder(vault.clone(), data, coordinator.clone());
-        coordinator.fail_once_at(crate::services::twin_events::MutationFaultPoint::AfterTarget(0));
-        assert!(store
-            .create_note(task_seven_note_create(
-                "Durable before event",
-                "survives restart",
-                "durable-before-event.md",
-            ))
-            .is_err());
-
-        assert!(vault.join("durable-before-event.md").exists());
-        let cached = store.list_notes().unwrap();
-        assert_eq!(cached.len(), 1);
-        assert_eq!(cached[0].id, "durable-before-event");
-        assert!(event_store.ordered_events().unwrap().is_empty());
-        assert_eq!(coordinator.pending_count().unwrap(), 1);
-        assert_eq!(coordinator.recover_pending().unwrap(), 1);
-        assert_eq!(event_store.ordered_events().unwrap().len(), 1);
-    }
-
-    #[test]
-    fn coordinated_import_container_is_one_sorted_group_with_no_parser_noise() {
-        let root = tempdir().unwrap();
-        let vault = root.path().join("vault");
-        let data = root.path().join("data");
-        std::fs::create_dir(&vault).unwrap();
-        std::fs::create_dir(&data).unwrap();
-        let event_store =
-            std::sync::Arc::new(crate::services::twin_events::TwinEventStore::new(&data));
-        event_store.initialize().unwrap();
-        let coordinator = std::sync::Arc::new(
-            crate::services::twin_events::MutationCoordinator::new(
-                &data,
-                &vault,
-                event_store.clone(),
-                std::sync::Arc::new(crate::services::twin_events::NoopMutationLifecycle),
-            )
-            .unwrap(),
-        );
-        let mut store = KnowledgeStore::with_event_recorder(vault, data, coordinator);
-        let notes = store
-            .import_note_container(
-                vec![
-                    task_seven_note_create("Zulu", "section z", "zulu.md"),
-                    task_seven_note_create("Alpha", "section a", "alpha.md"),
-                ],
-                "document-one",
-                b"the original imported document",
-            )
-            .unwrap();
-        assert_eq!(notes.len(), 2);
-        let events = event_store.ordered_events().unwrap();
-        assert_eq!(events.len(), 3);
-        let note_ids = events[..2]
-            .iter()
-            .map(|event| match &event.payload {
-                crate::models::twin_event::TwinEventPayload::NoteChanged(value) => {
-                    value.note_id.as_str()
-                }
-                _ => panic!("only persisted notes precede the container observation"),
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(note_ids, vec!["alpha", "zulu"]);
-        let crate::models::twin_event::TwinEventPayload::ObservationRecorded(observation) =
-            &events[2].payload
-        else {
-            panic!("one container observation must close the import group");
-        };
-        assert!(observation.claims.is_empty());
-        assert_eq!(events[2].evidence.len(), 3);
-        assert_eq!(
-            events[2]
-                .evidence
-                .iter()
-                .filter(|evidence| evidence.evidence_type
-                    == crate::models::twin_event::EvidenceType::Import)
-                .count(),
-            1
-        );
-        assert!(events.iter().all(|event| {
-            event.governance.sensitivity == crate::models::twin_event::Sensitivity::Sensitive
-                && !event.governance.allowed_uses.export
-                && !event.governance.allowed_uses.training
-        }));
-        assert_eq!(events[1].causal_parents, vec![events[0].event_id.clone()]);
-        assert_eq!(events[2].causal_parents, vec![events[1].event_id.clone()]);
-    }
-
-    #[test]
-    fn import_container_enforces_the_sixty_three_note_prewrite_boundary() {
-        let root = tempdir().unwrap();
-        let vault = root.path().join("vault");
-        let data = root.path().join("data");
-        std::fs::create_dir(&vault).unwrap();
-        std::fs::create_dir(&data).unwrap();
-        let event_store =
-            std::sync::Arc::new(crate::services::twin_events::TwinEventStore::new(&data));
-        event_store.initialize().unwrap();
-        let coordinator = std::sync::Arc::new(
-            crate::services::twin_events::MutationCoordinator::new(
-                &data,
-                &vault,
-                event_store.clone(),
-                std::sync::Arc::new(crate::services::twin_events::NoopMutationLifecycle),
-            )
-            .unwrap(),
-        );
-        let mut store = KnowledgeStore::with_event_recorder(vault.clone(), data, coordinator);
-        let creates = (0..63)
-            .map(|index| {
-                task_seven_note_create(
-                    &format!("Section {index:02}"),
-                    "body",
-                    &format!("section-{index:02}.md"),
-                )
-            })
-            .collect();
-        assert_eq!(
-            store
-                .import_note_container(creates, "document-63", b"source-63")
-                .unwrap()
-                .len(),
-            63
-        );
-        assert_eq!(event_store.ordered_events().unwrap().len(), 64);
-
-        let too_many = (0..64)
-            .map(|index| {
-                task_seven_note_create(
-                    &format!("Overflow {index:02}"),
-                    "body",
-                    &format!("overflow-{index:02}.md"),
-                )
-            })
-            .collect();
-        assert!(store
-            .import_note_container(too_many, "document-64", b"source-64")
-            .is_err());
-        assert_eq!(event_store.ordered_events().unwrap().len(), 64);
-        assert!(!vault.join("overflow-00.md").exists());
-    }
-
-    #[test]
-    fn note_and_overlay_writes_are_atomic_with_no_tmp_litter() {
-        let vault_dir = tempdir().expect("vault tempdir");
-        let data_dir = tempdir().expect("data tempdir");
-        let mut store = KnowledgeStore::new(
-            vault_dir.path().to_path_buf(),
-            data_dir.path().to_path_buf(),
-        );
-
-        let note = store
-            .create_note(NoteCreate {
-                title: "Atomic Adoption".to_string(),
-                content: "Body content survives the temp+rename write.".to_string(),
-                relative_path: None,
-                aliases: Vec::new(),
-                status: Default::default(),
-                tags: vec!["adoption".to_string()],
-                schema_version: CURRENT_NOTE_SCHEMA_VERSION,
-                migration_source: None,
-                optimizer_managed: false,
-                properties: HashMap::new(),
-            })
-            .expect("note should be created");
-
-        let note_path = vault_dir.path().join(&note.relative_path);
-        let persisted = std::fs::read_to_string(&note_path).expect("note file should exist");
-        assert!(persisted.contains("Atomic Adoption"));
-        assert!(persisted.contains("Body content survives the temp+rename write."));
-        assert_no_tmp_siblings(vault_dir.path());
-
-        store
-            .write_overlay(
-                &note.id,
-                &serde_json::json!({"aliases": ["Adoption Alias"]}),
-            )
-            .expect("overlay should be written");
-        let overlay = std::fs::read_to_string(store.overlay_path(&note.id))
-            .expect("overlay file should exist");
-        assert!(overlay.contains("Adoption Alias"));
-        assert_no_tmp_siblings(&store.overlay_notes_dir);
-    }
-
-    #[test]
-    fn validate_note_id_rejects_colon_variants() {
-        assert!(
-            KnowledgeStore::validate_note_id("C:foo").is_err(),
-            "drive-relative id must be rejected"
-        );
-        assert!(
-            KnowledgeStore::validate_note_id("foo:bar").is_err(),
-            "alternate-data-stream id must be rejected"
-        );
-    }
-
-    #[test]
-    fn validate_note_id_rejects_reserved_device_stems_case_insensitively() {
-        for candidate in [
-            "con",
-            "CON",
-            "con.md",
-            "CON.backup",
-            "prn",
-            "PRN.md",
-            "aux",
-            "AUX",
-            "nul",
-            "NUL.md",
-            "com1",
-            "COM1.md",
-            "com9",
-            "COM9",
-            "lpt1",
-            "LPT1.md",
-            "lpt9",
-            "LPT9",
-            // Windows strips trailing spaces and dots before device-name
-            // resolution, so these variants still reach the device.
-            "con ",
-            "con .md",
-            "CON. .md",
-            "nul.",
-            "aux . .md",
-        ] {
-            assert!(
-                KnowledgeStore::validate_note_id(candidate).is_err(),
-                "expected '{}' to be rejected as a reserved device name",
-                candidate
-            );
-        }
-    }
-
-    #[test]
-    fn validate_note_id_accepts_normal_unicode_titles() {
-        for candidate in [
-            "my-note",
-            "笔记-notes",
-            "my.note.v2",
-            "project-plan-2026",
-            "console-notes",
-            "company",
-            // Trailing space on a non-reserved stem must stay accepted:
-            // trimmed stem is "console", which is not a device name.
-            "console ",
-        ] {
-            assert!(
-                KnowledgeStore::validate_note_id(candidate).is_ok(),
-                "expected '{}' to be accepted",
-                candidate
-            );
-        }
-    }
-
-    #[test]
-    fn normalize_note_relative_path_rejects_colon_variants() {
-        assert!(
-            normalize_note_relative_path("C:foo").is_err(),
-            "drive-relative path must be rejected"
-        );
-        assert!(
-            normalize_note_relative_path("foo:bar.md").is_err(),
-            "alternate-data-stream path must be rejected"
-        );
-        assert!(
-            normalize_note_relative_path("sub/c:d.md").is_err(),
-            "colon in a nested component must be rejected"
-        );
-    }
-
-    #[test]
-    fn normalize_note_relative_path_rejects_reserved_device_components() {
-        for candidate in [
-            "con",
-            "CON.md",
-            "prn.md",
-            "aux",
-            "nul.md",
-            "com1.md",
-            "lpt9",
-            "con.backup.md",
-            "sub/CON/note.md",
-            "sub/prn.md/note.md",
-            // Trailing spaces/dots are stripped by Windows before device-name
-            // resolution, so these still reach the device.
-            "con .md",
-            "sub/CON. .md",
-            "sub/nul ./note.md",
-        ] {
-            assert!(
-                normalize_note_relative_path(candidate).is_err(),
-                "expected '{}' to be rejected",
-                candidate
-            );
-        }
-    }
-
-    #[test]
-    fn normalize_note_relative_path_accepts_normal_unicode_paths() {
-        for candidate in [
-            "笔记-notes.md",
-            "folder/my.note.v2.md",
-            "notes/2026/plan.md",
-            "console-notes.md",
-            "folder/console .md",
-        ] {
-            assert!(
-                normalize_note_relative_path(candidate).is_ok(),
-                "expected '{}' to be accepted",
-                candidate
-            );
-        }
-    }
-
-    #[test]
-    fn ensure_path_within_vault_rejects_parent_dir_escape() {
-        let vault_dir = tempdir().expect("vault tempdir");
-        let vault_path = vault_dir.path();
-        let joined = vault_path.join(Path::new("../../outside.md"));
-        assert!(
-            ensure_path_within_vault(vault_path, &joined).is_err(),
-            "parent-dir escape must be rejected"
-        );
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn ensure_path_within_vault_rejects_drive_relative_escape_on_windows() {
-        let vault_dir = tempdir().expect("vault tempdir");
-        let vault_path = vault_dir.path();
-        // On Windows, PathBuf::join replaces the base entirely when the
-        // argument carries its own drive prefix (drive-relative path).
-        let joined = vault_path.join("C:secret.md");
-        assert!(
-            ensure_path_within_vault(vault_path, &joined).is_err(),
-            "drive-relative escape must be rejected"
-        );
-    }
-
-    #[test]
-    fn store_rejects_hostile_note_ids_and_paths_end_to_end() {
-        let vault_dir = tempdir().expect("vault tempdir");
-        let data_dir = tempdir().expect("data tempdir");
-        let mut store = KnowledgeStore::new(
-            vault_dir.path().to_path_buf(),
-            data_dir.path().to_path_buf(),
-        );
-
-        assert!(store.get_note("C:secret").is_err());
-        assert!(store.get_note("con").is_err());
-        assert!(store.delete_note("con").is_err());
-        assert!(store
-            .create_note(NoteCreate {
-                title: "Hostile".to_string(),
-                content: "x".to_string(),
-                relative_path: Some("C:evil.md".to_string()),
-                aliases: Vec::new(),
-                status: Default::default(),
-                tags: Vec::new(),
-                schema_version: CURRENT_NOTE_SCHEMA_VERSION,
-                migration_source: None,
-                optimizer_managed: false,
-                properties: HashMap::new(),
-            })
-            .is_err());
-    }
-
-    /// Frontmatter block with a tab character used as block-sequence indentation,
-    /// which yaml-rust2 rejects ("tab cannot be used as indentation"). This is not
-    /// well-formed YAML, so `YamlLoader::load_from_str` errors and the gray_matter
-    /// engine falls back to `Pod::Null`, which then fails to deserialize into
-    /// `NoteFrontmatter` (a non-map `Pod` is an invalid type for the struct,
-    /// regardless of field defaults).
-    const MALFORMED_FRONTMATTER_NOTE: &str = "---\ntitle: Original Title\ntags:\n\t- alpha\nstatus: canonical\n---\n\nOriginal body content.";
-
-    #[test]
-    fn read_note_with_malformed_yaml_frontmatter_survives_without_error() {
-        let vault_dir = tempdir().expect("vault tempdir");
-        let data_dir = tempdir().expect("data tempdir");
-
-        let note_path = vault_dir.path().join("broken.md");
-        std::fs::write(&note_path, MALFORMED_FRONTMATTER_NOTE)
-            .expect("note file should be written");
-
-        let store = KnowledgeStore::new(
-            vault_dir.path().to_path_buf(),
-            data_dir.path().to_path_buf(),
-        );
-
-        let note = store
-            .find_note_by_relative_path("broken.md")
-            .expect("lookup should not error")
-            .expect("malformed note should still be readable");
-        assert!(
-            note.content.contains("Original body content."),
-            "body content should be preserved even though frontmatter failed to parse"
-        );
-        assert!(
-            note.frontmatter_raw_fallback.is_some(),
-            "unparsable frontmatter should be retained as a raw fallback"
-        );
-        assert!(
-            note.frontmatter_raw_fallback
-                .as_ref()
-                .unwrap()
-                .contains("Original Title"),
-            "raw fallback should contain the original frontmatter text"
-        );
-    }
-
-    #[test]
-    fn content_only_update_preserves_original_raw_frontmatter_verbatim() {
-        let vault_dir = tempdir().expect("vault tempdir");
-        let data_dir = tempdir().expect("data tempdir");
-
-        let note_path = vault_dir.path().join("broken.md");
-        std::fs::write(&note_path, MALFORMED_FRONTMATTER_NOTE)
-            .expect("note file should be written");
-
-        let mut store = KnowledgeStore::new(
-            vault_dir.path().to_path_buf(),
-            data_dir.path().to_path_buf(),
-        );
-        let note_id = store
-            .find_note_by_relative_path("broken.md")
-            .expect("lookup should not error")
-            .expect("malformed note should still be readable")
-            .id;
-
-        store
-            .update_note(
-                &note_id,
-                NoteUpdate {
-                    content: Some("Updated body content.".to_string()),
-                    ..Default::default()
-                },
-            )
-            .expect("content-only update should succeed on a malformed-frontmatter note");
-
-        let persisted = std::fs::read_to_string(&note_path).expect("note file should still exist");
-        assert!(
-            persisted.contains("title: Original Title\ntags:\n\t- alpha\nstatus: canonical"),
-            "original raw frontmatter block should be preserved byte-for-byte:\n{persisted}"
-        );
-        assert!(
-            persisted.contains("Updated body content."),
-            "new content should be written:\n{persisted}"
-        );
-        assert!(
-            !persisted.contains("Original body content."),
-            "old content should be replaced, not appended:\n{persisted}"
-        );
-    }
-
-    #[test]
-    fn explicit_frontmatter_update_replaces_malformed_original() {
-        let vault_dir = tempdir().expect("vault tempdir");
-        let data_dir = tempdir().expect("data tempdir");
-
-        let note_path = vault_dir.path().join("broken.md");
-        std::fs::write(&note_path, MALFORMED_FRONTMATTER_NOTE)
-            .expect("note file should be written");
-
-        let mut store = KnowledgeStore::new(
-            vault_dir.path().to_path_buf(),
-            data_dir.path().to_path_buf(),
-        );
-        let note_id = store
-            .find_note_by_relative_path("broken.md")
-            .expect("lookup should not error")
-            .expect("malformed note should still be readable")
-            .id;
-
-        let updated = store
-            .update_note(
-                &note_id,
-                NoteUpdate {
-                    status: Some(NoteStatus::Evidence),
-                    ..Default::default()
-                },
-            )
-            .expect("explicit frontmatter update should succeed");
-
-        assert!(
-            updated.frontmatter_raw_fallback.is_none(),
-            "explicitly editing a frontmatter field should clear the raw fallback"
-        );
-
-        let persisted = std::fs::read_to_string(&note_path).expect("note file should still exist");
-        assert!(
-            !persisted.contains("\t- alpha"),
-            "malformed original frontmatter should no longer be present:\n{persisted}"
-        );
-        assert!(
-            persisted.contains("status: evidence"),
-            "newly serialized frontmatter should reflect the explicit edit:\n{persisted}"
-        );
-    }
-
-    #[test]
-    fn well_formed_frontmatter_has_no_raw_fallback() {
-        let vault_dir = tempdir().expect("vault tempdir");
-        let data_dir = tempdir().expect("data tempdir");
-        let mut store = KnowledgeStore::new(
-            vault_dir.path().to_path_buf(),
-            data_dir.path().to_path_buf(),
-        );
-
-        let note = store
-            .create_note(NoteCreate {
-                title: "Well Formed".to_string(),
-                content: "Body.".to_string(),
-                relative_path: None,
-                aliases: Vec::new(),
-                status: Default::default(),
-                tags: Vec::new(),
-                schema_version: CURRENT_NOTE_SCHEMA_VERSION,
-                migration_source: None,
-                optimizer_managed: false,
-                properties: HashMap::new(),
-            })
-            .expect("note should be created");
-
-        assert!(
-            note.frontmatter_raw_fallback.is_none(),
-            "a freshly created, well-formed note must not carry a raw fallback"
-        );
-
-        let fetched = store.get_note(&note.id).expect("note should be readable");
-        assert!(
-            fetched.frontmatter_raw_fallback.is_none(),
-            "re-reading a well-formed note must not carry a raw fallback"
-        );
-    }
-
-    /// Valid YAML frontmatter that simply omits `title:` — the norm for
-    /// Obsidian-style and imported vaults. This must NOT be treated as a parse
-    /// failure: title falls back to the H1 heading downstream, and custom fields
-    /// must flow into `properties` and round-trip through writes.
-    const TITLE_LESS_VALID_FRONTMATTER_NOTE: &str = "---\nstatus: evidence\ntags:\n  - alpha\ncustom_field: keep-me\n---\n\n# Heading Title\n\nBody text.";
-
-    #[test]
-    fn title_less_valid_frontmatter_parses_without_fallback_and_round_trips() {
-        let vault_dir = tempdir().expect("vault tempdir");
-        let data_dir = tempdir().expect("data tempdir");
-
-        let note_path = vault_dir.path().join("no-title.md");
-        std::fs::write(&note_path, TITLE_LESS_VALID_FRONTMATTER_NOTE)
-            .expect("note file should be written");
-
-        let mut store = KnowledgeStore::new(
-            vault_dir.path().to_path_buf(),
-            data_dir.path().to_path_buf(),
-        );
-
-        let note = store
-            .find_note_by_relative_path("no-title.md")
-            .expect("lookup should not error")
-            .expect("title-less note should be readable");
-        assert!(
-            note.frontmatter_raw_fallback.is_none(),
-            "valid frontmatter without a title must NOT be treated as a parse failure"
-        );
-        assert_eq!(
-            note.title, "Heading Title",
-            "title should fall back to the H1 heading"
-        );
-        assert_eq!(note.status, NoteStatus::Evidence);
-        assert!(note.tags.contains(&"alpha".to_string()));
-        assert_eq!(
-            note.properties.get("custom_field").and_then(|v| v.as_str()),
-            Some("keep-me"),
-            "custom frontmatter fields should flow into properties"
-        );
-
-        // Content-only edit: custom field must survive on disk.
-        store
-            .update_note(
-                &note.id,
-                NoteUpdate {
-                    content: Some("# Heading Title\n\nEdited body.".to_string()),
-                    ..Default::default()
-                },
-            )
-            .expect("content-only update should succeed");
-        let persisted = std::fs::read_to_string(&note_path).expect("note file should still exist");
-        assert!(
-            persisted.contains("custom_field: keep-me"),
-            "custom field should round-trip through a content edit:\n{persisted}"
-        );
-        assert!(persisted.contains("Edited body."));
-
-        // Explicit frontmatter edit: custom field must STILL survive, because the
-        // frontmatter deserialized successfully and custom fields live in properties.
-        store
-            .update_note(
-                &note.id,
-                NoteUpdate {
-                    status: Some(NoteStatus::Canonical),
-                    ..Default::default()
-                },
-            )
-            .expect("explicit status update should succeed");
-        let persisted = std::fs::read_to_string(&note_path).expect("note file should still exist");
-        assert!(
-            persisted.contains("custom_field: keep-me"),
-            "custom field should round-trip through an explicit status edit:\n{persisted}"
-        );
-        assert!(
-            persisted.contains("status: canonical"),
-            "status edit should be reflected:\n{persisted}"
-        );
-    }
-}
+#[path = "knowledge_store_tests.rs"]
+mod tests;

@@ -614,6 +614,7 @@ mod tests {
                 stakes: None,
                 initial_leaning: None,
                 review_date: None,
+                primitive_assessment: PrimitiveDecisionAssessmentPayload::default(),
             }))
         };
         let first = decision(&["alpha", "alpha", "beta"]);

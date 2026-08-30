@@ -19,6 +19,8 @@ pub(super) fn build_response(model_id: &str, content: &str) -> ModelResponse {
         error: None,
         tokens_used: None,
         cost_usd: None,
+        provider: Some("openrouter".to_string()),
+        provenance: Some("canvas_openrouter".to_string()),
         created_at: chrono::Utc::now(),
         position: TilePosition::default(),
     }

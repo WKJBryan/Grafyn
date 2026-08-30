@@ -538,6 +538,7 @@ mod commit_note_write_tests {
                 data_path.clone(),
             )),
             mutation_startup_error: None,
+            vault_transition: Arc::new(tokio::sync::Mutex::new(())),
             memory_service: Arc::new(MemoryService::new()),
             boot_state: Arc::new(RwLock::new(BootStatus::default())),
         };

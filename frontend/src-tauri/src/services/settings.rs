@@ -17,6 +17,14 @@ pub struct SettingsService {
 }
 
 impl SettingsService {
+    #[cfg(test)]
+    pub(crate) fn for_test(config_path: PathBuf, settings: UserSettings) -> Self {
+        Self {
+            config_path,
+            settings,
+        }
+    }
+
     /// Create a SettingsService with default settings (used as fallback)
     pub fn load_defaults() -> Self {
         let config_dir = dirs::config_dir()
@@ -100,14 +108,18 @@ impl SettingsService {
 
     /// Update settings and persist to disk
     pub fn update(&mut self, update: SettingsUpdate) -> Result<UserSettings> {
+        let before = self.settings.clone();
         // Apply updates
         if let Some(vault_path) = update.vault_path {
-            // Validate the path exists (or can be created)
             let path = PathBuf::from(&vault_path);
-            if !path.exists() {
-                std::fs::create_dir_all(&path).context("Failed to create vault directory")?;
-            }
-            self.settings.vault_path = Some(vault_path);
+            crate::services::twin_events::validate_real_directory(&path, "vault directory")
+                .map_err(anyhow::Error::new)?;
+            self.settings.vault_path = Some(
+                std::fs::canonicalize(path)
+                    .context("Failed to canonicalize vault directory")?
+                    .to_string_lossy()
+                    .into_owned(),
+            );
         }
 
         if let Some(api_key) = update.openrouter_api_key {
@@ -244,7 +256,10 @@ impl SettingsService {
         }
 
         // Persist to disk
-        self.save()?;
+        if let Err(error) = self.save() {
+            self.settings = before;
+            return Err(error);
+        }
 
         Ok(self.settings.clone())
     }
@@ -411,6 +426,31 @@ mod tests {
     use crate::models::settings::CanvasModelPreset;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    fn vault_update(path: impl Into<String>) -> SettingsUpdate {
+        SettingsUpdate {
+            vault_path: Some(path.into()),
+            openrouter_api_key: None,
+            setup_completed: None,
+            theme: None,
+            mcp_enabled: None,
+            llm_model: None,
+            twin_llm_provider: None,
+            ollama_base_url: None,
+            ollama_model: None,
+            smart_web_search: None,
+            background_link_discovery_enabled: None,
+            background_link_discovery_llm_enabled: None,
+            background_vault_optimizer_enabled: None,
+            background_vault_optimizer_llm_enabled: None,
+            background_vault_optimizer_budget_monthly: None,
+            background_vault_optimizer_max_daily_writes: None,
+            background_vault_optimizer_edit_mode: None,
+            background_vault_optimizer_program_enabled: None,
+            vault_optimizer_program_path: None,
+            canvas_model_presets: None,
+        }
+    }
+
     #[test]
     fn test_default_settings() {
         let settings = UserSettings::default();
@@ -526,6 +566,55 @@ mod tests {
         let persisted = std::fs::read_to_string(&config_path).expect("settings file should exist");
         assert!(persisted.contains("\"theme\": \"dark\""));
         crate::services::atomic_io::assert_no_tmp_siblings(temp_dir.path());
+    }
+
+    #[test]
+    fn vault_update_requires_an_existing_real_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("settings.json");
+        let mut service = SettingsService {
+            config_path,
+            settings: UserSettings::default(),
+        };
+        let missing = temp.path().join("missing");
+        assert!(service
+            .update(vault_update(missing.to_string_lossy()))
+            .is_err());
+        assert!(!missing.exists());
+
+        let regular_file = temp.path().join("not-a-vault");
+        std::fs::write(&regular_file, b"not a directory").unwrap();
+        assert!(service
+            .update(vault_update(regular_file.to_string_lossy()))
+            .is_err());
+
+        let real = temp.path().join("real-vault");
+        let link = temp.path().join("linked-vault");
+        std::fs::create_dir(&real).unwrap();
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_dir(&real, &link);
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(&real, &link);
+        if linked.is_ok() {
+            assert!(service
+                .update(vault_update(link.to_string_lossy()))
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn failed_settings_persistence_does_not_publish_runtime_values() {
+        let temp = tempfile::tempdir().unwrap();
+        let before = UserSettings::default();
+        let mut service = SettingsService {
+            config_path: temp.path().to_path_buf(),
+            settings: before.clone(),
+        };
+        let mut update = vault_update(temp.path().to_string_lossy());
+        update.vault_path = None;
+        update.theme = Some("dark".into());
+        assert!(service.update(update).is_err());
+        assert_eq!(service.get().theme, before.theme);
     }
 
     #[test]

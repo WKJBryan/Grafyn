@@ -21,6 +21,7 @@ pub struct CanvasStore {
     session_cache: HashMap<String, CanvasSession>,
     /// Whether the session list cache has been populated from disk.
     list_cache_ready: bool,
+    pending_bases: HashMap<String, CanvasSession>,
     event_recorder: Arc<dyn crate::services::twin_events::EventRecorder>,
 }
 
@@ -42,6 +43,7 @@ impl CanvasStore {
             data_path,
             session_cache: HashMap::new(),
             list_cache_ready: false,
+            pending_bases: HashMap::new(),
             event_recorder,
         }
     }
@@ -157,6 +159,14 @@ impl CanvasStore {
                 .with_context(|| format!("Session not found: {}", id))?;
             self.session_cache.insert(id.to_string(), session);
         }
+        if !self.pending_bases.contains_key(id) {
+            let base = self
+                .session_cache
+                .get(id)
+                .expect("session was loaded")
+                .clone();
+            self.pending_bases.insert(id.to_string(), base);
+        }
         Ok(self.session_cache.get_mut(id).unwrap())
     }
 
@@ -217,8 +227,26 @@ impl CanvasStore {
     pub fn delete_session(&mut self, id: &str) -> Result<()> {
         Self::validate_session_id(id)?;
         let path = self.session_path(id);
-        std::fs::remove_file(&path).with_context(|| format!("Failed to delete session: {}", id))?;
+        if self.event_recorder.is_noop() {
+            std::fs::remove_file(&path)
+                .with_context(|| format!("Failed to delete session: {}", id))?;
+        } else {
+            self.event_recorder
+                .commit_mutation(
+                    crate::services::twin_events::MutationOrigin::Local,
+                    crate::models::twin_event::CausalStream::LocalOnly,
+                    crate::models::twin_event::SourceChannel::parse("canvas")
+                        .map_err(anyhow::Error::msg)?,
+                    vec![crate::services::twin_events::TargetMutation::tombstone(
+                        crate::services::twin_events::TargetKind::CanvasJson,
+                        format!("{id}.json"),
+                    )],
+                    Vec::new(),
+                )
+                .map_err(anyhow::Error::new)?;
+        }
         self.session_cache.remove(id);
+        self.pending_bases.remove(id);
         Ok(())
     }
 
@@ -229,6 +257,21 @@ impl CanvasStore {
         session.updated_at = Utc::now();
         let session = session.clone();
         self.write_session_file(&session)?;
+        Ok(session)
+    }
+
+    pub fn add_decision_tile(
+        &mut self,
+        session_id: &str,
+        tile: PromptTile,
+        twin_store: &mut crate::services::twin::TwinStore,
+        decision: crate::models::twin::DecisionEpisodeCreate,
+    ) -> Result<CanvasSession> {
+        let session = self.get_session_mut(session_id)?;
+        session.prompt_tiles.push(tile);
+        session.updated_at = Utc::now();
+        let session = session.clone();
+        self.write_session_file_with_decision(&session, twin_store, decision)?;
         Ok(session)
     }
 
@@ -489,6 +532,9 @@ impl CanvasStore {
 
     /// Save a full session object (used after streaming completes)
     pub fn save_session(&mut self, session: &CanvasSession) -> Result<()> {
+        if let Some(base) = self.session_cache.get(&session.id).cloned() {
+            self.pending_bases.insert(session.id.clone(), base);
+        }
         self.session_cache
             .insert(session.id.clone(), session.clone());
         self.write_session_file(session)
@@ -518,65 +564,230 @@ impl CanvasStore {
 
     /// Write a session to file
     fn write_session_file(&mut self, session: &CanvasSession) -> Result<()> {
+        self.write_session_file_internal(session, None)
+    }
+
+    fn write_session_file_with_decision(
+        &mut self,
+        session: &CanvasSession,
+        twin_store: &mut crate::services::twin::TwinStore,
+        decision: crate::models::twin::DecisionEpisodeCreate,
+    ) -> Result<()> {
+        self.write_session_file_internal(session, Some((twin_store, decision)))
+    }
+
+    fn write_session_file_internal(
+        &mut self,
+        session: &CanvasSession,
+        mut decision: Option<(
+            &mut crate::services::twin::TwinStore,
+            crate::models::twin::DecisionEpisodeCreate,
+        )>,
+    ) -> Result<()> {
         let path = self.session_path(&session.id);
-        let content = serde_json::to_string_pretty(session)?;
-        let before = if path.exists() {
+        let candidate = session.clone();
+        let cached_base = self.pending_bases.remove(&session.id);
+        let before_error_fallback = if path.exists() {
             Some(self.read_session_file(&path)?)
         } else {
             None
         };
-        let persist = || -> Result<()> {
-            if self.event_recorder.is_noop() {
-                return write_atomic(&path, content.as_bytes())
-                    .with_context(|| format!("Failed to write session: {:?}", path));
+        if self.event_recorder.is_noop() {
+            if decision.is_some() {
+                anyhow::bail!("compound decision capture requires a mutation coordinator");
             }
-            let drafts = crate::services::twin_events::canvas_transition_drafts(
-                before.as_ref(),
-                session,
-                &self
-                    .event_recorder
-                    .recorded_events()
-                    .map_err(anyhow::Error::new)?,
+            let content = serde_json::to_string_pretty(&candidate)?;
+            write_atomic(&path, content.as_bytes())
+                .with_context(|| format!("Failed to write session: {:?}", path))?;
+            return Ok(());
+        }
+
+        let recorder = self.event_recorder.clone();
+        let session_id = candidate.id.clone();
+        let path_for_plan = path.clone();
+        let mut committed_session = None;
+        let mut committed_decision_trace = None;
+        let mut planner = || {
+            let durable_before = if path_for_plan.exists() {
+                Some(self.read_session_file(&path_for_plan).map_err(|error| {
+                    crate::services::twin_events::MutationError::Invalid(error.to_string())
+                })?)
+            } else {
+                None
+            };
+            let after = match (&cached_base, &durable_before) {
+                (Some(base), Some(durable)) => {
+                    merge_canvas_session_change(base, &candidate, durable).map_err(|error| {
+                        crate::services::twin_events::MutationError::Invalid(error.to_string())
+                    })?
+                }
+                _ => candidate.clone(),
+            };
+            let content = serde_json::to_string_pretty(&after).map_err(|error| {
+                crate::services::twin_events::MutationError::Invalid(error.to_string())
+            })?;
+            let events = recorder.recorded_events()?;
+            let mut drafts = crate::services::twin_events::canvas_transition_drafts(
+                durable_before.as_ref(),
+                &after,
+                &events,
                 crate::services::twin_events::digest_bytes(content.as_bytes()),
             )
-            .map_err(anyhow::Error::msg)?;
-            if drafts.is_empty() {
-                return write_atomic(&path, content.as_bytes())
-                    .with_context(|| format!("Failed to write session: {:?}", path));
+            .map_err(crate::services::twin_events::MutationError::Invalid)?;
+            let mut targets = vec![crate::services::twin_events::TargetMutation::put(
+                crate::services::twin_events::TargetKind::CanvasJson,
+                format!("{session_id}.json"),
+                content,
+            )];
+            if let Some((twin_store, create)) = decision.as_mut() {
+                let (_episode, trace, values, decision_drafts) = twin_store
+                    .plan_decision_episode_mutation(create.clone())
+                    .map_err(|error| {
+                        crate::services::twin_events::MutationError::Invalid(error.to_string())
+                    })?;
+                targets.extend(twin_store.governed_json_targets(values).map_err(|error| {
+                    crate::services::twin_events::MutationError::Invalid(error.to_string())
+                })?);
+                drafts.extend(decision_drafts);
+                committed_decision_trace = Some(trace);
             }
-            self.event_recorder
-                .commit_mutation(
-                    crate::services::twin_events::MutationOrigin::Local,
-                    crate::models::twin_event::CausalStream::SyncEligible,
-                    crate::models::twin_event::SourceChannel::parse("canvas")
-                        .map_err(anyhow::Error::msg)?,
-                    vec![crate::services::twin_events::TargetMutation::put(
-                        crate::services::twin_events::TargetKind::CanvasJson,
-                        format!("{}.json", session.id),
-                        content.clone(),
-                    )],
-                    drafts,
-                )
-                .map_err(anyhow::Error::new)?;
-            Ok(())
+            committed_session = Some(after);
+            Ok(Some(crate::services::twin_events::MutationPlan::new(
+                crate::models::twin_event::CausalStream::SyncEligible,
+                crate::models::twin_event::SourceChannel::parse("canvas")
+                    .map_err(crate::services::twin_events::MutationError::Invalid)?,
+                targets,
+                drafts,
+            )))
         };
-        if let Err(error) = persist() {
+        let persist = recorder.commit_planned_mutation(
+            crate::services::twin_events::MutationOrigin::Local,
+            &mut planner,
+        );
+        if let Err(error) = persist {
             match self.read_session_file(&path) {
                 Ok(durable) => {
                     self.session_cache.insert(session.id.clone(), durable);
                 }
                 Err(_) => {
-                    if let Some(before) = before {
+                    if let Some(before) = before_error_fallback {
                         self.session_cache.insert(session.id.clone(), before);
                     } else {
                         self.session_cache.remove(&session.id);
                     }
                 }
             }
-            return Err(error);
+            return Err(anyhow::Error::new(error));
+        }
+        if let Some(committed) = committed_session {
+            self.session_cache.insert(session.id.clone(), committed);
+        }
+        if let (Some((twin_store, _)), Some(trace)) = (decision.as_mut(), committed_decision_trace)
+        {
+            twin_store.cache_committed_trace(trace);
         }
         Ok(())
     }
+}
+
+fn merge_canvas_session_change(
+    base: &CanvasSession,
+    candidate: &CanvasSession,
+    durable: &CanvasSession,
+) -> Result<CanvasSession> {
+    let base = serde_json::to_value(base)?;
+    let candidate = serde_json::to_value(candidate)?;
+    let mut durable = serde_json::to_value(durable)?;
+    merge_canvas_value(&base, &candidate, &mut durable);
+    Ok(serde_json::from_value(durable)?)
+}
+
+fn merge_canvas_value(
+    base: &serde_json::Value,
+    candidate: &serde_json::Value,
+    durable: &mut serde_json::Value,
+) {
+    if base == candidate {
+        return;
+    }
+    match (base, candidate, durable) {
+        (
+            serde_json::Value::Object(base),
+            serde_json::Value::Object(candidate),
+            serde_json::Value::Object(durable),
+        ) => {
+            for (key, candidate_value) in candidate {
+                match (base.get(key), durable.get_mut(key)) {
+                    (Some(base_value), Some(durable_value)) => {
+                        merge_canvas_value(base_value, candidate_value, durable_value)
+                    }
+                    _ => {
+                        durable.insert(key.clone(), candidate_value.clone());
+                    }
+                }
+            }
+        }
+        (
+            serde_json::Value::Array(base),
+            serde_json::Value::Array(candidate),
+            serde_json::Value::Array(durable),
+        ) if canvas_array_identity_key(base, candidate, durable).is_some() => {
+            let key = canvas_array_identity_key(base, candidate, durable).expect("checked key");
+            let base_ids = base
+                .iter()
+                .filter_map(|value| canvas_identity(value, key))
+                .collect::<HashSet<_>>();
+            let candidate_ids = candidate
+                .iter()
+                .filter_map(|value| canvas_identity(value, key))
+                .collect::<HashSet<_>>();
+            durable.retain(|value| {
+                canvas_identity(value, key)
+                    .is_none_or(|id| !base_ids.contains(&id) || candidate_ids.contains(&id))
+            });
+            for candidate_value in candidate {
+                let Some(id) = canvas_identity(candidate_value, key) else {
+                    continue;
+                };
+                let base_value = base
+                    .iter()
+                    .find(|value| canvas_identity(value, key).as_deref() == Some(id.as_str()));
+                let durable_value = durable
+                    .iter_mut()
+                    .find(|value| canvas_identity(value, key).as_deref() == Some(id.as_str()));
+                match (base_value, durable_value) {
+                    (Some(base_value), Some(durable_value)) => {
+                        merge_canvas_value(base_value, candidate_value, durable_value)
+                    }
+                    (None, None) => durable.push(candidate_value.clone()),
+                    _ => {}
+                }
+            }
+        }
+        (_, candidate, durable) => *durable = candidate.clone(),
+    }
+}
+
+fn canvas_array_identity_key(
+    base: &[serde_json::Value],
+    candidate: &[serde_json::Value],
+    durable: &[serde_json::Value],
+) -> Option<&'static str> {
+    ["id", "round_number", "model_id"].into_iter().find(|key| {
+        base.iter()
+            .chain(candidate)
+            .chain(durable)
+            .all(|value| canvas_identity(value, key).is_some())
+            && !(base.is_empty() && candidate.is_empty() && durable.is_empty())
+    })
+}
+
+fn canvas_identity(value: &serde_json::Value, key: &str) -> Option<String> {
+    let value = value.as_object()?.get(key)?;
+    value
+        .as_str()
+        .map(str::to_string)
+        .or_else(|| value.as_u64().map(|value| value.to_string()))
 }
 
 #[cfg(test)]
@@ -955,22 +1166,119 @@ mod tests {
     }
 
     #[test]
+    fn decision_submission_recovers_canvas_episode_and_trace_as_one_event_group() {
+        let root = tempdir().unwrap();
+        let data = root.path().join("data");
+        let vault = root.path().join("vault");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::create_dir(&vault).unwrap();
+        let event_store =
+            std::sync::Arc::new(crate::services::twin_events::TwinEventStore::new(&data));
+        event_store.initialize().unwrap();
+        let coordinator = std::sync::Arc::new(
+            crate::services::twin_events::MutationCoordinator::new(
+                &data,
+                &vault,
+                event_store.clone(),
+                std::sync::Arc::new(crate::services::twin_events::NoopMutationLifecycle),
+            )
+            .unwrap(),
+        );
+        let mut canvas = CanvasStore::with_event_recorder(data.join("canvas"), coordinator.clone());
+        let mut twin = crate::services::twin::TwinStore::with_event_recorder(
+            data.join("twin").join("scope-one"),
+            data.join("twin"),
+            coordinator.clone(),
+        );
+        let session = canvas
+            .create_session(SessionCreate {
+                title: "Decision".into(),
+                description: None,
+                tags: Vec::new(),
+            })
+            .unwrap();
+        let tile = PromptTile {
+            id: "decision-tile".into(),
+            prompt_type: crate::models::canvas::PromptType::Decision,
+            prompt: "Ship now?".into(),
+            decision_episode_id: Some("decision-episode".into()),
+            decision_metadata: Some(crate::models::canvas::DecisionPromptMetadata {
+                decision: "Ship now?".into(),
+                options: vec!["Ship".into(), "Wait".into()],
+                stakes: Some("Launch quality".into()),
+                initial_leaning: Some("Ship".into()),
+                review_date: None,
+            }),
+            ..PromptTile::default()
+        };
+        let create = crate::models::twin::DecisionEpisodeCreate {
+            id: "decision-episode".into(),
+            session_id: session.id.clone(),
+            tile_id: tile.id.clone(),
+            decision: "Ship now?".into(),
+            options: vec!["Ship".into(), "Wait".into()],
+            stakes: Some("Launch quality".into()),
+            initial_leaning: Some("Ship".into()),
+            review_date: None,
+            primitive_assessment: Default::default(),
+            context_version: Some("test-v1".into()),
+        };
+
+        coordinator.fail_once_at(crate::services::twin_events::MutationFaultPoint::AfterTarget(0));
+        assert!(canvas
+            .add_decision_tile(&session.id, tile, &mut twin, create)
+            .is_err());
+        assert_eq!(coordinator.pending_count().unwrap(), 1);
+        assert_eq!(coordinator.recover_pending().unwrap(), 1);
+        assert_eq!(coordinator.recover_pending().unwrap(), 0);
+
+        let captured = event_store.ordered_events().unwrap();
+        assert_eq!(captured.len(), 2);
+        assert!(matches!(
+            captured[0].payload,
+            crate::models::twin_event::TwinEventPayload::ConversationTurnRecorded(_)
+        ));
+        assert!(matches!(
+            captured[1].payload,
+            crate::models::twin_event::TwinEventPayload::DecisionRecorded(_)
+        ));
+        assert_eq!(
+            captured[1].causal_parents,
+            vec![captured[0].event_id.clone()]
+        );
+        assert_eq!(
+            twin.get_decision_episode("decision-episode")
+                .unwrap()
+                .tile_id,
+            "decision-tile"
+        );
+        assert!(twin
+            .get_session_trace(&session.id)
+            .unwrap()
+            .events
+            .iter()
+            .any(|event| event.event_type
+                == crate::models::twin::TraceEventType::DecisionEpisodeCreated));
+    }
+
+    #[test]
     fn coordinated_canvas_failure_restores_cache_and_persisted_session() {
         let root = tempdir().unwrap();
         let canvas = root.path().join("canvas");
-        let mut store = CanvasStore::with_event_recorder(
-            canvas.clone(),
-            std::sync::Arc::new(crate::services::twin_events::UnavailableEventRecorder::new(
-                "injected persistence failure",
-            )),
-        );
-        let session = store
+        let session = CanvasStore::new(canvas.clone())
             .create_session(SessionCreate {
                 title: "Stable".to_string(),
                 description: None,
                 tags: Vec::new(),
             })
             .unwrap();
+        let mut store = CanvasStore::with_event_recorder(
+            canvas.clone(),
+            std::sync::Arc::new(crate::services::twin_events::UnavailableEventRecorder::new(
+                "injected persistence failure",
+            )),
+        );
+        store.get_session(&session.id).unwrap();
         let before = std::fs::read(canvas.join(format!("{}.json", session.id))).unwrap();
         let result = store.add_tile(
             &session.id,
@@ -1040,6 +1348,201 @@ mod tests {
         assert_eq!(coordinator.pending_count().unwrap(), 1);
         assert_eq!(coordinator.recover_pending().unwrap(), 1);
         assert_eq!(event_store.ordered_events().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn target_only_canvas_write_uses_journal_and_recovers_without_event() {
+        let root = tempdir().unwrap();
+        let data = root.path().join("data");
+        let vault = root.path().join("vault");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::create_dir(&vault).unwrap();
+        let event_store =
+            std::sync::Arc::new(crate::services::twin_events::TwinEventStore::new(&data));
+        event_store.initialize().unwrap();
+        let coordinator = std::sync::Arc::new(
+            crate::services::twin_events::MutationCoordinator::new(
+                &data,
+                &vault,
+                event_store.clone(),
+                std::sync::Arc::new(crate::services::twin_events::NoopMutationLifecycle),
+            )
+            .unwrap(),
+        );
+        let mut store = CanvasStore::with_event_recorder(data.join("canvas"), coordinator.clone());
+        let session = store
+            .create_session(SessionCreate {
+                title: "Layout journal".into(),
+                description: None,
+                tags: Vec::new(),
+            })
+            .unwrap();
+
+        coordinator.fail_once_at(crate::services::twin_events::MutationFaultPoint::AfterTarget(0));
+        assert!(store
+            .update_viewport(
+                &session.id,
+                CanvasViewport {
+                    x: 7.0,
+                    y: 9.0,
+                    zoom: 0.75,
+                },
+            )
+            .is_err());
+        assert_eq!(coordinator.pending_count().unwrap(), 1);
+        assert_eq!(coordinator.recover_pending().unwrap(), 1);
+        assert!(event_store.ordered_events().unwrap().is_empty());
+        let durable = store.get_session(&session.id).unwrap();
+        assert_eq!(durable.viewport.x, 7.0);
+        assert_eq!(durable.viewport.y, 9.0);
+    }
+
+    #[test]
+    fn pending_canvas_change_is_recovered_before_fresh_session_plan() {
+        let root = tempdir().unwrap();
+        let data = root.path().join("data");
+        let vault = root.path().join("vault");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::create_dir(&vault).unwrap();
+        let event_store =
+            std::sync::Arc::new(crate::services::twin_events::TwinEventStore::new(&data));
+        event_store.initialize().unwrap();
+        let coordinator = std::sync::Arc::new(
+            crate::services::twin_events::MutationCoordinator::new(
+                &data,
+                &vault,
+                event_store.clone(),
+                std::sync::Arc::new(crate::services::twin_events::NoopMutationLifecycle),
+            )
+            .unwrap(),
+        );
+        let mut first = CanvasStore::with_event_recorder(data.join("canvas"), coordinator.clone());
+        let session = first
+            .create_session(SessionCreate {
+                title: "Fresh plan".into(),
+                description: None,
+                tags: Vec::new(),
+            })
+            .unwrap();
+        let mut stale = CanvasStore::with_event_recorder(data.join("canvas"), coordinator.clone());
+        stale.get_session(&session.id).unwrap();
+
+        coordinator.fail_once_at(crate::services::twin_events::MutationFaultPoint::AfterStage);
+        assert!(first
+            .add_tile(
+                &session.id,
+                PromptTile {
+                    id: "recovered-tile".into(),
+                    prompt: "first".into(),
+                    ..PromptTile::default()
+                },
+            )
+            .is_err());
+        stale
+            .add_tile(
+                &session.id,
+                PromptTile {
+                    id: "fresh-tile".into(),
+                    prompt: "second".into(),
+                    ..PromptTile::default()
+                },
+            )
+            .unwrap();
+        let durable = stale.get_session(&session.id).unwrap();
+        let ids = durable
+            .prompt_tiles
+            .iter()
+            .map(|tile| tile.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["recovered-tile", "fresh-tile"]);
+        assert_eq!(event_store.ordered_events().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn immediate_regeneration_supersedes_event_recovered_under_same_lock() {
+        let root = tempdir().unwrap();
+        let data = root.path().join("data");
+        let vault = root.path().join("vault");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::create_dir(&vault).unwrap();
+        let event_store =
+            std::sync::Arc::new(crate::services::twin_events::TwinEventStore::new(&data));
+        event_store.initialize().unwrap();
+        let coordinator = std::sync::Arc::new(
+            crate::services::twin_events::MutationCoordinator::new(
+                &data,
+                &vault,
+                event_store.clone(),
+                std::sync::Arc::new(crate::services::twin_events::NoopMutationLifecycle),
+            )
+            .unwrap(),
+        );
+        let mut store = CanvasStore::with_event_recorder(data.join("canvas"), coordinator.clone());
+        let session = store
+            .create_session(SessionCreate {
+                title: "Regenerate after crash".into(),
+                description: None,
+                tags: Vec::new(),
+            })
+            .unwrap();
+        let mut tile = PromptTile {
+            id: "tile".into(),
+            prompt: "prompt".into(),
+            models: vec!["model".into()],
+            ..PromptTile::default()
+        };
+        tile.responses.insert(
+            "model".into(),
+            ModelResponse {
+                id: "stable-response".into(),
+                model_id: "model".into(),
+                model_name: "Model".into(),
+                status: ResponseStatus::Pending,
+                ..ModelResponse::default()
+            },
+        );
+        store.add_tile(&session.id, tile).unwrap();
+        coordinator.fail_once_at(crate::services::twin_events::MutationFaultPoint::AfterTarget(0));
+        assert!(store
+            .update_tile_response(
+                &session.id,
+                "tile",
+                "model",
+                "first completion",
+                ResponseStatus::Completed,
+                None,
+                None,
+            )
+            .is_err());
+        store
+            .update_tile_response(
+                &session.id,
+                "tile",
+                "model",
+                "regenerated completion",
+                ResponseStatus::Completed,
+                None,
+                None,
+            )
+            .unwrap();
+
+        let response_events = event_store
+            .ordered_events()
+            .unwrap()
+            .into_iter()
+            .filter(|event| {
+                matches!(
+                    event.payload,
+                    crate::models::twin_event::TwinEventPayload::CanvasResponseRecorded(_)
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(response_events.len(), 2);
+        assert_eq!(
+            response_events[1].supersedes,
+            vec![response_events[0].event_id.clone()]
+        );
+        assert_eq!(coordinator.pending_count().unwrap(), 0);
     }
 
     #[test]
@@ -1168,6 +1671,8 @@ mod tests {
                     content: "Z case".into(),
                     stance: None,
                     cost_usd: Some(0.02),
+                    provider: Some("openrouter".into()),
+                    provenance: Some("canvas_debate_openrouter".into()),
                 },
                 DebateResponse {
                     model_id: "model-a".into(),
@@ -1175,6 +1680,8 @@ mod tests {
                     content: "A case".into(),
                     stance: None,
                     cost_usd: Some(0.01),
+                    provider: Some("openrouter".into()),
+                    provenance: Some("canvas_debate_openrouter".into()),
                 },
             ],
             created_at: Utc::now(),

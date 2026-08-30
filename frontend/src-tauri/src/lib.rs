@@ -30,7 +30,7 @@ use services::{
 use std::sync::Arc;
 use std::time::Instant;
 use tauri::{Emitter, Manager};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 /// Application state holding all services
 #[derive(Clone)]
@@ -52,6 +52,7 @@ pub struct AppState {
     pub twin_store: Arc<RwLock<TwinStore>>,
     pub twin_event_store: Arc<TwinEventStore>,
     pub mutation_startup_error: Option<String>,
+    pub vault_transition: Arc<Mutex<()>>,
     /// MemoryService is stateless — no lock needed, just Arc for shared ownership
     pub memory_service: Arc<MemoryService>,
     pub boot_state: Arc<RwLock<BootStatus>>,
@@ -230,6 +231,7 @@ pub fn run() {
                 twin_store: Arc::new(RwLock::new(twin_store)),
                 twin_event_store,
                 mutation_startup_error,
+                vault_transition: Arc::new(Mutex::new(())),
                 memory_service: Arc::new(MemoryService::new()),
                 boot_state,
             };
@@ -681,7 +683,11 @@ mod tests {
         ]
         .concat();
         assert!(!desktop.contains(&desktop_noop));
-        assert!(settings.contains("twin_store.replace_root_path(new_twin_path)"));
+        let retarget = settings
+            .find("twin.replace_root_path(candidate_twin)")
+            .unwrap();
+        let publish = settings.find("settings.update(update)").unwrap();
+        assert!(retarget < publish);
         let settings_noop = ["TwinStore::", "new(new_twin_path)"].concat();
         assert!(!settings.contains(&settings_noop));
     }

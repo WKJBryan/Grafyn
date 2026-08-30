@@ -195,6 +195,8 @@ pub async fn start_debate(
                 let provider_route = provider_route.clone();
 
                 join_set.spawn(async move {
+                    let response_provider = provider_route.provider_label().to_string();
+                    let response_provenance = provider_route.provenance_label(true).to_string();
                     let stream_result = match provider_route {
                         ModelProviderRoute::Ollama => {
                             let ollama = ollama_arc.read().await;
@@ -270,6 +272,8 @@ pub async fn start_debate(
                                             content: full_content,
                                             stance: None,
                                             cost_usd: None,
+                                            provider: Some(response_provider.clone()),
+                                            provenance: Some(response_provenance.clone()),
                                         };
                                     }
                                     Ok(None) => break, // Stream ended naturally
@@ -290,6 +294,8 @@ pub async fn start_debate(
                                             content: full_content,
                                             stance: None,
                                             cost_usd: None,
+                                            provider: Some(response_provider.clone()),
+                                            provenance: Some(response_provenance.clone()),
                                         };
                                     }
                                 }
@@ -312,6 +318,8 @@ pub async fn start_debate(
                                 content: full_content,
                                 stance: None,
                                 cost_usd,
+                                provider: Some(response_provider.clone()),
+                                provenance: Some(response_provenance.clone()),
                             }
                         }
                         Err(e) => {
@@ -341,6 +349,8 @@ pub async fn start_debate(
                                 content: e.to_string(),
                                 stance: None,
                                 cost_usd: None,
+                                provider: Some(response_provider),
+                                provenance: Some(response_provenance),
                             }
                         }
                     }
@@ -533,6 +543,8 @@ pub async fn continue_debate(
             let provider_route = provider_route.clone();
 
             join_set.spawn(async move {
+                let response_provider = provider_route.provider_label().to_string();
+                let response_provenance = provider_route.provenance_label(true).to_string();
                 let stream_result = match provider_route {
                     ModelProviderRoute::Ollama => {
                         let ollama = ollama_arc.read().await;
@@ -607,6 +619,8 @@ pub async fn continue_debate(
                                         content: full_content,
                                         stance: None,
                                         cost_usd: None,
+                                        provider: Some(response_provider.clone()),
+                                        provenance: Some(response_provenance.clone()),
                                     };
                                 }
                                 Ok(None) => break, // Stream ended naturally
@@ -627,6 +641,8 @@ pub async fn continue_debate(
                                         content: full_content,
                                         stance: None,
                                         cost_usd: None,
+                                        provider: Some(response_provider.clone()),
+                                        provenance: Some(response_provenance.clone()),
                                     };
                                 }
                             }
@@ -649,6 +665,8 @@ pub async fn continue_debate(
                             content: full_content,
                             stance: None,
                             cost_usd,
+                            provider: Some(response_provider.clone()),
+                            provenance: Some(response_provenance.clone()),
                         }
                     }
                     Err(e) => {
@@ -678,6 +696,8 @@ pub async fn continue_debate(
                             content: e.to_string(),
                             cost_usd: None,
                             stance: None,
+                            provider: Some(response_provider),
+                            provenance: Some(response_provenance),
                         }
                     }
                 }

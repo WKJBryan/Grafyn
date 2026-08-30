@@ -124,41 +124,53 @@ impl TwinEventStore {
         if !state.initialized {
             return Err(StoreError::NotInitialized);
         }
-        event.validate().map_err(StoreError::Invalid)?;
-        event.normalize();
-        let bytes = serialize_record(&event)?;
         let lock = self.acquire_process_lock()?;
         state.events = self.load_records()?;
-
-        if let Some(existing) = state.events.get(&event.event_id) {
-            let result = if semantic_bytes(existing) == semantic_bytes(&event) {
-                Ok(AppendOutcome::Duplicate)
-            } else {
-                Err(StoreError::Collision(event.event_id.clone()))
-            };
+        let outcome = validate_candidate_append(&state.events, &mut event);
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                FileExt::unlock(&lock)?;
+                return Err(error);
+            }
+        };
+        if outcome == AppendOutcome::Duplicate {
             FileExt::unlock(&lock)?;
-            return result;
+            return Ok(outcome);
         }
-
-        let expected = derive_event_id(&event);
-        if event.event_id != expected {
-            FileExt::unlock(&lock)?;
-            return Err(StoreError::WrongEventId {
-                supplied: event.event_id,
-                expected,
-            });
-        }
-        validate_append_sequence(&state.events, &event)?;
-        let known = state
-            .events
-            .values()
-            .map(|known| (known.event_id.clone(), known.causal_stream))
-            .collect();
-        validate_event_references(&known, &event)?;
+        let bytes = serialize_record(&event)?;
         self.install_no_clobber(&event, &bytes)?;
         state.events.insert(event.event_id.clone(), event);
         FileExt::unlock(&lock)?;
-        Ok(AppendOutcome::Appended)
+        Ok(outcome)
+    }
+
+    pub fn preflight_append_group(&self, group: &[TwinEvent]) -> Result<(), StoreError> {
+        if group.is_empty() {
+            return Ok(());
+        }
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| StoreError::Invalid("Twin event store lock poisoned".into()))?;
+        if !state.initialized {
+            return Err(StoreError::NotInitialized);
+        }
+        let lock = self.acquire_process_lock()?;
+        state.events = self.load_records()?;
+        let result = (|| {
+            let mut simulated = state.events.clone();
+            for candidate in group {
+                let mut candidate = candidate.clone();
+                if validate_candidate_append(&simulated, &mut candidate)? == AppendOutcome::Appended
+                {
+                    simulated.insert(candidate.event_id.clone(), candidate);
+                }
+            }
+            Ok(())
+        })();
+        FileExt::unlock(&lock)?;
+        result
     }
 
     pub fn ordered_events(&self) -> Result<Vec<TwinEvent>, StoreError> {
@@ -585,6 +597,35 @@ fn sync_directory_impl(path: &Path, trusted_boundary: bool) -> Result<(), StoreE
     }
 }
 
+fn validate_candidate_append(
+    events: &BTreeMap<EventId, TwinEvent>,
+    event: &mut TwinEvent,
+) -> Result<AppendOutcome, StoreError> {
+    event.validate().map_err(StoreError::Invalid)?;
+    event.normalize();
+    if let Some(existing) = events.get(&event.event_id) {
+        return if semantic_bytes(existing) == semantic_bytes(event) {
+            Ok(AppendOutcome::Duplicate)
+        } else {
+            Err(StoreError::Collision(event.event_id.clone()))
+        };
+    }
+    let expected = derive_event_id(event);
+    if event.event_id != expected {
+        return Err(StoreError::WrongEventId {
+            supplied: event.event_id.clone(),
+            expected,
+        });
+    }
+    validate_append_sequence(events, event)?;
+    let known = events
+        .values()
+        .map(|known| (known.event_id.clone(), known.causal_stream))
+        .collect();
+    validate_event_references(&known, event)?;
+    Ok(AppendOutcome::Appended)
+}
+
 fn validate_append_sequence(
     events: &BTreeMap<EventId, TwinEvent>,
     event: &TwinEvent,
@@ -769,6 +810,22 @@ pub trait EventRecorder: Send + Sync {
         ))
     }
 
+    fn commit_planned_mutation(
+        &self,
+        _origin: crate::services::twin_events::MutationOrigin,
+        _planner: &mut dyn FnMut() -> Result<
+            Option<crate::services::twin_events::MutationPlan>,
+            crate::services::twin_events::MutationError,
+        >,
+    ) -> Result<
+        crate::services::twin_events::MutationCommit,
+        crate::services::twin_events::MutationError,
+    > {
+        Err(crate::services::twin_events::MutationError::Invalid(
+            "event recorder does not support locked mutation planning".into(),
+        ))
+    }
+
     fn recover_pending_mutations(
         &self,
     ) -> Result<usize, crate::services::twin_events::MutationError> {
@@ -830,6 +887,24 @@ impl EventRecorder for NoopEventRecorder {
         _vault_path: &std::path::Path,
     ) -> Result<(), crate::services::twin_events::MutationError> {
         Ok(())
+    }
+
+    fn commit_planned_mutation(
+        &self,
+        _origin: crate::services::twin_events::MutationOrigin,
+        planner: &mut dyn FnMut() -> Result<
+            Option<crate::services::twin_events::MutationPlan>,
+            crate::services::twin_events::MutationError,
+        >,
+    ) -> Result<
+        crate::services::twin_events::MutationCommit,
+        crate::services::twin_events::MutationError,
+    > {
+        let _ = planner()?;
+        Ok(crate::services::twin_events::MutationCommit {
+            mutation_id: None,
+            events: Vec::new(),
+        })
     }
 
     fn is_noop(&self) -> bool {
@@ -1428,6 +1503,7 @@ mod tests {
                 stakes: None,
                 initial_leaning: None,
                 review_date: None,
+                primitive_assessment: Default::default(),
             }),
         );
         event.event_id = crate::services::twin_events::derive_event_id(&event);

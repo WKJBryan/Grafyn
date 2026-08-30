@@ -133,6 +133,7 @@ pub fn all_payloads() -> Vec<TwinEventPayload> {
             stakes: Some(BoundedContent::parse("direction").unwrap()),
             initial_leaning: None,
             review_date: None,
+            primitive_assessment: PrimitiveDecisionAssessmentPayload::default(),
         }),
         TwinEventPayload::DecisionOutcomeRecorded(DecisionOutcomeRecorded {
             decision_id: id(),
@@ -145,6 +146,7 @@ pub fn all_payloads() -> Vec<TwinEventPayload> {
             regret_score: None,
             lesson: Some(BoundedContent::parse("iterate").unwrap()),
             missed_something: None,
+            primitive_assessment: None,
         }),
         TwinEventPayload::FeedbackRecorded(FeedbackRecorded {
             feedback_id: id(),

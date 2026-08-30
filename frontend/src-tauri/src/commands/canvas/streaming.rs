@@ -3,8 +3,8 @@ use super::shared::{
     append_canvas_trace, effective_model_ids, resolve_model_route, ModelProviderRoute,
 };
 use crate::models::canvas::{
-    AddModelsRequest, CanvasStreamEvent, ModelResponse, PromptRequest, PromptTile, PromptType,
-    ResponseStatus, TilePosition,
+    AddModelsRequest, CanvasStreamEvent, ContextMode, ModelResponse, PromptRequest, PromptTile,
+    PromptType, ResponseStatus, TilePosition, TwinAnswerMode,
 };
 use crate::models::twin::{
     DecisionEpisodeCreate, PrimitiveDecisionAssessment, ReflectionCardCreate, TraceEventType,
@@ -59,6 +59,14 @@ pub async fn send_prompt(
         )?
     };
     request.models = effective_model_ids(&model_route, &request.models);
+    let response_provider = model_route.provider.provider_label().to_string();
+    let response_provenance = if request.context_mode == ContextMode::Twin
+        && request.twin_answer_mode == TwinAnswerMode::Simulation
+    {
+        "twin_simulation".to_string()
+    } else {
+        model_route.provider.provenance_label(false).to_string()
+    };
     let session = {
         let mut store = state.canvas_store.write().await;
         store.get_session(&session_id).map_err(|e| e.to_string())?
@@ -90,6 +98,8 @@ pub async fn send_prompt(
                 error: None,
                 tokens_used: None,
                 cost_usd: None,
+                provider: Some(response_provider.clone()),
+                provenance: Some(response_provenance.clone()),
                 created_at: now,
                 position: TilePosition {
                     x: llm_start_x,
@@ -127,73 +137,80 @@ pub async fn send_prompt(
         reasoning_effort: request.reasoning_effort.clone(),
     };
 
-    // Save tile to session
-    {
-        let mut store = state.canvas_store.write().await;
-        store
-            .add_tile(&session_id, tile.clone())
-            .map_err(|e| e.to_string())?;
-    }
-
-    if let Some(decision_episode_id) = decision_episode_id.clone() {
+    let decision_create = decision_episode_id.clone().map(|decision_episode_id| {
         let decision_metadata = request.decision_metadata.clone().unwrap_or_default();
         let decision = if decision_metadata.decision.trim().is_empty() {
             request.prompt.clone()
         } else {
             decision_metadata.decision
         };
-        let mut twin_store = state.twin_store.write().await;
-        twin_store
-            .record_decision_episode(DecisionEpisodeCreate {
-                id: decision_episode_id,
-                session_id: session_id.clone(),
-                tile_id: tile_id.clone(),
-                decision,
-                options: decision_metadata.options,
-                stakes: decision_metadata.stakes,
-                initial_leaning: decision_metadata.initial_leaning,
-                review_date: decision_metadata.review_date,
-                primitive_assessment: PrimitiveDecisionAssessment::default(),
-                // Stamped on every decision episode — including non-Twin
-                // context tiles — so attribution survives a failed or absent
-                // hidden prediction call.
-                context_version: Some(
-                    resolved_context
-                        .context_version
-                        .clone()
-                        .unwrap_or_else(|| TWIN_CONTEXT_VERSION.to_string()),
-                ),
-            })
-            .map_err(|error| error.to_string())?;
+        DecisionEpisodeCreate {
+            id: decision_episode_id,
+            session_id: session_id.clone(),
+            tile_id: tile_id.clone(),
+            decision,
+            options: decision_metadata.options,
+            stakes: decision_metadata.stakes,
+            initial_leaning: decision_metadata.initial_leaning,
+            review_date: decision_metadata.review_date,
+            primitive_assessment: PrimitiveDecisionAssessment::default(),
+            // Stamped on every decision episode — including non-Twin
+            // context tiles — so attribution survives a failed or absent
+            // hidden prediction call.
+            context_version: Some(
+                resolved_context
+                    .context_version
+                    .clone()
+                    .unwrap_or_else(|| TWIN_CONTEXT_VERSION.to_string()),
+            ),
+        }
+    });
+
+    // A decision tile, its decision episode, and the decision trace are one
+    // coordinated mutation. Ordinary prompts use the same Canvas boundary.
+    {
+        let mut store = state.canvas_store.write().await;
+        if let Some(create) = decision_create {
+            let mut twin_store = state.twin_store.write().await;
+            store
+                .add_decision_tile(&session_id, tile.clone(), &mut twin_store, create)
+                .map_err(|error| error.to_string())?;
+        } else {
+            store
+                .add_tile(&session_id, tile.clone())
+                .map_err(|error| error.to_string())?;
+        }
     }
 
-    append_canvas_trace(
-        state.twin_store.clone(),
-        &session_id,
-        TraceEventType::PromptSubmitted,
-        json!({
-            "tile_id": tile.id.clone(),
-            "prompt_type": tile.prompt_type.clone(),
-            "decision_episode_id": tile.decision_episode_id.clone(),
-            "decision_metadata": tile.decision_metadata.clone(),
-            "prompt": tile.prompt.clone(),
-            "models": tile.models.clone(),
-            "context_mode": tile.context_mode.clone(),
-            "parent_tile_id": tile.parent_tile_id.clone(),
-            "parent_model_id": tile.parent_model_id.clone(),
-            "context_note_ids": tile.context_notes.iter().map(|note| note.id.clone()).collect::<Vec<_>>(),
-            "twin_answer_mode": tile.twin_answer_mode.clone(),
-            "approved_twin_record_ids": tile.approved_twin_records.iter().map(|record| record.id.clone()).collect::<Vec<_>>(),
-            "candidate_twin_record_ids": tile.candidate_twin_records.iter().map(|record| record.id.clone()).collect::<Vec<_>>(),
-            "constitution_item_ids": resolved_context.constitution_items.iter().map(|item| item.id.clone()).collect::<Vec<_>>(),
-            "action_gap_ids": resolved_context.action_gaps.iter().map(|gap| gap.id.clone()).collect::<Vec<_>>(),
-            "context_version": resolved_context.context_version.clone(),
-            "decision_case_ids": resolved_context.decision_case_ids.clone(),
-            "web_search": tile.web_search,
-            "web_search_max_results": tile.web_search_max_results,
-        }),
-    )
-    .await;
+    if decision_episode_id.is_none() {
+        append_canvas_trace(
+            state.twin_store.clone(),
+            &session_id,
+            TraceEventType::PromptSubmitted,
+            json!({
+                "tile_id": tile.id.clone(),
+                "prompt_type": tile.prompt_type.clone(),
+                "decision_episode_id": tile.decision_episode_id.clone(),
+                "decision_metadata": tile.decision_metadata.clone(),
+                "prompt": tile.prompt.clone(),
+                "models": tile.models.clone(),
+                "context_mode": tile.context_mode.clone(),
+                "parent_tile_id": tile.parent_tile_id.clone(),
+                "parent_model_id": tile.parent_model_id.clone(),
+                "context_note_ids": tile.context_notes.iter().map(|note| note.id.clone()).collect::<Vec<_>>(),
+                "twin_answer_mode": tile.twin_answer_mode.clone(),
+                "approved_twin_record_ids": tile.approved_twin_records.iter().map(|record| record.id.clone()).collect::<Vec<_>>(),
+                "candidate_twin_record_ids": tile.candidate_twin_records.iter().map(|record| record.id.clone()).collect::<Vec<_>>(),
+                "constitution_item_ids": resolved_context.constitution_items.iter().map(|item| item.id.clone()).collect::<Vec<_>>(),
+                "action_gap_ids": resolved_context.action_gaps.iter().map(|gap| gap.id.clone()).collect::<Vec<_>>(),
+                "context_version": resolved_context.context_version.clone(),
+                "decision_case_ids": resolved_context.decision_case_ids.clone(),
+                "web_search": tile.web_search,
+                "web_search_max_results": tile.web_search_max_results,
+            }),
+        )
+        .await;
+    }
 
     // Emit TileCreated event
     let _ = window.emit(
@@ -537,6 +554,14 @@ pub async fn add_models_to_tile(
         )?
     };
     let model_ids = effective_model_ids(&model_route, &request.model_ids);
+    let response_provider = model_route.provider.provider_label().to_string();
+    let response_provenance = if tile.context_mode == ContextMode::Twin
+        && tile.twin_answer_mode == TwinAnswerMode::Simulation
+    {
+        "twin_simulation".to_string()
+    } else {
+        model_route.provider.provenance_label(false).to_string()
+    };
     let prompt_request = prompt_request_from_tile(&tile, model_ids.clone(), 0.7);
     let resolved_context = resolve_prompt_context(state.inner(), &session, &prompt_request).await?;
 
@@ -565,6 +590,8 @@ pub async fn add_models_to_tile(
                     error: None,
                     tokens_used: None,
                     cost_usd: None,
+                    provider: Some(response_provider.clone()),
+                    provenance: Some(response_provenance.clone()),
                     created_at: now,
                     position: TilePosition {
                         x: llm_start_x,

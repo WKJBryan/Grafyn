@@ -17,6 +17,24 @@ pub(super) enum ModelProviderRoute {
     Ollama,
 }
 
+impl ModelProviderRoute {
+    pub(super) fn provider_label(&self) -> &'static str {
+        match self {
+            Self::OpenRouter => "openrouter",
+            Self::Ollama => "ollama",
+        }
+    }
+
+    pub(super) fn provenance_label(&self, debate: bool) -> &'static str {
+        match (self, debate) {
+            (Self::OpenRouter, false) => "canvas_openrouter",
+            (Self::Ollama, false) => "canvas_ollama",
+            (Self::OpenRouter, true) => "canvas_debate_openrouter",
+            (Self::Ollama, true) => "canvas_debate_ollama",
+        }
+    }
+}
+
 pub(super) fn resolve_model_route(
     prompt_type: &PromptType,
     context_mode: &ContextMode,

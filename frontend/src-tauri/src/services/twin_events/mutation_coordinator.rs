@@ -351,11 +351,36 @@ fn governance_is_sync_eligible(governance: &Governance) -> bool {
         && governance.allowed_uses.sync
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum MutationOrigin {
     Local,
     Remote,
     Recovery,
+}
+
+#[derive(Debug)]
+pub struct MutationPlan {
+    pub requested_stream: CausalStream,
+    pub source_channel: crate::models::twin_event::SourceChannel,
+    pub targets: Vec<crate::services::twin_events::TargetMutation>,
+    pub drafts: Vec<TwinEventDraft>,
+}
+
+impl MutationPlan {
+    pub fn new(
+        requested_stream: CausalStream,
+        source_channel: crate::models::twin_event::SourceChannel,
+        targets: Vec<crate::services::twin_events::TargetMutation>,
+        drafts: Vec<TwinEventDraft>,
+    ) -> Self {
+        Self {
+            requested_stream,
+            source_channel,
+            targets,
+            drafts,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -405,6 +430,18 @@ pub struct MutationCoordinator {
     lifecycle: Arc<dyn MutationLifecycle>,
     in_process: std::sync::Mutex<()>,
     fault_once: std::sync::Mutex<Option<MutationFaultPoint>>,
+    root_lease: std::sync::Mutex<ActiveMarkdownRootLeaseV1>,
+}
+
+const ACTIVE_ROOT_LEASE_SCHEMA_VERSION: u16 = 1;
+const ACTIVE_ROOT_LEASE_LIMIT: u64 = 4096;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ActiveMarkdownRootLeaseV1 {
+    schema_version: u16,
+    root_scope: crate::models::twin_event::ContentDigest,
+    epoch_uuid: String,
 }
 
 impl MutationCoordinator {
@@ -439,6 +476,10 @@ impl MutationCoordinator {
             }
             Err(error) => return Err(error.into()),
         }
+        let process_lock = finalizer.acquire_coordinator_lock()?;
+        let root_scope = markdown_root_scope_for(&vault_path)?;
+        let root_lease = load_or_create_active_root_lease(&data_path, root_scope)?;
+        FileExt::unlock(&process_lock)?;
         Ok(Self {
             data_path,
             vault_path: std::sync::Mutex::new(vault_path),
@@ -448,6 +489,7 @@ impl MutationCoordinator {
             lifecycle,
             in_process: std::sync::Mutex::new(()),
             fault_once: std::sync::Mutex::new(None),
+            root_lease: std::sync::Mutex::new(root_lease),
         })
     }
 
@@ -463,19 +505,58 @@ impl MutationCoordinator {
         targets: Vec<crate::services::twin_events::TargetMutation>,
         drafts: Vec<TwinEventDraft>,
     ) -> Result<MutationCommit, MutationError> {
+        let mut plan = Some(MutationPlan::new(
+            requested_stream,
+            source_channel,
+            targets,
+            drafts,
+        ));
+        self.commit_planned(MutationOrigin::Local, &mut || Ok(plan.take()))
+    }
+
+    pub fn commit_planned(
+        &self,
+        origin: MutationOrigin,
+        planner: &mut dyn FnMut() -> Result<Option<MutationPlan>, MutationError>,
+    ) -> Result<MutationCommit, MutationError> {
         let _in_process = self
             .in_process
             .lock()
             .map_err(|_| MutationError::Invalid("mutation coordinator lock poisoned".into()))?;
         let process_lock = self.finalizer.acquire_coordinator_lock()?;
+        if let Err(error) = self.verify_root_lease_locked() {
+            FileExt::unlock(&process_lock)?;
+            return Err(error);
+        }
         for (_, pending) in self.journal.load_pending()? {
             if let Err(error) = self.replay_intent_locked(&pending, false) {
                 FileExt::unlock(&process_lock)?;
                 return Err(error);
             }
         }
-        let prepared = match self.prepare_intent(requested_stream, source_channel, targets, drafts)
-        {
+        let Some(plan) = (match planner() {
+            Ok(plan) => plan,
+            Err(error) => {
+                FileExt::unlock(&process_lock)?;
+                if origin == MutationOrigin::Local {
+                    self.lifecycle.known_failure(None, &error.to_string());
+                }
+                return Err(error);
+            }
+        }) else {
+            FileExt::unlock(&process_lock)?;
+            return Ok(MutationCommit {
+                mutation_id: None,
+                events: Vec::new(),
+            });
+        };
+        let prepared = match self.prepare_intent(
+            origin,
+            plan.requested_stream,
+            plan.source_channel,
+            plan.targets,
+            plan.drafts,
+        ) {
             Ok(Some(intent)) => intent,
             Ok(None) => {
                 FileExt::unlock(&process_lock)?;
@@ -486,21 +567,28 @@ impl MutationCoordinator {
             }
             Err(error) => {
                 FileExt::unlock(&process_lock)?;
-                self.lifecycle.known_failure(None, &error.to_string());
+                if origin == MutationOrigin::Local {
+                    self.lifecycle.known_failure(None, &error.to_string());
+                }
                 return Err(error);
             }
         };
 
-        if let Err(error) = self.lifecycle.stage_before_local(&prepared) {
-            FileExt::unlock(&process_lock)?;
-            self.lifecycle
-                .known_failure(Some(prepared.mutation_id.as_str()), &error.to_string());
-            return Err(error);
+        let invoke_lifecycle = origin == MutationOrigin::Local && !prepared.events.is_empty();
+        if invoke_lifecycle {
+            if let Err(error) = self.lifecycle.stage_before_local(&prepared) {
+                FileExt::unlock(&process_lock)?;
+                self.lifecycle
+                    .known_failure(Some(prepared.mutation_id.as_str()), &error.to_string());
+                return Err(error);
+            }
         }
         if let Err(error) = self.journal.stage(&prepared) {
             FileExt::unlock(&process_lock)?;
-            self.lifecycle
-                .known_failure(Some(prepared.mutation_id.as_str()), &error.to_string());
+            if invoke_lifecycle {
+                self.lifecycle
+                    .known_failure(Some(prepared.mutation_id.as_str()), &error.to_string());
+            }
             return Err(error);
         }
         let committed = self
@@ -511,11 +599,15 @@ impl MutationCoordinator {
             return Err(error.into());
         }
         if let Err(error) = committed {
-            self.lifecycle
-                .known_failure(Some(prepared.mutation_id.as_str()), &error.to_string());
+            if invoke_lifecycle {
+                self.lifecycle
+                    .known_failure(Some(prepared.mutation_id.as_str()), &error.to_string());
+            }
             return Err(error);
         }
-        self.lifecycle.committed(&prepared)?;
+        if invoke_lifecycle {
+            self.lifecycle.committed(&prepared)?;
+        }
         Ok(MutationCommit {
             mutation_id: Some(prepared.mutation_id.clone()),
             events: prepared.events,
@@ -532,32 +624,19 @@ impl MutationCoordinator {
                 "local mutations must use commit_local".into(),
             ));
         }
-        let _in_process = self
-            .in_process
-            .lock()
-            .map_err(|_| MutationError::Invalid("mutation coordinator lock poisoned".into()))?;
-        let process_lock = self.finalizer.acquire_coordinator_lock()?;
-        let mut targets = targets;
-        targets.sort_by(|left, right| {
-            (left.kind, left.relative_key.as_str()).cmp(&(right.kind, right.relative_key.as_str()))
-        });
-        for target in targets.iter().filter(|target| {
-            !matches!(
-                target.after,
-                crate::services::twin_events::DesiredImage::Tombstone
-            )
-        }) {
-            self.apply_target_mutation(target)?;
-        }
-        for target in targets.iter().filter(|target| {
-            matches!(
-                target.after,
-                crate::services::twin_events::DesiredImage::Tombstone
-            )
-        }) {
-            self.apply_target_mutation(target)?;
-        }
-        FileExt::unlock(&process_lock)?;
+        let source = match origin {
+            MutationOrigin::Remote => "remote",
+            MutationOrigin::Recovery => "recovery",
+            MutationOrigin::Local => unreachable!(),
+        };
+        let mut plan = Some(MutationPlan::new(
+            CausalStream::LocalOnly,
+            crate::models::twin_event::SourceChannel::parse(source)
+                .map_err(MutationError::Invalid)?,
+            targets,
+            Vec::new(),
+        ));
+        self.commit_planned(origin, &mut || Ok(plan.take()))?;
         Ok(())
     }
 
@@ -567,6 +646,7 @@ impl MutationCoordinator {
             .lock()
             .map_err(|_| MutationError::Invalid("mutation coordinator lock poisoned".into()))?;
         let process_lock = self.finalizer.acquire_coordinator_lock()?;
+        self.verify_root_lease_locked()?;
         let pending = self.journal.load_pending()?;
         let mut recovered = 0usize;
         for (_, intent) in pending {
@@ -591,6 +671,7 @@ impl MutationCoordinator {
             .map_err(|_| MutationError::Invalid("mutation coordinator lock poisoned".into()))?;
         let process_lock = self.finalizer.acquire_coordinator_lock()?;
         let result = (|| -> Result<(), MutationError> {
+            self.verify_root_lease_locked()?;
             crate::services::twin_events::validate_real_directory(
                 vault_path,
                 "trusted Markdown vault root",
@@ -599,11 +680,20 @@ impl MutationCoordinator {
             for (_, pending) in self.journal.load_pending()? {
                 self.replay_intent_locked(&pending, false)?;
             }
+            let next_lease = ActiveMarkdownRootLeaseV1 {
+                schema_version: ACTIVE_ROOT_LEASE_SCHEMA_VERSION,
+                root_scope: markdown_root_scope_for(&new_root)?,
+                epoch_uuid: Uuid::new_v4().to_string(),
+            };
+            write_active_root_lease(&self.data_path, &next_lease)?;
             *self
                 .vault_path
                 .lock()
                 .map_err(|_| MutationError::Invalid("Markdown root lock poisoned".into()))? =
                 new_root;
+            *self.root_lease.lock().map_err(|_| {
+                MutationError::Invalid("Markdown root lease lock poisoned".into())
+            })? = next_lease;
             Ok(())
         })();
         FileExt::unlock(&process_lock)?;
@@ -616,6 +706,7 @@ impl MutationCoordinator {
 
     fn prepare_intent(
         &self,
+        origin: MutationOrigin,
         requested_stream: CausalStream,
         source_channel: crate::models::twin_event::SourceChannel,
         targets: Vec<crate::services::twin_events::TargetMutation>,
@@ -630,9 +721,16 @@ impl MutationCoordinator {
         targets.sort_by(|left, right| {
             (left.kind, left.relative_key.as_str()).cmp(&(right.kind, right.relative_key.as_str()))
         });
-        for pair in targets.windows(2) {
-            if pair[0].kind == pair[1].kind && pair[0].relative_key == pair[1].relative_key {
-                return Err(MutationError::Invalid("duplicate mutation target".into()));
+        let mut physical_keys = std::collections::BTreeSet::new();
+        for target in &targets {
+            let key = crate::services::twin_events::physical_target_key(
+                target.kind,
+                &target.relative_key,
+            )?;
+            if !physical_keys.insert(key) {
+                return Err(MutationError::Invalid(
+                    "duplicate or aliased mutation target".into(),
+                ));
             }
         }
         let mut prepared_targets = Vec::new();
@@ -655,6 +753,11 @@ impl MutationCoordinator {
         if prepared_targets.is_empty() {
             return Ok(None);
         }
+        if origin != MutationOrigin::Local && !drafts.is_empty() {
+            return Err(MutationError::Invalid(
+                "nonlocal mutations cannot generate local events".into(),
+            ));
+        }
         let drafts = drafts
             .into_iter()
             .map(|mut draft| {
@@ -662,8 +765,14 @@ impl MutationCoordinator {
                 draft
             })
             .collect::<Vec<_>>();
-        let events = self.finalizer.finalize_locked(requested_stream, &drafts)?;
-        let stream = events[0].causal_stream;
+        let events = if drafts.is_empty() {
+            Vec::new()
+        } else {
+            self.finalizer.finalize_locked(requested_stream, &drafts)?
+        };
+        let stream = events
+            .first()
+            .map_or(requested_stream, |event| event.causal_stream);
         let markdown_root_scope = if prepared_targets
             .iter()
             .any(|target| target.kind == crate::services::twin_events::TargetKind::Markdown)
@@ -675,6 +784,7 @@ impl MutationCoordinator {
         let mut intent = crate::services::twin_events::MutationIntentV1 {
             schema_version: 1,
             mutation_id: crate::services::twin_events::digest_bytes(b"placeholder"),
+            origin,
             actor_id: self.finalizer.actor_id(),
             device_id: self.finalizer.device_id(),
             causal_stream: stream,
@@ -686,6 +796,7 @@ impl MutationCoordinator {
         };
         intent.mutation_id = crate::services::twin_events::derive_mutation_id(&intent);
         intent.validate()?;
+        self.store.preflight_append_group(&intent.events)?;
         let serialized = serde_json::to_vec(&intent)
             .map_err(|error| MutationError::Invalid(error.to_string()))?;
         if serialized.len() > crate::services::twin_events::MAX_SERIALIZED_INTENT_BYTES {
@@ -702,6 +813,7 @@ impl MutationCoordinator {
         inject_faults: bool,
     ) -> Result<(), MutationError> {
         intent.validate()?;
+        self.store.preflight_append_group(&intent.events)?;
         if let Some(intent_scope) = &intent.markdown_root_scope {
             if &self.current_markdown_root_scope()? != intent_scope {
                 self.journal.quarantine_intent(intent)?;
@@ -837,20 +949,24 @@ impl MutationCoordinator {
     fn current_markdown_root_scope(
         &self,
     ) -> Result<crate::models::twin_event::ContentDigest, MutationError> {
-        let root = self.target_root(crate::services::twin_events::TargetKind::Markdown)?;
-        crate::services::twin_events::validate_real_directory(
-            &root,
-            "trusted Markdown vault root",
-        )?;
-        let canonical = fs::canonicalize(root)?;
-        let encoded = canonical.to_str().ok_or_else(|| {
-            MutationError::Invalid("Markdown vault root must be valid UTF-8".into())
-        })?;
-        let mut scoped = Vec::with_capacity(encoded.len() + 48);
-        scoped.extend_from_slice(b"grafyn.markdown_root_scope.v1");
-        scoped.extend_from_slice(&(encoded.len() as u64).to_be_bytes());
-        scoped.extend_from_slice(encoded.as_bytes());
-        Ok(crate::services::twin_events::digest_bytes(&scoped))
+        markdown_root_scope_for(
+            &self.target_root(crate::services::twin_events::TargetKind::Markdown)?,
+        )
+    }
+
+    fn verify_root_lease_locked(&self) -> Result<(), MutationError> {
+        let expected = self
+            .root_lease
+            .lock()
+            .map_err(|_| MutationError::Invalid("Markdown root lease lock poisoned".into()))?
+            .clone();
+        let durable = load_active_root_lease(&self.data_path)?;
+        if durable != expected || durable.root_scope != self.current_markdown_root_scope()? {
+            return Err(MutationError::RecoveryConflict(
+                "stale-markdown-root-lease".into(),
+            ));
+        }
+        Ok(())
     }
 
     fn resolve_target_path(
@@ -952,6 +1068,92 @@ impl MutationCoordinator {
     }
 }
 
+fn markdown_root_scope_for(
+    root: &Path,
+) -> Result<crate::models::twin_event::ContentDigest, MutationError> {
+    crate::services::twin_events::validate_real_directory(root, "trusted Markdown vault root")?;
+    let canonical = fs::canonicalize(root)?;
+    let encoded = canonical
+        .to_str()
+        .ok_or_else(|| MutationError::Invalid("Markdown vault root must be valid UTF-8".into()))?;
+    let mut scoped = Vec::with_capacity(encoded.len() + 48);
+    scoped.extend_from_slice(b"grafyn.markdown_root_scope.v1");
+    scoped.extend_from_slice(&(encoded.len() as u64).to_be_bytes());
+    scoped.extend_from_slice(encoded.as_bytes());
+    Ok(crate::services::twin_events::digest_bytes(&scoped))
+}
+
+fn active_root_lease_path(data_path: &Path) -> PathBuf {
+    data_path
+        .join("twin")
+        .join("events")
+        .join("active-markdown-root-v1.json")
+}
+
+fn load_or_create_active_root_lease(
+    data_path: &Path,
+    root_scope: crate::models::twin_event::ContentDigest,
+) -> Result<ActiveMarkdownRootLeaseV1, MutationError> {
+    let path = active_root_lease_path(data_path);
+    if path.exists() {
+        let lease = load_active_root_lease(data_path)?;
+        if lease.root_scope != root_scope {
+            return Err(MutationError::RecoveryConflict(
+                "configured-markdown-root-is-not-active".into(),
+            ));
+        }
+        return Ok(lease);
+    }
+    let lease = ActiveMarkdownRootLeaseV1 {
+        schema_version: ACTIVE_ROOT_LEASE_SCHEMA_VERSION,
+        root_scope,
+        epoch_uuid: Uuid::new_v4().to_string(),
+    };
+    write_active_root_lease(data_path, &lease)?;
+    Ok(lease)
+}
+
+fn load_active_root_lease(data_path: &Path) -> Result<ActiveMarkdownRootLeaseV1, MutationError> {
+    let path = active_root_lease_path(data_path);
+    crate::services::twin_events::validate_real_file(&path, "active Markdown root lease")?;
+    let metadata = fs::symlink_metadata(&path)?;
+    if metadata.len() > ACTIVE_ROOT_LEASE_LIMIT {
+        return Err(MutationError::Invalid(
+            "active Markdown root lease exceeds its size limit".into(),
+        ));
+    }
+    let lease: ActiveMarkdownRootLeaseV1 = serde_json::from_slice(&fs::read(path)?)
+        .map_err(|error| MutationError::Invalid(format!("invalid root lease: {error}")))?;
+    if lease.schema_version != ACTIVE_ROOT_LEASE_SCHEMA_VERSION
+        || Uuid::parse_str(&lease.epoch_uuid).is_err()
+    {
+        return Err(MutationError::Invalid(
+            "invalid active Markdown root lease".into(),
+        ));
+    }
+    Ok(lease)
+}
+
+fn write_active_root_lease(
+    data_path: &Path,
+    lease: &ActiveMarkdownRootLeaseV1,
+) -> Result<(), MutationError> {
+    let path = active_root_lease_path(data_path);
+    let parent = path
+        .parent()
+        .ok_or_else(|| MutationError::Invalid("active root lease has no parent".into()))?;
+    crate::services::twin_events::validate_real_directory(parent, "Twin events directory")?;
+    if path.exists() {
+        crate::services::twin_events::validate_real_file(&path, "active Markdown root lease")?;
+    }
+    let mut bytes = serde_json::to_vec_pretty(lease)
+        .map_err(|error| MutationError::Invalid(error.to_string()))?;
+    bytes.push(b'\n');
+    crate::services::atomic_io::write_atomic(&path, &bytes)?;
+    crate::services::twin_events::sync_directory(parent)?;
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TargetClassification {
     Before,
@@ -1003,6 +1205,14 @@ impl crate::services::twin_events::EventRecorder for MutationCoordinator {
                 })
             }
         }
+    }
+
+    fn commit_planned_mutation(
+        &self,
+        origin: MutationOrigin,
+        planner: &mut dyn FnMut() -> Result<Option<MutationPlan>, MutationError>,
+    ) -> Result<MutationCommit, MutationError> {
+        self.commit_planned(origin, planner)
     }
 
     fn recover_pending_mutations(&self) -> Result<usize, MutationError> {

@@ -477,6 +477,72 @@ fn looks_implementation_detailed(text: &str) -> bool {
     )
 }
 
+fn apply_user_record_update(
+    mut record: UserRecord,
+    update: &UserRecordUpdate,
+) -> Result<UserRecord> {
+    let before = serde_json::to_value(&record)?;
+    if let Some(content) = &update.content {
+        record.content = content.clone();
+    }
+    if let Some(confidence) = update.confidence {
+        record.confidence = confidence.clamp(0.0, 1.0);
+    }
+    if let Some(valid_from) = update.valid_from {
+        record.valid_from = Some(valid_from);
+    }
+    if let Some(valid_until) = update.valid_until {
+        record.valid_until = Some(valid_until);
+    }
+    if let Some(links) = &update.links {
+        record.links = links.clone();
+    }
+    if let Some(metadata) = &update.metadata {
+        record.metadata = metadata.clone();
+    }
+    if serde_json::to_value(&record)? != before {
+        record.updated_at = Utc::now();
+    }
+    Ok(record)
+}
+
+fn apply_record_promotion(
+    mut record: UserRecord,
+    promotion_state: PromotionState,
+    rationale: Option<&str>,
+) -> (UserRecord, &'static str) {
+    let previous_state = record.promotion_state.clone();
+    let now = Utc::now();
+    record.promotion_state = promotion_state.clone();
+    record.updated_at = now;
+    append_promotion_history(
+        &mut record.metadata,
+        &previous_state,
+        &promotion_state,
+        rationale,
+        false,
+    );
+    if promotion_state == PromotionState::Rejected {
+        record
+            .metadata
+            .insert("reverted_at".to_string(), json!(now));
+        record
+            .metadata
+            .insert("revert_reason".to_string(), json!(rationale));
+        record
+            .metadata
+            .insert("auto_promoted".to_string(), Value::Bool(false));
+    }
+    let action = match promotion_state {
+        PromotionState::Candidate | PromotionState::AutoPromoted => "candidate",
+        PromotionState::Endorsed => "endorse",
+        PromotionState::Rejected => "reject",
+        PromotionState::Private => "private",
+        PromotionState::NoTrain => "no_train",
+    };
+    (record, action)
+}
+
 impl TwinStore {
     fn record_capture_governance(record: &UserRecord) -> crate::models::twin_event::Governance {
         if record.promotion_state.effective() == PromotionState::Private {
@@ -529,6 +595,16 @@ impl TwinStore {
         action: &str,
         rationale: Option<&str>,
     ) -> Result<()> {
+        let draft = self.record_feedback_draft(record, action, rationale)?;
+        self.write_governed_json(&self.record_file_path(&record.id), record, vec![draft])
+    }
+
+    fn record_feedback_draft(
+        &self,
+        record: &UserRecord,
+        action: &str,
+        rationale: Option<&str>,
+    ) -> Result<crate::services::twin_events::TwinEventDraft> {
         let digest = Self::governed_json_digest(record)?;
         let feedback_seed = format!(
             "{}\0{}\0{}",
@@ -561,7 +637,7 @@ impl TwinStore {
                 .map_err(anyhow::Error::msg)?,
             digest: Some(digest),
         });
-        self.write_governed_json(&self.record_file_path(&record.id), record, vec![draft])
+        Ok(draft)
     }
 
     /// Read-time compatibility overlay for artifacts materialized from the
@@ -603,6 +679,15 @@ impl TwinStore {
     }
 
     pub fn create_user_record(&mut self, create: UserRecordCreate) -> Result<UserRecord> {
+        if create
+            .promotion_state
+            .as_ref()
+            .is_some_and(|state| state.effective() != PromotionState::Candidate)
+        {
+            return Err(anyhow::anyhow!(
+                "governance state must be changed through the explicit promotion action"
+            ));
+        }
         self.ensure_record_cache()?;
         let record = Self::materialize_user_record(create);
         let automatic = record.origin == RecordOrigin::Inferred;
@@ -637,39 +722,68 @@ impl TwinStore {
     }
 
     pub fn update_user_record(&mut self, id: &str, update: UserRecordUpdate) -> Result<UserRecord> {
-        self.ensure_record_cache()?;
-        let mut record = self.get_user_record(id)?;
-        let before = serde_json::to_value(&record)?;
-
-        if let Some(content) = update.content {
-            record.content = content;
+        if update.promotion_state.is_some() {
+            return Err(anyhow::anyhow!(
+                "governance state must be changed through the explicit promotion action"
+            ));
         }
-        if let Some(confidence) = update.confidence {
-            record.confidence = confidence.clamp(0.0, 1.0);
-        }
-        if let Some(promotion_state) = update.promotion_state {
-            record.promotion_state = promotion_state.effective();
-        }
-        if let Some(valid_from) = update.valid_from {
-            record.valid_from = Some(valid_from);
-        }
-        if let Some(valid_until) = update.valid_until {
-            record.valid_until = Some(valid_until);
-        }
-        if let Some(links) = update.links {
-            record.links = links;
-        }
-        if let Some(metadata) = update.metadata {
-            record.metadata = metadata;
-        }
-
-        if serde_json::to_value(&record)? == before {
+        Self::validate_file_id(id)?;
+        if self.event_recorder.is_noop() {
+            self.ensure_record_cache()?;
+            let record = apply_user_record_update(self.get_user_record(id)?, &update)?;
+            if record.updated_at != self.get_user_record(id)?.updated_at {
+                self.write_record_observation(&record, false, None)?;
+                self.record_cache.insert(record.id.clone(), record.clone());
+            }
             return Ok(record);
         }
-        record.updated_at = Utc::now();
-        self.write_record_observation(&record, false, None)?;
-        self.record_cache.insert(record.id.clone(), record.clone());
 
+        let recorder = self.event_recorder.clone();
+        let path = self.record_file_path(id);
+        let mut committed = None;
+        let mut planner = || {
+            let before = self.read_record_file(&path).map_err(|error| {
+                crate::services::twin_events::MutationError::Invalid(error.to_string())
+            })?;
+            let record = apply_user_record_update(before.clone(), &update).map_err(|error| {
+                crate::services::twin_events::MutationError::Invalid(error.to_string())
+            })?;
+            committed = Some(record.clone());
+            if record.updated_at == before.updated_at {
+                return Ok(None);
+            }
+            let draft = self
+                .record_observation_draft(&record, false, None)
+                .map_err(|error| {
+                    crate::services::twin_events::MutationError::Invalid(error.to_string())
+                })?;
+            let values = vec![(
+                path.clone(),
+                serde_json::to_string_pretty(&record).map_err(|error| {
+                    crate::services::twin_events::MutationError::Invalid(error.to_string())
+                })?,
+            )];
+            let targets = self.governed_json_targets(values).map_err(|error| {
+                crate::services::twin_events::MutationError::Invalid(error.to_string())
+            })?;
+            Ok(Some(crate::services::twin_events::MutationPlan::new(
+                crate::models::twin_event::CausalStream::SyncEligible,
+                crate::models::twin_event::SourceChannel::parse("legacy_twin")
+                    .map_err(crate::services::twin_events::MutationError::Invalid)?,
+                targets,
+                vec![draft],
+            )))
+        };
+        if let Err(error) = recorder.commit_planned_mutation(
+            crate::services::twin_events::MutationOrigin::Local,
+            &mut planner,
+        ) {
+            self.reload_record_cache()?;
+            return Err(anyhow::Error::new(error));
+        }
+        let record = committed.ok_or_else(|| anyhow::anyhow!("record update was not planned"))?;
+        self.record_cache.insert(record.id.clone(), record.clone());
+        self.records_cache_ready = true;
         Ok(record)
     }
 
@@ -899,45 +1013,61 @@ impl TwinStore {
         promotion_state: PromotionState,
         rationale: Option<String>,
     ) -> Result<UserRecord> {
-        self.ensure_record_cache()?;
-        let mut record = self.get_user_record(id)?;
-        let previous_state = record.promotion_state.clone();
-        let now = Utc::now();
-
+        Self::validate_file_id(id)?;
         let promotion_state = promotion_state.effective();
-        record.promotion_state = promotion_state.clone();
-        record.updated_at = now;
-
-        append_promotion_history(
-            &mut record.metadata,
-            &previous_state,
-            &promotion_state,
-            rationale.as_deref(),
-            false,
-        );
-
-        if promotion_state == PromotionState::Rejected {
-            record
-                .metadata
-                .insert("reverted_at".to_string(), json!(now));
-            record
-                .metadata
-                .insert("revert_reason".to_string(), json!(rationale));
-            record
-                .metadata
-                .insert("auto_promoted".to_string(), Value::Bool(false));
+        if self.event_recorder.is_noop() {
+            self.ensure_record_cache()?;
+            let (record, action) = apply_record_promotion(
+                self.get_user_record(id)?,
+                promotion_state,
+                rationale.as_deref(),
+            );
+            self.write_record_feedback(&record, action, rationale.as_deref())?;
+            self.record_cache.insert(record.id.clone(), record.clone());
+            return Ok(record);
         }
 
-        let action = match promotion_state {
-            PromotionState::Candidate | PromotionState::AutoPromoted => "candidate",
-            PromotionState::Endorsed => "endorse",
-            PromotionState::Rejected => "reject",
-            PromotionState::Private => "private",
-            PromotionState::NoTrain => "no_train",
+        let recorder = self.event_recorder.clone();
+        let path = self.record_file_path(id);
+        let mut committed = None;
+        let mut planner = || {
+            let before = self.read_record_file(&path).map_err(|error| {
+                crate::services::twin_events::MutationError::Invalid(error.to_string())
+            })?;
+            let (record, action) =
+                apply_record_promotion(before, promotion_state.clone(), rationale.as_deref());
+            let draft = self
+                .record_feedback_draft(&record, action, rationale.as_deref())
+                .map_err(|error| {
+                    crate::services::twin_events::MutationError::Invalid(error.to_string())
+                })?;
+            let content = serde_json::to_string_pretty(&record).map_err(|error| {
+                crate::services::twin_events::MutationError::Invalid(error.to_string())
+            })?;
+            let targets = self
+                .governed_json_targets(vec![(path.clone(), content)])
+                .map_err(|error| {
+                    crate::services::twin_events::MutationError::Invalid(error.to_string())
+                })?;
+            committed = Some(record);
+            Ok(Some(crate::services::twin_events::MutationPlan::new(
+                crate::models::twin_event::CausalStream::SyncEligible,
+                crate::models::twin_event::SourceChannel::parse("legacy_twin")
+                    .map_err(crate::services::twin_events::MutationError::Invalid)?,
+                targets,
+                vec![draft],
+            )))
         };
-        self.write_record_feedback(&record, action, rationale.as_deref())?;
+        if let Err(error) = recorder.commit_planned_mutation(
+            crate::services::twin_events::MutationOrigin::Local,
+            &mut planner,
+        ) {
+            self.reload_record_cache()?;
+            return Err(anyhow::Error::new(error));
+        }
+        let record = committed.ok_or_else(|| anyhow::anyhow!("promotion was not planned"))?;
         self.record_cache.insert(record.id.clone(), record.clone());
-
+        self.records_cache_ready = true;
         Ok(record)
     }
 
@@ -962,6 +1092,12 @@ impl TwinStore {
 
         self.records_cache_ready = true;
         Ok(())
+    }
+
+    fn reload_record_cache(&mut self) -> Result<()> {
+        self.record_cache.clear();
+        self.records_cache_ready = false;
+        self.ensure_record_cache()
     }
 
     pub(super) fn record_file_path(&self, record_id: &str) -> PathBuf {
@@ -995,6 +1131,7 @@ mod tests {
     ) -> (
         TwinStore,
         std::sync::Arc<crate::services::twin_events::TwinEventStore>,
+        std::sync::Arc<crate::services::twin_events::MutationCoordinator>,
     ) {
         let data = root.join("data");
         let vault = root.join("vault");
@@ -1013,8 +1150,9 @@ mod tests {
             .unwrap(),
         );
         (
-            TwinStore::with_event_recorder(twin_root, data.join("twin"), coordinator),
+            TwinStore::with_event_recorder(twin_root, data.join("twin"), coordinator.clone()),
             events,
+            coordinator,
         )
     }
 
@@ -1034,9 +1172,48 @@ mod tests {
     }
 
     #[test]
+    fn generic_record_mutations_cannot_change_governance_state() {
+        for state in [
+            PromotionState::Endorsed,
+            PromotionState::Private,
+            PromotionState::Rejected,
+            PromotionState::NoTrain,
+        ] {
+            let root = tempdir().unwrap();
+            let mut store = TwinStore::new(root.path().join("twin"));
+            let mut create = record_create(RecordOrigin::User);
+            create.promotion_state = Some(state.clone());
+            assert!(
+                store.create_user_record(create).is_err(),
+                "create {state:?}"
+            );
+
+            let record = store
+                .create_user_record(record_create(RecordOrigin::User))
+                .unwrap();
+            assert!(
+                store
+                    .update_user_record(
+                        &record.id,
+                        UserRecordUpdate {
+                            promotion_state: Some(state.clone()),
+                            ..Default::default()
+                        },
+                    )
+                    .is_err(),
+                "update {state:?}"
+            );
+            assert_eq!(
+                store.get_user_record(&record.id).unwrap().promotion_state,
+                PromotionState::Candidate
+            );
+        }
+    }
+
+    #[test]
     fn coordinated_legacy_record_mutations_emit_observations_and_explicit_feedback_only() {
         let root = tempdir().unwrap();
-        let (mut store, events) = coordinated_twin_store(root.path());
+        let (mut store, events, _) = coordinated_twin_store(root.path());
         let record = store
             .create_user_record(record_create(RecordOrigin::User))
             .unwrap();
@@ -1088,7 +1265,7 @@ mod tests {
     #[test]
     fn inferred_legacy_record_is_tagged_as_automatic_grafyn_observation() {
         let root = tempdir().unwrap();
-        let (mut store, events) = coordinated_twin_store(root.path());
+        let (mut store, events, _) = coordinated_twin_store(root.path());
         store
             .create_user_record(record_create(RecordOrigin::Inferred))
             .unwrap();
@@ -1113,6 +1290,38 @@ mod tests {
             .create_user_record(record_create(RecordOrigin::User))
             .is_err());
         assert!(store.list_user_records().unwrap().is_empty());
+    }
+
+    #[test]
+    fn interrupted_record_update_is_recovered_before_the_next_fresh_plan() {
+        let root = tempdir().unwrap();
+        let (mut store, events, coordinator) = coordinated_twin_store(root.path());
+        let record = store
+            .create_user_record(record_create(RecordOrigin::User))
+            .unwrap();
+        coordinator.fail_once_at(crate::services::twin_events::MutationFaultPoint::AfterTarget(0));
+        assert!(store
+            .update_user_record(
+                &record.id,
+                UserRecordUpdate {
+                    content: Some("Recovered field".into()),
+                    ..Default::default()
+                },
+            )
+            .is_err());
+
+        let updated = store
+            .update_user_record(
+                &record.id,
+                UserRecordUpdate {
+                    confidence: Some(0.55),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(updated.content, "Recovered field");
+        assert_eq!(updated.confidence, 0.55);
+        assert_eq!(events.ordered_events().unwrap().len(), 3);
     }
 
     #[test]
@@ -1167,13 +1376,7 @@ mod tests {
         assert_eq!(bundle.included_records, 0);
 
         store
-            .update_user_record(
-                &synthetic.id,
-                UserRecordUpdate {
-                    promotion_state: Some(PromotionState::Endorsed),
-                    ..UserRecordUpdate::default()
-                },
-            )
+            .set_user_record_promotion(&synthetic.id, PromotionState::Endorsed, None)
             .expect("synthetic record should update");
 
         let bundle = store
@@ -1375,20 +1578,23 @@ mod tests {
         let temp_dir = tempdir().expect("temp dir should be created");
         let mut store = TwinStore::new(temp_dir.path().to_path_buf());
 
-        store
+        let approved = store
             .create_user_record(UserRecordCreate {
                 kind: UserRecordKind::Preference,
                 content: "Prefers evidence-backed implementation detail.".to_string(),
                 origin: RecordOrigin::User,
                 evidence_refs: Vec::new(),
                 confidence: 0.9,
-                promotion_state: Some(PromotionState::Endorsed),
+                promotion_state: Some(PromotionState::Candidate),
                 valid_from: None,
                 valid_until: None,
                 links: Vec::new(),
                 metadata: HashMap::new(),
             })
             .expect("approved record should create");
+        store
+            .set_user_record_promotion(&approved.id, PromotionState::Endorsed, None)
+            .expect("approved record should be endorsed explicitly");
         let relevant_candidate = store
             .create_user_record(UserRecordCreate {
                 kind: UserRecordKind::ReasoningPattern,
@@ -1437,20 +1643,23 @@ mod tests {
             PromotionState::Private,
             PromotionState::NoTrain,
         ] {
-            store
+            let record = store
                 .create_user_record(UserRecordCreate {
                     kind: UserRecordKind::Preference,
                     content: format!("Excluded record for red-team decision: {:?}", state),
                     origin: RecordOrigin::User,
                     evidence_refs: Vec::new(),
                     confidence: 0.9,
-                    promotion_state: Some(state),
+                    promotion_state: Some(PromotionState::Candidate),
                     valid_from: None,
                     valid_until: None,
                     links: Vec::new(),
                     metadata: HashMap::new(),
                 })
                 .expect("record should create");
+            store
+                .set_user_record_promotion(&record.id, state, None)
+                .expect("record governance should change explicitly");
         }
 
         let (approved, candidates) = store
@@ -1535,13 +1744,16 @@ mod tests {
                 origin: RecordOrigin::User,
                 evidence_refs: Vec::new(),
                 confidence: 0.7,
-                promotion_state: Some(PromotionState::Endorsed),
+                promotion_state: Some(PromotionState::Candidate),
                 valid_from: None,
                 valid_until: None,
                 links: Vec::new(),
                 metadata: HashMap::new(),
             })
             .expect("old record should be created");
+        let old_record = store
+            .set_user_record_promotion(&old_record.id, PromotionState::Endorsed, None)
+            .expect("old record should be endorsed explicitly");
 
         let new_record = store
             .create_user_record(UserRecordCreate {
@@ -1550,7 +1762,7 @@ mod tests {
                 origin: RecordOrigin::User,
                 evidence_refs: Vec::new(),
                 confidence: 0.9,
-                promotion_state: Some(PromotionState::Endorsed),
+                promotion_state: Some(PromotionState::Candidate),
                 valid_from: None,
                 valid_until: None,
                 links: vec![RecordLink {
@@ -1560,6 +1772,9 @@ mod tests {
                 metadata: HashMap::new(),
             })
             .expect("new record should be created");
+        let new_record = store
+            .set_user_record_promotion(&new_record.id, PromotionState::Endorsed, None)
+            .expect("new record should be endorsed explicitly");
 
         let listed = store.list_user_records().expect("records should list");
         let old = listed
@@ -1577,20 +1792,23 @@ mod tests {
     }
 
     fn endorsed_record(store: &mut TwinStore, content: &str, confidence: f32) -> UserRecord {
-        store
+        let record = store
             .create_user_record(UserRecordCreate {
                 kind: UserRecordKind::Preference,
                 content: content.to_string(),
                 origin: RecordOrigin::User,
                 evidence_refs: Vec::new(),
                 confidence,
-                promotion_state: Some(PromotionState::Endorsed),
+                promotion_state: Some(PromotionState::Candidate),
                 valid_from: None,
                 valid_until: None,
                 links: Vec::new(),
                 metadata: HashMap::new(),
             })
-            .expect("record should be created")
+            .expect("record should be created");
+        store
+            .set_user_record_promotion(&record.id, PromotionState::Endorsed, None)
+            .expect("record should be endorsed explicitly")
     }
 
     #[test]

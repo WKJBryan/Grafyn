@@ -1266,6 +1266,7 @@ mod tests {
             stakes: None,
             initial_leaning: None,
             review_date: None,
+            primitive_assessment: PrimitiveDecisionAssessmentPayload::default(),
         });
         source.event_type = TwinEventType::DecisionRecorded;
         source.causal_stream = CausalStream::LocalOnly;
@@ -1285,6 +1286,7 @@ mod tests {
             stakes: None,
             initial_leaning: None,
             review_date: None,
+            primitive_assessment: PrimitiveDecisionAssessmentPayload::default(),
         });
         relationship_source.governance.sensitivity = Sensitivity::Standard;
         relationship_source.governance.allowed_uses.recall = true;
@@ -1686,6 +1688,7 @@ mod tests {
             stakes: None,
             initial_leaning: None,
             review_date: None,
+            primitive_assessment: PrimitiveDecisionAssessmentPayload::default(),
         });
         decision.event_type = TwinEventType::DecisionRecorded;
         decision.event_id = derive_event_id(&decision);

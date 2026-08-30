@@ -1,7 +1,7 @@
-use crate::models::canvas::{CanvasSession, PromptType, ResponseStatus};
+use crate::models::canvas::{CanvasSession, ResponseStatus};
 use crate::models::twin_event::{
-    ActorId, BoundedLabel, CanvasResponseRecorded, ConversationTurnRecorded, DecimalCost,
-    DecisionRecorded, ModelId, ProvenanceLabel,
+    ActorId, CanvasResponseRecorded, ConversationTurnRecorded, DecimalCost, ModelId,
+    ProvenanceLabel,
 };
 use crate::models::twin_event::{
     AllowedUses, AuthorityClass, BoundedContent, BoundedRole, ContentDigest, EvidenceRef,
@@ -236,55 +236,6 @@ pub fn canvas_transition_drafts(
         );
         prompt.evidence.push(session_evidence.clone());
         drafts.push(prompt);
-
-        if tile.prompt_type == PromptType::Decision {
-            let metadata = tile.decision_metadata.as_ref();
-            let decision = metadata
-                .map(|value| value.decision.as_str())
-                .filter(|value| !value.trim().is_empty())
-                .unwrap_or(&tile.prompt);
-            let decision_id = tile
-                .decision_episode_id
-                .as_deref()
-                .unwrap_or(tile.id.as_str());
-            let mut decision_draft = TwinEventDraft::observed(
-                TwinEventPayload::DecisionRecorded(DecisionRecorded {
-                    decision_id: Identifier::parse(decision_id)?,
-                    decision: BoundedContent::parse(decision)?,
-                    options: metadata
-                        .map(|value| &value.options)
-                        .into_iter()
-                        .flatten()
-                        .map(BoundedContent::parse)
-                        .collect::<Result<Vec<_>, _>>()?,
-                    stakes: metadata
-                        .and_then(|value| value.stakes.as_deref())
-                        .map(BoundedContent::parse)
-                        .transpose()?,
-                    initial_leaning: metadata
-                        .and_then(|value| value.initial_leaning.as_deref())
-                        .map(BoundedContent::parse)
-                        .transpose()?,
-                    review_date: metadata
-                        .and_then(|value| value.review_date.as_deref())
-                        .map(BoundedLabel::parse)
-                        .transpose()?,
-                }),
-                tile.created_at,
-                source.clone(),
-                governance.clone(),
-            );
-            decision_draft.evidence = vec![
-                session_evidence.clone(),
-                EvidenceRef {
-                    evidence_type: EvidenceType::Decision,
-                    source_id: Identifier::parse(decision_id)?,
-                    digest: None,
-                },
-            ];
-            decision_draft.evidence.sort();
-            drafts.push(decision_draft);
-        }
     }
 
     let mut completed = Vec::new();
@@ -318,6 +269,8 @@ pub fn canvas_transition_drafts(
             &tile.prompt,
             &response.content,
             &response.model_id,
+            response.provider.as_deref(),
+            response.provenance.as_deref(),
             response.tokens_used.map(u64::from),
             response.cost_usd,
             response.created_at,
@@ -410,6 +363,8 @@ pub fn canvas_transition_drafts(
             &round.topic,
             &response.content,
             &response.model_id,
+            response.provider.as_deref(),
+            response.provenance.as_deref(),
             None,
             response.cost_usd,
             round.created_at,
@@ -434,6 +389,8 @@ fn canvas_response_draft(
     prompt: &str,
     response: &str,
     model_id: &str,
+    provider: Option<&str>,
+    provenance: Option<&str>,
     tokens_used: Option<u64>,
     cost_usd: Option<f64>,
     observed_at: DateTime<Utc>,
@@ -452,8 +409,8 @@ fn canvas_response_draft(
             prompt: BoundedContent::parse(prompt)?,
             response: BoundedContent::parse(response)?,
             model_id: ModelId::parse(model_id)?,
-            provider: None,
-            provenance: None,
+            provider: provider.map(Identifier::parse).transpose()?,
+            provenance: provenance.map(ProvenanceLabel::parse).transpose()?,
             tokens_used,
             cost_usd_decimal,
             prompt_digest: Some(crate::services::twin_events::digest_bytes(
@@ -551,6 +508,8 @@ mod tests {
             status,
             tokens_used: Some(21),
             cost_usd: Some(0.0125),
+            provider: Some("openrouter".to_string()),
+            provenance: Some("canvas_openrouter".to_string()),
             created_at: at(),
             ..ModelResponse::default()
         }
@@ -723,8 +682,11 @@ mod tests {
         );
         for (draft, response) in response_drafts.iter().zip(responses) {
             assert_eq!(draft.actor_id.as_ref().unwrap().as_str(), "model");
-            assert_eq!(response.provider, None);
-            assert_eq!(response.provenance, None);
+            assert_eq!(response.provider.as_ref().unwrap().as_str(), "openrouter");
+            assert_eq!(
+                response.provenance.as_ref().unwrap().as_str(),
+                "canvas_openrouter"
+            );
             assert_eq!(response.tokens_used, Some(21));
             assert_eq!(
                 response.cost_usd_decimal.as_ref().unwrap().as_str(),
@@ -830,6 +792,8 @@ mod tests {
                 content: "Second".to_string(),
                 stance: None,
                 cost_usd: Some(0.02),
+                provider: Some("openrouter".into()),
+                provenance: Some("canvas_debate_openrouter".into()),
             },
             DebateResponse {
                 model_id: "model-a".to_string(),
@@ -837,6 +801,8 @@ mod tests {
                 content: "First".to_string(),
                 stance: None,
                 cost_usd: None,
+                provider: Some("ollama".into()),
+                provenance: Some("canvas_debate_ollama".into()),
             },
         ];
 

@@ -20,6 +20,13 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
+type DecisionEpisodeMutationPlan = (
+    DecisionEpisode,
+    SessionTrace,
+    Vec<(PathBuf, String)>,
+    Vec<crate::services::twin_events::TwinEventDraft>,
+);
+
 fn clamp_decision_mirror_weights(mut weights: DecisionMirrorWeights) -> DecisionMirrorWeights {
     weights.notes_weight = clamp_weight(weights.notes_weight);
     weights.approved_records_weight = clamp_weight(weights.approved_records_weight);
@@ -526,6 +533,16 @@ impl TwinStore {
         &mut self,
         create: DecisionEpisodeCreate,
     ) -> Result<DecisionEpisode> {
+        let (episode, trace, values, drafts) = self.plan_decision_episode_mutation(create)?;
+        self.commit_governed_json_targets(values, drafts)?;
+        self.cache_committed_trace(trace);
+        Ok(episode)
+    }
+
+    pub(crate) fn plan_decision_episode_mutation(
+        &self,
+        create: DecisionEpisodeCreate,
+    ) -> Result<DecisionEpisodeMutationPlan> {
         Self::validate_file_id(&create.id)?;
         Self::validate_file_id(&create.session_id)?;
         Self::validate_file_id(&create.tile_id)?;
@@ -597,6 +614,11 @@ impl TwinStore {
                         .map(crate::models::twin_event::BoundedLabel::parse)
                         .transpose()
                         .map_err(anyhow::Error::msg)?,
+                    primitive_assessment:
+                        crate::models::twin_event::PrimitiveDecisionAssessmentPayload::from_legacy(
+                            &episode.primitive_assessment,
+                        )
+                        .map_err(anyhow::Error::msg)?,
                 },
             ),
             episode.updated_at,
@@ -624,20 +646,15 @@ impl TwinStore {
                 "primitive_assessment": episode.primitive_assessment,
             }),
         )?;
-        let trace_target = self.serialized_trace_target(&trace)?;
-        self.commit_governed_json_targets(
-            vec![
-                (
-                    self.decision_file_path(&episode.id),
-                    serde_json::to_string_pretty(&episode)?,
-                ),
-                trace_target,
-            ],
-            vec![draft],
-        )?;
-        self.cache_committed_trace(trace);
+        let values = vec![
+            (
+                self.decision_file_path(&episode.id),
+                serde_json::to_string_pretty(&episode)?,
+            ),
+            self.serialized_trace_target(&trace)?,
+        ];
 
-        Ok(episode)
+        Ok((episode, trace, values, vec![draft]))
     }
 
     pub fn list_decision_episodes(&self) -> Result<Vec<DecisionEpisode>> {
@@ -755,6 +772,7 @@ impl TwinStore {
         let explicit_regret = update.regret_score;
         let explicit_lesson = update.lesson.clone();
         let explicit_missed = update.missed_something.clone();
+        let explicit_primitive = update.primitive_assessment.clone();
 
         if let Some(selected_response) = update.selected_response {
             episode.selected_response = Some(selected_response);
@@ -828,6 +846,7 @@ impl TwinStore {
                 && explicit_regret.is_none()
                 && explicit_lesson.is_none()
                 && explicit_missed.is_none()
+                && explicit_primitive.is_none()
             {
                 anyhow::bail!("decision outcome mutation has no governed follow-up field");
             }
@@ -870,6 +889,13 @@ impl TwinStore {
                     missed_something: explicit_missed
                         .as_deref()
                         .map(crate::models::twin_event::BoundedContent::parse)
+                        .transpose()
+                        .map_err(anyhow::Error::msg)?,
+                    primitive_assessment: explicit_primitive
+                        .as_ref()
+                        .map(
+                            crate::models::twin_event::PrimitiveDecisionAssessmentPayload::from_legacy,
+                        )
                         .transpose()
                         .map_err(anyhow::Error::msg)?,
                 },
