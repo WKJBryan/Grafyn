@@ -22,52 +22,55 @@ pub(super) async fn fail_requested_prediction_if_same_root(
     request_root: &VaultAuthorityTokenV1,
     reason: &str,
 ) {
-    for _ in 0..2 {
-        let current = match crate::commands::capture_root_epoch(root_state) {
-            Ok(current) => current,
-            Err(error) => {
-                log::warn!(
-                    "Could not terminalize sealed prediction {episode_id} after {reason}: {error}"
-                );
-                return;
-            }
-        };
-        if !is_same_prediction_root(request_root, &current) {
+    let root_guard = match crate::commands::acquire_root_epoch(root_state).await {
+        Ok(guard) => guard,
+        Err(error) => {
             log::warn!(
-                "Sealed prediction {episode_id} remains in its former vault after root transition"
+                "Could not terminalize sealed prediction {episode_id} after {reason}: {error}"
             );
             return;
         }
-        let root_guard =
-            match crate::commands::acquire_expected_root_epoch(root_state, &current).await {
-                Ok(guard) => guard,
-                Err(_) => continue,
-            };
-        let commit = {
-            let mut store = twin_store.write().await;
-            store.mark_twin_prediction_failed_expecting_authority(episode_id, current.clone())
-        };
-        drop(root_guard);
-        match commit {
-            Ok(commit) => {
-                let _ = crate::commands::repair_after_authority_mutation(
+    };
+    if !is_same_prediction_root(request_root, root_guard.authority()) {
+        log::warn!(
+            "Sealed prediction {episode_id} remains in its former vault after root transition"
+        );
+        return;
+    }
+
+    let commit = {
+        let mut store = twin_store.write().await;
+        store.mark_twin_prediction_failed_with_commit(episode_id)
+    };
+    drop(root_guard);
+    match commit {
+        Ok(commit) => {
+            crate::commands::acknowledge_reported_repair(
+                crate::commands::repair_after_authority_mutation(
                     root_state,
                     &commit,
                     "sealed prediction failure",
                 )
-                .await;
-                return;
-            }
-            Err(error) if error.to_string().contains("authority") => continue,
-            Err(error) => {
-                log::warn!(
-                    "Failed to terminalize sealed prediction {episode_id} after {reason}: {error}"
+                .await,
+            );
+        }
+        Err(error) => {
+            let repair_commit = error
+                .downcast_ref::<crate::services::twin_events::MutationError>()
+                .and_then(|error| error.authority_advanced_commit());
+            if let Some(commit) = repair_commit {
+                crate::commands::acknowledge_reported_repair(
+                    crate::commands::repair_after_authority_mutation(
+                        root_state,
+                        &commit,
+                        "aborted sealed prediction failure",
+                    )
+                    .await,
                 );
-                return;
             }
+            log::warn!(
+                "Failed to terminalize sealed prediction {episode_id} after {reason}: {error}"
+            );
         }
     }
-    log::warn!(
-        "Could not terminalize sealed prediction {episode_id} after {reason}: authority kept changing"
-    );
 }

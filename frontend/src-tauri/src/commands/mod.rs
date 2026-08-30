@@ -200,7 +200,6 @@ mod root_epoch_source_guards {
                 include_str!("migration.rs"),
                 &[
                     "preview_markdown_migration",
-                    "get_markdown_migration_status",
                     "get_vault_optimizer_status",
                     "list_vault_optimizer_decisions",
                     "get_vault_optimizer_inbox",
@@ -216,7 +215,6 @@ mod root_epoch_source_guards {
                     "get_session_trace",
                     "get_twin_review",
                     "resolve_user_record_evidence",
-                    "export_twin_data",
                     "list_decision_episodes",
                     "get_decision_mirror_config",
                     "list_constitution_items",
@@ -239,6 +237,13 @@ mod root_epoch_source_guards {
                 );
             }
         }
+
+        let migration = include_str!("migration.rs");
+        let status = tauri_command_body(migration, "get_markdown_migration_status");
+        assert!(status.contains("acquire_root_epoch"));
+        assert!(status.contains("status_scoped"));
+        assert!(status.contains("authority()"));
+        assert!(!status.contains("acquire_derived_root_epoch"));
     }
 
     #[test]
@@ -492,26 +497,30 @@ mod root_epoch_source_guards {
         for required in [
             "create_note_expecting_authority",
             "update_note_expecting_authority",
-            ".authority_token",
-            "validate_authority_token(&root_epoch",
+            "complete_distill_note_mutation",
+            "latest_commit.as_ref()",
+            "repair_after_authority_mutation",
         ] {
             assert!(
                 distill.contains(required),
                 "distillation must chain governed note mutations via {required}"
             );
         }
+        assert!(!distill.contains("validate_authority_token(&root_epoch"));
 
         let links = include_str!("zettelkasten.rs");
         for required in [
             "update_note_expecting_authority",
-            ".authority_token",
-            "validate_authority_token(&root_epoch",
+            "complete_link_note_mutation",
+            "latest_commit.as_ref()",
+            "repair_after_authority_mutation",
         ] {
             assert!(
                 links.contains(required),
                 "link application must chain governed note mutations via {required}"
             );
         }
+        assert!(!links.contains("validate_authority_token(&root_epoch"));
 
         assert!(
             streaming.contains("sealed_epoch_receiver.await")
@@ -530,27 +539,40 @@ mod root_epoch_source_guards {
         );
         let normalize = warm_start.find("sync_topic_hubs(state)").unwrap();
         let capture = warm_start.find("capture_authority_token").unwrap();
-        let knowledge = warm_start.find("reload_authoritative_state").unwrap();
-        let twin = warm_start.find("rebuild_mutation_caches").unwrap();
-        let derive = warm_start.find("graph.build_from_notes").unwrap();
-        let publish = warm_start.find("publish_namespace_ready").unwrap();
-        assert!(normalize < capture && capture < knowledge && knowledge < twin);
-        assert!(twin < derive && derive < publish);
+        let rebuild = warm_start
+            .find("rebuild_authority_with_retained_guard")
+            .unwrap();
+        assert!(normalize < capture && capture < rebuild);
 
         let commands = include_str!("mod.rs");
-        let repair_start = commands
-            .rfind("pub(crate) async fn rebuild_and_publish_current_authority")
-            .unwrap();
-        let repair = &commands[repair_start..];
-        let repair = &repair[..repair.find("#[derive(Debug)]").unwrap()];
-        let normalize = repair.find("sync_topic_hubs(state)").unwrap();
-        let capture = repair.find("current_authority_token").unwrap();
-        let knowledge = repair.find("reload_authoritative_state").unwrap();
-        let twin = repair.find("rebuild_mutation_caches").unwrap();
-        let derive = repair.find("search.reindex_all").unwrap();
-        let publish = repair.find("publish_namespace_ready").unwrap();
-        assert!(normalize < capture && capture < knowledge && knowledge < twin);
+        let rebuild = function_body(
+            &commands[commands
+                .rfind("pub(crate) fn rebuild_authority_with_retained_guard")
+                .expect("shared rebuild helper should exist")..],
+            "pub(crate) fn rebuild_authority_with_retained_guard",
+            "async fn rebuild_and_publish_current_authority_inner",
+        );
+        let capture = rebuild.find("capture_authority_token").unwrap();
+        let knowledge = rebuild.find("reload_authoritative_state").unwrap();
+        let twin = rebuild.find("rebuild_mutation_caches").unwrap();
+        let derive = rebuild.find(".search").unwrap();
+        let publish = rebuild.find("publish_namespace_ready").unwrap();
+        assert!(capture < knowledge && knowledge < twin);
         assert!(twin < derive && derive < publish);
+
+        let repair = function_body(
+            &commands[commands
+                .rfind("async fn rebuild_and_publish_current_authority_inner")
+                .expect("repair coordinator should exist")..],
+            "async fn rebuild_and_publish_current_authority_inner",
+            "pub(crate) async fn rebuild_and_publish_current_authority",
+        );
+        let normalize = repair.find("normalize_topic_hubs_only").unwrap();
+        let guard = repair.find("begin_root_transition").unwrap();
+        let rebuild = repair
+            .find("rebuild_authority_with_retained_guard")
+            .unwrap();
+        assert!(normalize < guard && guard < rebuild);
 
         let settings = include_str!("settings.rs");
         for capture in settings.match_indices("capture_authority_token") {
@@ -770,13 +792,91 @@ pub(crate) async fn remove_link_discovery_note(
 
 async fn normalize_topic_hubs_only(
     state: &AppState,
-) -> Result<crate::services::topic_hub::TopicHubSyncResult, String> {
+    expected: crate::services::vault_namespace::VaultAuthorityTokenV1,
+) -> anyhow::Result<crate::services::topic_hub::TopicHubSyncResult> {
     let mut store = state.knowledge_store.write().await;
-    crate::services::topic_hub::sync_topic_hubs(&mut store).map_err(|error| error.to_string())
+    crate::services::topic_hub::sync_topic_hubs_expecting_authority(&mut store, expected)
 }
 
-pub(crate) async fn sync_topic_hubs(state: &AppState) -> Result<Vec<Note>, String> {
-    let sync_result = normalize_topic_hubs_only(state).await?;
+#[derive(Debug)]
+pub(crate) struct TopicHubCommandSync {
+    pub notes: Vec<Note>,
+    pub latest_commit: Option<crate::services::twin_events::MutationCommit>,
+    pub continuation_authority: crate::services::vault_namespace::VaultAuthorityTokenV1,
+}
+
+pub(crate) async fn sync_topic_hubs_at_authority(
+    state: &AppState,
+    expected: crate::services::vault_namespace::VaultAuthorityTokenV1,
+) -> Result<TopicHubCommandSync, String> {
+    let normalization = normalize_topic_hubs_only(state, expected.clone()).await;
+    let (sync_result, latest_commit, continuation_authority) = match normalization {
+        Ok(mut sync_result) => match sync_result.latest_commit.take() {
+            Some(commit) => {
+                let repair =
+                    repair_after_authority_mutation(state, &commit, "topic hub normalization")
+                        .await;
+                let continuation_authority = match repair {
+                    PostAuthorityRepair::Ready(authority) => authority,
+                    PostAuthorityRepair::NotRequired | PostAuthorityRepair::Unavailable(_) => {
+                        return Err(
+                            "topic hub normalization committed and recovery is pending; do not retry"
+                                .to_string(),
+                        );
+                    }
+                };
+                sync_result.all_notes = {
+                    let mut store = state.knowledge_store.write().await;
+                    store.reload_authoritative_state();
+                    store.list_full_notes().map_err(|error| error.to_string())?
+                };
+                (sync_result, Some(commit), continuation_authority)
+            }
+            None => (sync_result, None, expected),
+        },
+        Err(error) => {
+            if let Some(commit) = crate::services::topic_hub::topic_hub_partial_commit(&error) {
+                let repair =
+                    repair_after_authority_mutation(state, &commit, "topic hub normalization")
+                        .await;
+                return Err(match repair {
+                    PostAuthorityRepair::Ready(_) => format!(
+                        "topic hub normalization partially committed before a later failure: {error}; do not retry automatically"
+                    ),
+                    PostAuthorityRepair::NotRequired | PostAuthorityRepair::Unavailable(_) => {
+                        format!(
+                            "topic hub normalization partially committed and recovery is pending after a later failure: {error}; do not retry"
+                        )
+                    }
+                });
+            }
+            let (outcome, continuation_authority) =
+                finish_knowledge_authority_error(state, &error, "topic hub normalization").await?;
+            let all_notes = {
+                let mut store = state.knowledge_store.write().await;
+                store.reload_authoritative_state();
+                store.list_full_notes().map_err(|error| error.to_string())?
+            };
+            (
+                crate::services::topic_hub::TopicHubSyncResult {
+                    all_notes,
+                    changed_note_ids: Vec::new(),
+                    removed_note_ids: Vec::new(),
+                    latest_commit: None,
+                },
+                Some(outcome.commit),
+                continuation_authority,
+            )
+        }
+    };
+
+    if latest_commit.is_some() {
+        return Ok(TopicHubCommandSync {
+            notes: sync_result.all_notes,
+            latest_commit,
+            continuation_authority,
+        });
+    }
 
     let changed_ids = sync_result
         .changed_note_ids
@@ -834,11 +934,26 @@ pub(crate) async fn sync_topic_hubs(state: &AppState) -> Result<Vec<Note>, Strin
     rebuild_link_discovery(state, &sync_result.all_notes).await?;
     bootstrap_vault_optimizer(state, &sync_result.all_notes).await?;
 
-    Ok(sync_result.all_notes)
+    Ok(TopicHubCommandSync {
+        notes: sync_result.all_notes,
+        latest_commit,
+        continuation_authority,
+    })
 }
 
-pub(crate) async fn rebuild_all_indexes(state: &AppState) -> Result<Vec<Note>, String> {
-    let notes = sync_topic_hubs(state).await?;
+pub(crate) async fn sync_topic_hubs(state: &AppState) -> Result<Vec<Note>, String> {
+    let expected = capture_root_epoch(state)?;
+    sync_topic_hubs_at_authority(state, expected)
+        .await
+        .map(|result| result.notes)
+}
+
+pub(crate) async fn rebuild_all_indexes(
+    state: &AppState,
+    expected: crate::services::vault_namespace::VaultAuthorityTokenV1,
+) -> Result<TopicHubCommandSync, String> {
+    let sync = sync_topic_hubs_at_authority(state, expected).await?;
+    let notes = &sync.notes;
 
     {
         let mut search = state.search_service.write().await;
@@ -860,7 +975,7 @@ pub(crate) async fn rebuild_all_indexes(state: &AppState) -> Result<Vec<Note>, S
     }
 
     bootstrap_vault_optimizer(state, &notes).await?;
-    Ok(notes)
+    Ok(sync)
 }
 
 /// Rebuild every derived reader against one exact authority generation and
@@ -1018,6 +1133,7 @@ pub(crate) fn rebuild_authority_with_retained_guard(
 async fn rebuild_and_publish_current_authority_inner(
     state: &AppState,
     expected: &crate::services::vault_namespace::VaultAuthorityTokenV1,
+    normalize_hubs: bool,
     mut checkpoint: impl FnMut(AuthorityRepairStep) -> Result<(), String>,
 ) -> Result<crate::services::vault_namespace::VaultAuthorityTokenV1, String> {
     let _repair = state.authority_repair.lock().await;
@@ -1040,20 +1156,96 @@ async fn rebuild_and_publish_current_authority_inner(
     coordinator
         .recover_pending()
         .map_err(|error| error.to_string())?;
-    normalize_topic_hubs_only(state).await?;
+    // Replay can create, replace, rename, or delete note files after the
+    // KnowledgeStore last refreshed its indexes. Normalization reads through
+    // those indexes, so refresh the authoritative cache before it observes the
+    // recovered target set.
+    state
+        .knowledge_store
+        .write()
+        .await
+        .reload_authoritative_state();
+    let mut rebuild_expected = expected.clone();
+    if normalize_hubs {
+        for attempt in 0..2 {
+            match normalize_topic_hubs_only(state, rebuild_expected.clone()).await {
+                Ok(mut result) => {
+                    if let Some(commit) = result.latest_commit.take() {
+                        rebuild_expected = commit.authority_token.ok_or_else(|| {
+                            "topic hub normalization lost its authority token".to_string()
+                        })?;
+                    }
+                    break;
+                }
+                Err(error) => {
+                    if let Some(commit) =
+                        crate::services::topic_hub::topic_hub_partial_commit(&error)
+                    {
+                        rebuild_expected = commit.authority_token.ok_or_else(|| {
+                            "topic hub normalization lost its partial authority token".to_string()
+                        })?;
+                        state
+                            .knowledge_store
+                            .write()
+                            .await
+                            .reload_authoritative_state();
+                        if attempt == 1 {
+                            return Err(format!(
+                                "topic hub normalization partially committed and could not converge: {error}"
+                            ));
+                        }
+                        continue;
+                    }
+                    let outcome =
+                        crate::services::knowledge_store::knowledge_authority_advanced_outcome(
+                            &error,
+                        )
+                        .ok_or_else(|| error.to_string())?;
+                    rebuild_expected = outcome.commit.authority_token.clone().ok_or_else(|| {
+                        "topic hub normalization lost its recovery authority token".to_string()
+                    })?;
+                    coordinator
+                        .recover_pending()
+                        .map_err(|recovery_error| recovery_error.to_string())?;
+                    state
+                        .knowledge_store
+                        .write()
+                        .await
+                        .reload_authoritative_state();
+                    if outcome.target_aborted {
+                        return Err(
+                            "topic hub normalization target was not applied after authority changed"
+                                .to_string(),
+                        );
+                    }
+                    if attempt == 1 {
+                        return Err(
+                            "topic hub normalization committed and recovery remains pending"
+                                .to_string(),
+                        );
+                    }
+                }
+            }
+        }
+    }
     checkpoint(AuthorityRepairStep::Normalized)?;
     let mut guards = acquire_authority_repair_guards(state).await?;
     let process_guard = coordinator
         .begin_root_transition()
         .map_err(|error| error.to_string())?;
-    rebuild_authority_with_retained_guard(&mut guards, &process_guard, expected, checkpoint)
+    rebuild_authority_with_retained_guard(
+        &mut guards,
+        &process_guard,
+        &rebuild_expected,
+        checkpoint,
+    )
 }
 
 pub(crate) async fn rebuild_and_publish_current_authority(
     state: &AppState,
     expected: &crate::services::vault_namespace::VaultAuthorityTokenV1,
 ) -> Result<crate::services::vault_namespace::VaultAuthorityTokenV1, String> {
-    rebuild_and_publish_current_authority_inner(state, expected, |_| Ok(())).await
+    rebuild_and_publish_current_authority_inner(state, expected, true, |_| Ok(())).await
 }
 
 #[cfg(test)]
@@ -1062,7 +1254,16 @@ pub(crate) async fn rebuild_and_publish_current_authority_with_checkpoint(
     expected: &crate::services::vault_namespace::VaultAuthorityTokenV1,
     checkpoint: impl FnMut(AuthorityRepairStep) -> Result<(), String>,
 ) -> Result<crate::services::vault_namespace::VaultAuthorityTokenV1, String> {
-    rebuild_and_publish_current_authority_inner(state, expected, checkpoint).await
+    rebuild_and_publish_current_authority_inner(state, expected, true, checkpoint).await
+}
+
+async fn rebuild_and_publish_migration_authority(
+    state: &AppState,
+    expected: &crate::services::vault_namespace::VaultAuthorityTokenV1,
+) -> Result<crate::services::vault_namespace::VaultAuthorityTokenV1, String> {
+    // Migration manifests bind exact after-images. Topic-hub normalization is
+    // itself authoritative and would invalidate those rollback proofs.
+    rebuild_and_publish_current_authority_inner(state, expected, false, |_| Ok(())).await
 }
 
 #[must_use = "committed mutations must inspect and propagate repair readiness"]
@@ -1071,6 +1272,136 @@ pub(crate) enum PostAuthorityRepair {
     NotRequired,
     Ready(crate::services::vault_namespace::VaultAuthorityTokenV1),
     Unavailable(crate::models::mutation::CommittedMutationWarningV1),
+}
+
+#[derive(Debug)]
+pub(crate) struct CompletedKnowledgeNoteMutation {
+    pub note: Note,
+    pub commit: Option<crate::services::twin_events::MutationCommit>,
+    pub continuation_authority: crate::services::vault_namespace::VaultAuthorityTokenV1,
+    pub repaired: bool,
+}
+
+pub(crate) async fn finish_knowledge_authority_error(
+    state: &AppState,
+    error: &anyhow::Error,
+    operation: &str,
+) -> Result<
+    (
+        crate::services::knowledge_store::KnowledgeAuthorityAdvancedOutcome,
+        crate::services::vault_namespace::VaultAuthorityTokenV1,
+    ),
+    String,
+> {
+    let outcome = crate::services::knowledge_store::knowledge_authority_advanced_outcome(error)
+        .ok_or_else(|| error.to_string())?;
+    let repair = repair_after_authority_mutation(state, &outcome.commit, operation).await;
+    if outcome.target_aborted {
+        return Err(format!(
+            "{operation} was not applied after vault authority changed; refresh state before deciding whether to retry"
+        ));
+    }
+    match repair {
+        PostAuthorityRepair::Ready(authority) => Ok((outcome, authority)),
+        PostAuthorityRepair::NotRequired | PostAuthorityRepair::Unavailable(_) => Err(format!(
+            "{operation} committed and recovery is pending; do not retry"
+        )),
+    }
+}
+
+pub(crate) async fn complete_knowledge_note_mutation(
+    state: &AppState,
+    expected: &crate::services::vault_namespace::VaultAuthorityTokenV1,
+    prior_commit: Option<&crate::services::twin_events::MutationCommit>,
+    mutation: anyhow::Result<(Note, crate::services::twin_events::MutationCommit)>,
+    operation: &str,
+) -> Result<CompletedKnowledgeNoteMutation, String> {
+    match mutation {
+        Ok((note, commit)) => {
+            let continuation_authority = commit
+                .authority_token
+                .clone()
+                .unwrap_or_else(|| expected.clone());
+            let commit = commit.authority_token.is_some().then_some(commit);
+            Ok(CompletedKnowledgeNoteMutation {
+                note,
+                commit,
+                continuation_authority,
+                repaired: false,
+            })
+        }
+        Err(error) => {
+            let authority_outcome =
+                crate::services::knowledge_store::knowledge_authority_advanced_outcome(&error);
+            if let (Some(outcome), Some(_)) = (authority_outcome.as_ref(), prior_commit) {
+                if outcome.target_aborted {
+                    let repair =
+                        repair_after_authority_mutation(state, &outcome.commit, operation).await;
+                    return Err(match repair {
+                        PostAuthorityRepair::Ready(_) => format!(
+                            "{operation} partially committed before a later target was aborted after authority advanced; do not retry automatically"
+                        ),
+                        PostAuthorityRepair::NotRequired | PostAuthorityRepair::Unavailable(_) => {
+                            format!(
+                                "{operation} partially committed and recovery is pending after a later target was aborted; do not retry"
+                            )
+                        }
+                    });
+                }
+            }
+            if authority_outcome.is_none() {
+                if let Some(prior_commit) = prior_commit {
+                    let repair =
+                        repair_after_authority_mutation(state, prior_commit, operation).await;
+                    return Err(match repair {
+                        PostAuthorityRepair::Ready(_) => format!(
+                            "{operation} partially committed before a later failure: {error}; do not retry automatically"
+                        ),
+                        PostAuthorityRepair::NotRequired | PostAuthorityRepair::Unavailable(_) => {
+                            format!(
+                                "{operation} partially committed and recovery is pending after a later failure: {error}; do not retry"
+                            )
+                        }
+                    });
+                }
+                return Err(error.to_string());
+            }
+            let (outcome, continuation_authority) =
+                finish_knowledge_authority_error(state, &error, operation).await?;
+            let note_id = outcome.note_ids.first().ok_or_else(|| {
+                format!("{operation} committed without its result identity; do not retry")
+            })?;
+            let note = state
+                .knowledge_store
+                .read()
+                .await
+                .get_note(note_id)
+                .map_err(|load_error| {
+                    log::error!(
+                        "Recovered {operation} result '{note_id}' could not be loaded: {load_error}"
+                    );
+                    format!("{operation} committed and recovered; do not retry")
+                })?;
+            Ok(CompletedKnowledgeNoteMutation {
+                note,
+                commit: Some(outcome.commit),
+                continuation_authority,
+                repaired: true,
+            })
+        }
+    }
+}
+
+/// Consume a repair result at command boundaries whose public response cannot
+/// carry a warning. `Unavailable` has already published the sanitized global
+/// committed-warning event, so acknowledging it here preserves the successful
+/// mutation response without inviting a duplicate retry.
+pub(crate) fn acknowledge_reported_repair(repair: PostAuthorityRepair) {
+    match repair {
+        PostAuthorityRepair::NotRequired
+        | PostAuthorityRepair::Ready(_)
+        | PostAuthorityRepair::Unavailable(_) => {}
+    }
 }
 
 pub(crate) fn publish_committed_warning(
@@ -1124,6 +1455,27 @@ pub(crate) async fn repair_after_authority_mutation(
         return PostAuthorityRepair::NotRequired;
     };
     repair_after_authority_token(state, expected, operation).await
+}
+
+pub(crate) async fn repair_after_migration_authority_token(
+    state: &AppState,
+    expected: &crate::services::vault_namespace::VaultAuthorityTokenV1,
+    operation: &str,
+) -> PostAuthorityRepair {
+    match rebuild_and_publish_migration_authority(state, expected).await {
+        Ok(token) => PostAuthorityRepair::Ready(token),
+        Err(error) => {
+            let mut loaded = state.loaded_authority.write().await;
+            if loaded.as_ref() == Some(expected) {
+                *loaded = None;
+            }
+            drop(loaded);
+            log::error!(
+                "{operation} committed but authority repair failed; readiness remains unavailable: {error}"
+            );
+            PostAuthorityRepair::Unavailable(publish_committed_warning(state))
+        }
+    }
 }
 
 /// Single chokepoint for "a note was just created or edited on disk and needs to
@@ -1411,952 +1763,5 @@ pub(crate) async fn commit_note_delete(
 }
 
 #[cfg(test)]
-pub(crate) mod commit_note_write_tests {
-    use super::*;
-    use crate::models::boot::BootStatus;
-    use crate::models::note::{NoteCreate, NoteStatus, NoteUpdate};
-    use crate::models::settings::UserSettings;
-    use crate::services::canvas_store::CanvasStore;
-    use crate::services::chunk_index::ChunkIndex;
-    use crate::services::feedback::FeedbackService;
-    use crate::services::graph_index::GraphIndex;
-    use crate::services::knowledge_store::KnowledgeStore;
-    use crate::services::link_discovery::LinkDiscoveryService;
-    use crate::services::markdown_migration::MarkdownMigrationService;
-    use crate::services::memory::MemoryService;
-    use crate::services::ollama::OllamaService;
-    use crate::services::openrouter::OpenRouterService;
-    use crate::services::priority::PriorityScoringService;
-    use crate::services::retrieval::RetrievalService;
-    use crate::services::search::SearchService;
-    use crate::services::settings::SettingsService;
-    use crate::services::topic_hub::normalize_topic_key;
-    use crate::services::twin::TwinStore;
-    use crate::services::vault_optimizer::VaultOptimizerService;
-    use crate::AppState;
-    use std::sync::Arc;
-    use tempfile::TempDir;
-    use tokio::sync::RwLock;
-
-    /// Builds a fully-wired `AppState` over fresh tempdirs, mirroring
-    /// `main.rs`'s setup block. Kept local to this test module: no other test
-    /// in the crate currently needs a whole `AppState`, and command-level
-    /// tests can't cheaply construct `tauri::State` outside a running app, so
-    /// this exercises `commit_note_write` directly against real services.
-    pub(crate) fn build_test_state() -> (AppState, TempDir, TempDir) {
-        let vault_dir = TempDir::new().expect("vault tempdir should be created");
-        let data_dir = TempDir::new().expect("data tempdir should be created");
-        let vault_path = vault_dir.path().to_path_buf();
-        let data_path = data_dir.path().to_path_buf();
-
-        std::fs::create_dir_all(data_path.join("canvas"))
-            .expect("canvas directory should initialize");
-        let twin_event_store = Arc::new(crate::services::twin_events::TwinEventStore::new(
-            data_path.clone(),
-        ));
-        twin_event_store
-            .initialize()
-            .expect("event store should initialize");
-        let mutation_coordinator = Arc::new(
-            crate::services::twin_events::MutationCoordinator::new(
-                &data_path,
-                &vault_path,
-                twin_event_store.clone(),
-                Arc::new(crate::services::twin_events::NoopMutationLifecycle),
-            )
-            .expect("mutation coordinator should initialize"),
-        );
-        let namespace = mutation_coordinator
-            .current_namespace_path()
-            .expect("vault namespace should initialize");
-        let knowledge_store = KnowledgeStore::new(vault_path, namespace.clone());
-        let search_service =
-            SearchService::new(namespace.clone()).expect("search service should initialize");
-        let chunk_index =
-            ChunkIndex::new(namespace.clone()).expect("chunk index should initialize");
-
-        let state = AppState {
-            knowledge_store: Arc::new(RwLock::new(knowledge_store)),
-            graph_index: Arc::new(RwLock::new(GraphIndex::new())),
-            search_service: Arc::new(RwLock::new(search_service)),
-            canvas_store: Arc::new(RwLock::new(CanvasStore::new(data_path.join("canvas")))),
-            openrouter: Arc::new(RwLock::new(OpenRouterService::new(String::new()))),
-            ollama: Arc::new(RwLock::new(OllamaService::new(String::new()))),
-            feedback_service: Arc::new(RwLock::new(FeedbackService::new(
-                data_path.join("feedback"),
-            ))),
-            settings_service: Arc::new(RwLock::new(SettingsService::load_defaults())),
-            priority_service: Arc::new(RwLock::new(PriorityScoringService::new(data_path.clone()))),
-            retrieval_service: Arc::new(RwLock::new(RetrievalService::new(data_path.clone()))),
-            chunk_index: Arc::new(RwLock::new(chunk_index)),
-            link_discovery: Arc::new(RwLock::new(LinkDiscoveryService::new(namespace.clone()))),
-            markdown_migration: Arc::new(RwLock::new(MarkdownMigrationService::new(
-                namespace.clone(),
-            ))),
-            vault_optimizer: Arc::new(RwLock::new(VaultOptimizerService::new(namespace))),
-            twin_store: Arc::new(RwLock::new(TwinStore::new(data_path.join("twin")))),
-            twin_event_store,
-            mutation_coordinator: Some(mutation_coordinator),
-            mutation_startup_error: Arc::new(RwLock::new(None)),
-            loaded_authority: Arc::new(RwLock::new(None)),
-            authority_repair: Arc::new(tokio::sync::Mutex::new(())),
-            committed_warning_app: None,
-            vault_transition: Arc::new(tokio::sync::RwLock::new(())),
-            memory_service: Arc::new(MemoryService::new()),
-            boot_state: Arc::new(RwLock::new(BootStatus::default())),
-        };
-
-        (state, vault_dir, data_dir)
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn authority_rebuild_retains_process_lock_through_derived_publication() {
-        let (state, _vault_dir, _data_dir) = build_test_state();
-        let coordinator = state.mutation_coordinator.as_ref().unwrap().clone();
-        let expected = coordinator.current_authority_token().unwrap();
-        *state.loaded_authority.write().await = Some(expected.clone());
-
-        // Pause only after the rebuild owns every local service guard and the
-        // coordinator process guard. A peer process-lock acquisition must stay
-        // blocked until the retained window reaches ready publication.
-        let entered = Arc::new(std::sync::Barrier::new(2));
-        let release = Arc::new(std::sync::Barrier::new(2));
-        let hook_entered = entered.clone();
-        let hook_release = release.clone();
-        let repair_state = state.clone();
-        let rebuild = tokio::spawn(async move {
-            rebuild_and_publish_current_authority_with_checkpoint(
-                &repair_state,
-                &expected,
-                move |step| {
-                    if step == AuthorityRepairStep::Captured {
-                        hook_entered.wait();
-                        hook_release.wait();
-                    }
-                    Ok(())
-                },
-            )
-            .await
-        });
-        tokio::task::spawn_blocking(move || entered.wait())
-            .await
-            .unwrap();
-
-        let mut peer = tokio::task::spawn_blocking(move || coordinator.current_authority_token());
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(100), &mut peer)
-                .await
-                .is_err(),
-            "a peer acquired the mutation process lock while derived publication was incomplete"
-        );
-
-        tokio::task::spawn_blocking(move || release.wait())
-            .await
-            .unwrap();
-        rebuild
-            .await
-            .expect("rebuild task should not panic")
-            .expect("rebuild should complete after the graph lock is released");
-        peer.await
-            .expect("peer task should not panic")
-            .expect("peer should acquire after rebuild publication");
-    }
-
-    #[tokio::test]
-    async fn same_generation_rebuild_failure_leaves_durable_namespace_unready() {
-        let (state, _vault_dir, _data_dir) = build_test_state();
-        let coordinator = state.mutation_coordinator.as_ref().unwrap().clone();
-        coordinator.require_namespace_ready().unwrap();
-        let expected = coordinator.current_authority_token().unwrap();
-        *state.loaded_authority.write().await = Some(expected.clone());
-
-        let result =
-            rebuild_and_publish_current_authority_with_checkpoint(&state, &expected, |step| {
-                if step == AuthorityRepairStep::Search {
-                    return Err("injected mid-rebuild failure".into());
-                }
-                Ok(())
-            })
-            .await;
-
-        assert!(result.is_err());
-        assert!(coordinator.require_namespace_ready().is_err());
-        assert!(state.loaded_authority.read().await.is_none());
-        assert_eq!(coordinator.current_authority_token().unwrap(), expected);
-    }
-
-    #[tokio::test]
-    async fn normalization_prelude_failure_leaves_durable_namespace_unready() {
-        let (state, _vault_dir, _data_dir) = build_test_state();
-        let coordinator = state.mutation_coordinator.as_ref().unwrap().clone();
-        coordinator.require_namespace_ready().unwrap();
-        let expected = coordinator.current_authority_token().unwrap();
-        *state.loaded_authority.write().await = Some(expected.clone());
-
-        let result =
-            rebuild_and_publish_current_authority_with_checkpoint(&state, &expected, |step| {
-                if step == AuthorityRepairStep::Normalized {
-                    return Err("injected post-normalization failure".into());
-                }
-                Ok(())
-            })
-            .await;
-
-        assert!(result.is_err());
-        assert!(coordinator.require_namespace_ready().is_err());
-        assert!(state.loaded_authority.read().await.is_none());
-        assert_eq!(coordinator.current_authority_token().unwrap(), expected);
-    }
-
-    #[tokio::test]
-    async fn authority_rebuild_recovers_wal_only_after_fail_closed_invalidation() {
-        let (state, _vault_dir, _data_dir) = build_test_state();
-        let coordinator = state.mutation_coordinator.as_ref().unwrap().clone();
-        let expected = coordinator.current_authority_token().unwrap();
-        *state.loaded_authority.write().await = Some(expected.clone());
-        coordinator
-            .fail_once_at(crate::services::twin_events::MutationFaultPoint::BeforePendingRecovery);
-
-        let result = rebuild_and_publish_current_authority(&state, &expected).await;
-
-        assert!(
-            result.is_err(),
-            "rebuild must execute canonical WAL recovery"
-        );
-        assert!(coordinator.require_namespace_ready().is_err());
-        assert!(state.loaded_authority.read().await.is_none());
-    }
-
-    #[tokio::test]
-    async fn live_rebuild_replays_optimizer_wal_before_witness_recovery() {
-        let (state, vault_dir, _data_dir) = build_test_state();
-        let coordinator = state.mutation_coordinator.as_ref().unwrap().clone();
-        let namespace = coordinator.current_namespace_path().unwrap();
-        *state.knowledge_store.write().await = KnowledgeStore::with_event_recorder(
-            vault_dir.path().to_path_buf(),
-            namespace.clone(),
-            coordinator.clone(),
-        );
-        let created = {
-            let mut store = state.knowledge_store.write().await;
-            store
-                .create_note(NoteCreate {
-                    title: "Prepared WAL Recovery".to_string(),
-                    content: "A staged optimizer mutation must keep its audit owner.".to_string(),
-                    relative_path: None,
-                    aliases: Vec::new(),
-                    status: NoteStatus::Draft,
-                    tags: Vec::new(),
-                    schema_version: crate::models::note::CURRENT_NOTE_SCHEMA_VERSION,
-                    migration_source: None,
-                    optimizer_managed: false,
-                    properties: Default::default(),
-                })
-                .unwrap()
-        };
-        commit_note_write(&state, &created.id, "test_note_created")
-            .await
-            .unwrap();
-        let expected = coordinator.current_authority_token().unwrap();
-        let settings = UserSettings::default();
-        let pending = {
-            let store = state.knowledge_store.read().await;
-            let mut optimizer = state.vault_optimizer.write().await;
-            match optimizer
-                .prepare_next_expecting_authority(&store, &settings, expected)
-                .unwrap()
-            {
-                crate::services::vault_optimizer::OptimizerTick::Pending(pending) => *pending,
-                other => panic!("expected a pending optimizer write, got {other:?}"),
-            }
-        };
-        let original_queue: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(namespace.join("vault_migration/optimizer/queue.json")).unwrap(),
-        )
-        .unwrap();
-        let original_job_id = original_queue["queue"][0]["job_id"]
-            .as_str()
-            .unwrap()
-            .to_string();
-        coordinator.fail_next_replays_before_targets(2);
-        let apply = {
-            let mut store = state.knowledge_store.write().await;
-            let mut optimizer = state.vault_optimizer.write().await;
-            optimizer.apply_pending(&mut store, pending)
-        };
-        assert!(apply.is_err());
-        assert_eq!(coordinator.pending_count().unwrap(), 1);
-        assert!(!state
-            .knowledge_store
-            .read()
-            .await
-            .overlay_path(&created.id)
-            .exists());
-
-        let repair_token = coordinator.current_authority_token().unwrap();
-        rebuild_and_publish_current_authority(&state, &repair_token)
-            .await
-            .unwrap();
-
-        assert_eq!(coordinator.pending_count().unwrap(), 0);
-        assert!(state
-            .knowledge_store
-            .read()
-            .await
-            .overlay_path(&created.id)
-            .exists());
-        let optimizer = state.vault_optimizer.read().await;
-        let status = optimizer.status(&settings);
-        assert_eq!(status.accepted_count, 1);
-        assert_eq!(optimizer.list_decisions(10).unwrap().len(), 1);
-        assert_eq!(optimizer.inbox(None, 10).unwrap().len(), 1);
-        drop(optimizer);
-        let queue: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(namespace.join("vault_migration/optimizer/queue.json")).unwrap(),
-        )
-        .unwrap();
-        assert!(queue["queue"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|job| { job["job_id"].as_str() != Some(original_job_id.as_str()) }));
-        let pending_dir = namespace.join("vault_migration/optimizer/pending-publications-v1");
-        assert_eq!(std::fs::read_dir(pending_dir).unwrap().count(), 0);
-        coordinator.require_namespace_ready().unwrap();
-    }
-
-    #[tokio::test]
-    async fn post_cas_guard_abort_retires_optimizer_owner_before_ready_repair() {
-        let (state, vault_dir, data_dir) = build_test_state();
-        let coordinator = state.mutation_coordinator.as_ref().unwrap().clone();
-        let namespace = coordinator.current_namespace_path().unwrap();
-        *state.knowledge_store.write().await = KnowledgeStore::with_event_recorder(
-            vault_dir.path().to_path_buf(),
-            namespace.clone(),
-            coordinator.clone(),
-        );
-        let created = {
-            let mut store = state.knowledge_store.write().await;
-            store
-                .create_note(NoteCreate {
-                    title: "Post CAS Guard Abort".to_string(),
-                    content: "The source guard changes after authority advances.".to_string(),
-                    relative_path: None,
-                    aliases: Vec::new(),
-                    status: NoteStatus::Draft,
-                    tags: Vec::new(),
-                    schema_version: crate::models::note::CURRENT_NOTE_SCHEMA_VERSION,
-                    migration_source: None,
-                    optimizer_managed: false,
-                    properties: Default::default(),
-                })
-                .unwrap()
-        };
-        commit_note_write(&state, &created.id, "test_note_created")
-            .await
-            .unwrap();
-        let before = coordinator.current_authority_token().unwrap();
-        coordinator.require_namespace_ready().unwrap();
-        let settings = UserSettings::default();
-        let pending = {
-            let store = state.knowledge_store.read().await;
-            let mut optimizer = state.vault_optimizer.write().await;
-            match optimizer
-                .prepare_next_expecting_authority(&store, &settings, before.clone())
-                .unwrap()
-            {
-                crate::services::vault_optimizer::OptimizerTick::Pending(pending) => *pending,
-                other => panic!("expected a pending optimizer write, got {other:?}"),
-            }
-        };
-        let original_job_id = serde_json::from_slice::<serde_json::Value>(
-            &std::fs::read(namespace.join("vault_migration/optimizer/queue.json")).unwrap(),
-        )
-        .unwrap()["queue"][0]["job_id"]
-            .as_str()
-            .unwrap()
-            .to_string();
-        let entered = Arc::new(std::sync::Barrier::new(2));
-        let resume = Arc::new(std::sync::Barrier::new(2));
-        coordinator.pause_after_authority_advance_once(entered.clone(), resume.clone());
-        let knowledge = state.knowledge_store.clone();
-        let optimizer = state.vault_optimizer.clone();
-        let owner = std::thread::spawn(move || {
-            let mut store = knowledge.blocking_write();
-            let mut optimizer = optimizer.blocking_write();
-            optimizer.apply_pending(&mut store, pending)
-        });
-
-        entered.wait();
-        let pending_dir = namespace.join("vault_migration/optimizer/pending-publications-v1");
-        let witness: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(
-                std::fs::read_dir(&pending_dir)
-                    .unwrap()
-                    .next()
-                    .unwrap()
-                    .unwrap()
-                    .path(),
-            )
-            .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(witness["phase"], "prepared");
-        let markdown_path = vault_dir.path().join(&created.relative_path);
-        let mut edited = std::fs::read(&markdown_path).unwrap();
-        edited.extend_from_slice(b"\nExternal edit after authority CAS.\n");
-        std::fs::write(&markdown_path, &edited).unwrap();
-        resume.wait();
-
-        assert!(owner.join().unwrap().is_err());
-        let advanced = coordinator.current_authority_token().unwrap();
-        assert_eq!(
-            advanced.authority_generation,
-            before.authority_generation + 1
-        );
-        assert!(coordinator.require_namespace_ready().is_err());
-        assert_eq!(coordinator.pending_count().unwrap(), 0);
-        assert_eq!(std::fs::read_dir(&pending_dir).unwrap().count(), 0);
-        assert!(!state
-            .knowledge_store
-            .read()
-            .await
-            .overlay_path(&created.id)
-            .exists());
-        assert_eq!(std::fs::read(&markdown_path).unwrap(), edited);
-        {
-            let optimizer = state.vault_optimizer.read().await;
-            assert!(optimizer.list_decisions(10).unwrap().is_empty());
-            assert!(optimizer.inbox(None, 10).unwrap().is_empty());
-            let queue: serde_json::Value = serde_json::from_slice(
-                &std::fs::read(namespace.join("vault_migration/optimizer/queue.json")).unwrap(),
-            )
-            .unwrap();
-            let job = queue["queue"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .find(|job| job["job_id"].as_str() == Some(original_job_id.as_str()))
-                .unwrap();
-            assert_eq!(job["attempts"], 1);
-        }
-        assert_eq!(
-            std::fs::read_dir(data_dir.path().join("twin/mutations/receipts/v1"))
-                .unwrap()
-                .count(),
-            0
-        );
-
-        rebuild_and_publish_current_authority(&state, &advanced)
-            .await
-            .unwrap();
-        coordinator.require_namespace_ready().unwrap();
-        assert_eq!(
-            state.loaded_authority.read().await.as_ref(),
-            Some(&advanced)
-        );
-        assert_eq!(coordinator.pending_count().unwrap(), 0);
-        assert_eq!(std::fs::read_dir(&pending_dir).unwrap().count(), 0);
-        let _restarted = VaultOptimizerService::try_new(namespace.clone()).unwrap();
-        assert_eq!(std::fs::read_dir(&pending_dir).unwrap().count(), 0);
-        let queue: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(namespace.join("vault_migration/optimizer/queue.json")).unwrap(),
-        )
-        .unwrap();
-        assert!(queue["queue"].as_array().unwrap().iter().any(|job| {
-            job["job_id"].as_str() == Some(original_job_id.as_str()) && job["attempts"] == 1
-        }));
-    }
-
-    #[tokio::test]
-    async fn create_note_is_search_indexed_after_commit_note_write() {
-        let (state, _vault_dir, _data_dir) = build_test_state();
-
-        let created = {
-            let mut store = state.knowledge_store.write().await;
-            store
-                .create_note(NoteCreate {
-                    title: "Quokka Habits".to_string(),
-                    content: "The quokka forages for xylophonemarker9142 at dawn.".to_string(),
-                    relative_path: None,
-                    aliases: Vec::new(),
-                    status: NoteStatus::Draft,
-                    tags: Vec::new(),
-                    schema_version: crate::models::note::CURRENT_NOTE_SCHEMA_VERSION,
-                    migration_source: None,
-                    optimizer_managed: false,
-                    properties: Default::default(),
-                })
-                .expect("note should be created")
-        };
-
-        commit_note_write(&state, &created.id, "test_note_created")
-            .await
-            .expect("commit_note_write should succeed");
-
-        let search = state.search_service.read().await;
-        let results = search
-            .search("xylophonemarker9142", 10)
-            .expect("search should not error");
-        assert!(
-            results.iter().any(|r| r.note.id == created.id),
-            "expected newly created note to be search-indexed immediately, found: {:?}",
-            results.iter().map(|r| &r.note.id).collect::<Vec<_>>()
-        );
-    }
-
-    #[tokio::test]
-    async fn note_delete_repairs_readiness_from_its_exact_commit_token() {
-        let (state, vault_dir, _data_dir) = build_test_state();
-        let coordinator = state.mutation_coordinator.as_ref().unwrap().clone();
-        let namespace = coordinator.current_namespace_path().unwrap();
-        *state.knowledge_store.write().await = KnowledgeStore::with_event_recorder(
-            vault_dir.path().to_path_buf(),
-            namespace,
-            coordinator.clone(),
-        );
-        let create = NoteCreate {
-            title: "Delete repair sentinel".into(),
-            content: "repair-delete-marker".into(),
-            relative_path: None,
-            aliases: Vec::new(),
-            status: NoteStatus::Draft,
-            tags: Vec::new(),
-            schema_version: crate::models::note::CURRENT_NOTE_SCHEMA_VERSION,
-            migration_source: None,
-            optimizer_managed: false,
-            properties: Default::default(),
-        };
-        let (created, create_commit) = {
-            let expected = coordinator.current_authority_token().unwrap();
-            state
-                .knowledge_store
-                .write()
-                .await
-                .create_note_expecting_authority(create, "note_editor", expected)
-                .unwrap()
-        };
-        assert!(matches!(
-            repair_after_authority_mutation(&state, &create_commit, "note create").await,
-            PostAuthorityRepair::Ready(_)
-        ));
-        let delete_commit = {
-            let expected = coordinator.current_authority_token().unwrap();
-            state
-                .knowledge_store
-                .write()
-                .await
-                .delete_note_expecting_authority(&created.id, "note_editor", expected)
-                .unwrap()
-        };
-
-        assert!(matches!(
-            repair_after_authority_mutation(&state, &delete_commit, "note delete").await,
-            PostAuthorityRepair::Ready(_)
-        ));
-        coordinator.require_namespace_ready().unwrap();
-        assert!(state
-            .knowledge_store
-            .read()
-            .await
-            .get_note(&created.id)
-            .is_err());
-    }
-
-    #[tokio::test]
-    async fn update_note_content_is_search_indexed_after_commit_note_write() {
-        let (state, _vault_dir, _data_dir) = build_test_state();
-
-        let created = {
-            let mut store = state.knowledge_store.write().await;
-            store
-                .create_note(NoteCreate {
-                    title: "Wombat Notes".to_string(),
-                    content: "Original content with no special markers.".to_string(),
-                    relative_path: None,
-                    aliases: Vec::new(),
-                    status: NoteStatus::Draft,
-                    tags: Vec::new(),
-                    schema_version: crate::models::note::CURRENT_NOTE_SCHEMA_VERSION,
-                    migration_source: None,
-                    optimizer_managed: false,
-                    properties: Default::default(),
-                })
-                .expect("note should be created")
-        };
-        commit_note_write(&state, &created.id, "test_note_created")
-            .await
-            .expect("initial commit_note_write should succeed");
-
-        {
-            let mut store = state.knowledge_store.write().await;
-            store
-                .update_note(
-                    &created.id,
-                    NoteUpdate {
-                        content: Some(
-                            "Updated content mentions zebrawhistle6784 explicitly.".to_string(),
-                        ),
-                        ..Default::default()
-                    },
-                )
-                .expect("note should be updated");
-        }
-
-        commit_note_write(&state, &created.id, "test_note_updated")
-            .await
-            .expect("commit_note_write should succeed after update");
-
-        let search = state.search_service.read().await;
-        let results = search
-            .search("zebrawhistle6784", 10)
-            .expect("search should not error");
-        assert!(
-            results.iter().any(|r| r.note.id == created.id),
-            "expected updated note content to be search-indexed immediately, found: {:?}",
-            results.iter().map(|r| &r.note.id).collect::<Vec<_>>()
-        );
-    }
-
-    #[tokio::test]
-    async fn create_note_is_chunk_indexed_after_commit_note_write() {
-        let (state, _vault_dir, _data_dir) = build_test_state();
-
-        let created = {
-            let mut store = state.knowledge_store.write().await;
-            store
-                .create_note(NoteCreate {
-                    title: "Narwhal Facts".to_string(),
-                    content: "Narwhals communicate using kittywomble4471 clicks and whistles."
-                        .to_string(),
-                    relative_path: None,
-                    aliases: Vec::new(),
-                    status: NoteStatus::Draft,
-                    tags: Vec::new(),
-                    schema_version: crate::models::note::CURRENT_NOTE_SCHEMA_VERSION,
-                    migration_source: None,
-                    optimizer_managed: false,
-                    properties: Default::default(),
-                })
-                .expect("note should be created")
-        };
-
-        commit_note_write(&state, &created.id, "test_note_created")
-            .await
-            .expect("commit_note_write should succeed");
-
-        let chunks = state.chunk_index.read().await;
-        let results = chunks
-            .search_chunks("kittywomble4471", 10)
-            .expect("chunk search should not error");
-        assert!(
-            results.iter().any(|r| r.parent_note_id == created.id),
-            "expected newly created note's content to be chunk-indexed immediately, found: {:?}",
-            results
-                .iter()
-                .map(|r| &r.parent_note_id)
-                .collect::<Vec<_>>()
-        );
-    }
-
-    #[tokio::test]
-    async fn commit_note_writes_batches_a_single_hub_sync_across_multiple_notes() {
-        let (state, _vault_dir, _data_dir) = build_test_state();
-
-        let mut ids = Vec::new();
-        {
-            let mut store = state.knowledge_store.write().await;
-            for i in 0..3 {
-                let note = store
-                    .create_note(NoteCreate {
-                        title: format!("Batch Note {}", i),
-                        content: format!("Batch content marker batchmarker{}77 here.", i),
-                        relative_path: None,
-                        aliases: Vec::new(),
-                        status: NoteStatus::Draft,
-                        tags: Vec::new(),
-                        schema_version: crate::models::note::CURRENT_NOTE_SCHEMA_VERSION,
-                        migration_source: None,
-                        optimizer_managed: false,
-                        properties: Default::default(),
-                    })
-                    .expect("note should be created");
-                ids.push(note.id);
-            }
-        }
-
-        commit_note_writes(&state, &ids, "test_batch_created")
-            .await
-            .expect("commit_note_writes should succeed");
-
-        let search = state.search_service.read().await;
-        for (i, id) in ids.iter().enumerate() {
-            let results = search
-                .search(&format!("batchmarker{}77", i), 10)
-                .expect("search should not error");
-            assert!(
-                results.iter().any(|r| &r.note.id == id),
-                "expected batch note {} to be search-indexed",
-                i
-            );
-        }
-    }
-
-    /// Regression coverage for the optimizer-reindex bug: the background
-    /// vault optimizer's `sidecar_first` write path (`VaultOptimizerService::
-    /// prepare_next`) changes a note's tags via an overlay file, and that
-    /// change IS visible through `KnowledgeStore::get_note` (which merges the
-    /// overlay), but the search index's STORED tags field is a snapshot
-    /// frozen at the last `index_note` call — it goes stale the moment the
-    /// optimizer writes, until some other code path happens to reindex the
-    /// note. Searching by the note's own (unchanged) title still matches via
-    /// the title field regardless of the tag staleness, so the returned
-    /// `SearchResult::note.tags` — reconstructed purely from the indexed
-    /// document, not from the vault — is a direct probe of whether a reindex
-    /// actually happened.
-    #[tokio::test]
-    async fn optimizer_sidecar_write_is_reindexed_into_search() {
-        let (state, _vault_dir, _data_dir) = build_test_state();
-
-        let created = {
-            let mut store = state.knowledge_store.write().await;
-            store
-                .create_note(NoteCreate {
-                    title: "Quokka Alpha Habitat".to_string(),
-                    content: "Quokkas are found on Rottnest Island.".to_string(),
-                    relative_path: None,
-                    aliases: Vec::new(),
-                    status: NoteStatus::Draft,
-                    tags: Vec::new(),
-                    schema_version: crate::models::note::CURRENT_NOTE_SCHEMA_VERSION,
-                    migration_source: None,
-                    optimizer_managed: false,
-                    properties: Default::default(),
-                })
-                .expect("note should be created")
-        };
-        // Indexes the note once (empty tags) and enqueues it into the
-        // optimizer's queue, mirroring what actually happens on note
-        // creation in the running app.
-        commit_note_write(&state, &created.id, "test_note_created")
-            .await
-            .expect("commit_note_write should succeed");
-
-        let expected_tag = normalize_topic_key(&created.title).replace('-', "_");
-        let settings = UserSettings::default();
-        assert_eq!(
-            settings.background_vault_optimizer_edit_mode, "sidecar_first",
-            "this test exercises the sidecar_first path specifically"
-        );
-
-        // One worker tick, mirroring `start_vault_optimizer_worker`:
-        // preparation is read-only and returns an exact pending write, then
-        // application runs under the knowledge-store write lock.
-        let tick = {
-            let store = state.knowledge_store.read().await;
-            let mut optimizer = state.vault_optimizer.write().await;
-            optimizer
-                .prepare_next(&store, &settings)
-                .expect("prepare_next should not error")
-        };
-        let pending = match tick {
-            crate::services::vault_optimizer::OptimizerTick::Pending(pending) => pending,
-            other => panic!("sidecar_first mode must return a pending write, got {other:?}"),
-        };
-        let applied_note_id = {
-            let mut store = state.knowledge_store.write().await;
-            let mut optimizer = state.vault_optimizer.write().await;
-            match optimizer
-                .apply_pending(&mut store, *pending)
-                .expect("apply_pending should not error")
-            {
-                crate::services::vault_optimizer::OptimizerMutationResult::Committed {
-                    result,
-                    ..
-                } => result.note_id().to_string(),
-                crate::services::vault_optimizer::OptimizerMutationResult::NoWrite => {
-                    panic!("sidecar_first apply should report the committed note")
-                }
-            }
-        };
-
-        // The locks taken above are released by now (the block ended) —
-        // `commit_note_index_refresh` is called exactly as the worker calls
-        // it, only after releasing every optimizer-tick lock.
-        commit_note_index_refresh(&state, &applied_note_id)
-            .await
-            .expect("commit_note_index_refresh should succeed");
-
-        let search = state.search_service.read().await;
-        let results = search
-            .search(&created.title, 10)
-            .expect("search should not error");
-        let found = results
-            .iter()
-            .find(|r| r.note.id == created.id)
-            .expect("note should still be findable by its unchanged title");
-        assert!(
-            found.note.tags.contains(&expected_tag),
-            "expected the optimizer's sidecar overlay tag '{}' to be visible in \
-             search results without any manual reindex, got tags: {:?}",
-            expected_tag,
-            found.note.tags
-        );
-    }
-
-    /// Same regression as `optimizer_sidecar_write_is_reindexed_into_search`,
-    /// but for the `full_rewrite` edit mode: `prepare_next` returns a
-    /// `PendingOptimizerWrite` that the caller applies via `apply_pending`
-    /// under a write lock (a real `KnowledgeStore::update_note`, not a
-    /// sidecar overlay). That write is also invisible to search until
-    /// something reindexes it.
-    #[tokio::test]
-    async fn optimizer_full_rewrite_write_is_reindexed_into_search() {
-        let (state, _vault_dir, _data_dir) = build_test_state();
-
-        let created = {
-            let mut store = state.knowledge_store.write().await;
-            store
-                .create_note(NoteCreate {
-                    title: "Narwhal Beta Colony".to_string(),
-                    content: "Narwhals gather near Baffin Island in summer.".to_string(),
-                    relative_path: None,
-                    aliases: Vec::new(),
-                    status: NoteStatus::Draft,
-                    tags: Vec::new(),
-                    schema_version: crate::models::note::CURRENT_NOTE_SCHEMA_VERSION,
-                    migration_source: None,
-                    optimizer_managed: false,
-                    properties: Default::default(),
-                })
-                .expect("note should be created")
-        };
-        commit_note_write(&state, &created.id, "test_note_created")
-            .await
-            .expect("commit_note_write should succeed");
-
-        let expected_tag = normalize_topic_key(&created.title).replace('-', "_");
-        let settings = UserSettings {
-            background_vault_optimizer_edit_mode: "full_rewrite".to_string(),
-            ..UserSettings::default()
-        };
-
-        let tick = {
-            let store = state.knowledge_store.read().await;
-            let mut optimizer = state.vault_optimizer.write().await;
-            optimizer
-                .prepare_next(&store, &settings)
-                .expect("prepare_next should not error")
-        };
-        let pending = match tick {
-            crate::services::vault_optimizer::OptimizerTick::Pending(pending) => pending,
-            other => panic!(
-                "full_rewrite mode must return a pending write, got {:?}",
-                other
-            ),
-        };
-
-        let applied_note_id = {
-            let mut store = state.knowledge_store.write().await;
-            let mut optimizer = state.vault_optimizer.write().await;
-            match optimizer
-                .apply_pending(&mut store, *pending)
-                .expect("apply_pending should not error")
-            {
-                crate::services::vault_optimizer::OptimizerMutationResult::Committed {
-                    result,
-                    ..
-                } => result.note_id().to_string(),
-                crate::services::vault_optimizer::OptimizerMutationResult::NoWrite => {
-                    panic!("full_rewrite apply should report the committed note")
-                }
-            }
-        };
-
-        // The locks taken above are released by now (the block ended) —
-        // `commit_note_index_refresh` is called exactly as the worker calls
-        // it, only after releasing every optimizer-tick lock.
-        commit_note_index_refresh(&state, &applied_note_id)
-            .await
-            .expect("commit_note_index_refresh should succeed");
-
-        let search = state.search_service.read().await;
-        let results = search
-            .search(&created.title, 10)
-            .expect("search should not error");
-        let found = results
-            .iter()
-            .find(|r| r.note.id == created.id)
-            .expect("note should still be findable by its unchanged title");
-        assert!(
-            found.note.tags.contains(&expected_tag),
-            "expected the optimizer's full_rewrite tag '{}' to be visible in \
-             search results without any manual reindex, got tags: {:?}",
-            expected_tag,
-            found.note.tags
-        );
-    }
-
-    /// `commit_note_delete` is the symmetric counterpart to
-    /// `commit_note_write`: a note removed from the vault must stop being
-    /// findable via search immediately, without a manual reindex.
-    #[tokio::test]
-    async fn deleted_note_is_no_longer_search_indexed_after_commit_note_delete() {
-        let (state, _vault_dir, _data_dir) = build_test_state();
-
-        let created = {
-            let mut store = state.knowledge_store.write().await;
-            store
-                .create_note(NoteCreate {
-                    title: "Platypus Gamma Burrow".to_string(),
-                    content: "Platypuses dig burrows along riverbanks in Tasmania.".to_string(),
-                    relative_path: None,
-                    aliases: Vec::new(),
-                    status: NoteStatus::Draft,
-                    tags: Vec::new(),
-                    schema_version: crate::models::note::CURRENT_NOTE_SCHEMA_VERSION,
-                    migration_source: None,
-                    optimizer_managed: false,
-                    properties: Default::default(),
-                })
-                .expect("note should be created")
-        };
-        commit_note_write(&state, &created.id, "test_note_created")
-            .await
-            .expect("commit_note_write should succeed");
-
-        // Sanity check: the note is indeed searchable before deletion.
-        {
-            let search = state.search_service.read().await;
-            let results = search
-                .search(&created.title, 10)
-                .expect("search should not error");
-            assert!(
-                results.iter().any(|r| r.note.id == created.id),
-                "note should be search-indexed before deletion"
-            );
-        }
-
-        {
-            let mut store = state.knowledge_store.write().await;
-            store
-                .delete_note(&created.id)
-                .expect("note should be deleted from the vault");
-        }
-
-        commit_note_delete(&state, &created.id, "test_note_deleted")
-            .await
-            .expect("commit_note_delete should succeed");
-
-        let search = state.search_service.read().await;
-        let results = search
-            .search(&created.title, 10)
-            .expect("search should not error");
-        assert!(
-            !results.iter().any(|r| r.note.id == created.id),
-            "expected deleted note to be immediately removed from search results \
-             without any manual reindex, found: {:?}",
-            results.iter().map(|r| &r.note.id).collect::<Vec<_>>()
-        );
-    }
-}
+#[path = "commit_note_write_tests.rs"]
+pub(crate) mod commit_note_write_tests;

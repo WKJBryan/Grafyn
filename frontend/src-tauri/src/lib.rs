@@ -781,6 +781,14 @@ fn start_link_discovery_worker(state: AppState) {
     });
 }
 
+fn optimizer_worker_failure_commit(
+    error: &anyhow::Error,
+) -> Option<crate::services::twin_events::MutationCommit> {
+    error
+        .downcast_ref::<crate::services::twin_events::MutationError>()
+        .and_then(|error| error.authority_advanced_commit())
+}
+
 fn start_vault_optimizer_worker(state: AppState) {
     tauri::async_runtime::spawn(async move {
         loop {
@@ -825,6 +833,7 @@ fn start_vault_optimizer_worker(state: AppState) {
             // (see its doc comment in `commands/mod.rs` for why this can't
             // just be a call to `commit_note_write`).
             let mut apply_failed = false;
+            let mut failure_commit = None;
             let committed =
                 match tick {
                     Ok(OptimizerTick::NoWrite) => None,
@@ -853,6 +862,7 @@ fn start_vault_optimizer_worker(state: AppState) {
                                 "Background vault optimizer failed to resume retry fence: {}",
                                 error
                             );
+                            failure_commit = optimizer_worker_failure_commit(&error);
                             apply_failed = true;
                             None
                         }
@@ -878,6 +888,7 @@ fn start_vault_optimizer_worker(state: AppState) {
                         }
                         Err(error) => {
                             log::warn!("Background vault optimizer failed to apply: {}", error);
+                            failure_commit = optimizer_worker_failure_commit(&error);
                             apply_failed = true;
                             None
                         }
@@ -885,6 +896,8 @@ fn start_vault_optimizer_worker(state: AppState) {
                     }
                     Err(error) => {
                         log::warn!("Background vault optimizer failed to prepare: {}", error);
+                        failure_commit = optimizer_worker_failure_commit(&error);
+                        apply_failed = true;
                         None
                     }
                 };
@@ -895,14 +908,19 @@ fn start_vault_optimizer_worker(state: AppState) {
                 // read ticket, then force a complete authority rebuild so the
                 // witness is classified before this queue job can run again.
                 drop(root_guard);
-                let token = state
-                    .mutation_coordinator
-                    .as_ref()
-                    .ok_or_else(|| "mutation coordinator is unavailable".to_string())
-                    .and_then(|coordinator| {
-                        coordinator
-                            .current_authority_token()
-                            .map_err(|error| error.to_string())
+                let token = failure_commit
+                    .and_then(|commit| commit.authority_token)
+                    .map(Ok)
+                    .unwrap_or_else(|| {
+                        state
+                            .mutation_coordinator
+                            .as_ref()
+                            .ok_or_else(|| "mutation coordinator is unavailable".to_string())
+                            .and_then(|coordinator| {
+                                coordinator
+                                    .current_authority_token()
+                                    .map_err(|error| error.to_string())
+                            })
                     });
                 match token {
                     Ok(token) => match crate::commands::repair_after_authority_token(
@@ -952,6 +970,31 @@ fn start_vault_optimizer_worker(state: AppState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn optimizer_worker_failure_preserves_exact_authority_for_repair() {
+        let (state, _vault, _data) = crate::commands::commit_note_write_tests::build_test_state();
+        let authority = state
+            .mutation_coordinator
+            .as_ref()
+            .unwrap()
+            .current_authority_token()
+            .unwrap();
+        let mutation_id = crate::models::twin_event::ContentDigest::parse("b".repeat(64)).unwrap();
+        let error = anyhow::Error::new(
+            crate::services::twin_events::MutationError::AuthorityAdvanced {
+                mutation_id: mutation_id.clone(),
+                authority_token: authority.clone(),
+                target_aborted: false,
+                reason: "injected optimizer publication failure".into(),
+            },
+        );
+
+        let commit = optimizer_worker_failure_commit(&error)
+            .expect("the worker must retain the direct non-retryable commit");
+        assert_eq!(commit.mutation_id, Some(mutation_id));
+        assert_eq!(commit.authority_token, Some(authority));
+    }
 
     fn build_warm_start_state() -> (AppState, tempfile::TempDir, tempfile::TempDir) {
         let (mut state, vault, data) = crate::commands::commit_note_write_tests::build_test_state();

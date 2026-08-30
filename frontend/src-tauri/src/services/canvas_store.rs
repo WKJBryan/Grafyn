@@ -18,6 +18,16 @@ pub type TileResponseUpdate = (
     Option<f64>,
 );
 
+pub(crate) fn require_canvas_only_commit(
+    commit: &crate::services::twin_events::MutationCommit,
+) -> Result<()> {
+    anyhow::ensure!(
+        commit.authority_token.is_none(),
+        "Canvas-only mutation unexpectedly advanced content authority"
+    );
+    Ok(())
+}
+
 /// Service for managing canvas sessions (JSON file storage) with in-memory cache.
 ///
 /// The cache eliminates repeated disk reads — every get_session/list_sessions call
@@ -252,7 +262,8 @@ impl CanvasStore {
             std::fs::remove_file(&path)
                 .with_context(|| format!("Failed to delete session: {}", id))?;
         } else {
-            self.event_recorder
+            let commit = self
+                .event_recorder
                 .commit_mutation(
                     crate::services::twin_events::MutationOrigin::Local,
                     crate::models::twin_event::CausalStream::LocalOnly,
@@ -265,6 +276,7 @@ impl CanvasStore {
                     Vec::new(),
                 )
                 .map_err(anyhow::Error::new)?;
+            require_canvas_only_commit(&commit)?;
         }
         self.session_cache.remove(id);
         self.pending_bases.remove(id);
@@ -989,6 +1001,32 @@ mod tests {
     use crate::services::atomic_io::assert_no_tmp_siblings;
     use tempfile::tempdir;
 
+    #[derive(Debug)]
+    struct AuthorityBearingCanvasRecorder {
+        authority_token: crate::services::vault_namespace::VaultAuthorityTokenV1,
+    }
+
+    impl crate::services::twin_events::EventRecorder for AuthorityBearingCanvasRecorder {
+        fn commit_mutation(
+            &self,
+            _origin: crate::services::twin_events::MutationOrigin,
+            _stream: crate::models::twin_event::CausalStream,
+            _source_channel: crate::models::twin_event::SourceChannel,
+            _targets: Vec<crate::services::twin_events::TargetMutation>,
+            _drafts: Vec<crate::services::twin_events::TwinEventDraft>,
+        ) -> Result<
+            crate::services::twin_events::MutationCommit,
+            crate::services::twin_events::MutationError,
+        > {
+            Ok(crate::services::twin_events::MutationCommit {
+                mutation_id: None,
+                events: Vec::new(),
+                authority_token: Some(self.authority_token.clone()),
+                postcommit_warning: false,
+            })
+        }
+    }
+
     #[test]
     fn session_writes_are_atomic_with_no_tmp_litter() {
         let temp_dir = tempdir().expect("temp dir should be created");
@@ -1033,6 +1071,72 @@ mod tests {
 
         store.reload_authoritative_state();
         assert_eq!(store.get_session(&session.id).unwrap().title, "After");
+    }
+
+    #[test]
+    fn pure_canvas_json_commit_does_not_advance_authority() {
+        let root = tempdir().unwrap();
+        let data = root.path().join("data");
+        let vault = root.path().join("vault");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::create_dir(&vault).unwrap();
+        let event_store =
+            std::sync::Arc::new(crate::services::twin_events::TwinEventStore::new(&data));
+        event_store.initialize().unwrap();
+        let coordinator = std::sync::Arc::new(
+            crate::services::twin_events::MutationCoordinator::new(
+                &data,
+                &vault,
+                event_store,
+                std::sync::Arc::new(crate::services::twin_events::NoopMutationLifecycle),
+            )
+            .unwrap(),
+        );
+        let mut store = CanvasStore::with_event_recorder(data.join("canvas"), coordinator.clone());
+        let mut session = store
+            .create_session(SessionCreate {
+                title: "Canvas authority invariant".into(),
+                description: None,
+                tags: Vec::new(),
+            })
+            .unwrap();
+        let expected = coordinator.current_authority_token().unwrap();
+        session.viewport.x = 42.0;
+
+        let commit = store
+            .save_session_expecting_authority(&session, expected.clone())
+            .unwrap();
+
+        assert!(commit.authority_token.is_none());
+        assert_eq!(coordinator.current_authority_token().unwrap(), expected);
+    }
+
+    #[test]
+    fn canvas_delete_rejects_an_authority_bearing_commit() {
+        let root = tempdir().unwrap();
+        let canvas = root.path().join("canvas");
+        let session = CanvasStore::new(canvas.clone())
+            .create_session(SessionCreate {
+                title: "Reject unexpected authority".into(),
+                description: None,
+                tags: Vec::new(),
+            })
+            .unwrap();
+        let recorder = AuthorityBearingCanvasRecorder {
+            authority_token: crate::services::vault_namespace::VaultAuthorityTokenV1 {
+                root_scope: crate::services::twin_events::digest_bytes(b"canvas-test-scope"),
+                lease_epoch_uuid: "00000000-0000-4000-8000-000000000001".into(),
+                authority_generation: 1,
+            },
+        };
+        let mut store = CanvasStore::with_event_recorder(canvas.clone(), Arc::new(recorder));
+
+        let error = store.delete_session(&session.id).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("Canvas-only mutation unexpectedly advanced content authority"));
+        assert!(canvas.join(format!("{}.json", session.id)).exists());
     }
 
     fn build_response(model_id: &str) -> ModelResponse {
@@ -1440,12 +1544,13 @@ mod tests {
             context_version: Some("test-v1".into()),
         };
 
+        let expected = coordinator.current_authority_token().unwrap();
         coordinator.fail_once_at(crate::services::twin_events::MutationFaultPoint::AfterTarget(0));
-        assert!(canvas
-            .add_decision_tile(&session.id, tile, &mut twin, create)
-            .is_err());
-        assert_eq!(coordinator.pending_count().unwrap(), 1);
-        assert_eq!(coordinator.recover_pending().unwrap(), 1);
+        let (_, commit) = canvas
+            .add_decision_tile_expecting_authority(&session.id, tile, &mut twin, create, expected)
+            .unwrap();
+        assert!(commit.postcommit_warning);
+        assert_eq!(coordinator.pending_count().unwrap(), 0);
         assert_eq!(coordinator.recover_pending().unwrap(), 0);
 
         let captured = event_store.ordered_events().unwrap();
@@ -1693,26 +1798,29 @@ mod tests {
                 tags: Vec::new(),
             })
             .unwrap();
+        let expected = coordinator.current_authority_token().unwrap();
         coordinator.fail_once_at(crate::services::twin_events::MutationFaultPoint::AfterTarget(0));
-        assert!(store
-            .add_tile(
+        let (_, commit) = store
+            .add_tile_expecting_authority(
                 &session.id,
                 PromptTile {
                     id: "durable-before-event".into(),
                     prompt: "Persist me once".into(),
                     ..PromptTile::default()
                 },
+                expected,
             )
-            .is_err());
+            .unwrap();
+        assert!(commit.postcommit_warning);
 
         let path = data.join("canvas").join(format!("{}.json", session.id));
         let durable: CanvasSession = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
         let cached = store.get_session(&session.id).unwrap();
         assert_eq!(cached.prompt_tiles.len(), durable.prompt_tiles.len());
         assert_eq!(cached.prompt_tiles[0].id, durable.prompt_tiles[0].id);
-        assert!(event_store.ordered_events().unwrap().is_empty());
-        assert_eq!(coordinator.pending_count().unwrap(), 1);
-        assert_eq!(coordinator.recover_pending().unwrap(), 1);
+        assert_eq!(event_store.ordered_events().unwrap().len(), 1);
+        assert_eq!(coordinator.pending_count().unwrap(), 0);
+        assert_eq!(coordinator.recover_pending().unwrap(), 0);
         assert_eq!(event_store.ordered_events().unwrap().len(), 1);
     }
 
@@ -1745,7 +1853,7 @@ mod tests {
             .unwrap();
 
         coordinator.fail_once_at(crate::services::twin_events::MutationFaultPoint::AfterTarget(0));
-        assert!(store
+        store
             .update_viewport(
                 &session.id,
                 CanvasViewport {
@@ -1754,9 +1862,9 @@ mod tests {
                     zoom: 0.75,
                 },
             )
-            .is_err());
-        assert_eq!(coordinator.pending_count().unwrap(), 1);
-        assert_eq!(coordinator.recover_pending().unwrap(), 1);
+            .unwrap();
+        assert_eq!(coordinator.pending_count().unwrap(), 0);
+        assert_eq!(coordinator.recover_pending().unwrap(), 0);
         assert!(event_store.ordered_events().unwrap().is_empty());
         let durable = store.get_session(&session.id).unwrap();
         assert_eq!(durable.viewport.x, 7.0);
@@ -1793,17 +1901,21 @@ mod tests {
         let mut stale = CanvasStore::with_event_recorder(data.join("canvas"), coordinator.clone());
         stale.get_session(&session.id).unwrap();
 
+        let expected = coordinator.current_authority_token().unwrap();
         coordinator.fail_once_at(crate::services::twin_events::MutationFaultPoint::AfterStage);
-        assert!(first
-            .add_tile(
+        let (_, commit) = first
+            .add_tile_expecting_authority(
                 &session.id,
                 PromptTile {
                     id: "recovered-tile".into(),
                     prompt: "first".into(),
                     ..PromptTile::default()
                 },
+                expected,
             )
-            .is_err());
+            .unwrap();
+        assert!(commit.postcommit_warning);
+        assert_eq!(coordinator.pending_count().unwrap(), 0);
         stale
             .add_tile(
                 &session.id,
@@ -1868,9 +1980,10 @@ mod tests {
             },
         );
         store.add_tile(&session.id, tile).unwrap();
+        let expected = coordinator.current_authority_token().unwrap();
         coordinator.fail_once_at(crate::services::twin_events::MutationFaultPoint::AfterTarget(0));
-        assert!(store
-            .update_tile_response(
+        let commit = store
+            .update_tile_response_expecting_authority(
                 &session.id,
                 "tile",
                 "model",
@@ -1878,8 +1991,10 @@ mod tests {
                 ResponseStatus::Completed,
                 None,
                 None,
+                expected,
             )
-            .is_err());
+            .unwrap();
+        assert!(commit.postcommit_warning);
         store
             .update_tile_response(
                 &session.id,

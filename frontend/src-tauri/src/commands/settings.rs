@@ -1286,7 +1286,7 @@ mod tests {
         let ticket = crate::commands::acquire_root_epoch(&state).await.unwrap();
         let _snapshot = state.knowledge_store.read().await.list_notes().unwrap();
 
-        state
+        let peer_commit = state
             .mutation_coordinator
             .as_ref()
             .unwrap()
@@ -1301,6 +1301,7 @@ mod tests {
                 Vec::new(),
             )
             .unwrap();
+        assert!(peer_commit.authority_token.is_some());
 
         let error = ticket
             .finish(&state)

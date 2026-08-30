@@ -2,6 +2,7 @@ use crate::models::canvas::{CanvasSession, ContextMode, PromptType};
 use crate::models::settings::UserSettings;
 use crate::models::twin::TraceEventType;
 use crate::services::twin::TwinStore;
+use crate::AppState;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -113,22 +114,111 @@ pub(super) fn effective_model_ids(
     }
 }
 
-pub(super) async fn append_canvas_trace(
+/// Best-effort structural audit used only after an independently durable
+/// session/layout mutation. Governed traces must use the `Result`-returning
+/// `append_canvas_trace_expecting_authority` path below.
+pub(super) async fn append_optional_canvas_audit_trace(
     twin_store_arc: Arc<RwLock<TwinStore>>,
     session_id: &str,
     event_type: TraceEventType,
     payload: serde_json::Value,
 ) -> Option<crate::services::twin_events::MutationCommit> {
     let mut twin_store = twin_store_arc.write().await;
-    twin_store.clear_last_mutation_commit();
-    if let Err(error) = twin_store.append_trace_event(session_id, event_type, payload) {
-        log::error!(
-            "Failed to append twin trace for session '{}': {}",
-            session_id,
-            error
-        );
+    match twin_store.append_trace_event_with_commit(session_id, event_type, payload) {
+        Ok((_, commit)) => Some(commit),
+        Err(error) => {
+            if let Some(commit) = error
+                .downcast_ref::<crate::services::twin_events::MutationError>()
+                .and_then(|error| error.authority_advanced_commit())
+            {
+                return Some(commit);
+            }
+            log::error!(
+                "Failed to append twin trace for session '{}': {}",
+                session_id,
+                error
+            );
+            None
+        }
     }
-    twin_store.take_last_mutation_commit()
+}
+
+#[derive(Debug)]
+pub(super) struct CanvasTraceMutationError {
+    message: String,
+    repair_commit: Option<crate::services::twin_events::MutationCommit>,
+}
+
+impl CanvasTraceMutationError {
+    pub(super) fn precommit(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            repair_commit: None,
+        }
+    }
+
+    pub(super) fn repair_commit(&self) -> Option<&crate::services::twin_events::MutationCommit> {
+        self.repair_commit.as_ref()
+    }
+
+    pub(super) fn with_fallback_commit(
+        mut self,
+        commit: crate::services::twin_events::MutationCommit,
+    ) -> Self {
+        if self.repair_commit.is_none() && commit.authority_token.is_some() {
+            self.message = format!(
+                "{}; earlier Canvas work committed, so do not retry automatically",
+                self.message
+            );
+            self.repair_commit = Some(commit);
+        }
+        self
+    }
+}
+
+impl std::fmt::Display for CanvasTraceMutationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+pub(super) fn preserve_canvas_mutation_error(error: anyhow::Error) -> CanvasTraceMutationError {
+    let authority_outcome =
+        crate::services::knowledge_store::knowledge_authority_advanced_outcome(&error);
+    let repair_commit = authority_outcome
+        .as_ref()
+        .map(|outcome| outcome.commit.clone());
+    let target_aborted = authority_outcome
+        .as_ref()
+        .map(|outcome| outcome.target_aborted)
+        .unwrap_or(false);
+    let message = if target_aborted {
+        format!(
+            "Canvas mutation authority advanced but its target was aborted; do not retry automatically: {error}"
+        )
+    } else if repair_commit.is_some() {
+        format!("Canvas mutation authority advanced; do not retry automatically: {error}")
+    } else {
+        error.to_string()
+    };
+
+    CanvasTraceMutationError {
+        message,
+        repair_commit,
+    }
+}
+
+pub(super) async fn repair_canvas_trace_error(
+    state: &AppState,
+    error: &CanvasTraceMutationError,
+    operation: &str,
+) -> crate::commands::PostAuthorityRepair {
+    match error.repair_commit() {
+        Some(commit) => {
+            crate::commands::repair_after_authority_mutation(state, commit, operation).await
+        }
+        None => crate::commands::PostAuthorityRepair::NotRequired,
+    }
 }
 
 pub(super) async fn append_canvas_trace_expecting_authority(
@@ -137,19 +227,319 @@ pub(super) async fn append_canvas_trace_expecting_authority(
     event_type: TraceEventType,
     payload: serde_json::Value,
     expected: crate::services::vault_namespace::VaultAuthorityTokenV1,
-) -> Result<crate::services::vault_namespace::VaultAuthorityTokenV1, String> {
+) -> Result<crate::services::twin_events::MutationCommit, CanvasTraceMutationError> {
     let mut twin_store = twin_store_arc.write().await;
     let (_, commit) = twin_store
         .append_trace_event_expecting_authority(session_id, event_type, payload, expected)
-        .map_err(|error| error.to_string())?;
-    commit.authority_token.ok_or_else(|| {
-        "Twin trace mutation did not advance the content authority generation".to_string()
-    })
+        .map_err(|error| {
+            let aborted_commit = error
+                .downcast_ref::<crate::services::twin_events::MutationError>()
+                .filter(|error| error.authority_advanced_target_aborted())
+                .and_then(|error| error.authority_advanced_commit());
+            let message = if aborted_commit.is_some() {
+                format!(
+                    "Twin trace authority advanced but its target was aborted; do not retry automatically: {error}"
+                )
+            } else {
+                error.to_string()
+            };
+            CanvasTraceMutationError {
+                message,
+                repair_commit: aborted_commit,
+            }
+        })?;
+    if commit.authority_token.is_none() {
+        return Err(CanvasTraceMutationError::precommit(
+            "Twin trace mutation did not advance the content authority generation",
+        ));
+    }
+    Ok(commit)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn source_between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+        let start = source
+            .find(start)
+            .unwrap_or_else(|| panic!("missing source marker: {start}"));
+        let source = &source[start..];
+        let end = source
+            .find(end)
+            .unwrap_or_else(|| panic!("missing source marker: {end}"));
+        &source[..end]
+    }
+
+    #[test]
+    fn direct_canvas_abort_preserves_exact_commit_and_prohibits_retry() {
+        let mutation_id = crate::services::twin_events::digest_bytes(b"canvas-abort");
+        let authority_token = crate::services::vault_namespace::VaultAuthorityTokenV1 {
+            root_scope: crate::services::twin_events::digest_bytes(b"canvas-root"),
+            lease_epoch_uuid: uuid::Uuid::nil().to_string(),
+            authority_generation: 7,
+        };
+        let error = anyhow::Error::new(
+            crate::services::twin_events::MutationError::AuthorityAdvanced {
+                mutation_id: mutation_id.clone(),
+                authority_token: authority_token.clone(),
+                target_aborted: true,
+                reason: "guard drift".to_string(),
+            },
+        );
+
+        let preserved = preserve_canvas_mutation_error(error);
+
+        let repair_commit = preserved
+            .repair_commit()
+            .expect("the exact authority commit must survive the command boundary");
+        assert_eq!(repair_commit.mutation_id.as_ref(), Some(&mutation_id));
+        assert_eq!(
+            repair_commit.authority_token.as_ref(),
+            Some(&authority_token)
+        );
+        assert!(preserved.to_string().contains("target was aborted"));
+        assert!(preserved.to_string().contains("do not retry automatically"));
+    }
+
+    #[test]
+    fn knowledge_wrapped_canvas_commit_preserves_exact_commit_and_prohibits_retry() {
+        let root = tempfile::tempdir().unwrap();
+        let vault = root.path().join("vault");
+        let data = root.path().join("data");
+        std::fs::create_dir(&vault).unwrap();
+        std::fs::create_dir(&data).unwrap();
+        let events = Arc::new(crate::services::twin_events::TwinEventStore::new(&data));
+        events.initialize().unwrap();
+        let coordinator = Arc::new(
+            crate::services::twin_events::MutationCoordinator::new(
+                &data,
+                &vault,
+                events,
+                Arc::new(crate::services::twin_events::NoopMutationLifecycle),
+            )
+            .unwrap(),
+        );
+        let expected = coordinator.current_authority_token().unwrap();
+        let mut store = crate::services::knowledge_store::KnowledgeStore::with_event_recorder(
+            vault,
+            data,
+            coordinator.clone(),
+        );
+        coordinator.fail_next_replays_before_targets(2);
+        let error = store
+            .create_note_expecting_authority(
+                crate::models::note::NoteCreate {
+                    title: "Wrapped Canvas export".to_string(),
+                    content: "durable export".to_string(),
+                    relative_path: Some("wrapped-canvas-export.md".to_string()),
+                    aliases: Vec::new(),
+                    status: crate::models::note::NoteStatus::Evidence,
+                    tags: Vec::new(),
+                    schema_version: crate::models::note::CURRENT_NOTE_SCHEMA_VERSION,
+                    migration_source: None,
+                    optimizer_managed: false,
+                    properties: std::collections::HashMap::new(),
+                },
+                "canvas",
+                expected,
+            )
+            .unwrap_err();
+        assert!(error
+            .downcast_ref::<crate::services::twin_events::MutationError>()
+            .is_none());
+        let exact = crate::services::knowledge_store::knowledge_authority_advanced_outcome(&error)
+            .expect("KnowledgeStore must return its wrapped authority commit");
+
+        let preserved = preserve_canvas_mutation_error(error);
+
+        let repair_commit = preserved
+            .repair_commit()
+            .expect("the wrapped exact authority commit must survive the Canvas boundary");
+        assert_eq!(repair_commit.mutation_id, exact.commit.mutation_id);
+        assert_eq!(repair_commit.authority_token, exact.commit.authority_token);
+        assert_eq!(
+            repair_commit.authority_token,
+            Some(coordinator.current_authority_token().unwrap())
+        );
+        assert!(!exact.target_aborted);
+        assert!(preserved.to_string().contains("do not retry automatically"));
+    }
+
+    #[test]
+    fn precommit_trace_failure_preserves_the_prior_response_commit() {
+        let mutation_id = crate::services::twin_events::digest_bytes(b"canvas-response");
+        let authority_token = crate::services::vault_namespace::VaultAuthorityTokenV1 {
+            root_scope: crate::services::twin_events::digest_bytes(b"canvas-root"),
+            lease_epoch_uuid: uuid::Uuid::nil().to_string(),
+            authority_generation: 8,
+        };
+        let response_commit = crate::services::twin_events::MutationCommit {
+            mutation_id: Some(mutation_id.clone()),
+            events: Vec::new(),
+            authority_token: Some(authority_token.clone()),
+            postcommit_warning: false,
+        };
+
+        let preserved = CanvasTraceMutationError::precommit("trace failed before commit")
+            .with_fallback_commit(response_commit);
+
+        let repair_commit = preserved
+            .repair_commit()
+            .expect("the prior response commit must repair a precommit trace failure");
+        assert_eq!(repair_commit.mutation_id.as_ref(), Some(&mutation_id));
+        assert_eq!(
+            repair_commit.authority_token.as_ref(),
+            Some(&authority_token)
+        );
+        assert!(preserved.to_string().contains("do not retry automatically"));
+    }
+
+    #[test]
+    fn newer_trace_abort_commit_wins_over_response_fallback() {
+        let response_commit = crate::services::twin_events::MutationCommit {
+            mutation_id: Some(crate::services::twin_events::digest_bytes(
+                b"canvas-response",
+            )),
+            events: Vec::new(),
+            authority_token: Some(crate::services::vault_namespace::VaultAuthorityTokenV1 {
+                root_scope: crate::services::twin_events::digest_bytes(b"canvas-root"),
+                lease_epoch_uuid: uuid::Uuid::nil().to_string(),
+                authority_generation: 8,
+            }),
+            postcommit_warning: false,
+        };
+        let trace_mutation_id = crate::services::twin_events::digest_bytes(b"canvas-trace");
+        let trace_authority = crate::services::vault_namespace::VaultAuthorityTokenV1 {
+            root_scope: crate::services::twin_events::digest_bytes(b"canvas-root"),
+            lease_epoch_uuid: uuid::Uuid::nil().to_string(),
+            authority_generation: 9,
+        };
+        let trace_error = preserve_canvas_mutation_error(anyhow::Error::new(
+            crate::services::twin_events::MutationError::AuthorityAdvanced {
+                mutation_id: trace_mutation_id.clone(),
+                authority_token: trace_authority.clone(),
+                target_aborted: true,
+                reason: "trace guard drift".to_string(),
+            },
+        ))
+        .with_fallback_commit(response_commit);
+
+        let repair_commit = trace_error.repair_commit().unwrap();
+        assert_eq!(repair_commit.mutation_id.as_ref(), Some(&trace_mutation_id));
+        assert_eq!(
+            repair_commit.authority_token.as_ref(),
+            Some(&trace_authority)
+        );
+    }
+
+    #[test]
+    fn governed_canvas_callers_preserve_exact_commits_before_repair() {
+        let streaming = include_str!("streaming.rs");
+        let reflection = source_between(
+            streaming,
+            "let (_, commit) = match twin_store.record_reflection_card_expecting_authority",
+            "publication_commit = commit;",
+        );
+        assert!(reflection.contains("preserve_canvas_mutation_error"));
+        assert!(reflection.contains("with_fallback_commit(publication_commit.clone())"));
+        assert!(reflection.contains("repair_canvas_trace_error"));
+
+        let context = include_str!("context.rs");
+        let prediction = source_between(
+            context,
+            "pub(super) async fn run_sealed_twin_prediction",
+            "fn build_twin_context_prompt",
+        );
+        assert!(prediction.contains("preserve_canvas_mutation_error"));
+        assert!(prediction.contains("repair_canvas_trace_error"));
+        assert!(prediction.contains("repair_after_authority_mutation"));
+        assert!(!prediction.contains("repair_after_authority_token"));
+
+        let session = include_str!("session.rs");
+        let export = source_between(
+            session,
+            "pub async fn export_to_note",
+            "Ok(serde_json::json!",
+        );
+        assert!(export.contains("preserve_canvas_mutation_error"));
+        assert!(export.contains("repair_canvas_trace_error"));
+    }
+
+    #[test]
+    fn required_trace_failures_emit_user_visible_non_retry_errors() {
+        let streaming = include_str!("streaming.rs");
+        for marker in [
+            "Failed to append governed Canvas result trace",
+            "Failed to persist governed models-added trace",
+            "Failed to persist governed added-model result trace",
+            "Failed to persist governed regeneration trace",
+        ] {
+            let branch = source_between(streaming, marker, "return;");
+            assert!(
+                branch.contains("emit_persistence_error"),
+                "{marker} remains logs-only"
+            );
+        }
+
+        let debate = include_str!("debate.rs");
+        let start_failure = source_between(
+            debate,
+            "Canvas debate was saved, but its audit trace failed",
+            "return Ok(debate_id);",
+        );
+        assert!(start_failure.contains("CanvasStreamEvent::DebateError"));
+
+        let session = include_str!("session.rs");
+        let export_failure = source_between(
+            session,
+            "Canvas note export committed, but its audit trace could not be appended",
+            "return Ok(serde_json::json!",
+        );
+        assert!(export_failure.contains("CanvasStreamEvent::Error"));
+    }
+
+    #[tokio::test]
+    async fn governed_trace_helper_preserves_the_full_exact_commit() {
+        let root = tempfile::tempdir().unwrap();
+        let data = root.path().join("data");
+        let vault = root.path().join("vault");
+        let twin_root = data.join("twin/scope-one");
+        std::fs::create_dir_all(&twin_root).unwrap();
+        std::fs::create_dir(&vault).unwrap();
+        let events = Arc::new(crate::services::twin_events::TwinEventStore::new(&data));
+        events.initialize().unwrap();
+        let coordinator = Arc::new(
+            crate::services::twin_events::MutationCoordinator::new(
+                &data,
+                &vault,
+                events,
+                Arc::new(crate::services::twin_events::NoopMutationLifecycle),
+            )
+            .unwrap(),
+        );
+        let expected = coordinator.current_authority_token().unwrap();
+        coordinator.fail_once_at(crate::services::twin_events::MutationFaultPoint::AfterStage);
+        let store = Arc::new(RwLock::new(TwinStore::with_event_recorder(
+            twin_root,
+            data.join("twin"),
+            coordinator,
+        )));
+
+        let commit = append_canvas_trace_expecting_authority(
+            store,
+            "session-exact-commit",
+            TraceEventType::PromptSubmitted,
+            serde_json::json!({ "prompt": "preserve warning" }),
+            expected,
+        )
+        .await
+        .unwrap();
+
+        assert!(commit.mutation_id.is_some());
+        assert!(commit.postcommit_warning);
+        assert!(commit.authority_token.is_some());
+    }
 
     #[test]
     fn model_route_uses_ollama_for_all_vault_context_when_configured() {

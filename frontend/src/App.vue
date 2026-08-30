@@ -30,6 +30,23 @@ import { useToast } from '@/composables/useToast'
 const COMMITTED_WARNING_EVENT = 'grafyn://committed-warning'
 const DEGRADED_READINESS_MESSAGE =
   'Your change was saved, but derived views are temporarily unavailable.'
+const COMMITTED_WARNING_MESSAGES = new Map([
+  ['derived_state_unavailable', DEGRADED_READINESS_MESSAGE],
+  [
+    'optimizer_publication_pending',
+    'Your change was saved, but its optimizer audit publication is still pending.',
+  ],
+  [
+    'optimizer_rollback_recovery_pending',
+    'The rollback is accepted, but restoring the target bytes is still pending. Do not retry.',
+  ],
+  [
+    'optimizer_rollback_not_applied',
+    'The rollback did not restore target bytes after authority advanced.',
+  ],
+])
+const UNKNOWN_COMMITTED_WARNING_MESSAGE =
+  'Your change was saved, but follow-up work is temporarily unavailable.'
 
 const route = useRoute()
 const guide = useGuide()
@@ -46,7 +63,6 @@ function committedWarningIdentity(payload) {
   return JSON.stringify({
     operation: payload?.operation ?? warning?.operation ?? null,
     code: warning?.code ?? null,
-    message: warning?.message ?? null,
   })
 }
 
@@ -57,7 +73,10 @@ function handleCommittedWarning(event) {
   if (seenCommittedWarnings.has(identity)) return
 
   seenCommittedWarnings.add(identity)
-  toast.warning(DEGRADED_READINESS_MESSAGE)
+  const warning = event?.payload?.warning ?? event?.payload
+  toast.warning(
+    COMMITTED_WARNING_MESSAGES.get(warning?.code) ?? UNKNOWN_COMMITTED_WARNING_MESSAGE,
+  )
 }
 
 async function registerCommittedWarningListener() {

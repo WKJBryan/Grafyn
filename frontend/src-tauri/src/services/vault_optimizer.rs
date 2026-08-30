@@ -18,6 +18,13 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use uuid::Uuid;
 
+mod publication;
+#[path = "vault_optimizer/rollback.rs"]
+mod rollback;
+#[cfg(test)]
+#[path = "vault_optimizer_rollback_tests.rs"]
+mod rollback_tests;
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct QueuedOptimizerNote {
@@ -31,6 +38,15 @@ struct QueuedOptimizerNote {
     /// parked into the inbox as a failed decision instead of retried forever.
     #[serde(default)]
     attempts: u32,
+    #[serde(default)]
+    pending_parking: Option<PendingOptimizerParkingV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PendingOptimizerParkingV1 {
+    error: String,
+    at: DateTime<Utc>,
 }
 
 /// A processing failure gets `MAX_OPTIMIZER_ATTEMPTS` tries (each a separate
@@ -42,11 +58,11 @@ const MAX_OPTIMIZER_ATTEMPTS: u32 = 3;
 const OPTIMIZER_STATE_SCHEMA_VERSION: u16 = 1;
 const PENDING_PUBLICATIONS_DIRECTORY: &str = "pending-publications-v1";
 const MAX_PENDING_PUBLICATIONS: usize = 64;
-const MAX_PENDING_PUBLICATION_BYTES: usize = 1024 * 1024;
+const MAX_PENDING_PUBLICATION_BYTES: usize = 16 * 1024 * 1024;
 const MAX_OPTIMIZER_STATE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_OPTIMIZER_AUDIT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_OPTIMIZER_AUDIT_ENTRIES: usize = 4096;
-const MAX_OPTIMIZER_CHANGE_BYTES: usize = 1024 * 1024;
+const MAX_OPTIMIZER_CHANGE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_OPTIMIZER_ORPHAN_TEMPS: usize = 64;
 const CHANGES_DIRECTORY: &str = "changes";
 const QUEUE_KEY: &str = "queue.json";
@@ -104,6 +120,8 @@ struct OptimizerChange {
     markdown_relative_path: Option<String>,
     #[serde(default)]
     created_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    exact_rollback: Option<rollback::ExactOptimizerRollbackMaterialV1>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -115,6 +133,8 @@ struct PendingOptimizerPublication {
     audit_written: bool,
     counted: bool,
     queue_removed: bool,
+    #[serde(default)]
+    abort_queue_reconciled: bool,
     expected_authority: Option<crate::services::vault_namespace::VaultAuthorityTokenV1>,
     mutation_id: Option<crate::models::twin_event::ContentDigest>,
     committed_authority: Option<crate::services::vault_namespace::VaultAuthorityTokenV1>,
@@ -131,6 +151,7 @@ struct PendingOptimizerPublication {
 enum OptimizerPublicationPhase {
     RetryFenced,
     Prepared,
+    Aborted,
     Committed,
 }
 
@@ -139,9 +160,13 @@ enum OptimizerPublicationPhase {
 enum OptimizerAuditEventV1 {
     Rollback {
         change_id: String,
+        #[serde(default)]
+        rollback_id: String,
         at: DateTime<Utc>,
     },
     OptimizerParked {
+        #[serde(default)]
+        job_id: String,
         note_id: String,
         attempts: u32,
         error: String,
@@ -178,9 +203,13 @@ enum OptimizerPublicationTarget {
 pub struct VaultOptimizerService {
     optimizer_dir: PathBuf,
     optimizer_root: Option<std::sync::Arc<crate::services::twin_events::AnchoredRoot>>,
+    #[cfg_attr(not(test), allow(dead_code))]
     queue_path: PathBuf,
+    #[cfg_attr(not(test), allow(dead_code))]
     decisions_path: PathBuf,
+    #[cfg_attr(not(test), allow(dead_code))]
     events_path: PathBuf,
+    #[cfg_attr(not(test), allow(dead_code))]
     changes_dir: PathBuf,
     state: OptimizerState,
     #[cfg(test)]
@@ -189,6 +218,8 @@ pub struct VaultOptimizerService {
     fail_committed_publication_once: bool,
     #[cfg(test)]
     fail_retry_fence_stage_after_write_once: bool,
+    #[cfg(test)]
+    fail_terminal_parking_after_publication_once: bool,
     #[cfg(test)]
     pause_after_retry_fence_once: Option<(
         std::sync::Arc<std::sync::Barrier>,
@@ -233,6 +264,7 @@ impl VaultOptimizerService {
             .map_err(anyhow::Error::new)?;
         root.open_directory(PENDING_PUBLICATIONS_DIRECTORY, true)
             .map_err(anyhow::Error::new)?;
+        rollback::initialize_root(&root)?;
 
         let mut service = Self {
             optimizer_dir,
@@ -248,6 +280,8 @@ impl VaultOptimizerService {
             fail_committed_publication_once: false,
             #[cfg(test)]
             fail_retry_fence_stage_after_write_once: false,
+            #[cfg(test)]
+            fail_terminal_parking_after_publication_once: false,
             #[cfg(test)]
             pause_after_retry_fence_once: None,
             #[cfg(test)]
@@ -274,6 +308,7 @@ impl VaultOptimizerService {
         if let Some(root) = optimizer_root.as_deref() {
             let _ = root.open_directory(CHANGES_DIRECTORY, true);
             let _ = root.open_directory(PENDING_PUBLICATIONS_DIRECTORY, true);
+            let _ = rollback::initialize_root(root);
         }
         Self {
             queue_path: optimizer_dir.join("queue.json"),
@@ -290,6 +325,8 @@ impl VaultOptimizerService {
             #[cfg(test)]
             fail_retry_fence_stage_after_write_once: false,
             #[cfg(test)]
+            fail_terminal_parking_after_publication_once: false,
+            #[cfg(test)]
             pause_after_retry_fence_once: None,
             #[cfg(test)]
             pause_before_markdown_digest_once: None,
@@ -304,6 +341,7 @@ impl VaultOptimizerService {
         self.optimizer_dir == data_path.join("vault_migration").join("optimizer")
     }
 
+    #[cfg(test)]
     pub(crate) fn state_revision(&self) -> u64 {
         self.state.state_revision
     }
@@ -357,7 +395,8 @@ impl VaultOptimizerService {
                 self.state.schema_version
             );
         }
-        self.validate_persisted_state()
+        self.validate_persisted_state()?;
+        self.recover_pending_parkings()
     }
 
     #[cfg(test)]
@@ -373,6 +412,11 @@ impl VaultOptimizerService {
     #[cfg(test)]
     fn fail_next_retry_fence_stage_after_write(&mut self) {
         self.fail_retry_fence_stage_after_write_once = true;
+    }
+
+    #[cfg(test)]
+    fn fail_next_terminal_parking_after_publication(&mut self) {
+        self.fail_terminal_parking_after_publication_once = true;
     }
 
     #[cfg(test)]
@@ -453,6 +497,9 @@ impl VaultOptimizerService {
             if !job_ids.insert(job.job_id.as_str()) || !note_ids.insert(job.note_id.as_str()) {
                 anyhow::bail!("optimizer queue contains duplicate job identity");
             }
+            if job.pending_parking.is_some() && job.attempts < MAX_OPTIMIZER_ATTEMPTS {
+                anyhow::bail!("optimizer parking witness precedes the terminal attempt");
+            }
         }
         self.load_decisions()?;
         self.load_inbox()?;
@@ -477,6 +524,7 @@ impl VaultOptimizerService {
         for (_, pending) in self.load_pending_publications()? {
             validate_pending_publication(&pending)?;
         }
+        rollback::validate_pending_rollbacks(self)?;
         Ok(())
     }
 
@@ -496,6 +544,7 @@ impl VaultOptimizerService {
             reason: reason.to_string(),
             enqueued_at: Utc::now(),
             attempts: 0,
+            pending_parking: None,
         });
     }
 
@@ -556,101 +605,13 @@ impl VaultOptimizerService {
         Ok(inbox)
     }
 
-    pub fn rollback_change(
-        &mut self,
-        change_id: &str,
-        store: &mut KnowledgeStore,
-    ) -> Result<VaultOptimizerRollbackResult> {
-        self.rollback_change_internal(change_id, store, None)
-    }
-
     pub(crate) fn rollback_change_expecting_authority(
         &mut self,
         change_id: &str,
         store: &mut KnowledgeStore,
         expected: crate::services::vault_namespace::VaultAuthorityTokenV1,
-    ) -> Result<VaultOptimizerRollbackResult> {
-        self.rollback_change_internal(change_id, store, Some(expected))
-    }
-
-    fn rollback_change_internal(
-        &mut self,
-        change_id: &str,
-        store: &mut KnowledgeStore,
-        expected: Option<crate::services::vault_namespace::VaultAuthorityTokenV1>,
-    ) -> Result<VaultOptimizerRollbackResult> {
-        let change = self
-            .read_change(change_id)
-            .with_context(|| format!("Optimizer change '{}' not found", change_id))?;
-
-        if change.mode == "sidecar_first" || change.overlay_after.is_some() {
-            if change
-                .overlay_before
-                .as_ref()
-                .is_none_or(serde_json::Value::is_null)
-            {
-                if let Some(expected) = expected.clone() {
-                    store.delete_overlay_from_source_expecting_authority(
-                        &change.note_id,
-                        "vault_optimizer",
-                        expected,
-                    )?;
-                } else {
-                    store.delete_overlay(&change.note_id)?;
-                }
-            } else {
-                let overlay_before = change
-                    .overlay_before
-                    .as_ref()
-                    .expect("non-null overlay was checked above");
-                if let Some(expected) = expected.clone() {
-                    store.write_overlay_from_source_expecting_authority(
-                        &change.note_id,
-                        overlay_before,
-                        "vault_optimizer",
-                        expected,
-                    )?;
-                } else {
-                    store.write_overlay(&change.note_id, overlay_before)?;
-                }
-            }
-        } else if let Some(note_before) = change.note_before {
-            let update = NoteUpdate {
-                title: Some(note_before.title),
-                content: Some(note_before.content),
-                relative_path: Some(note_before.relative_path),
-                aliases: Some(note_before.aliases),
-                status: Some(note_before.status),
-                tags: Some(note_before.tags),
-                schema_version: Some(note_before.schema_version),
-                migration_source: note_before.migration_source,
-                optimizer_managed: Some(note_before.optimizer_managed),
-                properties: Some(note_before.properties),
-            };
-            if let Some(expected) = expected {
-                store.update_note_expecting_authority(
-                    &change.note_id,
-                    update,
-                    "vault_optimizer",
-                    expected,
-                )?;
-            } else {
-                store.update_note_from_source(&change.note_id, update, "vault_optimizer")?;
-            }
-        }
-
-        self.state.rollback_count += 1;
-        self.append_event(OptimizerAuditEventV1::Rollback {
-            change_id: change_id.to_string(),
-            at: Utc::now(),
-        })?;
-        self.persist_state()?;
-
-        Ok(VaultOptimizerRollbackResult {
-            change_id: change_id.to_string(),
-            rolled_back: true,
-            message: "Optimizer change rolled back".to_string(),
-        })
+    ) -> Result<OptimizerRollbackMutationOutcome> {
+        rollback::rollback_change(self, change_id, store, expected)
     }
 
     /// Advances the optimizer queue using only *read* access to the vault.
@@ -710,6 +671,10 @@ impl VaultOptimizerService {
         let Some(job) = self.state.queue.first().cloned() else {
             return Ok(OptimizerTick::NoWrite);
         };
+        if job.pending_parking.is_some() {
+            self.finish_pending_parking(&job)?;
+            return Ok(OptimizerTick::NoWrite);
+        }
         if let Some((_, pending)) = self
             .load_pending_publications()?
             .into_iter()
@@ -887,8 +852,10 @@ impl VaultOptimizerService {
         let crate::services::knowledge_store::OptimizerNoteSnapshot {
             note: current,
             markdown_precondition,
+            markdown_raw_bytes,
             overlay_value,
             overlay_digest,
+            overlay_raw_bytes,
         } = snapshot;
 
         // Same guard as `prepare_next`: an external edit in the gap may have
@@ -931,11 +898,15 @@ impl VaultOptimizerService {
             self.defer_or_park_job_fresh(&job.job_id, &error)?;
             return Ok(OptimizerMutationResult::NoWrite);
         }
-        let proposal = if sidecar_target_is_already_exact {
-            proposal
-        } else {
-            refreshed_proposal
-        };
+        if sidecar_target_is_already_exact {
+            // The external writer satisfied the exact proposal before this
+            // optimizer acquired an owner fence. Complete the queue item as a
+            // no-op; the strict coordinator path intentionally refuses to
+            // claim already-present bytes without an owned receipt.
+            self.complete_noop_job_fresh(&job.job_id)?;
+            return Ok(OptimizerMutationResult::NoWrite);
+        }
+        let proposal = refreshed_proposal;
 
         #[cfg(test)]
         if edit_mode != "sidecar_first" {
@@ -964,11 +935,40 @@ impl VaultOptimizerService {
                     .clone()
                     .expect("sidecar overlay was constructed above");
                 let after_bytes = serde_json::to_vec_pretty(&overlay_after)?;
+                let after_digest = crate::services::twin_events::digest_bytes(&after_bytes);
+                let restore_before = before_digest.as_ref().map_or(
+                    crate::services::twin_events::BeforeImage::Absent,
+                    |digest| crate::services::twin_events::BeforeImage::Sha256(digest.clone()),
+                );
+                let apply_after =
+                    crate::services::twin_events::BeforeImage::Sha256(after_digest.clone());
+                let restore_utf8 = overlay_raw_bytes
+                    .map(String::from_utf8)
+                    .transpose()
+                    .context("optimizer overlay source is not UTF-8")?;
+                let rollback_governance = store.optimizer_overlay_governance(
+                    &source_relative_path,
+                    &markdown_raw_bytes,
+                    restore_utf8.as_deref().map(str::as_bytes),
+                )?;
+                let apply_governance = store.optimizer_overlay_governance(
+                    &source_relative_path,
+                    &markdown_raw_bytes,
+                    Some(&after_bytes),
+                )?;
+                let apply_payload_digest = rollback::effective_sidecar_digest(
+                    &source_digest,
+                    &apply_after,
+                );
+                let apply_evidence_digest = rollback::effective_sidecar_digest(
+                    &source_digest,
+                    &restore_before,
+                );
                 Ok((
                     OptimizerPublicationTarget::Overlay {
                         note_id: current.id.clone(),
                         before_digest,
-                        after_digest: crate::services::twin_events::digest_bytes(&after_bytes),
+                        after_digest,
                         source_relative_path: source_relative_path.clone(),
                         source_digest: Some(source_digest.clone()),
                     },
@@ -981,6 +981,26 @@ impl VaultOptimizerService {
                         markdown_before_digest: Some(source_digest),
                         markdown_relative_path: Some(source_relative_path),
                         created_at: decision.created_at,
+                        exact_rollback: Some(rollback::ExactOptimizerRollbackMaterialV1 {
+                            schema_version:
+                                rollback::EXACT_OPTIMIZER_ROLLBACK_SCHEMA_VERSION,
+                            target_kind:
+                                crate::services::twin_events::TargetKind::OverlayJson,
+                            target_key: format!("{}.json", current.id),
+                            restore_before,
+                            restore_utf8,
+                            apply_after,
+                            source_relative_path: markdown_precondition
+                                .relative_path()
+                                .to_string(),
+                            source_digest: markdown_precondition.expected_digest().clone(),
+                            apply_payload_digest: apply_payload_digest.clone(),
+                            apply_evidence_digest: apply_evidence_digest.clone(),
+                            rollback_payload_digest: apply_evidence_digest,
+                            rollback_evidence_digest: apply_payload_digest,
+                            apply_governance,
+                            rollback_governance,
+                        }),
                         ..Default::default()
                     },
                     None,
@@ -998,11 +1018,14 @@ impl VaultOptimizerService {
                 if before_path != after_path {
                     anyhow::bail!("optimizer rewrite unexpectedly changed the note path");
                 }
+                let after_digest = crate::services::twin_events::digest_bytes(&after_bytes);
+                let restore_utf8 = String::from_utf8(markdown_raw_bytes)
+                    .context("optimizer Markdown source is not UTF-8")?;
                 Ok((
                     OptimizerPublicationTarget::Markdown {
                         relative_path: before_path.clone(),
                         before_digest: before_digest.clone(),
-                        after_digest: crate::services::twin_events::digest_bytes(&after_bytes),
+                        after_digest: after_digest.clone(),
                     },
                     OptimizerChange {
                         change_id: change_id.clone(),
@@ -1013,6 +1036,29 @@ impl VaultOptimizerService {
                         markdown_before_digest: Some(before_digest.clone()),
                         markdown_relative_path: Some(before_path.clone()),
                         created_at: decision.created_at,
+                        exact_rollback: Some(rollback::ExactOptimizerRollbackMaterialV1 {
+                            schema_version:
+                                rollback::EXACT_OPTIMIZER_ROLLBACK_SCHEMA_VERSION,
+                            target_kind: crate::services::twin_events::TargetKind::Markdown,
+                            target_key: before_path.clone(),
+                            restore_before:
+                                crate::services::twin_events::BeforeImage::Sha256(
+                                    before_digest.clone(),
+                                ),
+                            restore_utf8: Some(restore_utf8),
+                            apply_after:
+                                crate::services::twin_events::BeforeImage::Sha256(
+                                    after_digest.clone(),
+                                ),
+                            source_relative_path: before_path,
+                            source_digest: before_digest.clone(),
+                            apply_payload_digest: after_digest.clone(),
+                            apply_evidence_digest: before_digest.clone(),
+                            rollback_payload_digest: before_digest,
+                            rollback_evidence_digest: after_digest,
+                            apply_governance: store.optimizer_note_governance(&exact),
+                            rollback_governance: store.optimizer_note_governance(&current),
+                        }),
                         ..Default::default()
                     },
                     Some(exact),
@@ -1038,6 +1084,7 @@ impl VaultOptimizerService {
             audit_written: false,
             counted: false,
             queue_removed: false,
+            abort_queue_reconciled: false,
             expected_authority: expected_authority.clone(),
             mutation_id: None,
             committed_authority: None,
@@ -1130,1118 +1177,6 @@ impl VaultOptimizerService {
         })?;
         self.commit_staged_publication(store, publication, None)
     }
-
-    fn commit_staged_publication(
-        &mut self,
-        store: &mut KnowledgeStore,
-        mut publication: PendingOptimizerPublication,
-        compatibility_update: Option<NoteUpdate>,
-    ) -> Result<OptimizerMutationResult<OptimizerAppliedResult>> {
-        let expected_authority = publication.expected_authority.clone();
-        let change_id = publication.change_id.clone();
-        let job_id = publication.job.job_id.clone();
-        let note_id = publication.note.id.clone();
-        let source_precondition = match &publication.target {
-            OptimizerPublicationTarget::Overlay {
-                source_relative_path,
-                source_digest,
-                ..
-            } => {
-                let source_digest = source_digest.clone().ok_or_else(|| {
-                    anyhow::anyhow!("optimizer sidecar witness lacks its source digest")
-                });
-                match source_digest.and_then(|digest| {
-                    store.optimizer_markdown_precondition(source_relative_path, digest)
-                }) {
-                    Ok(precondition) => Some(precondition),
-                    Err(error) => {
-                        if expected_authority.is_some() {
-                            self.abort_retry_fence_and_defer(&change_id, &job_id, &error, true)?;
-                        } else {
-                            self.defer_or_park_job_fresh(&job_id, &error)?;
-                        }
-                        return Ok(OptimizerMutationResult::NoWrite);
-                    }
-                }
-            }
-            OptimizerPublicationTarget::Markdown { .. } => None,
-        };
-        if let Some(precondition) = source_precondition.as_ref() {
-            if let Err(error) = precondition.verify().map_err(anyhow::Error::new) {
-                if expected_authority.is_some() {
-                    self.abort_retry_fence_and_defer(&change_id, &job_id, &error, true)?;
-                } else {
-                    self.defer_or_park_job_fresh(&job_id, &error)?;
-                }
-                return Ok(OptimizerMutationResult::NoWrite);
-            }
-        }
-        let source_guard = if expected_authority.is_some() {
-            match source_precondition.as_ref() {
-                Some(precondition) => match precondition.retained_target() {
-                    Ok(target) => Some(target),
-                    Err(error) => {
-                        let error = anyhow::Error::new(error);
-                        self.abort_retry_fence_and_defer(&change_id, &job_id, &error, true)?;
-                        return Ok(OptimizerMutationResult::NoWrite);
-                    }
-                },
-                None => None,
-            }
-        } else {
-            None
-        };
-
-        // No optimizer state lock is held across this authority CAS. The
-        // coordinator hooks durably install Prepared after it has finalized
-        // the exact intent and mark Committed before releasing the shared
-        // process lock, closing the post-effect publication race.
-        let optimizer_root = self.retained_optimizer_root_handle()?;
-        let prepared_template = publication.clone();
-        let committed_template = publication.clone();
-        let fail_prepared_publication = {
-            #[cfg(test)]
-            {
-                std::mem::take(&mut self.fail_prepared_publication_once)
-            }
-            #[cfg(not(test))]
-            {
-                false
-            }
-        };
-        let fail_committed_publication = {
-            #[cfg(test)]
-            {
-                std::mem::take(&mut self.fail_committed_publication_once)
-            }
-            #[cfg(not(test))]
-            {
-                false
-            }
-        };
-        let post_publication = std::cell::RefCell::new(None);
-        let post_error = std::cell::RefCell::new(None);
-        #[cfg(test)]
-        let mut pause_after_prepared_publication =
-            self.pause_after_prepared_publication_once.take();
-        let mut prepared_hook = |intent: &crate::services::twin_events::MutationIntentV1| {
-            if fail_prepared_publication {
-                return Err(crate::services::twin_events::MutationError::Io(
-                    "injected optimizer Prepared publication failure".into(),
-                ));
-            }
-            if let Some(precondition) = source_precondition.as_ref() {
-                precondition.verify()?;
-            }
-            let mut prepared = prepared_template.clone();
-            let expected = prepared.expected_authority.as_ref().ok_or_else(|| {
-                crate::services::twin_events::MutationError::Invalid(
-                    "optimizer witness requires an exact source authority".into(),
-                )
-            })?;
-            let targets_match = match &prepared.target {
-                OptimizerPublicationTarget::Overlay {
-                    note_id,
-                    before_digest,
-                    after_digest,
-                    source_relative_path,
-                    source_digest,
-                } => {
-                    let overlay_before = before_digest.as_ref().map_or(
-                        crate::services::twin_events::BeforeImage::Absent,
-                        |digest| crate::services::twin_events::BeforeImage::Sha256(digest.clone()),
-                    );
-                    source_digest.as_ref().is_some_and(|source_digest| {
-                        intent.targets.len() == 2
-                            && intent.targets.iter().any(|target| {
-                                target.kind == crate::services::twin_events::TargetKind::OverlayJson
-                                    && target.relative_key == format!("{note_id}.json")
-                                    && target.before == overlay_before
-                                    && &target.after_digest == after_digest
-                            })
-                            && intent.targets.iter().any(|target| {
-                                target.kind == crate::services::twin_events::TargetKind::Markdown
-                                    && target.relative_key == *source_relative_path
-                                    && target.before
-                                        == crate::services::twin_events::BeforeImage::Sha256(
-                                            source_digest.clone(),
-                                        )
-                                    && target.after_digest == *source_digest
-                            })
-                    })
-                }
-                OptimizerPublicationTarget::Markdown {
-                    relative_path,
-                    before_digest,
-                    after_digest,
-                } => {
-                    intent.targets.len() == 1
-                        && intent.targets.first().is_some_and(|target| {
-                            target.kind == crate::services::twin_events::TargetKind::Markdown
-                                && target.relative_key == *relative_path
-                                && target.before
-                                    == crate::services::twin_events::BeforeImage::Sha256(
-                                        before_digest.clone(),
-                                    )
-                                && &target.after_digest == after_digest
-                        })
-                }
-            };
-            if intent.schema_version != 3
-                || !intent.retain_commit_receipt
-                || intent.markdown_root_scope.as_ref() != Some(&expected.root_scope)
-                || !targets_match
-            {
-                return Err(crate::services::twin_events::MutationError::Invalid(
-                    "optimizer witness does not bind the finalized mutation intent".into(),
-                ));
-            }
-            prepared.phase = OptimizerPublicationPhase::Prepared;
-            prepared.mutation_id = Some(intent.mutation_id.clone());
-            if prepared.expected_authority.is_some()
-                && intent.content_authority_generation
-                    != prepared
-                        .expected_authority
-                        .as_ref()
-                        .and_then(|token| token.authority_generation.checked_add(1))
-            {
-                return Err(crate::services::twin_events::MutationError::Invalid(
-                    "optimizer publication authority generation mismatch".into(),
-                ));
-            }
-            write_pending_publication(&optimizer_root, &prepared).map_err(|error| {
-                crate::services::twin_events::MutationError::Io(error.to_string())
-            })?;
-            #[cfg(test)]
-            if let Some((entered, resume)) = pause_after_prepared_publication.take() {
-                entered.wait();
-                resume.wait();
-            }
-            Ok(())
-        };
-        let committed_root = self.retained_optimizer_root_handle()?;
-        let mut committed_hook = |commit: &crate::services::twin_events::MutationCommit| {
-            if fail_committed_publication {
-                let error = "injected optimizer Committed publication failure".to_string();
-                *post_error.borrow_mut() = Some(error);
-                return Err(crate::services::twin_events::MutationError::Io(
-                    "optimizer committed publication could not be persisted".into(),
-                ));
-            }
-            let mut committed = committed_template.clone();
-            committed.phase = OptimizerPublicationPhase::Committed;
-            committed.retry_fenced = true;
-            committed.mutation_id = commit.mutation_id.clone();
-            committed.committed_authority = commit.authority_token.clone();
-            match write_pending_publication(&committed_root, &committed) {
-                Ok(()) => {
-                    *post_publication.borrow_mut() = Some(committed);
-                    Ok(())
-                }
-                Err(error) => {
-                    *post_error.borrow_mut() = Some(error.to_string());
-                    Err(crate::services::twin_events::MutationError::Io(
-                        "optimizer committed publication could not be persisted".into(),
-                    ))
-                }
-            }
-        };
-
-        #[cfg(test)]
-        if let Some((entered, resume)) = self.pause_before_prepared_hook_once.take() {
-            entered.wait();
-            resume.wait();
-        }
-
-        let write_result =
-            if let Some(overlay_after) = publication.change.overlay_after.as_ref() {
-                if expected_authority.is_some() {
-                    store.write_overlay_from_source_with_authority_and_hooks(
-                        &note_id,
-                        overlay_after,
-                        "vault_optimizer",
-                        expected_authority.clone(),
-                        &mut prepared_hook,
-                        &mut committed_hook,
-                        true,
-                        source_guard,
-                    )
-                } else {
-                    store.write_overlay_from_source_with_authority(
-                        &note_id,
-                        overlay_after,
-                        "vault_optimizer",
-                        None,
-                    )
-                }
-            } else {
-                let before =
-                    publication.change.note_before.clone().ok_or_else(|| {
-                        anyhow::anyhow!("optimizer publication has no source note")
-                    })?;
-                let before_digest = publication
-                    .change
-                    .markdown_before_digest
-                    .clone()
-                    .ok_or_else(|| anyhow::anyhow!("optimizer publication has no source digest"))?;
-                let exact =
-                    publication.change.note_after.clone().ok_or_else(|| {
-                        anyhow::anyhow!("optimizer publication has no exact note")
-                    })?;
-                match expected_authority.clone() {
-                    Some(expected) => store
-                        .replace_note_exact_expecting_authority_with_hooks(
-                            &note_id,
-                            before,
-                            before_digest,
-                            exact,
-                            "vault_optimizer",
-                            expected,
-                            &mut prepared_hook,
-                            &mut committed_hook,
-                        )
-                        .map(|(_, commit)| commit),
-                    None => store
-                        .update_note_from_source_with_commit(
-                            &note_id,
-                            compatibility_update.ok_or_else(|| {
-                                anyhow::anyhow!("optimizer compatibility update is missing")
-                            })?,
-                            "vault_optimizer",
-                        )
-                        .map(|(_, commit)| commit),
-                }
-            };
-        let commit = match write_result {
-            Ok(commit) => commit,
-            Err(error) => {
-                let aborted_precondition = error
-                    .downcast_ref::<crate::services::twin_events::MutationError>()
-                    .and_then(|error| match error {
-                        crate::services::twin_events::MutationError::AbortedPrecondition {
-                            mutation_id,
-                            authority_advanced,
-                        } => Some((mutation_id.clone(), *authority_advanced)),
-                        _ => None,
-                    });
-                if let Some((mutation_id, authority_advanced)) = aborted_precondition {
-                    if self.abort_precondition_owner_and_defer(
-                        &change_id,
-                        &job_id,
-                        &mutation_id,
-                        &error,
-                    )? && !authority_advanced
-                    {
-                        return Ok(OptimizerMutationResult::NoWrite);
-                    }
-                    return Err(error);
-                }
-                // A RetryFenced witness proves the Prepared hook never
-                // completed, so no authoritative effect could have started.
-                // Prepared/Committed witnesses remain for exact rebuild
-                // classification and are never cleared optimistically.
-                if expected_authority.is_some() {
-                    if self.abort_retry_fence_and_defer(&change_id, &job_id, &error, false)? {
-                        return Ok(OptimizerMutationResult::NoWrite);
-                    }
-                }
-                return Err(error);
-            }
-        };
-        if expected_authority.is_some()
-            && commit.mutation_id.is_none()
-            && commit.authority_token.is_none()
-        {
-            self.complete_retry_fenced_noop(&change_id, &job_id)?;
-            return Ok(OptimizerMutationResult::NoWrite);
-        }
-        publication.phase = OptimizerPublicationPhase::Committed;
-        publication.retry_fenced = true;
-        publication.mutation_id = commit.mutation_id.clone();
-        publication.committed_authority = commit.authority_token.clone();
-        let mark_result = if expected_authority.is_none() {
-            Ok(())
-        } else if let Some(error) = post_error.into_inner() {
-            Err(anyhow::anyhow!(error))
-        } else if let Some(committed_publication) = post_publication.into_inner() {
-            publication = committed_publication;
-            Ok(())
-        } else {
-            Err(anyhow::anyhow!(
-                "optimizer committed hook did not publish its durable fence"
-            ))
-        };
-        let warning = match mark_result {
-            Ok(()) if expected_authority.is_some() && !commit.postcommit_warning => None,
-            Ok(()) if expected_authority.is_some() => Some(
-                crate::models::mutation::CommittedMutationWarningV1::derived_state_unavailable(),
-            ),
-            Ok(()) => match self.with_locked_fresh_state(|service| {
-                service.finalize_compatibility_publication(&publication)
-            }) {
-                Ok(()) => None,
-                Err(error) => {
-                    log::error!("Optimizer compatibility publication {change_id} failed: {error}");
-                    Some(
-                        crate::models::mutation::CommittedMutationWarningV1::derived_state_unavailable(),
-                    )
-                }
-            },
-            Err(error) => {
-                log::error!(
-                "Optimizer authority change {change_id} committed but postwrite publication failed: {error}"
-            );
-                Some(
-                    crate::models::mutation::CommittedMutationWarningV1::derived_state_unavailable(
-                    ),
-                )
-            }
-        };
-        Ok(OptimizerMutationResult::Committed {
-            result: OptimizerAppliedResult { note_id, change_id },
-            commit,
-            warning,
-        })
-    }
-
-    fn stage_pending_publication(&self, pending: &PendingOptimizerPublication) -> Result<()> {
-        write_pending_publication(self.retained_optimizer_root()?, pending)
-    }
-
-    fn load_pending_publications(&self) -> Result<Vec<(String, PendingOptimizerPublication)>> {
-        load_pending_publications(self.retained_optimizer_root()?)
-    }
-
-    fn complete_retry_fenced_noop(&mut self, change_id: &str, job_id: &str) -> Result<()> {
-        self.with_locked_fresh_state(|service| {
-            let pending = service
-                .load_pending_publications()?
-                .into_iter()
-                .find(|(_, pending)| pending.change_id == change_id)
-                .map(|(_, pending)| pending)
-                .ok_or_else(|| anyhow::anyhow!("optimizer no-op retry fence disappeared"))?;
-            if pending.phase != OptimizerPublicationPhase::RetryFenced
-                || pending.job.job_id != job_id
-            {
-                anyhow::bail!("optimizer no-op retry fence changed before cleanup");
-            }
-            remove_pending_publication(service.retained_optimizer_root()?, change_id)?;
-            let before = service.state.queue.len();
-            service.remove_queued_job_id(job_id);
-            if service.state.queue.len() != before {
-                service.state.last_run_at = Some(Utc::now());
-                service.persist_state()?;
-            }
-            Ok(())
-        })
-    }
-
-    fn abort_retry_fence_and_defer(
-        &mut self,
-        change_id: &str,
-        job_id: &str,
-        error: &anyhow::Error,
-        missing_is_unprepared: bool,
-    ) -> Result<bool> {
-        let error_message = error.to_string();
-        self.with_locked_fresh_state(|service| {
-            let pending = service
-                .load_pending_publications()?
-                .into_iter()
-                .find(|(_, pending)| pending.change_id == change_id);
-            match pending {
-                Some((_, pending))
-                    if pending.phase == OptimizerPublicationPhase::RetryFenced
-                        && pending.job.job_id == job_id =>
-                {
-                    remove_pending_publication(service.retained_optimizer_root()?, change_id)?;
-                    service.defer_or_park_job_id(job_id, anyhow::anyhow!(error_message))?;
-                    Ok(true)
-                }
-                None if missing_is_unprepared => {
-                    service.defer_or_park_job_id(job_id, anyhow::anyhow!(error_message))?;
-                    Ok(true)
-                }
-                _ => Ok(false),
-            }
-        })
-    }
-
-    fn abort_precondition_owner_and_defer(
-        &mut self,
-        change_id: &str,
-        job_id: &str,
-        mutation_id: &str,
-        error: &anyhow::Error,
-    ) -> Result<bool> {
-        let error_message = error.to_string();
-        self.with_locked_fresh_state(|service| {
-            let pending = service
-                .load_pending_publications()?
-                .into_iter()
-                .find(|(_, pending)| pending.change_id == change_id)
-                .map(|(_, pending)| pending);
-            let Some(pending) = pending else {
-                return Ok(false);
-            };
-            if pending.phase != OptimizerPublicationPhase::Prepared
-                || pending.job.job_id != job_id
-                || pending.mutation_id.as_ref().map(|id| id.as_str()) != Some(mutation_id)
-            {
-                return Ok(false);
-            }
-            remove_pending_publication(service.retained_optimizer_root()?, change_id)?;
-            service.defer_or_park_job_id(job_id, anyhow::anyhow!(error_message))?;
-            Ok(true)
-        })
-    }
-
-    fn preserve_retry_fence_or_defer(
-        &mut self,
-        change_id: &str,
-        job_id: &str,
-        error: &anyhow::Error,
-    ) -> Result<()> {
-        let error_message = error.to_string();
-        self.with_locked_fresh_state(|service| {
-            let owners = service
-                .load_pending_publications()?
-                .into_iter()
-                .filter(|(_, pending)| pending.job.job_id == job_id)
-                .collect::<Vec<_>>();
-            if let Some((_, owner)) = owners.first() {
-                if owner.change_id == change_id
-                    && owner.phase == OptimizerPublicationPhase::RetryFenced
-                {
-                    return Ok(());
-                }
-                return Ok(());
-            }
-            service.defer_or_park_job_id(job_id, anyhow::anyhow!(error_message))
-        })
-    }
-
-    fn finalize_pending_publication(
-        &mut self,
-        pending: &mut PendingOptimizerPublication,
-    ) -> Result<()> {
-        validate_pending_publication(pending)?;
-        if pending.phase != OptimizerPublicationPhase::Committed {
-            anyhow::bail!("optimizer publication is not durably committed");
-        }
-
-        if !pending.audit_written {
-            let inbox_entry = publication_inbox_entry(pending)?;
-            let event = publication_audit_event(pending)?;
-            self.write_change(&pending.change)?;
-            self.push_decision_unique(pending.decision.clone())?;
-            self.push_inbox_unique(inbox_entry)?;
-            self.append_event_unique(&pending.change_id, event)?;
-            pending.audit_written = true;
-            self.stage_pending_publication(pending)?;
-        }
-
-        if !pending.counted {
-            let decisions = self.load_decisions()?;
-            self.state.accepted_count = decisions
-                .iter()
-                .filter(|decision| decision.kind == "optimizer_update")
-                .count();
-            self.state.last_run_at = decisions
-                .iter()
-                .filter_map(|decision| decision.created_at)
-                .max();
-            let today = Utc::now().date_naive();
-            self.state.daily_write_date = Some(today.to_string());
-            self.state.daily_write_count = decisions
-                .iter()
-                .filter(|decision| {
-                    decision.kind == "optimizer_update"
-                        && decision
-                            .created_at
-                            .is_some_and(|created| created.date_naive() == today)
-                })
-                .count()
-                .try_into()
-                .map_err(|_| anyhow::anyhow!("optimizer daily write count overflow"))?;
-            self.persist_state()?;
-            pending.counted = true;
-            self.stage_pending_publication(pending)?;
-        }
-
-        if !pending.queue_removed {
-            self.remove_queued_job_id(&pending.job.job_id);
-            self.persist_state()?;
-            pending.queue_removed = true;
-            self.stage_pending_publication(pending)?;
-        }
-        Ok(())
-    }
-
-    fn finalize_compatibility_publication(
-        &mut self,
-        pending: &PendingOptimizerPublication,
-    ) -> Result<()> {
-        let inbox_entry = publication_inbox_entry(pending)?;
-        let event = publication_audit_event(pending)?;
-        let audit_result = (|| -> Result<()> {
-            self.write_change(&pending.change)?;
-            self.push_decision_unique(pending.decision.clone())?;
-            self.push_inbox_unique(inbox_entry)?;
-            self.append_event_unique(&pending.change_id, event)
-        })();
-
-        if audit_result.is_ok() {
-            let decisions = self.load_decisions()?;
-            self.state.accepted_count = decisions
-                .iter()
-                .filter(|decision| decision.kind == "optimizer_update")
-                .count();
-            self.state.last_run_at = decisions
-                .iter()
-                .filter_map(|decision| decision.created_at)
-                .max();
-            let today = Utc::now().date_naive();
-            self.state.daily_write_date = Some(today.to_string());
-            self.state.daily_write_count = decisions
-                .iter()
-                .filter(|decision| {
-                    decision.kind == "optimizer_update"
-                        && decision
-                            .created_at
-                            .is_some_and(|created| created.date_naive() == today)
-                })
-                .count()
-                .try_into()
-                .map_err(|_| anyhow::anyhow!("optimizer daily write count overflow"))?;
-        }
-        // Even compatibility callers that do not supply an authority token
-        // must never retry a write that already returned a commit.
-        self.remove_queued_job_id(&pending.job.job_id);
-        self.persist_state()?;
-        audit_result
-    }
-
-    pub(crate) fn recover_pending_publications_locked(
-        &mut self,
-        _store: &KnowledgeStore,
-        guard: &crate::services::twin_events::MutationRootTransitionGuard<'_>,
-    ) -> Result<()> {
-        cleanup_optimizer_orphan_temps(self.retained_optimizer_root()?)?;
-        for (_, mut pending) in self.load_pending_publications()? {
-            if pending.phase == OptimizerPublicationPhase::RetryFenced {
-                // This pre-effect witness is both the stable retry identity
-                // and the durable reservation for all four audit outputs.
-                // It may belong to a live writer waiting for the coordinator,
-                // or to a crashed writer; either way, deleting it here races
-                // the former and strands the latter. Leave it adoptable by a
-                // later optimizer tick.
-                continue;
-            }
-            let expected = pending.expected_authority.as_ref().ok_or_else(|| {
-                anyhow::anyhow!("optimizer publication is missing its source authority")
-            })?;
-            let mutation_id = pending.mutation_id.clone().ok_or_else(|| {
-                anyhow::anyhow!("optimizer publication is missing its finalized mutation ID")
-            })?;
-            if pending.phase == OptimizerPublicationPhase::Committed
-                && pending.audit_written
-                && pending.counted
-                && pending.queue_removed
-            {
-                // Publication completion is itself a durable proof. This
-                // branch makes the receipt-delete / witness-delete crash gap
-                // idempotent: a missing receipt can only be accepted after all
-                // four monotonic phases were fsynced in the witness.
-                guard
-                    .consume_witnessed_mutation_receipt(&mutation_id)
-                    .map_err(anyhow::Error::new)?;
-                remove_pending_publication(self.retained_optimizer_root()?, &pending.change_id)?;
-                continue;
-            }
-            let (kind, key, before, after) = match &pending.target {
-                OptimizerPublicationTarget::Overlay {
-                    note_id,
-                    before_digest,
-                    after_digest,
-                    ..
-                } => (
-                    crate::services::twin_events::TargetKind::OverlayJson,
-                    format!("{note_id}.json"),
-                    before_digest.as_ref().map_or(
-                        crate::services::twin_events::BeforeImage::Absent,
-                        |digest| crate::services::twin_events::BeforeImage::Sha256(digest.clone()),
-                    ),
-                    after_digest.clone(),
-                ),
-                OptimizerPublicationTarget::Markdown {
-                    relative_path,
-                    before_digest,
-                    after_digest,
-                } => (
-                    crate::services::twin_events::TargetKind::Markdown,
-                    relative_path.clone(),
-                    crate::services::twin_events::BeforeImage::Sha256(before_digest.clone()),
-                    after_digest.clone(),
-                ),
-            };
-            match guard
-                .classify_witnessed_mutation(&mutation_id, expected, kind, &key, &before, &after)
-                .map_err(anyhow::Error::new)?
-            {
-                crate::services::twin_events::WitnessedMutationRecovery::NotCommitted => {
-                    remove_pending_publication(
-                        self.retained_optimizer_root()?,
-                        &pending.change_id,
-                    )?;
-                }
-                crate::services::twin_events::WitnessedMutationRecovery::Committed(commit) => {
-                    if pending.phase == OptimizerPublicationPhase::Committed
-                        && pending.committed_authority != commit.authority_token
-                    {
-                        anyhow::bail!("optimizer committed witness authority mismatch");
-                    }
-                    pending.phase = OptimizerPublicationPhase::Committed;
-                    pending.retry_fenced = true;
-                    pending.committed_authority = commit.authority_token;
-                    self.stage_pending_publication(&pending)?;
-                    self.finalize_pending_publication(&mut pending)?;
-                    guard
-                        .consume_witnessed_mutation_receipt(&mutation_id)
-                        .map_err(anyhow::Error::new)?;
-                    remove_pending_publication(
-                        self.retained_optimizer_root()?,
-                        &pending.change_id,
-                    )?;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Records a processing failure for `job`. Below `MAX_OPTIMIZER_ATTEMPTS`
-    /// the job stays queued (in its original position) with `attempts`
-    /// incremented, so it's retried on a later tick. At the limit it's parked:
-    /// removed from the queue and recorded in the inbox with status `"failed"`
-    /// so a human can see it, instead of spinning on a poisoned entry forever.
-    fn defer_or_park_job(&mut self, job: QueuedOptimizerNote, error: anyhow::Error) -> Result<()> {
-        self.defer_or_park_job_id(&job.job_id, error)
-    }
-
-    fn defer_or_park_job_fresh(&mut self, job_id: &str, error: &anyhow::Error) -> Result<()> {
-        let error_message = error.to_string();
-        self.with_locked_fresh_state(|service| {
-            if service
-                .load_pending_publications()?
-                .into_iter()
-                .any(|(_, pending)| pending.job.job_id == job_id)
-            {
-                return Ok(());
-            }
-            service.defer_or_park_job_id(job_id, anyhow::anyhow!(error_message))
-        })
-    }
-
-    fn defer_or_park_job_id(&mut self, job_id: &str, error: anyhow::Error) -> Result<()> {
-        let Some(position) = self
-            .state
-            .queue
-            .iter()
-            .position(|entry| entry.job_id == job_id)
-        else {
-            return Ok(());
-        };
-        let mut job = self.state.queue[position].clone();
-        job.attempts = job
-            .attempts
-            .checked_add(1)
-            .ok_or_else(|| anyhow::anyhow!("optimizer attempt count exhausted"))?;
-        log::warn!(
-            "Vault optimizer job for note '{}' failed (attempt {}/{}): {}",
-            job.note_id,
-            job.attempts,
-            MAX_OPTIMIZER_ATTEMPTS,
-            error
-        );
-
-        if job.attempts >= MAX_OPTIMIZER_ATTEMPTS {
-            self.state.queue.remove(position);
-            let inbox_entry = VaultOptimizerInboxEntry {
-                id: Uuid::new_v4().to_string(),
-                note_id: Some(job.note_id.clone()),
-                status: "failed".to_string(),
-                title: job.note_id.clone(),
-                reason: format!(
-                    "Vault optimizer parked after {} failed attempts: {}",
-                    job.attempts, error
-                ),
-                diff_preview: String::new(),
-                confidence: 0.0,
-                created_at: Some(Utc::now()),
-                change_id: None,
-            };
-            self.push_inbox(inbox_entry)?;
-            self.append_event(OptimizerAuditEventV1::OptimizerParked {
-                note_id: job.note_id,
-                attempts: job.attempts,
-                error: error.to_string(),
-                at: Utc::now(),
-            })?;
-        } else {
-            self.state.queue[position].attempts = job.attempts;
-        }
-
-        self.persist_state()?;
-        Ok(())
-    }
-
-    fn remove_queued_job(&mut self, note_id: &str) {
-        if let Some(pos) = self
-            .state
-            .queue
-            .iter()
-            .position(|entry| entry.note_id == note_id)
-        {
-            self.state.queue.remove(pos);
-        }
-    }
-
-    fn remove_queued_job_id(&mut self, job_id: &str) {
-        if let Some(position) = self
-            .state
-            .queue
-            .iter()
-            .position(|entry| entry.job_id == job_id)
-        {
-            self.state.queue.remove(position);
-        }
-    }
-
-    fn complete_noop_job(&mut self, note_id: &str) -> Result<()> {
-        self.remove_queued_job(note_id);
-        self.state.last_run_at = Some(Utc::now());
-        self.persist_state()
-    }
-
-    fn complete_noop_job_fresh(&mut self, job_id: &str) -> Result<()> {
-        self.with_locked_fresh_state(|service| {
-            if service
-                .load_pending_publications()?
-                .into_iter()
-                .any(|(_, pending)| pending.job.job_id == job_id)
-            {
-                return Ok(());
-            }
-            let before = service.state.queue.len();
-            service.remove_queued_job_id(job_id);
-            if service.state.queue.len() == before {
-                return Ok(());
-            }
-            service.state.last_run_at = Some(Utc::now());
-            service.persist_state()
-        })
-    }
-
-    /// Whether today's write count has already reached
-    /// `background_vault_optimizer_max_daily_writes`. Only meaningful once at
-    /// least one write has happened today; a fresh day always reports `false`
-    /// regardless of yesterday's count.
-    fn daily_write_cap_reached(&self, settings: &UserSettings) -> bool {
-        let today = Utc::now().date_naive().to_string();
-        self.state.daily_write_date.as_deref() == Some(today.as_str())
-            && self.state.daily_write_count >= settings.background_vault_optimizer_max_daily_writes
-    }
-
-    fn persist_state(&mut self) -> Result<()> {
-        let previous_revision = self.state.state_revision;
-        self.state.schema_version = OPTIMIZER_STATE_SCHEMA_VERSION;
-        self.state.state_revision = self
-            .state
-            .state_revision
-            .checked_add(1)
-            .ok_or_else(|| anyhow::anyhow!("vault optimizer state revision exhausted"))?;
-        let bytes = serde_json::to_vec_pretty(&self.state)?;
-        if bytes.len() > MAX_OPTIMIZER_STATE_BYTES {
-            self.state.state_revision = previous_revision;
-            anyhow::bail!("vault optimizer state exceeds its 4 MiB limit");
-        }
-        let result = self
-            .retained_optimizer_root()?
-            .put_atomic(QUEUE_KEY, &bytes)
-            .map_err(anyhow::Error::new);
-        if let Err(error) = result {
-            self.state.state_revision = previous_revision;
-            return Err(error);
-        }
-        Ok(())
-    }
-
-    fn pending_audit_reservations(
-        &self,
-        exclude_change_id: Option<&str>,
-    ) -> Result<Vec<PendingOptimizerPublication>> {
-        Ok(self
-            .load_pending_publications()?
-            .into_iter()
-            .map(|(_, pending)| pending)
-            .filter(|pending| {
-                !pending.audit_written && exclude_change_id != Some(pending.change_id.as_str())
-            })
-            .collect())
-    }
-
-    fn ensure_decision_capacity(
-        &self,
-        additional: &VaultOptimizerDecision,
-        exclude_change_id: Option<&str>,
-    ) -> Result<()> {
-        let mut decisions = self.load_decisions()?;
-        for pending in self.pending_audit_reservations(exclude_change_id)? {
-            merge_optimizer_decision(&mut decisions, pending.decision)?;
-        }
-        merge_optimizer_decision(&mut decisions, additional.clone())?;
-        validate_json_audit_capacity(&decisions, "optimizer decisions")
-    }
-
-    fn ensure_inbox_capacity(
-        &self,
-        additional: &VaultOptimizerInboxEntry,
-        exclude_change_id: Option<&str>,
-    ) -> Result<()> {
-        let mut inbox = self.load_inbox()?;
-        for pending in self.pending_audit_reservations(exclude_change_id)? {
-            merge_optimizer_inbox(&mut inbox, publication_inbox_entry(&pending)?)?;
-        }
-        merge_optimizer_inbox(&mut inbox, additional.clone())?;
-        validate_json_audit_capacity(&inbox, "optimizer inbox")
-    }
-
-    fn ensure_event_capacity(
-        &self,
-        additional: &OptimizerAuditEventV1,
-        exclude_change_id: Option<&str>,
-    ) -> Result<()> {
-        let mut events = self.load_events()?;
-        for pending in self.pending_audit_reservations(exclude_change_id)? {
-            merge_optimizer_event(&mut events, publication_audit_event(&pending)?)?;
-        }
-        merge_optimizer_event(&mut events, additional.clone())?;
-        serialize_optimizer_events(&events).map(|_| ())
-    }
-
-    fn ensure_change_capacity(
-        &self,
-        additional: &OptimizerChange,
-        exclude_change_id: Option<&str>,
-    ) -> Result<()> {
-        let root = self.retained_optimizer_root()?;
-        let names = root
-            .regular_file_names(CHANGES_DIRECTORY)
-            .map_err(anyhow::Error::new)?;
-        if names.len() > MAX_OPTIMIZER_AUDIT_ENTRIES {
-            anyhow::bail!("optimizer change audit exceeds 4096 entries");
-        }
-        let mut changes = HashMap::new();
-        for name in names {
-            let change_id = name
-                .strip_suffix(".json")
-                .ok_or_else(|| anyhow::anyhow!("invalid optimizer change filename"))?;
-            merge_optimizer_change(&mut changes, self.read_change(change_id)?)?;
-        }
-        for pending in self.pending_audit_reservations(exclude_change_id)? {
-            merge_optimizer_change(&mut changes, pending.change)?;
-        }
-        merge_optimizer_change(&mut changes, additional.clone())?;
-        if changes.len() > MAX_OPTIMIZER_AUDIT_ENTRIES {
-            anyhow::bail!("optimizer change audit has reached 4096 entries");
-        }
-        for change in changes.values() {
-            if serde_json::to_vec_pretty(change)?.len() > MAX_OPTIMIZER_CHANGE_BYTES {
-                anyhow::bail!("optimizer change exceeds its 1 MiB limit");
-            }
-        }
-        Ok(())
-    }
-
-    fn preflight_publication_audit(&self, pending: &PendingOptimizerPublication) -> Result<()> {
-        validate_pending_publication(pending)?;
-        let inbox = publication_inbox_entry(pending)?;
-        let event = publication_audit_event(pending)?;
-        self.ensure_decision_capacity(&pending.decision, None)?;
-        self.ensure_inbox_capacity(&inbox, None)?;
-        self.ensure_event_capacity(&event, None)?;
-        self.ensure_change_capacity(&pending.change, None)
-    }
-
-    fn load_decisions(&self) -> Result<Vec<VaultOptimizerDecision>> {
-        load_bounded_json_vec(
-            self.retained_optimizer_root()?,
-            DECISIONS_KEY,
-            "optimizer decisions",
-        )
-    }
-
-    fn push_decision_unique(&self, decision: VaultOptimizerDecision) -> Result<()> {
-        self.ensure_decision_capacity(&decision, decision.change_id.as_deref())?;
-        let mut decisions = self.load_decisions()?;
-        if let Some(existing) = decisions
-            .iter()
-            .find(|existing| existing.id == decision.id || existing.change_id == decision.change_id)
-        {
-            if existing == &decision {
-                return Ok(());
-            }
-            anyhow::bail!("optimizer decision identity collision");
-        }
-        if decisions.len() >= MAX_OPTIMIZER_AUDIT_ENTRIES {
-            anyhow::bail!("optimizer decisions have reached 4096 entries");
-        }
-        decisions.push(decision);
-        write_bounded_json_vec(self.retained_optimizer_root()?, DECISIONS_KEY, &decisions)
-    }
-
-    fn load_inbox(&self) -> Result<Vec<VaultOptimizerInboxEntry>> {
-        load_bounded_json_vec(
-            self.retained_optimizer_root()?,
-            INBOX_KEY,
-            "optimizer inbox",
-        )
-    }
-
-    fn push_inbox(&self, entry: VaultOptimizerInboxEntry) -> Result<()> {
-        self.ensure_inbox_capacity(&entry, None)?;
-        let mut inbox = self.load_inbox()?;
-        if inbox.len() >= MAX_OPTIMIZER_AUDIT_ENTRIES {
-            anyhow::bail!("optimizer inbox has reached 4096 entries");
-        }
-        inbox.push(entry);
-        write_bounded_json_vec(self.retained_optimizer_root()?, INBOX_KEY, &inbox)
-    }
-
-    fn push_inbox_unique(&self, entry: VaultOptimizerInboxEntry) -> Result<()> {
-        self.ensure_inbox_capacity(&entry, entry.change_id.as_deref())?;
-        let mut inbox = self.load_inbox()?;
-        if let Some(existing) = inbox
-            .iter()
-            .find(|existing| existing.id == entry.id || existing.change_id == entry.change_id)
-        {
-            if existing == &entry {
-                return Ok(());
-            }
-            anyhow::bail!("optimizer inbox identity collision");
-        }
-        if inbox.len() >= MAX_OPTIMIZER_AUDIT_ENTRIES {
-            anyhow::bail!("optimizer inbox has reached 4096 entries");
-        }
-        inbox.push(entry);
-        write_bounded_json_vec(self.retained_optimizer_root()?, INBOX_KEY, &inbox)
-    }
-
-    fn write_change(&self, change: &OptimizerChange) -> Result<()> {
-        parse_canonical_uuid(&change.change_id, "optimizer change ID")?;
-        self.ensure_change_capacity(change, Some(change.change_id.as_str()))?;
-        let root = self.retained_optimizer_root()?;
-        let key = format!("{CHANGES_DIRECTORY}/{}.json", change.change_id);
-        if let Some(bytes) = root
-            .read_bounded(&key, MAX_OPTIMIZER_CHANGE_BYTES)
-            .map_err(anyhow::Error::new)?
-        {
-            let existing: OptimizerChange =
-                serde_json::from_slice(&bytes).context("invalid optimizer change audit")?;
-            if serde_json::to_value(existing)? == serde_json::to_value(change)? {
-                return Ok(());
-            }
-            anyhow::bail!("optimizer change identity collision");
-        }
-        let bytes = serde_json::to_vec_pretty(change)?;
-        if bytes.len() > MAX_OPTIMIZER_CHANGE_BYTES {
-            anyhow::bail!("optimizer change exceeds its 1 MiB limit");
-        }
-        root.put_atomic(&key, &bytes).map_err(anyhow::Error::new)
-    }
-
-    fn read_change(&self, change_id: &str) -> Result<OptimizerChange> {
-        parse_canonical_uuid(change_id, "optimizer change ID")?;
-        let key = format!("{CHANGES_DIRECTORY}/{change_id}.json");
-        let bytes = self
-            .retained_optimizer_root()?
-            .read_bounded(&key, MAX_OPTIMIZER_CHANGE_BYTES)
-            .map_err(anyhow::Error::new)?
-            .ok_or_else(|| anyhow::anyhow!("optimizer change does not exist"))?;
-        let change: OptimizerChange =
-            serde_json::from_slice(&bytes).context("invalid optimizer change audit")?;
-        if change.change_id != change_id {
-            anyhow::bail!("optimizer change identity mismatch");
-        }
-        Ok(change)
-    }
-
-    fn load_events(&self) -> Result<Vec<OptimizerAuditEventV1>> {
-        let Some(bytes) = self
-            .retained_optimizer_root()?
-            .read_bounded(EVENTS_KEY, MAX_OPTIMIZER_AUDIT_BYTES)
-            .map_err(anyhow::Error::new)?
-        else {
-            return Ok(Vec::new());
-        };
-        let contents = std::str::from_utf8(&bytes).context("optimizer event audit is not UTF-8")?;
-        let mut events = Vec::new();
-        for (index, line) in contents.lines().enumerate() {
-            if index >= MAX_OPTIMIZER_AUDIT_ENTRIES {
-                anyhow::bail!("optimizer event audit exceeds 4096 entries");
-            }
-            if line.is_empty() {
-                anyhow::bail!("optimizer event audit contains an empty record");
-            }
-            events.push(
-                serde_json::from_str::<OptimizerAuditEventV1>(line).with_context(|| {
-                    format!("invalid optimizer event audit at line {}", index + 1)
-                })?,
-            );
-        }
-        Ok(events)
-    }
-
-    fn write_events(&self, events: &[OptimizerAuditEventV1]) -> Result<()> {
-        let bytes = serialize_optimizer_events(events)?;
-        self.retained_optimizer_root()?
-            .put_atomic(EVENTS_KEY, &bytes)
-            .map_err(anyhow::Error::new)
-    }
-
-    fn append_event(&self, event: OptimizerAuditEventV1) -> Result<()> {
-        self.ensure_event_capacity(&event, None)?;
-        let mut events = self.load_events()?;
-        if events.len() >= MAX_OPTIMIZER_AUDIT_ENTRIES {
-            anyhow::bail!("optimizer event audit has reached 4096 entries");
-        }
-        events.push(event);
-        self.write_events(&events)
-    }
-
-    fn append_event_unique(&self, change_id: &str, event: OptimizerAuditEventV1) -> Result<()> {
-        self.ensure_event_capacity(&event, Some(change_id))?;
-        let mut events = self.load_events()?;
-        if let Some(existing) = events.iter().find(|existing| {
-            matches!(
-                existing,
-                OptimizerAuditEventV1::OptimizerApply {
-                    change_id: existing_id,
-                    ..
-                } if existing_id == change_id
-            )
-        }) {
-            if existing == &event {
-                return Ok(());
-            }
-            anyhow::bail!("optimizer event audit identity collision");
-        }
-        if events.len() >= MAX_OPTIMIZER_AUDIT_ENTRIES {
-            anyhow::bail!("optimizer event audit has reached 4096 entries");
-        }
-        events.push(event);
-        self.write_events(&events)
-    }
 }
 
 fn parse_canonical_uuid(value: &str, label: &str) -> Result<Uuid> {
@@ -2324,17 +1259,42 @@ fn merge_optimizer_event(
     candidate: OptimizerAuditEventV1,
 ) -> Result<()> {
     let candidate_change_id = match &candidate {
-        OptimizerAuditEventV1::OptimizerApply { change_id, .. } => Some(change_id.as_str()),
-        _ => None,
+        OptimizerAuditEventV1::OptimizerApply { change_id, .. }
+        | OptimizerAuditEventV1::Rollback { change_id, .. } => Some(change_id.as_str()),
+        OptimizerAuditEventV1::OptimizerParked { job_id, .. } if !job_id.is_empty() => {
+            Some(job_id.as_str())
+        }
+        OptimizerAuditEventV1::OptimizerParked { .. } => None,
     };
     if let Some(change_id) = candidate_change_id {
         if let Some(existing) = values.iter().find(|existing| {
             matches!(
-                existing,
-                OptimizerAuditEventV1::OptimizerApply {
-                    change_id: existing_id,
-                    ..
-                } if existing_id == change_id
+                (existing, &candidate),
+                (
+                    OptimizerAuditEventV1::OptimizerApply {
+                        change_id: existing_id,
+                        ..
+                    },
+                    OptimizerAuditEventV1::OptimizerApply { .. }
+                ) if existing_id == change_id
+            ) || matches!(
+                (existing, &candidate),
+                (
+                    OptimizerAuditEventV1::Rollback {
+                        change_id: existing_id,
+                        ..
+                    },
+                    OptimizerAuditEventV1::Rollback { .. }
+                ) if existing_id == change_id
+            ) || matches!(
+                (existing, &candidate),
+                (
+                    OptimizerAuditEventV1::OptimizerParked {
+                        job_id: existing_id,
+                        ..
+                    },
+                    OptimizerAuditEventV1::OptimizerParked { .. }
+                ) if !existing_id.is_empty() && existing_id == change_id
             )
         }) {
             if existing == &candidate {
@@ -2468,10 +1428,14 @@ fn pending_publication_key(change_id: &str) -> Result<String> {
 fn cleanup_optimizer_orphan_temps(root: &crate::services::twin_events::AnchoredRoot) -> Result<()> {
     for (directory, durable_limit) in [
         (PENDING_PUBLICATIONS_DIRECTORY, MAX_PENDING_PUBLICATIONS),
+        (
+            rollback::PENDING_ROLLBACKS_DIRECTORY,
+            rollback::MAX_PENDING_ROLLBACKS,
+        ),
         (CHANGES_DIRECTORY, MAX_OPTIMIZER_AUDIT_ENTRIES),
     ] {
         let names = root
-            .regular_file_names(directory)
+            .regular_file_names_bounded(directory, durable_limit + MAX_OPTIMIZER_ORPHAN_TEMPS)
             .map_err(anyhow::Error::new)?;
         if names.len() > durable_limit + MAX_OPTIMIZER_ORPHAN_TEMPS {
             anyhow::bail!("optimizer {directory} directory exceeds its bounded entry limit");
@@ -2589,16 +1553,67 @@ fn validate_pending_publication(pending: &PendingOptimizerPublication) -> Result
             }
         }
     }
+    if let Some(material) = pending.change.exact_rollback.as_ref() {
+        material.validate(&pending.change)?;
+        let target_matches = match &pending.target {
+            OptimizerPublicationTarget::Overlay {
+                note_id,
+                after_digest,
+                ..
+            } => {
+                material.target_kind == crate::services::twin_events::TargetKind::OverlayJson
+                    && material.target_key == format!("{note_id}.json")
+                    && material.apply_after
+                        == crate::services::twin_events::BeforeImage::Sha256(after_digest.clone())
+            }
+            OptimizerPublicationTarget::Markdown {
+                relative_path,
+                after_digest,
+                ..
+            } => {
+                material.target_kind == crate::services::twin_events::TargetKind::Markdown
+                    && material.target_key == *relative_path
+                    && material.apply_after
+                        == crate::services::twin_events::BeforeImage::Sha256(after_digest.clone())
+            }
+        };
+        if !target_matches {
+            anyhow::bail!("optimizer exact rollback does not bind its publication target");
+        }
+    }
     match (
         pending.phase,
         pending.mutation_id.as_ref(),
         pending.committed_authority.as_ref(),
     ) {
         (OptimizerPublicationPhase::RetryFenced, None, None)
-            if !pending.audit_written && !pending.counted && !pending.queue_removed => {}
+            if !pending.audit_written
+                && !pending.counted
+                && !pending.queue_removed
+                && !pending.abort_queue_reconciled => {}
         (OptimizerPublicationPhase::Prepared, Some(_), None)
-            if !pending.audit_written && !pending.counted && !pending.queue_removed => {}
+            if !pending.audit_written
+                && !pending.counted
+                && !pending.queue_removed
+                && !pending.abort_queue_reconciled => {}
+        (OptimizerPublicationPhase::Aborted, Some(_), committed)
+            if !pending.audit_written && !pending.counted && !pending.queue_removed =>
+        {
+            if let Some(committed) = committed {
+                let expected = pending.expected_authority.as_ref().unwrap();
+                if committed.root_scope != expected.root_scope
+                    || committed.lease_epoch_uuid != expected.lease_epoch_uuid
+                    || Some(committed.authority_generation)
+                        != expected.authority_generation.checked_add(1)
+                {
+                    anyhow::bail!("invalid optimizer aborted-publication authority");
+                }
+            }
+        }
         (OptimizerPublicationPhase::Committed, Some(_), Some(committed)) => {
+            if pending.abort_queue_reconciled {
+                anyhow::bail!("invalid optimizer committed abort reconciliation");
+            }
             let expected = pending.expected_authority.as_ref().unwrap();
             if committed.root_scope != expected.root_scope
                 || committed.lease_epoch_uuid != expected.lease_epoch_uuid
@@ -2620,7 +1635,7 @@ fn write_pending_publication(
     validate_pending_publication(pending)?;
     let bytes = serde_json::to_vec_pretty(pending)?;
     if bytes.len() > MAX_PENDING_PUBLICATION_BYTES {
-        anyhow::bail!("optimizer pending publication exceeds its 1 MiB limit");
+        anyhow::bail!("optimizer pending publication exceeds its 16 MiB limit");
     }
     root.open_directory(PENDING_PUBLICATIONS_DIRECTORY, true)
         .map_err(anyhow::Error::new)?;
@@ -2742,6 +1757,23 @@ pub enum OptimizerMutationResult<T> {
         result: T,
         commit: crate::services::twin_events::MutationCommit,
         warning: Option<crate::models::mutation::CommittedMutationWarningV1>,
+    },
+}
+
+#[must_use = "optimizer rollback authority changes must consume their exact mutation commit"]
+#[derive(Debug)]
+pub(crate) enum OptimizerRollbackMutationOutcome {
+    NoWrite(VaultOptimizerRollbackResult),
+    Committed {
+        result: VaultOptimizerRollbackResult,
+        commit: crate::services::twin_events::MutationCommit,
+        warning: Option<crate::models::mutation::CommittedMutationWarningV1>,
+    },
+    Partial {
+        result: VaultOptimizerRollbackResult,
+        commit: crate::services::twin_events::MutationCommit,
+        warning: crate::models::mutation::CommittedMutationWarningV1,
+        recovery_pending: bool,
     },
 }
 
@@ -2936,1893 +1968,5 @@ fn merge_unique_strings(existing: Vec<String>, additions: Vec<String>) -> Vec<St
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::models::note::{NoteCreate, NoteStatus};
-    use crate::services::atomic_io::assert_no_tmp_siblings;
-    use tempfile::tempdir;
-
-    fn try_symlink_file(target: &std::path::Path, link: &std::path::Path) -> bool {
-        #[cfg(unix)]
-        {
-            std::os::unix::fs::symlink(target, link).unwrap();
-            true
-        }
-        #[cfg(windows)]
-        {
-            match std::os::windows::fs::symlink_file(target, link) {
-                Ok(()) => true,
-                Err(error) if matches!(error.raw_os_error(), Some(5) | Some(1314)) => {
-                    eprintln!("skipping symlink regression without Windows symlink privilege");
-                    false
-                }
-                Err(error) => panic!("failed to create file symlink: {error}"),
-            }
-        }
-    }
-
-    fn make_note_create(title: &str) -> NoteCreate {
-        NoteCreate {
-            title: title.to_string(),
-            content: format!("Content for {}", title),
-            relative_path: None,
-            aliases: Vec::new(),
-            status: NoteStatus::Draft,
-            tags: Vec::new(),
-            schema_version: CURRENT_NOTE_SCHEMA_VERSION,
-            migration_source: None,
-            optimizer_managed: false,
-            properties: HashMap::new(),
-        }
-    }
-
-    fn run_one_optimizer_write(
-        service: &mut VaultOptimizerService,
-        store: &mut KnowledgeStore,
-        settings: &UserSettings,
-    ) {
-        let tick = service
-            .prepare_next(store, settings)
-            .expect("optimizer prepare should not error");
-        match tick {
-            OptimizerTick::Pending(pending) => assert!(matches!(
-                service
-                    .apply_pending(store, *pending)
-                    .expect("optimizer apply should not error"),
-                OptimizerMutationResult::Committed { .. }
-            )),
-            OptimizerTick::RetryFenced(pending) => assert!(matches!(
-                service
-                    .apply_retry_fenced(store, *pending)
-                    .expect("optimizer retry fence should resume"),
-                OptimizerMutationResult::Committed { .. }
-            )),
-            OptimizerTick::Committed { .. } => {}
-            OptimizerTick::NoWrite => panic!("expected an optimizer authority write"),
-        }
-    }
-
-    fn make_note(id: &str, title: &str) -> Note {
-        let now = Utc::now();
-        Note {
-            id: id.to_string(),
-            title: title.to_string(),
-            content: format!("Content of {}", title),
-            relative_path: format!("{}.md", id),
-            aliases: Vec::new(),
-            status: NoteStatus::Draft,
-            tags: Vec::new(),
-            created_at: now,
-            updated_at: now,
-            schema_version: crate::models::note::CURRENT_NOTE_SCHEMA_VERSION,
-            migration_source: None,
-            optimizer_managed: false,
-            wikilinks: Vec::new(),
-            parsed_links: Vec::new(),
-            properties: HashMap::new(),
-            ..Default::default()
-        }
-    }
-
-    fn authority_optimizer_fixture(
-        title: &str,
-    ) -> (
-        tempfile::TempDir,
-        tempfile::TempDir,
-        std::sync::Arc<crate::services::twin_events::MutationCoordinator>,
-        KnowledgeStore,
-        VaultOptimizerService,
-        Note,
-    ) {
-        let vault_dir = tempdir().unwrap();
-        let data_dir = tempdir().unwrap();
-        let events = std::sync::Arc::new(crate::services::twin_events::TwinEventStore::new(
-            data_dir.path(),
-        ));
-        events.initialize().unwrap();
-        let coordinator = std::sync::Arc::new(
-            crate::services::twin_events::MutationCoordinator::new(
-                data_dir.path(),
-                vault_dir.path(),
-                events,
-                std::sync::Arc::new(crate::services::twin_events::NoopMutationLifecycle),
-            )
-            .unwrap(),
-        );
-        let namespace = coordinator.current_namespace_path().unwrap();
-        let mut store = KnowledgeStore::with_event_recorder(
-            vault_dir.path().to_path_buf(),
-            namespace.clone(),
-            coordinator.clone(),
-        );
-        let note = store.create_note(make_note_create(title)).unwrap();
-        let mut service = VaultOptimizerService::try_new(namespace).unwrap();
-        service
-            .bootstrap_checked(std::slice::from_ref(&note))
-            .unwrap();
-        (vault_dir, data_dir, coordinator, store, service, note)
-    }
-
-    fn prepare_authority_write(
-        service: &mut VaultOptimizerService,
-        store: &KnowledgeStore,
-        coordinator: &crate::services::twin_events::MutationCoordinator,
-    ) -> PendingOptimizerWrite {
-        match service
-            .prepare_next_expecting_authority(
-                store,
-                &UserSettings::default(),
-                coordinator.current_authority_token().unwrap(),
-            )
-            .unwrap()
-        {
-            OptimizerTick::Pending(pending) => *pending,
-            other => panic!("expected a pending authority write, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn locked_restart_cleans_only_canonical_optimizer_orphan_temps() {
-        let data_dir = tempdir().unwrap();
-        let service = VaultOptimizerService::try_new(data_dir.path().to_path_buf()).unwrap();
-        let change_temp = service.changes_dir.join(format!(".{}.tmp", Uuid::new_v4()));
-        let pending_temp = service
-            .optimizer_dir
-            .join(PENDING_PUBLICATIONS_DIRECTORY)
-            .join(format!(".{}.tmp", Uuid::new_v4()));
-        std::fs::write(&change_temp, b"fsynced orphan").unwrap();
-        std::fs::write(&pending_temp, b"fsynced orphan").unwrap();
-        drop(service);
-
-        let restarted = VaultOptimizerService::try_new(data_dir.path().to_path_buf()).unwrap();
-
-        assert!(!change_temp.exists());
-        assert!(!pending_temp.exists());
-        assert!(restarted.load_pending_publications().unwrap().is_empty());
-    }
-
-    #[test]
-    fn noncanonical_optimizer_temp_is_not_deleted_as_an_orphan() {
-        let data_dir = tempdir().unwrap();
-        let service = VaultOptimizerService::try_new(data_dir.path().to_path_buf()).unwrap();
-        let unknown = service.changes_dir.join(".not-a-uuid.tmp");
-        std::fs::write(&unknown, b"untrusted file").unwrap();
-        drop(service);
-
-        assert!(VaultOptimizerService::try_new(data_dir.path().to_path_buf()).is_err());
-        assert!(unknown.exists());
-    }
-
-    #[test]
-    fn corrupt_optimizer_audits_fail_closed_on_restart() {
-        let decisions_dir = tempdir().unwrap();
-        let decisions = VaultOptimizerService::try_new(decisions_dir.path().to_path_buf()).unwrap();
-        std::fs::write(&decisions.decisions_path, b"{not-json").unwrap();
-        drop(decisions);
-        assert!(VaultOptimizerService::try_new(decisions_dir.path().to_path_buf()).is_err());
-
-        let events_dir = tempdir().unwrap();
-        let events = VaultOptimizerService::try_new(events_dir.path().to_path_buf()).unwrap();
-        std::fs::write(&events.events_path, b"{not-json\n").unwrap();
-        drop(events);
-        assert!(VaultOptimizerService::try_new(events_dir.path().to_path_buf()).is_err());
-    }
-
-    #[test]
-    fn state_lock_and_protected_io_share_one_retained_root_capability() {
-        let original = tempdir().unwrap();
-        let replacement = tempdir().unwrap();
-        let mut service = VaultOptimizerService::try_new(original.path().to_path_buf()).unwrap();
-        service
-            .bootstrap_checked(&[make_note("original-note", "Original")])
-            .unwrap();
-        let mut replacement_service =
-            VaultOptimizerService::try_new(replacement.path().to_path_buf()).unwrap();
-        replacement_service
-            .bootstrap_checked(&[make_note("replacement-note", "Replacement")])
-            .unwrap();
-
-        let lock = service.acquire_state_lock().unwrap();
-        service.optimizer_dir = replacement_service.optimizer_dir.clone();
-        service.reload_from_disk_checked().unwrap();
-        lock.unlock().unwrap();
-
-        assert_eq!(service.state.queue.len(), 1);
-        assert_eq!(service.state.queue[0].note_id, "original-note");
-    }
-
-    #[test]
-    fn legacy_queue_job_id_is_stable_across_restarts() {
-        let data_dir = tempdir().unwrap();
-        let optimizer_dir = data_dir.path().join("vault_migration/optimizer");
-        std::fs::create_dir_all(&optimizer_dir).unwrap();
-        std::fs::write(
-            optimizer_dir.join(QUEUE_KEY),
-            serde_json::to_vec_pretty(&serde_json::json!({
-                "queue": [{
-                    "note_id": "legacy-note",
-                    "reason": "legacy",
-                    "enqueued_at": "2026-08-30T00:00:00Z",
-                    "attempts": 0
-                }]
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-
-        let first = VaultOptimizerService::try_new(data_dir.path().to_path_buf()).unwrap();
-        let first_id = first.state.queue[0].job_id.clone();
-        parse_canonical_uuid(&first_id, "legacy optimizer job ID").unwrap();
-        drop(first);
-        let second = VaultOptimizerService::try_new(data_dir.path().to_path_buf()).unwrap();
-
-        assert_eq!(second.state.queue[0].job_id, first_id);
-    }
-
-    #[test]
-    fn prepared_hook_failure_releases_retry_fence_for_same_process_retry() {
-        let (_vault, _data, coordinator, mut store, mut service, _) =
-            authority_optimizer_fixture("Prepared Hook Failure");
-        let first = prepare_authority_write(&mut service, &store, &coordinator);
-        let first_change_id = first.change_id.clone();
-        let job_id = first.job.job_id.clone();
-        service.fail_next_prepared_publication();
-
-        assert!(matches!(
-            service.apply_pending(&mut store, first).unwrap(),
-            OptimizerMutationResult::NoWrite
-        ));
-        assert!(service.load_pending_publications().unwrap().is_empty());
-
-        let retry = prepare_authority_write(&mut service, &store, &coordinator);
-        assert_eq!(retry.job.job_id, job_id);
-        assert_ne!(retry.change_id, first_change_id);
-    }
-
-    #[test]
-    fn receipt_capacity_failure_releases_retry_fence_for_same_process_retry() {
-        let (_vault, data, coordinator, mut store, mut service, _) =
-            authority_optimizer_fixture("Receipt Capacity Failure");
-        let receipts = data.path().join("twin/mutations/receipts/v1");
-        for index in 0..256_u16 {
-            std::fs::write(receipts.join(format!("{index:064x}.json")), b"{}").unwrap();
-        }
-        let first = prepare_authority_write(&mut service, &store, &coordinator);
-        let first_change_id = first.change_id.clone();
-        let job_id = first.job.job_id.clone();
-
-        assert!(matches!(
-            service.apply_pending(&mut store, first).unwrap(),
-            OptimizerMutationResult::NoWrite
-        ));
-        assert!(service.load_pending_publications().unwrap().is_empty());
-
-        let retry = prepare_authority_write(&mut service, &store, &coordinator);
-        assert_eq!(retry.job.job_id, job_id);
-        assert_ne!(retry.change_id, first_change_id);
-    }
-
-    #[test]
-    fn ambiguous_retry_fence_stage_failure_preserves_adoptable_owner() {
-        let (_vault, _data, coordinator, mut store, mut service, note) =
-            authority_optimizer_fixture("Retry Fence Stage Failure");
-        let first = prepare_authority_write(&mut service, &store, &coordinator);
-        let first_change_id = first.change_id.clone();
-        let job_id = first.job.job_id.clone();
-        service.fail_next_retry_fence_stage_after_write();
-
-        assert!(matches!(
-            service.apply_pending(&mut store, first).unwrap(),
-            OptimizerMutationResult::NoWrite
-        ));
-        let pending = service.load_pending_publications().unwrap();
-        assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].1.change_id, first_change_id);
-        assert_eq!(pending[0].1.phase, OptimizerPublicationPhase::RetryFenced);
-        assert_eq!(service.state.queue[0].attempts, 0);
-        assert!(!store.overlay_path(&note.id).exists());
-
-        let retry = match service
-            .prepare_next_expecting_authority(
-                &store,
-                &UserSettings::default(),
-                coordinator.current_authority_token().unwrap(),
-            )
-            .unwrap()
-        {
-            OptimizerTick::RetryFenced(retry) => *retry,
-            other => panic!("expected the stable retry fence, got {other:?}"),
-        };
-        assert_eq!(retry.publication.job.job_id, job_id);
-        assert_eq!(retry.publication.change_id, first_change_id);
-        assert!(matches!(
-            service.apply_retry_fenced(&mut store, retry).unwrap(),
-            OptimizerMutationResult::Committed { .. }
-        ));
-        assert!(store.overlay_path(&note.id).exists());
-    }
-
-    #[test]
-    fn optimizer_source_snapshot_rejects_oversize_before_witness() {
-        let (_vault, _data, coordinator, mut store, mut service, note) =
-            authority_optimizer_fixture("Oversize Overlay Source");
-        let pending = prepare_authority_write(&mut service, &store, &coordinator);
-        let authority_before = coordinator.current_authority_token().unwrap();
-        let oversized = serde_json::to_vec(&serde_json::json!({
-            "tags": ["x".repeat(crate::services::twin_events::MAX_MARKDOWN_TWIN_BYTES)]
-        }))
-        .unwrap();
-        std::fs::write(store.overlay_path(&note.id), oversized).unwrap();
-
-        assert!(store.optimizer_overlay_snapshot(&note.id).is_err());
-        assert!(matches!(
-            service.apply_pending(&mut store, pending).unwrap(),
-            OptimizerMutationResult::NoWrite
-        ));
-        assert_eq!(service.state.queue[0].attempts, 1);
-        assert_eq!(
-            coordinator.current_authority_token().unwrap(),
-            authority_before
-        );
-        assert!(service.load_pending_publications().unwrap().is_empty());
-        assert!(service.list_decisions(10).unwrap().is_empty());
-
-        assert!(matches!(
-            service
-                .prepare_next_expecting_authority(
-                    &store,
-                    &UserSettings::default(),
-                    authority_before.clone(),
-                )
-                .unwrap(),
-            OptimizerTick::NoWrite
-        ));
-        assert_eq!(service.state.queue[0].attempts, 2);
-        assert!(matches!(
-            service
-                .prepare_next_expecting_authority(
-                    &store,
-                    &UserSettings::default(),
-                    authority_before.clone(),
-                )
-                .unwrap(),
-            OptimizerTick::NoWrite
-        ));
-        assert!(service.state.queue.is_empty());
-        assert_eq!(service.inbox(Some("failed"), 10).unwrap().len(), 1);
-        assert!(service.list_decisions(10).unwrap().is_empty());
-    }
-
-    #[test]
-    fn optimizer_prepare_rejects_oversize_markdown_without_authority_or_witness() {
-        let (vault, _data, coordinator, store, mut service, note) =
-            authority_optimizer_fixture("Oversize Markdown Source");
-        let authority_before = coordinator.current_authority_token().unwrap();
-        std::fs::write(
-            vault.path().join(&note.relative_path),
-            vec![b'x'; crate::services::twin_events::MAX_MARKDOWN_TWIN_BYTES + 1],
-        )
-        .unwrap();
-
-        assert!(matches!(
-            service
-                .prepare_next_expecting_authority(
-                    &store,
-                    &UserSettings::default(),
-                    authority_before.clone(),
-                )
-                .unwrap(),
-            OptimizerTick::NoWrite
-        ));
-        assert_eq!(service.state.queue[0].attempts, 1);
-        assert_eq!(
-            coordinator.current_authority_token().unwrap(),
-            authority_before
-        );
-        assert!(service.load_pending_publications().unwrap().is_empty());
-    }
-
-    #[test]
-    fn optimizer_apply_rejects_symlinked_markdown_without_reading_outside() {
-        let (vault, _data, coordinator, mut store, mut service, note) =
-            authority_optimizer_fixture("Symlink Markdown Source");
-        let pending = prepare_authority_write(&mut service, &store, &coordinator);
-        let authority_before = coordinator.current_authority_token().unwrap();
-        let outside = vault
-            .path()
-            .parent()
-            .unwrap()
-            .join(format!("optimizer-outside-{}.md", Uuid::new_v4()));
-        let secret = "outside-markdown-must-not-be-read";
-        std::fs::write(&outside, secret).unwrap();
-        let markdown = vault.path().join(&note.relative_path);
-        std::fs::remove_file(&markdown).unwrap();
-        if !try_symlink_file(&outside, &markdown) {
-            let _ = std::fs::remove_file(&outside);
-            return;
-        }
-
-        assert!(matches!(
-            service.apply_pending(&mut store, pending).unwrap(),
-            OptimizerMutationResult::NoWrite
-        ));
-        assert_eq!(std::fs::read(&outside).unwrap(), secret.as_bytes());
-        assert_eq!(service.state.queue[0].attempts, 1);
-        assert_eq!(
-            coordinator.current_authority_token().unwrap(),
-            authority_before
-        );
-        assert!(service.load_pending_publications().unwrap().is_empty());
-        std::fs::remove_file(&markdown).unwrap();
-        std::fs::remove_file(&outside).unwrap();
-    }
-
-    #[test]
-    fn optimizer_apply_rejects_symlinked_overlay_without_reading_outside() {
-        let (vault, _data, coordinator, mut store, mut service, note) =
-            authority_optimizer_fixture("Symlink Overlay Source");
-        let pending = prepare_authority_write(&mut service, &store, &coordinator);
-        let authority_before = coordinator.current_authority_token().unwrap();
-        let outside = vault
-            .path()
-            .parent()
-            .unwrap()
-            .join(format!("optimizer-outside-{}.json", Uuid::new_v4()));
-        let secret = "outside-overlay-must-not-be-read";
-        std::fs::write(&outside, format!(r#"{{"tags":["{secret}"]}}"#)).unwrap();
-        let overlay = store.overlay_path(&note.id);
-        if overlay.exists() {
-            std::fs::remove_file(&overlay).unwrap();
-        }
-        if !try_symlink_file(&outside, &overlay) {
-            let _ = std::fs::remove_file(&outside);
-            return;
-        }
-
-        assert!(matches!(
-            service.apply_pending(&mut store, pending).unwrap(),
-            OptimizerMutationResult::NoWrite
-        ));
-        assert_eq!(
-            std::fs::read_to_string(&outside).unwrap(),
-            format!(r#"{{"tags":["{secret}"]}}"#)
-        );
-        assert_eq!(service.state.queue[0].attempts, 1);
-        assert_eq!(
-            coordinator.current_authority_token().unwrap(),
-            authority_before
-        );
-        assert!(service.load_pending_publications().unwrap().is_empty());
-        std::fs::remove_file(&overlay).unwrap();
-        std::fs::remove_file(&outside).unwrap();
-    }
-
-    #[test]
-    fn pending_publication_rejects_cross_field_corruption() {
-        let (_vault, _data, coordinator, mut store, mut service, _) =
-            authority_optimizer_fixture("Witness Binding");
-        let pending = prepare_authority_write(&mut service, &store, &coordinator);
-        let _ = service.apply_pending(&mut store, pending).unwrap();
-        let (_, valid) = service.load_pending_publications().unwrap().remove(0);
-
-        let mut wrong_kind = valid.clone();
-        wrong_kind.decision.kind = "other".into();
-        assert!(validate_pending_publication(&wrong_kind).is_err());
-
-        let mut wrong_note = valid.clone();
-        wrong_note.decision.note_id = Some("other-note".into());
-        assert!(validate_pending_publication(&wrong_note).is_err());
-
-        let mut wrong_mode = valid.clone();
-        wrong_mode.change.mode = "full_rewrite".into();
-        assert!(validate_pending_publication(&wrong_mode).is_err());
-
-        let mut wrong_after = valid;
-        match &mut wrong_after.target {
-            OptimizerPublicationTarget::Overlay { after_digest, .. }
-            | OptimizerPublicationTarget::Markdown { after_digest, .. } => {
-                *after_digest = crate::services::twin_events::digest_bytes(b"wrong-after");
-            }
-        }
-        assert!(validate_pending_publication(&wrong_after).is_err());
-    }
-
-    #[test]
-    fn exact_overlay_target_completes_as_noop_before_retry_fence() {
-        let (_vault, _data, coordinator, mut store, mut service, _) =
-            authority_optimizer_fixture("Exact Overlay Noop");
-        let pending = prepare_authority_write(&mut service, &store, &coordinator);
-        let snapshot = store
-            .optimizer_note_snapshot(&pending.job.note_id)
-            .unwrap()
-            .unwrap();
-        let overlay = optimizer_sidecar_overlay(
-            &pending.proposal,
-            snapshot.markdown_precondition.relative_path(),
-            snapshot.markdown_precondition.expected_digest(),
-        );
-        std::fs::write(
-            store.overlay_path(&pending.job.note_id),
-            serde_json::to_string_pretty(&overlay).unwrap(),
-        )
-        .unwrap();
-        let authority_before = coordinator.current_authority_token().unwrap();
-
-        assert!(matches!(
-            service.apply_pending(&mut store, pending).unwrap(),
-            OptimizerMutationResult::NoWrite
-        ));
-        assert_eq!(
-            coordinator.current_authority_token().unwrap(),
-            authority_before
-        );
-        assert!(service.state.queue.is_empty());
-        assert!(service.load_pending_publications().unwrap().is_empty());
-        assert!(service.list_decisions(10).unwrap().is_empty());
-        assert!(service.inbox(None, 10).unwrap().is_empty());
-
-        let restarted =
-            VaultOptimizerService::try_new(coordinator.current_namespace_path().unwrap()).unwrap();
-        assert!(restarted.state.queue.is_empty());
-        assert!(restarted.load_pending_publications().unwrap().is_empty());
-    }
-
-    #[test]
-    fn externally_satisfied_markdown_target_cleans_retry_fence_as_noop() {
-        let (vault, _data, coordinator, mut store, mut service, note) =
-            authority_optimizer_fixture("Exact Markdown Noop");
-        let settings = UserSettings {
-            background_vault_optimizer_edit_mode: "full_rewrite".into(),
-            ..UserSettings::default()
-        };
-        let pending = match service
-            .prepare_next_expecting_authority(
-                &store,
-                &settings,
-                coordinator.current_authority_token().unwrap(),
-            )
-            .unwrap()
-        {
-            OptimizerTick::Pending(pending) => *pending,
-            other => panic!("expected a pending full rewrite, got {other:?}"),
-        };
-        let entered = std::sync::Arc::new(std::sync::Barrier::new(2));
-        let resume = std::sync::Arc::new(std::sync::Barrier::new(2));
-        service.pause_after_retry_fence_once(entered.clone(), resume.clone());
-        let owner = std::thread::spawn(move || {
-            let result = service.apply_pending(&mut store, pending);
-            (service, result)
-        });
-
-        entered.wait();
-        let witness =
-            VaultOptimizerService::try_new(coordinator.current_namespace_path().unwrap()).unwrap();
-        let publication = witness.load_pending_publications().unwrap().remove(0).1;
-        let exact = publication.change.note_after.unwrap();
-        let (_, bytes) = KnowledgeStore::canonical_serialized_note_bytes(&exact).unwrap();
-        std::fs::write(vault.path().join(&note.relative_path), bytes).unwrap();
-        let authority_before = coordinator.current_authority_token().unwrap();
-        resume.wait();
-
-        let (service, result) = owner.join().unwrap();
-        assert!(matches!(result.unwrap(), OptimizerMutationResult::NoWrite));
-        assert_eq!(
-            coordinator.current_authority_token().unwrap(),
-            authority_before
-        );
-        assert!(service.state.queue.is_empty());
-        assert!(service.load_pending_publications().unwrap().is_empty());
-        assert!(service.list_decisions(10).unwrap().is_empty());
-        assert!(service.inbox(None, 10).unwrap().is_empty());
-
-        let restarted =
-            VaultOptimizerService::try_new(coordinator.current_namespace_path().unwrap()).unwrap();
-        assert!(restarted.state.queue.is_empty());
-        assert!(restarted.load_pending_publications().unwrap().is_empty());
-    }
-
-    #[test]
-    fn sidecar_source_edit_before_coordinator_has_no_authority_or_overlay_effect() {
-        let (vault, _data, coordinator, mut store, mut service, note) =
-            authority_optimizer_fixture("Sidecar Source Guard");
-        let pending = prepare_authority_write(&mut service, &store, &coordinator);
-        let overlay_path = store.overlay_path(&note.id);
-        let entered = std::sync::Arc::new(std::sync::Barrier::new(2));
-        let resume = std::sync::Arc::new(std::sync::Barrier::new(2));
-        service.pause_before_prepared_hook_once(entered.clone(), resume.clone());
-        let owner = std::thread::spawn(move || {
-            let result = service.apply_pending(&mut store, pending);
-            (service, result)
-        });
-
-        entered.wait();
-        let markdown_path = vault.path().join(&note.relative_path);
-        let mut external = std::fs::read_to_string(&markdown_path).unwrap();
-        external.push_str("\n\nExternal edit before sidecar commit.\n");
-        std::fs::write(&markdown_path, external).unwrap();
-        let authority_before = coordinator.current_authority_token().unwrap();
-        resume.wait();
-
-        let (service, result) = owner.join().unwrap();
-        assert!(matches!(result.unwrap(), OptimizerMutationResult::NoWrite));
-        assert_eq!(
-            coordinator.current_authority_token().unwrap(),
-            authority_before
-        );
-        assert!(!overlay_path.exists());
-        assert!(service.load_pending_publications().unwrap().is_empty());
-        assert!(service.list_decisions(10).unwrap().is_empty());
-        assert_eq!(service.state.queue[0].attempts, 1);
-    }
-
-    #[test]
-    fn prepared_sidecar_guard_abort_retires_exact_owner_and_defers_without_authority() {
-        let (vault, data, coordinator, mut store, mut service, note) =
-            authority_optimizer_fixture("Prepared Sidecar Guard Abort");
-        let pending = prepare_authority_write(&mut service, &store, &coordinator);
-        let job_id = pending.job.job_id.clone();
-        let overlay_path = store.overlay_path(&note.id);
-        let namespace = coordinator.current_namespace_path().unwrap();
-        let authority_before = coordinator.current_authority_token().unwrap();
-        coordinator
-            .begin_root_transition()
-            .unwrap()
-            .publish_namespace_ready(&authority_before)
-            .unwrap();
-        let entered = std::sync::Arc::new(std::sync::Barrier::new(2));
-        let resume = std::sync::Arc::new(std::sync::Barrier::new(2));
-        service.pause_after_prepared_publication_once(entered.clone(), resume.clone());
-        let owner = std::thread::spawn(move || {
-            let result = service.apply_pending(&mut store, pending);
-            (service, result)
-        });
-
-        entered.wait();
-        let mut observer = VaultOptimizerService::try_new(namespace.clone()).unwrap();
-        let owners = observer.load_pending_publications().unwrap();
-        assert_eq!(owners.len(), 1);
-        assert_eq!(owners[0].1.phase, OptimizerPublicationPhase::Prepared);
-        let prepared_change_id = owners[0].1.change_id.clone();
-        let prepared_mutation_id = owners[0].1.mutation_id.clone().unwrap();
-        assert!(!observer
-            .abort_precondition_owner_and_defer(
-                &prepared_change_id,
-                &job_id,
-                "wrong-mutation-id",
-                &anyhow::anyhow!("must not retire a different owner"),
-            )
-            .unwrap());
-        let unchanged_owners = observer.load_pending_publications().unwrap();
-        assert_eq!(unchanged_owners.len(), 1);
-        assert_eq!(
-            unchanged_owners[0].1.mutation_id.as_ref(),
-            Some(&prepared_mutation_id)
-        );
-        assert_eq!(observer.state.queue[0].attempts, 0);
-        assert_eq!(
-            std::fs::read_dir(data.path().join("twin/mutations/pending/v1"))
-                .unwrap()
-                .count(),
-            0
-        );
-        let markdown_path = vault.path().join(&note.relative_path);
-        let mut external = std::fs::read(&markdown_path).unwrap();
-        external.extend_from_slice(b"\nExternal edit after Prepared publication.\n");
-        std::fs::write(&markdown_path, &external).unwrap();
-        resume.wait();
-
-        let (service, result) = owner.join().unwrap();
-        assert!(matches!(result.unwrap(), OptimizerMutationResult::NoWrite));
-        assert_eq!(
-            coordinator.current_authority_token().unwrap(),
-            authority_before
-        );
-        coordinator.require_namespace_ready().unwrap();
-        assert_eq!(coordinator.pending_count().unwrap(), 0);
-        assert!(!overlay_path.exists());
-        assert_eq!(std::fs::read(&markdown_path).unwrap(), external);
-        assert!(service.load_pending_publications().unwrap().is_empty());
-        assert!(service.list_decisions(10).unwrap().is_empty());
-        assert!(service.inbox(None, 10).unwrap().is_empty());
-        assert_eq!(service.state.queue.len(), 1);
-        assert_eq!(service.state.queue[0].job_id, job_id);
-        assert_eq!(service.state.queue[0].attempts, 1);
-        assert_eq!(
-            std::fs::read_dir(data.path().join("twin/mutations/receipts/v1"))
-                .unwrap()
-                .count(),
-            0
-        );
-
-        let restarted = VaultOptimizerService::try_new(namespace).unwrap();
-        assert!(restarted.load_pending_publications().unwrap().is_empty());
-        assert_eq!(restarted.state.queue[0].attempts, 1);
-        assert!(!restarted
-            .load_pending_publications()
-            .unwrap()
-            .iter()
-            .any(|(_, owner)| owner.mutation_id.as_ref() == Some(&prepared_mutation_id)));
-    }
-
-    #[test]
-    fn two_prepared_peers_keep_one_stable_job_owner_through_restart() {
-        let (vault, _data, coordinator, mut owner_store, mut owner, _note) =
-            authority_optimizer_fixture("Single Pending Owner");
-        let namespace = coordinator.current_namespace_path().unwrap();
-        let mut peer = VaultOptimizerService::try_new(namespace.clone()).unwrap();
-        let mut peer_store = KnowledgeStore::with_event_recorder(
-            vault.path().to_path_buf(),
-            namespace.clone(),
-            coordinator.clone(),
-        );
-        let expected = coordinator.current_authority_token().unwrap();
-        let first = prepare_authority_write(&mut owner, &owner_store, &coordinator);
-        let second = prepare_authority_write(&mut peer, &peer_store, &coordinator);
-        assert_eq!(first.job.job_id, second.job.job_id);
-        assert_ne!(first.change_id, second.change_id);
-        let first_change_id = first.change_id.clone();
-        let entered = std::sync::Arc::new(std::sync::Barrier::new(2));
-        let resume = std::sync::Arc::new(std::sync::Barrier::new(2));
-        owner.pause_after_retry_fence_once(entered.clone(), resume.clone());
-        let owner_thread = std::thread::spawn(move || {
-            let result = owner.apply_pending(&mut owner_store, first);
-            (owner, result)
-        });
-
-        entered.wait();
-        assert!(matches!(
-            peer.apply_pending(&mut peer_store, second).unwrap(),
-            OptimizerMutationResult::NoWrite
-        ));
-        let owners = peer.load_pending_publications().unwrap();
-        assert_eq!(owners.len(), 1);
-        assert_eq!(owners[0].1.change_id, first_change_id);
-        assert_eq!(peer.state.queue[0].attempts, 0);
-        assert!(peer.inbox(Some("failed"), 10).unwrap().is_empty());
-        resume.wait();
-
-        let (owner, result) = owner_thread.join().unwrap();
-        assert!(matches!(
-            result.unwrap(),
-            OptimizerMutationResult::Committed { .. }
-        ));
-        drop(owner);
-        let mut restarted = VaultOptimizerService::try_new(namespace).unwrap();
-        let owners = restarted.load_pending_publications().unwrap();
-        assert_eq!(owners.len(), 1);
-        assert_eq!(owners[0].1.change_id, first_change_id);
-
-        let state_lock = restarted.acquire_state_lock().unwrap();
-        restarted.reload_from_disk_checked().unwrap();
-        {
-            let guard = coordinator.begin_root_transition().unwrap();
-            restarted
-                .recover_pending_publications_locked(&peer_store, &guard)
-                .unwrap();
-        }
-        state_lock.unlock().unwrap();
-        assert!(restarted.state.queue.is_empty());
-        assert!(restarted.load_pending_publications().unwrap().is_empty());
-        assert_eq!(restarted.list_decisions(10).unwrap().len(), 1);
-        assert_eq!(
-            coordinator.current_authority_token().unwrap(),
-            crate::services::vault_namespace::VaultAuthorityTokenV1 {
-                authority_generation: expected.authority_generation + 1,
-                ..expected
-            }
-        );
-    }
-
-    #[test]
-    fn duplicate_persisted_job_owners_fail_closed_on_restart() {
-        let (_vault, _data, coordinator, mut store, mut service, _) =
-            authority_optimizer_fixture("Duplicate Pending Owner");
-        let pending = prepare_authority_write(&mut service, &store, &coordinator);
-        service.fail_next_retry_fence_stage_after_write();
-        assert!(matches!(
-            service.apply_pending(&mut store, pending).unwrap(),
-            OptimizerMutationResult::NoWrite
-        ));
-        let mut duplicate = service.load_pending_publications().unwrap().remove(0).1;
-        let duplicate_id = Uuid::new_v4().to_string();
-        duplicate.change_id = duplicate_id.clone();
-        duplicate.decision.id = duplicate_id.clone();
-        duplicate.decision.change_id = Some(duplicate_id.clone());
-        duplicate.change.change_id = duplicate_id;
-        write_pending_publication(service.retained_optimizer_root().unwrap(), &duplicate).unwrap();
-        let namespace = coordinator.current_namespace_path().unwrap();
-        drop(service);
-
-        let error = VaultOptimizerService::try_new(namespace).unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("multiple pending-publication owners"));
-    }
-
-    #[test]
-    fn full_change_audit_rejects_optimizer_before_authority_effect() {
-        let (_vault, _data, coordinator, mut store, mut service, note) =
-            authority_optimizer_fixture("Full Change Audit");
-        let before = coordinator.current_authority_token().unwrap();
-        for index in 0..MAX_OPTIMIZER_AUDIT_ENTRIES {
-            let change_id = Uuid::from_u128(index as u128 + 1).to_string();
-            std::fs::write(
-                service.changes_dir.join(format!("{change_id}.json")),
-                serde_json::to_vec(&OptimizerChange {
-                    change_id,
-                    note_id: format!("old-{index}"),
-                    mode: "sidecar_first".into(),
-                    ..Default::default()
-                })
-                .unwrap(),
-            )
-            .unwrap();
-        }
-        let pending = prepare_authority_write(&mut service, &store, &coordinator);
-
-        assert!(matches!(
-            service.apply_pending(&mut store, pending).unwrap(),
-            OptimizerMutationResult::NoWrite
-        ));
-        assert_eq!(coordinator.current_authority_token().unwrap(), before);
-        assert!(!store.overlay_path(&note.id).exists());
-        assert!(service.load_pending_publications().unwrap().is_empty());
-        assert_eq!(
-            std::fs::read_dir(&service.changes_dir).unwrap().count(),
-            4096
-        );
-    }
-
-    #[test]
-    fn pending_reservation_blocks_other_audit_writers_at_boundary() {
-        let (_vault, _data, coordinator, mut store, mut service, _) =
-            authority_optimizer_fixture("Reserved Audit Slot");
-        let pending = prepare_authority_write(&mut service, &store, &coordinator);
-        let _ = service.apply_pending(&mut store, pending).unwrap();
-        let now = Utc::now();
-        let inbox = (0..(MAX_OPTIMIZER_AUDIT_ENTRIES - 1))
-            .map(|index| VaultOptimizerInboxEntry {
-                id: format!("legacy-inbox-{index}"),
-                status: "failed".into(),
-                ..Default::default()
-            })
-            .collect::<Vec<_>>();
-        write_bounded_json_vec(
-            service.retained_optimizer_root().unwrap(),
-            INBOX_KEY,
-            &inbox,
-        )
-        .unwrap();
-        assert!(service
-            .push_inbox(VaultOptimizerInboxEntry {
-                id: "would-consume-reserved-inbox".into(),
-                status: "failed".into(),
-                ..Default::default()
-            })
-            .is_err());
-
-        let events = (0..(MAX_OPTIMIZER_AUDIT_ENTRIES - 1))
-            .map(|index| OptimizerAuditEventV1::Rollback {
-                change_id: format!("legacy-rollback-{index}"),
-                at: now,
-            })
-            .collect::<Vec<_>>();
-        service.write_events(&events).unwrap();
-        assert!(service
-            .append_event(OptimizerAuditEventV1::Rollback {
-                change_id: "would-consume-reserved-event".into(),
-                at: now,
-            })
-            .is_err());
-    }
-
-    #[test]
-    fn peer_recovery_preserves_a_live_retry_fence_and_its_last_audit_slot() {
-        let (vault, _data, coordinator, mut store, mut service, _) =
-            authority_optimizer_fixture("Live Retry Fence");
-        let inbox = (0..(MAX_OPTIMIZER_AUDIT_ENTRIES - 1))
-            .map(|index| VaultOptimizerInboxEntry {
-                id: format!("existing-inbox-{index}"),
-                status: "failed".into(),
-                ..Default::default()
-            })
-            .collect::<Vec<_>>();
-        write_bounded_json_vec(
-            service.retained_optimizer_root().unwrap(),
-            INBOX_KEY,
-            &inbox,
-        )
-        .unwrap();
-        let pending = prepare_authority_write(&mut service, &store, &coordinator);
-        let entered = std::sync::Arc::new(std::sync::Barrier::new(2));
-        let resume = std::sync::Arc::new(std::sync::Barrier::new(2));
-        service.pause_after_retry_fence_once(entered.clone(), resume.clone());
-
-        let owner = std::thread::spawn(move || {
-            let outcome = service.apply_pending(&mut store, pending);
-            (service, store, outcome)
-        });
-        entered.wait();
-
-        let namespace = coordinator.current_namespace_path().unwrap();
-        let peer_store = KnowledgeStore::with_event_recorder(
-            vault.path().to_path_buf(),
-            namespace.clone(),
-            coordinator.clone(),
-        );
-        let mut peer = VaultOptimizerService::try_new(namespace).unwrap();
-        let state_lock = peer.acquire_state_lock().unwrap();
-        peer.reload_from_disk_checked().unwrap();
-        let guard = coordinator.begin_root_transition().unwrap();
-        peer.recover_pending_publications_locked(&peer_store, &guard)
-            .unwrap();
-        drop(guard);
-        state_lock.unlock().unwrap();
-
-        assert!(matches!(
-            peer.prepare_next_expecting_authority(
-                &peer_store,
-                &UserSettings::default(),
-                coordinator.current_authority_token().unwrap(),
-            )
-            .unwrap(),
-            OptimizerTick::RetryFenced(_)
-        ));
-        assert!(peer
-            .push_inbox(VaultOptimizerInboxEntry {
-                id: "would-steal-live-reservation".into(),
-                status: "failed".into(),
-                ..Default::default()
-            })
-            .is_err());
-
-        resume.wait();
-        let (_service, _store, outcome) = owner.join().unwrap();
-        assert!(matches!(
-            outcome.unwrap(),
-            OptimizerMutationResult::Committed { .. }
-        ));
-    }
-
-    #[test]
-    fn committed_publication_replays_all_phases_once_after_restart() {
-        let (_vault, _data, coordinator, mut store, mut service, note) =
-            authority_optimizer_fixture("Restarted Publication");
-        let pending = prepare_authority_write(&mut service, &store, &coordinator);
-        let outcome = service.apply_pending(&mut store, pending).unwrap();
-        assert!(matches!(outcome, OptimizerMutationResult::Committed { .. }));
-        drop(service);
-
-        let namespace = coordinator.current_namespace_path().unwrap();
-        let mut restarted = VaultOptimizerService::try_new(namespace.clone()).unwrap();
-        let state_lock = restarted.acquire_state_lock().unwrap();
-        restarted.reload_from_disk_checked().unwrap();
-        let guard = coordinator.begin_root_transition().unwrap();
-        restarted
-            .recover_pending_publications_locked(&store, &guard)
-            .unwrap();
-        state_lock.unlock().unwrap();
-        drop(guard);
-
-        assert!(restarted.load_pending_publications().unwrap().is_empty());
-        assert!(restarted
-            .state
-            .queue
-            .iter()
-            .all(|job| job.note_id != note.id));
-        assert_eq!(restarted.state.accepted_count, 1);
-        assert_eq!(restarted.load_decisions().unwrap().len(), 1);
-        assert_eq!(restarted.load_inbox().unwrap().len(), 1);
-        assert_eq!(restarted.load_events().unwrap().len(), 1);
-
-        drop(restarted);
-        let replayed = VaultOptimizerService::try_new(namespace).unwrap();
-        assert_eq!(replayed.state.accepted_count, 1);
-        assert_eq!(replayed.load_decisions().unwrap().len(), 1);
-        assert_eq!(replayed.load_inbox().unwrap().len(), 1);
-        assert_eq!(replayed.load_events().unwrap().len(), 1);
-    }
-
-    #[test]
-    fn completed_witness_survives_receipt_delete_before_witness_delete() {
-        let (_vault, _data, coordinator, mut store, mut service, _) =
-            authority_optimizer_fixture("Receipt Witness Gap");
-        let pending = prepare_authority_write(&mut service, &store, &coordinator);
-        let _ = service.apply_pending(&mut store, pending).unwrap();
-        let state_lock = service.acquire_state_lock().unwrap();
-        service.reload_from_disk_checked().unwrap();
-        let (_, mut publication) = service.load_pending_publications().unwrap().remove(0);
-        service
-            .finalize_pending_publication(&mut publication)
-            .unwrap();
-        let mutation_id = publication.mutation_id.clone().unwrap();
-        state_lock.unlock().unwrap();
-
-        let guard = coordinator.begin_root_transition().unwrap();
-        guard
-            .consume_witnessed_mutation_receipt(&mutation_id)
-            .unwrap();
-        drop(guard);
-        drop(service);
-
-        let namespace = coordinator.current_namespace_path().unwrap();
-        let mut restarted = VaultOptimizerService::try_new(namespace).unwrap();
-        let state_lock = restarted.acquire_state_lock().unwrap();
-        restarted.reload_from_disk_checked().unwrap();
-        let guard = coordinator.begin_root_transition().unwrap();
-        restarted
-            .recover_pending_publications_locked(&store, &guard)
-            .unwrap();
-        state_lock.unlock().unwrap();
-
-        assert!(restarted.load_pending_publications().unwrap().is_empty());
-        assert_eq!(restarted.state.accepted_count, 1);
-        assert_eq!(restarted.load_decisions().unwrap().len(), 1);
-        assert_eq!(restarted.load_events().unwrap().len(), 1);
-    }
-
-    #[test]
-    fn queue_state_writes_are_atomic_with_no_tmp_litter() {
-        let data_dir = tempdir().expect("temp dir should be created");
-        let mut service = VaultOptimizerService::new(data_dir.path().to_path_buf());
-
-        service.bootstrap(&[make_note("note-1", "Optimizer Adoption")]);
-
-        let persisted =
-            std::fs::read_to_string(&service.queue_path).expect("queue.json should exist");
-        assert!(persisted.contains("note-1"));
-        assert_no_tmp_siblings(&service.optimizer_dir);
-    }
-
-    #[test]
-    fn peer_instances_reload_revision_before_enqueuing() {
-        let data_dir = tempdir().expect("temp dir should be created");
-        let mut first = VaultOptimizerService::new(data_dir.path().to_path_buf());
-        let mut peer = VaultOptimizerService::new(data_dir.path().to_path_buf());
-
-        first
-            .with_locked_fresh_state(|service| {
-                service.enqueue_note_checked("note-a", "first").map(|_| ())
-            })
-            .unwrap();
-        let first_revision = first.state_revision();
-        peer.with_locked_fresh_state(|service| {
-            service.enqueue_note_checked("note-b", "peer").map(|_| ())
-        })
-        .unwrap();
-        let peer_revision = peer.state_revision();
-        let queued = first
-            .with_locked_fresh_state(|service| {
-                Ok(service
-                    .state
-                    .queue
-                    .iter()
-                    .map(|entry| entry.note_id.clone())
-                    .collect::<std::collections::BTreeSet<_>>())
-            })
-            .unwrap();
-
-        assert_eq!(queued, ["note-a".to_string(), "note-b".to_string()].into());
-        assert!(peer_revision > first_revision);
-        assert_eq!(first.state_revision(), peer_revision);
-    }
-
-    #[test]
-    fn daily_write_cap_defers_third_write_in_same_day() {
-        let vault_dir = tempdir().expect("vault tempdir should be created");
-        let data_dir = tempdir().expect("data tempdir should be created");
-        let event_store = std::sync::Arc::new(crate::services::twin_events::TwinEventStore::new(
-            data_dir.path(),
-        ));
-        event_store.initialize().unwrap();
-        let coordinator = std::sync::Arc::new(
-            crate::services::twin_events::MutationCoordinator::new(
-                data_dir.path(),
-                vault_dir.path(),
-                event_store.clone(),
-                std::sync::Arc::new(crate::services::twin_events::NoopMutationLifecycle),
-            )
-            .unwrap(),
-        );
-        let mut store = KnowledgeStore::with_event_recorder(
-            vault_dir.path().to_path_buf(),
-            data_dir.path().to_path_buf(),
-            coordinator,
-        );
-
-        let notes = vec![
-            store
-                .create_note(make_note_create("Alpha Topic"))
-                .expect("note 1 should be created"),
-            store
-                .create_note(make_note_create("Beta Topic"))
-                .expect("note 2 should be created"),
-            store
-                .create_note(make_note_create("Gamma Topic"))
-                .expect("note 3 should be created"),
-        ];
-
-        let mut service = VaultOptimizerService::new(data_dir.path().to_path_buf());
-        service.bootstrap(&notes);
-        assert_eq!(service.state.queue.len(), 3);
-
-        let settings = UserSettings {
-            background_vault_optimizer_max_daily_writes: 2,
-            ..UserSettings::default()
-        };
-
-        run_one_optimizer_write(&mut service, &mut store, &settings);
-        run_one_optimizer_write(&mut service, &mut store, &settings);
-        assert_eq!(
-            service.state.queue.len(),
-            1,
-            "two notes should have been dequeued after being written"
-        );
-        assert_eq!(service.state.accepted_count, 2);
-        assert_eq!(service.state.daily_write_count, 2);
-
-        let queue_before_cap = service.state.queue.clone();
-        assert!(matches!(
-            service
-                .prepare_next(&store, &settings)
-                .expect("tick 3 (capped) should not error"),
-            OptimizerTick::NoWrite
-        ));
-        assert_eq!(
-            service.state.queue.len(),
-            1,
-            "the third note must stay queued once the daily cap is hit"
-        );
-        assert_eq!(
-            service.state.queue, queue_before_cap,
-            "the deferred job must be untouched (no attempts bump, no removal)"
-        );
-        assert_eq!(
-            service.state.accepted_count, 2,
-            "no write should be recorded past the daily cap"
-        );
-        assert_eq!(
-            event_store.ordered_events().unwrap().len(),
-            3,
-            "sidecar overlays and capped no-ops must not emit beyond note creation"
-        );
-    }
-
-    #[test]
-    fn stale_optimizer_source_aborts_before_overlay_and_queue_publication() {
-        let vault_dir = tempdir().unwrap();
-        let data_dir = tempdir().unwrap();
-        let events = std::sync::Arc::new(crate::services::twin_events::TwinEventStore::new(
-            data_dir.path(),
-        ));
-        events.initialize().unwrap();
-        let coordinator = std::sync::Arc::new(
-            crate::services::twin_events::MutationCoordinator::new(
-                data_dir.path(),
-                vault_dir.path(),
-                events,
-                std::sync::Arc::new(crate::services::twin_events::NoopMutationLifecycle),
-            )
-            .unwrap(),
-        );
-        let namespace = coordinator.current_namespace_path().unwrap();
-        let mut store = KnowledgeStore::with_event_recorder(
-            vault_dir.path().to_path_buf(),
-            namespace.clone(),
-            coordinator.clone(),
-        );
-        let note = store.create_note(make_note_create("Stale Topic")).unwrap();
-        let source = coordinator.current_authority_token().unwrap();
-        let mut service = VaultOptimizerService::new(namespace);
-        service.bootstrap(std::slice::from_ref(&note));
-        let queue_before = service.state.queue.clone();
-
-        store
-            .update_note(
-                &note.id,
-                NoteUpdate {
-                    tags: Some(vec!["peer".into()]),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        assert_ne!(
-            coordinator.current_authority_token().unwrap(),
-            source,
-            "peer note update must advance the exact optimizer source authority"
-        );
-        let pending = match service
-            .prepare_next_expecting_authority(&store, &UserSettings::default(), source)
-            .unwrap()
-        {
-            OptimizerTick::Pending(pending) => *pending,
-            other => panic!("expected a pending stale-authority write, got {other:?}"),
-        };
-        assert!(matches!(
-            service.apply_pending(&mut store, pending).unwrap(),
-            OptimizerMutationResult::NoWrite
-        ));
-        assert_eq!(service.state.queue.len(), queue_before.len());
-        assert_eq!(service.state.queue[0].job_id, queue_before[0].job_id);
-        assert_eq!(service.state.queue[0].attempts, 1);
-        assert!(!store.overlay_path(&note.id).exists());
-        assert_eq!(service.state.accepted_count, 0);
-        assert!(service.load_pending_publications().unwrap().is_empty());
-    }
-
-    #[test]
-    fn postwrite_publication_failure_returns_explicit_committed_result() {
-        let vault_dir = tempdir().unwrap();
-        let data_dir = tempdir().unwrap();
-        let events = std::sync::Arc::new(crate::services::twin_events::TwinEventStore::new(
-            data_dir.path(),
-        ));
-        events.initialize().unwrap();
-        let coordinator = std::sync::Arc::new(
-            crate::services::twin_events::MutationCoordinator::new(
-                data_dir.path(),
-                vault_dir.path(),
-                events,
-                std::sync::Arc::new(crate::services::twin_events::NoopMutationLifecycle),
-            )
-            .unwrap(),
-        );
-        let namespace = coordinator.current_namespace_path().unwrap();
-        let mut store = KnowledgeStore::with_event_recorder(
-            vault_dir.path().to_path_buf(),
-            namespace.clone(),
-            coordinator.clone(),
-        );
-        let note = store
-            .create_note(make_note_create("Committed Optimizer Topic"))
-            .unwrap();
-        let expected = coordinator.current_authority_token().unwrap();
-        let mut service = VaultOptimizerService::new(namespace);
-        service.bootstrap(std::slice::from_ref(&note));
-
-        // The governed overlay write and retained receipt succeed, while the
-        // committed-witness publication is faulted before the coordinator
-        // releases its retained process guard.
-        service.fail_next_committed_publication();
-
-        let tick = service
-            .prepare_next_expecting_authority(&store, &UserSettings::default(), expected)
-            .expect("a durable governed write must not be returned as retryable failure");
-        let outcome = match tick {
-            OptimizerTick::Pending(pending) => service
-                .apply_pending(&mut store, *pending)
-                .expect("a durable governed write must not be returned as retryable failure"),
-            other => panic!("expected pending optimizer write, got {other:?}"),
-        };
-        match outcome {
-            OptimizerMutationResult::Committed {
-                result,
-                commit,
-                warning,
-            } => {
-                assert_eq!(result.note_id(), note.id);
-                assert!(commit.authority_token.is_some());
-                assert!(warning.is_some());
-            }
-            other => panic!("expected explicit committed optimizer result, got {other:?}"),
-        }
-        assert!(store.overlay_path(&note.id).exists());
-        let pending = service.load_pending_publications().unwrap();
-        assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].1.phase, OptimizerPublicationPhase::Prepared);
-        assert!(pending[0].1.retry_fenced);
-        assert!(
-            matches!(
-                service
-                    .prepare_next_expecting_authority(
-                        &store,
-                        &UserSettings::default(),
-                        coordinator.current_authority_token().unwrap(),
-                    )
-                    .unwrap(),
-                OptimizerTick::NoWrite
-            ),
-            "the durable publication witness must fence the queued job from retry"
-        );
-    }
-
-    #[test]
-    fn stale_rollback_source_aborts_before_overlay_and_rollback_state_publication() {
-        let vault_dir = tempdir().unwrap();
-        let data_dir = tempdir().unwrap();
-        let events = std::sync::Arc::new(crate::services::twin_events::TwinEventStore::new(
-            data_dir.path(),
-        ));
-        events.initialize().unwrap();
-        let coordinator = std::sync::Arc::new(
-            crate::services::twin_events::MutationCoordinator::new(
-                data_dir.path(),
-                vault_dir.path(),
-                events,
-                std::sync::Arc::new(crate::services::twin_events::NoopMutationLifecycle),
-            )
-            .unwrap(),
-        );
-        let namespace = coordinator.current_namespace_path().unwrap();
-        let mut store = KnowledgeStore::with_event_recorder(
-            vault_dir.path().to_path_buf(),
-            namespace.clone(),
-            coordinator.clone(),
-        );
-        let note = store
-            .create_note(make_note_create("Rollback Source"))
-            .unwrap();
-        let old_overlay = serde_json::json!({"tags": ["before"]});
-        let overlay = serde_json::json!({"tags": ["optimizer"]});
-        store.write_overlay(&note.id, &old_overlay).unwrap();
-        store.write_overlay(&note.id, &overlay).unwrap();
-        let source = coordinator.current_authority_token().unwrap();
-        let mut service = VaultOptimizerService::new(namespace);
-        let change_id = Uuid::new_v4().to_string();
-        std::fs::write(
-            service.changes_dir.join(format!("{change_id}.json")),
-            serde_json::to_vec_pretty(&OptimizerChange {
-                change_id: change_id.to_string(),
-                note_id: note.id.clone(),
-                mode: "sidecar_first".to_string(),
-                overlay_before: Some(old_overlay),
-                overlay_after: Some(overlay.clone()),
-                note_before: None,
-                note_after: None,
-                markdown_before_digest: None,
-                markdown_relative_path: None,
-                created_at: Some(Utc::now()),
-            })
-            .unwrap(),
-        )
-        .unwrap();
-
-        store.create_note(make_note_create("Peer Change")).unwrap();
-        assert_ne!(coordinator.current_authority_token().unwrap(), source);
-        let error = service
-            .rollback_change_expecting_authority(&change_id, &mut store, source)
-            .unwrap_err();
-
-        assert!(error.to_string().contains("authority"));
-        assert_eq!(
-            serde_json::from_slice::<Value>(&std::fs::read(store.overlay_path(&note.id)).unwrap())
-                .unwrap(),
-            overlay
-        );
-        assert_eq!(service.state.rollback_count, 0);
-        assert!(!service.events_path.exists());
-    }
-
-    #[test]
-    fn sidecar_rollback_restores_an_absent_overlay() {
-        let vault_dir = tempdir().unwrap();
-        let data_dir = tempdir().unwrap();
-        let events = std::sync::Arc::new(crate::services::twin_events::TwinEventStore::new(
-            data_dir.path(),
-        ));
-        events.initialize().unwrap();
-        let coordinator = std::sync::Arc::new(
-            crate::services::twin_events::MutationCoordinator::new(
-                data_dir.path(),
-                vault_dir.path(),
-                events,
-                std::sync::Arc::new(crate::services::twin_events::NoopMutationLifecycle),
-            )
-            .unwrap(),
-        );
-        let namespace = coordinator.current_namespace_path().unwrap();
-        let mut store = KnowledgeStore::with_event_recorder(
-            vault_dir.path().to_path_buf(),
-            namespace.clone(),
-            coordinator.clone(),
-        );
-        let note = store
-            .create_note(make_note_create("Absent Overlay"))
-            .unwrap();
-        let overlay = serde_json::json!({"tags": ["optimizer"]});
-        store.write_overlay(&note.id, &overlay).unwrap();
-        let source = coordinator.current_authority_token().unwrap();
-        let mut service = VaultOptimizerService::new(namespace);
-        let change_id = Uuid::new_v4().to_string();
-        std::fs::write(
-            service.changes_dir.join(format!("{change_id}.json")),
-            serde_json::to_vec_pretty(&OptimizerChange {
-                change_id: change_id.to_string(),
-                note_id: note.id.clone(),
-                mode: "sidecar_first".to_string(),
-                overlay_before: None,
-                overlay_after: Some(overlay),
-                note_before: None,
-                note_after: None,
-                markdown_before_digest: None,
-                markdown_relative_path: None,
-                created_at: Some(Utc::now()),
-            })
-            .unwrap(),
-        )
-        .unwrap();
-
-        let result = service
-            .rollback_change_expecting_authority(&change_id, &mut store, source)
-            .unwrap();
-
-        assert!(result.rolled_back);
-        assert!(!store.overlay_path(&note.id).exists());
-        assert_eq!(service.state.rollback_count, 1);
-    }
-
-    #[test]
-    fn apply_pending_merges_against_current_note_not_stale_snapshot() {
-        // Between `prepare_next` (read lock) and `apply_pending` (write lock)
-        // there is a real await suspension in the background worker, so a
-        // concurrent user `update_note` can land in the gap. The apply stage
-        // must merge the proposal's ADDITIONS against the note's CURRENT
-        // state, not the snapshot captured in `prepare_next` — otherwise it
-        // silently drops the user's fresh tag and reverts their rename.
-        let vault_dir = tempdir().expect("vault tempdir should be created");
-        let data_dir = tempdir().expect("data tempdir should be created");
-        let event_store = std::sync::Arc::new(crate::services::twin_events::TwinEventStore::new(
-            data_dir.path(),
-        ));
-        event_store.initialize().unwrap();
-        let coordinator = std::sync::Arc::new(
-            crate::services::twin_events::MutationCoordinator::new(
-                data_dir.path(),
-                vault_dir.path(),
-                event_store.clone(),
-                std::sync::Arc::new(crate::services::twin_events::NoopMutationLifecycle),
-            )
-            .unwrap(),
-        );
-        let mut store = KnowledgeStore::with_event_recorder(
-            vault_dir.path().to_path_buf(),
-            data_dir.path().to_path_buf(),
-            coordinator,
-        );
-
-        let note = store
-            .create_note(make_note_create("Interleaved Edit Topic"))
-            .expect("note should be created");
-
-        let mut service = VaultOptimizerService::new(data_dir.path().to_path_buf());
-        service.bootstrap(std::slice::from_ref(&note));
-
-        let settings = UserSettings {
-            background_vault_optimizer_edit_mode: "full_rewrite".to_string(),
-            ..UserSettings::default()
-        };
-
-        let pending = match service
-            .prepare_next(&store, &settings)
-            .expect("prepare should not error")
-        {
-            OptimizerTick::Pending(pending) => pending,
-            other => panic!(
-                "full_rewrite mode must return a pending write, got {:?}",
-                other
-            ),
-        };
-
-        // Simulate the interleaved user edit landing between the read-locked
-        // prepare stage and the write-locked apply stage: add a tag and move
-        // the note to a new path.
-        store
-            .update_note(
-                &note.id,
-                NoteUpdate {
-                    tags: Some(vec!["user-fresh-tag".to_string()]),
-                    relative_path: Some("renamed-by-user.md".to_string()),
-                    ..Default::default()
-                },
-            )
-            .expect("interleaved user edit should succeed");
-
-        let applied = service
-            .apply_pending(&mut store, *pending)
-            .expect("apply should not error");
-        let OptimizerMutationResult::Committed { result, .. } = applied else {
-            panic!("apply_pending must report its committed write")
-        };
-        assert_eq!(result.note_id(), note.id);
-
-        let final_note = store.get_note(&note.id).expect("note should still exist");
-        assert!(
-            final_note.tags.iter().any(|tag| tag == "user-fresh-tag"),
-            "the user's interleaved tag must survive the optimizer apply, got tags: {:?}",
-            final_note.tags
-        );
-        assert!(
-            final_note
-                .tags
-                .iter()
-                .any(|tag| tag == "interleaved_edit_topic"),
-            "the proposal's additive tag must still be applied, got tags: {:?}",
-            final_note.tags
-        );
-        assert_eq!(
-            final_note.relative_path, "renamed-by-user.md",
-            "the user's interleaved rename must not be reverted to the snapshot path"
-        );
-        let events = event_store.ordered_events().unwrap();
-        assert_eq!(events.len(), 3);
-        assert_eq!(events[0].context.source_channel.as_str(), "note_editor");
-        assert_eq!(events[1].context.source_channel.as_str(), "note_editor");
-        assert_eq!(events[2].context.source_channel.as_str(), "vault_optimizer");
-    }
-
-    #[test]
-    fn external_markdown_edit_between_refetch_and_digest_is_not_overwritten() {
-        let (vault, _data, coordinator, mut store, mut service, note) =
-            authority_optimizer_fixture("Torn Snapshot Topic");
-        let settings = UserSettings {
-            background_vault_optimizer_edit_mode: "full_rewrite".into(),
-            ..UserSettings::default()
-        };
-        let pending = match service
-            .prepare_next_expecting_authority(
-                &store,
-                &settings,
-                coordinator.current_authority_token().unwrap(),
-            )
-            .unwrap()
-        {
-            OptimizerTick::Pending(pending) => *pending,
-            other => panic!("expected a pending full rewrite, got {other:?}"),
-        };
-        let entered = std::sync::Arc::new(std::sync::Barrier::new(2));
-        let resume = std::sync::Arc::new(std::sync::Barrier::new(2));
-        service.pause_before_markdown_digest_once(entered.clone(), resume.clone());
-        let owner = std::thread::spawn(move || {
-            let outcome = service.apply_pending(&mut store, pending);
-            (store, outcome)
-        });
-
-        entered.wait();
-        let markdown_path = vault.path().join(&note.relative_path);
-        let mut external = std::fs::read_to_string(&markdown_path).unwrap();
-        external.push_str("\n\nExternal B survives.\n");
-        std::fs::write(&markdown_path, external).unwrap();
-        resume.wait();
-
-        let (store, outcome) = owner.join().unwrap();
-        assert!(matches!(outcome.unwrap(), OptimizerMutationResult::NoWrite));
-        assert!(store
-            .get_note(&note.id)
-            .unwrap()
-            .content
-            .contains("External B survives."));
-        let restarted =
-            VaultOptimizerService::try_new(coordinator.current_namespace_path().unwrap()).unwrap();
-        assert_eq!(restarted.state.queue[0].attempts, 1);
-        assert!(restarted.load_pending_publications().unwrap().is_empty());
-    }
-
-    #[test]
-    fn apply_pending_parks_job_when_note_deleted_in_the_gap() {
-        // If the note is deleted between prepare and apply, the apply stage
-        // must not resurrect it — the job is dropped like any missing note.
-        let vault_dir = tempdir().expect("vault tempdir should be created");
-        let data_dir = tempdir().expect("data tempdir should be created");
-        let mut store = KnowledgeStore::new(
-            vault_dir.path().to_path_buf(),
-            data_dir.path().to_path_buf(),
-        );
-
-        let note = store
-            .create_note(make_note_create("Deleted In Gap Topic"))
-            .expect("note should be created");
-
-        let mut service = VaultOptimizerService::new(data_dir.path().to_path_buf());
-        service.bootstrap(std::slice::from_ref(&note));
-
-        let settings = UserSettings {
-            background_vault_optimizer_edit_mode: "full_rewrite".to_string(),
-            ..UserSettings::default()
-        };
-
-        let pending = match service
-            .prepare_next(&store, &settings)
-            .expect("prepare should not error")
-        {
-            OptimizerTick::Pending(pending) => pending,
-            other => panic!(
-                "full_rewrite mode must return a pending write, got {:?}",
-                other
-            ),
-        };
-
-        store
-            .delete_note(&note.id)
-            .expect("interleaved delete should succeed");
-
-        let applied = service
-            .apply_pending(&mut store, *pending)
-            .expect("apply of a deleted note must not error");
-        assert!(matches!(applied, OptimizerMutationResult::NoWrite));
-
-        assert!(
-            store.get_note(&note.id).is_err(),
-            "the optimizer must not resurrect a note deleted in the gap"
-        );
-        assert!(
-            service.state.queue.is_empty(),
-            "the job for a deleted note must be dropped from the queue"
-        );
-        assert_eq!(
-            service.state.accepted_count, 0,
-            "no write should be recorded for a deleted note"
-        );
-    }
-
-    #[test]
-    fn apply_noop_does_not_clobber_a_peer_enqueue() {
-        let vault_dir = tempdir().unwrap();
-        let data_dir = tempdir().unwrap();
-        let mut store = KnowledgeStore::new(
-            vault_dir.path().to_path_buf(),
-            data_dir.path().to_path_buf(),
-        );
-        let removed = store.create_note(make_note_create("Removed job")).unwrap();
-        let peer_note = store.create_note(make_note_create("Peer enqueue")).unwrap();
-        let mut service = VaultOptimizerService::new(data_dir.path().to_path_buf());
-        service.bootstrap(std::slice::from_ref(&removed));
-        let settings = UserSettings {
-            background_vault_optimizer_edit_mode: "full_rewrite".into(),
-            ..UserSettings::default()
-        };
-        let pending = match service.prepare_next(&store, &settings).unwrap() {
-            OptimizerTick::Pending(pending) => *pending,
-            other => panic!("expected pending optimizer write, got {other:?}"),
-        };
-
-        let mut peer = VaultOptimizerService::try_new(data_dir.path().to_path_buf()).unwrap();
-        peer.with_locked_fresh_state(|peer| {
-            assert!(peer.enqueue_note_checked(&peer_note.id, "peer")?);
-            Ok(())
-        })
-        .unwrap();
-        store.delete_note(&removed.id).unwrap();
-
-        assert!(matches!(
-            service.apply_pending(&mut store, pending).unwrap(),
-            OptimizerMutationResult::NoWrite
-        ));
-        let restarted = VaultOptimizerService::try_new(data_dir.path().to_path_buf()).unwrap();
-        assert_eq!(restarted.state.queue.len(), 1);
-        assert_eq!(restarted.state.queue[0].note_id, peer_note.id);
-    }
-
-    #[test]
-    fn apply_error_does_not_clobber_a_peer_enqueue() {
-        let vault_dir = tempdir().unwrap();
-        let data_dir = tempdir().unwrap();
-        let mut store = KnowledgeStore::new(
-            vault_dir.path().to_path_buf(),
-            data_dir.path().to_path_buf(),
-        );
-        let note = store.create_note(make_note_create("Poison Topic")).unwrap();
-        let mut service = VaultOptimizerService::new(data_dir.path().to_path_buf());
-        service.bootstrap(std::slice::from_ref(&note));
-        let pending = match service
-            .prepare_next(&store, &UserSettings::default())
-            .unwrap()
-        {
-            OptimizerTick::Pending(pending) => *pending,
-            other => panic!("expected pending optimizer write, got {other:?}"),
-        };
-        poison_overlay_directory(&store, &note);
-
-        let mut peer = VaultOptimizerService::try_new(data_dir.path().to_path_buf()).unwrap();
-        peer.with_locked_fresh_state(|peer| {
-            assert!(peer.enqueue_note_checked("peer-survivor", "peer")?);
-            Ok(())
-        })
-        .unwrap();
-
-        assert!(matches!(
-            service.apply_pending(&mut store, pending).unwrap(),
-            OptimizerMutationResult::NoWrite
-        ));
-        let restarted = VaultOptimizerService::try_new(data_dir.path().to_path_buf()).unwrap();
-        assert_eq!(restarted.state.queue.len(), 2);
-        assert_eq!(restarted.state.queue[0].note_id, note.id);
-        assert_eq!(restarted.state.queue[0].attempts, 1);
-        assert_eq!(restarted.state.queue[1].note_id, "peer-survivor");
-    }
-
-    #[test]
-    fn run_next_ignores_llm_enabled_because_no_llm_path_exists() {
-        // vault_optimizer has no LLM/network call path today:
-        // `build_optimizer_proposal` is purely rule-based, and neither
-        // `prepare_next` nor `apply_pending` reference `OpenRouterService` or
-        // any network client anywhere in this file (confirmed by inspection —
-        // there is no seam to stub). This test characterizes that fact:
-        // toggling `background_vault_optimizer_llm_enabled` produces
-        // identical decisions, proving enabling it doesn't silently add
-        // behavior and disabling it doesn't block the rules pipeline. If an
-        // LLM-backed enrichment step is ever added, it must be gated on this
-        // flag and this test should then be replaced with one that exercises
-        // the real seam.
-        fn run_with_llm_flag(llm_enabled: bool) -> VaultOptimizerDecision {
-            let vault_dir = tempdir().expect("vault tempdir should be created");
-            let data_dir = tempdir().expect("data tempdir should be created");
-            let mut store = KnowledgeStore::new(
-                vault_dir.path().to_path_buf(),
-                data_dir.path().to_path_buf(),
-            );
-            let note = store
-                .create_note(make_note_create("Shared Topic"))
-                .expect("note should be created");
-
-            let mut service = VaultOptimizerService::new(data_dir.path().to_path_buf());
-            service.bootstrap(&[note]);
-
-            let settings = UserSettings {
-                background_vault_optimizer_llm_enabled: llm_enabled,
-                ..UserSettings::default()
-            };
-            run_one_optimizer_write(&mut service, &mut store, &settings);
-
-            service
-                .list_decisions(1)
-                .expect("decisions should be readable")
-                .into_iter()
-                .next()
-                .expect("a decision should have been recorded")
-        }
-
-        let disabled = run_with_llm_flag(false);
-        let enabled = run_with_llm_flag(true);
-
-        assert_eq!(disabled.reason, enabled.reason);
-        assert_eq!(disabled.diff_preview, enabled.diff_preview);
-        assert_eq!(disabled.confidence, enabled.confidence);
-    }
-
-    /// Replaces the overlay directory with a regular file so the secure
-    /// optimizer snapshot fails before any authority mutation. Returns the
-    /// poisoned store and the note that will always fail to process.
-    fn seed_poisoned_note(
-        vault_dir: &std::path::Path,
-        data_dir: &std::path::Path,
-    ) -> (KnowledgeStore, Note) {
-        let mut store = KnowledgeStore::new(vault_dir.to_path_buf(), data_dir.to_path_buf());
-        let note = store
-            .create_note(make_note_create("Poison Topic"))
-            .expect("note should be created");
-
-        poison_overlay_directory(&store, &note);
-
-        (store, note)
-    }
-
-    fn poison_overlay_directory(store: &KnowledgeStore, note: &Note) {
-        let overlay_dir = store
-            .overlay_path(&note.id)
-            .parent()
-            .expect("overlay path should have a parent")
-            .to_path_buf();
-        std::fs::remove_dir_all(&overlay_dir).expect("overlay dir should be removable");
-        std::fs::write(&overlay_dir, b"blocking file")
-            .expect("blocking file should be writable in place of the overlay dir");
-    }
-
-    #[test]
-    fn processing_error_keeps_job_queued_and_increments_attempts() {
-        let vault_dir = tempdir().expect("vault tempdir should be created");
-        let data_dir = tempdir().expect("data tempdir should be created");
-        let (store, note) = seed_poisoned_note(vault_dir.path(), data_dir.path());
-
-        let mut service = VaultOptimizerService::new(data_dir.path().to_path_buf());
-        service.bootstrap(std::slice::from_ref(&note));
-
-        let settings = UserSettings::default();
-
-        assert!(matches!(
-            service
-                .prepare_next(&store, &settings)
-                .expect("preparing a processing attempt must not error"),
-            OptimizerTick::NoWrite
-        ));
-
-        assert_eq!(
-            service.state.queue.len(),
-            1,
-            "a failed job must stay queued, not be dropped"
-        );
-        assert_eq!(service.state.queue[0].note_id, note.id);
-        assert_eq!(
-            service.state.queue[0].attempts, 1,
-            "the first failure should record exactly one attempt"
-        );
-        assert_eq!(
-            service.state.accepted_count, 0,
-            "no write should have been recorded for a failed job"
-        );
-    }
-
-    #[test]
-    fn poison_job_is_parked_after_max_attempts() {
-        let vault_dir = tempdir().expect("vault tempdir should be created");
-        let data_dir = tempdir().expect("data tempdir should be created");
-        let (store, note) = seed_poisoned_note(vault_dir.path(), data_dir.path());
-
-        let mut service = VaultOptimizerService::new(data_dir.path().to_path_buf());
-        service.bootstrap(std::slice::from_ref(&note));
-
-        let settings = UserSettings::default();
-
-        for attempt in 1..=MAX_OPTIMIZER_ATTEMPTS {
-            assert!(matches!(
-                service
-                    .prepare_next(&store, &settings)
-                    .expect("preparing a processing attempt must not error"),
-                OptimizerTick::NoWrite
-            ));
-            if attempt < MAX_OPTIMIZER_ATTEMPTS {
-                assert_eq!(
-                    service.state.queue.len(),
-                    1,
-                    "job should still be queued before the attempt limit"
-                );
-            }
-        }
-
-        assert!(
-            service.state.queue.is_empty(),
-            "a poisoned job must be dropped from the queue after {} attempts",
-            MAX_OPTIMIZER_ATTEMPTS
-        );
-        let inbox = service
-            .inbox(Some("failed"), 10)
-            .expect("inbox should be readable");
-        assert_eq!(inbox.len(), 1);
-        assert_eq!(inbox[0].note_id.as_deref(), Some(note.id.as_str()));
-        assert_eq!(inbox[0].status, "failed");
-    }
-
-    #[test]
-    fn root_retarget_discards_old_queue_and_bootstraps_only_new_vault_ids() {
-        let old_vault = tempdir().unwrap();
-        let new_vault = tempdir().unwrap();
-        let data = tempdir().unwrap();
-        let mut old_store =
-            KnowledgeStore::new(old_vault.path().to_path_buf(), data.path().to_path_buf());
-        let mut new_store =
-            KnowledgeStore::new(new_vault.path().to_path_buf(), data.path().to_path_buf());
-        let old_note = old_store.create_note(make_note_create("Old root")).unwrap();
-        let new_note = new_store.create_note(make_note_create("New root")).unwrap();
-        let mut service = VaultOptimizerService::new(data.path().to_path_buf());
-        service.bootstrap(std::slice::from_ref(&old_note));
-        assert_eq!(service.state.queue[0].note_id, old_note.id);
-
-        service.reset_for_vault(std::slice::from_ref(&new_note));
-        assert_eq!(service.state.queue.len(), 1);
-        assert_eq!(service.state.queue[0].note_id, new_note.id);
-        assert!(service
-            .state
-            .queue
-            .iter()
-            .all(|entry| entry.note_id != old_note.id));
-    }
-}
+#[path = "vault_optimizer_tests.rs"]
+mod tests;

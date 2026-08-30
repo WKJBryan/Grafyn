@@ -520,6 +520,17 @@ impl TwinStore {
         &mut self,
         update: DecisionMirrorConfigUpdate,
     ) -> Result<DecisionMirrorConfig> {
+        let (config, _commit) = self.update_decision_mirror_config_with_commit(update)?;
+        Ok(config)
+    }
+
+    pub(crate) fn update_decision_mirror_config_with_commit(
+        &mut self,
+        update: DecisionMirrorConfigUpdate,
+    ) -> Result<(
+        DecisionMirrorConfig,
+        crate::services::twin_events::MutationCommit,
+    )> {
         if !self.event_recorder.is_noop() {
             let recorder = self.event_recorder.clone();
             let mut committed = None;
@@ -552,31 +563,70 @@ impl TwinStore {
                 crate::services::twin_events::MutationOrigin::Local,
                 &mut planner,
             );
-            self.finish_mutation_commit(result)?;
+            let commit = self.finish_mutation_commit(result)?;
             let config =
                 committed.ok_or_else(|| anyhow::anyhow!("config update was not planned"))?;
             self.invalidate_mutation_caches();
-            return Ok(config);
+            return Ok((config, commit));
         }
         let mut config = self.get_decision_mirror_config()?;
         apply_decision_mirror_config_update(&mut config, &update);
 
         self.write_decision_mirror_config_file(&config)?;
         self.invalidate_mutation_caches();
-        Ok(config)
+        Ok((config, Self::tokenless_mutation_commit()))
     }
 
     pub fn reset_decision_mirror_config(&mut self) -> Result<DecisionMirrorConfig> {
-        let config = DecisionMirrorConfig::default();
-        self.write_decision_mirror_config_file(&config)?;
-        self.invalidate_mutation_caches();
+        let (config, _commit) = self.reset_decision_mirror_config_with_commit()?;
         Ok(config)
+    }
+
+    pub(crate) fn reset_decision_mirror_config_with_commit(
+        &mut self,
+    ) -> Result<(
+        DecisionMirrorConfig,
+        crate::services::twin_events::MutationCommit,
+    )> {
+        let config = DecisionMirrorConfig::default();
+        let commit = if self.event_recorder.is_noop() {
+            self.write_decision_mirror_config_file(&config)?;
+            Self::tokenless_mutation_commit()
+        } else {
+            let values = vec![(
+                self.decision_mirror_config_path.clone(),
+                serde_json::to_string_pretty(&config)?,
+            )];
+            let targets = self.governed_json_targets(values)?;
+            let result = self.event_recorder.commit_mutation(
+                crate::services::twin_events::MutationOrigin::Local,
+                crate::models::twin_event::CausalStream::LocalOnly,
+                crate::models::twin_event::SourceChannel::parse("legacy_twin")
+                    .map_err(anyhow::Error::msg)?,
+                targets,
+                Vec::new(),
+            );
+            self.finish_mutation_commit(result)?
+        };
+        self.invalidate_mutation_caches();
+        Ok((config, commit))
     }
 
     pub fn record_decision_episode(
         &mut self,
         create: DecisionEpisodeCreate,
     ) -> Result<DecisionEpisode> {
+        self.record_decision_episode_with_commit(create)
+            .map(|(episode, _commit)| episode)
+    }
+
+    pub(crate) fn record_decision_episode_with_commit(
+        &mut self,
+        create: DecisionEpisodeCreate,
+    ) -> Result<(
+        DecisionEpisode,
+        crate::services::twin_events::MutationCommit,
+    )> {
         if !self.event_recorder.is_noop() {
             let recorder = self.event_recorder.clone();
             let mut committed = None;
@@ -602,16 +652,16 @@ impl TwinStore {
                 crate::services::twin_events::MutationOrigin::Local,
                 &mut planner,
             );
-            self.finish_mutation_commit(result)?;
+            let commit = self.finish_mutation_commit(result)?;
             let (episode, trace) =
                 committed.ok_or_else(|| anyhow::anyhow!("decision episode was not planned"))?;
             self.cache_committed_trace(trace);
-            return Ok(episode);
+            return Ok((episode, commit));
         }
         let (episode, trace, values, drafts) = self.plan_decision_episode_mutation(create)?;
-        self.commit_governed_json_targets(values, drafts)?;
+        let commit = self.commit_governed_json_targets(values, drafts)?;
         self.cache_committed_trace(trace);
-        Ok(episode)
+        Ok((episode, commit))
     }
 
     pub(crate) fn plan_decision_episode_mutation(
@@ -815,6 +865,23 @@ impl TwinStore {
         update: DecisionOutcomeUpdate,
         selected_response_id: Option<String>,
     ) -> Result<DecisionEpisode> {
+        let (episode, _commit) = self.update_decision_outcome_with_response_id_and_commit(
+            id,
+            update,
+            selected_response_id,
+        )?;
+        Ok(episode)
+    }
+
+    pub(crate) fn update_decision_outcome_with_response_id_and_commit(
+        &mut self,
+        id: &str,
+        update: DecisionOutcomeUpdate,
+        selected_response_id: Option<String>,
+    ) -> Result<(
+        DecisionEpisode,
+        crate::services::twin_events::MutationCommit,
+    )> {
         Self::validate_file_id(id)?;
         if !self.event_recorder.is_noop() {
             let recorder = self.event_recorder.clone();
@@ -844,7 +911,7 @@ impl TwinStore {
                 crate::services::twin_events::MutationOrigin::Local,
                 &mut planner,
             );
-            self.finish_mutation_commit(result)?;
+            let commit = self.finish_mutation_commit(result)?;
             let (episode, trace) =
                 committed.ok_or_else(|| anyhow::anyhow!("decision outcome was not planned"))?;
             if let Some(trace) = trace {
@@ -852,18 +919,20 @@ impl TwinStore {
             } else {
                 self.invalidate_mutation_caches();
             }
-            return Ok(episode);
+            return Ok((episode, commit));
         }
 
         let (episode, mutation) =
             self.plan_decision_outcome_mutation(id, &update, selected_response_id.as_deref())?;
-        if let Some((trace, values, drafts)) = mutation {
-            self.commit_governed_json_targets(values, drafts)?;
+        let commit = if let Some((trace, values, drafts)) = mutation {
+            let commit = self.commit_governed_json_targets(values, drafts)?;
             self.cache_committed_trace(trace);
+            commit
         } else {
             self.invalidate_mutation_caches();
-        }
-        Ok(episode)
+            Self::tokenless_mutation_commit()
+        };
+        Ok((episode, commit))
     }
 
     fn plan_decision_outcome_mutation(
@@ -1153,23 +1222,17 @@ impl TwinStore {
         }
         let (episode, trace, values) =
             self.plan_twin_prediction_mutation(episode_id, &draft, model_id, context_version)?;
-        if !values.is_empty() {
-            self.commit_governed_json_targets(values, Vec::new())?;
-        }
+        let commit = if values.is_empty() {
+            Self::tokenless_mutation_commit()
+        } else {
+            self.commit_governed_json_targets(values, Vec::new())?
+        };
         if let Some(trace) = trace {
             self.cache_committed_trace(trace);
         } else {
             self.invalidate_mutation_caches();
         }
-        Ok((
-            episode,
-            crate::services::twin_events::MutationCommit {
-                mutation_id: None,
-                events: Vec::new(),
-                authority_token: None,
-                postcommit_warning: false,
-            },
-        ))
+        Ok((episode, commit))
     }
 
     fn plan_twin_prediction_mutation(
@@ -1244,6 +1307,14 @@ impl TwinStore {
             .map(|_| ())
     }
 
+    pub(crate) fn mark_twin_prediction_failed_with_commit(
+        &mut self,
+        episode_id: &str,
+    ) -> Result<crate::services::twin_events::MutationCommit> {
+        self.mark_twin_prediction_failed_internal(episode_id, None)
+    }
+
+    #[cfg(test)]
     pub(crate) fn mark_twin_prediction_failed_expecting_authority(
         &mut self,
         episode_id: &str,
@@ -1440,17 +1511,9 @@ impl TwinStore {
             return Ok((card, commit));
         }
         let (card, trace, values) = self.plan_reflection_card_mutation(create)?;
-        self.commit_governed_json_targets(values, Vec::new())?;
+        let commit = self.commit_governed_json_targets(values, Vec::new())?;
         self.cache_committed_trace(trace);
-        Ok((
-            card,
-            crate::services::twin_events::MutationCommit {
-                mutation_id: None,
-                events: Vec::new(),
-                authority_token: None,
-                postcommit_warning: false,
-            },
-        ))
+        Ok((card, commit))
     }
 
     fn plan_reflection_card_mutation(
@@ -1718,11 +1781,12 @@ impl TwinStore {
 
     fn write_decision_mirror_config_file(&self, config: &DecisionMirrorConfig) -> Result<()> {
         self.write_pretty_json(&self.decision_mirror_config_path, config)
+            .map(|_commit| ())
     }
 
     fn write_decision_file(&self, episode: &DecisionEpisode) -> Result<()> {
         let path = self.decision_file_path(&episode.id);
-        self.write_pretty_json(&path, episode)
+        self.write_pretty_json(&path, episode).map(|_commit| ())
     }
 
     pub(super) fn list_reflection_cards(&self) -> Result<Vec<ReflectionCard>> {

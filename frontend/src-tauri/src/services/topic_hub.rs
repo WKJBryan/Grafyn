@@ -11,6 +11,7 @@ pub struct TopicHubSyncResult {
     pub all_notes: Vec<Note>,
     pub changed_note_ids: Vec<String>,
     pub removed_note_ids: Vec<String>,
+    pub(crate) latest_commit: Option<crate::services::twin_events::MutationCommit>,
 }
 
 #[allow(dead_code)]
@@ -99,8 +100,143 @@ impl HubRegistry {
     }
 }
 
+struct TopicHubMutations<'a> {
+    store: &'a mut KnowledgeStore,
+    expected: Option<crate::services::vault_namespace::VaultAuthorityTokenV1>,
+    latest_commit: Option<crate::services::twin_events::MutationCommit>,
+}
+
+impl<'a> TopicHubMutations<'a> {
+    fn new(
+        store: &'a mut KnowledgeStore,
+        expected: Option<crate::services::vault_namespace::VaultAuthorityTokenV1>,
+    ) -> Self {
+        Self {
+            store,
+            expected,
+            latest_commit: None,
+        }
+    }
+
+    fn record(&mut self, commit: crate::services::twin_events::MutationCommit) {
+        if let Some(authority) = commit.authority_token.clone() {
+            self.expected = Some(authority);
+            self.latest_commit = Some(commit);
+        }
+    }
+
+    fn create_note(&mut self, create: NoteCreate) -> Result<Note> {
+        let result = match self.expected.clone() {
+            Some(expected) => {
+                self.store
+                    .create_note_expecting_authority(create, "topic_hub", expected)
+            }
+            None => self
+                .store
+                .create_note_from_source_with_commit(create, "topic_hub"),
+        }?;
+        self.record(result.1);
+        Ok(result.0)
+    }
+
+    fn update_note(&mut self, id: &str, update: NoteUpdate) -> Result<Note> {
+        let result = match self.expected.clone() {
+            Some(expected) => {
+                self.store
+                    .update_note_expecting_authority(id, update, "topic_hub", expected)
+            }
+            None => self
+                .store
+                .update_note_from_source_with_commit(id, update, "topic_hub"),
+        }?;
+        self.record(result.1);
+        Ok(result.0)
+    }
+
+    fn delete_note(&mut self, id: &str) -> Result<()> {
+        let commit = match self.expected.clone() {
+            Some(expected) => self
+                .store
+                .delete_note_expecting_authority(id, "topic_hub", expected),
+            None => self
+                .store
+                .delete_note_from_source_with_commit(id, "topic_hub"),
+        }?;
+        self.record(commit);
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct TopicHubPartialMutationError {
+    commit: crate::services::twin_events::MutationCommit,
+    source_message: String,
+}
+
+impl std::fmt::Display for TopicHubPartialMutationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "topic hub normalization partially committed before a later failure: {}",
+            self.source_message
+        )
+    }
+}
+
+impl std::error::Error for TopicHubPartialMutationError {}
+
+pub(crate) fn topic_hub_partial_commit(
+    error: &anyhow::Error,
+) -> Option<crate::services::twin_events::MutationCommit> {
+    error
+        .downcast_ref::<TopicHubPartialMutationError>()
+        .map(|error| error.commit.clone())
+}
+
 pub fn sync_topic_hubs(store: &mut KnowledgeStore) -> Result<TopicHubSyncResult> {
-    let mut notes_by_id = store
+    sync_topic_hubs_with_expected(store, None)
+}
+
+pub(crate) fn sync_topic_hubs_expecting_authority(
+    store: &mut KnowledgeStore,
+    expected: crate::services::vault_namespace::VaultAuthorityTokenV1,
+) -> Result<TopicHubSyncResult> {
+    sync_topic_hubs_with_expected(store, Some(expected))
+}
+
+fn sync_topic_hubs_with_expected(
+    store: &mut KnowledgeStore,
+    expected: Option<crate::services::vault_namespace::VaultAuthorityTokenV1>,
+) -> Result<TopicHubSyncResult> {
+    let mut mutations = TopicHubMutations::new(store, expected);
+    match run_topic_hub_sync(&mut mutations) {
+        Ok(mut result) => {
+            result.latest_commit = mutations.latest_commit;
+            Ok(result)
+        }
+        Err(error) => match mutations.latest_commit {
+            Some(prior_commit) => {
+                let repair_commit =
+                    match crate::services::knowledge_store::knowledge_authority_advanced_outcome(
+                        &error,
+                    ) {
+                        Some(outcome) if outcome.target_aborted => outcome.commit,
+                        Some(_) => return Err(error),
+                        None => prior_commit,
+                    };
+                Err(anyhow::Error::new(TopicHubPartialMutationError {
+                    commit: repair_commit,
+                    source_message: error.to_string(),
+                }))
+            }
+            None => Err(error),
+        },
+    }
+}
+
+fn run_topic_hub_sync(mutations: &mut TopicHubMutations<'_>) -> Result<TopicHubSyncResult> {
+    let mut notes_by_id = mutations
+        .store
         .list_full_notes()?
         .into_iter()
         .map(|note| (note.id.clone(), note))
@@ -119,20 +255,20 @@ pub fn sync_topic_hubs(store: &mut KnowledgeStore) -> Result<TopicHubSyncResult>
             continue;
         };
         if should_remove_noisy_auto_hub(&current) {
-            store.delete_note(&current.id)?;
+            mutations.delete_note(&current.id)?;
             notes_by_id.remove(&current.id);
             removed_note_ids.insert(current.id);
             continue;
         }
 
         let desired = standardize_existing_hub(&current);
-        if let Some(updated) = persist_if_changed(store, &current, desired)? {
+        if let Some(updated) = persist_if_changed(mutations, &current, desired)? {
             changed_note_ids.insert(updated.id.clone());
             notes_by_id.insert(updated.id.clone(), updated);
         }
     }
 
-    for removed_id in remove_duplicate_auto_hubs(store, &mut notes_by_id)? {
+    for removed_id in remove_duplicate_auto_hubs(mutations, &mut notes_by_id)? {
         removed_note_ids.insert(removed_id);
     }
 
@@ -158,7 +294,7 @@ pub fn sync_topic_hubs(store: &mut KnowledgeStore) -> Result<TopicHubSyncResult>
             let (hub_id, _) = if let Some(resolved) = registry.resolve(&seed) {
                 resolved
             } else {
-                let created = create_topic_hub_note(store, &seed)?;
+                let created = create_topic_hub_note(mutations, &seed)?;
                 let hub_id = created.id.clone();
                 changed_note_ids.insert(hub_id.clone());
                 notes_by_id.insert(hub_id.clone(), created.clone());
@@ -178,13 +314,13 @@ pub fn sync_topic_hubs(store: &mut KnowledgeStore) -> Result<TopicHubSyncResult>
 
         let mut desired = current.clone();
         desired.set_topic_hub_metadata(false, primary_topic_key, resolved_hub_ids, Vec::new());
-        if let Some(updated) = persist_if_changed(store, &current, desired)? {
+        if let Some(updated) = persist_if_changed(mutations, &current, desired)? {
             changed_note_ids.insert(updated.id.clone());
             notes_by_id.insert(updated.id.clone(), updated);
         }
     }
 
-    let refreshed_notes = store.list_full_notes()?;
+    let refreshed_notes = mutations.store.list_full_notes()?;
     notes_by_id = refreshed_notes
         .into_iter()
         .map(|note| (note.id.clone(), note))
@@ -202,16 +338,17 @@ pub fn sync_topic_hubs(store: &mut KnowledgeStore) -> Result<TopicHubSyncResult>
         let members = memberships.get(&hub_id).cloned().unwrap_or_default();
         let related = related_hubs.get(&hub_id).cloned().unwrap_or_default();
         let desired = rewrite_hub_note(&current, &members, &related, &notes_by_id);
-        if let Some(updated) = persist_if_changed(store, &current, desired)? {
+        if let Some(updated) = persist_if_changed(mutations, &current, desired)? {
             changed_note_ids.insert(updated.id.clone());
             notes_by_id.insert(updated.id.clone(), updated);
         }
     }
 
     Ok(TopicHubSyncResult {
-        all_notes: store.list_full_notes()?,
+        all_notes: mutations.store.list_full_notes()?,
         changed_note_ids: changed_note_ids.into_iter().collect(),
         removed_note_ids: removed_note_ids.into_iter().collect(),
+        latest_commit: None,
     })
 }
 
@@ -317,7 +454,7 @@ fn standardize_existing_hub(note: &Note) -> Note {
 }
 
 fn remove_duplicate_auto_hubs(
-    store: &mut KnowledgeStore,
+    mutations: &mut TopicHubMutations<'_>,
     notes_by_id: &mut HashMap<String, Note>,
 ) -> Result<Vec<String>> {
     let mut by_topic_key: HashMap<String, Vec<String>> = HashMap::new();
@@ -352,7 +489,7 @@ fn remove_duplicate_auto_hubs(
                 continue;
             }
 
-            store.delete_note(&duplicate.id)?;
+            mutations.delete_note(&duplicate.id)?;
             notes_by_id.remove(&duplicate.id);
             removed.push(duplicate.id);
         }
@@ -879,7 +1016,7 @@ fn build_related_lines(
     lines
 }
 
-fn create_topic_hub_note(store: &mut KnowledgeStore, topic_key: &str) -> Result<Note> {
+fn create_topic_hub_note(mutations: &mut TopicHubMutations<'_>, topic_key: &str) -> Result<Note> {
     let title = hub_title_from_key(topic_key);
     let mut properties = HashMap::new();
     properties.insert(PROP_IS_TOPIC_HUB.to_string(), Value::Bool(true));
@@ -892,7 +1029,7 @@ fn create_topic_hub_note(store: &mut KnowledgeStore, topic_key: &str) -> Result<
         Value::Array(vec![Value::String(topic_key.to_string())]),
     );
 
-    store.create_note(NoteCreate {
+    mutations.create_note(NoteCreate {
         title,
         content: String::new(),
         relative_path: Some(format!("_grafyn/hubs/{}/index.md", topic_key)),
@@ -911,7 +1048,7 @@ fn create_topic_hub_note(store: &mut KnowledgeStore, topic_key: &str) -> Result<
 }
 
 fn persist_if_changed(
-    store: &mut KnowledgeStore,
+    mutations: &mut TopicHubMutations<'_>,
     current: &Note,
     desired: Note,
 ) -> Result<Option<Note>> {
@@ -919,7 +1056,7 @@ fn persist_if_changed(
         return Ok(None);
     }
 
-    let updated = store.update_note(
+    let updated = mutations.update_note(
         &current.id,
         NoteUpdate {
             title: (current.title != desired.title).then_some(desired.title.clone()),
@@ -1617,6 +1754,211 @@ mod tests {
         assert!(hub.content.contains("## Notes In This Topic"));
         assert!(hub.content.contains("## Debates And Questions"));
         assert!(hub.content.contains("contradicts"));
+        Ok(())
+    }
+
+    #[test]
+    fn expecting_authority_sync_preserves_exact_post_authority_commit() -> Result<()> {
+        let vault = tempfile::tempdir()?;
+        let data = tempfile::tempdir()?;
+        let events = std::sync::Arc::new(crate::services::twin_events::TwinEventStore::new(
+            data.path().to_path_buf(),
+        ));
+        events.initialize()?;
+        let coordinator =
+            std::sync::Arc::new(crate::services::twin_events::MutationCoordinator::new(
+                data.path(),
+                vault.path(),
+                events,
+                std::sync::Arc::new(crate::services::twin_events::NoopMutationLifecycle),
+            )?);
+        let mut store = KnowledgeStore::with_event_recorder(
+            vault.path().to_path_buf(),
+            coordinator.current_namespace_path()?,
+            coordinator.clone(),
+        );
+        let (created, create_commit) = store.create_note_expecting_authority(
+            NoteCreate {
+                title: "Topic source".into(),
+                content: "#rust systems".into(),
+                relative_path: Some("topic-source.md".into()),
+                aliases: Vec::new(),
+                status: NoteStatus::Draft,
+                tags: vec!["rust".into()],
+                schema_version: crate::models::note::CURRENT_NOTE_SCHEMA_VERSION,
+                migration_source: None,
+                optimizer_managed: false,
+                properties: Default::default(),
+            },
+            "test",
+            coordinator.current_authority_token()?,
+        )?;
+        let expected = create_commit.authority_token.unwrap();
+        coordinator.fail_next_replays_before_targets(2);
+
+        let error = sync_topic_hubs_expecting_authority(&mut store, expected)
+            .expect_err("the injected post-authority replay fault must reach the caller");
+        let outcome =
+            crate::services::knowledge_store::knowledge_authority_advanced_outcome(&error)
+                .expect("topic normalization must preserve the KnowledgeStore wrapper");
+
+        assert!(!outcome.target_aborted);
+        assert!(outcome.commit.mutation_id.is_some());
+        assert!(outcome.commit.authority_token.is_some());
+        assert!(!outcome.note_ids.is_empty());
+        assert!(
+            outcome.note_ids.iter().any(|id| id == &created.id)
+                || outcome.note_ids.iter().any(|id| id.starts_with("hub-"))
+        );
+        assert_eq!(coordinator.pending_count()?, 1);
+        coordinator.recover_pending()?;
+        assert_eq!(coordinator.pending_count()?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn later_preauthority_failure_preserves_first_topic_commit() -> Result<()> {
+        let vault = tempfile::tempdir()?;
+        let data = tempfile::tempdir()?;
+        let events = std::sync::Arc::new(crate::services::twin_events::TwinEventStore::new(
+            data.path().to_path_buf(),
+        ));
+        events.initialize()?;
+        let coordinator =
+            std::sync::Arc::new(crate::services::twin_events::MutationCoordinator::new(
+                data.path(),
+                vault.path(),
+                events,
+                std::sync::Arc::new(crate::services::twin_events::NoopMutationLifecycle),
+            )?);
+        let mut store = KnowledgeStore::with_event_recorder(
+            vault.path().to_path_buf(),
+            coordinator.current_namespace_path()?,
+            coordinator.clone(),
+        );
+        let (_, create_commit) = store.create_note_expecting_authority(
+            NoteCreate {
+                title: "Partial topic source".into(),
+                content: "Rust topic source".into(),
+                relative_path: Some("partial-topic-source.md".into()),
+                aliases: Vec::new(),
+                status: NoteStatus::Draft,
+                tags: vec!["rust".into()],
+                schema_version: crate::models::note::CURRENT_NOTE_SCHEMA_VERSION,
+                migration_source: None,
+                optimizer_managed: false,
+                properties: Default::default(),
+            },
+            "test",
+            coordinator.current_authority_token()?,
+        )?;
+        let expected = create_commit.authority_token.unwrap();
+        let entered = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let resume = std::sync::Arc::new(std::sync::Barrier::new(2));
+        coordinator.pause_after_authority_advance_once(entered.clone(), resume.clone());
+        let owner =
+            std::thread::spawn(move || sync_topic_hubs_expecting_authority(&mut store, expected));
+
+        entered.wait();
+        coordinator.fail_once_at(
+            crate::services::twin_events::MutationFaultPoint::BeforePreAuthorityMarker,
+        );
+        resume.wait();
+
+        let error = owner
+            .join()
+            .expect("topic normalization thread should not panic")
+            .expect_err("the second mutation must fail before authority");
+        let commit = topic_hub_partial_commit(&error)
+            .expect("the first successful exact commit must survive the later error");
+        assert!(commit.mutation_id.is_some());
+        assert_eq!(
+            commit.authority_token,
+            Some(coordinator.current_authority_token()?)
+        );
+        assert!(error.to_string().contains("partially committed"));
+        Ok(())
+    }
+
+    #[test]
+    fn later_target_abort_preserves_newest_topic_commit_as_partial_batch() -> Result<()> {
+        let vault = tempfile::tempdir()?;
+        let data = tempfile::tempdir()?;
+        let events = std::sync::Arc::new(crate::services::twin_events::TwinEventStore::new(
+            data.path().to_path_buf(),
+        ));
+        events.initialize()?;
+        let coordinator =
+            std::sync::Arc::new(crate::services::twin_events::MutationCoordinator::new(
+                data.path(),
+                vault.path(),
+                events,
+                std::sync::Arc::new(crate::services::twin_events::NoopMutationLifecycle),
+            )?);
+        let mut store = KnowledgeStore::with_event_recorder(
+            vault.path().to_path_buf(),
+            coordinator.current_namespace_path()?,
+            coordinator.clone(),
+        );
+        let (_, create_commit) = store.create_note_expecting_authority(
+            NoteCreate {
+                title: "Target-abort topic source".into(),
+                content: "Rust topic source".into(),
+                relative_path: Some("target-abort-topic-source.md".into()),
+                aliases: Vec::new(),
+                status: NoteStatus::Draft,
+                tags: vec!["rust".into()],
+                schema_version: crate::models::note::CURRENT_NOTE_SCHEMA_VERSION,
+                migration_source: None,
+                optimizer_managed: false,
+                properties: Default::default(),
+            },
+            "test",
+            coordinator.current_authority_token()?,
+        )?;
+        let expected = create_commit.authority_token.unwrap();
+        let first_entered = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let first_resume = std::sync::Arc::new(std::sync::Barrier::new(2));
+        coordinator.pause_after_authority_advance_once(first_entered.clone(), first_resume.clone());
+        let owner = std::thread::spawn(move || {
+            sync_topic_hubs_expecting_authority(&mut store, expected.clone())
+                .map_err(|error| (error, expected))
+        });
+
+        first_entered.wait();
+        let second_entered = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let second_resume = std::sync::Arc::new(std::sync::Barrier::new(2));
+        coordinator
+            .pause_after_authority_advance_once(second_entered.clone(), second_resume.clone());
+        first_resume.wait();
+        second_entered.wait();
+        std::fs::write(
+            vault.path().join("target-abort-topic-source.md"),
+            "# External topic winner\n",
+        )?;
+        second_resume.wait();
+
+        let (error, expected) = owner
+            .join()
+            .expect("topic normalization thread should not panic")
+            .expect_err("the second topic mutation target must abort after authority");
+        let commit = topic_hub_partial_commit(&error)
+            .expect("the later exact abort commit must carry the partial batch outcome");
+        assert_eq!(
+            commit
+                .authority_token
+                .as_ref()
+                .unwrap()
+                .authority_generation,
+            expected.authority_generation + 2
+        );
+        assert_eq!(
+            commit.authority_token,
+            Some(coordinator.current_authority_token()?)
+        );
+        assert!(commit.mutation_id.is_some());
+        assert!(commit.postcommit_warning);
+        assert!(error.to_string().contains("partially committed"));
         Ok(())
     }
 }

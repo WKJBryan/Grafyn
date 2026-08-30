@@ -561,6 +561,7 @@ impl TwinStore {
     ) -> Result<()> {
         let draft = self.record_observation_draft(record, automatic, tag)?;
         self.write_governed_json(&self.record_file_path(&record.id), record, vec![draft])
+            .map(|_commit| ())
     }
 
     pub(super) fn record_observation_draft(
@@ -596,6 +597,7 @@ impl TwinStore {
     ) -> Result<()> {
         let draft = self.record_feedback_draft(record, action, rationale)?;
         self.write_governed_json(&self.record_file_path(&record.id), record, vec![draft])
+            .map(|_commit| ())
     }
 
     fn record_feedback_draft(
@@ -673,6 +675,14 @@ impl TwinStore {
     }
 
     pub fn create_user_record(&mut self, create: UserRecordCreate) -> Result<UserRecord> {
+        let (record, _commit) = self.create_user_record_with_commit(create)?;
+        Ok(record)
+    }
+
+    pub(crate) fn create_user_record_with_commit(
+        &mut self,
+        create: UserRecordCreate,
+    ) -> Result<(UserRecord, crate::services::twin_events::MutationCommit)> {
         if create
             .promotion_state
             .as_ref()
@@ -692,7 +702,7 @@ impl TwinStore {
                 automatic.then_some("legacy_inference"),
             )?;
             self.invalidate_mutation_caches();
-            return Ok(record);
+            return Ok((record, Self::tokenless_mutation_commit()));
         }
 
         let recorder = self.event_recorder.clone();
@@ -742,10 +752,10 @@ impl TwinStore {
             crate::services::twin_events::MutationOrigin::Local,
             &mut planner,
         );
-        self.finish_mutation_commit(result)?;
+        let commit = self.finish_mutation_commit(result)?;
         let record = committed.ok_or_else(|| anyhow::anyhow!("record create was not planned"))?;
         self.invalidate_mutation_caches();
-        Ok(record)
+        Ok((record, commit))
     }
 
     pub(super) fn materialize_user_record(create: UserRecordCreate) -> UserRecord {
@@ -773,6 +783,15 @@ impl TwinStore {
     }
 
     pub fn update_user_record(&mut self, id: &str, update: UserRecordUpdate) -> Result<UserRecord> {
+        let (record, _commit) = self.update_user_record_with_commit(id, update)?;
+        Ok(record)
+    }
+
+    pub(crate) fn update_user_record_with_commit(
+        &mut self,
+        id: &str,
+        update: UserRecordUpdate,
+    ) -> Result<(UserRecord, crate::services::twin_events::MutationCommit)> {
         if update.promotion_state.is_some() {
             return Err(anyhow::anyhow!(
                 "governance state must be changed through the explicit promotion action"
@@ -786,7 +805,7 @@ impl TwinStore {
                 self.write_record_observation(&record, false, None)?;
                 self.invalidate_mutation_caches();
             }
-            return Ok(record);
+            return Ok((record, Self::tokenless_mutation_commit()));
         }
 
         let recorder = self.event_recorder.clone();
@@ -829,13 +848,23 @@ impl TwinStore {
             crate::services::twin_events::MutationOrigin::Local,
             &mut planner,
         );
-        self.finish_mutation_commit(result)?;
+        let commit = self.finish_mutation_commit(result)?;
         let record = committed.ok_or_else(|| anyhow::anyhow!("record update was not planned"))?;
         self.invalidate_mutation_caches();
-        Ok(record)
+        Ok((record, commit))
     }
 
     pub fn run_twin_inference(&mut self) -> Result<TwinInferenceRunSummary> {
+        let (summary, _commit) = self.run_twin_inference_with_commit()?;
+        Ok(summary)
+    }
+
+    pub(crate) fn run_twin_inference_with_commit(
+        &mut self,
+    ) -> Result<(
+        TwinInferenceRunSummary,
+        crate::services::twin_events::MutationCommit,
+    )> {
         if !self.event_recorder.is_noop() {
             let recorder = self.event_recorder.clone();
             let mut committed = None;
@@ -1002,11 +1031,11 @@ impl TwinStore {
                 crate::services::twin_events::MutationOrigin::Local,
                 &mut planner,
             );
-            self.finish_mutation_commit(result)?;
+            let commit = self.finish_mutation_commit(result)?;
             let (summary, _records) = committed
                 .ok_or_else(|| anyhow::anyhow!("Twin inference was not planned"))?;
             self.invalidate_mutation_caches();
-            return Ok(summary);
+            return Ok((summary, commit));
         }
 
         self.ensure_record_cache()?;
@@ -1103,17 +1132,20 @@ impl TwinStore {
             }
         }
 
-        Ok(TwinInferenceRunSummary {
-            inference_version: TWIN_INFERENCE_VERSION.to_string(),
-            scanned_traces: traces.len(),
-            scanned_events,
-            created_records,
-            updated_records,
-            auto_promoted_records,
-            candidate_records,
-            skipped_rejected_records,
-            generated_at: Utc::now(),
-        })
+        Ok((
+            TwinInferenceRunSummary {
+                inference_version: TWIN_INFERENCE_VERSION.to_string(),
+                scanned_traces: traces.len(),
+                scanned_events,
+                created_records,
+                updated_records,
+                auto_promoted_records,
+                candidate_records,
+                skipped_rejected_records,
+                generated_at: Utc::now(),
+            },
+            Self::tokenless_mutation_commit(),
+        ))
     }
 
     pub fn get_twin_review(&mut self) -> Result<Vec<TwinReviewRecord>> {
@@ -1235,6 +1267,17 @@ impl TwinStore {
         promotion_state: PromotionState,
         rationale: Option<String>,
     ) -> Result<UserRecord> {
+        let (record, _commit) =
+            self.set_user_record_promotion_with_commit(id, promotion_state, rationale)?;
+        Ok(record)
+    }
+
+    pub(crate) fn set_user_record_promotion_with_commit(
+        &mut self,
+        id: &str,
+        promotion_state: PromotionState,
+        rationale: Option<String>,
+    ) -> Result<(UserRecord, crate::services::twin_events::MutationCommit)> {
         Self::validate_file_id(id)?;
         let promotion_state = promotion_state.effective();
         if self.event_recorder.is_noop() {
@@ -1246,7 +1289,7 @@ impl TwinStore {
             );
             self.write_record_feedback(&record, action, rationale.as_deref())?;
             self.invalidate_mutation_caches();
-            return Ok(record);
+            return Ok((record, Self::tokenless_mutation_commit()));
         }
 
         let recorder = self.event_recorder.clone();
@@ -1284,10 +1327,10 @@ impl TwinStore {
             crate::services::twin_events::MutationOrigin::Local,
             &mut planner,
         );
-        self.finish_mutation_commit(result)?;
+        let commit = self.finish_mutation_commit(result)?;
         let record = committed.ok_or_else(|| anyhow::anyhow!("promotion was not planned"))?;
         self.invalidate_mutation_caches();
-        Ok(record)
+        Ok((record, commit))
     }
 
     pub(super) fn ensure_record_cache(&mut self) -> Result<()> {
@@ -1322,7 +1365,7 @@ impl TwinStore {
     #[cfg(test)]
     pub(super) fn write_record_file(&self, record: &UserRecord) -> Result<()> {
         let path = self.record_file_path(&record.id);
-        self.write_pretty_json(&path, record)
+        self.write_pretty_json(&path, record).map(|_commit| ())
     }
 }
 
@@ -1419,21 +1462,39 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_twin_mutation_exposes_its_exact_post_commit_token_for_desktop_repair() {
+    fn consecutive_twin_mutations_return_their_own_exact_commit_tokens() {
         let root = tempdir().unwrap();
         let (mut store, _events, coordinator) = coordinated_twin_store(root.path());
-        store.clear_last_mutation_commit();
+        let initial = coordinator.current_authority_token().unwrap();
 
-        store
-            .create_user_record(record_create(RecordOrigin::User))
+        let (_, first) = store
+            .create_user_record_with_commit(record_create(RecordOrigin::User))
+            .unwrap();
+        let (_, second) = store
+            .create_user_record_with_commit(record_create(RecordOrigin::User))
             .unwrap();
 
-        let commit = store.take_last_mutation_commit().unwrap();
         assert_eq!(
-            commit.authority_token.as_ref(),
+            first
+                .authority_token
+                .as_ref()
+                .expect("first commit must carry authority")
+                .authority_generation,
+            initial.authority_generation + 1
+        );
+        assert_eq!(
+            second
+                .authority_token
+                .as_ref()
+                .expect("second commit must carry authority")
+                .authority_generation,
+            initial.authority_generation + 2
+        );
+        assert_eq!(
+            second.authority_token.as_ref(),
             Some(&coordinator.current_authority_token().unwrap())
         );
-        assert!(store.take_last_mutation_commit().is_none());
+        assert_ne!(first.mutation_id, second.mutation_id);
     }
 
     #[test]
@@ -1526,15 +1587,17 @@ mod tests {
             .create_user_record(record_create(RecordOrigin::User))
             .unwrap();
         coordinator.fail_once_at(crate::services::twin_events::MutationFaultPoint::AfterTarget(0));
-        assert!(store
-            .update_user_record(
+        let (_, commit) = store
+            .update_user_record_with_commit(
                 &record.id,
                 UserRecordUpdate {
                     content: Some("Recovered field".into()),
                     ..Default::default()
                 },
             )
-            .is_err());
+            .unwrap();
+        assert!(commit.postcommit_warning);
+        assert_eq!(coordinator.recover_pending().unwrap(), 0);
 
         let updated = store
             .update_user_record(

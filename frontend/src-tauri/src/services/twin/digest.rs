@@ -126,6 +126,16 @@ fn memory_digest_action_label(action: &MemoryDigestAction) -> &'static str {
 
 impl TwinStore {
     pub fn list_memory_digest(&mut self) -> Result<Vec<MemoryDigestItem>> {
+        let (items, _commit) = self.list_memory_digest_with_commit()?;
+        Ok(items)
+    }
+
+    pub(crate) fn list_memory_digest_with_commit(
+        &mut self,
+    ) -> Result<(
+        Vec<MemoryDigestItem>,
+        crate::services::twin_events::MutationCommit,
+    )> {
         if !self.event_recorder.is_noop() {
             let recorder = self.event_recorder.clone();
             let mut committed = None;
@@ -154,20 +164,19 @@ impl TwinStore {
                 crate::services::twin_events::MutationOrigin::Local,
                 &mut planner,
             );
-            self.finish_mutation_commit(result)?;
-            let pending = committed.ok_or_else(|| anyhow::anyhow!("memory digest was not planned"))?;
+            let commit = self.finish_mutation_commit(result)?;
+            let pending =
+                committed.ok_or_else(|| anyhow::anyhow!("memory digest was not planned"))?;
             self.invalidate_mutation_caches();
-            return Ok(pending);
+            return Ok((pending, commit));
         }
         let (all_items, pending) = self.plan_memory_digest_items()?;
         self.write_memory_digest_file(&all_items)?;
         self.invalidate_mutation_caches();
-        Ok(pending)
+        Ok((pending, Self::tokenless_mutation_commit()))
     }
 
-    fn plan_memory_digest_items(
-        &self,
-    ) -> Result<(Vec<MemoryDigestItem>, Vec<MemoryDigestItem>)> {
+    fn plan_memory_digest_items(&self) -> Result<(Vec<MemoryDigestItem>, Vec<MemoryDigestItem>)> {
         let mut existing = self.read_memory_digest_file()?;
         let mut existing_by_id = existing
             .iter()
@@ -274,6 +283,18 @@ impl TwinStore {
         id: &str,
         request: MemoryDigestReviewRequest,
     ) -> Result<MemoryDigestItem> {
+        let (item, _commit) = self.review_memory_digest_item_with_commit(id, request)?;
+        Ok(item)
+    }
+
+    pub(crate) fn review_memory_digest_item_with_commit(
+        &mut self,
+        id: &str,
+        request: MemoryDigestReviewRequest,
+    ) -> Result<(
+        MemoryDigestItem,
+        crate::services::twin_events::MutationCommit,
+    )> {
         Self::validate_file_id(id)?;
         if !self.event_recorder.is_noop() {
             let recorder = self.event_recorder.clone();
@@ -282,8 +303,8 @@ impl TwinStore {
                 let (item, records, values, draft) = self
                     .plan_memory_digest_review(id, &request)
                     .map_err(|error| {
-                        crate::services::twin_events::MutationError::Invalid(error.to_string())
-                    })?;
+                    crate::services::twin_events::MutationError::Invalid(error.to_string())
+                })?;
                 let targets = self.governed_json_targets(values).map_err(|error| {
                     crate::services::twin_events::MutationError::Invalid(error.to_string())
                 })?;
@@ -300,11 +321,11 @@ impl TwinStore {
                 crate::services::twin_events::MutationOrigin::Local,
                 &mut planner,
             );
-            self.finish_mutation_commit(result)?;
-            let (item, _records) = committed
-                .ok_or_else(|| anyhow::anyhow!("memory digest review was not planned"))?;
+            let commit = self.finish_mutation_commit(result)?;
+            let (item, _records) =
+                committed.ok_or_else(|| anyhow::anyhow!("memory digest review was not planned"))?;
             self.invalidate_mutation_caches();
-            return Ok(item);
+            return Ok((item, commit));
         }
         let mut items = self.read_memory_digest_file()?;
         if !items.iter().any(|item| item.id == id) {
@@ -417,9 +438,9 @@ impl TwinStore {
                 });
             }
             draft.evidence.sort();
-            self.commit_governed_json_targets(values, vec![draft])?;
+            let commit = self.commit_governed_json_targets(values, vec![draft])?;
             self.invalidate_mutation_caches();
-            return Ok(item);
+            return Ok((item, commit));
         }
 
         self.write_memory_digest_file(&items)?;
@@ -463,7 +484,7 @@ impl TwinStore {
             }
         }
 
-        Ok(item)
+        Ok((item, Self::tokenless_mutation_commit()))
     }
 
     fn plan_memory_digest_review(
@@ -489,17 +510,15 @@ impl TwinStore {
 
         let mut updated_records = Vec::new();
         for record_id in &item.record_ids {
-            let Some(mut record) = self
-                .read_twin_json_bounded::<UserRecord>(&self.record_file_path(record_id))?
+            let Some(mut record) =
+                self.read_twin_json_bounded::<UserRecord>(&self.record_file_path(record_id))?
             else {
                 continue;
             };
             let next_state = match request.action {
                 MemoryDigestAction::Keep => PromotionState::Endorsed,
                 MemoryDigestAction::Soften => PromotionState::Candidate,
-                MemoryDigestAction::NotMe | MemoryDigestAction::Reject => {
-                    PromotionState::Rejected
-                }
+                MemoryDigestAction::NotMe | MemoryDigestAction::Reject => PromotionState::Rejected,
                 MemoryDigestAction::Private => PromotionState::Private,
                 MemoryDigestAction::NoTrain => PromotionState::NoTrain,
             };
@@ -591,6 +610,7 @@ impl TwinStore {
 
     fn write_memory_digest_file(&self, items: &[MemoryDigestItem]) -> Result<()> {
         self.write_pretty_json(&self.digest_path, &items)
+            .map(|_commit| ())
     }
 }
 

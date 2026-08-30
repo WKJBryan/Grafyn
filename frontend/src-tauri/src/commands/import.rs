@@ -26,6 +26,40 @@ enum ParsedImport {
     },
 }
 
+struct ImportAuthorityErrorOutcome {
+    notice: String,
+    note_ids: Vec<String>,
+    recovered: bool,
+    target_aborted: bool,
+}
+
+async fn finish_import_authority_error(
+    state: &AppState,
+    error: &anyhow::Error,
+    operation: &str,
+) -> Option<ImportAuthorityErrorOutcome> {
+    let outcome = crate::services::knowledge_store::knowledge_authority_advanced_outcome(error)?;
+    let repair =
+        crate::commands::repair_after_authority_mutation(state, &outcome.commit, "import").await;
+    let recovered =
+        !outcome.target_aborted && matches!(repair, crate::commands::PostAuthorityRepair::Ready(_));
+    let notice = if outcome.target_aborted {
+        format!(
+            "{operation} was not applied after vault authority changed; refresh state before deciding whether to retry."
+        )
+    } else if recovered {
+        format!("{operation} committed and recovered; do not retry.")
+    } else {
+        format!("{operation} committed and recovery is pending; do not retry.")
+    };
+    Some(ImportAuthorityErrorOutcome {
+        notice,
+        note_ids: outcome.note_ids,
+        recovered,
+        target_aborted: outcome.target_aborted,
+    })
+}
+
 /// Preview content in an import file (auto-detects format).
 #[tauri::command]
 pub async fn preview_import(
@@ -95,11 +129,6 @@ async fn apply_conversation_import(
     source_content: String,
     state: State<'_, AppState>,
 ) -> Result<ImportResult, String> {
-    state
-        .knowledge_store
-        .write()
-        .await
-        .clear_last_mutation_commit();
     let to_import: Vec<_> = if conversation_ids.is_empty() {
         all_conversations
     } else {
@@ -180,31 +209,39 @@ async fn apply_conversation_import(
         };
 
         // Create the note
-        let created = {
+        let mutation = {
             let mut store = state.knowledge_store.write().await;
-            match store.import_note_container(
+            store.import_note_container_with_commit(
                 vec![note_create],
                 &conv.id,
                 source_content.as_bytes(),
-            ) {
-                Ok(mut notes) => notes.remove(0),
-                Err(e) => {
-                    errors.push(format!("Failed to create '{}': {}", conv.title, e));
+            )
+        };
+        let (created, commit) = match mutation {
+            Ok((mut notes, commit)) => (notes.remove(0), commit),
+            Err(error) => {
+                if let Some(outcome) = finish_import_authority_error(
+                    state.inner(),
+                    &error,
+                    &format!("Import '{}'", conv.title),
+                )
+                .await
+                {
+                    if outcome.recovered {
+                        note_ids.extend(outcome.note_ids);
+                    } else if outcome.target_aborted {
+                        skipped += 1;
+                    }
+                    errors.push(outcome.notice);
+                } else {
+                    errors.push(format!("Failed to create '{}': {}", conv.title, error));
                     skipped += 1;
-                    continue;
                 }
+                continue;
             }
         };
 
         note_ids.push(created.id.clone());
-    }
-
-    let commit = state
-        .knowledge_store
-        .write()
-        .await
-        .take_last_mutation_commit();
-    if let Some(commit) = commit {
         if let crate::commands::PostAuthorityRepair::Unavailable(warning) =
             crate::commands::repair_after_authority_mutation(state.inner(), &commit, "import").await
         {
@@ -236,11 +273,6 @@ async fn apply_document_import(
     source_content: String,
     state: State<'_, AppState>,
 ) -> Result<ImportResult, String> {
-    state
-        .knowledge_store
-        .write()
-        .await
-        .clear_last_mutation_commit();
     let to_import = if selected_ids.is_empty() {
         batch.items
     } else {
@@ -284,21 +316,58 @@ async fn apply_document_import(
     }
 
     if !creates.is_empty() {
-        let created = {
+        let requested_count = creates.len();
+        let mutation = {
             let mut store = state.knowledge_store.write().await;
-            store
-                .import_note_container(creates, &batch.source_title, source_content.as_bytes())
-                .map_err(|error| format!("Failed to import document: {error}"))?
+            store.import_note_container_with_commit(
+                creates,
+                &batch.source_title,
+                source_content.as_bytes(),
+            )
+        };
+        let (created, commit) = match mutation {
+            Ok(result) => result,
+            Err(error) => {
+                if let Some(outcome) = finish_import_authority_error(
+                    state.inner(),
+                    &error,
+                    &format!("Import '{}'", batch.source_title),
+                )
+                .await
+                {
+                    let imported = if outcome.recovered {
+                        note_ids.extend(outcome.note_ids);
+                        note_ids.len()
+                    } else {
+                        0
+                    };
+                    errors.push(outcome.notice);
+                    return Ok(ImportResult {
+                        imported,
+                        skipped: if outcome.target_aborted {
+                            requested_count
+                        } else {
+                            0
+                        },
+                        note_ids,
+                        errors,
+                        semantic_link_suggestions: Vec::new(),
+                        semantic_link_error: None,
+                        message: if outcome.recovered {
+                            "The document import committed and recovered; do not retry.".to_string()
+                        } else if outcome.target_aborted {
+                            "The document import was not applied after vault authority changed."
+                                .to_string()
+                        } else {
+                            "The document import committed and is being recovered; do not retry."
+                                .to_string()
+                        },
+                    });
+                }
+                return Err(format!("Failed to import document: {error}"));
+            }
         };
         note_ids.extend(created.into_iter().map(|note| note.id));
-    }
-
-    let commit = state
-        .knowledge_store
-        .write()
-        .await
-        .take_last_mutation_commit();
-    if let Some(commit) = commit {
         if let crate::commands::PostAuthorityRepair::Unavailable(warning) =
             crate::commands::repair_after_authority_mutation(state.inner(), &commit, "import").await
         {
@@ -583,5 +652,53 @@ mod tests {
         assert!(content.contains("Interviewer: How do you decide what to trust?"));
         assert!(content.contains("Expert: I need a real demo first."));
         assert_eq!(import::detect_platform(&content), Some("interview"));
+    }
+
+    #[tokio::test]
+    async fn authority_advanced_import_is_repaired_and_never_reported_as_failed() {
+        let (mut state, vault, _data) =
+            crate::commands::commit_note_write_tests::build_test_state();
+        let coordinator = state.mutation_coordinator.as_ref().unwrap().clone();
+        state.knowledge_store = std::sync::Arc::new(tokio::sync::RwLock::new(
+            crate::services::knowledge_store::KnowledgeStore::with_event_recorder(
+                vault.path().to_path_buf(),
+                coordinator.current_namespace_path().unwrap(),
+                coordinator.clone(),
+            ),
+        ));
+        coordinator.fail_next_replays_before_targets(2);
+        let error = {
+            let mut store = state.knowledge_store.write().await;
+            store
+                .import_note_container_with_commit(
+                    vec![NoteCreate {
+                        title: "Recovered import".into(),
+                        content: "one durable import".into(),
+                        relative_path: Some("recovered-import.md".into()),
+                        aliases: Vec::new(),
+                        status: NoteStatus::Evidence,
+                        tags: Vec::new(),
+                        schema_version: crate::models::note::CURRENT_NOTE_SCHEMA_VERSION,
+                        migration_source: Some("import".into()),
+                        optimizer_managed: false,
+                        properties: Default::default(),
+                    }],
+                    "recovered-container",
+                    b"source",
+                )
+                .expect_err("the first call must expose authority-advanced recovery")
+        };
+
+        let outcome = finish_import_authority_error(&state, &error, "Import 'recovered-container'")
+            .await
+            .expect("authority-advanced import must have a non-retryable outcome");
+        assert!(outcome
+            .notice
+            .contains("committed and recovered; do not retry"));
+        assert!(!outcome.notice.contains("Failed"));
+        assert_eq!(outcome.note_ids, vec!["recovered-import"]);
+        assert!(outcome.recovered);
+        assert_eq!(coordinator.pending_count().unwrap(), 0);
+        assert!(vault.path().join("recovered-import.md").exists());
     }
 }

@@ -75,6 +75,7 @@ pub struct TargetMutation {
     pub after: DesiredImage,
     pub expected_before: Option<BeforeImage>,
     pub(crate) retain_exact_precondition: bool,
+    pub(crate) check_expected_before_before_after_elision: bool,
 }
 
 impl TargetMutation {
@@ -89,6 +90,7 @@ impl TargetMutation {
             after: DesiredImage::Utf8Bytes(content.into()),
             expected_before: None,
             retain_exact_precondition: false,
+            check_expected_before_before_after_elision: false,
         }
     }
 
@@ -99,6 +101,7 @@ impl TargetMutation {
             after: DesiredImage::Tombstone,
             expected_before: None,
             retain_exact_precondition: false,
+            check_expected_before_before_after_elision: false,
         }
     }
 
@@ -109,6 +112,12 @@ impl TargetMutation {
 
     pub(crate) fn retaining_exact_precondition(mut self) -> Self {
         self.retain_exact_precondition = true;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn checking_expected_before_before_after_elision(mut self) -> Self {
+        self.check_expected_before_before_after_elision = true;
         self
     }
 }
@@ -178,11 +187,6 @@ impl MutationIntentV1 {
                 )
         };
         let has_exact_precondition = self.targets.iter().any(is_exact_precondition);
-        if has_exact_precondition && !self.events.is_empty() {
-            return Err(MutationError::Invalid(
-                "retained exact preconditions cannot stage lifecycle events".into(),
-            ));
-        }
         if has_exact_precondition && self.targets.iter().all(is_exact_precondition) {
             return Err(MutationError::Invalid(
                 "retained exact preconditions require a writable target".into(),
@@ -192,7 +196,11 @@ impl MutationIntentV1 {
             .targets
             .iter()
             .any(|target| matches!(target.kind, TargetKind::Markdown | TargetKind::OverlayJson));
-        if self.markdown_root_scope.is_some() != has_vault_scoped_target {
+        let retained_authority_owner =
+            self.retain_commit_receipt && self.content_authority_generation.is_some();
+        if self.markdown_root_scope.is_some()
+            != (has_vault_scoped_target || retained_authority_owner)
+        {
             return Err(MutationError::Invalid(
                 "vault-scoped mutations must carry exactly one root scope digest".into(),
             ));
@@ -487,6 +495,7 @@ fn is_windows_reserved_component(component: &str) -> bool {
 }
 
 const PENDING_DIRECTORY: &str = "twin/mutations/pending/v1";
+const PREAUTHORITY_DIRECTORY: &str = "twin/mutations/preauthority/v1";
 const QUARANTINE_DIRECTORY: &str = "twin/mutations/quarantine/v1";
 const STAGING_DIRECTORY: &str = "twin/mutations/staging/v1";
 const RECEIPTS_DIRECTORY: &str = "twin/mutations/receipts/v1";
@@ -503,14 +512,85 @@ pub(crate) struct MutationCommitReceiptV1 {
     pub(crate) authority_generation: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PreAuthorityMutationV1 {
+    pub(crate) schema_version: u16,
+    pub(crate) state: PreAuthorityMutationStateV1,
+    pub(crate) expected_authority: crate::services::vault_namespace::VaultAuthorityTokenV1,
+    pub(crate) intent: MutationIntentV1,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum PreAuthorityMutationStateV1 {
+    Prepared,
+    AbortedBeforeAuthority,
+    AbortedAfterAuthority,
+}
+
+impl PreAuthorityMutationV1 {
+    fn validate(&self) -> Result<(), MutationError> {
+        self.intent.validate()?;
+        let intended_generation = self
+            .expected_authority
+            .authority_generation
+            .checked_add(1)
+            .ok_or_else(|| {
+                MutationError::RecoveryConflict("authority-generation-exhausted".into())
+            })?;
+        let supported_intent = matches!(
+            (
+                self.intent.schema_version,
+                self.intent.retain_commit_receipt
+            ),
+            (2, false) | (3, true)
+        );
+        let scope_matches = self
+            .intent
+            .markdown_root_scope
+            .as_ref()
+            .map_or(self.intent.schema_version == 2, |scope| {
+                scope == &self.expected_authority.root_scope
+            });
+        if self.schema_version != 1
+            || !supported_intent
+            || self.intent.origin != crate::services::twin_events::MutationOrigin::Local
+            || self.intent.content_authority_generation != Some(intended_generation)
+            || !scope_matches
+            || Uuid::parse_str(&self.expected_authority.lease_epoch_uuid)
+                .ok()
+                .is_none_or(|lease| lease.to_string() != self.expected_authority.lease_epoch_uuid)
+        {
+            return Err(MutationError::Invalid(
+                "invalid pre-authority mutation owner".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 pub struct LocalMutationJournal {
     root: crate::services::twin_events::AnchoredRoot,
+}
+
+fn serialize_intent(intent: &MutationIntentV1) -> Result<Vec<u8>, MutationError> {
+    let mut bytes = serde_json::to_vec_pretty(intent)
+        .map_err(|error| MutationError::Invalid(error.to_string()))?;
+    bytes.push(b'\n');
+    if bytes.len() > MAX_SERIALIZED_INTENT_BYTES {
+        return Err(MutationError::Invalid(
+            "serialized mutation intent exceeds the 32 MiB limit".into(),
+        ));
+    }
+    Ok(bytes)
 }
 
 impl LocalMutationJournal {
     pub fn initialize(data_path: impl AsRef<Path>) -> Result<Self, MutationError> {
         let root = crate::services::twin_events::AnchoredRoot::open(data_path)?;
         root.open_directory(PENDING_DIRECTORY, true)?;
+        root.open_directory(PREAUTHORITY_DIRECTORY, true)?;
         root.open_directory(QUARANTINE_DIRECTORY, true)?;
         root.open_directory(STAGING_DIRECTORY, true)?;
         root.open_directory(RECEIPTS_DIRECTORY, true)?;
@@ -521,7 +601,10 @@ impl LocalMutationJournal {
         &self,
         _lock: &crate::services::twin_events::CoordinatorProcessLock,
     ) -> Result<usize, MutationError> {
-        Ok(self.pending_paths()?.len())
+        self.pending_paths()?
+            .len()
+            .checked_add(self.preauthority_paths()?.len())
+            .ok_or_else(|| MutationError::Invalid("mutation journal count overflow".into()))
     }
 
     pub(crate) fn quarantine_count(
@@ -542,14 +625,7 @@ impl LocalMutationJournal {
                 "local mutation journal has reached 256 pending intents".into(),
             ));
         }
-        let mut bytes = serde_json::to_vec_pretty(intent)
-            .map_err(|error| MutationError::Invalid(error.to_string()))?;
-        bytes.push(b'\n');
-        if bytes.len() > MAX_SERIALIZED_INTENT_BYTES {
-            return Err(MutationError::Invalid(
-                "serialized mutation intent exceeds the 32 MiB limit".into(),
-            ));
-        }
+        let bytes = serialize_intent(intent)?;
         let path = self.path_for(&intent.mutation_id);
         self.root
             .install_no_clobber(&path, STAGING_DIRECTORY, &bytes)?;
@@ -563,6 +639,302 @@ impl LocalMutationJournal {
             ));
         }
         Ok(())
+    }
+
+    pub(crate) fn stage_preauthority(
+        &self,
+        _lock: &crate::services::twin_events::CoordinatorProcessLock,
+        expected_authority: &crate::services::vault_namespace::VaultAuthorityTokenV1,
+        intent: &MutationIntentV1,
+    ) -> Result<(), MutationError> {
+        let marker = PreAuthorityMutationV1 {
+            schema_version: 1,
+            state: PreAuthorityMutationStateV1::Prepared,
+            expected_authority: expected_authority.clone(),
+            intent: intent.clone(),
+        };
+        marker.validate()?;
+        let path = self.preauthority_path_for(&intent.mutation_id);
+        let loaded = self.load_preauthority(_lock)?;
+        if loaded.len() >= MAX_PENDING_INTENTS
+            && loaded.iter().all(|(existing, _)| existing != &path)
+        {
+            return Err(MutationError::Invalid(
+                "pre-authority mutation records have reached 256 entries".into(),
+            ));
+        }
+        if loaded.iter().any(|(existing, marker)| {
+            existing != &path && marker.state == PreAuthorityMutationStateV1::Prepared
+        }) {
+            return Err(MutationError::RecoveryConflict(
+                "another pre-authority mutation must be recovered first".into(),
+            ));
+        }
+        let mut bytes = serde_json::to_vec_pretty(&marker)
+            .map_err(|error| MutationError::Invalid(error.to_string()))?;
+        bytes.push(b'\n');
+        if bytes.len() > MAX_SERIALIZED_INTENT_BYTES {
+            return Err(MutationError::Invalid(
+                "serialized pre-authority mutation exceeds the 32 MiB limit".into(),
+            ));
+        }
+        self.root
+            .install_no_clobber(&path, STAGING_DIRECTORY, &bytes)?;
+        let existing = self
+            .root
+            .read_bounded(&path, MAX_SERIALIZED_INTENT_BYTES)?
+            .ok_or_else(|| MutationError::Invalid("pre-authority mutation disappeared".into()))?;
+        if existing != bytes {
+            return Err(MutationError::Invalid(
+                "pre-authority mutation identity collision".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn load_preauthority(
+        &self,
+        _lock: &crate::services::twin_events::CoordinatorProcessLock,
+    ) -> Result<Vec<(String, PreAuthorityMutationV1)>, MutationError> {
+        let mut loaded = Vec::new();
+        let mut prepared_count = 0usize;
+        for path in self.preauthority_paths()? {
+            let bytes = self
+                .root
+                .read_bounded(&path, MAX_SERIALIZED_INTENT_BYTES)?
+                .ok_or_else(|| {
+                    MutationError::Invalid("pre-authority mutation disappeared".into())
+                })?;
+            let marker: PreAuthorityMutationV1 =
+                serde_json::from_slice(&bytes).map_err(|error| {
+                    MutationError::Invalid(format!("corrupt pre-authority mutation: {error}"))
+                })?;
+            marker.validate()?;
+            if marker.state == PreAuthorityMutationStateV1::Prepared {
+                prepared_count += 1;
+                if prepared_count > 1 {
+                    return Err(MutationError::Invalid(
+                        "local mutation journal has multiple prepared pre-authority owners".into(),
+                    ));
+                }
+            }
+            if path != self.preauthority_path_for(&marker.intent.mutation_id) {
+                return Err(MutationError::Invalid(
+                    "pre-authority mutation is stored at a noncanonical path".into(),
+                ));
+            }
+            loaded.push((path, marker));
+        }
+        Ok(loaded)
+    }
+
+    pub(crate) fn promote_preauthority(
+        &self,
+        lock: &crate::services::twin_events::CoordinatorProcessLock,
+        marker: &PreAuthorityMutationV1,
+    ) -> Result<(), MutationError> {
+        marker.validate()?;
+        if marker.state != PreAuthorityMutationStateV1::Prepared {
+            return Err(MutationError::RecoveryConflict(
+                "aborted pre-authority mutation cannot be promoted".into(),
+            ));
+        }
+        self.stage(lock, &marker.intent)?;
+        let path = self.path_for(&marker.intent.mutation_id);
+        let expected = serialize_intent(&marker.intent)?;
+        let durable = self
+            .root
+            .read_bounded(&path, MAX_SERIALIZED_INTENT_BYTES)?
+            .ok_or_else(|| MutationError::Invalid("promoted mutation WAL disappeared".into()))?;
+        if durable != expected {
+            return Err(MutationError::Invalid(
+                "promoted mutation WAL is not byte-identical".into(),
+            ));
+        }
+        self.root
+            .delete(&self.preauthority_path_for(&marker.intent.mutation_id))
+    }
+
+    pub(crate) fn abort_preauthority(
+        &self,
+        _lock: &crate::services::twin_events::CoordinatorProcessLock,
+        marker: &PreAuthorityMutationV1,
+    ) -> Result<(), MutationError> {
+        marker.validate()?;
+        if marker.state != PreAuthorityMutationStateV1::Prepared {
+            return Ok(());
+        }
+        if !marker.intent.retain_commit_receipt {
+            // Schema-2 mutations have no external owner witness to
+            // acknowledge an abort tombstone. At the unchanged authority the
+            // marker itself proves there was no effect, so retiring it is the
+            // complete durable outcome and the caller may replan.
+            return self
+                .root
+                .delete(&self.preauthority_path_for(&marker.intent.mutation_id));
+        }
+        let aborted = PreAuthorityMutationV1 {
+            state: PreAuthorityMutationStateV1::AbortedBeforeAuthority,
+            ..marker.clone()
+        };
+        let mut bytes = serde_json::to_vec_pretty(&aborted)
+            .map_err(|error| MutationError::Invalid(error.to_string()))?;
+        bytes.push(b'\n');
+        if bytes.len() > MAX_SERIALIZED_INTENT_BYTES {
+            return Err(MutationError::Invalid(
+                "serialized aborted mutation exceeds the 32 MiB limit".into(),
+            ));
+        }
+        let path = self.preauthority_path_for(&marker.intent.mutation_id);
+        self.root.put_atomic(&path, &bytes)?;
+        let durable = self
+            .root
+            .read_bounded(&path, MAX_SERIALIZED_INTENT_BYTES)?
+            .ok_or_else(|| MutationError::Invalid("aborted mutation disappeared".into()))?;
+        if durable != bytes {
+            return Err(MutationError::Invalid(
+                "aborted mutation was not published durably".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn retain_aborted_after_authority(
+        &self,
+        lock: &crate::services::twin_events::CoordinatorProcessLock,
+        intent: &MutationIntentV1,
+        committed_authority: &crate::services::vault_namespace::VaultAuthorityTokenV1,
+    ) -> Result<(), MutationError> {
+        let expected_generation = committed_authority
+            .authority_generation
+            .checked_sub(1)
+            .ok_or_else(|| {
+                MutationError::RecoveryConflict("authority-generation-underflow".into())
+            })?;
+        let marker = PreAuthorityMutationV1 {
+            schema_version: 1,
+            state: PreAuthorityMutationStateV1::AbortedAfterAuthority,
+            expected_authority: crate::services::vault_namespace::VaultAuthorityTokenV1 {
+                root_scope: committed_authority.root_scope.clone(),
+                lease_epoch_uuid: committed_authority.lease_epoch_uuid.clone(),
+                authority_generation: expected_generation,
+            },
+            intent: intent.clone(),
+        };
+        marker.validate()?;
+        if marker.intent.content_authority_generation
+            != Some(committed_authority.authority_generation)
+        {
+            return Err(MutationError::RecoveryConflict(
+                "post-authority abort does not match the committed authority".into(),
+            ));
+        }
+        let path = self.preauthority_path_for(&intent.mutation_id);
+        let loaded = self.load_preauthority(lock)?;
+        if loaded.len() >= MAX_PENDING_INTENTS
+            && loaded.iter().all(|(existing, _)| existing != &path)
+        {
+            return Err(MutationError::Invalid(
+                "pre-authority mutation records have reached 256 entries".into(),
+            ));
+        }
+        let mut bytes = serde_json::to_vec_pretty(&marker)
+            .map_err(|error| MutationError::Invalid(error.to_string()))?;
+        bytes.push(b'\n');
+        if bytes.len() > MAX_SERIALIZED_INTENT_BYTES {
+            return Err(MutationError::Invalid(
+                "serialized post-authority abort exceeds the 32 MiB limit".into(),
+            ));
+        }
+        if let Some((_, existing)) = loaded.iter().find(|(existing, _)| existing == &path) {
+            if existing == &marker {
+                return Ok(());
+            }
+            if existing.state == PreAuthorityMutationStateV1::Prepared
+                && existing.expected_authority == marker.expected_authority
+                && existing.intent == marker.intent
+            {
+                self.root.put_atomic(&path, &bytes)?;
+            } else {
+                return Err(MutationError::RecoveryConflict(
+                    "post-authority abort identity collision".into(),
+                ));
+            }
+        } else {
+            self.root
+                .install_no_clobber(&path, STAGING_DIRECTORY, &bytes)?;
+        }
+        let durable = self
+            .root
+            .read_bounded(&path, MAX_SERIALIZED_INTENT_BYTES)?
+            .ok_or_else(|| MutationError::Invalid("post-authority abort disappeared".into()))?;
+        if durable != bytes {
+            return Err(MutationError::RecoveryConflict(
+                "post-authority abort identity collision".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn preauthority_for(
+        &self,
+        lock: &crate::services::twin_events::CoordinatorProcessLock,
+        mutation_id: &ContentDigest,
+    ) -> Result<Option<PreAuthorityMutationV1>, MutationError> {
+        Ok(self
+            .load_preauthority(lock)?
+            .into_iter()
+            .find_map(|(_, marker)| (marker.intent.mutation_id == *mutation_id).then_some(marker)))
+    }
+
+    pub(crate) fn consume_aborted_preauthority(
+        &self,
+        _lock: &crate::services::twin_events::CoordinatorProcessLock,
+        mutation_id: &ContentDigest,
+    ) -> Result<(), MutationError> {
+        let path = self.preauthority_path_for(mutation_id);
+        let Some(bytes) = self.root.read_bounded(&path, MAX_SERIALIZED_INTENT_BYTES)? else {
+            return Ok(());
+        };
+        let marker: PreAuthorityMutationV1 = serde_json::from_slice(&bytes)
+            .map_err(|error| MutationError::Invalid(error.to_string()))?;
+        marker.validate()?;
+        if marker.intent.mutation_id != *mutation_id
+            || !matches!(
+                marker.state,
+                PreAuthorityMutationStateV1::AbortedBeforeAuthority
+                    | PreAuthorityMutationStateV1::AbortedAfterAuthority
+            )
+        {
+            return Err(MutationError::RecoveryConflict(
+                "only an acknowledged aborted mutation can be consumed".into(),
+            ));
+        }
+        self.root.delete(&path)
+    }
+
+    pub(crate) fn remove_matching_aborted_wal(
+        &self,
+        _lock: &crate::services::twin_events::CoordinatorProcessLock,
+        marker: &PreAuthorityMutationV1,
+    ) -> Result<bool, MutationError> {
+        marker.validate()?;
+        if marker.state != PreAuthorityMutationStateV1::AbortedAfterAuthority {
+            return Err(MutationError::RecoveryConflict(
+                "only a post-authority abort can retire a staged WAL".into(),
+            ));
+        }
+        let path = self.path_for(&marker.intent.mutation_id);
+        let Some(durable) = self.root.read_bounded(&path, MAX_SERIALIZED_INTENT_BYTES)? else {
+            return Ok(false);
+        };
+        if durable != serialize_intent(&marker.intent)? {
+            return Err(MutationError::RecoveryConflict(
+                "post-authority abort does not match the staged WAL".into(),
+            ));
+        }
+        self.root.delete(&path)?;
+        Ok(true)
     }
 
     pub(crate) fn load_pending(
@@ -744,7 +1116,21 @@ impl LocalMutationJournal {
         _lock: &crate::services::twin_events::CoordinatorProcessLock,
         mutation_id: &ContentDigest,
     ) -> Result<(), MutationError> {
-        self.root.delete(&self.receipt_path_for(mutation_id))
+        let receipt = self.load_committed_receipt(_lock, mutation_id)?;
+        let marker = self.preauthority_for(_lock, mutation_id)?;
+        match (receipt, marker) {
+            (Some(_), Some(_)) => Err(MutationError::RecoveryConflict(
+                "mutation has conflicting committed and pre-authority proofs".into(),
+            )),
+            (None, Some(marker)) if marker.state == PreAuthorityMutationStateV1::Prepared => {
+                Err(MutationError::RecoveryConflict(
+                    "active pre-authority owner cannot be consumed".into(),
+                ))
+            }
+            (Some(_), None) => self.root.delete(&self.receipt_path_for(mutation_id)),
+            (None, Some(_)) => self.consume_aborted_preauthority(_lock, mutation_id),
+            (None, None) => Ok(()),
+        }
     }
 
     pub(crate) fn quarantine_intent(
@@ -763,6 +1149,10 @@ impl LocalMutationJournal {
         format!("{RECEIPTS_DIRECTORY}/{}.json", id.as_str())
     }
 
+    fn preauthority_path_for(&self, id: &ContentDigest) -> String {
+        format!("{PREAUTHORITY_DIRECTORY}/{}.json", id.as_str())
+    }
+
     fn pending_paths(&self) -> Result<Vec<String>, MutationError> {
         let mut paths = self
             .json_names(PENDING_DIRECTORY)?
@@ -778,7 +1168,27 @@ impl LocalMutationJournal {
         Ok(paths)
     }
 
+    fn preauthority_paths(&self) -> Result<Vec<String>, MutationError> {
+        let mut paths = self
+            .json_names(PREAUTHORITY_DIRECTORY)?
+            .into_iter()
+            .map(|name| format!("{PREAUTHORITY_DIRECTORY}/{name}"))
+            .collect::<Vec<_>>();
+        if paths.len() > MAX_PENDING_INTENTS {
+            return Err(MutationError::Invalid(
+                "local mutation journal exceeds 256 pre-authority records".into(),
+            ));
+        }
+        paths.sort();
+        Ok(paths)
+    }
+
     fn quarantine_path(&self, source: &str) -> Result<(), MutationError> {
+        if self.json_names(QUARANTINE_DIRECTORY)?.len() >= MAX_PENDING_INTENTS {
+            return Err(MutationError::Invalid(
+                "mutation quarantine has reached 256 entries".into(),
+            ));
+        }
         let name = source.rsplit('/').next().unwrap_or("intent.json");
         let target = format!("{QUARANTINE_DIRECTORY}/{}-{name}", Uuid::new_v4());
         self.root.rename(source, &target, false)
@@ -788,8 +1198,25 @@ impl LocalMutationJournal {
         &self,
         _lock: &crate::services::twin_events::CoordinatorProcessLock,
     ) -> Result<(), MutationError> {
-        for directory in [PENDING_DIRECTORY, STAGING_DIRECTORY, RECEIPTS_DIRECTORY] {
-            for name in self.root.regular_file_names(directory)? {
+        for directory in [
+            PENDING_DIRECTORY,
+            PREAUTHORITY_DIRECTORY,
+            QUARANTINE_DIRECTORY,
+            STAGING_DIRECTORY,
+            RECEIPTS_DIRECTORY,
+        ] {
+            let names = self
+                .root
+                .regular_file_names_bounded(directory, directory_entry_limit(directory))?;
+            if let Some(name) = names.iter().find(|name| {
+                !(name.starts_with('.') && name.ends_with(".tmp"))
+                    && (directory == STAGING_DIRECTORY || !name.ends_with(".json"))
+            }) {
+                return Err(MutationError::Invalid(format!(
+                    "mutation journal contains an unexpected entry: {name}"
+                )));
+            }
+            for name in names {
                 if name.starts_with('.') && name.ends_with(".tmp") {
                     self.root.delete(&format!("{directory}/{name}"))?;
                 }
@@ -799,13 +1226,23 @@ impl LocalMutationJournal {
     }
 
     fn json_names(&self, directory: &str) -> Result<Vec<String>, MutationError> {
-        let names = self.root.regular_file_names(directory)?;
+        let names = self
+            .root
+            .regular_file_names_bounded(directory, directory_entry_limit(directory))?;
         if let Some(name) = names.iter().find(|name| !name.ends_with(".json")) {
             return Err(MutationError::Invalid(format!(
                 "mutation journal contains a non-JSON entry: {name}"
             )));
         }
         Ok(names)
+    }
+}
+
+fn directory_entry_limit(directory: &str) -> usize {
+    if directory == RECEIPTS_DIRECTORY {
+        MAX_COMMIT_RECEIPTS
+    } else {
+        MAX_PENDING_INTENTS
     }
 }
 
@@ -1092,6 +1529,34 @@ mod tests {
                 )
                 .unwrap();
         }
+
+        // A canonical receipt does not exempt the directory from the global
+        // cap. The inventory must fail closed before adopting any existing
+        // proof when an extra entry is present.
+        let overflow_id = digest_bytes(b"receipt-cap-overflow");
+        journal
+            .root
+            .put_atomic(
+                &journal.receipt_path_for(&overflow_id),
+                serde_json::to_vec(&MutationCommitReceiptV1 {
+                    schema_version: 1,
+                    mutation_id: overflow_id,
+                    root_scope: committed.root_scope.clone(),
+                    lease_epoch_uuid: committed.lease_epoch_uuid.clone(),
+                    authority_generation: committed.authority_generation,
+                })
+                .unwrap()
+                .as_slice(),
+            )
+            .unwrap();
+        assert!(journal
+            .preflight_commit_receipt_slot(guard.process_lock(), &intent, &committed)
+            .is_err());
+        journal
+            .root
+            .delete(&journal.receipt_path_for(&digest_bytes(b"receipt-cap-overflow")))
+            .unwrap();
+
         let mut another = intent.clone();
         another.targets[0].relative_key = "another.md".to_string();
         another.mutation_id = derive_mutation_id(&another);
@@ -1115,6 +1580,85 @@ mod tests {
         assert!(journal
             .retain_committed_receipt(guard.process_lock(), &another, &committed)
             .is_err());
+    }
+
+    #[test]
+    fn postauthority_abort_rejects_a_nonidentical_staged_wal_before_cleanup() {
+        let temp = tempdir().unwrap();
+        let vault = temp.path().join("vault");
+        std::fs::create_dir(&vault).unwrap();
+        let store = Arc::new(TwinEventStore::new(temp.path()));
+        store.initialize().unwrap();
+        let coordinator =
+            MutationCoordinator::new(temp.path(), &vault, store, Arc::new(NoopMutationLifecycle))
+                .unwrap();
+        let guard = coordinator.begin_root_transition().unwrap();
+        let lease = guard.current_lease().unwrap();
+        let expected = guard.capture_authority_token(&lease).unwrap();
+        let committed = crate::services::vault_namespace::VaultAuthorityTokenV1 {
+            root_scope: expected.root_scope.clone(),
+            lease_epoch_uuid: expected.lease_epoch_uuid.clone(),
+            authority_generation: expected.authority_generation + 1,
+        };
+        let mut intent = MutationIntentV1 {
+            schema_version: 3,
+            mutation_id: digest_bytes(b"placeholder"),
+            origin: crate::services::twin_events::MutationOrigin::Local,
+            actor_id: crate::models::twin_event::ActorId::parse("owner").unwrap(),
+            device_id: crate::models::twin_event::DeviceId::parse("device").unwrap(),
+            causal_stream: CausalStream::LocalOnly,
+            source_channel: SourceChannel::parse("vault_optimizer").unwrap(),
+            markdown_root_scope: Some(committed.root_scope.clone()),
+            content_authority_generation: Some(committed.authority_generation),
+            retain_commit_receipt: true,
+            targets: vec![MutationTargetV1 {
+                kind: TargetKind::Markdown,
+                relative_key: "abort.md".to_string(),
+                before: BeforeImage::Absent,
+                after: DesiredImage::Utf8Bytes("after".to_string()),
+                after_digest: digest_bytes(b"after"),
+            }],
+            events: Vec::new(),
+            created_at: chrono::Utc::now(),
+        };
+        intent.mutation_id = derive_mutation_id(&intent);
+        intent.validate().unwrap();
+        let journal = LocalMutationJournal::initialize(temp.path()).unwrap();
+        journal.stage(guard.process_lock(), &intent).unwrap();
+        journal
+            .retain_aborted_after_authority(guard.process_lock(), &intent, &committed)
+            .unwrap();
+
+        let pending_path = journal.path_for(&intent.mutation_id);
+        let mut nonidentical = serialize_intent(&intent).unwrap();
+        nonidentical.push(b' ');
+        journal
+            .root
+            .put_atomic(&pending_path, &nonidentical)
+            .unwrap();
+        let marker = journal
+            .preauthority_for(guard.process_lock(), &intent.mutation_id)
+            .unwrap()
+            .unwrap();
+        assert!(journal
+            .remove_matching_aborted_wal(guard.process_lock(), &marker)
+            .is_err());
+        assert_eq!(
+            journal
+                .root
+                .read_bounded(&pending_path, MAX_SERIALIZED_INTENT_BYTES)
+                .unwrap()
+                .unwrap(),
+            nonidentical
+        );
+        assert_eq!(
+            journal
+                .preauthority_for(guard.process_lock(), &intent.mutation_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            PreAuthorityMutationStateV1::AbortedAfterAuthority
+        );
     }
 
     #[test]
@@ -1313,7 +1857,7 @@ mod tests {
         assert_eq!(coordinator.pending_count().unwrap(), 0);
         assert!(store.ordered_events().unwrap().is_empty());
 
-        coordinator
+        let valid_commit = coordinator
             .commit_local(
                 CausalStream::LocalOnly,
                 SourceChannel::parse("note_editor").unwrap(),
@@ -1325,6 +1869,7 @@ mod tests {
                 vec![draft("valid-after-rejection")],
             )
             .unwrap();
+        assert_eq!(valid_commit.events.len(), 1);
         assert_eq!(store.ordered_events().unwrap().len(), 1);
     }
 
@@ -1359,7 +1904,7 @@ mod tests {
         assert_eq!(coordinator.recover_pending().unwrap(), 0);
 
         coordinator.fail_once_at(MutationFaultPoint::AfterTarget(0));
-        coordinator
+        let remote_commit = coordinator
             .apply_nonlocal(
                 crate::services::twin_events::MutationOrigin::Remote,
                 vec![
@@ -1368,6 +1913,7 @@ mod tests {
                 ],
             )
             .expect("target-only remote replay must converge in-call");
+        assert!(remote_commit.events.is_empty());
         assert_eq!(coordinator.pending_count().unwrap(), 0);
         assert_eq!(coordinator.recover_pending().unwrap(), 0);
         assert_eq!(
@@ -1561,7 +2107,7 @@ mod tests {
             MutationCoordinator::new(temp.path(), &vault, store.clone(), lifecycle.clone())
                 .unwrap();
 
-        coordinator
+        let remote_commit = coordinator
             .apply_nonlocal(
                 crate::services::twin_events::MutationOrigin::Remote,
                 vec![TargetMutation::put(
@@ -1571,6 +2117,7 @@ mod tests {
                 )],
             )
             .unwrap();
+        assert!(remote_commit.events.is_empty());
         assert!(lifecycle.calls.lock().unwrap().is_empty());
         assert!(store.ordered_events().unwrap().is_empty());
 
@@ -1681,7 +2228,7 @@ mod tests {
         );
         assert!(!vault_b.join("interrupted.md").exists());
 
-        coordinator
+        let switched_commit = coordinator
             .commit_local(
                 CausalStream::SyncEligible,
                 SourceChannel::parse("note_editor").unwrap(),
@@ -1693,6 +2240,7 @@ mod tests {
                 vec![draft("after-switch")],
             )
             .unwrap();
+        assert_eq!(switched_commit.events.len(), 1);
         assert!(!vault_a.join("after-switch.md").exists());
         assert_eq!(
             std::fs::read_to_string(vault_b.join("after-switch.md")).unwrap(),
@@ -1804,8 +2352,10 @@ mod tests {
             })
         };
         barrier.wait();
-        desktop_thread.join().unwrap().unwrap();
-        mcp_thread.join().unwrap().unwrap();
+        let desktop_commit = desktop_thread.join().unwrap().unwrap();
+        let mcp_commit = mcp_thread.join().unwrap().unwrap();
+        assert_eq!(desktop_commit.events.len(), 1);
+        assert_eq!(mcp_commit.events.len(), 1);
 
         assert_eq!(
             std::fs::read_to_string(vault.join("desktop.md")).unwrap(),
@@ -1846,6 +2396,38 @@ mod tests {
             std::fs::write(pending.join(format!("{index:064x}.json")), "{}").unwrap();
         }
         assert!(coordinator.pending_count().is_err());
+    }
+
+    #[test]
+    fn journal_directory_caps_count_temporary_and_quarantine_entries() {
+        let temp = tempdir().unwrap();
+        let vault = temp.path().join("vault");
+        std::fs::create_dir(&vault).unwrap();
+        let store = Arc::new(TwinEventStore::new(temp.path()));
+        store.initialize().unwrap();
+        let coordinator =
+            MutationCoordinator::new(temp.path(), &vault, store, Arc::new(NoopMutationLifecycle))
+                .unwrap();
+        let guard = coordinator.begin_root_transition().unwrap();
+        let journal = LocalMutationJournal::initialize(temp.path()).unwrap();
+
+        let staging = temp.path().join(STAGING_DIRECTORY.replace('/', "\\"));
+        for index in 0..=MAX_PENDING_INTENTS {
+            std::fs::write(staging.join(format!(".{index}.tmp")), b"temp").unwrap();
+        }
+        assert!(journal
+            .cleanup_orphan_temps_locked(guard.process_lock())
+            .is_err());
+        assert_eq!(
+            std::fs::read_dir(&staging).unwrap().count(),
+            MAX_PENDING_INTENTS + 1
+        );
+
+        let quarantine = temp.path().join(QUARANTINE_DIRECTORY.replace('/', "\\"));
+        for index in 0..=MAX_PENDING_INTENTS {
+            std::fs::write(quarantine.join(format!("{index:064x}.json")), b"{}").unwrap();
+        }
+        assert!(journal.quarantine_count(guard.process_lock()).is_err());
     }
 
     #[test]

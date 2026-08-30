@@ -24,17 +24,29 @@ impl TwinStore {
         session: &CanvasSession,
         request: CanvasFeedbackRequest,
     ) -> Result<CanvasFeedbackResult> {
+        let (result, _commit) = self.record_canvas_feedback_with_commit(session, request)?;
+        Ok(result)
+    }
+
+    pub(crate) fn record_canvas_feedback_with_commit(
+        &mut self,
+        session: &CanvasSession,
+        request: CanvasFeedbackRequest,
+    ) -> Result<(
+        CanvasFeedbackResult,
+        crate::services::twin_events::MutationCommit,
+    )> {
         Self::validate_file_id(&session.id)?;
         if !self.event_recorder.is_noop() {
             let mut committed = None;
-            self.commit_planned_twin_mutation(|store| {
+            let commit = self.commit_planned_twin_mutation(|store| {
                 let durable_session = store
                     .read_canvas_session_bounded(&session.id)?
                     .ok_or_else(|| anyhow::anyhow!("Persisted Canvas session was not found"))?;
-                let (result, trace, record, values, drafts) =
+                let (result, _trace, _record, values, drafts) =
                     store.plan_canvas_feedback_mutation(&durable_session, &request)?;
                 let targets = store.governed_json_targets(values)?;
-                committed = Some((result, trace, record));
+                committed = Some(result);
                 Ok(Some(crate::services::twin_events::MutationPlan::new(
                     crate::models::twin_event::CausalStream::SyncEligible,
                     SourceChannel::parse("canvas").map_err(anyhow::Error::msg)?,
@@ -42,23 +54,21 @@ impl TwinStore {
                     drafts,
                 )))
             })?;
-            let (result, trace, record) = committed
-                .ok_or_else(|| anyhow::anyhow!("Canvas feedback was not planned"))?;
-            let _ = (trace, record);
+            let result =
+                committed.ok_or_else(|| anyhow::anyhow!("Canvas feedback was not planned"))?;
             self.invalidate_mutation_caches();
-            return Ok(result);
+            return Ok((result, commit));
         }
         self.ensure_record_cache()?;
-        let (result, trace, record, values, drafts) =
+        let (result, _trace, _record, values, drafts) =
             self.plan_canvas_feedback_mutation(session, &request)?;
-        self.commit_governed_json_targets_with_source(
+        let commit = self.commit_governed_json_targets_with_source(
             SourceChannel::parse("canvas").map_err(anyhow::Error::msg)?,
             values,
             drafts,
         )?;
-        let _ = (trace, record);
         self.invalidate_mutation_caches();
-        Ok(result)
+        Ok((result, commit))
     }
 
     fn plan_canvas_feedback_mutation(
@@ -701,8 +711,8 @@ mod tests {
         persist_session(root.path(), &session);
         coordinator.fail_once_at(crate::services::twin_events::MutationFaultPoint::AfterTarget(0));
 
-        assert!(store
-            .record_canvas_feedback(
+        let (_, commit) = store
+            .record_canvas_feedback_with_commit(
                 &session,
                 CanvasFeedbackRequest {
                     feedback_type: CanvasFeedbackType::Correction,
@@ -717,10 +727,10 @@ mod tests {
                     .unwrap()
                 },
             )
-            .is_err());
+            .unwrap();
+        assert!(commit.postcommit_warning);
         assert!(!store.trace_cache.contains_key(&session.id));
         assert!(store.record_cache.is_empty());
-        assert_eq!(coordinator.recover_pending().unwrap(), 1);
         assert_eq!(coordinator.recover_pending().unwrap(), 0);
 
         assert_eq!(events.ordered_events().unwrap().len(), 2);

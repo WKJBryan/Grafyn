@@ -9,8 +9,7 @@ use crate::models::twin::{
 use crate::models::twin::{
     ExportBundle, ExportFileSummary, PromotionState, TraceEventType, TwinExportRequest, UserRecord,
 };
-use crate::services::atomic_io::write_atomic;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use chrono::Utc;
 use serde_json::{json, Value};
 use std::collections::hash_map::DefaultHasher;
@@ -32,7 +31,49 @@ enum ExportSplit {
 
 impl TwinStore {
     pub fn export_bundle(&mut self, request: TwinExportRequest) -> Result<ExportBundle> {
-        self.ensure_record_cache()?;
+        let (bundle, _commit) = self.export_bundle_with_commit(request)?;
+        Ok(bundle)
+    }
+
+    pub(crate) fn export_bundle_with_commit(
+        &mut self,
+        request: TwinExportRequest,
+    ) -> Result<(ExportBundle, crate::services::twin_events::MutationCommit)> {
+        if self.event_recorder.is_noop() {
+            let (bundle, materialized_files) = self.materialize_export_bundle(&request)?;
+            for (path, content) in materialized_files {
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                crate::services::atomic_io::write_atomic(&path, content.as_bytes())?;
+            }
+            return Ok((bundle, Self::tokenless_mutation_commit()));
+        }
+
+        let mut committed_bundle = None;
+        let commit = self.commit_planned_twin_mutation(|store| {
+            let (bundle, materialized_files) = store.materialize_export_bundle(&request)?;
+            let targets = store.governed_json_targets(materialized_files)?;
+            committed_bundle = Some(bundle);
+            Ok(Some(crate::services::twin_events::MutationPlan::new(
+                crate::models::twin_event::CausalStream::SyncEligible,
+                crate::models::twin_event::SourceChannel::parse("legacy_twin")
+                    .map_err(anyhow::Error::msg)?,
+                targets,
+                Vec::new(),
+            )))
+        })?;
+        let bundle = committed_bundle
+            .ok_or_else(|| anyhow::anyhow!("Export mutation completed without a bundle"))?;
+        Ok((bundle, commit))
+    }
+
+    fn materialize_export_bundle(
+        &mut self,
+        request: &TwinExportRequest,
+    ) -> Result<(ExportBundle, Vec<(std::path::PathBuf, String)>)> {
+        self.invalidate_mutation_caches();
+        self.rebuild_mutation_caches()?;
 
         let eval_percentage = request.eval_percentage.unwrap_or(DEFAULT_EVAL_PERCENTAGE);
         let holdout_percentage = request
@@ -50,13 +91,6 @@ impl TwinStore {
         Self::validate_file_id(bundle_name)?;
 
         let output_dir = self.exports_path.join(bundle_name);
-        std::fs::create_dir_all(&output_dir).with_context(|| {
-            format!(
-                "Failed to create export directory: {}",
-                output_dir.display()
-            )
-        })?;
-
         let approved_path = output_dir.join("approved_user_records.jsonl");
         let candidate_path = output_dir.join("candidate_user_records.jsonl");
         let rejected_path = output_dir.join("rejected_user_records.jsonl");
@@ -69,6 +103,7 @@ impl TwinStore {
         let decision_episodes_path = output_dir.join("decision_episodes.jsonl");
         let feedback_events_path = output_dir.join("feedback_events.jsonl");
         let manifest_path = output_dir.join("manifest.json");
+        let mut materialized_files = Vec::new();
 
         let mut records: Vec<UserRecord> = self.record_cache.values().cloned().collect();
         records.sort_by(|a, b| a.id.cmp(&b.id));
@@ -109,12 +144,12 @@ impl TwinStore {
             }
         }
 
-        self.write_jsonl_file(&approved_path, &approved_lines)?;
-        self.write_jsonl_file(&candidate_path, &candidate_lines)?;
-        self.write_jsonl_file(&rejected_path, &rejected_lines)?;
-        self.write_jsonl_file(&train_path, &train_lines)?;
-        self.write_jsonl_file(&eval_path, &eval_lines)?;
-        self.write_jsonl_file(&holdout_path, &holdout_lines)?;
+        materialized_files.push(Self::jsonl_target(&approved_path, &approved_lines));
+        materialized_files.push(Self::jsonl_target(&candidate_path, &candidate_lines));
+        materialized_files.push(Self::jsonl_target(&rejected_path, &rejected_lines));
+        materialized_files.push(Self::jsonl_target(&train_path, &train_lines));
+        materialized_files.push(Self::jsonl_target(&eval_path, &eval_lines));
+        materialized_files.push(Self::jsonl_target(&holdout_path, &holdout_lines));
         let decision_mirror_config = self.get_decision_mirror_config()?;
         let benchmark_lines = self
             .list_decision_episodes_with_reflections()?
@@ -135,21 +170,21 @@ impl TwinStore {
                 }))
             })
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        self.write_jsonl_file(&benchmark_path, &benchmark_lines)?;
+        materialized_files.push(Self::jsonl_target(&benchmark_path, &benchmark_lines));
         let constitution_lines = self
             .list_constitution_items()?
             .into_iter()
             .filter(|item| !self.artifact_has_only_legacy_auto_support(&item.linked_record_ids))
             .map(|item| serde_json::to_string(&item))
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        self.write_jsonl_file(&constitution_path, &constitution_lines)?;
+        materialized_files.push(Self::jsonl_target(&constitution_path, &constitution_lines));
         let action_gap_lines = self
             .list_action_gaps()?
             .into_iter()
             .filter(|gap| !self.artifact_has_only_legacy_auto_support(&gap.linked_record_ids))
             .map(|gap| serde_json::to_string(&gap))
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        self.write_jsonl_file(&action_gaps_path, &action_gap_lines)?;
+        materialized_files.push(Self::jsonl_target(&action_gaps_path, &action_gap_lines));
 
         // Decision episodes with sealed-prediction integrity: while an
         // episode has no recorded choice, its prediction exports as a
@@ -178,7 +213,10 @@ impl TwinStore {
                 serde_json::to_string(&value).map_err(anyhow::Error::from)
             })
             .collect::<Result<Vec<_>>>()?;
-        self.write_jsonl_file(&decision_episodes_path, &decision_episode_lines)?;
+        materialized_files.push(Self::jsonl_target(
+            &decision_episodes_path,
+            &decision_episode_lines,
+        ));
 
         // Ranking / Matches-Me / insight raw material. Privacy rule: skip
         // events that are evidence for records now marked Rejected, Private,
@@ -230,7 +268,10 @@ impl TwinStore {
                     .collect::<Vec<_>>()
             })
             .collect::<Result<Vec<_>>>()?;
-        self.write_jsonl_file(&feedback_events_path, &feedback_event_lines)?;
+        materialized_files.push(Self::jsonl_target(
+            &feedback_events_path,
+            &feedback_event_lines,
+        ));
 
         let manifest = serde_json::json!({
             "bundle_schema_version": 2,
@@ -277,9 +318,12 @@ impl TwinStore {
                 "private_or_no_train": private_or_no_train_record_ids.len(),
             }
         });
-        self.write_pretty_json(&manifest_path, &manifest)?;
+        materialized_files.push((
+            manifest_path.clone(),
+            serde_json::to_string_pretty(&manifest)?,
+        ));
 
-        Ok(ExportBundle {
+        let bundle = ExportBundle {
             output_dir: output_dir.display().to_string(),
             approved_user_records: ExportFileSummary {
                 path: approved_path.display().to_string(),
@@ -328,7 +372,8 @@ impl TwinStore {
             manifest_path: manifest_path.display().to_string(),
             included_records: train_lines.len() + eval_lines.len() + holdout_lines.len(),
             excluded_records: private_or_no_train_record_ids.len(),
-        })
+        };
+        Ok((bundle, materialized_files))
     }
 
     fn split_for_record(
@@ -378,16 +423,12 @@ impl TwinStore {
         })
     }
 
-    fn write_jsonl_file(&self, path: &Path, lines: &[String]) -> Result<()> {
+    fn jsonl_target(path: &Path, lines: &[String]) -> (std::path::PathBuf, String) {
         let mut content = lines.join("\n");
         if !content.is_empty() {
             content.push('\n');
         }
-        if self.event_recorder.is_noop() {
-            return write_atomic(path, content.as_bytes())
-                .with_context(|| format!("Failed to write JSONL file: {}", path.display()));
-        }
-        self.commit_governed_json_targets(vec![(path.to_path_buf(), content)], Vec::new())
+        (path.to_path_buf(), content)
     }
 }
 
@@ -396,6 +437,111 @@ mod tests {
     use super::*;
     use crate::models::twin::{default_record_confidence, PromotionState, UserRecordKind};
     use tempfile::tempdir;
+
+    fn coordinated_store(
+        root: &std::path::Path,
+    ) -> (
+        TwinStore,
+        std::sync::Arc<crate::services::twin_events::MutationCoordinator>,
+    ) {
+        let data = root.join("data");
+        let vault = root.join("vault");
+        let twin_root = data.join("twin").join("scope-one");
+        std::fs::create_dir_all(&twin_root).unwrap();
+        std::fs::create_dir(&vault).unwrap();
+        let events = std::sync::Arc::new(crate::services::twin_events::TwinEventStore::new(&data));
+        events.initialize().unwrap();
+        let coordinator = std::sync::Arc::new(
+            crate::services::twin_events::MutationCoordinator::new(
+                &data,
+                &vault,
+                events,
+                std::sync::Arc::new(crate::services::twin_events::NoopMutationLifecycle),
+            )
+            .unwrap(),
+        );
+        (
+            TwinStore::with_event_recorder(twin_root, data.join("twin"), coordinator.clone()),
+            coordinator,
+        )
+    }
+
+    #[test]
+    fn coordinated_export_installs_the_complete_bundle_in_one_authority_generation() {
+        let root = tempdir().unwrap();
+        let (mut store, coordinator) = coordinated_store(root.path());
+        let before = coordinator.current_authority_token().unwrap();
+
+        let (bundle, commit) = store
+            .export_bundle_with_commit(TwinExportRequest::default())
+            .unwrap();
+
+        let committed = commit
+            .authority_token
+            .as_ref()
+            .expect("export must return its authority token");
+        assert_eq!(
+            committed.authority_generation,
+            before.authority_generation + 1
+        );
+        assert_eq!(committed, &coordinator.current_authority_token().unwrap());
+        for path in [
+            &bundle.approved_user_records.path,
+            &bundle.candidate_user_records.path,
+            &bundle.rejected_user_records.path,
+            &bundle.train.path,
+            &bundle.eval.path,
+            &bundle.holdout.path,
+            &bundle.manifest_path,
+        ] {
+            assert!(std::path::Path::new(path).is_file(), "missing {path}");
+        }
+    }
+
+    #[test]
+    fn coordinated_export_reloads_peer_records_inside_its_single_mutation() {
+        let root = tempdir().unwrap();
+        let (mut exporter, coordinator) = coordinated_store(root.path());
+        assert!(exporter.list_user_records().unwrap().is_empty());
+        let data = root.path().join("data");
+        let mut peer = TwinStore::with_event_recorder(
+            data.join("twin/scope-one"),
+            data.join("twin"),
+            coordinator.clone(),
+        );
+        let (record, _) = peer
+            .create_user_record_with_commit(UserRecordCreate {
+                kind: UserRecordKind::Fact,
+                content: "Peer record must be exported".to_string(),
+                origin: RecordOrigin::User,
+                evidence_refs: Vec::new(),
+                confidence: 0.9,
+                promotion_state: Some(PromotionState::Candidate),
+                valid_from: None,
+                valid_until: None,
+                links: Vec::new(),
+                metadata: HashMap::new(),
+            })
+            .unwrap();
+        let before_export = coordinator.current_authority_token().unwrap();
+
+        let (bundle, commit) = exporter
+            .export_bundle_with_commit(TwinExportRequest::default())
+            .unwrap();
+
+        assert_eq!(bundle.candidate_user_records.count, 1);
+        assert!(std::fs::read_to_string(&bundle.candidate_user_records.path)
+            .unwrap()
+            .contains(&record.id));
+        assert_eq!(
+            commit
+                .authority_token
+                .as_ref()
+                .unwrap()
+                .authority_generation,
+            before_export.authority_generation + 1
+        );
+    }
 
     #[test]
     fn export_separates_approved_candidate_and_rejected_records() {
@@ -520,12 +666,14 @@ mod tests {
             links: Vec::new(),
             metadata: HashMap::new(),
         };
-        store
+        assert!(store
             .write_pretty_json(
                 &store.records_path.join("legacy-artifact-record.json"),
                 &legacy,
             )
-            .unwrap();
+            .unwrap()
+            .authority_token
+            .is_none());
         let item = store
             .create_constitution_item(crate::models::twin::ConstitutionItemCreate {
                 claim: "legacy-only constitution export".to_string(),

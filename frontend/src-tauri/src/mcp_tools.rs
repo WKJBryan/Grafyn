@@ -12,9 +12,7 @@ use crate::services::memory::MemoryService;
 use crate::services::priority::PriorityScoringService;
 use crate::services::retrieval::RetrievalService;
 use crate::services::search::SearchService;
-use crate::services::twin_events::{
-    MutationCoordinator, MutationError,
-};
+use crate::services::twin_events::{MutationCoordinator, MutationError};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, Content, ServerCapabilities, ServerInfo};
@@ -55,6 +53,12 @@ struct McpAuthorityReadTicket {
     coordinator: Arc<MutationCoordinator>,
     expected: crate::services::vault_namespace::VaultAuthorityTokenV1,
     require_ready: bool,
+}
+
+struct McpAuthorityAdvancedWrite {
+    notice: String,
+    note_ids: Vec<String>,
+    recovered: bool,
 }
 
 impl McpAuthorityReadTicket {
@@ -240,6 +244,12 @@ fn err_result(msg: String) -> Result<CallToolResult, McpError> {
     Ok(CallToolResult::success(vec![Content::text(msg)]))
 }
 
+fn committed_refresh_failure_notice(operation: &str) -> String {
+    format!(
+        "{operation} committed, but this MCP server could not refresh its authority; do not retry. Restart the MCP server before another write."
+    )
+}
+
 fn read_mcp_import_content(file_path: &str) -> Result<String, String> {
     let extension = Path::new(file_path)
         .extension()
@@ -422,8 +432,13 @@ impl GrafynMcpServer {
     fn refresh_authoritative_after_write(
         &self,
         store: &mut KnowledgeStore,
+        commit: &crate::services::twin_events::MutationCommit,
     ) -> Result<(), MutationError> {
-        let token = self.derived_authority.coordinator.current_authority_token()?;
+        let token = commit.authority_token.clone().ok_or_else(|| {
+            MutationError::RecoveryConflict(
+                "MCP mutation did not return its exact authority token".into(),
+            )
+        })?;
         store.reload_authoritative_state();
         self.derived_authority
             .coordinator
@@ -437,6 +452,41 @@ impl GrafynMcpServer {
         Ok(())
     }
 
+    fn recover_authority_advanced_write(
+        &self,
+        store: &mut KnowledgeStore,
+        error: &anyhow::Error,
+        operation: &str,
+    ) -> Option<McpAuthorityAdvancedWrite> {
+        let outcome =
+            crate::services::knowledge_store::knowledge_authority_advanced_outcome(error)?;
+        let recovered = self.derived_authority.coordinator.recover_pending();
+        if let Err(recovery_error) = &recovered {
+            log::error!("MCP {operation} authority recovery remains pending: {recovery_error}");
+        }
+        let refreshed = self.refresh_authoritative_after_write(store, &outcome.commit);
+        if let Err(refresh_error) = &refreshed {
+            log::error!("MCP {operation} authority refresh failed: {refresh_error}");
+        }
+        let target_recovered = !outcome.target_aborted && recovered.is_ok();
+        let notice = if outcome.target_aborted {
+            format!(
+                "{operation} was not applied after vault authority changed; refresh state before deciding whether to retry."
+            )
+        } else if target_recovered && refreshed.is_ok() {
+            format!("{operation} committed and recovered; do not retry.")
+        } else if target_recovered {
+            committed_refresh_failure_notice(operation)
+        } else {
+            format!("{operation} committed and recovery is pending; do not retry.")
+        };
+        Some(McpAuthorityAdvancedWrite {
+            notice,
+            note_ids: outcome.note_ids,
+            recovered: target_recovered,
+        })
+    }
+
     #[tool(
         description = "List all notes in the knowledge base with metadata (title, status, tags). Returns JSON array sorted by last updated."
     )]
@@ -448,19 +498,19 @@ impl GrafynMcpServer {
         let result = {
             let ks = self.knowledge_store.read().await;
             match ks.list_notes() {
-            Ok(notes) => {
-                let response: Vec<NoteMetaResponse> = notes
-                    .into_iter()
-                    .map(|n| NoteMetaResponse {
-                        id: n.id,
-                        title: n.title,
-                        status: n.status.to_string(),
-                        tags: n.tags,
-                    })
-                    .collect();
-                json_result(&response)
-            }
-            Err(e) => err_result(format!("Failed to list notes: {}", e)),
+                Ok(notes) => {
+                    let response: Vec<NoteMetaResponse> = notes
+                        .into_iter()
+                        .map(|n| NoteMetaResponse {
+                            id: n.id,
+                            title: n.title,
+                            status: n.status.to_string(),
+                            tags: n.tags,
+                        })
+                        .collect();
+                    json_result(&response)
+                }
+                Err(e) => err_result(format!("Failed to list notes: {}", e)),
             }
         };
         finish_mcp_read(
@@ -484,14 +534,14 @@ impl GrafynMcpServer {
         let result = {
             let ks = self.knowledge_store.read().await;
             match ks.get_note(&params.id) {
-            Ok(note) => json_result(&NoteResponse {
-                id: note.id,
-                title: note.title,
-                status: note.status.to_string(),
-                tags: note.tags,
-                content: note.content,
-            }),
-            Err(e) => err_result(format!("Note not found: {}", e)),
+                Ok(note) => json_result(&NoteResponse {
+                    id: note.id,
+                    title: note.title,
+                    status: note.status.to_string(),
+                    tags: note.tags,
+                    content: note.content,
+                }),
+                Err(e) => err_result(format!("Note not found: {}", e)),
             }
         };
         finish_mcp_read(
@@ -523,12 +573,11 @@ impl GrafynMcpServer {
         };
 
         let mut ks = self.knowledge_store.write().await;
-        match ks.create_note_from_source(create, "mcp") {
-            Ok(note) => {
-                if let Err(error) = self.refresh_authoritative_after_write(&mut ks) {
-                    return err_result(format!(
-                        "Note was committed, but MCP authority refresh failed: {error}"
-                    ));
+        match ks.create_note_from_source_with_commit(create, "mcp") {
+            Ok((note, commit)) => {
+                if let Err(error) = self.refresh_authoritative_after_write(&mut ks, &commit) {
+                    log::error!("MCP note creation authority refresh failed: {error}");
+                    return text_result(committed_refresh_failure_notice("Note creation"));
                 }
                 json_result(&NoteResponse {
                     id: note.id,
@@ -538,7 +587,14 @@ impl GrafynMcpServer {
                     content: note.content,
                 })
             }
-            Err(e) => err_result(format!("Failed to create note: {}", e)),
+            Err(e) => {
+                if let Some(outcome) =
+                    self.recover_authority_advanced_write(&mut ks, &e, "Note creation")
+                {
+                    return text_result(outcome.notice);
+                }
+                err_result(format!("Failed to create note: {}", e))
+            }
         }
     }
 
@@ -564,12 +620,11 @@ impl GrafynMcpServer {
         };
 
         let mut ks = self.knowledge_store.write().await;
-        match ks.update_note_from_source(&id, update, "mcp") {
-            Ok(note) => {
-                if let Err(error) = self.refresh_authoritative_after_write(&mut ks) {
-                    return err_result(format!(
-                        "Note was committed, but MCP authority refresh failed: {error}"
-                    ));
+        match ks.update_note_from_source_with_commit(&id, update, "mcp") {
+            Ok((note, commit)) => {
+                if let Err(error) = self.refresh_authoritative_after_write(&mut ks, &commit) {
+                    log::error!("MCP note update authority refresh failed: {error}");
+                    return text_result(committed_refresh_failure_notice("Note update"));
                 }
                 json_result(&NoteResponse {
                     id: note.id,
@@ -579,7 +634,14 @@ impl GrafynMcpServer {
                     content: note.content,
                 })
             }
-            Err(e) => err_result(format!("Failed to update note: {}", e)),
+            Err(e) => {
+                if let Some(outcome) =
+                    self.recover_authority_advanced_write(&mut ks, &e, "Note update")
+                {
+                    return text_result(outcome.notice);
+                }
+                err_result(format!("Failed to update note: {}", e))
+            }
         }
     }
 
@@ -591,16 +653,22 @@ impl GrafynMcpServer {
         Parameters(params): Parameters<DeleteNoteParams>,
     ) -> Result<CallToolResult, McpError> {
         let mut ks = self.knowledge_store.write().await;
-        match ks.delete_note_from_source(&params.id, "mcp") {
-            Ok(()) => {
-                if let Err(error) = self.refresh_authoritative_after_write(&mut ks) {
-                    return err_result(format!(
-                        "Note was committed, but MCP authority refresh failed: {error}"
-                    ));
+        match ks.delete_note_from_source_with_commit(&params.id, "mcp") {
+            Ok(commit) => {
+                if let Err(error) = self.refresh_authoritative_after_write(&mut ks, &commit) {
+                    log::error!("MCP note deletion authority refresh failed: {error}");
+                    return text_result(committed_refresh_failure_notice("Note deletion"));
                 }
                 text_result(format!("Note '{}' deleted successfully.", params.id))
             }
-            Err(e) => err_result(format!("Failed to delete note: {}", e)),
+            Err(e) => {
+                if let Some(outcome) =
+                    self.recover_authority_advanced_write(&mut ks, &e, "Note deletion")
+                {
+                    return text_result(outcome.notice);
+                }
+                err_result(format!("Failed to delete note: {}", e))
+            }
         }
     }
 
@@ -621,23 +689,23 @@ impl GrafynMcpServer {
         let result = {
             let search = search_service.read().await;
             match search.search(&params.query, params.limit) {
-            Ok(results) => {
-                let response: Vec<serde_json::Value> = results
-                    .into_iter()
-                    .map(|r| {
-                        serde_json::json!({
-                            "id": r.note.id,
-                            "title": r.note.title,
-                            "score": r.score,
-                            "snippet": r.snippet,
-                            "status": r.note.status.to_string(),
-                            "tags": r.note.tags,
+                Ok(results) => {
+                    let response: Vec<serde_json::Value> = results
+                        .into_iter()
+                        .map(|r| {
+                            serde_json::json!({
+                                "id": r.note.id,
+                                "title": r.note.title,
+                                "score": r.score,
+                                "snippet": r.snippet,
+                                "status": r.note.status.to_string(),
+                                "tags": r.note.tags,
+                            })
                         })
-                    })
-                    .collect();
-                json_result(&response)
-            }
-            Err(e) => err_result(format!("Search failed: {}", e)),
+                        .collect();
+                    json_result(&response)
+                }
+                Err(e) => err_result(format!("Search failed: {}", e)),
             }
         };
         finish_mcp_read(
@@ -833,19 +901,37 @@ impl GrafynMcpServer {
                 continue;
             }
             let mut ks = self.knowledge_store.write().await;
-            match ks.import_note_container(creates, &container_id, content.as_bytes()) {
-                Ok(notes) => created_notes.extend(notes),
-                Err(e) => {
-                    errors.push(format!("Failed to import '{}': {}", container_id, e));
+            match ks.import_note_container_with_commit(creates, &container_id, content.as_bytes()) {
+                Ok((notes, commit)) => {
+                    if let Err(error) = self.refresh_authoritative_after_write(&mut ks, &commit) {
+                        log::error!("MCP import authority refresh failed: {error}");
+                        errors.push(committed_refresh_failure_notice(&format!(
+                            "Import '{container_id}'"
+                        )));
+                    }
+                    created_notes.extend(notes);
                 }
-            }
-        }
-        if !created_notes.is_empty() {
-            let mut ks = self.knowledge_store.write().await;
-            if let Err(error) = self.refresh_authoritative_after_write(&mut ks) {
-                errors.push(format!(
-                    "Notes were committed, but MCP authority refresh failed: {error}"
-                ));
+                Err(e) => {
+                    if let Some(outcome) = self.recover_authority_advanced_write(
+                        &mut ks,
+                        &e,
+                        &format!("Import '{container_id}'"),
+                    ) {
+                        if outcome.recovered {
+                            for note_id in outcome.note_ids {
+                                match ks.get_note(&note_id) {
+                                    Ok(note) => created_notes.push(note),
+                                    Err(error) => log::error!(
+                                        "Recovered MCP import note '{note_id}' could not be loaded: {error}"
+                                    ),
+                                }
+                            }
+                        }
+                        errors.push(outcome.notice);
+                    } else {
+                        errors.push(format!("Failed to import '{}': {}", container_id, e));
+                    }
+                }
             }
         }
         let created_ids = created_notes
@@ -874,75 +960,74 @@ impl GrafynMcpServer {
             Err(result) => return Ok(result),
         };
         // If token_budget is set and chunk index is available, use chunk retrieval
-        let result = if let (Some(budget), Some(chunk_index)) =
-            (params.token_budget, &self.chunk_index)
-        {
-            let chunk_index = chunk_index.read().await;
-            let graph = self.graph_index.read().await;
-            let priority = self.priority_service.read().await;
-            let retrieval = self.retrieval_service.read().await;
+        let result =
+            if let (Some(budget), Some(chunk_index)) = (params.token_budget, &self.chunk_index) {
+                let chunk_index = chunk_index.read().await;
+                let graph = self.graph_index.read().await;
+                let priority = self.priority_service.read().await;
+                let retrieval = self.retrieval_service.read().await;
 
-            match retrieval.retrieve_chunks(
-                &chunk_index,
-                &graph,
-                &priority,
-                &params.query,
-                budget,
-                &params.context_note_ids,
-            ) {
-                Ok(chunks) => {
-                    let response: Vec<serde_json::Value> = chunks
-                        .into_iter()
-                        .map(|c| {
-                            serde_json::json!({
-                                "parent_note_id": c.parent_note_id,
-                                "parent_title": c.parent_title,
-                                "text": c.text,
-                                "score": c.search_score,
-                                "token_estimate": c.token_estimate,
+                match retrieval.retrieve_chunks(
+                    &chunk_index,
+                    &graph,
+                    &priority,
+                    &params.query,
+                    budget,
+                    &params.context_note_ids,
+                ) {
+                    Ok(chunks) => {
+                        let response: Vec<serde_json::Value> = chunks
+                            .into_iter()
+                            .map(|c| {
+                                serde_json::json!({
+                                    "parent_note_id": c.parent_note_id,
+                                    "parent_title": c.parent_title,
+                                    "text": c.text,
+                                    "score": c.search_score,
+                                    "token_estimate": c.token_estimate,
+                                })
                             })
-                        })
-                        .collect();
-                    json_result(&response)
+                            .collect();
+                        json_result(&response)
+                    }
+                    Err(e) => err_result(format!("Chunk recall failed: {}", e)),
                 }
-                Err(e) => err_result(format!("Chunk recall failed: {}", e)),
-            }
-        } else {
-            // Note-level recall (original behavior)
-            let Some(search_service) = &self.search_service else {
-                return err_result("Vault-derived search index is unavailable.".into());
+            } else {
+                // Note-level recall (original behavior)
+                let Some(search_service) = &self.search_service else {
+                    return err_result("Vault-derived search index is unavailable.".into());
+                };
+                let search = search_service.read().await;
+                let graph = self.graph_index.read().await;
+                let memory = self.memory_service.read().await;
+
+                match memory.recall_relevant(
+                    &search,
+                    &graph,
+                    &params.query,
+                    &params.context_note_ids,
+                    params.limit,
+                ) {
+                    Ok(results) => {
+                        let response: Vec<serde_json::Value> = results
+                            .into_iter()
+                            .map(|r| {
+                                serde_json::json!({
+                                    "note_id": r.note_id,
+                                    "title": r.title,
+                                    "snippet": r.snippet,
+                                    "score": r.score,
+                                    "graph_boost": r.graph_boost,
+                                    "total_score": r.total_score,
+                                    "tags": r.tags,
+                                })
+                            })
+                            .collect();
+                        json_result(&response)
+                    }
+                    Err(e) => err_result(format!("Recall failed: {}", e)),
+                }
             };
-            let search = search_service.read().await;
-            let graph = self.graph_index.read().await;
-            let memory = self.memory_service.read().await;
-
-            match memory.recall_relevant(
-                &search,
-                &graph,
-                &params.query,
-                &params.context_note_ids,
-                params.limit,
-            ) {
-                Ok(results) => {
-                    let response: Vec<serde_json::Value> = results
-                        .into_iter()
-                        .map(|r| {
-                            serde_json::json!({
-                                "note_id": r.note_id,
-                                "title": r.title,
-                                "snippet": r.snippet,
-                                "score": r.score,
-                                "graph_boost": r.graph_boost,
-                                "total_score": r.total_score,
-                                "tags": r.tags,
-                            })
-                        })
-                        .collect();
-                    json_result(&response)
-                }
-                Err(e) => err_result(format!("Recall failed: {}", e)),
-            }
-        };
         finish_mcp_read(
             ticket,
             result,
@@ -981,24 +1066,24 @@ impl GrafynMcpServer {
                 params.token_budget,
                 &params.context_note_ids,
             ) {
-            Ok(chunks) => {
-                let total_tokens: usize = chunks.iter().map(|c| c.token_estimate).sum();
-                let response = serde_json::json!({
-                    "chunks": chunks.iter().map(|c| {
-                        serde_json::json!({
-                            "parent_note_id": c.parent_note_id,
-                            "parent_title": c.parent_title,
-                            "text": c.text,
-                            "score": c.search_score,
-                            "token_estimate": c.token_estimate,
-                        })
-                    }).collect::<Vec<_>>(),
-                    "total_tokens": total_tokens,
-                    "token_budget": params.token_budget,
-                });
-                json_result(&response)
-            }
-            Err(e) => err_result(format!("Chunk search failed: {}", e)),
+                Ok(chunks) => {
+                    let total_tokens: usize = chunks.iter().map(|c| c.token_estimate).sum();
+                    let response = serde_json::json!({
+                        "chunks": chunks.iter().map(|c| {
+                            serde_json::json!({
+                                "parent_note_id": c.parent_note_id,
+                                "parent_title": c.parent_title,
+                                "text": c.text,
+                                "score": c.search_score,
+                                "token_estimate": c.token_estimate,
+                            })
+                        }).collect::<Vec<_>>(),
+                        "total_tokens": total_tokens,
+                        "token_budget": params.token_budget,
+                    });
+                    json_result(&response)
+                }
+                Err(e) => err_result(format!("Chunk search failed: {}", e)),
             }
         };
         finish_mcp_read(
@@ -1151,6 +1236,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn authority_advanced_mcp_create_recovers_once_and_never_looks_retryable() {
+        let root = tempdir().unwrap();
+        let (server, events, _data, coordinator) = test_server(root.path());
+        coordinator.fail_next_replays_before_targets(2);
+
+        let result = server
+            .create_note(Parameters(CreateNoteParams {
+                title: "Recovered exactly once".into(),
+                content: "durable after recovery".into(),
+                tags: Vec::new(),
+                status: "draft".into(),
+            }))
+            .await
+            .unwrap();
+        let rendered = format!("{result:?}");
+
+        assert!(rendered.contains("committed and recovered; do not retry"));
+        assert!(!rendered.contains("Failed to create note"));
+        assert_eq!(coordinator.pending_count().unwrap(), 0);
+        assert_eq!(events.ordered_events().unwrap().len(), 1);
+        let listed = server.list_notes().await.unwrap();
+        assert!(format!("{listed:?}").contains("recovered-exactly-once"));
+    }
+
+    #[tokio::test]
+    async fn committed_mcp_refresh_failure_is_explicitly_non_retryable() {
+        let root = tempdir().unwrap();
+        let (server, events, _data, _coordinator) = test_server(root.path());
+        let token = server.derived_authority.authoritative_token.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = token.lock().unwrap();
+            panic!("poison the MCP authority refresh lock");
+        })
+        .join();
+
+        let result = server
+            .create_note(Parameters(CreateNoteParams {
+                title: "Committed despite refresh".into(),
+                content: "do not duplicate".into(),
+                tags: Vec::new(),
+                status: "draft".into(),
+            }))
+            .await
+            .unwrap();
+        let rendered = format!("{result:?}");
+
+        assert_eq!(events.ordered_events().unwrap().len(), 1);
+        assert!(rendered.contains("committed"));
+        assert!(rendered.contains("do not retry"));
+        assert!(!rendered.contains("authority token lock poisoned"));
+    }
+
+    #[test]
+    fn every_mcp_commit_refresh_failure_uses_the_same_non_retryable_notice() {
+        for operation in ["Note creation", "Note update", "Note deletion", "Import"] {
+            let notice = committed_refresh_failure_notice(operation);
+            assert!(notice.contains("committed"));
+            assert!(notice.contains("do not retry"));
+        }
+        let source = include_str!("mcp_tools.rs");
+        assert!(source.matches("committed_refresh_failure_notice(").count() >= 5);
+    }
+
+    #[tokio::test]
     async fn mismatched_namespace_allows_authoritative_notes_but_blocks_derived_tools() {
         let root = tempdir().unwrap();
         let (mut server, _events, _data, _coordinator) = test_server(root.path());
@@ -1267,13 +1416,8 @@ mod tests {
         let events = Arc::new(TwinEventStore::new(&data));
         events.initialize().unwrap();
         let coordinator = Arc::new(
-            MutationCoordinator::new(
-                &data,
-                &vault,
-                events,
-                Arc::new(NoopMutationLifecycle),
-            )
-            .unwrap(),
+            MutationCoordinator::new(&data, &vault, events, Arc::new(NoopMutationLifecycle))
+                .unwrap(),
         );
         let namespace = coordinator.current_namespace_path().unwrap();
         let stale = coordinator.current_authority_token().unwrap();
@@ -1333,7 +1477,7 @@ mod tests {
         let listed = server.list_notes().await.unwrap();
         assert!(format!("{listed:?}").contains("local-authority"));
 
-        coordinator
+        let _ = coordinator
             .commit_local(
                 crate::models::twin_event::CausalStream::LocalOnly,
                 crate::models::twin_event::SourceChannel::parse("mcp").unwrap(),

@@ -116,8 +116,8 @@
         let (mut store, events, coordinator) = coordinated_decision_store(root.path());
         coordinator.fail_once_at(crate::services::twin_events::MutationFaultPoint::AfterTarget(0));
 
-        assert!(store
-            .record_decision_episode(DecisionEpisodeCreate {
+        let (_, commit) = store
+            .record_decision_episode_with_commit(DecisionEpisodeCreate {
                 id: "decision-crash".to_string(),
                 session_id: "session-crash".to_string(),
                 tile_id: "tile-crash".to_string(),
@@ -129,9 +129,9 @@
                 primitive_assessment: Default::default(),
                 context_version: None,
             })
-            .is_err());
+            .unwrap();
+        assert!(commit.postcommit_warning);
         assert!(!store.trace_cache.contains_key("session-crash"));
-        assert_eq!(coordinator.recover_pending().unwrap(), 1);
         assert_eq!(coordinator.recover_pending().unwrap(), 0);
 
         assert_eq!(events.ordered_events().unwrap().len(), 1);
@@ -204,12 +204,14 @@
             links: Vec::new(),
             metadata: HashMap::new(),
         };
-        store
+        assert!(store
             .write_pretty_json(
                 &store.records_path.join("legacy-artifact-record.json"),
                 &legacy,
             )
-            .unwrap();
+            .unwrap()
+            .authority_token
+            .is_none());
         let item = store
             .create_constitution_item(crate::models::twin::ConstitutionItemCreate {
                 claim: "legacy-only constitution evidence".to_string(),

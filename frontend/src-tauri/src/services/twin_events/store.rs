@@ -489,6 +489,9 @@ fn store_capability_error(error: super::MutationError) -> StoreError {
         super::MutationError::AbortedPrecondition { mutation_id, .. } => {
             StoreError::Invalid(mutation_id)
         }
+        super::MutationError::AuthorityAdvanced { mutation_id, .. } => {
+            StoreError::Invalid(mutation_id.as_str().to_string())
+        }
     }
 }
 
@@ -757,7 +760,45 @@ pub fn topological_order(events: &[TwinEvent]) -> Result<Vec<TwinEvent>, StoreEr
     Ok(ordered)
 }
 
+#[allow(private_interfaces)] // Retained-recovery methods expose only app-internal authority types.
 pub trait EventRecorder: Send + Sync {
+    fn current_authority_token(
+        &self,
+    ) -> Result<
+        crate::services::vault_namespace::VaultAuthorityTokenV1,
+        crate::services::twin_events::MutationError,
+    > {
+        Err(crate::services::twin_events::MutationError::Invalid(
+            "event recorder does not expose content authority".into(),
+        ))
+    }
+
+    fn classify_witnessed_mutation(
+        &self,
+        _mutation_id: &crate::models::twin_event::ContentDigest,
+        _expected_authority: &crate::services::vault_namespace::VaultAuthorityTokenV1,
+        _target_kind: crate::services::twin_events::TargetKind,
+        _target_key: &str,
+        _expected_before: &crate::services::twin_events::BeforeImage,
+        _expected_after: &crate::services::twin_events::BeforeImage,
+    ) -> Result<
+        crate::services::twin_events::WitnessedMutationRecovery,
+        crate::services::twin_events::MutationError,
+    > {
+        Err(crate::services::twin_events::MutationError::Invalid(
+            "event recorder does not expose retained receipt recovery".into(),
+        ))
+    }
+
+    fn consume_witnessed_mutation_receipt(
+        &self,
+        _mutation_id: &crate::models::twin_event::ContentDigest,
+    ) -> Result<(), crate::services::twin_events::MutationError> {
+        Err(crate::services::twin_events::MutationError::Invalid(
+            "event recorder does not expose retained receipt recovery".into(),
+        ))
+    }
+
     fn commit_mutation(
         &self,
         _origin: crate::services::twin_events::MutationOrigin,

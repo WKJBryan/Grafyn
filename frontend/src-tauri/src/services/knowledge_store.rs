@@ -15,6 +15,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use walkdir::WalkDir;
 
+mod exact_targets;
+
 lazy_static! {
     /// Regex for extracting wikilinks: [[Target]] or [[Target|Display]]
     static ref WIKILINK_REGEX: Regex = Regex::new(r"\[\[([^\]|]+)(?:\|[^\]]+)?\]\]").unwrap();
@@ -59,6 +61,8 @@ struct OptimizerOverlaySourceV1 {
 pub struct KnowledgeStore {
     vault_path: PathBuf,
     overlay_notes_dir: PathBuf,
+    vault_root: Option<Arc<crate::services::twin_events::AnchoredRoot>>,
+    overlay_root: Option<Arc<crate::services::twin_events::AnchoredRoot>>,
     /// In-memory cache of note metadata, kept in sync with disk.
     meta_cache: Vec<NoteMeta>,
     path_index: HashMap<String, PathBuf>,
@@ -66,16 +70,101 @@ pub struct KnowledgeStore {
     alias_index: HashMap<String, String>,
     relative_path_index: HashMap<String, String>,
     event_recorder: Arc<dyn crate::services::twin_events::EventRecorder>,
-    last_mutation_commit:
-        Arc<std::sync::Mutex<Option<crate::services::twin_events::MutationCommit>>>,
 }
 
 pub(crate) struct OptimizerNoteSnapshot {
     pub note: Note,
     pub markdown_precondition: OptimizerMarkdownPrecondition,
+    pub markdown_raw_bytes: Vec<u8>,
     pub overlay_value: Option<Value>,
     pub overlay_digest: Option<crate::models::twin_event::ContentDigest>,
+    pub overlay_raw_bytes: Option<Vec<u8>>,
 }
+
+#[derive(Debug, Clone)]
+pub(crate) struct KnowledgeAuthorityAdvancedOutcome {
+    pub commit: crate::services::twin_events::MutationCommit,
+    pub target_aborted: bool,
+    pub note_ids: Vec<String>,
+}
+
+#[derive(Debug)]
+struct KnowledgeAuthorityAdvancedError {
+    outcome: KnowledgeAuthorityAdvancedOutcome,
+    source: crate::services::twin_events::MutationError,
+}
+
+impl std::fmt::Display for KnowledgeAuthorityAdvancedError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.source.fmt(formatter)
+    }
+}
+
+impl std::error::Error for KnowledgeAuthorityAdvancedError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+fn preserve_knowledge_authority_error(
+    error: crate::services::twin_events::MutationError,
+    note_ids: Vec<String>,
+) -> anyhow::Error {
+    let Some(commit) = error.authority_advanced_commit() else {
+        return anyhow::Error::new(error);
+    };
+    anyhow::Error::new(KnowledgeAuthorityAdvancedError {
+        outcome: KnowledgeAuthorityAdvancedOutcome {
+            commit,
+            target_aborted: error.authority_advanced_target_aborted(),
+            note_ids,
+        },
+        source: error,
+    })
+}
+
+pub(crate) fn knowledge_authority_advanced_outcome(
+    error: &anyhow::Error,
+) -> Option<KnowledgeAuthorityAdvancedOutcome> {
+    if let Some(error) = error.downcast_ref::<KnowledgeAuthorityAdvancedError>() {
+        return Some(error.outcome.clone());
+    }
+    let error = error.downcast_ref::<crate::services::twin_events::MutationError>()?;
+    Some(KnowledgeAuthorityAdvancedOutcome {
+        commit: error.authority_advanced_commit()?,
+        target_aborted: error.authority_advanced_target_aborted(),
+        note_ids: Vec::new(),
+    })
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ExactMigrationTarget {
+    pub kind: crate::services::twin_events::TargetKind,
+    pub relative_key: String,
+    pub expected_before: crate::services::twin_events::BeforeImage,
+    pub desired: crate::services::twin_events::DesiredImage,
+    pub note_event: Option<ExactMigrationNoteEvent>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ExactMigrationNoteEvent {
+    pub note_id: String,
+    pub change: crate::models::twin_event::NoteChangeKind,
+    pub observed_at: chrono::DateTime<Utc>,
+    pub governance: crate::models::twin_event::Governance,
+    pub payload_digest: crate::models::twin_event::ContentDigest,
+    pub evidence_digest: crate::models::twin_event::ContentDigest,
+}
+
+pub(crate) struct MigrationMarkdownSnapshot {
+    pub note: Option<Note>,
+    pub source: crate::models::migration::MarkdownMigrationSourceV1,
+    pub raw_bytes: Vec<u8>,
+    pub overlay_raw_bytes: Option<Vec<u8>>,
+}
+
+const MAX_MIGRATION_SOURCE_COUNT: usize = 50_000;
+const MAX_MIGRATION_SCAN_BYTES: usize = 256 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub(crate) struct OptimizerMarkdownPrecondition {
@@ -188,17 +277,26 @@ impl KnowledgeStore {
             .join("overlay")
             .join("notes");
         let _ = std::fs::create_dir_all(&overlay_notes_dir);
+        let vault_root = crate::services::twin_events::AnchoredRoot::open(&vault_path)
+            .map(Arc::new)
+            .map_err(|error| log::error!("Failed to retain vault capability: {error}"))
+            .ok();
+        let overlay_root = crate::services::twin_events::AnchoredRoot::open(&overlay_notes_dir)
+            .map(Arc::new)
+            .map_err(|error| log::error!("Failed to retain overlay capability: {error}"))
+            .ok();
 
         let mut store = Self {
             vault_path,
             overlay_notes_dir,
+            vault_root,
+            overlay_root,
             meta_cache: Vec::new(),
             path_index: HashMap::new(),
             title_index: HashMap::new(),
             alias_index: HashMap::new(),
             relative_path_index: HashMap::new(),
             event_recorder,
-            last_mutation_commit: Arc::new(std::sync::Mutex::new(None)),
         };
         store.refresh_cache();
         store
@@ -215,10 +313,23 @@ impl KnowledgeStore {
                 vault_path.display()
             )
         })?;
-        self.event_recorder
-            .retarget_markdown_root(&vault_path)
-            .map_err(anyhow::Error::new)?;
+        self.vault_root = None;
+        self.overlay_root = None;
+        if let Err(error) = self.event_recorder.retarget_markdown_root(&vault_path) {
+            self.vault_root = crate::services::twin_events::AnchoredRoot::open(&self.vault_path)
+                .map(Arc::new)
+                .ok();
+            self.overlay_root =
+                crate::services::twin_events::AnchoredRoot::open(&self.overlay_notes_dir)
+                    .map(Arc::new)
+                    .ok();
+            return Err(anyhow::Error::new(error));
+        }
         self.vault_path = vault_path;
+        self.vault_root = Some(Arc::new(
+            crate::services::twin_events::AnchoredRoot::open(&self.vault_path)
+                .map_err(anyhow::Error::new)?,
+        ));
         self.refresh_cache();
         Ok(())
     }
@@ -246,6 +357,14 @@ impl KnowledgeStore {
                 self.overlay_notes_dir.display()
             )
         })?;
+        self.vault_root = Some(Arc::new(
+            crate::services::twin_events::AnchoredRoot::open(&self.vault_path)
+                .map_err(anyhow::Error::new)?,
+        ));
+        self.overlay_root = Some(Arc::new(
+            crate::services::twin_events::AnchoredRoot::open(&self.overlay_notes_dir)
+                .map_err(anyhow::Error::new)?,
+        ));
         self.refresh_cache();
         Ok(())
     }
@@ -254,41 +373,406 @@ impl KnowledgeStore {
         &self.vault_path
     }
 
-    fn remember_mutation_commit(&self, commit: &crate::services::twin_events::MutationCommit) {
-        if let Ok(mut slot) = self.last_mutation_commit.lock() {
-            *slot = Some(commit.clone());
+    /// Builds the exact physical inputs used by Markdown migration previews.
+    /// This deliberately bypasses the metadata cache for file discovery and
+    /// bytes, then binds the freshly rebuilt note identity map and the complete
+    /// overlay directory (including orphan overlays).
+    pub(crate) fn migration_source_snapshot(
+        &mut self,
+        selected_program_path: &str,
+        fallback_at: chrono::DateTime<Utc>,
+    ) -> Result<(
+        Vec<MigrationMarkdownSnapshot>,
+        Vec<crate::models::migration::MarkdownMigrationOverlaySourceV1>,
+    )> {
+        let overlay_root = self
+            .overlay_root
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("retained overlay capability is unavailable"))?;
+        let mut overlays = Vec::new();
+        let mut overlay_data_by_note = HashMap::new();
+        let mut total_bytes = 0usize;
+        if self.overlay_notes_dir.exists() {
+            for entry in WalkDir::new(&self.overlay_notes_dir).min_depth(1) {
+                let entry = entry?;
+                if entry.file_type().is_symlink() {
+                    anyhow::bail!(
+                        "symlinked overlay source is not eligible for migration: {}",
+                        entry.path().display()
+                    );
+                }
+                if !entry.file_type().is_file() {
+                    continue;
+                }
+                if overlays.len() >= MAX_MIGRATION_SOURCE_COUNT {
+                    anyhow::bail!("migration overlay inventory is too large");
+                }
+                let relative = entry.path().strip_prefix(&self.overlay_notes_dir)?;
+                let relative_path = normalize_relative_path_for_output(&relative.to_string_lossy());
+                if relative.components().count() != 1
+                    || relative
+                        .extension()
+                        .and_then(|extension| extension.to_str())
+                        != Some("json")
+                {
+                    anyhow::bail!(
+                        "migration overlays must be direct <note-id>.json files: {relative_path}"
+                    );
+                }
+                let note_id = relative
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .ok_or_else(|| anyhow::anyhow!("migration overlay name is not UTF-8"))?
+                    .to_string();
+                Self::validate_note_id(&note_id)?;
+                let bytes = overlay_root
+                    .read_bounded(
+                        &relative_path,
+                        crate::services::twin_events::MAX_MARKDOWN_TWIN_BYTES,
+                    )
+                    .map_err(anyhow::Error::new)?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "overlay disappeared during migration source scan: {relative_path}"
+                        )
+                    })?;
+                total_bytes = total_bytes
+                    .checked_add(bytes.len())
+                    .ok_or_else(|| anyhow::anyhow!("migration scan byte count overflowed"))?;
+                if total_bytes > MAX_MIGRATION_SCAN_BYTES {
+                    anyhow::bail!("migration source inventory exceeds its aggregate byte limit");
+                }
+                let overlay_data: OverlayNoteData = serde_json::from_slice(&bytes)
+                    .with_context(|| format!("invalid migration overlay: {relative_path}"))?;
+                if overlay_data_by_note
+                    .insert(
+                        note_id,
+                        (relative_path.clone(), overlay_data, bytes.clone()),
+                    )
+                    .is_some()
+                {
+                    anyhow::bail!("duplicate overlay note identity in migration source scan");
+                }
+                overlays.push(crate::models::migration::MarkdownMigrationOverlaySourceV1 {
+                    relative_path,
+                    digest: crate::services::twin_events::digest_bytes(&bytes),
+                    byte_len: u64::try_from(bytes.len())?,
+                });
+            }
         }
+        overlays.sort_by_key(|entry| migration_physical_path_key(&entry.relative_path));
+        if overlays
+            .windows(2)
+            .any(|pair| migration_paths_equal(&pair[0].relative_path, &pair[1].relative_path))
+        {
+            anyhow::bail!("duplicate overlay path in migration source scan");
+        }
+        let overlays_by_path = overlays
+            .iter()
+            .map(|entry| (entry.relative_path.as_str(), entry))
+            .collect::<HashMap<_, _>>();
+
+        let vault_root = self
+            .vault_root
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("retained vault capability is unavailable"))?;
+        let selected_program_path = normalize_note_relative_path(selected_program_path)?;
+        let mut seen_note_ids = HashSet::new();
+        let mut snapshots = Vec::new();
+        for entry in WalkDir::new(&self.vault_path).min_depth(1) {
+            let entry = entry?;
+            let is_markdown = entry
+                .path()
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("md"));
+            if entry.file_type().is_symlink() {
+                anyhow::bail!(
+                    "symlinked vault entry is not eligible for migration: {}",
+                    entry.path().display()
+                );
+            }
+            if !entry.file_type().is_file() || !is_markdown {
+                continue;
+            }
+            if snapshots.len() >= MAX_MIGRATION_SOURCE_COUNT {
+                anyhow::bail!("migration Markdown inventory is too large");
+            }
+            let relative = entry.path().strip_prefix(&self.vault_path)?;
+            let relative_path = normalize_note_relative_path(&normalize_relative_path_for_output(
+                &relative.to_string_lossy(),
+            ))?;
+            let bytes = vault_root
+                .read_bounded(
+                    &relative_path,
+                    crate::services::twin_events::MAX_MARKDOWN_TWIN_BYTES,
+                )
+                .map_err(anyhow::Error::new)?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Markdown disappeared during migration source scan: {relative_path}"
+                    )
+                })?;
+            total_bytes = total_bytes
+                .checked_add(bytes.len())
+                .ok_or_else(|| anyhow::anyhow!("migration scan byte count overflowed"))?;
+            if total_bytes > MAX_MIGRATION_SCAN_BYTES {
+                anyhow::bail!("migration source inventory exceeds its aggregate byte limit");
+            }
+            let markdown_digest = crate::services::twin_events::digest_bytes(&bytes);
+            let note_id = if migration_paths_equal(&relative_path, &selected_program_path)
+                || migration_paths_equal(&relative_path, "_grafyn/program.md")
+            {
+                None
+            } else {
+                let content = std::str::from_utf8(&bytes)
+                    .with_context(|| format!("migration Markdown is not UTF-8: {relative_path}"))?;
+                let path = self.vault_path.join(&relative_path);
+                let mut note =
+                    self.parse_note_content_without_overlay_at(&path, content, None, fallback_at)?;
+                Self::validate_note_id(&note.id)?;
+                if !seen_note_ids.insert(note.id.clone()) {
+                    anyhow::bail!(
+                        "duplicate note identity in migration source scan: {}",
+                        note.id
+                    );
+                }
+                if let Some((overlay_path, overlay_data, _)) = overlay_data_by_note.get(&note.id) {
+                    Self::merge_overlay_data(
+                        &mut note,
+                        overlay_data.clone(),
+                        &relative_path,
+                        &markdown_digest,
+                    );
+                    debug_assert!(overlays_by_path.contains_key(overlay_path.as_str()));
+                }
+                let note_id = note.id.clone();
+                Some((note_id, note))
+            };
+            let overlay = note_id.as_ref().map_or(
+                crate::models::migration::MigrationSourceStateV1::Absent,
+                |(note_id, _)| {
+                    overlay_data_by_note.get(note_id).map_or(
+                        crate::models::migration::MigrationSourceStateV1::Absent,
+                        |(overlay_path, _, _)| {
+                            let entry = overlays_by_path
+                                .get(overlay_path.as_str())
+                                .expect("validated overlay inventory entry exists");
+                            crate::models::migration::MigrationSourceStateV1::Present {
+                                digest: entry.digest.clone(),
+                                byte_len: entry.byte_len,
+                            }
+                        },
+                    )
+                },
+            );
+            let source = crate::models::migration::MarkdownMigrationSourceV1 {
+                relative_path,
+                markdown_digest,
+                byte_len: u64::try_from(bytes.len())?,
+                note_id: note_id.as_ref().map(|(note_id, _)| note_id.clone()),
+                overlay,
+            };
+            let overlay_raw_bytes = note_id
+                .as_ref()
+                .and_then(|(note_id, _)| overlay_data_by_note.get(note_id))
+                .map(|(_, _, bytes)| bytes.clone());
+            snapshots.push(MigrationMarkdownSnapshot {
+                note: note_id.map(|(_, note)| note),
+                source,
+                raw_bytes: bytes,
+                overlay_raw_bytes,
+            });
+        }
+        snapshots.sort_by_key(|entry| migration_physical_path_key(&entry.source.relative_path));
+        if snapshots.windows(2).any(|pair| {
+            migration_paths_equal(&pair[0].source.relative_path, &pair[1].source.relative_path)
+        }) {
+            anyhow::bail!("duplicate Markdown path in migration source scan");
+        }
+        Ok((snapshots, overlays))
     }
 
-    fn remember_commit_result(
-        &self,
-        result: Result<
-            crate::services::twin_events::MutationCommit,
-            crate::services::twin_events::MutationError,
-        >,
-    ) -> Result<
-        crate::services::twin_events::MutationCommit,
-        crate::services::twin_events::MutationError,
-    > {
-        if let Ok(commit) = &result {
-            self.remember_mutation_commit(commit);
-        }
-        result
+    /// Commits one fully materialized migration step. The planner rechecks the
+    /// exact physical before-image while holding the coordinator lock before it
+    /// offers a plan, including when an external writer installed the desired
+    /// bytes. Every real step retains a schema-3 receipt for owner recovery.
+    pub(crate) fn commit_exact_migration_target_with_hooks(
+        &mut self,
+        target: ExactMigrationTarget,
+        expected_authority: crate::services::vault_namespace::VaultAuthorityTokenV1,
+        prepared: &mut dyn FnMut(
+            &crate::services::twin_events::MutationIntentV1,
+        )
+            -> Result<(), crate::services::twin_events::MutationError>,
+        committed: &mut dyn FnMut(
+            &crate::services::twin_events::MutationCommit,
+        )
+            -> Result<(), crate::services::twin_events::MutationError>,
+    ) -> Result<crate::services::twin_events::MutationCommit> {
+        self.commit_exact_target_with_hooks(
+            target,
+            None,
+            "migration",
+            expected_authority,
+            prepared,
+            committed,
+        )
     }
 
-    pub(crate) fn clear_last_mutation_commit(&self) {
-        if let Ok(mut slot) = self.last_mutation_commit.lock() {
-            *slot = None;
-        }
+    pub(crate) fn commit_exact_optimizer_target_with_hooks(
+        &mut self,
+        target: ExactMigrationTarget,
+        source_guard: Option<crate::services::twin_events::TargetMutation>,
+        expected_authority: crate::services::vault_namespace::VaultAuthorityTokenV1,
+        prepared: &mut dyn FnMut(
+            &crate::services::twin_events::MutationIntentV1,
+        )
+            -> Result<(), crate::services::twin_events::MutationError>,
+        committed: &mut dyn FnMut(
+            &crate::services::twin_events::MutationCommit,
+        )
+            -> Result<(), crate::services::twin_events::MutationError>,
+    ) -> Result<crate::services::twin_events::MutationCommit> {
+        self.commit_exact_target_with_hooks(
+            target,
+            source_guard,
+            "vault_optimizer",
+            expected_authority,
+            prepared,
+            committed,
+        )
     }
 
-    pub(crate) fn take_last_mutation_commit(
-        &self,
-    ) -> Option<crate::services::twin_events::MutationCommit> {
-        self.last_mutation_commit
-            .lock()
-            .ok()
-            .and_then(|mut slot| slot.take())
+    fn commit_exact_target_with_hooks(
+        &mut self,
+        target: ExactMigrationTarget,
+        source_guard: Option<crate::services::twin_events::TargetMutation>,
+        source: &str,
+        expected_authority: crate::services::vault_namespace::VaultAuthorityTokenV1,
+        prepared: &mut dyn FnMut(
+            &crate::services::twin_events::MutationIntentV1,
+        )
+            -> Result<(), crate::services::twin_events::MutationError>,
+        committed: &mut dyn FnMut(
+            &crate::services::twin_events::MutationCommit,
+        )
+            -> Result<(), crate::services::twin_events::MutationError>,
+    ) -> Result<crate::services::twin_events::MutationCommit> {
+        if !matches!(
+            target.kind,
+            crate::services::twin_events::TargetKind::Markdown
+                | crate::services::twin_events::TargetKind::OverlayJson
+        ) {
+            anyhow::bail!("migration target kind is not supported");
+        }
+        let source_channel =
+            crate::models::twin_event::SourceChannel::parse(source).map_err(anyhow::Error::msg)?;
+        if self.event_recorder.is_noop() {
+            anyhow::bail!("strict Markdown migration requires a mutation coordinator");
+        }
+
+        let root = match target.kind {
+            crate::services::twin_events::TargetKind::Markdown => self.vault_root.clone(),
+            crate::services::twin_events::TargetKind::OverlayJson => self.overlay_root.clone(),
+            _ => unreachable!(),
+        }
+        .ok_or_else(|| anyhow::anyhow!("retained migration target capability is unavailable"))?;
+        let recorder = self.event_recorder.clone();
+        let target_for_plan = target.clone();
+        let source_guard_for_plan = source_guard.clone();
+        let mut planner = || {
+            let current = root
+                .read_bounded(
+                    &target_for_plan.relative_key,
+                    crate::services::twin_events::MAX_MARKDOWN_TWIN_BYTES,
+                )?
+                .map_or(crate::services::twin_events::BeforeImage::Absent, |bytes| {
+                    crate::services::twin_events::BeforeImage::Sha256(
+                        crate::services::twin_events::digest_bytes(&bytes),
+                    )
+                });
+            if current != target_for_plan.expected_before {
+                return Err(
+                    crate::services::twin_events::MutationError::RecoveryConflict(
+                        "exact migration target changed before commit".into(),
+                    ),
+                );
+            }
+            let after_digest =
+                crate::services::twin_events::desired_digest(&target_for_plan.desired);
+            if matches!(
+                (&current, &target_for_plan.desired),
+                (
+                    crate::services::twin_events::BeforeImage::Absent,
+                    crate::services::twin_events::DesiredImage::Tombstone
+                )
+            ) || matches!(
+                &current,
+                crate::services::twin_events::BeforeImage::Sha256(digest)
+                    if digest == &after_digest
+            ) {
+                return Err(crate::services::twin_events::MutationError::RecoveryConflict(
+                    "strict migration operation is already at its after-image without an owned receipt"
+                        .into(),
+                ));
+            }
+            let coordinator_target = crate::services::twin_events::TargetMutation {
+                kind: target_for_plan.kind,
+                relative_key: target_for_plan.relative_key.clone(),
+                after: target_for_plan.desired.clone(),
+                expected_before: Some(target_for_plan.expected_before.clone()),
+                retain_exact_precondition: false,
+                check_expected_before_before_after_elision: true,
+            };
+            let mut coordinator_targets =
+                Vec::with_capacity(1 + usize::from(source_guard_for_plan.is_some()));
+            if let Some(source_guard) = source_guard_for_plan.clone() {
+                coordinator_targets.push(source_guard);
+            }
+            coordinator_targets.push(coordinator_target);
+            let drafts = target_for_plan
+                .note_event
+                .as_ref()
+                .map(|event| {
+                    crate::services::twin_events::note_changed_draft(
+                        &event.note_id,
+                        event.change.clone(),
+                        event.payload_digest.clone(),
+                        event.evidence_digest.clone(),
+                        event.observed_at,
+                        source_channel.clone(),
+                        event.governance.clone(),
+                    )
+                    .map_err(crate::services::twin_events::MutationError::Invalid)
+                })
+                .transpose()?
+                .into_iter()
+                .collect();
+            Ok(Some(
+                crate::services::twin_events::MutationPlan::new(
+                    crate::models::twin_event::CausalStream::SyncEligible,
+                    source_channel.clone(),
+                    coordinator_targets,
+                    drafts,
+                )
+                .expecting_authority(expected_authority.clone())
+                .retaining_commit_receipt(),
+            ))
+        };
+        let commit = recorder
+            .commit_planned_mutation_with_hooks(
+                crate::services::twin_events::MutationOrigin::Local,
+                &mut planner,
+                prepared,
+                committed,
+            )
+            .map_err(anyhow::Error::new)?;
+        if commit.mutation_id.is_none() || commit.authority_token.is_none() {
+            anyhow::bail!("strict mutation did not return an owned receipt and authority");
+        }
+        self.refresh_cache();
+        Ok(commit)
     }
 
     /// Rebuild the metadata cache and lookups from disk.
@@ -450,14 +934,36 @@ impl KnowledgeStore {
         container_id: &str,
         source_bytes: &[u8],
     ) -> Result<Vec<Note>> {
+        self.import_note_container_with_commit(creates, container_id, source_bytes)
+            .map(|(notes, _)| notes)
+    }
+
+    pub(crate) fn import_note_container_with_commit(
+        &mut self,
+        creates: Vec<NoteCreate>,
+        container_id: &str,
+        source_bytes: &[u8],
+    ) -> Result<(Vec<Note>, crate::services::twin_events::MutationCommit)> {
         if creates.is_empty() || creates.len() > 63 {
             anyhow::bail!("an import container must persist 1..=63 notes");
         }
         if self.event_recorder.is_noop() {
-            return creates
+            let notes = creates
                 .into_iter()
-                .map(|create| self.create_note_from_source(create, "import"))
-                .collect();
+                .map(|create| {
+                    self.create_note_from_source_with_commit(create, "import")
+                        .map(|(note, _)| note)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            return Ok((
+                notes,
+                crate::services::twin_events::MutationCommit {
+                    mutation_id: None,
+                    events: Vec::new(),
+                    authority_token: None,
+                    postcommit_warning: false,
+                },
+            ));
         }
 
         let source_digest = crate::services::twin_events::digest_bytes(source_bytes);
@@ -571,20 +1077,26 @@ impl KnowledgeStore {
                 drafts,
             )))
         };
-        let commit_result = recorder.commit_planned_mutation(
+        let commit = match recorder.commit_planned_mutation(
             crate::services::twin_events::MutationOrigin::Local,
             &mut planner,
-        );
-        if let Err(error) = self.remember_commit_result(commit_result) {
-            self.refresh_cache();
-            return Err(anyhow::Error::new(error));
-        }
+        ) {
+            Ok(commit) => commit,
+            Err(error) => {
+                self.refresh_cache();
+                return Err(preserve_knowledge_authority_error(
+                    error,
+                    return_ids.clone().unwrap_or_default(),
+                ));
+            }
+        };
         self.refresh_cache();
-        return_ids
+        let notes = return_ids
             .expect("import planner returned note IDs")
             .iter()
             .map(|note_id| self.get_note(note_id))
-            .collect()
+            .collect::<Result<Vec<_>>>()?;
+        Ok((notes, commit))
     }
 
     fn create_note_with_context(
@@ -707,9 +1219,12 @@ impl KnowledgeStore {
             &mut planner,
         );
         self.refresh_cache();
-        let commit = self
-            .remember_commit_result(result)
-            .map_err(anyhow::Error::new)?;
+        let commit = result.map_err(|error| {
+            preserve_knowledge_authority_error(
+                error,
+                planned_id.iter().cloned().collect::<Vec<_>>(),
+            )
+        })?;
         Ok((
             self.get_note(planned_id.as_deref().expect("planner returned a note ID"))?,
             commit,
@@ -923,9 +1438,12 @@ impl KnowledgeStore {
             &mut planner,
         );
         self.refresh_cache();
-        let commit = self
-            .remember_commit_result(result)
-            .map_err(anyhow::Error::new)?;
+        let commit = result.map_err(|error| {
+            preserve_knowledge_authority_error(
+                error,
+                planned_id.iter().cloned().collect::<Vec<_>>(),
+            )
+        })?;
         Ok((
             self.get_note(planned_id.as_deref().expect("planner returned a note ID"))?,
             commit,
@@ -985,825 +1503,6 @@ impl KnowledgeStore {
         note.wikilinks = self.extract_wikilinks(&note.content);
         note.parsed_links = self.extract_links(&note.content, &note.relative_path);
         Ok(())
-    }
-
-    pub(crate) fn materialize_note_update_at(
-        &self,
-        current: &Note,
-        update: NoteUpdate,
-        updated_at: chrono::DateTime<Utc>,
-    ) -> Result<Note> {
-        let mut note = current.clone();
-        self.apply_note_update(&mut note, update, false)?;
-        note.updated_at = updated_at;
-        Ok(note)
-    }
-
-    pub(crate) fn serialized_note_bytes(&self, note: &Note) -> Result<(String, Vec<u8>)> {
-        Self::canonical_serialized_note_bytes(note)
-    }
-
-    pub(crate) fn recover_coordinated_mutations(&self) -> Result<usize> {
-        self.event_recorder
-            .recover_pending_mutations()
-            .map_err(anyhow::Error::new)
-    }
-
-    pub(crate) fn optimizer_markdown_snapshot(
-        &self,
-        relative_path: &str,
-    ) -> Result<Option<(Note, OptimizerMarkdownPrecondition)>> {
-        let normalized = normalize_note_relative_path(relative_path)?;
-        let root = crate::services::twin_events::AnchoredRoot::open(&self.vault_path)
-            .map_err(anyhow::Error::new)?;
-        let Some(bytes) = root
-            .read_bounded(
-                &normalized,
-                crate::services::twin_events::MAX_MARKDOWN_TWIN_BYTES,
-            )
-            .map_err(anyhow::Error::new)?
-        else {
-            return Ok(None);
-        };
-        let content = std::str::from_utf8(&bytes).context("optimizer Markdown is not UTF-8")?;
-        let path = self.resolve_vault_relative_path(&normalized)?;
-        let note = self.parse_note_content_without_overlay(&path, content, None)?;
-        Ok(Some((
-            note,
-            OptimizerMarkdownPrecondition {
-                relative_path: normalized,
-                expected_digest: crate::services::twin_events::digest_bytes(&bytes),
-                root: Arc::new(root),
-            },
-        )))
-    }
-
-    pub(crate) fn optimizer_note_snapshot(
-        &self,
-        note_id: &str,
-    ) -> Result<Option<OptimizerNoteSnapshot>> {
-        Self::validate_note_id(note_id)?;
-        let path = self.note_path(note_id)?;
-        let relative_path = path
-            .strip_prefix(&self.vault_path)
-            .map_err(|_| anyhow::anyhow!("optimizer note path escaped the vault"))?
-            .to_str()
-            .ok_or_else(|| anyhow::anyhow!("optimizer note path is not UTF-8"))?;
-        let Some((mut note, markdown_precondition)) =
-            self.optimizer_markdown_snapshot(relative_path)?
-        else {
-            return Ok(None);
-        };
-        if note.id != note_id {
-            anyhow::bail!("optimizer note identity changed before snapshot");
-        }
-        let (overlay_value, overlay_digest) = self.optimizer_overlay_snapshot(note_id)?;
-        if let Some(value) = overlay_value.as_ref() {
-            let overlay: OverlayNoteData = serde_json::from_value(value.clone())
-                .context("invalid optimizer overlay source")?;
-            Self::merge_overlay_data(
-                &mut note,
-                overlay,
-                markdown_precondition.relative_path(),
-                markdown_precondition.expected_digest(),
-            );
-        }
-        Ok(Some(OptimizerNoteSnapshot {
-            note,
-            markdown_precondition,
-            overlay_value,
-            overlay_digest,
-        }))
-    }
-
-    pub(crate) fn optimizer_markdown_precondition(
-        &self,
-        relative_path: &str,
-        expected_digest: crate::models::twin_event::ContentDigest,
-    ) -> Result<OptimizerMarkdownPrecondition> {
-        let relative_path = normalize_note_relative_path(relative_path)?;
-        let root = crate::services::twin_events::AnchoredRoot::open(&self.vault_path)
-            .map_err(anyhow::Error::new)?;
-        Ok(OptimizerMarkdownPrecondition {
-            relative_path,
-            expected_digest,
-            root: Arc::new(root),
-        })
-    }
-
-    pub(crate) fn optimizer_overlay_snapshot(
-        &self,
-        note_id: &str,
-    ) -> Result<(
-        Option<serde_json::Value>,
-        Option<crate::models::twin_event::ContentDigest>,
-    )> {
-        Self::validate_note_id(note_id)?;
-        let data_root = self
-            .overlay_notes_dir
-            .ancestors()
-            .nth(3)
-            .ok_or_else(|| anyhow::anyhow!("optimizer overlay root is invalid"))?;
-        let root = crate::services::twin_events::AnchoredRoot::open(data_root)
-            .map_err(anyhow::Error::new)?;
-        let Some(bytes) = root
-            .read_bounded(
-                &format!("vault_migration/overlay/notes/{note_id}.json"),
-                crate::services::twin_events::MAX_MARKDOWN_TWIN_BYTES,
-            )
-            .map_err(anyhow::Error::new)?
-        else {
-            return Ok((None, None));
-        };
-        let digest = crate::services::twin_events::digest_bytes(&bytes);
-        let value = serde_json::from_slice(&bytes).context("invalid optimizer overlay source")?;
-        Ok((Some(value), Some(digest)))
-    }
-
-    pub(crate) fn replace_note_exact_expecting_authority(
-        &mut self,
-        id: &str,
-        exact: Note,
-        source: &str,
-        expected: crate::services::vault_namespace::VaultAuthorityTokenV1,
-    ) -> Result<(Note, crate::services::twin_events::MutationCommit)> {
-        let snapshot = self
-            .optimizer_note_snapshot(id)?
-            .ok_or_else(|| anyhow::anyhow!("optimizer source note does not exist"))?;
-        self.replace_note_exact_expecting_authority_with_hooks(
-            id,
-            snapshot.note,
-            snapshot.markdown_precondition.expected_digest().clone(),
-            exact,
-            source,
-            expected,
-            &mut |_| Ok(()),
-            &mut |_| Ok(()),
-        )
-    }
-
-    pub(crate) fn replace_note_exact_expecting_authority_with_hooks(
-        &mut self,
-        id: &str,
-        before: Note,
-        before_digest: crate::models::twin_event::ContentDigest,
-        exact: Note,
-        source: &str,
-        expected: crate::services::vault_namespace::VaultAuthorityTokenV1,
-        prepared: &mut dyn FnMut(
-            &crate::services::twin_events::MutationIntentV1,
-        )
-            -> Result<(), crate::services::twin_events::MutationError>,
-        committed: &mut dyn FnMut(
-            &crate::services::twin_events::MutationCommit,
-        )
-            -> Result<(), crate::services::twin_events::MutationError>,
-    ) -> Result<(Note, crate::services::twin_events::MutationCommit)> {
-        Self::validate_note_id(id)?;
-        if exact.id != id {
-            anyhow::bail!("exact replacement note identity does not match target");
-        }
-        if before.id != id || before.relative_path != exact.relative_path {
-            anyhow::bail!("exact replacement source does not match target");
-        }
-        if self.event_recorder.is_noop() {
-            self.write_note_file(&exact)?;
-            self.cache_exact_note(&exact)?;
-            return Ok((
-                exact,
-                crate::services::twin_events::MutationCommit {
-                    mutation_id: None,
-                    events: Vec::new(),
-                    authority_token: None,
-                    postcommit_warning: false,
-                },
-            ));
-        }
-        let recorder = self.event_recorder.clone();
-        let source_channel =
-            crate::models::twin_event::SourceChannel::parse(source).map_err(anyhow::Error::msg)?;
-        let exact_for_plan = exact.clone();
-        let mut planner = || {
-            let (relative_path, exact_bytes) =
-                Self::canonical_serialized_note_bytes(&exact_for_plan).map_err(|error| {
-                    crate::services::twin_events::MutationError::Invalid(error.to_string())
-                })?;
-            let after_digest = crate::services::twin_events::digest_bytes(&exact_bytes);
-            if before_digest == after_digest {
-                return Ok(None);
-            }
-            let target = crate::services::twin_events::TargetMutation::put(
-                crate::services::twin_events::TargetKind::Markdown,
-                normalize_relative_path_for_output(&relative_path),
-                String::from_utf8(exact_bytes).expect("Markdown serialization is UTF-8"),
-            )
-            .expecting(crate::services::twin_events::BeforeImage::Sha256(
-                before_digest.clone(),
-            ));
-            let draft = crate::services::twin_events::note_changed_draft(
-                &exact_for_plan.id,
-                crate::models::twin_event::NoteChangeKind::Updated,
-                after_digest,
-                before_digest.clone(),
-                exact_for_plan.updated_at,
-                source_channel.clone(),
-                note_capture_governance(&exact_for_plan, source_channel.as_str()),
-            )
-            .map_err(crate::services::twin_events::MutationError::Invalid)?;
-            let plan = crate::services::twin_events::MutationPlan::new(
-                crate::models::twin_event::CausalStream::SyncEligible,
-                source_channel.clone(),
-                vec![target],
-                vec![draft],
-            )
-            .expecting_authority(expected.clone())
-            .retaining_commit_receipt();
-            Ok(Some(plan))
-        };
-        let result = recorder.commit_planned_mutation_with_hooks(
-            crate::services::twin_events::MutationOrigin::Local,
-            &mut planner,
-            prepared,
-            committed,
-        );
-        let commit = self
-            .remember_commit_result(result)
-            .map_err(anyhow::Error::new)?;
-        self.cache_exact_note(&exact)?;
-        Ok((exact, commit))
-    }
-
-    /// Administrative variant of `update_note` that preserves the note's existing
-    /// `updated_at` timestamp. See `backfill_legacy_grafyn_notes` for the motivating
-    /// case: schema/provenance bookkeeping writes should not bump recency ranking.
-    pub(crate) fn update_note_preserving_timestamp(
-        &mut self,
-        id: &str,
-        update: NoteUpdate,
-    ) -> Result<Note> {
-        self.update_note_with_options(
-            id,
-            update,
-            false,
-            NoteMutationContext::local("migration")?,
-            None,
-        )
-        .map(|(note, _)| note)
-    }
-
-    pub(crate) fn restore_note_bytes_from_source(
-        &mut self,
-        relative_path: &str,
-        bytes: &[u8],
-        source: &str,
-    ) -> Result<Note> {
-        let relative_path = normalize_note_relative_path(relative_path)?;
-        let after = std::str::from_utf8(bytes)
-            .with_context(|| format!("restored Markdown is not UTF-8: {relative_path}"))?
-            .to_string();
-        if self.event_recorder.is_noop() {
-            let path = self.resolve_vault_relative_path(&relative_path)?;
-            let note = self
-                .find_note_by_relative_path(&relative_path)?
-                .ok_or_else(|| {
-                    anyhow::anyhow!("note to restore is not indexed: {relative_path}")
-                })?;
-            let before = std::fs::read(&path)?;
-            if before == bytes {
-                return Ok(note);
-            }
-            write_atomic(&path, bytes)?;
-            self.refresh_cache();
-            self.get_note(&note.id)
-        } else {
-            let recorder = self.event_recorder.clone();
-            let source = source.to_string();
-            let mut restored_note_id = None;
-            let mut planner = || {
-                self.refresh_cache();
-                let path = self
-                    .resolve_vault_relative_path(&relative_path)
-                    .map_err(|error| {
-                        crate::services::twin_events::MutationError::Invalid(error.to_string())
-                    })?;
-                let note = self
-                    .find_note_by_relative_path(&relative_path)
-                    .map_err(|error| {
-                        crate::services::twin_events::MutationError::Invalid(error.to_string())
-                    })?
-                    .ok_or_else(|| {
-                        crate::services::twin_events::MutationError::Invalid(format!(
-                            "note to restore is not indexed: {relative_path}"
-                        ))
-                    })?;
-                restored_note_id = Some(note.id.clone());
-                let before = std::fs::read(&path).map_err(|error| {
-                    crate::services::twin_events::MutationError::Io(error.to_string())
-                })?;
-                if before == bytes {
-                    return Ok(None);
-                }
-                let source_channel = crate::models::twin_event::SourceChannel::parse(&source)
-                    .map_err(crate::services::twin_events::MutationError::Invalid)?;
-                let draft = crate::services::twin_events::note_changed_draft(
-                    &note.id,
-                    crate::models::twin_event::NoteChangeKind::Updated,
-                    crate::services::twin_events::digest_bytes(bytes),
-                    crate::services::twin_events::digest_bytes(&before),
-                    Utc::now(),
-                    source_channel.clone(),
-                    note_capture_governance(&note, &source),
-                )
-                .map_err(crate::services::twin_events::MutationError::Invalid)?;
-                Ok(Some(crate::services::twin_events::MutationPlan::new(
-                    crate::models::twin_event::CausalStream::SyncEligible,
-                    source_channel,
-                    vec![crate::services::twin_events::TargetMutation::put(
-                        crate::services::twin_events::TargetKind::Markdown,
-                        relative_path.clone(),
-                        after.clone(),
-                    )],
-                    vec![draft],
-                )))
-            };
-            let commit_result = recorder.commit_planned_mutation(
-                crate::services::twin_events::MutationOrigin::Local,
-                &mut planner,
-            );
-            if let Err(error) = self.remember_commit_result(commit_result) {
-                self.refresh_cache();
-                return Err(anyhow::Error::new(error));
-            }
-            self.refresh_cache();
-            self.get_note(
-                restored_note_id
-                    .as_deref()
-                    .expect("restore planner returned a note ID"),
-            )
-        }
-    }
-
-    pub(crate) fn put_vault_file_target_only_expected(
-        &mut self,
-        relative_path: &str,
-        bytes: &[u8],
-        source: &str,
-        expected_before: Option<crate::services::twin_events::BeforeImage>,
-    ) -> Result<()> {
-        let relative_path = normalize_note_relative_path(relative_path)?;
-        let after = std::str::from_utf8(bytes)
-            .with_context(|| format!("Markdown target is not UTF-8: {relative_path}"))?
-            .to_string();
-        if self.event_recorder.is_noop() {
-            let path = self.resolve_vault_relative_path(&relative_path)?;
-            if let Some(expected) = expected_before.as_ref() {
-                let current = before_image_for_path(&path)?;
-                if current
-                    == crate::services::twin_events::BeforeImage::Sha256(
-                        crate::services::twin_events::digest_bytes(bytes),
-                    )
-                {
-                    return Ok(());
-                }
-                if &current != expected {
-                    anyhow::bail!("conditional Markdown target changed: {relative_path}");
-                }
-            }
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            write_atomic(&path, bytes)?;
-            self.refresh_cache();
-            return Ok(());
-        }
-        let recorder = self.event_recorder.clone();
-        let source_channel =
-            crate::models::twin_event::SourceChannel::parse(source).map_err(anyhow::Error::msg)?;
-        let target = crate::services::twin_events::TargetMutation::put(
-            crate::services::twin_events::TargetKind::Markdown,
-            relative_path,
-            after,
-        );
-        let target = match expected_before {
-            Some(expected) => target.expecting(expected),
-            None => target,
-        };
-        let mut plan = Some(crate::services::twin_events::MutationPlan::new(
-            crate::models::twin_event::CausalStream::LocalOnly,
-            source_channel,
-            vec![target],
-            Vec::new(),
-        ));
-        let result = recorder.commit_planned_mutation(
-            crate::services::twin_events::MutationOrigin::Local,
-            &mut || Ok(plan.take()),
-        );
-        self.refresh_cache();
-        self.remember_commit_result(result)
-            .map(|_| ())
-            .map_err(anyhow::Error::new)
-    }
-
-    pub(crate) fn delete_vault_file_target_only(
-        &mut self,
-        relative_path: &str,
-        source: &str,
-    ) -> Result<()> {
-        self.delete_vault_file_target_only_expected(relative_path, source, None)
-    }
-
-    pub(crate) fn delete_vault_file_target_only_expected(
-        &mut self,
-        relative_path: &str,
-        source: &str,
-        expected_before: Option<crate::services::twin_events::BeforeImage>,
-    ) -> Result<()> {
-        let relative_path = normalize_note_relative_path(relative_path)?;
-        if self.event_recorder.is_noop() {
-            let path = self.resolve_vault_relative_path(&relative_path)?;
-            if let Some(expected) = expected_before.as_ref() {
-                let current = before_image_for_path(&path)?;
-                if current == crate::services::twin_events::BeforeImage::Absent {
-                    return Ok(());
-                }
-                if &current != expected {
-                    anyhow::bail!("conditional Markdown target changed: {relative_path}");
-                }
-            }
-            match std::fs::remove_file(path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
-            }
-            self.refresh_cache();
-            return Ok(());
-        }
-        let recorder = self.event_recorder.clone();
-        let source_channel =
-            crate::models::twin_event::SourceChannel::parse(source).map_err(anyhow::Error::msg)?;
-        let target = crate::services::twin_events::TargetMutation::tombstone(
-            crate::services::twin_events::TargetKind::Markdown,
-            relative_path,
-        );
-        let target = match expected_before {
-            Some(expected) => target.expecting(expected),
-            None => target,
-        };
-        let mut plan = Some(crate::services::twin_events::MutationPlan::new(
-            crate::models::twin_event::CausalStream::LocalOnly,
-            source_channel,
-            vec![target],
-            Vec::new(),
-        ));
-        let result = recorder.commit_planned_mutation(
-            crate::services::twin_events::MutationOrigin::Local,
-            &mut || Ok(plan.take()),
-        );
-        self.refresh_cache();
-        self.remember_commit_result(result)
-            .map(|_| ())
-            .map_err(anyhow::Error::new)
-    }
-
-    pub(crate) fn validate_vault_file_target(
-        &mut self,
-        relative_path: &str,
-        expected: crate::services::twin_events::BeforeImage,
-    ) -> Result<()> {
-        let relative_path = normalize_note_relative_path(relative_path)?;
-        let recorder = self.event_recorder.clone();
-        let mut planner = || {
-            let path = self
-                .resolve_vault_relative_path(&relative_path)
-                .map_err(|error| {
-                    crate::services::twin_events::MutationError::Invalid(error.to_string())
-                })?;
-            let current = before_image_for_path(&path).map_err(|error| {
-                crate::services::twin_events::MutationError::Io(error.to_string())
-            })?;
-            if current != expected {
-                return Err(
-                    crate::services::twin_events::MutationError::RecoveryConflict(format!(
-                        "conditional Markdown target changed: {relative_path}"
-                    )),
-                );
-            }
-            Ok(None)
-        };
-        recorder
-            .commit_planned_mutation(
-                crate::services::twin_events::MutationOrigin::Local,
-                &mut planner,
-            )
-            .map(|_| ())
-            .map_err(anyhow::Error::new)
-    }
-
-    pub fn delete_note(&mut self, id: &str) -> Result<()> {
-        self.delete_note_from_source(id, "note_editor")
-    }
-
-    pub fn delete_note_from_source(&mut self, id: &str, source: &str) -> Result<()> {
-        self.delete_note_from_source_with_commit(id, source)
-            .map(|_| ())
-    }
-
-    pub(crate) fn delete_note_from_source_with_commit(
-        &mut self,
-        id: &str,
-        source: &str,
-    ) -> Result<crate::services::twin_events::MutationCommit> {
-        self.delete_note_with_context(id, source, None)
-    }
-
-    pub(crate) fn delete_note_expecting_authority(
-        &mut self,
-        id: &str,
-        source: &str,
-        expected: crate::services::vault_namespace::VaultAuthorityTokenV1,
-    ) -> Result<crate::services::twin_events::MutationCommit> {
-        self.delete_note_with_context(id, source, Some(expected))
-    }
-
-    fn delete_note_with_context(
-        &mut self,
-        id: &str,
-        source: &str,
-        expected: Option<crate::services::vault_namespace::VaultAuthorityTokenV1>,
-    ) -> Result<crate::services::twin_events::MutationCommit> {
-        Self::validate_note_id(id)?;
-        let context = NoteMutationContext::local(source)?;
-        let commit = if self.event_recorder.is_noop() {
-            let path = self.note_path(id)?;
-            let note = self.get_note(id)?;
-            self.persist_note_delete(&note, &path, context)?;
-            crate::services::twin_events::MutationCommit {
-                mutation_id: None,
-                events: Vec::new(),
-                authority_token: None,
-                postcommit_warning: false,
-            }
-        } else {
-            let recorder = self.event_recorder.clone();
-            let note_id = id.to_string();
-            let mut planner = || {
-                self.refresh_cache();
-                let note = self.get_note(&note_id).map_err(|error| {
-                    crate::services::twin_events::MutationError::Invalid(error.to_string())
-                })?;
-                let path = self.note_path(&note_id).map_err(|error| {
-                    crate::services::twin_events::MutationError::Invalid(error.to_string())
-                })?;
-                let mut plan = self
-                    .plan_note_delete(&note, &path, context.clone())
-                    .map_err(|error| {
-                        crate::services::twin_events::MutationError::Invalid(error.to_string())
-                    })?;
-                if let Some(expected) = expected.clone() {
-                    plan = plan.expecting_authority(expected);
-                }
-                Ok(Some(plan))
-            };
-            let result = recorder.commit_planned_mutation(
-                crate::services::twin_events::MutationOrigin::Local,
-                &mut planner,
-            );
-            match self.remember_commit_result(result) {
-                Ok(commit) => commit,
-                Err(error) => {
-                    self.refresh_cache();
-                    return Err(anyhow::Error::new(error));
-                }
-            }
-        };
-        if self.event_recorder.is_noop() {
-            let overlay_path = self.overlay_path(id);
-            if overlay_path.exists() {
-                let _ = std::fs::remove_file(&overlay_path);
-            }
-        }
-        self.refresh_cache();
-        Ok(commit)
-    }
-
-    pub fn overlay_path(&self, note_id: &str) -> PathBuf {
-        self.overlay_notes_dir.join(format!("{}.json", note_id))
-    }
-
-    pub fn write_overlay(&self, note_id: &str, overlay: &serde_json::Value) -> Result<()> {
-        self.write_overlay_from_source(note_id, overlay, "vault_optimizer")
-    }
-
-    pub fn write_overlay_from_source(
-        &self,
-        note_id: &str,
-        overlay: &serde_json::Value,
-        source: &str,
-    ) -> Result<()> {
-        self.write_overlay_from_source_with_authority(note_id, overlay, source, None)
-            .map(|_| ())
-    }
-
-    pub(crate) fn write_overlay_from_source_expecting_authority(
-        &self,
-        note_id: &str,
-        overlay: &serde_json::Value,
-        source: &str,
-        expected: crate::services::vault_namespace::VaultAuthorityTokenV1,
-    ) -> Result<crate::services::twin_events::MutationCommit> {
-        self.write_overlay_from_source_with_authority(note_id, overlay, source, Some(expected))
-    }
-
-    pub(crate) fn write_overlay_from_source_with_authority(
-        &self,
-        note_id: &str,
-        overlay: &serde_json::Value,
-        source: &str,
-        expected: Option<crate::services::vault_namespace::VaultAuthorityTokenV1>,
-    ) -> Result<crate::services::twin_events::MutationCommit> {
-        self.write_overlay_from_source_with_authority_and_hooks(
-            note_id,
-            overlay,
-            source,
-            expected,
-            &mut |_| Ok(()),
-            &mut |_| Ok(()),
-            false,
-            None,
-        )
-    }
-
-    pub(crate) fn write_overlay_from_source_with_authority_and_hooks(
-        &self,
-        note_id: &str,
-        overlay: &serde_json::Value,
-        source: &str,
-        expected: Option<crate::services::vault_namespace::VaultAuthorityTokenV1>,
-        prepared: &mut dyn FnMut(
-            &crate::services::twin_events::MutationIntentV1,
-        )
-            -> Result<(), crate::services::twin_events::MutationError>,
-        committed: &mut dyn FnMut(
-            &crate::services::twin_events::MutationCommit,
-        )
-            -> Result<(), crate::services::twin_events::MutationError>,
-        retain_commit_receipt: bool,
-        source_guard: Option<crate::services::twin_events::TargetMutation>,
-    ) -> Result<crate::services::twin_events::MutationCommit> {
-        Self::validate_note_id(note_id)?;
-        let content = serde_json::to_string_pretty(overlay)?;
-        if !self.event_recorder.is_noop() {
-            let source_channel = crate::models::twin_event::SourceChannel::parse(source)
-                .map_err(anyhow::Error::msg)?;
-            let target_key = format!("{note_id}.json");
-            if source_guard.is_some() && !retain_commit_receipt {
-                anyhow::bail!("optimizer source guards require retained schema-3 receipts");
-            }
-            let mut targets = Vec::with_capacity(1 + usize::from(source_guard.is_some()));
-            if let Some(source_guard) = source_guard {
-                targets.push(source_guard);
-            }
-            targets.push(crate::services::twin_events::TargetMutation::put(
-                crate::services::twin_events::TargetKind::OverlayJson,
-                target_key,
-                content,
-            ));
-            let mut mutation_plan = crate::services::twin_events::MutationPlan::new(
-                crate::models::twin_event::CausalStream::LocalOnly,
-                source_channel,
-                targets,
-                Vec::new(),
-            );
-            if let Some(expected) = expected {
-                mutation_plan = mutation_plan.expecting_authority(expected);
-            }
-            if retain_commit_receipt {
-                mutation_plan = mutation_plan.retaining_commit_receipt();
-            }
-            let mut plan = Some(mutation_plan);
-            let commit = self
-                .event_recorder
-                .commit_planned_mutation_with_hooks(
-                    crate::services::twin_events::MutationOrigin::Local,
-                    &mut || Ok(plan.take()),
-                    prepared,
-                    committed,
-                )
-                .map_err(anyhow::Error::new)?;
-            self.remember_mutation_commit(&commit);
-            return Ok(commit);
-        }
-        if let Some(parent) = self.overlay_path(note_id).parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        write_atomic(&self.overlay_path(note_id), content.as_bytes())
-            .with_context(|| format!("Failed to write overlay for '{}'", note_id))?;
-        Ok(crate::services::twin_events::MutationCommit {
-            mutation_id: None,
-            events: Vec::new(),
-            authority_token: None,
-            postcommit_warning: false,
-        })
-    }
-
-    pub fn delete_overlay(&self, note_id: &str) -> Result<()> {
-        self.delete_overlay_from_source(note_id, "vault_optimizer")
-    }
-
-    pub fn delete_overlay_from_source(&self, note_id: &str, source: &str) -> Result<()> {
-        self.delete_overlay_from_source_with_authority(note_id, source, None)
-            .map(|_| ())
-    }
-
-    pub(crate) fn delete_overlay_from_source_expecting_authority(
-        &self,
-        note_id: &str,
-        source: &str,
-        expected: crate::services::vault_namespace::VaultAuthorityTokenV1,
-    ) -> Result<crate::services::twin_events::MutationCommit> {
-        self.delete_overlay_from_source_with_authority(note_id, source, Some(expected))
-    }
-
-    pub(crate) fn delete_overlay_from_source_with_authority(
-        &self,
-        note_id: &str,
-        source: &str,
-        expected: Option<crate::services::vault_namespace::VaultAuthorityTokenV1>,
-    ) -> Result<crate::services::twin_events::MutationCommit> {
-        Self::validate_note_id(note_id)?;
-        if !self.event_recorder.is_noop() {
-            let source_channel = crate::models::twin_event::SourceChannel::parse(source)
-                .map_err(anyhow::Error::msg)?;
-            let target_key = format!("{note_id}.json");
-            let mut mutation_plan = crate::services::twin_events::MutationPlan::new(
-                crate::models::twin_event::CausalStream::LocalOnly,
-                source_channel,
-                vec![crate::services::twin_events::TargetMutation::tombstone(
-                    crate::services::twin_events::TargetKind::OverlayJson,
-                    target_key,
-                )],
-                Vec::new(),
-            );
-            if let Some(expected) = expected {
-                mutation_plan = mutation_plan.expecting_authority(expected);
-            }
-            let mut plan = Some(mutation_plan);
-            let commit = self
-                .event_recorder
-                .commit_planned_mutation(
-                    crate::services::twin_events::MutationOrigin::Local,
-                    &mut || Ok(plan.take()),
-                )
-                .map_err(anyhow::Error::new)?;
-            self.remember_mutation_commit(&commit);
-            return Ok(commit);
-        }
-        let path = self.overlay_path(note_id);
-        if path.exists() {
-            std::fs::remove_file(path)?;
-        }
-        Ok(crate::services::twin_events::MutationCommit {
-            mutation_id: None,
-            events: Vec::new(),
-            authority_token: None,
-            postcommit_warning: false,
-        })
-    }
-
-    pub fn extract_wikilinks(&self, content: &str) -> Vec<String> {
-        WIKILINK_REGEX
-            .captures_iter(content)
-            .filter_map(|cap| cap.get(1).map(|m| m.as_str().trim().to_string()))
-            .filter(|value| !value.is_empty())
-            .collect()
-    }
-
-    pub fn extract_links(&self, content: &str, source_relative_path: &str) -> Vec<ParsedLink> {
-        let mut links = self.extract_typed_wikilinks(content);
-        links.extend(self.extract_markdown_links(content, source_relative_path));
-        links
-    }
-
-    /// Extract typed wikilinks with relationship information.
-    pub fn extract_typed_wikilinks(&self, content: &str) -> Vec<ParsedLink> {
-        TYPED_WIKILINK_REGEX
-            .captures_iter(content)
-            .filter_map(|cap| {
-                let target_title = cap.get(1)?.as_str().trim().to_string();
-                if target_title.is_empty() {
-                    return None;
-                }
-                let relation = cap
-                    .get(2)
-                    .map(|m| RelationType::from_str_lossy(m.as_str()))
-                    .unwrap_or(RelationType::Untyped);
-                Some(ParsedLink {
-                    target_title,
-                    target_path: None,
-                    relation,
-                })
-            })
-            .collect()
     }
 
     fn extract_markdown_links(&self, content: &str, source_relative_path: &str) -> Vec<ParsedLink> {
@@ -1918,6 +1617,16 @@ impl KnowledgeStore {
         content: &str,
         file_modified: Option<std::time::SystemTime>,
     ) -> Result<Note> {
+        self.parse_note_content_without_overlay_at(path, content, file_modified, Utc::now())
+    }
+
+    fn parse_note_content_without_overlay_at(
+        &self,
+        path: &Path,
+        content: &str,
+        file_modified: Option<std::time::SystemTime>,
+        fallback_at: chrono::DateTime<Utc>,
+    ) -> Result<Note> {
         let matter = Matter::<YAML>::new();
         let parsed = matter.parse(content);
 
@@ -1967,7 +1676,7 @@ impl KnowledgeStore {
             .and_then(|value| value.to_str())
             .unwrap_or("note");
 
-        let now = Utc::now();
+        let now = fallback_at;
         let created_at = frontmatter.created_at.unwrap_or(now);
         let updated_at = frontmatter
             .updated_at
@@ -2484,6 +2193,28 @@ fn normalize_lookup_key(value: &str) -> String {
     value.trim().replace('\\', "/").to_lowercase()
 }
 
+fn migration_paths_equal(left: &str, right: &str) -> bool {
+    #[cfg(windows)]
+    {
+        left.eq_ignore_ascii_case(right)
+    }
+    #[cfg(not(windows))]
+    {
+        left == right
+    }
+}
+
+fn migration_physical_path_key(value: &str) -> String {
+    #[cfg(windows)]
+    {
+        value.to_ascii_lowercase()
+    }
+    #[cfg(not(windows))]
+    {
+        value.to_string()
+    }
+}
+
 fn normalize_relative_path_for_output(value: &str) -> String {
     value
         .replace('\\', "/")
@@ -2578,6 +2309,7 @@ fn normalize_note_relative_path(value: &str) -> Result<String> {
     }
 }
 
+#[allow(dead_code)] // Used by bounded legacy migration recovery helpers.
 fn before_image_for_path(path: &Path) -> Result<crate::services::twin_events::BeforeImage> {
     match std::fs::read(path) {
         Ok(bytes) => Ok(crate::services::twin_events::BeforeImage::Sha256(

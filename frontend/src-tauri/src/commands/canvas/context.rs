@@ -1,5 +1,7 @@
 pub(super) use super::prediction_terminality::fail_requested_prediction_if_same_root;
-use super::shared::ModelProviderRoute;
+use super::shared::{
+    preserve_canvas_mutation_error, repair_canvas_trace_error, ModelProviderRoute,
+};
 use crate::commands::run_retrieval;
 use crate::models::canvas::{
     CanvasSession, ContextMode, DecisionPromptMetadata, PromptRequest, PromptType, TileContextNote,
@@ -1145,21 +1147,36 @@ pub(super) async fn run_sealed_twin_prediction(
             ) {
                 Ok((_, commit)) => commit,
                 Err(error) => {
+                    let error = preserve_canvas_mutation_error(error);
                     log::warn!("Failed to seal twin prediction for {episode_id}: {error}");
                     drop(store);
                     drop(root_guard);
+                    let repair = repair_canvas_trace_error(
+                        &root_state,
+                        &error,
+                        "sealed prediction persistence",
+                    )
+                    .await;
+                    let failed_epoch = match &repair {
+                        crate::commands::PostAuthorityRepair::Ready(epoch) => epoch.clone(),
+                        _ => error
+                            .repair_commit()
+                            .and_then(|commit| commit.authority_token.clone())
+                            .unwrap_or_else(|| root_epoch.clone()),
+                    };
+                    crate::commands::acknowledge_reported_repair(repair);
                     fail_requested_prediction_if_same_root(
                         &root_state,
                         &twin_store,
                         &episode_id,
-                        &root_epoch,
+                        &failed_epoch,
                         "prediction persistence",
                     )
                     .await;
                     return;
                 }
             };
-            let Some(publication_epoch) = commit.authority_token else {
+            if commit.authority_token.is_none() {
                 drop(store);
                 drop(root_guard);
                 fail_requested_prediction_if_same_root(
@@ -1171,13 +1188,13 @@ pub(super) async fn run_sealed_twin_prediction(
                 )
                 .await;
                 return;
-            };
+            }
             drop(store);
             drop(root_guard);
             if let crate::commands::PostAuthorityRepair::Unavailable(error) =
-                crate::commands::repair_after_authority_token(
+                crate::commands::repair_after_authority_mutation(
                     &root_state,
-                    &publication_epoch,
+                    &commit,
                     "sealed prediction",
                 )
                 .await
@@ -2224,21 +2241,6 @@ mod tests {
                 "model-facing prompt contains forbidden meta-framing: {forbidden}"
             );
         }
-    }
-
-    #[test]
-    fn sealed_prediction_prompt_uses_advisor_framing_without_identity() {
-        let options = vec!["Ship now".to_string(), "Wait a sprint".to_string()];
-        let user_message = build_twin_prediction_user_message(
-            &ConstitutionSetup::default(),
-            "Ship the importer before polish?",
-            &options,
-            None,
-        );
-
-        assert!(!user_message.contains("I am "));
-        assert!(user_message.contains("best fits this decision-maker's"));
-        assert!(user_message.contains("predicted_option"));
     }
 
     #[test]

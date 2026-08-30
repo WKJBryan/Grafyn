@@ -132,7 +132,10 @@
           v-if="inputPreview"
           class="input-preview"
         >
-          <p v-for="option in inputPreview.options" :key="option.key">
+          <p
+            v-for="option in inputPreview.options"
+            :key="option.key"
+          >
             {{ option.key }}. {{ option.text }}
           </p>
           <p>{{ inputPreview.answer_key ? `Answer key: ${inputPreview.answer_key}` : 'No answer key' }}</p>

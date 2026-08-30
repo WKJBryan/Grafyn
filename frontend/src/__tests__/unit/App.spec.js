@@ -117,6 +117,7 @@ describe('desktop Tauri shell', () => {
 
     handleWarning({ payload: warning })
     handleWarning({ payload: { ...warning } })
+    handleWarning({ payload: { ...warning, message: 'different backend detail' } })
     handleWarning({ payload: { ...warning, operation: 'update_note' } })
 
     expect(tauriPlugins.toastWarning).toHaveBeenCalledTimes(2)
@@ -148,6 +149,79 @@ describe('desktop Tauri shell', () => {
       'Your change was saved, but derived views are temporarily unavailable.',
     )
     expect(tauriPlugins.toastWarning).not.toHaveBeenCalledWith('internal backend detail')
+
+    wrapper.unmount()
+  })
+
+  it('maps optimizer warning codes and unknown codes to safe local copy', async () => {
+    const wrapper = mountApp()
+    await flushPromises()
+    const handleWarning = tauriPlugins.listen.mock.calls[0][1]
+
+    handleWarning({
+      payload: {
+        code: 'optimizer_publication_pending',
+        message: 'private publication detail',
+      },
+    })
+    handleWarning({
+      payload: {
+        code: 'optimizer_rollback_recovery_pending',
+        message: 'private recovery detail',
+      },
+    })
+    handleWarning({
+      payload: {
+        code: 'optimizer_rollback_not_applied',
+        message: 'private rollback detail',
+      },
+    })
+    handleWarning({
+      payload: {
+        code: 'future_warning_code',
+        message: 'private future detail',
+      },
+    })
+    handleWarning({
+      payload: {
+        code: 'constructor',
+        message: 'private prototype detail',
+      },
+    })
+    handleWarning({
+      payload: {
+        code: '__proto__',
+        message: 'private prototype detail',
+      },
+    })
+
+    expect(tauriPlugins.toastWarning).toHaveBeenNthCalledWith(
+      1,
+      'Your change was saved, but its optimizer audit publication is still pending.',
+    )
+    expect(tauriPlugins.toastWarning).toHaveBeenNthCalledWith(
+      2,
+      'The rollback is accepted, but restoring the target bytes is still pending. Do not retry.',
+    )
+    expect(tauriPlugins.toastWarning).toHaveBeenNthCalledWith(
+      3,
+      'The rollback did not restore target bytes after authority advanced.',
+    )
+    expect(tauriPlugins.toastWarning).toHaveBeenNthCalledWith(
+      4,
+      'Your change was saved, but follow-up work is temporarily unavailable.',
+    )
+    expect(tauriPlugins.toastWarning).toHaveBeenNthCalledWith(
+      5,
+      'Your change was saved, but follow-up work is temporarily unavailable.',
+    )
+    expect(tauriPlugins.toastWarning).toHaveBeenNthCalledWith(
+      6,
+      'Your change was saved, but follow-up work is temporarily unavailable.',
+    )
+    expect(tauriPlugins.toastWarning).not.toHaveBeenCalledWith(
+      expect.stringContaining('private'),
+    )
 
     wrapper.unmount()
   })

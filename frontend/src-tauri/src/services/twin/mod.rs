@@ -43,6 +43,7 @@ use std::sync::Arc;
 
 const AUTO_PROMOTE_CONFIDENCE: f32 = 0.75;
 const AUTO_PROMOTE_SUPPORT_COUNT: usize = 3;
+const MAX_TWIN_JSON_FILES_PER_DIRECTORY: usize = 4096;
 
 pub struct TwinStore {
     root_path: PathBuf,
@@ -62,13 +63,20 @@ pub struct TwinStore {
     record_cache: HashMap<String, UserRecord>,
     records_cache_ready: bool,
     event_recorder: Arc<dyn crate::services::twin_events::EventRecorder>,
-    last_mutation_commit:
-        std::sync::Mutex<Option<crate::services::twin_events::MutationCommit>>,
     root_capability: Option<crate::services::twin_events::AnchoredRoot>,
     data_capability: Option<crate::services::twin_events::AnchoredRoot>,
 }
 
 impl TwinStore {
+    fn tokenless_mutation_commit() -> crate::services::twin_events::MutationCommit {
+        crate::services::twin_events::MutationCommit {
+            mutation_id: None,
+            events: Vec::new(),
+            authority_token: None,
+            postcommit_warning: false,
+        }
+    }
+
     pub fn new(root_path: PathBuf) -> Self {
         Self::with_event_recorder(
             root_path.clone(),
@@ -123,7 +131,6 @@ impl TwinStore {
             record_cache: HashMap::new(),
             records_cache_ready: false,
             event_recorder,
-            last_mutation_commit: std::sync::Mutex::new(None),
             root_capability,
             data_capability,
         }
@@ -150,15 +157,20 @@ impl TwinStore {
         &self.target_root_path
     }
 
-    fn write_pretty_json<T: Serialize>(&self, path: &Path, value: &T) -> Result<()> {
+    fn write_pretty_json<T: Serialize>(
+        &self,
+        path: &Path,
+        value: &T,
+    ) -> Result<crate::services::twin_events::MutationCommit> {
         let content = serde_json::to_string_pretty(value)?;
         if self.event_recorder.is_noop() {
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)
                     .with_context(|| format!("Failed to create directory: {}", parent.display()))?;
             }
-            return write_atomic(path, content.as_bytes())
-                .with_context(|| format!("Failed to write JSON file: {}", path.display()));
+            write_atomic(path, content.as_bytes())
+                .with_context(|| format!("Failed to write JSON file: {}", path.display()))?;
+            return Ok(Self::tokenless_mutation_commit());
         }
         self.commit_governed_json_targets(vec![(path.to_path_buf(), content)], Vec::new())
     }
@@ -178,9 +190,10 @@ impl TwinStore {
             .map_err(|_| anyhow::anyhow!("Twin read escaped the configured store root"))?
             .to_string_lossy()
             .replace('\\', "/");
-        let root = self.root_capability.as_ref().ok_or_else(|| {
-            anyhow::anyhow!("Twin store root capability could not be acquired")
-        })?;
+        let root = self
+            .root_capability
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Twin store root capability could not be acquired"))?;
         let Some(bytes) = root
             .read_bounded(&relative, TWIN_JSON_LIMIT)
             .map_err(anyhow::Error::new)?
@@ -196,11 +209,12 @@ impl TwinStore {
         &self,
         relative_directory: &str,
     ) -> Result<Vec<T>> {
-        let root = self.root_capability.as_ref().ok_or_else(|| {
-            anyhow::anyhow!("Twin store root capability could not be acquired")
-        })?;
+        let root = self
+            .root_capability
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Twin store root capability could not be acquired"))?;
         let names = root
-            .regular_file_names(relative_directory)
+            .regular_file_names_bounded(relative_directory, MAX_TWIN_JSON_FILES_PER_DIRECTORY)
             .map_err(anyhow::Error::new)?;
         let mut values = Vec::new();
         for name in names
@@ -283,15 +297,6 @@ impl TwinStore {
         Ok(())
     }
 
-    fn remember_mutation_commit(
-        &self,
-        commit: &crate::services::twin_events::MutationCommit,
-    ) {
-        if let Ok(mut slot) = self.last_mutation_commit.lock() {
-            *slot = Some(commit.clone());
-        }
-    }
-
     fn finish_mutation_commit(
         &mut self,
         result: Result<
@@ -299,31 +304,37 @@ impl TwinStore {
             crate::services::twin_events::MutationError,
         >,
     ) -> Result<crate::services::twin_events::MutationCommit> {
+        let authority_advanced = result
+            .as_ref()
+            .err()
+            .and_then(|error| error.authority_advanced_commit())
+            .is_some();
+        let result = Self::recoverable_mutation_commit(result);
+        if authority_advanced || result.is_err() {
+            self.invalidate_mutation_caches();
+        }
+        result
+    }
+
+    fn recoverable_mutation_commit(
+        result: Result<
+            crate::services::twin_events::MutationCommit,
+            crate::services::twin_events::MutationError,
+        >,
+    ) -> Result<crate::services::twin_events::MutationCommit> {
         match result {
-            Ok(commit) => {
-                self.remember_mutation_commit(&commit);
-                Ok(commit)
-            }
+            Ok(commit) => Ok(commit),
             Err(error) => {
-                self.invalidate_mutation_caches();
-                Err(anyhow::Error::new(error))
+                if error.authority_advanced_target_aborted() {
+                    return Err(anyhow::Error::new(error));
+                }
+                if let Some(commit) = error.authority_advanced_commit() {
+                    Ok(commit)
+                } else {
+                    Err(anyhow::Error::new(error))
+                }
             }
         }
-    }
-
-    pub(crate) fn clear_last_mutation_commit(&self) {
-        if let Ok(mut slot) = self.last_mutation_commit.lock() {
-            *slot = None;
-        }
-    }
-
-    pub(crate) fn take_last_mutation_commit(
-        &self,
-    ) -> Option<crate::services::twin_events::MutationCommit> {
-        self.last_mutation_commit
-            .lock()
-            .ok()
-            .and_then(|mut slot| slot.take())
     }
 
     fn commit_planned_twin_mutation<F>(
@@ -331,7 +342,7 @@ impl TwinStore {
         mut planner: F,
     ) -> Result<crate::services::twin_events::MutationCommit>
     where
-        F: FnMut(&Self) -> Result<Option<crate::services::twin_events::MutationPlan>>,
+        F: FnMut(&mut Self) -> Result<Option<crate::services::twin_events::MutationPlan>>,
     {
         let recorder = self.event_recorder.clone();
         let result = {
@@ -355,7 +366,7 @@ impl TwinStore {
         path: &Path,
         value: &T,
         drafts: Vec<crate::services::twin_events::TwinEventDraft>,
-    ) -> Result<()> {
+    ) -> Result<crate::services::twin_events::MutationCommit> {
         let content = serde_json::to_string_pretty(value)?;
         self.commit_governed_json_targets(vec![(path.to_path_buf(), content)], drafts)
     }
@@ -364,11 +375,13 @@ impl TwinStore {
         &self,
         path: &Path,
         drafts: Vec<crate::services::twin_events::TwinEventDraft>,
-    ) -> Result<()> {
+    ) -> Result<crate::services::twin_events::MutationCommit> {
         if self.event_recorder.is_noop() {
             match std::fs::remove_file(path) {
-                Ok(()) => return Ok(()),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Ok(()) => return Ok(Self::tokenless_mutation_commit()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(Self::tokenless_mutation_commit())
+                }
                 Err(error) => return Err(error.into()),
             }
         }
@@ -377,9 +390,8 @@ impl TwinStore {
             .map_err(|_| anyhow::anyhow!("Twin mutation target escaped the configured Twin root"))?
             .to_string_lossy()
             .replace('\\', "/");
-        let commit = self
-            .event_recorder
-            .commit_mutation(
+        Self::recoverable_mutation_commit(
+            self.event_recorder.commit_mutation(
                 crate::services::twin_events::MutationOrigin::Local,
                 crate::models::twin_event::CausalStream::SyncEligible,
                 crate::models::twin_event::SourceChannel::parse("legacy_twin")
@@ -389,17 +401,15 @@ impl TwinStore {
                     relative,
                 )],
                 drafts,
-            )
-            .map_err(anyhow::Error::new)?;
-        self.remember_mutation_commit(&commit);
-        Ok(())
+            ),
+        )
     }
 
     fn commit_governed_json_targets(
         &self,
         values: Vec<(PathBuf, String)>,
         drafts: Vec<crate::services::twin_events::TwinEventDraft>,
-    ) -> Result<()> {
+    ) -> Result<crate::services::twin_events::MutationCommit> {
         self.commit_governed_json_targets_with_source(
             crate::models::twin_event::SourceChannel::parse("legacy_twin")
                 .map_err(anyhow::Error::msg)?,
@@ -413,7 +423,7 @@ impl TwinStore {
         source_channel: crate::models::twin_event::SourceChannel,
         values: Vec<(PathBuf, String)>,
         drafts: Vec<crate::services::twin_events::TwinEventDraft>,
-    ) -> Result<()> {
+    ) -> Result<crate::services::twin_events::MutationCommit> {
         if self.event_recorder.is_noop() {
             for (path, content) in values {
                 if let Some(parent) = path.parent() {
@@ -421,21 +431,16 @@ impl TwinStore {
                 }
                 write_atomic(&path, content.as_bytes())?;
             }
-            return Ok(());
+            return Ok(Self::tokenless_mutation_commit());
         }
         let targets = self.governed_json_targets(values)?;
-        let commit = self
-            .event_recorder
-            .commit_mutation(
-                crate::services::twin_events::MutationOrigin::Local,
-                crate::models::twin_event::CausalStream::SyncEligible,
-                source_channel,
-                targets,
-                drafts,
-            )
-            .map_err(anyhow::Error::new)?;
-        self.remember_mutation_commit(&commit);
-        Ok(())
+        Self::recoverable_mutation_commit(self.event_recorder.commit_mutation(
+            crate::services::twin_events::MutationOrigin::Local,
+            crate::models::twin_event::CausalStream::SyncEligible,
+            source_channel,
+            targets,
+            drafts,
+        ))
     }
 
     pub(crate) fn governed_json_targets(
@@ -488,9 +493,7 @@ impl TwinStore {
 #[cfg(test)]
 mod cache_tests {
     use super::*;
-    use crate::models::twin::{
-        PromotionState, RecordOrigin, UserRecordCreate, UserRecordKind,
-    };
+    use crate::models::twin::{PromotionState, RecordOrigin, UserRecordCreate, UserRecordKind};
     use std::collections::{HashMap, HashSet};
     use tempfile::tempdir;
 
@@ -519,14 +522,20 @@ mod cache_tests {
         store.write_record_file(&second).unwrap();
         let first_trace = SessionTrace::new("session-a");
         let second_trace = SessionTrace::new("session-b");
-        store
+        assert!(store
             .write_pretty_json(&store.trace_file_path("session-a"), &first_trace)
-            .unwrap();
-        store
+            .unwrap()
+            .authority_token
+            .is_none());
+        assert!(store
             .write_pretty_json(&store.trace_file_path("session-b"), &second_trace)
-            .unwrap();
+            .unwrap()
+            .authority_token
+            .is_none());
 
-        store.record_cache.insert("stale".to_string(), record("stale"));
+        store
+            .record_cache
+            .insert("stale".to_string(), record("stale"));
         store.trace_cache.insert(
             "stale-session".to_string(),
             SessionTrace::new("stale-session"),
@@ -552,7 +561,9 @@ mod cache_tests {
     fn cache_rebuild_failure_leaves_both_caches_invalid_and_empty() {
         let temp = tempdir().unwrap();
         let mut store = TwinStore::new(temp.path().to_path_buf());
-        store.record_cache.insert("stale".to_string(), record("stale"));
+        store
+            .record_cache
+            .insert("stale".to_string(), record("stale"));
         store.trace_cache.insert(
             "stale-session".to_string(),
             SessionTrace::new("stale-session"),

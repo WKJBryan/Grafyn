@@ -174,14 +174,16 @@ fn interrupted_note_target_refreshes_cache_from_durable_bytes_before_recovery() 
     );
     let mut store = KnowledgeStore::with_event_recorder(vault.clone(), data, coordinator.clone());
     coordinator.fail_once_at(crate::services::twin_events::MutationFaultPoint::AfterTarget(0));
-    let created = store
-        .create_note(task_seven_note_create(
-            "Durable before event",
-            "survives restart",
-            "durable-before-event.md",
-        ))
+    let (created, commit) = store
+        .create_note_from_source_with_commit(
+            task_seven_note_create(
+                "Durable before event",
+                "survives restart",
+                "durable-before-event.md",
+            ),
+            "note_editor",
+        )
         .expect("the exact durable note effect must converge in-call");
-    let commit = store.take_last_mutation_commit().unwrap();
     assert!(commit.postcommit_warning);
     assert!(commit.mutation_id.is_some());
     assert!(commit.authority_token.is_some());
@@ -237,10 +239,9 @@ fn interrupted_note_delete_recovers_markdown_overlay_and_generation_together() {
     let before_delete = coordinator.current_authority_token().unwrap();
 
     coordinator.fail_once_at(crate::services::twin_events::MutationFaultPoint::AfterTarget(0));
-    store
-        .delete_note(&created.id)
+    let commit = store
+        .delete_note_from_source_with_commit(&created.id, "note_editor")
         .expect("the exact partial delete must converge in-call");
-    let commit = store.take_last_mutation_commit().unwrap();
     assert!(commit.postcommit_warning);
     assert!(commit.mutation_id.is_some());
     assert_eq!(commit.events.len(), 1);
@@ -291,17 +292,17 @@ fn pending_update_is_recovered_before_fresh_note_fields_are_planned() {
     let mut stale = KnowledgeStore::with_event_recorder(vault.clone(), data, coordinator.clone());
 
     coordinator.fail_once_at(crate::services::twin_events::MutationFaultPoint::AfterStage);
-    let first_update = first
-        .update_note(
+    let (first_update, commit) = first
+        .update_note_from_source_with_commit(
             &created.id,
             NoteUpdate {
                 content: Some("recovered content".into()),
                 ..Default::default()
             },
+            "note_editor",
         )
         .expect("the staged update must converge in-call");
     assert_eq!(first_update.content, "recovered content");
-    let commit = first.take_last_mutation_commit().unwrap();
     assert!(commit.postcommit_warning);
     assert!(commit.mutation_id.is_some());
     assert!(commit.authority_token.is_some());
@@ -346,14 +347,12 @@ fn pending_same_title_create_allocates_a_fresh_id_after_recovery() {
     let mut stale = KnowledgeStore::with_event_recorder(vault.clone(), data, coordinator.clone());
 
     coordinator.fail_once_at(crate::services::twin_events::MutationFaultPoint::AfterStage);
-    let first_created = first
-        .create_note(task_seven_note_create(
-            "Same title",
-            "first",
-            "same-title.md",
-        ))
+    let (first_created, commit) = first
+        .create_note_from_source_with_commit(
+            task_seven_note_create("Same title", "first", "same-title.md"),
+            "note_editor",
+        )
         .expect("the staged create must converge in-call");
-    let commit = first.take_last_mutation_commit().unwrap();
     assert!(commit.postcommit_warning);
     assert!(commit.mutation_id.is_some());
     assert!(commit.authority_token.is_some());
@@ -401,10 +400,12 @@ fn pending_create_is_recovered_before_import_allocates_ids_and_paths() {
     let mut stale = KnowledgeStore::with_event_recorder(vault, data, coordinator.clone());
 
     coordinator.fail_once_at(crate::services::twin_events::MutationFaultPoint::AfterStage);
-    let first_created = first
-        .create_note(task_seven_note_create("Shared title", "first", "shared.md"))
+    let (first_created, commit) = first
+        .create_note_from_source_with_commit(
+            task_seven_note_create("Shared title", "first", "shared.md"),
+            "note_editor",
+        )
         .expect("the staged create must converge in-call");
-    let commit = first.take_last_mutation_commit().unwrap();
     assert!(commit.postcommit_warning);
     assert!(commit.mutation_id.is_some());
     assert!(commit.authority_token.is_some());
@@ -460,16 +461,16 @@ fn pending_move_is_recovered_before_delete_resolves_the_durable_path() {
     let mut stale = KnowledgeStore::with_event_recorder(vault.clone(), data, coordinator.clone());
 
     coordinator.fail_once_at(crate::services::twin_events::MutationFaultPoint::AfterStage);
-    let moved = first
-        .update_note(
+    let (moved, commit) = first
+        .update_note_from_source_with_commit(
             &created.id,
             NoteUpdate {
                 relative_path: Some("moved/new.md".into()),
                 ..Default::default()
             },
+            "note_editor",
         )
         .expect("the staged move must converge in-call");
-    let commit = first.take_last_mutation_commit().unwrap();
     assert!(commit.postcommit_warning);
     assert!(commit.mutation_id.is_some());
     assert!(commit.authority_token.is_some());
@@ -521,17 +522,17 @@ fn pending_update_is_recovered_before_restore_records_fresh_evidence() {
         KnowledgeStore::with_event_recorder(vault.clone(), data.clone(), coordinator.clone());
 
     coordinator.fail_once_at(crate::services::twin_events::MutationFaultPoint::AfterStage);
-    let updated = first
-        .update_note(
+    let (updated, commit) = first
+        .update_note_from_source_with_commit(
             &created.id,
             NoteUpdate {
                 content: Some("pending recovered body".into()),
                 ..Default::default()
             },
+            "note_editor",
         )
         .expect("the staged update must converge in-call");
     assert_eq!(updated.content, "pending recovered body");
-    let commit = first.take_last_mutation_commit().unwrap();
     assert!(commit.postcommit_warning);
     assert!(commit.mutation_id.is_some());
     assert!(commit.authority_token.is_some());
@@ -606,9 +607,10 @@ fn coordinated_import_container_is_one_sorted_group_with_no_parser_noise() {
         )
         .unwrap(),
     );
-    let mut store = KnowledgeStore::with_event_recorder(vault, data, coordinator);
-    let notes = store
-        .import_note_container(
+    let mut store = KnowledgeStore::with_event_recorder(vault, data, coordinator.clone());
+    let before = coordinator.current_authority_token().unwrap();
+    let (notes, commit) = store
+        .import_note_container_with_commit(
             vec![
                 task_seven_note_create("Zulu", "section z", "zulu.md"),
                 task_seven_note_create("Alpha", "section a", "alpha.md"),
@@ -618,6 +620,17 @@ fn coordinated_import_container_is_one_sorted_group_with_no_parser_noise() {
         )
         .unwrap();
     assert_eq!(notes.len(), 2);
+    assert!(commit.mutation_id.is_some());
+    assert_eq!(commit.events.len(), 3);
+    let committed = commit
+        .authority_token
+        .expect("import returns its exact authority");
+    assert_eq!(committed.root_scope, before.root_scope);
+    assert_eq!(
+        committed.authority_generation,
+        before.authority_generation + 1
+    );
+    assert_eq!(coordinator.current_authority_token().unwrap(), committed);
     let events = event_store.ordered_events().unwrap();
     assert_eq!(events.len(), 3);
     let note_ids = events[..2]
@@ -653,6 +666,49 @@ fn coordinated_import_container_is_one_sorted_group_with_no_parser_noise() {
     }));
     assert_eq!(events[1].causal_parents, vec![events[0].event_id.clone()]);
     assert_eq!(events[2].causal_parents, vec![events[1].event_id.clone()]);
+}
+
+#[test]
+fn coordinated_import_preserves_authority_advanced_commit_for_its_caller() {
+    let root = tempdir().unwrap();
+    let vault = root.path().join("vault");
+    let data = root.path().join("data");
+    std::fs::create_dir(&vault).unwrap();
+    std::fs::create_dir(&data).unwrap();
+    let events = std::sync::Arc::new(crate::services::twin_events::TwinEventStore::new(&data));
+    events.initialize().unwrap();
+    let coordinator = std::sync::Arc::new(
+        crate::services::twin_events::MutationCoordinator::new(
+            &data,
+            &vault,
+            events,
+            std::sync::Arc::new(crate::services::twin_events::NoopMutationLifecycle),
+        )
+        .unwrap(),
+    );
+    let mut store = KnowledgeStore::with_event_recorder(vault, data, coordinator.clone());
+
+    coordinator.fail_next_replays_before_targets(2);
+    let error = store
+        .import_note_container_with_commit(
+            vec![task_seven_note_create(
+                "Pending import",
+                "exactly once",
+                "pending-import.md",
+            )],
+            "pending-container",
+            b"pending source",
+        )
+        .expect_err("the exact authority-advanced outcome must reach the caller");
+    let outcome = knowledge_authority_advanced_outcome(&error)
+        .expect("KnowledgeStore must preserve the exact non-retryable outcome");
+    assert_eq!(
+        outcome.commit.authority_token,
+        Some(coordinator.current_authority_token().unwrap())
+    );
+    assert_eq!(outcome.note_ids, vec!["pending-import"]);
+    assert!(!outcome.target_aborted);
+    assert_eq!(coordinator.pending_count().unwrap(), 1);
 }
 
 #[test]

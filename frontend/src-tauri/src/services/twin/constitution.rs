@@ -748,6 +748,7 @@ impl TwinStore {
             tag,
         )?;
         self.write_governed_json(path, value, vec![draft])
+            .map(|_commit| ())
     }
 
     fn legacy_artifact_observation_draft<T: serde::Serialize>(
@@ -860,9 +861,20 @@ impl TwinStore {
         &mut self,
         create: ConstitutionItemCreate,
     ) -> Result<ConstitutionItem> {
+        let (item, _commit) = self.create_constitution_item_with_commit(create)?;
+        Ok(item)
+    }
+
+    pub(crate) fn create_constitution_item_with_commit(
+        &mut self,
+        create: ConstitutionItemCreate,
+    ) -> Result<(
+        ConstitutionItem,
+        crate::services::twin_events::MutationCommit,
+    )> {
         if !self.event_recorder.is_noop() {
             let mut committed = None;
-            self.commit_planned_twin_mutation(|store| {
+            let commit = self.commit_planned_twin_mutation(|store| {
                 let item = materialize_constitution_item(create.clone());
                 let automatic = item
                     .source
@@ -889,7 +901,9 @@ impl TwinStore {
                     vec![draft],
                 )))
             })?;
-            return committed.ok_or_else(|| anyhow::anyhow!("Constitution create was not planned"));
+            let item =
+                committed.ok_or_else(|| anyhow::anyhow!("Constitution create was not planned"))?;
+            return Ok((item, commit));
         }
         let item = materialize_constitution_item(create);
         let automatic = item
@@ -904,7 +918,7 @@ impl TwinStore {
             automatic,
             automatic.then_some("legacy_inference"),
         )?;
-        Ok(item)
+        Ok((item, Self::tokenless_mutation_commit()))
     }
 
     pub fn update_constitution_item(
@@ -912,10 +926,22 @@ impl TwinStore {
         id: &str,
         update: ConstitutionItemUpdate,
     ) -> Result<ConstitutionItem> {
+        let (item, _commit) = self.update_constitution_item_with_commit(id, update)?;
+        Ok(item)
+    }
+
+    pub(crate) fn update_constitution_item_with_commit(
+        &mut self,
+        id: &str,
+        update: ConstitutionItemUpdate,
+    ) -> Result<(
+        ConstitutionItem,
+        crate::services::twin_events::MutationCommit,
+    )> {
         Self::validate_file_id(id)?;
         if !self.event_recorder.is_noop() {
             let mut committed = None;
-            self.commit_planned_twin_mutation(|store| {
+            let commit = self.commit_planned_twin_mutation(|store| {
                 let path = store.constitution_file_path(id);
                 let before = store.read_constitution_file(&path)?;
                 let item = apply_constitution_item_update(before.clone(), &update)?;
@@ -930,10 +956,8 @@ impl TwinStore {
                     false,
                     None,
                 )?;
-                let targets = store.governed_json_targets(vec![(
-                    path,
-                    serde_json::to_string_pretty(&item)?,
-                )])?;
+                let targets = store
+                    .governed_json_targets(vec![(path, serde_json::to_string_pretty(&item)?)])?;
                 Ok(Some(crate::services::twin_events::MutationPlan::new(
                     crate::models::twin_event::CausalStream::SyncEligible,
                     crate::models::twin_event::SourceChannel::parse("legacy_twin")
@@ -942,13 +966,15 @@ impl TwinStore {
                     vec![draft],
                 )))
             })?;
-            return committed.ok_or_else(|| anyhow::anyhow!("Constitution update was not planned"));
+            let item =
+                committed.ok_or_else(|| anyhow::anyhow!("Constitution update was not planned"))?;
+            return Ok((item, commit));
         }
         let path = self.constitution_file_path(id);
         let before = self.read_constitution_file(&path)?;
         let item = apply_constitution_item_update(before.clone(), &update)?;
         if item.updated_at == before.updated_at {
-            return Ok(item);
+            return Ok((item, Self::tokenless_mutation_commit()));
         }
         self.write_legacy_artifact_observation(
             &path,
@@ -958,7 +984,7 @@ impl TwinStore {
             false,
             None,
         )?;
-        Ok(item)
+        Ok((item, Self::tokenless_mutation_commit()))
     }
 
     pub fn review_constitution_item(
@@ -966,12 +992,23 @@ impl TwinStore {
         id: &str,
         request: ConstitutionReviewRequest,
     ) -> Result<ConstitutionItem> {
+        let (item, _commit) = self.review_constitution_item_with_commit(id, request)?;
+        Ok(item)
+    }
+
+    pub(crate) fn review_constitution_item_with_commit(
+        &mut self,
+        id: &str,
+        request: ConstitutionReviewRequest,
+    ) -> Result<(
+        ConstitutionItem,
+        crate::services::twin_events::MutationCommit,
+    )> {
         Self::validate_file_id(id)?;
         if !self.event_recorder.is_noop() {
             let mut committed = None;
-            self.commit_planned_twin_mutation(|store| {
-                let mut item =
-                    store.read_constitution_file(&store.constitution_file_path(id))?;
+            let commit = self.commit_planned_twin_mutation(|store| {
+                let mut item = store.read_constitution_file(&store.constitution_file_path(id))?;
                 item.status = constitution_status_for_action(&request.action);
                 item.updated_at = Utc::now();
                 let draft = store.legacy_artifact_feedback_draft(
@@ -1006,10 +1043,10 @@ impl TwinStore {
                     vec![draft],
                 )))
             })?;
-            let (item, trace) = committed
-                .ok_or_else(|| anyhow::anyhow!("Constitution review was not planned"))?;
+            let (item, trace) =
+                committed.ok_or_else(|| anyhow::anyhow!("Constitution review was not planned"))?;
             self.cache_committed_trace(trace);
-            return Ok(item);
+            return Ok((item, commit));
         }
         let mut item = self.read_constitution_file(&self.constitution_file_path(id))?;
         item.status = constitution_status_for_action(&request.action);
@@ -1031,7 +1068,7 @@ impl TwinStore {
             }),
         )?;
         let trace_target = self.serialized_trace_target(&trace)?;
-        self.commit_governed_json_targets(
+        let commit = self.commit_governed_json_targets(
             vec![
                 (
                     self.constitution_file_path(&item.id),
@@ -1042,7 +1079,7 @@ impl TwinStore {
             vec![draft],
         )?;
         self.cache_committed_trace(trace);
-        Ok(item)
+        Ok((item, commit))
     }
 
     pub fn list_action_gaps(&self) -> Result<Vec<ActionGap>> {
@@ -1073,16 +1110,17 @@ impl TwinStore {
 
     pub fn create_action_gap(&mut self, create: ActionGapCreate) -> Result<ActionGap> {
         self.create_action_gap_with_capture(create, false)
+            .map(|(gap, _commit)| gap)
     }
 
     fn create_action_gap_with_capture(
         &mut self,
         create: ActionGapCreate,
         automatic: bool,
-    ) -> Result<ActionGap> {
+    ) -> Result<(ActionGap, crate::services::twin_events::MutationCommit)> {
         if !self.event_recorder.is_noop() {
             let mut committed = None;
-            self.commit_planned_twin_mutation(|store| {
+            let commit = self.commit_planned_twin_mutation(|store| {
                 let gap = materialize_action_gap(create.clone());
                 let draft = store.legacy_artifact_observation_draft(
                     &gap.id,
@@ -1104,7 +1142,9 @@ impl TwinStore {
                     vec![draft],
                 )))
             })?;
-            return committed.ok_or_else(|| anyhow::anyhow!("action gap create was not planned"));
+            let gap =
+                committed.ok_or_else(|| anyhow::anyhow!("action gap create was not planned"))?;
+            return Ok((gap, commit));
         }
         let gap = materialize_action_gap(create);
         self.write_legacy_artifact_observation(
@@ -1115,7 +1155,7 @@ impl TwinStore {
             automatic,
             automatic.then_some("legacy_inference"),
         )?;
-        Ok(gap)
+        Ok((gap, Self::tokenless_mutation_commit()))
     }
 
     pub fn review_action_gap(
@@ -1123,10 +1163,19 @@ impl TwinStore {
         id: &str,
         request: ConstitutionReviewRequest,
     ) -> Result<ActionGap> {
+        let (gap, _commit) = self.review_action_gap_with_commit(id, request)?;
+        Ok(gap)
+    }
+
+    pub(crate) fn review_action_gap_with_commit(
+        &mut self,
+        id: &str,
+        request: ConstitutionReviewRequest,
+    ) -> Result<(ActionGap, crate::services::twin_events::MutationCommit)> {
         Self::validate_file_id(id)?;
         if !self.event_recorder.is_noop() {
             let mut committed = None;
-            self.commit_planned_twin_mutation(|store| {
+            let commit = self.commit_planned_twin_mutation(|store| {
                 let mut gap = store.read_action_gap_file(&store.action_gap_file_path(id))?;
                 gap.status = constitution_status_for_action(&request.action);
                 gap.updated_at = Utc::now();
@@ -1162,10 +1211,10 @@ impl TwinStore {
                     vec![draft],
                 )))
             })?;
-            let (gap, trace) = committed
-                .ok_or_else(|| anyhow::anyhow!("action gap review was not planned"))?;
+            let (gap, trace) =
+                committed.ok_or_else(|| anyhow::anyhow!("action gap review was not planned"))?;
             self.cache_committed_trace(trace);
-            return Ok(gap);
+            return Ok((gap, commit));
         }
         let mut gap = self.read_action_gap_file(&self.action_gap_file_path(id))?;
         gap.status = constitution_status_for_action(&request.action);
@@ -1187,7 +1236,7 @@ impl TwinStore {
             }),
         )?;
         let trace_target = self.serialized_trace_target(&trace)?;
-        self.commit_governed_json_targets(
+        let commit = self.commit_governed_json_targets(
             vec![
                 (
                     self.action_gap_file_path(&gap.id),
@@ -1198,7 +1247,7 @@ impl TwinStore {
             vec![draft],
         )?;
         self.cache_committed_trace(trace);
-        Ok(gap)
+        Ok((gap, commit))
     }
 
     pub fn get_constitution_setup(&self) -> Result<ConstitutionSetup> {
@@ -1211,9 +1260,20 @@ impl TwinStore {
         &mut self,
         setup: ConstitutionSetup,
     ) -> Result<ConstitutionSetup> {
+        let (setup, _commit) = self.save_constitution_setup_with_commit(setup)?;
+        Ok(setup)
+    }
+
+    pub(crate) fn save_constitution_setup_with_commit(
+        &mut self,
+        setup: ConstitutionSetup,
+    ) -> Result<(
+        ConstitutionSetup,
+        crate::services::twin_events::MutationCommit,
+    )> {
         if !self.event_recorder.is_noop() {
             let mut committed = None;
-            self.commit_planned_twin_mutation(|store| {
+            let commit = self.commit_planned_twin_mutation(|store| {
                 let setup = clean_constitution_setup(setup.clone());
                 let observed_at = setup.updated_at.expect("setup timestamp assigned");
                 let setup_draft = store.legacy_artifact_observation_draft(
@@ -1311,10 +1371,10 @@ impl TwinStore {
                     drafts,
                 )))
             })?;
-            let (setup, trace) = committed
-                .ok_or_else(|| anyhow::anyhow!("Constitution setup was not planned"))?;
+            let (setup, trace) =
+                committed.ok_or_else(|| anyhow::anyhow!("Constitution setup was not planned"))?;
             self.cache_committed_trace(trace);
-            return Ok(setup);
+            return Ok((setup, commit));
         }
         let setup = clean_constitution_setup(setup);
         let observed_at = setup.updated_at.expect("setup timestamp assigned");
@@ -1340,7 +1400,7 @@ impl TwinStore {
             }),
         )?;
         let trace_target = self.serialized_trace_target(&trace)?;
-        self.commit_governed_json_targets(
+        let commit = self.commit_governed_json_targets(
             vec![
                 (
                     self.setup_path.clone(),
@@ -1366,7 +1426,7 @@ impl TwinStore {
         };
 
         self.seed_constitution_setup_items(&setup, evidence_ref)?;
-        Ok(setup)
+        Ok((setup, commit))
     }
 
     pub fn run_constitution_inference(&mut self) -> Result<ConstitutionInferenceSummary> {
@@ -1377,11 +1437,21 @@ impl TwinStore {
         &mut self,
         notes: &[Note],
     ) -> Result<ConstitutionInferenceSummary> {
+        let (summary, _commit) = self.run_constitution_inference_with_notes_and_commit(notes)?;
+        Ok(summary)
+    }
+
+    pub(crate) fn run_constitution_inference_with_notes_and_commit(
+        &mut self,
+        notes: &[Note],
+    ) -> Result<(
+        ConstitutionInferenceSummary,
+        crate::services::twin_events::MutationCommit,
+    )> {
         if !self.event_recorder.is_noop() {
             let mut committed = None;
-            self.commit_planned_twin_mutation(|store| {
-                let (summary, trace, plan) =
-                    store.plan_constitution_inference_mutation(notes)?;
+            let commit = self.commit_planned_twin_mutation(|store| {
+                let (summary, trace, plan) = store.plan_constitution_inference_mutation(notes)?;
                 committed = Some((summary, trace));
                 Ok(Some(plan))
             })?;
@@ -1389,7 +1459,7 @@ impl TwinStore {
                 .ok_or_else(|| anyhow::anyhow!("Constitution inference was not planned"))?;
             self.invalidate_mutation_caches();
             self.cache_committed_trace(trace);
-            return Ok(summary);
+            return Ok((summary, commit));
         }
         self.ensure_record_cache()?;
         let current_note_ids = notes
@@ -1475,7 +1545,7 @@ impl TwinStore {
             {
                 let key = action_gap_key(&stated_value, &revealed_behavior);
                 if gap_keys.insert(key) {
-                    self.create_action_gap_with_capture(ActionGapCreate {
+                    let (_gap, _commit) = self.create_action_gap_with_capture(ActionGapCreate {
                         stated_value,
                         revealed_behavior,
                         driver_hypothesis: Some(
@@ -1512,7 +1582,7 @@ impl TwinStore {
             let revealed_behavior = format!("Chosen option: {}", chosen_option.trim());
             let key = action_gap_key(&stated_value, &revealed_behavior);
             if gap_keys.insert(key) {
-                self.create_action_gap_with_capture(ActionGapCreate {
+                let (_gap, _commit) = self.create_action_gap_with_capture(ActionGapCreate {
                     stated_value,
                     revealed_behavior,
                     driver_hypothesis: Some("Inferred from a decision where final action diverged from initial leaning.".to_string()),
@@ -1631,7 +1701,7 @@ impl TwinStore {
             TraceEventType::ConstitutionInferenceRun,
             serde_json::to_value(&summary)?,
         )?;
-        Ok(summary)
+        Ok((summary, Self::tokenless_mutation_commit()))
     }
 
     fn plan_constitution_inference_mutation(
@@ -1851,9 +1921,10 @@ impl TwinStore {
         }
 
         for decision in &decisions {
-            let (Some(initial_leaning), Some(chosen_option)) =
-                (decision.initial_leaning.as_ref(), decision.chosen_option.as_ref())
-            else {
+            let (Some(initial_leaning), Some(chosen_option)) = (
+                decision.initial_leaning.as_ref(),
+                decision.chosen_option.as_ref(),
+            ) else {
                 continue;
             };
             if initial_leaning
@@ -1933,7 +2004,8 @@ impl TwinStore {
                                 skipped_domain_claims += 1;
                                 continue;
                             }
-                            let finding = format!("Interview finding: {}", excerpt(turn.content.trim()));
+                            let finding =
+                                format!("Interview finding: {}", excerpt(turn.content.trim()));
                             let exists = all_records.iter().any(|record| {
                                 record.kind == UserRecordKind::Fact
                                     && record.content == finding
@@ -2147,7 +2219,8 @@ impl TwinStore {
                     crate::services::twin_events::standard_capture_governance(),
                 )
                 .map_err(anyhow::Error::msg)?;
-                self.delete_governed_json(&self.record_file_path(&record.id), vec![draft])?;
+                self.delete_governed_json(&self.record_file_path(&record.id), vec![draft])
+                    .map(|_commit| ())?;
             }
             Ok(stale_records.len())
         })();
@@ -2188,7 +2261,8 @@ impl TwinStore {
                 crate::services::twin_events::standard_capture_governance(),
             )
             .map_err(anyhow::Error::msg)?;
-            self.delete_governed_json(&self.constitution_file_path(&item.id), vec![draft])?;
+            self.delete_governed_json(&self.constitution_file_path(&item.id), vec![draft])
+                .map(|_commit| ())?;
         }
 
         Ok(stale_items.len())
@@ -2220,7 +2294,8 @@ impl TwinStore {
                 crate::services::twin_events::standard_capture_governance(),
             )
             .map_err(anyhow::Error::msg)?;
-            self.delete_governed_json(&self.constitution_file_path(&item.id), vec![draft])?;
+            self.delete_governed_json(&self.constitution_file_path(&item.id), vec![draft])
+                .map(|_commit| ())?;
         }
 
         Ok(stale_items.len())
@@ -2282,15 +2357,13 @@ impl TwinStore {
     }
 
     pub(super) fn read_constitution_file(&self, path: &Path) -> Result<ConstitutionItem> {
-        self.read_twin_json_bounded(path)?.ok_or_else(|| {
-            anyhow::anyhow!("Failed to read constitution file: {}", path.display())
-        })
+        self.read_twin_json_bounded(path)?
+            .ok_or_else(|| anyhow::anyhow!("Failed to read constitution file: {}", path.display()))
     }
 
     pub(super) fn read_action_gap_file(&self, path: &Path) -> Result<ActionGap> {
-        self.read_twin_json_bounded(path)?.ok_or_else(|| {
-            anyhow::anyhow!("Failed to read action gap file: {}", path.display())
-        })
+        self.read_twin_json_bounded(path)?
+            .ok_or_else(|| anyhow::anyhow!("Failed to read action gap file: {}", path.display()))
     }
 
     fn seed_constitution_setup_items(

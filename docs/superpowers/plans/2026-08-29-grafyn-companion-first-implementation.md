@@ -232,15 +232,17 @@ Task 1 repairs these baselines before migration. Later tasks must not redefine t
 
 **Contract:** Successful note, capture, Canvas, feedback, Twin record/digest/Constitution review, decision/outcome, and import mutations append exactly one appropriate governed event group even when invoked through MCP. Remote/recovery origins never re-record. A crash at any injected coordinator boundary recovers to either no logical operation or one complete logical operation, never a half-applied durable state.
 
-- [ ] Introduce `MutationOrigin::{Local, Remote, Recovery}` at the storage-service boundary and write failing local/remote/recovery tests before changing public methods.
-- [ ] Inject `Arc<dyn EventRecorder>` into shared stores using compatibility constructors that default to `NoopEventRecorder` for existing unit fixtures.
-- [ ] Stage a typed local intent containing mutation ID, target, before digest, bounded desired after-image/tombstone, and event group; then apply user bytes, append events idempotently, and remove the intent. Recovery advances before→after, completes event append when after already matches, and quarantines an unknown third digest instead of overwriting it. Do not rely on post-write command fan-out for event durability.
-- [ ] Write restart/fault-injection tests for crashes after journal stage, after user mutation, after event append, and before journal cleanup; rerunning recovery must be idempotent.
-- [ ] Map service changes to typed payloads and evidence refs. Imported conversations emit a container observation, not parser-noise events.
-- [ ] Ensure Canvas events occur only after session persistence succeeds and contain prompt/response/model/cost/provenance, excluding API keys and raw unselected context.
-- [ ] Add MCP integration coverage for create/update/delete event emission.
-- [ ] Run storage, Canvas, Twin, import, and MCP tests plus full Rust tests.
-- [ ] Commit: `feat: capture governed events across Grafyn mutations`
+- [x] Introduce `MutationOrigin::{Local, Remote, Recovery}` at the storage-service boundary and write failing local/remote/recovery tests before changing public methods.
+- [x] Inject `Arc<dyn EventRecorder>` into shared stores using compatibility constructors that default to `NoopEventRecorder` for existing unit fixtures.
+- [x] Stage a typed local intent containing mutation ID, target, before digest, bounded desired after-image/tombstone, and event group; then apply user bytes, append events idempotently, and remove the intent. Recovery advances before→after, completes event append when after already matches, and quarantines an unknown third digest instead of overwriting it. Do not rely on post-write command fan-out for event durability.
+- [x] Write restart/fault-injection tests for crashes after journal stage, after user mutation, after event append, and before journal cleanup; rerunning recovery must be idempotent.
+- [x] Map service changes to typed payloads and evidence refs. Imported conversations emit a container observation, not parser-noise events.
+- [x] Ensure Canvas events occur only after session persistence succeeds and contain prompt/response/model/cost/provenance, excluding API keys and raw unselected context.
+- [x] Add MCP integration coverage for create/update/delete event emission.
+- [x] Run storage, Canvas, Twin, import, and MCP tests plus full Rust tests.
+- [x] Commit: `feat: capture governed events across Grafyn mutations`
+
+**Verification (2026-08-31):** 685 desktop Rust tests, 573 MCP tests, 12 Twin Eval lab tests, and 484 frontend tests passed; strict-warning builds, production frontend build, license alignment, source-size, scoped rustfmt, and diff checks passed. Independent review reported no Critical or Important findings.
 
 ## Task 8: Expose Twin state, review, attention explanations, and export
 

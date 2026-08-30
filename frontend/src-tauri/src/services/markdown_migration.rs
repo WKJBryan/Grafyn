@@ -2,11 +2,15 @@ use crate::models::migration::{
     ExpectedProgramTarget, MarkdownMigrationApplyResult, MarkdownMigrationMode,
     MarkdownMigrationNoteProposal, MarkdownMigrationPreview, MarkdownMigrationPreviewSummary,
     MarkdownMigrationRequest, MarkdownMigrationStatus, MarkdownMigrationTopicCandidate,
+    MigrationAuthoritySnapshotV1,
 };
+#[cfg(test)]
+use crate::models::note::NoteCreate;
 use crate::models::note::{
-    Note, NoteCreate, NoteUpdate, CURRENT_NOTE_SCHEMA_VERSION, PROP_AUTO_INSERTED_LINK_IDS,
+    Note, NoteUpdate, CURRENT_NOTE_SCHEMA_VERSION, PROP_AUTO_INSERTED_LINK_IDS,
     PROP_INFERRED_LINK_IDS, PROP_TOPIC_ALIASES, PROP_TOPIC_KEY,
 };
+#[cfg(test)]
 use crate::services::atomic_io::write_atomic;
 use crate::services::knowledge_store::KnowledgeStore;
 use crate::services::topic_hub::normalize_topic_key;
@@ -18,11 +22,27 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
+mod recovery;
+mod semantics;
+mod state;
+mod status;
+mod transaction;
+mod validation;
+#[cfg(test)]
+pub(crate) use transaction::MigrationMutationOutcome;
+
+#[cfg(test)]
+#[path = "markdown_migration_transaction_tests.rs"]
+mod transaction_tests;
+
 const MIGRATION_SOURCE_MARKDOWN: &str = "markdown_migration";
 const MIGRATION_SOURCE_BACKFILL: &str = "grafyn_schema_backfill";
+const MIGRATION_PREVIEW_SCHEMA_VERSION: u16 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct StoredManifest {
+    #[serde(default)]
+    schema_version: u16,
     run_id: String,
     preview_id: String,
     #[serde(default)]
@@ -54,12 +74,149 @@ struct StoredManifest {
     program_after_digest: Option<crate::models::twin_event::ContentDigest>,
     #[serde(default)]
     program_path: Option<String>,
+    #[serde(default)]
+    request: Option<MarkdownMigrationRequest>,
+    #[serde(default)]
+    source_inventory: Vec<crate::models::migration::MarkdownMigrationSourceV1>,
+    #[serde(default)]
+    overlay_inventory: Vec<crate::models::migration::MarkdownMigrationOverlaySourceV1>,
+    #[serde(default)]
+    starting_authority: Option<crate::services::vault_namespace::VaultAuthorityTokenV1>,
+    #[serde(default)]
+    final_authority: Option<crate::services::vault_namespace::VaultAuthorityTokenV1>,
+    #[serde(default)]
+    operations: Vec<MigrationOperationV1>,
+    #[serde(default)]
+    #[serde(
+        serialize_with = "serialize_usize_as_u64",
+        deserialize_with = "deserialize_u64_as_usize"
+    )]
+    apply_next: usize,
+    #[serde(default)]
+    #[serde(
+        serialize_with = "serialize_usize_as_u64",
+        deserialize_with = "deserialize_u64_as_usize"
+    )]
+    rollback_next: usize,
+    #[serde(default)]
+    #[serde(
+        serialize_with = "serialize_usize_as_u64",
+        deserialize_with = "deserialize_u64_as_usize"
+    )]
+    rollback_total: usize,
+    #[serde(default)]
+    authority_only_advances: u64,
+    #[serde(default)]
+    active_step: Option<MigrationStepWitnessV1>,
+    #[serde(default)]
+    last_commit: Option<MigrationCommitProofV1>,
+}
+
+const MIGRATION_MANIFEST_SCHEMA_VERSION: u16 = 1;
+const MAX_MIGRATION_RECORD_BYTES: usize = 64 * 1024 * 1024;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MigrationOperationV1 {
+    #[serde(
+        serialize_with = "serialize_usize_as_u64",
+        deserialize_with = "deserialize_u64_as_usize"
+    )]
+    index: usize,
+    target_kind: crate::services::twin_events::TargetKind,
+    target_key: String,
+    before: crate::services::twin_events::BeforeImage,
+    after: crate::services::twin_events::BeforeImage,
+    after_digest: crate::models::twin_event::ContentDigest,
+    after_blob_key: Option<String>,
+    before_blob_key: Option<String>,
+    note_event: Option<StoredMigrationNoteEventV1>,
+    rollback_note_event: Option<StoredMigrationNoteEventV1>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredMigrationNoteEventV1 {
+    note_id: String,
+    change: crate::models::twin_event::NoteChangeKind,
+    observed_at: DateTime<Utc>,
+    governance: crate::models::twin_event::Governance,
+    payload_digest: crate::models::twin_event::ContentDigest,
+    evidence_digest: crate::models::twin_event::ContentDigest,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MigrationStepWitnessV1 {
+    direction: MigrationDirectionV1,
+    #[serde(
+        serialize_with = "serialize_usize_as_u64",
+        deserialize_with = "deserialize_u64_as_usize"
+    )]
+    operation_index: usize,
+    expected_authority: crate::services::vault_namespace::VaultAuthorityTokenV1,
+    #[serde(default)]
+    intent: Option<crate::services::twin_events::MutationIntentV1>,
+    #[serde(default)]
+    committed_authority: Option<crate::services::vault_namespace::VaultAuthorityTokenV1>,
+    #[serde(default)]
+    progress_recorded: bool,
+    #[serde(default)]
+    receipt_consumed: bool,
+    #[serde(default)]
+    abort_recorded: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum MigrationDirectionV1 {
+    Apply,
+    Rollback,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MigrationCommitProofV1 {
+    mutation_id: crate::models::twin_event::ContentDigest,
+    authority: crate::services::vault_namespace::VaultAuthorityTokenV1,
+}
+
+const MIGRATION_COMMIT_RECORD_SCHEMA_VERSION: u16 = 1;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MigrationCommitRecordV1 {
+    schema_version: u16,
+    run_id: String,
+    mutation_id: crate::models::twin_event::ContentDigest,
+    authority: crate::services::vault_namespace::VaultAuthorityTokenV1,
+    direction: MigrationDirectionV1,
+    #[serde(
+        serialize_with = "serialize_usize_as_u64",
+        deserialize_with = "deserialize_u64_as_usize"
+    )]
+    operation_index: usize,
+    outcome: MigrationCommitOutcomeV1,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum MigrationCommitOutcomeV1 {
+    Committed,
+    AuthorityOnly,
 }
 
 #[derive(Debug, Clone)]
 pub struct MarkdownMigrationService {
     data_path: PathBuf,
     runs_dir: PathBuf,
+    migration_root: Option<std::sync::Arc<crate::services::twin_events::AnchoredRoot>>,
+    #[cfg(test)]
+    fail_manifest_write_at: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
+    blob_byte_limit: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
+    status_scan_byte_limit: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl MarkdownMigrationService {
@@ -70,6 +227,17 @@ impl MarkdownMigrationService {
             Self {
                 runs_dir: fallback.join("vault_migration").join("runs"),
                 data_path: fallback,
+                migration_root: None,
+                #[cfg(test)]
+                fail_manifest_write_at: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                #[cfg(test)]
+                blob_byte_limit: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(
+                    transaction::MAX_MIGRATION_BLOB_BYTES,
+                )),
+                #[cfg(test)]
+                status_scan_byte_limit: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(
+                    status::MAX_MIGRATION_STATUS_SCAN_BYTES,
+                )),
             }
         })
     }
@@ -79,9 +247,28 @@ impl MarkdownMigrationService {
         let runs_dir = base_dir.join("runs");
         std::fs::create_dir_all(&runs_dir)?;
         std::fs::create_dir_all(base_dir.join("overlay").join("notes"))?;
+        let migration_root = crate::services::twin_events::AnchoredRoot::open(&base_dir)
+            .map_err(anyhow::Error::new)?;
+        migration_root
+            .open_directory("runs", true)
+            .map_err(anyhow::Error::new)?;
+        migration_root
+            .open_directory("staging", true)
+            .map_err(anyhow::Error::new)?;
         Ok(Self {
             data_path,
             runs_dir,
+            migration_root: Some(std::sync::Arc::new(migration_root)),
+            #[cfg(test)]
+            fail_manifest_write_at: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            blob_byte_limit: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(
+                transaction::MAX_MIGRATION_BLOB_BYTES,
+            )),
+            #[cfg(test)]
+            status_scan_byte_limit: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(
+                status::MAX_MIGRATION_STATUS_SCAN_BYTES,
+            )),
         })
     }
 
@@ -94,187 +281,130 @@ impl MarkdownMigrationService {
         vault_path: PathBuf,
         request: MarkdownMigrationRequest,
     ) -> Result<MarkdownMigrationPreview> {
-        let store = KnowledgeStore::new(vault_path.clone(), self.data_path.clone());
+        let mut store = KnowledgeStore::new(vault_path.clone(), self.data_path.clone());
         let root_scope = crate::services::twin_events::root_identity_for_path(&vault_path)
             .map_err(anyhow::Error::new)?;
-        self.preview_scoped(&store, root_scope, request)
+        // Compatibility helper for isolated service tests. Production callers
+        // must use `preview_scoped` with the coordinator's exact authority.
+        self.preview_scoped_with_schema(
+            &mut store,
+            crate::services::vault_namespace::VaultAuthorityTokenV1 {
+                root_scope,
+                lease_epoch_uuid: Uuid::nil().to_string(),
+                authority_generation: 0,
+            },
+            request,
+            0,
+        )
     }
 
     pub(crate) fn preview_scoped(
         &self,
-        store: &KnowledgeStore,
-        root_scope: crate::models::twin_event::ContentDigest,
+        store: &mut KnowledgeStore,
+        authority: crate::services::vault_namespace::VaultAuthorityTokenV1,
         request: MarkdownMigrationRequest,
     ) -> Result<MarkdownMigrationPreview> {
+        self.preview_scoped_with_schema(store, authority, request, MIGRATION_PREVIEW_SCHEMA_VERSION)
+    }
+
+    fn preview_scoped_with_schema(
+        &self,
+        store: &mut KnowledgeStore,
+        authority: crate::services::vault_namespace::VaultAuthorityTokenV1,
+        request: MarkdownMigrationRequest,
+        schema_version: u16,
+    ) -> Result<MarkdownMigrationPreview> {
         let vault_path = store.vault_path().to_path_buf();
-        let notes = store.list_full_notes()?;
         let created_at = Utc::now();
         let preview_id = Uuid::new_v4().to_string();
+        let migration_root = self
+            .migration_root
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("retained migration capability is unavailable"))?;
+        let _transaction_lock = migration_root
+            .lock_exclusive("runs/transaction.lock")
+            .map_err(anyhow::Error::new)?;
+        if schema_version == MIGRATION_PREVIEW_SCHEMA_VERSION
+            && store.current_migration_authority()? != authority
+        {
+            anyhow::bail!("migration authority changed before preview scan");
+        }
+        let captured_authority = authority.clone();
         let hub_folder =
-            normalize_hub_folder(request.hub_folder.as_deref().unwrap_or("_grafyn/hubs"));
-        let program_path = normalize_program_path(
+            canonical_hub_folder(request.hub_folder.as_deref().unwrap_or("_grafyn/hubs"))?;
+        let program_path = canonical_program_path(
             request
                 .program_path
                 .as_deref()
                 .unwrap_or("_grafyn/program.md"),
-        );
-        let program_contents = default_program_file_contents(&hub_folder, &program_path);
-        let program_after_digest =
-            crate::services::twin_events::digest_bytes(program_contents.as_bytes());
-        let expected_program_target = match std::fs::read(vault_path.join(&program_path)) {
-            Ok(bytes) => ExpectedProgramTarget::Present {
-                digest: crate::services::twin_events::digest_bytes(&bytes),
-            },
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                ExpectedProgramTarget::Absent
-            }
-            Err(error) => return Err(error.into()),
-        };
-
-        let resolution_index = build_reference_index(&notes);
-        let existing_hubs = notes
+        )?;
+        let request = canonical_migration_request(&request, &hub_folder, &program_path);
+        let (source_snapshots, overlay_inventory) =
+            store.migration_source_snapshot(&program_path, created_at)?;
+        let source_inventory = source_snapshots
             .iter()
-            .filter(|note| note.is_topic_hub())
-            .filter_map(|note| note.topic_key().map(|key| (key, note.id.clone())))
-            .collect::<HashMap<_, _>>();
-
-        let mut summary = MarkdownMigrationPreviewSummary::default();
-        let mut topic_buckets: BTreeMap<String, MarkdownMigrationTopicCandidate> = BTreeMap::new();
-        let mut note_proposals = Vec::new();
-        let mut ambiguous_titles = HashMap::new();
-
-        summary.total_scanned_notes = notes.len();
-
-        for note in &notes {
-            let raw_path = vault_path.join(&note.relative_path);
-            let raw_content = std::fs::read_to_string(&raw_path).unwrap_or_default();
-            let has_frontmatter = raw_content.trim_start().starts_with("---");
-            if !has_frontmatter {
-                summary.files_without_frontmatter += 1;
-            }
-            if !raw_content.trim_start().starts_with("---\n")
-                || note.title == humanize_title(&note.relative_path)
-            {
-                summary.inferred_titles += 1;
-            }
-            if !note.aliases.is_empty() {
-                summary.inferred_aliases += note.aliases.len();
-            }
-
-            let inferred_tags = infer_topic_tags(note);
-            if !inferred_tags.is_empty() {
-                summary.inferred_tags_or_topic_seeds += inferred_tags.len();
-            }
-
-            let mut markdown_resolved = 0usize;
-            let mut wikilinks_resolved = 0usize;
-            for parsed_link in &note.parsed_links {
-                if let Some(target_path) = &parsed_link.target_path {
-                    if store.find_note_by_relative_path(target_path)?.is_some() {
-                        markdown_resolved += 1;
-                    }
-                } else if resolve_reference(parsed_link.target_title.as_str(), &resolution_index)
-                    .is_some()
-                {
-                    wikilinks_resolved += 1;
-                }
-            }
-            summary.markdown_links_resolved += markdown_resolved;
-            summary.wikilinks_resolved += wikilinks_resolved;
-
-            let collisions = find_ambiguous_references(note, &resolution_index);
-            if !collisions.is_empty() {
-                summary.ambiguous_matches += collisions.len();
-                ambiguous_titles.extend(collisions);
-            }
-
-            let inferred_link_ids = infer_unlinked_note_mentions(note, &resolution_index);
-            let topic_key = inferred_tags
-                .first()
-                .map(|value| normalize_topic_key(value))
-                .filter(|value| !value.is_empty());
-
-            let confidence = if note.tags.is_empty() { 0.78 } else { 0.91 };
-            let write_required = request.mode.allows_user_note_writes()
-                && (!inferred_link_ids.is_empty()
-                    || note.schema_version < CURRENT_NOTE_SCHEMA_VERSION
-                    || !inferred_tags.is_empty());
-
-            if write_required {
-                summary.files_to_rewrite += 1;
-            }
-            if !inferred_link_ids.is_empty() && request.mode.allows_user_note_writes() {
-                summary.proposed_auto_link_edits += inferred_link_ids.len().min(3);
-            }
-            if note.schema_version < CURRENT_NOTE_SCHEMA_VERSION && note.migration_source.is_none()
-            {
-                summary.old_grafyn_notes_eligible_for_backfill += 1;
-            }
-
-            if let Some(topic_key) = &topic_key {
-                let display_name = display_topic_name(topic_key);
-                let entry = topic_buckets.entry(topic_key.clone()).or_insert_with(|| {
-                    MarkdownMigrationTopicCandidate {
-                        topic_key: topic_key.clone(),
-                        display_name: display_name.clone(),
-                        reuse_existing_hub_id: existing_hubs.get(topic_key).cloned(),
-                        ..Default::default()
-                    }
-                });
-                entry.member_note_ids.push(note.id.clone());
-                entry.member_note_titles.push(note.title.clone());
-            }
-
-            note_proposals.push(MarkdownMigrationNoteProposal {
-                note_id: note.id.clone(),
-                title: note.title.clone(),
-                relative_path: note.relative_path.clone(),
-                aliases: note.aliases.clone(),
-                inferred_tags,
-                inferred_link_ids,
-                topic_key,
-                confidence,
-                write_required,
-            });
-        }
-
-        let topic_candidates = topic_buckets.into_values().collect::<Vec<_>>();
-        summary.proposed_hubs = topic_candidates
-            .iter()
-            .filter(|candidate| candidate.reuse_existing_hub_id.is_none())
-            .count();
-        summary.files_to_create = summary.proposed_hubs
-            + usize::from(matches!(
-                &expected_program_target,
-                ExpectedProgramTarget::Absent
-            ));
+            .map(|snapshot| snapshot.source.clone())
+            .collect::<Vec<_>>();
+        let derived = semantics::derive_preview_semantics(
+            &source_snapshots,
+            &request,
+            &hub_folder,
+            &program_path,
+        )?;
 
         let preview = MarkdownMigrationPreview {
+            schema_version,
             preview_id: preview_id.clone(),
-            root_scope: Some(root_scope),
+            root_scope: Some(authority.root_scope.clone()),
+            authority: Some(MigrationAuthoritySnapshotV1 {
+                root_scope: authority.root_scope,
+                lease_epoch_uuid: authority.lease_epoch_uuid,
+                authority_generation: authority.authority_generation,
+            }),
+            request: Some(request.clone()),
             vault_path: vault_path.to_string_lossy().to_string(),
             created_at: Some(created_at),
             mode: request.mode,
             hub_folder,
-            program_path,
-            expected_program_target: Some(expected_program_target),
-            program_after_digest: Some(program_after_digest),
-            summary,
-            topic_candidates,
-            note_proposals,
-            ambiguous_titles,
+            program_path: program_path.clone(),
+            expected_program_target: Some(derived.expected_program_target),
+            program_after_digest: Some(derived.program_after_digest),
+            summary: derived.summary,
+            topic_candidates: derived.topic_candidates,
+            note_proposals: derived.note_proposals,
+            source_inventory,
+            overlay_inventory,
+            ambiguous_titles: derived.ambiguous_titles,
         };
 
-        let run_dir = self.runs_dir.join(&preview_id);
-        std::fs::create_dir_all(&run_dir)?;
-        write_atomic(
-            &run_dir.join("preview.json"),
-            serde_json::to_string_pretty(&preview)?.as_bytes(),
-        )?;
+        let (finish_sources, finish_overlays) =
+            store.migration_source_snapshot(&program_path, created_at)?;
+        let finish_inventory = finish_sources
+            .into_iter()
+            .map(|snapshot| snapshot.source)
+            .collect::<Vec<_>>();
+        if finish_inventory != preview.source_inventory
+            || finish_overlays != preview.overlay_inventory
+        {
+            anyhow::bail!("migration sources changed while preview was being derived");
+        }
+        if schema_version == MIGRATION_PREVIEW_SCHEMA_VERSION
+            && store.current_migration_authority()? != captured_authority
+        {
+            anyhow::bail!("migration authority changed while preview was being derived");
+        }
+        let preview_bytes = serde_json::to_vec_pretty(&preview)?;
+        if preview_bytes.len() > MAX_MIGRATION_RECORD_BYTES {
+            anyhow::bail!("migration preview exceeds its bounded record limit");
+        }
+        migration_root
+            .put_atomic(&format!("runs/{preview_id}/preview.json"), &preview_bytes)
+            .map_err(anyhow::Error::new)?;
 
         Ok(preview)
     }
 
+    #[cfg(test)]
     pub fn apply(
         &self,
         preview_id: &str,
@@ -283,10 +413,11 @@ impl MarkdownMigrationService {
     ) -> Result<MarkdownMigrationApplyResult> {
         let root_scope = crate::services::twin_events::root_identity_for_path(store.vault_path())
             .map_err(anyhow::Error::new)?;
-        self.apply_scoped(preview_id, request, store, &root_scope)
+        self.apply_legacy_scoped(preview_id, request, store, &root_scope)
     }
 
-    pub(crate) fn apply_scoped(
+    #[cfg(test)]
+    fn apply_legacy_scoped(
         &self,
         preview_id: &str,
         request: MarkdownMigrationRequest,
@@ -532,6 +663,8 @@ impl MarkdownMigrationService {
             overlay_note_ids,
             skipped_fallback_note_ids,
             message,
+            warning: None,
+            accepted_request: manifest.request.clone(),
         })
     }
 
@@ -566,59 +699,20 @@ impl MarkdownMigrationService {
     pub(crate) fn status_scoped(
         &self,
         run_id: Option<&str>,
-        expected_root_scope: &crate::models::twin_event::ContentDigest,
+        expected_authority: &crate::services::vault_namespace::VaultAuthorityTokenV1,
     ) -> Result<MarkdownMigrationStatus> {
-        let target_id = match run_id {
-            Some(run_id) => Some(run_id.to_string()),
-            None => self.latest_run_id_for_scope(expected_root_scope)?,
-        };
-        let Some(target_id) = target_id else {
-            return Ok(MarkdownMigrationStatus {
-                status: "idle".into(),
-                ..Default::default()
-            });
-        };
-        let preview = self.load_preview(&target_id)?;
-        if preview.root_scope.is_none() {
-            return Ok(MarkdownMigrationStatus {
-                run_id: Some(target_id.clone()),
-                preview_id: Some(target_id),
-                status: "legacy_unscoped_audit_only".into(),
-                mode: Some(preview.mode),
-                created_at: preview.created_at,
-                rollback_available: false,
-                summary: Some(preview.summary),
-                ..Default::default()
-            });
-        }
-        if preview.root_scope.as_ref() != Some(expected_root_scope) {
-            anyhow::bail!("migration run belongs to another vault scope");
-        }
-        let manifest = self.load_manifest(&target_id).ok().filter(|manifest| {
-            manifest.root_scope.as_ref() == Some(expected_root_scope)
-        });
-        Ok(MarkdownMigrationStatus {
-            run_id: Some(target_id.clone()),
-            preview_id: Some(target_id),
-            status: manifest
-                .as_ref()
-                .map(|value| value.status.clone())
-                .unwrap_or_else(|| "previewed".into()),
-            mode: Some(preview.mode),
-            created_at: preview.created_at,
-            applied_at: manifest.as_ref().and_then(|value| value.applied_at),
-            rollback_available: manifest.is_some(),
-            summary: Some(preview.summary),
-        })
+        self.status_transaction(run_id, expected_authority)
     }
 
+    #[cfg(test)]
     pub fn rollback(&self, run_id: &str, store: &mut KnowledgeStore) -> Result<()> {
         let root_scope = crate::services::twin_events::root_identity_for_path(store.vault_path())
             .map_err(anyhow::Error::new)?;
-        self.rollback_scoped(run_id, store, &root_scope)
+        self.rollback_legacy_scoped(run_id, store, &root_scope)
     }
 
-    pub(crate) fn rollback_scoped(
+    #[cfg(test)]
+    fn rollback_legacy_scoped(
         &self,
         run_id: &str,
         store: &mut KnowledgeStore,
@@ -701,7 +795,9 @@ impl MarkdownMigrationService {
                 if let Err(error) = store.delete_vault_file_target_only_expected(
                     relative_path,
                     "migration",
-                    Some(crate::services::twin_events::BeforeImage::Sha256(after_digest)),
+                    Some(crate::services::twin_events::BeforeImage::Sha256(
+                        after_digest,
+                    )),
                 ) {
                     failures.push(format!(
                         "failed to remove created program file '{}': {}",
@@ -722,10 +818,9 @@ impl MarkdownMigrationService {
                         }
                     }
                     Ok(None) => {
-                        if let Err(error) = store.delete_vault_file_target_only(
-                            relative_path,
-                            "migration",
-                        ) {
+                        if let Err(error) =
+                            store.delete_vault_file_target_only(relative_path, "migration")
+                        {
                             failures.push(format!(
                                 "failed to remove derived migration file '{}': {}",
                                 relative_path, error
@@ -859,32 +954,6 @@ impl MarkdownMigrationService {
         Ok(newest.map(|(_, id)| id))
     }
 
-    fn latest_run_id_for_scope(
-        &self,
-        expected_root_scope: &crate::models::twin_event::ContentDigest,
-    ) -> Result<Option<String>> {
-        let mut newest: Option<(std::time::SystemTime, String)> = None;
-        for entry in std::fs::read_dir(&self.runs_dir)? {
-            let entry = entry?;
-            if !entry.file_type()?.is_dir() {
-                continue;
-            }
-            let id = entry.file_name().to_string_lossy().to_string();
-            let Ok(preview) = self.load_preview(&id) else {
-                continue;
-            };
-            if preview.root_scope.as_ref() != Some(expected_root_scope) {
-                continue;
-            }
-            let modified = entry.metadata()?.modified()?;
-            match &newest {
-                Some((current, _)) if current >= &modified => {}
-                _ => newest = Some((modified, id)),
-            }
-        }
-        Ok(newest.map(|(_, id)| id))
-    }
-
     fn load_preview(&self, preview_id: &str) -> Result<MarkdownMigrationPreview> {
         let path = self.runs_dir.join(preview_id).join("preview.json");
         let data = std::fs::read_to_string(&path)
@@ -906,6 +975,7 @@ impl MarkdownMigrationService {
     /// the in-memory manifest — this function intentionally does not touch manifest.json,
     /// since the manifest for a run is only written once, after `apply()` finishes, from
     /// the single in-memory `StoredManifest` it accumulates.
+    #[cfg(test)]
     fn backup_note(&self, run_dir: &Path, vault_path: &str, relative_path: &str) -> Result<bool> {
         let source_path = Path::new(vault_path).join(relative_path);
         if !source_path.exists() {
@@ -942,6 +1012,24 @@ fn require_current_preview_scope(
     Ok(())
 }
 
+fn serialize_usize_as_u64<S>(value: &usize, serializer: S) -> std::result::Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_u64(
+        u64::try_from(*value).map_err(|_| serde::ser::Error::custom("index exceeds u64"))?,
+    )
+}
+
+fn deserialize_u64_as_usize<'de, D>(deserializer: D) -> std::result::Result<usize, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = u64::deserialize(deserializer)?;
+    usize::try_from(value).map_err(|_| serde::de::Error::custom("index exceeds this platform"))
+}
+
+#[cfg(test)]
 fn expected_program_before_image(
     expected: &ExpectedProgramTarget,
 ) -> crate::services::twin_events::BeforeImage {
@@ -1068,6 +1156,7 @@ fn find_ambiguous_references(
     collisions
 }
 
+#[cfg(test)]
 fn append_related_links(
     content: &str,
     inferred_link_ids: &[String],
@@ -1128,6 +1217,44 @@ fn normalize_program_path(value: &str) -> String {
         .trim_matches('/')
         .trim()
         .to_string()
+}
+
+fn canonical_hub_folder(value: &str) -> Result<String> {
+    let normalized = normalize_hub_folder(value);
+    if normalized.is_empty() {
+        anyhow::bail!("migration hub folder cannot be empty");
+    }
+    crate::services::twin_events::validate_target_key(
+        crate::services::twin_events::TargetKind::Markdown,
+        &format!("{normalized}/probe.md"),
+    )
+    .map_err(anyhow::Error::new)?;
+    Ok(normalized)
+}
+
+fn canonical_program_path(value: &str) -> Result<String> {
+    let mut normalized = normalize_program_path(value);
+    if !normalized.to_ascii_lowercase().ends_with(".md") {
+        normalized.push_str(".md");
+    }
+    crate::services::twin_events::validate_target_key(
+        crate::services::twin_events::TargetKind::Markdown,
+        &normalized,
+    )
+    .map_err(anyhow::Error::new)?;
+    Ok(normalized)
+}
+
+fn migration_path_key(value: &str) -> String {
+    let normalized = value.trim().replace('\\', "/");
+    #[cfg(windows)]
+    {
+        normalized.to_lowercase()
+    }
+    #[cfg(not(windows))]
+    {
+        normalized
+    }
 }
 
 fn merge_unique_strings(existing: Vec<String>, additions: Vec<String>) -> Vec<String> {
@@ -1219,6 +1346,21 @@ fn default_program_file_contents(hub_folder: &str, program_path: &str) -> String
     )
 }
 
+fn canonical_migration_request(
+    request: &MarkdownMigrationRequest,
+    hub_folder: &str,
+    program_path: &str,
+) -> MarkdownMigrationRequest {
+    MarkdownMigrationRequest {
+        mode: request.mode.clone(),
+        hub_folder: Some(hub_folder.to_string()),
+        start_optimizer: Some(request.start_optimizer.unwrap_or(true)),
+        enable_llm: Some(request.enable_llm.unwrap_or(false)),
+        auto_insert_links: Some(request.auto_insert_links.unwrap_or(false)),
+        program_path: Some(program_path.to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1229,9 +1371,9 @@ mod tests {
     fn migration_program_put_is_target_only_and_crash_recoverable() {
         let vault_dir = tempdir().unwrap();
         let data_dir = tempdir().unwrap();
-        let events = std::sync::Arc::new(
-            crate::services::twin_events::TwinEventStore::new(data_dir.path()),
-        );
+        let events = std::sync::Arc::new(crate::services::twin_events::TwinEventStore::new(
+            data_dir.path(),
+        ));
         events.initialize().unwrap();
         let coordinator = std::sync::Arc::new(
             crate::services::twin_events::MutationCoordinator::new(
@@ -1247,6 +1389,9 @@ mod tests {
         let preview = service
             .preview(vault_dir.path().to_path_buf(), request.clone())
             .unwrap();
+        let authority_before = coordinator.current_authority_token().unwrap();
+        let expected_program =
+            default_program_file_contents(&preview.hub_folder, &preview.program_path);
         let mut store = KnowledgeStore::with_event_recorder(
             vault_dir.path().to_path_buf(),
             data_dir.path().to_path_buf(),
@@ -1254,11 +1399,34 @@ mod tests {
         );
         coordinator.fail_once_at(crate::services::twin_events::MutationFaultPoint::AfterStage);
 
-        assert!(service.apply(&preview.preview_id, request, &mut store).is_err());
-        assert!(!vault_dir.path().join("_grafyn/program.md").exists());
-        assert_eq!(coordinator.pending_count().unwrap(), 1);
-        assert_eq!(coordinator.recover_pending().unwrap(), 1);
-        assert!(vault_dir.path().join("_grafyn/program.md").is_file());
+        let applied = service
+            .apply(&preview.preview_id, request, &mut store)
+            .expect("the exact staged program mutation must converge in-call");
+        assert_eq!(applied.run_id, preview.preview_id);
+        assert_eq!(applied.status, "applied");
+        assert!(applied.created_hub_note_ids.is_empty());
+        assert!(applied.touched_note_ids.is_empty());
+        assert!(applied.overlay_note_ids.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(vault_dir.path().join("_grafyn/program.md")).unwrap(),
+            expected_program
+        );
+        let authority_after = coordinator.current_authority_token().unwrap();
+        assert_eq!(authority_after.root_scope, authority_before.root_scope);
+        assert_eq!(
+            authority_after.lease_epoch_uuid,
+            authority_before.lease_epoch_uuid
+        );
+        assert_eq!(
+            authority_after.authority_generation,
+            authority_before.authority_generation + 1
+        );
+        assert_eq!(coordinator.pending_count().unwrap(), 0);
+        assert_eq!(coordinator.recover_pending().unwrap(), 0);
+        assert_eq!(
+            coordinator.current_authority_token().unwrap(),
+            authority_after
+        );
         assert!(events.ordered_events().unwrap().is_empty());
     }
 
@@ -1286,9 +1454,7 @@ mod tests {
         assert!(persisted.contains(&preview.preview_id));
         assert_eq!(
             preview.root_scope,
-            Some(
-                crate::services::twin_events::root_identity_for_path(vault_dir.path()).unwrap()
-            )
+            Some(crate::services::twin_events::root_identity_for_path(vault_dir.path()).unwrap())
         );
         assert_eq!(
             preview.expected_program_target,
@@ -1310,6 +1476,57 @@ mod tests {
             assert!(persisted_json.get(key).is_some(), "missing {key}");
         }
         assert_no_tmp_siblings(&run_dir);
+    }
+
+    #[test]
+    fn preview_resolves_markdown_links_from_the_same_fresh_snapshot() {
+        let vault_dir = tempdir().unwrap();
+        let data_dir = tempdir().unwrap();
+        let events = std::sync::Arc::new(crate::services::twin_events::TwinEventStore::new(
+            data_dir.path(),
+        ));
+        events.initialize().unwrap();
+        let coordinator = std::sync::Arc::new(
+            crate::services::twin_events::MutationCoordinator::new(
+                data_dir.path(),
+                vault_dir.path(),
+                events,
+                std::sync::Arc::new(crate::services::twin_events::NoopMutationLifecycle),
+            )
+            .unwrap(),
+        );
+        let authority = coordinator.current_authority_token().unwrap();
+        let derived = crate::services::vault_namespace::scoped_data_path(
+            data_dir.path(),
+            &authority.root_scope,
+        );
+        let mut store = KnowledgeStore::with_event_recorder(
+            vault_dir.path().to_path_buf(),
+            data_dir.path().to_path_buf(),
+            coordinator,
+        );
+        store
+            .adopt_coordinated_vault_path(vault_dir.path().to_path_buf(), &derived)
+            .unwrap();
+        std::fs::write(
+            vault_dir.path().join("source.md"),
+            "# Source\n\n[Target](target.md)",
+        )
+        .unwrap();
+        std::fs::write(vault_dir.path().join("target.md"), "# Target").unwrap();
+        let service = MarkdownMigrationService::new(data_dir.path().to_path_buf());
+
+        let preview = service
+            .preview_scoped_with_schema(
+                &mut store,
+                authority,
+                MarkdownMigrationRequest::default(),
+                MIGRATION_PREVIEW_SCHEMA_VERSION,
+            )
+            .unwrap();
+
+        assert_eq!(preview.summary.total_scanned_notes, 2);
+        assert_eq!(preview.summary.markdown_links_resolved, 1);
     }
 
     #[test]
@@ -1336,11 +1553,8 @@ mod tests {
             .unwrap();
         std::fs::create_dir(vault.join("_grafyn")).unwrap();
         std::fs::write(vault.join("_grafyn/program.md"), b"user edit").unwrap();
-        let mut store = KnowledgeStore::with_event_recorder(
-            vault.clone(),
-            data.clone(),
-            coordinator.clone(),
-        );
+        let mut store =
+            KnowledgeStore::with_event_recorder(vault.clone(), data.clone(), coordinator.clone());
 
         let error = service
             .apply(
@@ -1349,7 +1563,9 @@ mod tests {
                 &mut store,
             )
             .unwrap_err();
-        assert!(error.to_string().contains("conditional mutation target changed"));
+        assert!(error
+            .to_string()
+            .contains("conditional mutation target changed"));
         assert_eq!(
             std::fs::read(vault.join("_grafyn/program.md")).unwrap(),
             b"user edit"
@@ -1384,11 +1600,8 @@ mod tests {
         let preview = service
             .preview(vault.clone(), MarkdownMigrationRequest::default())
             .unwrap();
-        let mut store = KnowledgeStore::with_event_recorder(
-            vault.clone(),
-            data,
-            coordinator.clone(),
-        );
+        let mut store =
+            KnowledgeStore::with_event_recorder(vault.clone(), data, coordinator.clone());
         let applied = service
             .apply(
                 &preview.preview_id,

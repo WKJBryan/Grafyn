@@ -1,6 +1,7 @@
 use super::shared::{
-    append_canvas_trace_expecting_authority, effective_model_ids, resolve_model_route,
-    source_tile_context_provider, ModelProviderRoute,
+    append_canvas_trace_expecting_authority, effective_model_ids, preserve_canvas_mutation_error,
+    repair_canvas_trace_error, resolve_model_route, source_tile_context_provider,
+    ModelProviderRoute,
 };
 use crate::models::canvas::{
     CanvasStreamEvent, ContextMode, Debate, DebateContinueRequest, DebateResponse, DebateRound,
@@ -15,11 +16,18 @@ use serde_json::json;
 use std::time::Duration;
 use tauri::{Emitter, State};
 
-fn no_cost_stream<S>(stream: S) -> std::pin::Pin<Box<dyn futures::Stream<Item = anyhow::Result<StreamUpdate>> + Send>>
+fn no_cost_stream<S>(
+    stream: S,
+) -> std::pin::Pin<Box<dyn futures::Stream<Item = anyhow::Result<StreamUpdate>> + Send>>
 where
     S: futures::Stream<Item = anyhow::Result<String>> + Send + 'static,
 {
-    Box::pin(stream.map(|result| result.map(|content| StreamUpdate { content, cost_usd: None })))
+    Box::pin(stream.map(|result| {
+        result.map(|content| StreamUpdate {
+            content,
+            cost_usd: None,
+        })
+    }))
 }
 
 /// Start a debate between models with streaming via Tauri events
@@ -109,16 +117,14 @@ pub async fn start_debate(
     // Save debate to session
     {
         let mut store = state.canvas_store.write().await;
-        store
-            .add_debate_expecting_authority(
-                &session_id,
-                debate.clone(),
-                input_root_epoch.clone(),
-            )
+        let commit = store
+            .add_debate_expecting_authority(&session_id, debate.clone(), input_root_epoch.clone())
             .map_err(|e| e.to_string())?;
+        crate::services::canvas_store::require_canvas_only_commit(&commit)
+            .map_err(|error| error.to_string())?;
     }
 
-    let root_epoch = match append_canvas_trace_expecting_authority(
+    let trace_commit = match append_canvas_trace_expecting_authority(
         state.twin_store.clone(),
         &session_id,
         TraceEventType::DebateStarted,
@@ -133,23 +139,38 @@ pub async fn start_debate(
     )
     .await
     {
-        Ok(epoch) => epoch,
+        Ok(commit) => commit,
         Err(error) => {
             drop(root_ticket);
+            crate::commands::acknowledge_reported_repair(
+                repair_canvas_trace_error(state.inner(), &error, "Canvas debate start").await,
+            );
             log::error!("Canvas debate was saved, but its audit trace failed: {error}");
             let _ = window.emit(
                 "canvas-stream",
                 CanvasStreamEvent::DebateCreated {
+                    session_id: session_id.clone(),
+                    debate: debate.clone(),
+                },
+            );
+            let _ = window.emit(
+                "canvas-stream",
+                CanvasStreamEvent::DebateError {
                     session_id,
-                    debate,
+                    debate_id: debate.id,
+                    model_id: "system".to_string(),
+                    error: format!(
+                        "Canvas debate was saved, but its required trace failed: {error}"
+                    ),
+                    round_number: 0,
                 },
             );
             return Ok(debate_id);
         }
     };
-    let root_epoch = match crate::commands::repair_after_authority_token(
+    let root_epoch = match crate::commands::repair_after_authority_mutation(
         state.inner(),
-        &root_epoch,
+        &trace_commit,
         "Canvas debate start",
     )
     .await
@@ -159,10 +180,7 @@ pub async fn start_debate(
             drop(root_ticket);
             let _ = window.emit(
                 "canvas-stream",
-                CanvasStreamEvent::DebateCreated {
-                    session_id,
-                    debate,
-                },
+                CanvasStreamEvent::DebateCreated { session_id, debate },
             );
             return Ok(debate_id);
         }
@@ -272,7 +290,15 @@ pub async fn start_debate(
                                 )
                                 .await;
                             drop(openrouter);
-                            result.map(|stream| Box::pin(stream) as std::pin::Pin<Box<dyn futures::Stream<Item = anyhow::Result<StreamUpdate>> + Send>>)
+                            result.map(|stream| {
+                                Box::pin(stream)
+                                    as std::pin::Pin<
+                                        Box<
+                                            dyn futures::Stream<Item = anyhow::Result<StreamUpdate>>
+                                                + Send,
+                                        >,
+                                    >
+                            })
                         }
                     };
 
@@ -424,25 +450,23 @@ pub async fn start_debate(
             };
             debate_state.rounds.push(round);
 
-            let round_root_guard = match crate::commands::acquire_expected_root_epoch(
-                &stream_root_state,
-                &root_epoch,
-            )
-            .await
-            {
-                Ok(guard) => guard,
-                Err(error) => {
-                    emit_debate_persist_error(
-                        &window,
-                        &session_id_clone,
-                        &debate_id_clone,
-                        round_num,
-                        &debate_state,
-                        &anyhow::anyhow!(error),
-                    );
-                    return;
-                }
-            };
+            let round_root_guard =
+                match crate::commands::acquire_expected_root_epoch(&stream_root_state, &root_epoch)
+                    .await
+                {
+                    Ok(guard) => guard,
+                    Err(error) => {
+                        emit_debate_persist_error(
+                            &window,
+                            &session_id_clone,
+                            &debate_id_clone,
+                            round_num,
+                            &debate_state,
+                            &anyhow::anyhow!(error),
+                        );
+                        return;
+                    }
+                };
 
             // Persist after each round. If this fails, surface it instead of
             // silently continuing to stream rounds that will never survive a
@@ -481,25 +505,23 @@ pub async fn start_debate(
             .last()
             .map(|round| round.round_number)
             .unwrap_or(max_rounds);
-        let root_guard = match crate::commands::acquire_expected_root_epoch(
-            &stream_root_state,
-            &root_epoch,
-        )
-        .await
-        {
-            Ok(guard) => guard,
-            Err(error) => {
-                emit_debate_persist_error(
-                    &window,
-                    &session_id_clone,
-                    &debate_id_clone,
-                    final_round_number,
-                    &debate_state,
-                    &anyhow::anyhow!(error),
-                );
-                return;
-            }
-        };
+        let root_guard =
+            match crate::commands::acquire_expected_root_epoch(&stream_root_state, &root_epoch)
+                .await
+            {
+                Ok(guard) => guard,
+                Err(error) => {
+                    emit_debate_persist_error(
+                        &window,
+                        &session_id_clone,
+                        &debate_id_clone,
+                        final_round_number,
+                        &debate_state,
+                        &anyhow::anyhow!(error),
+                    );
+                    return;
+                }
+            };
         let completion_commit = {
             let mut store = canvas_store_arc.write().await;
             match store.update_debate_expecting_authority(
@@ -592,7 +614,7 @@ pub async fn continue_debate(
     };
     root_ticket.validate(state.inner()).await?;
 
-    let root_epoch = append_canvas_trace_expecting_authority(
+    let trace_commit = match append_canvas_trace_expecting_authority(
         state.twin_store.clone(),
         &session_id,
         TraceEventType::DebateContinued,
@@ -603,10 +625,20 @@ pub async fn continue_debate(
         }),
         input_root_epoch,
     )
-    .await?;
-    let root_epoch = match crate::commands::repair_after_authority_token(
+    .await
+    {
+        Ok(commit) => commit,
+        Err(error) => {
+            drop(root_ticket);
+            crate::commands::acknowledge_reported_repair(
+                repair_canvas_trace_error(state.inner(), &error, "Canvas debate continue").await,
+            );
+            return Err(error.to_string());
+        }
+    };
+    let root_epoch = match crate::commands::repair_after_authority_mutation(
         state.inner(),
-        &root_epoch,
+        &trace_commit,
         "Canvas debate continue",
     )
     .await
@@ -700,7 +732,15 @@ pub async fn continue_debate(
                             )
                             .await;
                         drop(openrouter);
-                        result.map(|stream| Box::pin(stream) as std::pin::Pin<Box<dyn futures::Stream<Item = anyhow::Result<StreamUpdate>> + Send>>)
+                        result.map(|stream| {
+                            Box::pin(stream)
+                                as std::pin::Pin<
+                                    Box<
+                                        dyn futures::Stream<Item = anyhow::Result<StreamUpdate>>
+                                            + Send,
+                                    >,
+                                >
+                        })
                     }
                 };
 
@@ -851,25 +891,23 @@ pub async fn continue_debate(
         };
         debate_state.rounds.push(round);
 
-        let root_guard = match crate::commands::acquire_expected_root_epoch(
-            &stream_root_state,
-            &root_epoch,
-        )
-        .await
-        {
-            Ok(guard) => guard,
-            Err(error) => {
-                emit_debate_persist_error(
-                    &window,
-                    &session_id,
-                    &debate_id,
-                    round_num,
-                    &debate_state,
-                    &anyhow::anyhow!(error),
-                );
-                return;
-            }
-        };
+        let root_guard =
+            match crate::commands::acquire_expected_root_epoch(&stream_root_state, &root_epoch)
+                .await
+            {
+                Ok(guard) => guard,
+                Err(error) => {
+                    emit_debate_persist_error(
+                        &window,
+                        &session_id,
+                        &debate_id,
+                        round_num,
+                        &debate_state,
+                        &anyhow::anyhow!(error),
+                    );
+                    return;
+                }
+            };
 
         let commit = {
             let mut store = canvas_store_arc.write().await;
@@ -880,6 +918,17 @@ pub async fn continue_debate(
             ) {
                 Ok(commit) => commit,
                 Err(error) => {
+                    let error = preserve_canvas_mutation_error(error);
+                    drop(store);
+                    drop(root_guard);
+                    crate::commands::acknowledge_reported_repair(
+                        repair_canvas_trace_error(
+                            &stream_root_state,
+                            &error,
+                            "Canvas debate continuation persistence",
+                        )
+                        .await,
+                    );
                     emit_debate_persist_error(
                         &window,
                         &session_id,
@@ -892,9 +941,7 @@ pub async fn continue_debate(
                 }
             }
         };
-        root_epoch = commit
-            .authority_token
-            .unwrap_or_else(|| root_epoch.clone());
+        root_epoch = commit.authority_token.unwrap_or_else(|| root_epoch.clone());
         drop(root_guard);
         if !matches!(
             crate::commands::repair_after_authority_token(
@@ -929,7 +976,7 @@ fn emit_debate_persist_error(
     debate_id: &str,
     round_number: u32,
     debate_state: &Debate,
-    error: &anyhow::Error,
+    error: &(impl std::fmt::Display + ?Sized),
 ) {
     log::error!(
         "Failed to persist debate '{}' round {} for session '{}': {}",

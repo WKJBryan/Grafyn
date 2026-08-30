@@ -255,6 +255,14 @@ impl AnchoredRoot {
         &self,
         relative_directory: &str,
     ) -> Result<Vec<String>, MutationError> {
+        self.regular_file_names_bounded(relative_directory, usize::MAX)
+    }
+
+    pub(crate) fn regular_file_names_bounded(
+        &self,
+        relative_directory: &str,
+        max_entries: usize,
+    ) -> Result<Vec<String>, MutationError> {
         validate_relative_key(relative_directory)?;
         let directory = self.open_directory(relative_directory, false)?;
         let mut names = Vec::new();
@@ -271,6 +279,11 @@ impl AnchoredRoot {
             let name = name
                 .to_str()
                 .ok_or_else(|| MutationError::Invalid("filename is not UTF-8".into()))?;
+            if names.len() >= max_entries {
+                return Err(MutationError::Invalid(format!(
+                    "capability directory exceeds its {max_entries}-entry limit"
+                )));
+            }
             names.push(name.to_string());
         }
         names.sort();

@@ -144,17 +144,17 @@
             .unwrap();
         coordinator.fail_once_at(crate::services::twin_events::MutationFaultPoint::AfterTarget(0));
 
-        assert!(store
-            .review_constitution_item(
+        let (_, commit) = store
+            .review_constitution_item_with_commit(
                 &item.id,
                 ConstitutionReviewRequest {
                     action: MemoryDigestAction::Keep,
                     rationale: Some("Reviewed".to_string()),
                 },
             )
-            .is_err());
+            .unwrap();
+        assert!(commit.postcommit_warning);
         assert!(!store.trace_cache.contains_key("constitution-review"));
-        assert_eq!(coordinator.recover_pending().unwrap(), 1);
         assert_eq!(coordinator.recover_pending().unwrap(), 0);
 
         assert_eq!(events.ordered_events().unwrap().len(), 2);
@@ -213,9 +213,11 @@
             links: Vec::new(),
             metadata: HashMap::new(),
         };
-        store
+        assert!(store
             .write_pretty_json(&store.records_path.join("legacy-auto.json"), &legacy)
-            .unwrap();
+            .unwrap()
+            .authority_token
+            .is_none());
         let item = store
             .create_constitution_item(ConstitutionItemCreate {
                 claim: "Legacy-only active constitution".to_string(),
@@ -287,9 +289,11 @@
             content: "independent approved support".to_string(),
             ..legacy.clone()
         };
-        store
+        assert!(store
             .write_pretty_json(&store.records_path.join("endorsed-record.json"), &endorsed)
-            .unwrap();
+            .unwrap()
+            .authority_token
+            .is_none());
         let preserved = store
             .create_constitution_item(ConstitutionItemCreate {
                 claim: "Approved independent constitution".to_string(),

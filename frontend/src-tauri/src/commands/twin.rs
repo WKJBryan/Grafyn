@@ -14,20 +14,65 @@ use tauri::State;
 async fn run_twin_mutation<T>(
     state: &AppState,
     operation_name: &str,
-    operation: impl FnOnce(&mut crate::services::twin::TwinStore) -> anyhow::Result<T>,
+    operation: impl FnOnce(
+        &mut crate::services::twin::TwinStore,
+    ) -> anyhow::Result<(T, crate::services::twin_events::MutationCommit)>,
 ) -> Result<T, String> {
-    let _root_epoch = crate::commands::acquire_root_epoch(state).await?;
-    let (result, commit) = {
+    let root_ticket = crate::commands::acquire_root_epoch(state).await?;
+    let result = {
         let mut store = state.twin_store.write().await;
-        store.clear_last_mutation_commit();
-        let result = operation(&mut store).map_err(|error| error.to_string());
-        let commit = store.take_last_mutation_commit();
-        (result, commit)
+        operation(&mut store)
     };
-    if let Some(commit) = commit {
-        crate::commands::repair_after_authority_mutation(state, &commit, operation_name).await;
+    finish_twin_mutation(state, root_ticket, operation_name, result).await
+}
+
+async fn finish_twin_mutation<T>(
+    state: &AppState,
+    root_ticket: crate::commands::RootReadTicket,
+    operation_name: &str,
+    result: anyhow::Result<(T, crate::services::twin_events::MutationCommit)>,
+) -> Result<T, String> {
+    match result {
+        Ok((value, commit)) if commit.authority_token.is_some() => {
+            drop(root_ticket);
+            match crate::commands::repair_after_authority_mutation(state, &commit, operation_name)
+                .await
+            {
+                crate::commands::PostAuthorityRepair::NotRequired
+                | crate::commands::PostAuthorityRepair::Ready(_)
+                | crate::commands::PostAuthorityRepair::Unavailable(_) => {}
+            }
+            Ok(value)
+        }
+        Ok((value, _commit)) => {
+            root_ticket.finish(state).await?;
+            Ok(value)
+        }
+        Err(error) => {
+            if let Some(commit) = error
+                .downcast_ref::<crate::services::twin_events::MutationError>()
+                .and_then(|error| error.authority_advanced_commit())
+            {
+                drop(root_ticket);
+                match crate::commands::repair_after_authority_mutation(
+                    state,
+                    &commit,
+                    operation_name,
+                )
+                .await
+                {
+                    crate::commands::PostAuthorityRepair::NotRequired
+                    | crate::commands::PostAuthorityRepair::Ready(_)
+                    | crate::commands::PostAuthorityRepair::Unavailable(_) => {}
+                }
+                return Err(format!(
+                    "{operation_name} committed and is being recovered; do not retry"
+                ));
+            }
+            root_ticket.finish(state).await?;
+            Err(error.to_string())
+        }
     }
-    result
 }
 
 #[tauri::command]
@@ -66,7 +111,7 @@ pub async fn create_user_record(
     state: State<'_, AppState>,
 ) -> Result<UserRecord, String> {
     run_twin_mutation(state.inner(), "user record create", move |store| {
-        store.create_user_record(record)
+        store.create_user_record_with_commit(record)
     })
     .await
 }
@@ -78,7 +123,7 @@ pub async fn update_user_record(
     state: State<'_, AppState>,
 ) -> Result<UserRecord, String> {
     run_twin_mutation(state.inner(), "user record update", move |store| {
-        store.update_user_record(&id, update)
+        store.update_user_record_with_commit(&id, update)
     })
     .await
 }
@@ -104,7 +149,7 @@ pub async fn run_twin_inference(
     state: State<'_, AppState>,
 ) -> Result<TwinInferenceRunSummary, String> {
     run_twin_mutation(state.inner(), "Twin inference", |store| {
-        store.run_twin_inference()
+        store.run_twin_inference_with_commit()
     })
     .await
 }
@@ -144,7 +189,7 @@ pub async fn set_user_record_promotion(
     state: State<'_, AppState>,
 ) -> Result<UserRecord, String> {
     run_twin_mutation(state.inner(), "user record review", move |store| {
-        store.set_user_record_promotion(&id, promotion_state, rationale)
+        store.set_user_record_promotion_with_commit(&id, promotion_state, rationale)
     })
     .await
 }
@@ -154,15 +199,10 @@ pub async fn export_twin_data(
     request: TwinExportRequest,
     state: State<'_, AppState>,
 ) -> Result<crate::models::twin::ExportBundle, String> {
-    let root_ticket = crate::commands::acquire_derived_root_epoch(state.inner()).await?;
-    let result = {
-        let mut store = state.twin_store.write().await;
-        store
-            .export_bundle(request)
-            .map_err(|error| error.to_string())?
-    };
-    root_ticket.finish(state.inner()).await?;
-    Ok(result)
+    run_twin_mutation(state.inner(), "Twin export", move |store| {
+        store.export_bundle_with_commit(request)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -213,26 +253,17 @@ pub async fn update_decision_outcome(
         None
     };
     root_ticket.validate(state.inner()).await?;
-    let (result, commit) = {
+    let result = {
         let mut store = state.twin_store.write().await;
-        store.clear_last_mutation_commit();
-        let result = store
-            .update_decision_outcome_with_response_id(&id, update, selected_response_id)
-            .map_err(|error| error.to_string());
-        (result, store.take_last_mutation_commit())
+        store.update_decision_outcome_with_response_id_and_commit(&id, update, selected_response_id)
     };
-    if let Some(commit) = commit {
-        drop(root_ticket);
-        crate::commands::repair_after_authority_mutation(
-            state.inner(),
-            &commit,
-            "decision outcome update",
-        )
-        .await;
-    } else {
-        root_ticket.finish(state.inner()).await?;
-    }
-    result
+    finish_twin_mutation(
+        state.inner(),
+        root_ticket,
+        "decision outcome update",
+        result,
+    )
+    .await
 }
 
 fn resolve_persisted_response_id(
@@ -269,9 +300,11 @@ pub async fn update_decision_mirror_config(
     update: DecisionMirrorConfigUpdate,
     state: State<'_, AppState>,
 ) -> Result<DecisionMirrorConfig, String> {
-    run_twin_mutation(state.inner(), "decision mirror config update", move |store| {
-        store.update_decision_mirror_config(update)
-    })
+    run_twin_mutation(
+        state.inner(),
+        "decision mirror config update",
+        move |store| store.update_decision_mirror_config_with_commit(update),
+    )
     .await
 }
 
@@ -280,7 +313,7 @@ pub async fn reset_decision_mirror_config(
     state: State<'_, AppState>,
 ) -> Result<DecisionMirrorConfig, String> {
     run_twin_mutation(state.inner(), "decision mirror config reset", |store| {
-        store.reset_decision_mirror_config()
+        store.reset_decision_mirror_config_with_commit()
     })
     .await
 }
@@ -290,7 +323,7 @@ pub async fn list_memory_digest(
     state: State<'_, AppState>,
 ) -> Result<Vec<MemoryDigestItem>, String> {
     run_twin_mutation(state.inner(), "memory digest refresh", |store| {
-        store.list_memory_digest()
+        store.list_memory_digest_with_commit()
     })
     .await
 }
@@ -302,7 +335,7 @@ pub async fn review_memory_digest_item(
     state: State<'_, AppState>,
 ) -> Result<MemoryDigestItem, String> {
     run_twin_mutation(state.inner(), "memory digest review", move |store| {
-        store.review_memory_digest_item(&id, request)
+        store.review_memory_digest_item_with_commit(&id, request)
     })
     .await
 }
@@ -328,7 +361,7 @@ pub async fn create_constitution_item(
     state: State<'_, AppState>,
 ) -> Result<ConstitutionItem, String> {
     run_twin_mutation(state.inner(), "constitution item create", move |store| {
-        store.create_constitution_item(item)
+        store.create_constitution_item_with_commit(item)
     })
     .await
 }
@@ -340,7 +373,7 @@ pub async fn update_constitution_item(
     state: State<'_, AppState>,
 ) -> Result<ConstitutionItem, String> {
     run_twin_mutation(state.inner(), "constitution item update", move |store| {
-        store.update_constitution_item(&id, update)
+        store.update_constitution_item_with_commit(&id, update)
     })
     .await
 }
@@ -352,7 +385,7 @@ pub async fn review_constitution_item(
     state: State<'_, AppState>,
 ) -> Result<ConstitutionItem, String> {
     run_twin_mutation(state.inner(), "constitution item review", move |store| {
-        store.review_constitution_item(&id, request)
+        store.review_constitution_item_with_commit(&id, request)
     })
     .await
 }
@@ -375,7 +408,7 @@ pub async fn review_action_gap(
     state: State<'_, AppState>,
 ) -> Result<ActionGap, String> {
     run_twin_mutation(state.inner(), "action gap review", move |store| {
-        store.review_action_gap(&id, request)
+        store.review_action_gap_with_commit(&id, request)
     })
     .await
 }
@@ -401,7 +434,7 @@ pub async fn save_constitution_setup(
     state: State<'_, AppState>,
 ) -> Result<ConstitutionSetup, String> {
     run_twin_mutation(state.inner(), "constitution setup save", move |store| {
-        store.save_constitution_setup(setup)
+        store.save_constitution_setup_with_commit(setup)
     })
     .await
 }
@@ -410,28 +443,16 @@ pub async fn save_constitution_setup(
 pub async fn run_constitution_inference(
     state: State<'_, AppState>,
 ) -> Result<ConstitutionInferenceSummary, String> {
-    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
+    let root_ticket = crate::commands::acquire_root_epoch(state.inner()).await?;
     let notes = {
         let store = state.knowledge_store.read().await;
         store.list_full_notes().map_err(|error| error.to_string())?
     };
-    let (result, commit) = {
+    let result = {
         let mut store = state.twin_store.write().await;
-        store.clear_last_mutation_commit();
-        let result = store
-            .run_constitution_inference_with_notes(&notes)
-            .map_err(|error| error.to_string());
-        (result, store.take_last_mutation_commit())
+        store.run_constitution_inference_with_notes_and_commit(&notes)
     };
-    if let Some(commit) = commit {
-        crate::commands::repair_after_authority_mutation(
-            state.inner(),
-            &commit,
-            "constitution inference",
-        )
-        .await;
-    }
-    result
+    finish_twin_mutation(state.inner(), root_ticket, "constitution inference", result).await
 }
 
 #[tauri::command]
@@ -450,37 +471,50 @@ pub async fn record_canvas_feedback(
     };
     root_ticket.validate(state.inner()).await?;
 
-    let (result, commit) = {
+    let result = {
         let mut twin_store = state.twin_store.write().await;
-        twin_store.clear_last_mutation_commit();
-        let result = twin_store
-            .record_canvas_feedback(&session, request)
-            .map_err(|error| error.to_string());
-        (result, twin_store.take_last_mutation_commit())
+        twin_store.record_canvas_feedback_with_commit(&session, request)
     };
-    if let Some(commit) = commit {
-        drop(root_ticket);
-        crate::commands::repair_after_authority_mutation(
-            state.inner(),
-            &commit,
-            "Canvas feedback",
-        )
-        .await;
-    } else {
-        root_ticket.finish(state.inner()).await?;
-    }
-    result
+    finish_twin_mutation(state.inner(), root_ticket, "Canvas feedback", result).await
 }
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_persisted_response_id;
+    use super::{resolve_persisted_response_id, run_twin_mutation};
     use crate::models::canvas::{CanvasSession, ModelResponse, PromptTile};
-    use crate::models::twin::{ConstitutionItemCreate, ConstitutionItemUpdate};
+    use crate::models::twin::{ConstitutionItemCreate, ConstitutionItemUpdate, TwinExportRequest};
     use crate::services::twin::TwinStore;
     use std::sync::Arc;
     use tempfile::tempdir;
     use tokio::sync::RwLock;
+
+    #[tokio::test]
+    async fn export_command_repairs_its_exact_commit_and_publishes_ready() {
+        let (mut state, _vault_dir, data_dir) =
+            crate::commands::commit_note_write_tests::build_test_state();
+        let coordinator = state.mutation_coordinator.as_ref().unwrap().clone();
+        let initial = coordinator.current_authority_token().unwrap();
+        *state.loaded_authority.write().await = Some(initial.clone());
+        let twin_target_root = data_dir.path().join("twin");
+        let twin_root = twin_target_root.join("scope-one");
+        state.twin_store = Arc::new(RwLock::new(TwinStore::with_event_recorder(
+            twin_root,
+            twin_target_root,
+            coordinator.clone(),
+        )));
+
+        let bundle = run_twin_mutation(&state, "Twin export", |store| {
+            store.export_bundle_with_commit(TwinExportRequest::default())
+        })
+        .await
+        .expect("export and exact-token repair should succeed");
+
+        let ready = coordinator.current_authority_token().unwrap();
+        assert_eq!(ready.authority_generation, initial.authority_generation + 1);
+        assert_eq!(state.loaded_authority.read().await.as_ref(), Some(&ready));
+        coordinator.require_namespace_ready().unwrap();
+        assert!(std::path::Path::new(&bundle.manifest_path).is_file());
+    }
 
     #[test]
     fn selected_outcome_response_resolves_the_persisted_canvas_response_id() {

@@ -4,7 +4,8 @@ use super::context::{
 };
 use super::shared::{
     append_canvas_trace_expecting_authority, effective_model_ids, is_vault_context_prompt,
-    resolve_model_route, ModelProviderRoute,
+    preserve_canvas_mutation_error, repair_canvas_trace_error, resolve_model_route,
+    CanvasTraceMutationError, ModelProviderRoute,
 };
 use crate::models::canvas::{
     AddModelsRequest, CanvasStreamEvent, ContextMode, ModelResponse, PromptRequest, PromptTile,
@@ -187,7 +188,7 @@ pub async fn send_prompt(
 
     // A decision tile, its decision episode, and the decision trace are one
     // coordinated mutation. Ordinary prompts use the same Canvas boundary.
-    let initial_commit = {
+    let initial_commit = match {
         let mut store = state.canvas_store.write().await;
         if let Some(create) = decision_create {
             let mut twin_store = state.twin_store.write().await;
@@ -199,21 +200,30 @@ pub async fn send_prompt(
                     create,
                     input_root_epoch.clone(),
                 )
-                .map_err(|error| error.to_string())?
-                .1
+                .map(|(_, commit)| commit)
         } else {
             store
                 .add_tile_expecting_authority(&session_id, tile.clone(), input_root_epoch.clone())
-                .map_err(|error| error.to_string())?
-                .1
+                .map(|(_, commit)| commit)
+        }
+    } {
+        Ok(commit) => commit,
+        Err(error) => {
+            let error = preserve_canvas_mutation_error(error);
+            drop(root_ticket);
+            crate::commands::acknowledge_reported_repair(
+                repair_canvas_trace_error(state.inner(), &error, "Canvas prompt").await,
+            );
+            return Err(error.to_string());
         }
     };
     let mut root_epoch = initial_commit.authority_token.clone().ok_or_else(|| {
         "Canvas prompt mutation did not advance the content authority generation".to_string()
     })?;
+    let mut repair_commit = initial_commit.clone();
 
     if decision_episode_id.is_none() {
-        root_epoch = match append_canvas_trace_expecting_authority(
+        let trace_commit = match append_canvas_trace_expecting_authority(
             state.twin_store.clone(),
             &session_id,
             TraceEventType::PromptSubmitted,
@@ -242,14 +252,12 @@ pub async fn send_prompt(
         )
         .await
         {
-            Ok(epoch) => epoch,
+            Ok(commit) => commit,
             Err(error) => {
-                crate::commands::repair_after_authority_mutation(
-                    state.inner(),
-                    &initial_commit,
-                    "Canvas prompt",
-                )
-                .await;
+                let error = error.with_fallback_commit(initial_commit.clone());
+                crate::commands::acknowledge_reported_repair(
+                    repair_canvas_trace_error(state.inner(), &error, "Canvas prompt").await,
+                );
                 drop(root_ticket);
                 let _ = window.emit(
                     "canvas-stream",
@@ -270,10 +278,14 @@ pub async fn send_prompt(
                 return Ok(tile_id);
             }
         };
+        root_epoch = trace_commit.authority_token.clone().ok_or_else(|| {
+            "Canvas prompt trace did not advance the content authority generation".to_string()
+        })?;
+        repair_commit = trace_commit;
     }
-    root_epoch = match crate::commands::repair_after_authority_token(
+    root_epoch = match crate::commands::repair_after_authority_mutation(
         state.inner(),
-        &root_epoch,
+        &repair_commit,
         "Canvas prompt",
     )
     .await
@@ -582,10 +594,27 @@ pub async fn send_prompt(
             ) {
                 Ok(commit) => commit,
                 Err(error) => {
+                    let error = preserve_canvas_mutation_error(error);
                     let model_ids: Vec<String> = results
                         .iter()
                         .map(|(model_id, _, _, _, _)| model_id.clone())
                         .collect();
+                    drop(store);
+                    drop(root_guard);
+                    let repair = repair_canvas_trace_error(
+                        &stream_root_state,
+                        &error,
+                        "Canvas response persistence",
+                    )
+                    .await;
+                    let failed_epoch = match &repair {
+                        crate::commands::PostAuthorityRepair::Ready(epoch) => epoch.clone(),
+                        _ => error
+                            .repair_commit()
+                            .and_then(|commit| commit.authority_token.clone())
+                            .unwrap_or_else(|| stream_root_epoch.clone()),
+                    };
+                    crate::commands::acknowledge_reported_repair(repair);
                     emit_persistence_error(
                         &window,
                         &session_id_clone,
@@ -593,14 +622,12 @@ pub async fn send_prompt(
                         &model_ids,
                         &error,
                     );
-                    drop(store);
-                    drop(root_guard);
                     if let Some(episode_id) = decision_episode_id_for_reflection.as_deref() {
                         fail_requested_prediction_if_same_root(
                             &stream_root_state,
                             &twin_store_arc,
                             episode_id,
-                            &stream_root_epoch,
+                            &failed_epoch,
                             "visible response persistence",
                         )
                         .await;
@@ -611,28 +638,52 @@ pub async fn send_prompt(
         };
         let mut publication_epoch = response_commit
             .authority_token
+            .clone()
             .unwrap_or_else(|| stream_root_epoch.clone());
+        let mut publication_commit = response_commit;
         drop(root_guard);
 
-        publication_epoch = match append_model_result_traces(
+        publication_commit = match append_model_result_traces(
             twin_store_arc.clone(),
             &session_id_clone,
             &tile_id_clone,
             "send_prompt",
             &results,
-            publication_epoch.clone(),
+            publication_commit,
         )
         .await
         {
-            Ok(epoch) => epoch,
+            Ok(commit) => commit,
             Err(error) => {
                 log::error!("Failed to append governed Canvas result trace: {error}");
+                let model_ids = results
+                    .iter()
+                    .map(|(model_id, _, _, _, _)| model_id.clone())
+                    .collect::<Vec<_>>();
+                let repair =
+                    repair_canvas_trace_error(&stream_root_state, &error, "Canvas response trace")
+                        .await;
+                let failed_epoch = match &repair {
+                    crate::commands::PostAuthorityRepair::Ready(epoch) => epoch.clone(),
+                    _ => error
+                        .repair_commit()
+                        .and_then(|commit| commit.authority_token.clone())
+                        .unwrap_or_else(|| publication_epoch.clone()),
+                };
+                crate::commands::acknowledge_reported_repair(repair);
+                emit_persistence_error(
+                    &window,
+                    &session_id_clone,
+                    &tile_id_clone,
+                    &model_ids,
+                    &error,
+                );
                 if let Some(episode_id) = decision_episode_id_for_reflection.as_deref() {
                     fail_requested_prediction_if_same_root(
                         &stream_root_state,
                         &twin_store_arc,
                         episode_id,
-                        &publication_epoch,
+                        &failed_epoch,
                         "visible response trace",
                     )
                     .await;
@@ -640,6 +691,10 @@ pub async fn send_prompt(
                 return;
             }
         };
+        publication_epoch = publication_commit
+            .authority_token
+            .clone()
+            .expect("governed result traces must carry authority");
 
         if let Some(decision_episode_id) = decision_episode_id_for_reflection.as_deref() {
             let mut twin_store = twin_store_arc.write().await;
@@ -665,24 +720,66 @@ pub async fn send_prompt(
                 ) {
                     Ok(committed) => committed,
                     Err(error) => {
+                        let error = preserve_canvas_mutation_error(error)
+                            .with_fallback_commit(publication_commit.clone());
                         log::error!("Failed to persist governed reflection card: {error}");
                         drop(twin_store);
+                        let repair = repair_canvas_trace_error(
+                            &stream_root_state,
+                            &error,
+                            "Canvas reflection card",
+                        )
+                        .await;
+                        let failed_epoch = match &repair {
+                            crate::commands::PostAuthorityRepair::Ready(epoch) => epoch.clone(),
+                            _ => error
+                                .repair_commit()
+                                .and_then(|commit| commit.authority_token.clone())
+                                .unwrap_or_else(|| publication_epoch.clone()),
+                        };
+                        crate::commands::acknowledge_reported_repair(repair);
+                        emit_persistence_error(
+                            &window,
+                            &session_id_clone,
+                            &tile_id_clone,
+                            std::slice::from_ref(model_id),
+                            &error,
+                        );
                         fail_requested_prediction_if_same_root(
                             &stream_root_state,
                             &twin_store_arc,
                             decision_episode_id,
-                            &publication_epoch,
+                            &failed_epoch,
                             "visible response reflection",
                         )
                         .await;
                         return;
                     }
                 };
-                publication_epoch = match commit.authority_token {
+                publication_epoch = match commit.authority_token.clone() {
                     Some(epoch) => epoch,
                     None => {
-                        log::error!("Reflection-card mutation did not advance authority");
+                        let error = CanvasTraceMutationError::precommit(
+                            "Reflection-card mutation did not advance authority",
+                        )
+                        .with_fallback_commit(publication_commit.clone());
+                        log::error!("{error}");
                         drop(twin_store);
+                        crate::commands::acknowledge_reported_repair(
+                            repair_canvas_trace_error(
+                                &stream_root_state,
+                                &error,
+                                "Canvas reflection card",
+                            )
+                            .await,
+                        );
+                        emit_persistence_error(
+                            &window,
+                            &session_id_clone,
+                            &tile_id_clone,
+                            std::slice::from_ref(model_id),
+                            &error,
+                        );
                         fail_requested_prediction_if_same_root(
                             &stream_root_state,
                             &twin_store_arc,
@@ -694,12 +791,13 @@ pub async fn send_prompt(
                         return;
                     }
                 };
+                publication_commit = commit;
             }
         }
 
-        let published_epoch = match crate::commands::repair_after_authority_token(
+        let published_epoch = match crate::commands::repair_after_authority_mutation(
             &stream_root_state,
-            &publication_epoch,
+            &publication_commit,
             "Canvas response",
         )
         .await
@@ -916,9 +1014,11 @@ pub async fn add_models_to_tile(
                 t.responses.insert(model_id.clone(), response);
             }
             session.updated_at = Utc::now();
-            store
+            let commit = store
                 .save_session_expecting_authority(&session, root_epoch.clone())
                 .map_err(|e| e.to_string())?;
+            crate::services::canvas_store::require_canvas_only_commit(&commit)
+                .map_err(|error| error.to_string())?;
         }
     }
     drop(root_ticket);
@@ -1128,21 +1228,33 @@ pub async fn add_models_to_tile(
             ) {
                 Ok(commit) => commit,
                 Err(error) => {
+                    let error = preserve_canvas_mutation_error(error);
                     let model_ids: Vec<String> = results
                         .iter()
                         .map(|(model_id, _, _, _, _)| model_id.clone())
                         .collect();
+                    drop(store);
+                    drop(root_guard);
+                    crate::commands::acknowledge_reported_repair(
+                        repair_canvas_trace_error(
+                            &stream_root_state,
+                            &error,
+                            "Canvas added-model response persistence",
+                        )
+                        .await,
+                    );
                     emit_persistence_error(&window, &session_id, &tile_id, &model_ids, &error);
                     return;
                 }
             }
         };
-        let mut publication_epoch = response_commit
+        let publication_epoch = response_commit
             .authority_token
+            .clone()
             .unwrap_or_else(|| root_epoch.clone());
         drop(root_guard);
 
-        publication_epoch = match append_canvas_trace_expecting_authority(
+        let mut publication_commit = match append_canvas_trace_expecting_authority(
             twin_store_arc.clone(),
             &session_id,
             TraceEventType::ModelsAdded,
@@ -1154,33 +1266,66 @@ pub async fn add_models_to_tile(
         )
         .await
         {
-            Ok(epoch) => epoch,
+            Ok(commit) => commit,
             Err(error) => {
+                let error = error.with_fallback_commit(response_commit.clone());
                 log::error!("Failed to persist governed models-added trace: {error}");
+                crate::commands::acknowledge_reported_repair(
+                    repair_canvas_trace_error(
+                        &stream_root_state,
+                        &error,
+                        "Canvas models-added trace",
+                    )
+                    .await,
+                );
+                let model_ids = results
+                    .iter()
+                    .map(|(model_id, _, _, _, _)| model_id.clone())
+                    .collect::<Vec<_>>();
+                emit_persistence_error(
+                    &window,
+                    &session_id,
+                    &tile_id,
+                    &model_ids,
+                    &error,
+                );
                 return;
             }
         };
-        publication_epoch = match append_model_result_traces(
+        publication_commit = match append_model_result_traces(
             twin_store_arc.clone(),
             &session_id,
             &tile_id,
             "add_models_to_tile",
             &results,
-            publication_epoch,
+            publication_commit,
         )
         .await
         {
-            Ok(epoch) => epoch,
+            Ok(commit) => commit,
             Err(error) => {
                 log::error!("Failed to persist governed added-model result trace: {error}");
+                crate::commands::acknowledge_reported_repair(
+                    repair_canvas_trace_error(
+                        &stream_root_state,
+                        &error,
+                        "Canvas added-model result trace",
+                    )
+                    .await,
+                );
+                let model_ids = results
+                    .iter()
+                    .map(|(model_id, _, _, _, _)| model_id.clone())
+                    .collect::<Vec<_>>();
+                emit_persistence_error(&window, &session_id, &tile_id, &model_ids, &error);
                 return;
             }
         };
 
         if !matches!(
-            crate::commands::repair_after_authority_token(
+            crate::commands::repair_after_authority_mutation(
                 &stream_root_state,
-                &publication_epoch,
+                &publication_commit,
                 "Canvas models added",
             )
             .await,
@@ -1245,7 +1390,7 @@ pub async fn regenerate_response(
     // Reset response to streaming
     {
         let mut store = state.canvas_store.write().await;
-        store
+        let commit = store
             .update_tile_response_expecting_authority(
                 &session_id,
                 &tile_id,
@@ -1256,6 +1401,8 @@ pub async fn regenerate_response(
                 None,
                 root_epoch.clone(),
             )
+            .map_err(|error| error.to_string())?;
+        crate::services::canvas_store::require_canvas_only_commit(&commit)
             .map_err(|error| error.to_string())?;
     }
     drop(root_ticket);
@@ -1404,6 +1551,17 @@ pub async fn regenerate_response(
             ) {
                 Ok(commit) => commit,
                 Err(error) => {
+                    let error = preserve_canvas_mutation_error(error);
+                    drop(store);
+                    drop(root_guard);
+                    crate::commands::acknowledge_reported_repair(
+                        repair_canvas_trace_error(
+                            &stream_root_state,
+                            &error,
+                            "Canvas regenerated-response persistence",
+                        )
+                        .await,
+                    );
                     emit_persistence_error(
                         &window,
                         &session_id,
@@ -1417,9 +1575,10 @@ pub async fn regenerate_response(
         };
         let publication_epoch = response_commit
             .authority_token
+            .clone()
             .unwrap_or_else(|| root_epoch.clone());
         drop(root_guard);
-        let publication_epoch = match append_canvas_trace_expecting_authority(
+        let trace_commit = match append_canvas_trace_expecting_authority(
             twin_store_arc,
             &session_id,
             TraceEventType::ResponseRegenerated,
@@ -1434,16 +1593,32 @@ pub async fn regenerate_response(
         )
         .await
         {
-            Ok(epoch) => epoch,
+            Ok(commit) => commit,
             Err(error) => {
+                let error = error.with_fallback_commit(response_commit.clone());
                 log::error!("Failed to persist governed regeneration trace: {error}");
+                crate::commands::acknowledge_reported_repair(
+                    repair_canvas_trace_error(
+                        &stream_root_state,
+                        &error,
+                        "Canvas response regeneration trace",
+                    )
+                    .await,
+                );
+                emit_persistence_error(
+                    &window,
+                    &session_id,
+                    &tile_id,
+                    std::slice::from_ref(&model_id),
+                    &error,
+                );
                 return;
             }
         };
         if !matches!(
-            crate::commands::repair_after_authority_token(
+            crate::commands::repair_after_authority_mutation(
                 &stream_root_state,
-                &publication_epoch,
+                &trace_commit,
                 "Canvas response regeneration",
             )
             .await,
@@ -1492,8 +1667,13 @@ async fn append_model_result_traces(
     tile_id: &str,
     trigger: &str,
     results: &[StreamedResponseUpdate],
-    mut expected: crate::services::vault_namespace::VaultAuthorityTokenV1,
-) -> Result<crate::services::vault_namespace::VaultAuthorityTokenV1, String> {
+    mut latest_commit: crate::services::twin_events::MutationCommit,
+) -> Result<crate::services::twin_events::MutationCommit, CanvasTraceMutationError> {
+    let mut expected = latest_commit.authority_token.clone().ok_or_else(|| {
+        CanvasTraceMutationError::precommit(
+            "Canvas response mutation did not advance the content authority generation",
+        )
+    })?;
     for (model_id, content, status, error, _) in results {
         let event_type = if *status == ResponseStatus::Error {
             TraceEventType::ResponseErrored
@@ -1501,7 +1681,7 @@ async fn append_model_result_traces(
             TraceEventType::ResponseCompleted
         };
 
-        expected = append_canvas_trace_expecting_authority(
+        latest_commit = match append_canvas_trace_expecting_authority(
             twin_store_arc.clone(),
             session_id,
             event_type,
@@ -1515,9 +1695,19 @@ async fn append_model_result_traces(
             }),
             expected,
         )
-        .await?;
+        .await
+        {
+            Ok(commit) => commit,
+            Err(error) => return Err(error.with_fallback_commit(latest_commit)),
+        };
+        expected = latest_commit.authority_token.clone().ok_or_else(|| {
+            CanvasTraceMutationError::precommit(
+                "Canvas response trace did not advance the content authority generation",
+            )
+            .with_fallback_commit(latest_commit.clone())
+        })?;
     }
-    Ok(expected)
+    Ok(latest_commit)
 }
 
 fn emit_canvas_error(
@@ -1549,7 +1739,7 @@ fn emit_persistence_error(
     session_id: &str,
     tile_id: &str,
     model_ids: &[String],
-    error: &anyhow::Error,
+    error: &(impl std::fmt::Display + ?Sized),
 ) {
     log::error!(
         "Failed to persist canvas tile '{}' responses for session '{}': {}",

@@ -737,6 +737,26 @@ fn build_topic_hub_updates(
 
 // ── Main distill command ───────────────────────────────────────────────────
 
+async fn complete_distill_note_mutation(
+    state: &AppState,
+    expected: &crate::services::vault_namespace::VaultAuthorityTokenV1,
+    prior_commit: Option<&crate::services::twin_events::MutationCommit>,
+    mutation: anyhow::Result<(
+        crate::models::note::Note,
+        crate::services::twin_events::MutationCommit,
+    )>,
+    operation: &str,
+) -> Result<crate::commands::CompletedKnowledgeNoteMutation, String> {
+    crate::commands::complete_knowledge_note_mutation(
+        state,
+        expected,
+        prior_commit,
+        mutation,
+        operation,
+    )
+    .await
+}
+
 /// Distill a container note into atomic draft notes with configurable
 /// extraction mode, deduplication, and hub creation policy.
 #[tauri::command]
@@ -747,6 +767,8 @@ pub async fn distill_note(
 ) -> Result<DistillResponse, String> {
     let root_ticket = crate::commands::acquire_root_epoch(state.inner()).await?;
     let mut root_epoch = root_ticket.authority().clone();
+    let mut latest_commit = None;
+    let mut repair_pending = false;
     // 1. Get the container note
     let note = {
         let store = state.knowledge_store.read().await;
@@ -798,6 +820,7 @@ pub async fn distill_note(
     };
 
     if candidates.is_empty() {
+        root_ticket.finish(state.inner()).await?;
         return Ok(DistillResponse {
             created_note_ids: vec![],
             hub_updates: vec![],
@@ -868,21 +891,28 @@ pub async fn distill_note(
                             ..Default::default()
                         };
 
-                        let updated = {
+                        let mutation = {
                             let mut store = state.knowledge_store.write().await;
-                            store
-                                .update_note_expecting_authority(
-                                    &existing_id,
-                                    update,
-                                    "note_editor",
-                                    root_epoch.clone(),
-                                )
-                                .ok()
+                            store.update_note_expecting_authority(
+                                &existing_id,
+                                update,
+                                "note_editor",
+                                root_epoch.clone(),
+                            )
                         };
 
-                        if let Some((_updated_note, commit)) = updated {
-                            root_epoch =
-                                commit.authority_token.unwrap_or_else(|| root_epoch.clone());
+                        let completed = complete_distill_note_mutation(
+                            state.inner(),
+                            &root_epoch,
+                            latest_commit.as_ref(),
+                            mutation,
+                            "note distillation merge",
+                        )
+                        .await?;
+                        root_epoch = completed.continuation_authority;
+                        if let Some(commit) = completed.commit {
+                            latest_commit = Some(commit);
+                            repair_pending = !completed.repaired;
                         }
                     }
 
@@ -939,15 +969,25 @@ pub async fn distill_note(
         };
 
         // Create the note
-        let (created, commit) = {
+        let mutation = {
             let mut store = state.knowledge_store.write().await;
-            store
-                .create_note_expecting_authority(note_create, "note_editor", root_epoch.clone())
-                .map_err(|e| e.to_string())?
+            store.create_note_expecting_authority(note_create, "note_editor", root_epoch.clone())
         };
-        root_epoch = commit.authority_token.unwrap_or_else(|| root_epoch.clone());
+        let completed = complete_distill_note_mutation(
+            state.inner(),
+            &root_epoch,
+            latest_commit.as_ref(),
+            mutation,
+            "note distillation create",
+        )
+        .await?;
+        root_epoch = completed.continuation_authority;
+        if let Some(commit) = completed.commit {
+            latest_commit = Some(commit);
+            repair_pending = !completed.repaired;
+        }
 
-        created_ids.push(created.id.clone());
+        created_ids.push(completed.note.id);
     }
 
     // 6. Update container note with extracted links
@@ -986,36 +1026,44 @@ pub async fn distill_note(
             ..Default::default()
         };
 
-        let updated = {
+        let mutation = {
             let mut store = state.knowledge_store.write().await;
-            store
-                .update_note_expecting_authority(&id, update, "note_editor", root_epoch.clone())
-                .ok()
+            store.update_note_expecting_authority(&id, update, "note_editor", root_epoch.clone())
         };
 
-        if let Some((_updated_note, commit)) = updated {
-            root_epoch = commit.authority_token.unwrap_or_else(|| root_epoch.clone());
-            true
-        } else {
-            false
+        let completed = complete_distill_note_mutation(
+            state.inner(),
+            &root_epoch,
+            latest_commit.as_ref(),
+            mutation,
+            "note distillation container update",
+        )
+        .await?;
+        if let Some(commit) = completed.commit {
+            latest_commit = Some(commit);
+            repair_pending = !completed.repaired;
         }
+        true
     } else {
         false
     };
 
-    state
-        .mutation_coordinator
-        .as_ref()
-        .ok_or_else(|| "mutation coordinator is unavailable".to_string())?
-        .validate_authority_token(&root_epoch, false)
-        .map_err(|error| error.to_string())?;
-    drop(root_ticket);
-    let repair = crate::commands::repair_after_authority_token(
-        state.inner(),
-        &root_epoch,
-        "note distillation",
-    )
-    .await;
+    let repair = if let Some(commit) = latest_commit.as_ref() {
+        drop(root_ticket);
+        if repair_pending {
+            crate::commands::repair_after_authority_mutation(
+                state.inner(),
+                commit,
+                "note distillation",
+            )
+            .await
+        } else {
+            crate::commands::PostAuthorityRepair::NotRequired
+        }
+    } else {
+        root_ticket.finish(state.inner()).await?;
+        crate::commands::PostAuthorityRepair::NotRequired
+    };
     let synced_notes = {
         let mut store = state.knowledge_store.write().await;
         store.reload_authoritative_state();
@@ -1087,6 +1135,7 @@ pub async fn normalize_tags(
     // Only update if tags changed
     let existing_normalized: Vec<String> = normalize_all_tags(&note.tags);
     if merged == existing_normalized {
+        root_ticket.finish(state.inner()).await?;
         return Ok(note);
     }
 
@@ -1095,20 +1144,34 @@ pub async fn normalize_tags(
         ..Default::default()
     };
 
-    let (updated, commit) = {
+    let mutation = {
         let mut store = state.knowledge_store.write().await;
-        store
-            .update_note_expecting_authority(&id, update, "note_editor", root_epoch)
-            .map_err(|e| e.to_string())?
+        store.update_note_expecting_authority(&id, update, "note_editor", root_epoch)
     };
-    drop(root_ticket);
-    let _ = crate::commands::repair_after_authority_mutation(
+    let completed = complete_distill_note_mutation(
         state.inner(),
-        &commit,
+        root_ticket.authority(),
+        None,
+        mutation,
         "tag normalization",
     )
-    .await;
-    Ok(updated)
+    .await?;
+    if let Some(commit) = completed.commit.as_ref() {
+        drop(root_ticket);
+        if !completed.repaired {
+            crate::commands::acknowledge_reported_repair(
+                crate::commands::repair_after_authority_mutation(
+                    state.inner(),
+                    commit,
+                    "tag normalization",
+                )
+                .await,
+            );
+        }
+    } else {
+        root_ticket.finish(state.inner()).await?;
+    }
+    Ok(completed.note)
 }
 
 #[cfg(test)]
@@ -1288,5 +1351,306 @@ mod tests {
         let candidates = extract_candidates_rules(content, &tags);
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].title, "Atomic: Long Enough");
+    }
+
+    #[tokio::test]
+    async fn distill_mutation_recovers_exact_post_authority_commit_without_retry() {
+        let (mut state, vault, _data) =
+            crate::commands::commit_note_write_tests::build_test_state();
+        let coordinator = state.mutation_coordinator.as_ref().unwrap().clone();
+        state.knowledge_store = std::sync::Arc::new(tokio::sync::RwLock::new(
+            crate::services::knowledge_store::KnowledgeStore::with_event_recorder(
+                vault.path().to_path_buf(),
+                coordinator.current_namespace_path().unwrap(),
+                coordinator.clone(),
+            ),
+        ));
+        let expected = coordinator.current_authority_token().unwrap();
+        coordinator.fail_next_replays_before_targets(2);
+        let mutation = {
+            let mut store = state.knowledge_store.write().await;
+            store.create_note_expecting_authority(
+                NoteCreate {
+                    title: "Recovered distill atom".into(),
+                    content: "one durable atom".into(),
+                    relative_path: Some("recovered-distill-atom.md".into()),
+                    aliases: Vec::new(),
+                    status: NoteStatus::Draft,
+                    tags: Vec::new(),
+                    schema_version: crate::models::note::CURRENT_NOTE_SCHEMA_VERSION,
+                    migration_source: None,
+                    optimizer_managed: false,
+                    properties: Default::default(),
+                },
+                "note_editor",
+                expected.clone(),
+            )
+        };
+        let exact = crate::services::knowledge_store::knowledge_authority_advanced_outcome(
+            mutation.as_ref().unwrap_err(),
+        )
+        .unwrap()
+        .commit;
+
+        let completed = complete_distill_note_mutation(
+            &state,
+            &expected,
+            None,
+            mutation,
+            "note distillation create",
+        )
+        .await
+        .expect("the committed atom should recover without retry");
+
+        assert_eq!(completed.note.id, "recovered-distill-atom");
+        let recovered_commit = completed.commit.as_ref().unwrap();
+        assert_eq!(recovered_commit.mutation_id, exact.mutation_id);
+        assert_eq!(recovered_commit.authority_token, exact.authority_token);
+        assert_eq!(
+            recovered_commit.postcommit_warning,
+            exact.postcommit_warning
+        );
+        assert!(completed.repaired);
+        assert_eq!(coordinator.pending_count().unwrap(), 0);
+        assert!(vault.path().join("recovered-distill-atom.md").exists());
+    }
+
+    #[tokio::test]
+    async fn later_distill_failure_repairs_prior_commit_and_forbids_blind_retry() {
+        let (mut state, vault, _data) =
+            crate::commands::commit_note_write_tests::build_test_state();
+        let coordinator = state.mutation_coordinator.as_ref().unwrap().clone();
+        state.knowledge_store = std::sync::Arc::new(tokio::sync::RwLock::new(
+            crate::services::knowledge_store::KnowledgeStore::with_event_recorder(
+                vault.path().to_path_buf(),
+                coordinator.current_namespace_path().unwrap(),
+                coordinator.clone(),
+            ),
+        ));
+        let (created, prior_commit) = state
+            .knowledge_store
+            .write()
+            .await
+            .create_note_expecting_authority(
+                NoteCreate {
+                    title: "First distill atom".into(),
+                    content: "first write succeeds".into(),
+                    relative_path: Some("first-distill-atom.md".into()),
+                    aliases: Vec::new(),
+                    status: NoteStatus::Draft,
+                    tags: Vec::new(),
+                    schema_version: crate::models::note::CURRENT_NOTE_SCHEMA_VERSION,
+                    migration_source: None,
+                    optimizer_managed: false,
+                    properties: Default::default(),
+                },
+                "note_editor",
+                coordinator.current_authority_token().unwrap(),
+            )
+            .unwrap();
+        let expected = prior_commit.authority_token.clone().unwrap();
+        let later_failure: anyhow::Result<(
+            crate::models::note::Note,
+            crate::services::twin_events::MutationCommit,
+        )> = Err(anyhow::anyhow!("injected container precommit failure"));
+
+        let error = complete_distill_note_mutation(
+            &state,
+            &expected,
+            Some(&prior_commit),
+            later_failure,
+            "note distillation container update",
+        )
+        .await
+        .expect_err("partial distillation must not look safely retryable");
+
+        assert!(error.contains("partially committed"));
+        assert!(error.contains("do not retry"));
+        coordinator.require_namespace_ready().unwrap();
+        assert_eq!(
+            state
+                .knowledge_store
+                .read()
+                .await
+                .get_note(&created.id)
+                .unwrap()
+                .content,
+            "first write succeeds"
+        );
+    }
+
+    async fn assert_later_target_abort_is_partial_and_repairs_newest_commit(
+        force_recovery_pending: bool,
+    ) {
+        let (mut state, vault, _data) =
+            crate::commands::commit_note_write_tests::build_test_state();
+        let coordinator = state.mutation_coordinator.as_ref().unwrap().clone();
+        state.knowledge_store = std::sync::Arc::new(tokio::sync::RwLock::new(
+            crate::services::knowledge_store::KnowledgeStore::with_event_recorder(
+                vault.path().to_path_buf(),
+                coordinator.current_namespace_path().unwrap(),
+                coordinator.clone(),
+            ),
+        ));
+        let (_, prior_commit) = state
+            .knowledge_store
+            .write()
+            .await
+            .create_note_expecting_authority(
+                NoteCreate {
+                    title: "First durable distill atom".into(),
+                    content: "the first batch write is durable".into(),
+                    relative_path: Some("first-durable-distill-atom.md".into()),
+                    aliases: Vec::new(),
+                    status: NoteStatus::Draft,
+                    tags: Vec::new(),
+                    schema_version: crate::models::note::CURRENT_NOTE_SCHEMA_VERSION,
+                    migration_source: None,
+                    optimizer_managed: false,
+                    properties: Default::default(),
+                },
+                "note_editor",
+                coordinator.current_authority_token().unwrap(),
+            )
+            .unwrap();
+        let expected = prior_commit.authority_token.clone().unwrap();
+        let entered = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let resume = std::sync::Arc::new(std::sync::Barrier::new(2));
+        coordinator.pause_after_authority_advance_once(entered.clone(), resume.clone());
+        let store = state.knowledge_store.clone();
+        let task_expected = expected.clone();
+        let mutation = tokio::spawn(async move {
+            store.write().await.create_note_expecting_authority(
+                NoteCreate {
+                    title: "Aborted later distill atom".into(),
+                    content: "this target must lose to external drift".into(),
+                    relative_path: Some("aborted-later-distill-atom.md".into()),
+                    aliases: Vec::new(),
+                    status: NoteStatus::Draft,
+                    tags: Vec::new(),
+                    schema_version: crate::models::note::CURRENT_NOTE_SCHEMA_VERSION,
+                    migration_source: None,
+                    optimizer_managed: false,
+                    properties: Default::default(),
+                },
+                "note_editor",
+                task_expected,
+            )
+        });
+
+        tokio::task::spawn_blocking(move || entered.wait())
+            .await
+            .unwrap();
+        std::fs::write(
+            vault.path().join("aborted-later-distill-atom.md"),
+            "# External winner\n",
+        )
+        .unwrap();
+        tokio::task::spawn_blocking(move || resume.wait())
+            .await
+            .unwrap();
+        let mutation = mutation.await.unwrap();
+        let later = crate::services::knowledge_store::knowledge_authority_advanced_outcome(
+            mutation.as_ref().unwrap_err(),
+        )
+        .expect("the later target abort must retain its exact authority commit");
+        assert!(later.target_aborted);
+        assert_eq!(
+            later
+                .commit
+                .authority_token
+                .as_ref()
+                .unwrap()
+                .authority_generation,
+            expected.authority_generation + 1
+        );
+        if force_recovery_pending {
+            *state.loaded_authority.write().await = later.commit.authority_token.clone();
+            state.mutation_coordinator = None;
+        }
+
+        let error = complete_distill_note_mutation(
+            &state,
+            &expected,
+            Some(&prior_commit),
+            mutation,
+            "note distillation create",
+        )
+        .await
+        .expect_err("a later target abort must expose earlier durable batch work");
+
+        assert!(error.contains("partially committed"));
+        assert!(error.contains("do not retry"));
+        assert!(!error.contains("deciding whether to retry"));
+        if force_recovery_pending {
+            assert!(error.contains("recovery is pending"));
+            assert!(state.loaded_authority.read().await.is_none());
+            state.mutation_coordinator = Some(coordinator.clone());
+            assert!(matches!(
+                crate::commands::repair_after_authority_mutation(
+                    &state,
+                    &later.commit,
+                    "distill target-abort cleanup"
+                )
+                .await,
+                crate::commands::PostAuthorityRepair::Ready(_)
+            ));
+        } else {
+            assert!(!error.contains("recovery is pending"));
+            assert_eq!(
+                state.loaded_authority.read().await.as_ref(),
+                later.commit.authority_token.as_ref()
+            );
+        }
+        coordinator.require_namespace_ready().unwrap();
+        assert_eq!(coordinator.pending_count().unwrap(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn later_distill_target_abort_repairs_newest_commit_as_partial_batch() {
+        assert_later_target_abort_is_partial_and_repairs_newest_commit(false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn later_distill_target_abort_reports_recovery_pending_without_inviting_retry() {
+        assert_later_target_abort_is_partial_and_repairs_newest_commit(true).await;
+    }
+
+    #[tokio::test]
+    async fn distill_target_abort_is_not_reported_as_a_committed_note() {
+        let (state, _vault, _data) = crate::commands::commit_note_write_tests::build_test_state();
+        let authority = state
+            .mutation_coordinator
+            .as_ref()
+            .unwrap()
+            .current_authority_token()
+            .unwrap();
+        let mutation_id = crate::models::twin_event::ContentDigest::parse("b".repeat(64)).unwrap();
+        let mutation: anyhow::Result<(
+            crate::models::note::Note,
+            crate::services::twin_events::MutationCommit,
+        )> = Err(anyhow::Error::new(
+            crate::services::twin_events::MutationError::AuthorityAdvanced {
+                mutation_id,
+                authority_token: authority.clone(),
+                target_aborted: true,
+                reason: "injected target abort".into(),
+            },
+        ));
+
+        let error = complete_distill_note_mutation(
+            &state,
+            &authority,
+            None,
+            mutation,
+            "note distillation create",
+        )
+        .await
+        .expect_err("an aborted target must remain distinguishable");
+
+        assert!(error.contains("was not applied"));
+        assert!(error.contains("refresh state before deciding whether to retry"));
+        assert!(!error.contains("partially committed"));
+        assert!(!error.contains("committed and recovered"));
     }
 }
