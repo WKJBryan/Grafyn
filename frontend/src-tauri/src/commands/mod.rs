@@ -537,6 +537,7 @@ mod commit_note_write_tests {
             twin_event_store: Arc::new(crate::services::twin_events::TwinEventStore::new(
                 data_path.clone(),
             )),
+            mutation_startup_error: None,
             memory_service: Arc::new(MemoryService::new()),
             boot_state: Arc::new(RwLock::new(BootStatus::default())),
         };

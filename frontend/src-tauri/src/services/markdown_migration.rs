@@ -343,7 +343,7 @@ impl MarkdownMigrationService {
                 None
             };
 
-            let updated = store.update_note(
+            let updated = store.update_note_from_source(
                 &proposal.note_id,
                 NoteUpdate {
                     title: None,
@@ -360,6 +360,7 @@ impl MarkdownMigrationService {
                     optimizer_managed: Some(false),
                     properties: Some(properties),
                 },
+                "migration",
             )?;
             touched_note_ids.push(updated.id.clone());
         }
@@ -373,32 +374,35 @@ impl MarkdownMigrationService {
                 "# Hub: {}\n\nGrafyn will keep this topic hub updated from its member notes.\n",
                 topic.display_name
             );
-            let created = store.create_note(NoteCreate {
-                title: format!("Hub: {}", topic.display_name),
-                content,
-                relative_path: Some(format!(
-                    "{}/{}.md",
-                    preview.hub_folder,
-                    slugify(&topic.display_name)
-                )),
-                aliases: vec![topic.display_name.clone()],
-                status: crate::models::note::NoteStatus::Canonical,
-                tags: vec!["hub".to_string()],
-                schema_version: CURRENT_NOTE_SCHEMA_VERSION,
-                migration_source: Some(MIGRATION_SOURCE_MARKDOWN.to_string()),
-                optimizer_managed: true,
-                properties: HashMap::from([
-                    (
-                        PROP_TOPIC_KEY.to_string(),
-                        Value::String(topic.topic_key.clone()),
-                    ),
-                    (
-                        PROP_TOPIC_ALIASES.to_string(),
-                        Value::Array(vec![Value::String(topic.display_name.clone())]),
-                    ),
-                    ("is_topic_hub".to_string(), Value::Bool(true)),
-                ]),
-            })?;
+            let created = store.create_note_from_source(
+                NoteCreate {
+                    title: format!("Hub: {}", topic.display_name),
+                    content,
+                    relative_path: Some(format!(
+                        "{}/{}.md",
+                        preview.hub_folder,
+                        slugify(&topic.display_name)
+                    )),
+                    aliases: vec![topic.display_name.clone()],
+                    status: crate::models::note::NoteStatus::Canonical,
+                    tags: vec!["hub".to_string()],
+                    schema_version: CURRENT_NOTE_SCHEMA_VERSION,
+                    migration_source: Some(MIGRATION_SOURCE_MARKDOWN.to_string()),
+                    optimizer_managed: true,
+                    properties: HashMap::from([
+                        (
+                            PROP_TOPIC_KEY.to_string(),
+                            Value::String(topic.topic_key.clone()),
+                        ),
+                        (
+                            PROP_TOPIC_ALIASES.to_string(),
+                            Value::Array(vec![Value::String(topic.display_name.clone())]),
+                        ),
+                        ("is_topic_hub".to_string(), Value::Bool(true)),
+                    ]),
+                },
+                "migration",
+            )?;
             created_hub_note_ids.push(created.id.clone());
             manifest.created_files.push(created.relative_path.clone());
         }
@@ -508,20 +512,11 @@ impl MarkdownMigrationService {
                 ));
                 continue;
             }
-            if let Some(parent) = target_path.parent() {
-                if let Err(error) = std::fs::create_dir_all(parent) {
-                    failures.push(format!(
-                        "failed to create parent directory for '{}': {}",
-                        relative_path, error
-                    ));
-                    continue;
-                }
-            }
-            // Restore via read + atomic write (temp file + rename) so a crash
-            // mid-restore can never leave the very note being rescued truncated.
             match std::fs::read(&backup_path) {
                 Ok(bytes) => {
-                    if let Err(error) = write_atomic(&target_path, &bytes) {
+                    if let Err(error) =
+                        store.restore_note_bytes_from_source(relative_path, &bytes, "migration")
+                    {
                         failures.push(format!(
                             "failed to restore '{}' -> '{}': {}",
                             backup_path.display(),
@@ -543,11 +538,27 @@ impl MarkdownMigrationService {
         for relative_path in &manifest.created_files {
             let target_path = vault_path.join(relative_path);
             if target_path.exists() {
-                if let Err(error) = std::fs::remove_file(&target_path) {
-                    failures.push(format!(
-                        "failed to remove created file '{}': {}",
+                match store.find_note_by_relative_path(relative_path) {
+                    Ok(Some(note)) => {
+                        if let Err(error) = store.delete_note_from_source(&note.id, "migration") {
+                            failures.push(format!(
+                                "failed to remove created note '{}': {}",
+                                relative_path, error
+                            ));
+                        }
+                    }
+                    Ok(None) => {
+                        if let Err(error) = std::fs::remove_file(&target_path) {
+                            failures.push(format!(
+                                "failed to remove derived migration file '{}': {}",
+                                relative_path, error
+                            ));
+                        }
+                    }
+                    Err(error) => failures.push(format!(
+                        "failed to classify created file '{}': {}",
                         relative_path, error
-                    ));
+                    )),
                 }
             }
         }
@@ -1114,6 +1125,54 @@ mod tests {
     }
 
     #[test]
+    fn coordinated_apply_and_rollback_emit_only_migration_note_changes() {
+        let root = tempdir().unwrap();
+        let vault = root.path().join("vault");
+        let data = root.path().join("data");
+        std::fs::create_dir(&vault).unwrap();
+        std::fs::create_dir(&data).unwrap();
+        let events = std::sync::Arc::new(crate::services::twin_events::TwinEventStore::new(&data));
+        events.initialize().unwrap();
+        let coordinator = std::sync::Arc::new(
+            crate::services::twin_events::MutationCoordinator::new(
+                &data,
+                &vault,
+                events.clone(),
+                std::sync::Arc::new(crate::services::twin_events::NoopMutationLifecycle),
+            )
+            .unwrap(),
+        );
+        let mut store =
+            KnowledgeStore::with_event_recorder(vault.clone(), data.clone(), coordinator);
+        seed_two_notes(&mut store);
+        let baseline = events.ordered_events().unwrap().len();
+        let service = MarkdownMigrationService::new(data);
+        let request = MarkdownMigrationRequest {
+            mode: MarkdownMigrationMode::FullRewrite,
+            auto_insert_links: Some(true),
+            ..Default::default()
+        };
+        let preview = service.preview(vault, request.clone()).unwrap();
+        let applied = service
+            .apply(&preview.preview_id, request, &mut store)
+            .unwrap();
+        let after_apply = events.ordered_events().unwrap();
+        assert!(after_apply.len() > baseline);
+        assert!(after_apply[baseline..]
+            .iter()
+            .all(|event| event.context.source_channel.as_str() == "migration"));
+
+        service.rollback(&applied.run_id, &mut store).unwrap();
+        let after_rollback = events.ordered_events().unwrap();
+        assert!(after_rollback.len() > after_apply.len());
+        assert!(after_rollback[after_apply.len()..].iter().all(|event| event
+            .context
+            .source_channel
+            .as_str()
+            == "migration"));
+    }
+
+    #[test]
     fn rollback_is_idempotent() {
         let vault_dir = tempdir().expect("vault tempdir");
         let data_dir = tempdir().expect("data tempdir");
@@ -1337,9 +1396,23 @@ mod tests {
         // rewritten (and `updated_at` bumped) on every single boot.
         let vault_dir = tempdir().expect("vault tempdir");
         let data_dir = tempdir().expect("data tempdir");
-        let mut store = KnowledgeStore::new(
+        let events = std::sync::Arc::new(crate::services::twin_events::TwinEventStore::new(
+            data_dir.path(),
+        ));
+        events.initialize().unwrap();
+        let coordinator = std::sync::Arc::new(
+            crate::services::twin_events::MutationCoordinator::new(
+                data_dir.path(),
+                vault_dir.path(),
+                events.clone(),
+                std::sync::Arc::new(crate::services::twin_events::NoopMutationLifecycle),
+            )
+            .unwrap(),
+        );
+        let mut store = KnowledgeStore::with_event_recorder(
             vault_dir.path().to_path_buf(),
             data_dir.path().to_path_buf(),
+            coordinator,
         );
 
         let note = store
@@ -1357,6 +1430,7 @@ mod tests {
             })
             .expect("note should be created");
         let note_path = vault_dir.path().join(&note.relative_path);
+        let baseline = events.ordered_events().unwrap().len();
 
         let service = MarkdownMigrationService::new(data_dir.path().to_path_buf());
 
@@ -1368,6 +1442,12 @@ mod tests {
         assert!(
             first_pass.contains(&note.id),
             "first pass should backfill provenance for a never-migrated note"
+        );
+        let after_first_events = events.ordered_events().unwrap();
+        assert_eq!(after_first_events.len(), baseline + 1);
+        assert_eq!(
+            after_first_events[baseline].context.source_channel.as_str(),
+            "migration"
         );
 
         // Give the filesystem a chance to distinguish mtimes if a second write occurs.
@@ -1381,6 +1461,7 @@ mod tests {
             second_pass.is_empty(),
             "second pass must not touch an already-backfilled note with zero alias candidates, got: {second_pass:?}"
         );
+        assert_eq!(events.ordered_events().unwrap().len(), baseline + 1);
 
         let after_second = snapshot(&note_path);
         assert_eq!(

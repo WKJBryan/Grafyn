@@ -1,0 +1,1139 @@
+use crate::models::twin_event::{
+    ActorId, CausalStream, ContentDigest, DeviceId, SourceChannel, TwinEvent,
+};
+use crate::services::twin_events::{derive_event_id, MutationError};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
+use std::path::{Component, Path, PathBuf};
+use uuid::Uuid;
+
+fn required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
+}
+
+pub const MAX_PENDING_INTENTS: usize = 256;
+pub const MAX_INTENT_TARGETS: usize = 64;
+pub const MAX_INTENT_EVENTS: usize = 64;
+pub const MAX_TARGET_KEY_BYTES: usize = 512;
+pub const MAX_MARKDOWN_TWIN_BYTES: usize = 1024 * 1024;
+pub const MAX_CANVAS_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_TOTAL_AFTER_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_EVENT_GROUP_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_SERIALIZED_INTENT_BYTES: usize = 32 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum TargetKind {
+    Markdown,
+    TwinJson,
+    CanvasJson,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "state",
+    content = "digest",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum BeforeImage {
+    Absent,
+    Sha256(ContentDigest),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "state",
+    content = "content",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum DesiredImage {
+    Tombstone,
+    Utf8Bytes(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MutationTargetV1 {
+    pub kind: TargetKind,
+    pub relative_key: String,
+    pub before: BeforeImage,
+    pub after: DesiredImage,
+    pub after_digest: ContentDigest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TargetMutation {
+    pub kind: TargetKind,
+    pub relative_key: String,
+    pub after: DesiredImage,
+}
+
+impl TargetMutation {
+    pub fn put(
+        kind: TargetKind,
+        relative_key: impl Into<String>,
+        content: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind,
+            relative_key: relative_key.into(),
+            after: DesiredImage::Utf8Bytes(content.into()),
+        }
+    }
+
+    pub fn tombstone(kind: TargetKind, relative_key: impl Into<String>) -> Self {
+        Self {
+            kind,
+            relative_key: relative_key.into(),
+            after: DesiredImage::Tombstone,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MutationIntentV1 {
+    pub schema_version: u16,
+    pub mutation_id: ContentDigest,
+    pub actor_id: ActorId,
+    pub device_id: DeviceId,
+    pub causal_stream: CausalStream,
+    pub source_channel: SourceChannel,
+    #[serde(deserialize_with = "required_option")]
+    pub markdown_root_scope: Option<ContentDigest>,
+    pub targets: Vec<MutationTargetV1>,
+    pub events: Vec<TwinEvent>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl MutationIntentV1 {
+    pub fn validate(&self) -> Result<(), MutationError> {
+        if self.schema_version != 1 {
+            return Err(MutationError::Invalid(
+                "unsupported local mutation journal schema".into(),
+            ));
+        }
+        if self.targets.is_empty() || self.targets.len() > MAX_INTENT_TARGETS {
+            return Err(MutationError::Invalid(
+                "mutation intent must contain 1..=64 targets".into(),
+            ));
+        }
+        if self.events.is_empty() || self.events.len() > MAX_INTENT_EVENTS {
+            return Err(MutationError::Invalid(
+                "mutation intent must contain 1..=64 events".into(),
+            ));
+        }
+        let has_markdown_target = self
+            .targets
+            .iter()
+            .any(|target| target.kind == TargetKind::Markdown);
+        if self.markdown_root_scope.is_some() != has_markdown_target {
+            return Err(MutationError::Invalid(
+                "Markdown mutations must carry exactly one root scope digest".into(),
+            ));
+        }
+        let mut target_order = self
+            .targets
+            .iter()
+            .map(|target| (target.kind, target.relative_key.as_str()))
+            .collect::<Vec<_>>();
+        let original_order = target_order.clone();
+        target_order.sort();
+        target_order.dedup();
+        if target_order != original_order || target_order.len() != self.targets.len() {
+            return Err(MutationError::Invalid(
+                "mutation targets must be unique and canonically ordered".into(),
+            ));
+        }
+        let mut total_after = 0usize;
+        for target in &self.targets {
+            validate_relative_key(&target.relative_key)?;
+            let expected = desired_digest(&target.after);
+            if target.after_digest != expected {
+                return Err(MutationError::Invalid(
+                    "mutation target after digest is invalid".into(),
+                ));
+            }
+            if let DesiredImage::Utf8Bytes(content) = &target.after {
+                let length = content.len();
+                let limit = match target.kind {
+                    TargetKind::Markdown | TargetKind::TwinJson => MAX_MARKDOWN_TWIN_BYTES,
+                    TargetKind::CanvasJson => MAX_CANVAS_BYTES,
+                };
+                if length > limit {
+                    return Err(MutationError::Invalid(format!(
+                        "mutation target exceeds its {limit}-byte limit"
+                    )));
+                }
+                total_after = total_after
+                    .checked_add(length)
+                    .ok_or_else(|| MutationError::Invalid("mutation size overflow".into()))?;
+            }
+        }
+        if total_after > MAX_TOTAL_AFTER_BYTES {
+            return Err(MutationError::Invalid(
+                "mutation after-images exceed the 16 MiB total limit".into(),
+            ));
+        }
+        let mut event_bytes = 0usize;
+        for event in &self.events {
+            event.validate().map_err(MutationError::Invalid)?;
+            if derive_event_id(event) != event.event_id {
+                return Err(MutationError::Invalid(
+                    "mutation intent contains a noncanonical event ID".into(),
+                ));
+            }
+            if event.device_id != self.device_id
+                || event.causal_stream != self.causal_stream
+                || event.context.source_channel != self.source_channel
+            {
+                return Err(MutationError::Invalid(
+                    "mutation event group identity, stream, or source mismatch".into(),
+                ));
+            }
+            let length = serde_json::to_vec(event)
+                .map_err(|error| MutationError::Invalid(error.to_string()))?
+                .len();
+            if length > crate::services::twin_events::MAX_TWIN_EVENT_BYTES {
+                return Err(MutationError::Invalid(
+                    "mutation event exceeds the 256 KiB limit".into(),
+                ));
+            }
+            event_bytes = event_bytes
+                .checked_add(length)
+                .ok_or_else(|| MutationError::Invalid("event group size overflow".into()))?;
+        }
+        if event_bytes > MAX_EVENT_GROUP_BYTES {
+            return Err(MutationError::Invalid(
+                "mutation event group exceeds the 4 MiB limit".into(),
+            ));
+        }
+        if derive_mutation_id(self) != self.mutation_id {
+            return Err(MutationError::Invalid(
+                "mutation ID does not match canonical content".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+pub fn digest_bytes(bytes: &[u8]) -> ContentDigest {
+    let digest = Sha256::digest(bytes);
+    ContentDigest::parse(format!("{digest:x}")).expect("SHA-256 is a valid content digest")
+}
+
+pub fn desired_digest(after: &DesiredImage) -> ContentDigest {
+    match after {
+        DesiredImage::Tombstone => digest_bytes(b"grafyn.local_mutation.tombstone.v1"),
+        DesiredImage::Utf8Bytes(content) => digest_bytes(content.as_bytes()),
+    }
+}
+
+pub fn derive_mutation_id(intent: &MutationIntentV1) -> ContentDigest {
+    fn frame(hasher: &mut Sha256, value: &[u8]) {
+        hasher.update((value.len() as u64).to_be_bytes());
+        hasher.update(value);
+    }
+    let mut hasher = Sha256::new();
+    frame(&mut hasher, b"grafyn.local_mutation.v1");
+    frame(&mut hasher, intent.actor_id.as_str().as_bytes());
+    frame(&mut hasher, intent.device_id.as_str().as_bytes());
+    frame(
+        &mut hasher,
+        match intent.causal_stream {
+            CausalStream::LocalOnly => b"local_only",
+            CausalStream::SyncEligible => b"sync_eligible",
+        },
+    );
+    frame(&mut hasher, intent.source_channel.as_str().as_bytes());
+    match &intent.markdown_root_scope {
+        Some(scope) => {
+            frame(&mut hasher, b"markdown_root_scope");
+            frame(&mut hasher, scope.as_str().as_bytes());
+        }
+        None => frame(&mut hasher, b"no_markdown_root_scope"),
+    }
+    for event in &intent.events {
+        frame(&mut hasher, event.event_id.as_str().as_bytes());
+    }
+    for target in &intent.targets {
+        frame(
+            &mut hasher,
+            match target.kind {
+                TargetKind::Markdown => b"markdown",
+                TargetKind::TwinJson => b"twin_json",
+                TargetKind::CanvasJson => b"canvas_json",
+            },
+        );
+        frame(&mut hasher, target.relative_key.as_bytes());
+        match &target.before {
+            BeforeImage::Absent => frame(&mut hasher, b"absent"),
+            BeforeImage::Sha256(digest) => frame(&mut hasher, digest.as_str().as_bytes()),
+        }
+        frame(&mut hasher, target.after_digest.as_str().as_bytes());
+    }
+    ContentDigest::parse(format!("{:x}", hasher.finalize()))
+        .expect("SHA-256 is a valid mutation ID")
+}
+
+pub fn validate_relative_key(key: &str) -> Result<(), MutationError> {
+    if key.is_empty() || key.len() > MAX_TARGET_KEY_BYTES || key.contains('\\') {
+        return Err(MutationError::Invalid(
+            "mutation target key must be 1..=512 safe UTF-8 bytes".into(),
+        ));
+    }
+    let path = Path::new(key);
+    if path.is_absolute()
+        || key.as_bytes().get(1) == Some(&b':')
+        || path.components().any(|component| {
+            !matches!(component, Component::Normal(_))
+                || component.as_os_str().to_string_lossy().is_empty()
+        })
+    {
+        return Err(MutationError::Invalid(
+            "mutation target key contains traversal or absolute path material".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub struct LocalMutationJournal {
+    pending_dir: PathBuf,
+    quarantine_dir: PathBuf,
+}
+
+impl LocalMutationJournal {
+    pub fn initialize(data_path: impl AsRef<Path>) -> Result<Self, MutationError> {
+        let twin = data_path.as_ref().join("twin");
+        crate::services::twin_events::validate_real_directory(&twin, "Twin directory")?;
+        let mutations =
+            crate::services::twin_events::ensure_real_child_directory(&twin, "mutations", false)?;
+        let pending = crate::services::twin_events::ensure_real_child_directory(
+            &mutations, "pending", false,
+        )?;
+        let pending_dir =
+            crate::services::twin_events::ensure_real_child_directory(&pending, "v1", false)?;
+        let quarantine = crate::services::twin_events::ensure_real_child_directory(
+            &mutations,
+            "quarantine",
+            false,
+        )?;
+        let quarantine_dir =
+            crate::services::twin_events::ensure_real_child_directory(&quarantine, "v1", false)?;
+        Ok(Self {
+            pending_dir,
+            quarantine_dir,
+        })
+    }
+
+    pub fn pending_count(&self) -> Result<usize, MutationError> {
+        Ok(self.pending_paths()?.len())
+    }
+
+    pub fn quarantine_count(&self) -> Result<usize, MutationError> {
+        count_real_json_files(&self.quarantine_dir)
+    }
+
+    pub fn stage(&self, intent: &MutationIntentV1) -> Result<(), MutationError> {
+        intent.validate()?;
+        if self.pending_count()? >= MAX_PENDING_INTENTS {
+            return Err(MutationError::Invalid(
+                "local mutation journal has reached 256 pending intents".into(),
+            ));
+        }
+        let mut bytes = serde_json::to_vec_pretty(intent)
+            .map_err(|error| MutationError::Invalid(error.to_string()))?;
+        bytes.push(b'\n');
+        if bytes.len() > MAX_SERIALIZED_INTENT_BYTES {
+            return Err(MutationError::Invalid(
+                "serialized mutation intent exceeds the 32 MiB limit".into(),
+            ));
+        }
+        let path = self.path_for(&intent.mutation_id);
+        install_no_clobber(&path, &bytes)?;
+        let existing = fs::read(&path)?;
+        if existing != bytes {
+            return Err(MutationError::Invalid(
+                "mutation ID collision in local journal".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn load_pending(&self) -> Result<Vec<(PathBuf, MutationIntentV1)>, MutationError> {
+        let mut loaded = Vec::new();
+        for path in self.pending_paths()? {
+            let metadata = fs::symlink_metadata(&path)?;
+            if metadata.len() > MAX_SERIALIZED_INTENT_BYTES as u64 {
+                self.quarantine_path(&path)?;
+                return Err(MutationError::Invalid(
+                    "serialized mutation intent exceeds the 32 MiB limit".into(),
+                ));
+            }
+            let intent: MutationIntentV1 = match serde_json::from_slice(&fs::read(&path)?) {
+                Ok(intent) => intent,
+                Err(error) => {
+                    self.quarantine_path(&path)?;
+                    return Err(MutationError::Invalid(format!(
+                        "corrupt mutation intent: {error}"
+                    )));
+                }
+            };
+            if let Err(error) = intent.validate() {
+                self.quarantine_path(&path)?;
+                return Err(error);
+            }
+            if path != self.path_for(&intent.mutation_id) {
+                self.quarantine_path(&path)?;
+                return Err(MutationError::Invalid(
+                    "mutation intent is stored at a noncanonical path".into(),
+                ));
+            }
+            loaded.push((path, intent));
+        }
+        Ok(loaded)
+    }
+
+    pub fn remove(&self, intent: &MutationIntentV1) -> Result<(), MutationError> {
+        let path = self.path_for(&intent.mutation_id);
+        match fs::remove_file(&path) {
+            Ok(()) => crate::services::twin_events::sync_directory(&self.pending_dir)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        Ok(())
+    }
+
+    pub fn quarantine_intent(&self, intent: &MutationIntentV1) -> Result<(), MutationError> {
+        self.quarantine_path(&self.path_for(&intent.mutation_id))
+    }
+
+    fn path_for(&self, id: &ContentDigest) -> PathBuf {
+        self.pending_dir.join(format!("{}.json", id.as_str()))
+    }
+
+    fn pending_paths(&self) -> Result<Vec<PathBuf>, MutationError> {
+        let mut paths = real_json_files(&self.pending_dir)?;
+        if paths.len() > MAX_PENDING_INTENTS {
+            return Err(MutationError::Invalid(
+                "local mutation journal exceeds 256 pending intents".into(),
+            ));
+        }
+        paths.sort();
+        Ok(paths)
+    }
+
+    fn quarantine_path(&self, source: &Path) -> Result<(), MutationError> {
+        crate::services::twin_events::validate_real_file(source, "mutation intent")?;
+        let name = source
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("intent.json");
+        let target = self
+            .quarantine_dir
+            .join(format!("{}-{name}", Uuid::new_v4()));
+        fs::rename(source, target)?;
+        crate::services::twin_events::sync_directory(&self.pending_dir)?;
+        crate::services::twin_events::sync_directory(&self.quarantine_dir)?;
+        Ok(())
+    }
+}
+
+fn count_real_json_files(directory: &Path) -> Result<usize, MutationError> {
+    Ok(real_json_files(directory)?.len())
+}
+
+fn real_json_files(directory: &Path) -> Result<Vec<PathBuf>, MutationError> {
+    crate::services::twin_events::validate_real_directory(directory, "mutation journal directory")?;
+    let mut paths = Vec::new();
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(MutationError::Invalid(format!(
+                "mutation journal contains a non-regular entry: {}",
+                path.display()
+            )));
+        }
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            return Err(MutationError::Invalid(format!(
+                "mutation journal contains a non-JSON entry: {}",
+                path.display()
+            )));
+        }
+        paths.push(path);
+    }
+    Ok(paths)
+}
+
+fn install_no_clobber(path: &Path, bytes: &[u8]) -> Result<(), MutationError> {
+    let directory = path
+        .parent()
+        .ok_or_else(|| MutationError::Invalid("journal path has no parent".into()))?;
+    crate::services::twin_events::validate_real_directory(directory, "mutation journal directory")?;
+    let temporary = directory.join(format!(".{}.tmp", Uuid::new_v4()));
+    let result = (|| -> Result<(), MutationError> {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        match fs::hard_link(&temporary, path) {
+            Ok(()) => crate::services::twin_events::sync_directory(directory)?,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.into()),
+        }
+        Ok(())
+    })();
+    let cleanup = fs::remove_file(&temporary);
+    if let Err(error) = cleanup {
+        if error.kind() != io::ErrorKind::NotFound {
+            return Err(error.into());
+        }
+    }
+    crate::services::twin_events::sync_directory(directory)?;
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::twin_event::{CausalStream, SourceChannel};
+    use crate::services::twin_events::{
+        MutationCoordinator, MutationFaultPoint, NoopMutationLifecycle, TargetMutation,
+        TwinEventStore,
+    };
+    use std::sync::{Arc, Mutex};
+    use tempfile::tempdir;
+
+    fn draft(label: &str) -> crate::services::twin_events::TwinEventDraft {
+        use crate::models::twin_event::{
+            Governance, Identifier, NoteChangeKind, NoteChanged, TwinEventPayload,
+        };
+        use chrono::{TimeZone, Utc};
+        crate::services::twin_events::TwinEventDraft {
+            actor_id: None,
+            causal_parents: Vec::new(),
+            recorded_at: Utc.with_ymd_and_hms(2026, 8, 30, 2, 0, 0).unwrap(),
+            observed_at: Utc.with_ymd_and_hms(2026, 8, 30, 2, 0, 0).unwrap(),
+            occurred_at: None,
+            valid_from: None,
+            valid_to: None,
+            supersedes: Vec::new(),
+            reinforces: Vec::new(),
+            context: Default::default(),
+            evidence: Vec::new(),
+            governance: Governance::direct_observation(),
+            payload: TwinEventPayload::NoteChanged(NoteChanged {
+                note_id: Identifier::parse(label).unwrap(),
+                change: NoteChangeKind::Updated,
+                content_digest: None,
+            }),
+        }
+    }
+
+    #[test]
+    fn staged_mixed_targets_and_partial_events_recover_idempotently() {
+        let temp = tempdir().unwrap();
+        let vault = temp.path().join("vault");
+        std::fs::create_dir(&vault).unwrap();
+        std::fs::write(vault.join("old.md"), "old").unwrap();
+        let store = Arc::new(TwinEventStore::new(temp.path()));
+        store.initialize().unwrap();
+        let coordinator = MutationCoordinator::new(
+            temp.path(),
+            &vault,
+            store.clone(),
+            Arc::new(NoopMutationLifecycle),
+        )
+        .unwrap();
+        coordinator.fail_once_at(MutationFaultPoint::AfterTarget(0));
+        let result = coordinator.commit_local(
+            CausalStream::SyncEligible,
+            SourceChannel::parse("note_editor").unwrap(),
+            vec![
+                TargetMutation::put(TargetKind::Markdown, "new.md", "new"),
+                TargetMutation::tombstone(TargetKind::Markdown, "old.md"),
+            ],
+            vec![draft("move")],
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            std::fs::read_to_string(vault.join("new.md")).unwrap(),
+            "new"
+        );
+        assert!(vault.join("old.md").exists());
+        assert!(store.ordered_events().unwrap().is_empty());
+
+        assert_eq!(coordinator.recover_pending().unwrap(), 1);
+        assert!(!vault.join("old.md").exists());
+        assert_eq!(store.ordered_events().unwrap().len(), 1);
+        assert_eq!(coordinator.recover_pending().unwrap(), 0);
+        assert_eq!(store.ordered_events().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn third_digest_preserves_user_bytes_and_quarantines_intent() {
+        let temp = tempdir().unwrap();
+        let vault = temp.path().join("vault");
+        std::fs::create_dir(&vault).unwrap();
+        std::fs::write(vault.join("note.md"), "before").unwrap();
+        let store = Arc::new(TwinEventStore::new(temp.path()));
+        store.initialize().unwrap();
+        let coordinator =
+            MutationCoordinator::new(temp.path(), &vault, store, Arc::new(NoopMutationLifecycle))
+                .unwrap();
+        coordinator.fail_once_at(MutationFaultPoint::AfterStage);
+        assert!(coordinator
+            .commit_local(
+                CausalStream::SyncEligible,
+                SourceChannel::parse("note_editor").unwrap(),
+                vec![TargetMutation::put(
+                    TargetKind::Markdown,
+                    "note.md",
+                    "desired",
+                )],
+                vec![draft("note")],
+            )
+            .is_err());
+        std::fs::write(vault.join("note.md"), "unexpected newer bytes").unwrap();
+        assert!(matches!(
+            coordinator.recover_pending(),
+            Err(crate::services::twin_events::MutationError::RecoveryConflict(_))
+        ));
+        assert_eq!(
+            std::fs::read_to_string(vault.join("note.md")).unwrap(),
+            "unexpected newer bytes"
+        );
+        assert_eq!(coordinator.pending_count().unwrap(), 0);
+        assert_eq!(coordinator.quarantine_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn journal_rejects_traversal_and_oversized_targets_before_writing() {
+        let temp = tempdir().unwrap();
+        let vault = temp.path().join("vault");
+        std::fs::create_dir(&vault).unwrap();
+        let store = Arc::new(TwinEventStore::new(temp.path()));
+        store.initialize().unwrap();
+        let coordinator =
+            MutationCoordinator::new(temp.path(), &vault, store, Arc::new(NoopMutationLifecycle))
+                .unwrap();
+        for key in ["../escape.md", "/absolute.md", "C:/drive.md", "a\\b.md"] {
+            assert!(coordinator
+                .commit_local(
+                    CausalStream::LocalOnly,
+                    SourceChannel::parse("note_editor").unwrap(),
+                    vec![TargetMutation::put(TargetKind::Markdown, key, "x")],
+                    vec![draft("bad")],
+                )
+                .is_err());
+        }
+        assert!(coordinator
+            .commit_local(
+                CausalStream::LocalOnly,
+                SourceChannel::parse("note_editor").unwrap(),
+                vec![TargetMutation::put(
+                    TargetKind::Markdown,
+                    "large.md",
+                    "x".repeat(1024 * 1024 + 1),
+                )],
+                vec![draft("large")],
+            )
+            .is_err());
+        assert_eq!(coordinator.pending_count().unwrap(), 0);
+        assert!(!temp.path().join("escape.md").exists());
+    }
+
+    #[test]
+    fn every_crash_boundary_converges_to_one_complete_mutation() {
+        let points = [
+            MutationFaultPoint::AfterStage,
+            MutationFaultPoint::AfterTarget(0),
+            MutationFaultPoint::AfterTarget(1),
+            MutationFaultPoint::AfterTargets,
+            MutationFaultPoint::AfterEvent(0),
+            MutationFaultPoint::AfterEvent(1),
+            MutationFaultPoint::BeforeCleanup,
+            MutationFaultPoint::AfterCleanupBeforeFanout,
+        ];
+        for point in points {
+            let temp = tempdir().unwrap();
+            let vault = temp.path().join("vault");
+            std::fs::create_dir(&vault).unwrap();
+            std::fs::write(vault.join("old.md"), "old").unwrap();
+            let store = Arc::new(TwinEventStore::new(temp.path()));
+            store.initialize().unwrap();
+            let coordinator = MutationCoordinator::new(
+                temp.path(),
+                &vault,
+                store.clone(),
+                Arc::new(NoopMutationLifecycle),
+            )
+            .unwrap();
+            coordinator.fail_once_at(point);
+            assert!(
+                coordinator
+                    .commit_local(
+                        CausalStream::SyncEligible,
+                        SourceChannel::parse("note_editor").unwrap(),
+                        vec![
+                            TargetMutation::put(TargetKind::Markdown, "new.md", "new"),
+                            TargetMutation::tombstone(TargetKind::Markdown, "old.md"),
+                        ],
+                        vec![draft("one"), draft("two")],
+                    )
+                    .is_err(),
+                "{point:?}"
+            );
+
+            drop(coordinator);
+            drop(store);
+            let reopened_store = Arc::new(TwinEventStore::new(temp.path()));
+            reopened_store.initialize().unwrap();
+            let reopened = MutationCoordinator::new(
+                temp.path(),
+                &vault,
+                reopened_store.clone(),
+                Arc::new(NoopMutationLifecycle),
+            )
+            .unwrap();
+            let recovered = reopened.recover_pending().unwrap();
+            if point == MutationFaultPoint::AfterCleanupBeforeFanout {
+                assert_eq!(recovered, 0, "{point:?}");
+            } else {
+                assert_eq!(recovered, 1, "{point:?}");
+            }
+            drop(reopened);
+            drop(reopened_store);
+            let twice_reopened_store = Arc::new(TwinEventStore::new(temp.path()));
+            twice_reopened_store.initialize().unwrap();
+            let twice_reopened = MutationCoordinator::new(
+                temp.path(),
+                &vault,
+                twice_reopened_store.clone(),
+                Arc::new(NoopMutationLifecycle),
+            )
+            .unwrap();
+            assert_eq!(twice_reopened.recover_pending().unwrap(), 0, "{point:?}");
+            assert_eq!(
+                std::fs::read_to_string(vault.join("new.md")).unwrap(),
+                "new"
+            );
+            assert!(!vault.join("old.md").exists());
+            assert_eq!(
+                twice_reopened_store.ordered_events().unwrap().len(),
+                2,
+                "{point:?}"
+            );
+        }
+    }
+
+    #[derive(Default)]
+    struct CountingLifecycle {
+        calls: Mutex<Vec<&'static str>>,
+    }
+
+    impl crate::services::twin_events::MutationLifecycle for CountingLifecycle {
+        fn stage_before_local(
+            &self,
+            _: &MutationIntentV1,
+        ) -> Result<(), crate::services::twin_events::MutationError> {
+            self.calls.lock().unwrap().push("stage");
+            Ok(())
+        }
+
+        fn committed(
+            &self,
+            _: &MutationIntentV1,
+        ) -> Result<(), crate::services::twin_events::MutationError> {
+            self.calls.lock().unwrap().push("committed");
+            Ok(())
+        }
+
+        fn known_failure(&self, _: Option<&str>, _: &str) {
+            self.calls.lock().unwrap().push("known_failure");
+        }
+    }
+
+    #[test]
+    fn lifecycle_is_local_only_and_remote_recovery_never_echo() {
+        let temp = tempdir().unwrap();
+        let vault = temp.path().join("vault");
+        std::fs::create_dir(&vault).unwrap();
+        let store = Arc::new(TwinEventStore::new(temp.path()));
+        store.initialize().unwrap();
+        let lifecycle = Arc::new(CountingLifecycle::default());
+        let coordinator =
+            MutationCoordinator::new(temp.path(), &vault, store.clone(), lifecycle.clone())
+                .unwrap();
+
+        coordinator
+            .apply_nonlocal(
+                crate::services::twin_events::MutationOrigin::Remote,
+                vec![TargetMutation::put(
+                    TargetKind::Markdown,
+                    "remote.md",
+                    "remote",
+                )],
+            )
+            .unwrap();
+        assert!(lifecycle.calls.lock().unwrap().is_empty());
+        assert!(store.ordered_events().unwrap().is_empty());
+
+        coordinator.fail_once_at(MutationFaultPoint::AfterStage);
+        assert!(coordinator
+            .commit_local(
+                CausalStream::SyncEligible,
+                SourceChannel::parse("note_editor").unwrap(),
+                vec![TargetMutation::put(
+                    TargetKind::Markdown,
+                    "local.md",
+                    "local"
+                )],
+                vec![draft("local")],
+            )
+            .is_err());
+        assert_eq!(
+            *lifecycle.calls.lock().unwrap(),
+            vec!["stage", "known_failure"]
+        );
+        coordinator.recover_pending().unwrap();
+        assert_eq!(
+            *lifecycle.calls.lock().unwrap(),
+            vec!["stage", "known_failure"]
+        );
+        assert_eq!(store.ordered_events().unwrap().len(), 1);
+
+        assert!(coordinator
+            .commit_local(
+                CausalStream::LocalOnly,
+                SourceChannel::parse("note_editor").unwrap(),
+                vec![TargetMutation::put(
+                    TargetKind::Markdown,
+                    "too-large.md",
+                    "x".repeat(MAX_MARKDOWN_TWIN_BYTES + 1),
+                )],
+                vec![draft("too-large")],
+            )
+            .is_err());
+        assert_eq!(
+            *lifecycle.calls.lock().unwrap(),
+            vec!["stage", "known_failure", "known_failure"]
+        );
+    }
+
+    #[test]
+    fn mutation_identity_binds_outer_actor_and_source_but_not_audit_time() {
+        let temp = tempdir().unwrap();
+        let vault = temp.path().join("vault");
+        std::fs::create_dir(&vault).unwrap();
+        let store = Arc::new(TwinEventStore::new(temp.path()));
+        store.initialize().unwrap();
+        let coordinator =
+            MutationCoordinator::new(temp.path(), &vault, store, Arc::new(NoopMutationLifecycle))
+                .unwrap();
+        coordinator.fail_once_at(MutationFaultPoint::AfterStage);
+        assert!(coordinator
+            .commit_local(
+                CausalStream::SyncEligible,
+                SourceChannel::parse("note_editor").unwrap(),
+                vec![TargetMutation::put(TargetKind::Markdown, "note.md", "note")],
+                vec![draft("note")],
+            )
+            .is_err());
+        let pending = std::fs::read_dir(temp.path().join("twin/mutations/pending/v1"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let intent: MutationIntentV1 =
+            serde_json::from_slice(&std::fs::read(pending).unwrap()).unwrap();
+
+        let mut altered_source = intent.clone();
+        altered_source.source_channel = SourceChannel::parse("mcp").unwrap();
+        assert_ne!(derive_mutation_id(&altered_source), intent.mutation_id);
+        altered_source.mutation_id = derive_mutation_id(&altered_source);
+        assert!(altered_source.validate().is_err());
+
+        let mut altered_actor = intent.clone();
+        altered_actor.actor_id = crate::models::twin_event::ActorId::parse("other-owner").unwrap();
+        assert_ne!(derive_mutation_id(&altered_actor), intent.mutation_id);
+
+        let mut altered_scope = intent.clone();
+        altered_scope.markdown_root_scope = Some(digest_bytes(b"other-root"));
+        assert_ne!(derive_mutation_id(&altered_scope), intent.mutation_id);
+
+        let mut missing_scope = serde_json::to_value(&intent).unwrap();
+        missing_scope
+            .as_object_mut()
+            .unwrap()
+            .remove("markdown_root_scope");
+        assert!(serde_json::from_value::<MutationIntentV1>(missing_scope).is_err());
+
+        let mut altered_audit_time = intent.clone();
+        altered_audit_time.created_at += chrono::Duration::days(1);
+        assert_eq!(derive_mutation_id(&altered_audit_time), intent.mutation_id);
+    }
+
+    #[test]
+    fn retarget_recovers_pending_markdown_under_the_old_root_before_switching() {
+        let temp = tempdir().unwrap();
+        let vault_a = temp.path().join("vault-a");
+        let vault_b = temp.path().join("vault-b");
+        std::fs::create_dir(&vault_a).unwrap();
+        std::fs::create_dir(&vault_b).unwrap();
+        let store = Arc::new(TwinEventStore::new(temp.path()));
+        store.initialize().unwrap();
+        let coordinator = MutationCoordinator::new(
+            temp.path(),
+            &vault_a,
+            store.clone(),
+            Arc::new(NoopMutationLifecycle),
+        )
+        .unwrap();
+
+        coordinator.fail_once_at(MutationFaultPoint::AfterStage);
+        assert!(coordinator
+            .commit_local(
+                CausalStream::SyncEligible,
+                SourceChannel::parse("note_editor").unwrap(),
+                vec![TargetMutation::put(
+                    TargetKind::Markdown,
+                    "interrupted.md",
+                    "old-root bytes",
+                )],
+                vec![draft("interrupted")],
+            )
+            .is_err());
+        assert_eq!(coordinator.pending_count().unwrap(), 1);
+
+        coordinator.retarget_markdown_root(&vault_b).unwrap();
+        assert_eq!(coordinator.pending_count().unwrap(), 0);
+        assert_eq!(
+            std::fs::read_to_string(vault_a.join("interrupted.md")).unwrap(),
+            "old-root bytes"
+        );
+        assert!(!vault_b.join("interrupted.md").exists());
+
+        coordinator
+            .commit_local(
+                CausalStream::SyncEligible,
+                SourceChannel::parse("note_editor").unwrap(),
+                vec![TargetMutation::put(
+                    TargetKind::Markdown,
+                    "after-switch.md",
+                    "new-root bytes",
+                )],
+                vec![draft("after-switch")],
+            )
+            .unwrap();
+        assert!(!vault_a.join("after-switch.md").exists());
+        assert_eq!(
+            std::fs::read_to_string(vault_b.join("after-switch.md")).unwrap(),
+            "new-root bytes"
+        );
+        assert_eq!(store.ordered_events().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn stale_markdown_root_intent_is_quarantined_without_touching_new_root() {
+        let temp = tempdir().unwrap();
+        let vault_a = temp.path().join("vault-a");
+        let vault_b = temp.path().join("vault-b");
+        std::fs::create_dir(&vault_a).unwrap();
+        std::fs::create_dir(&vault_b).unwrap();
+        let store = Arc::new(TwinEventStore::new(temp.path()));
+        store.initialize().unwrap();
+        let current = MutationCoordinator::new(
+            temp.path(),
+            &vault_a,
+            store.clone(),
+            Arc::new(NoopMutationLifecycle),
+        )
+        .unwrap();
+        let stale = MutationCoordinator::new(
+            temp.path(),
+            &vault_a,
+            store.clone(),
+            Arc::new(NoopMutationLifecycle),
+        )
+        .unwrap();
+        current.retarget_markdown_root(&vault_b).unwrap();
+
+        stale.fail_once_at(MutationFaultPoint::AfterStage);
+        assert!(stale
+            .commit_local(
+                CausalStream::SyncEligible,
+                SourceChannel::parse("mcp").unwrap(),
+                vec![TargetMutation::put(
+                    TargetKind::Markdown,
+                    "stale.md",
+                    "stale-root bytes",
+                )],
+                vec![draft("stale")],
+            )
+            .is_err());
+
+        assert!(matches!(
+            current.recover_pending(),
+            Err(crate::services::twin_events::MutationError::RecoveryConflict(_))
+        ));
+        assert!(!vault_a.join("stale.md").exists());
+        assert!(!vault_b.join("stale.md").exists());
+        assert_eq!(current.pending_count().unwrap(), 0);
+        assert_eq!(current.quarantine_count().unwrap(), 1);
+        assert!(store.ordered_events().unwrap().is_empty());
+    }
+
+    #[test]
+    fn desktop_and_mcp_coordinators_serialize_one_device_lane_without_duplicates() {
+        let temp = tempdir().unwrap();
+        let vault = temp.path().join("vault");
+        std::fs::create_dir(&vault).unwrap();
+        let store = Arc::new(TwinEventStore::new(temp.path()));
+        store.initialize().unwrap();
+        let desktop = Arc::new(
+            MutationCoordinator::new(
+                temp.path(),
+                &vault,
+                store.clone(),
+                Arc::new(NoopMutationLifecycle),
+            )
+            .unwrap(),
+        );
+        let mcp = Arc::new(
+            MutationCoordinator::new(
+                temp.path(),
+                &vault,
+                store.clone(),
+                Arc::new(NoopMutationLifecycle),
+            )
+            .unwrap(),
+        );
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let desktop_thread = {
+            let coordinator = desktop.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                coordinator.commit_local(
+                    CausalStream::SyncEligible,
+                    SourceChannel::parse("note_editor").unwrap(),
+                    vec![TargetMutation::put(
+                        TargetKind::Markdown,
+                        "desktop.md",
+                        "desktop",
+                    )],
+                    vec![draft("desktop")],
+                )
+            })
+        };
+        let mcp_thread = {
+            let coordinator = mcp.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                coordinator.commit_local(
+                    CausalStream::SyncEligible,
+                    SourceChannel::parse("mcp").unwrap(),
+                    vec![TargetMutation::put(TargetKind::Markdown, "mcp.md", "mcp")],
+                    vec![draft("mcp")],
+                )
+            })
+        };
+        barrier.wait();
+        desktop_thread.join().unwrap().unwrap();
+        mcp_thread.join().unwrap().unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(vault.join("desktop.md")).unwrap(),
+            "desktop"
+        );
+        assert_eq!(
+            std::fs::read_to_string(vault.join("mcp.md")).unwrap(),
+            "mcp"
+        );
+        let events = store
+            .ordered_events_for_stream(CausalStream::SyncEligible)
+            .unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].device_id, events[1].device_id);
+        assert_eq!(events[0].device_sequence, 1);
+        assert_eq!(events[1].device_sequence, 2);
+        assert!(events[1].causal_parents.contains(&events[0].event_id));
+        assert_ne!(events[0].event_id, events[1].event_id);
+    }
+
+    #[test]
+    fn corrupt_pending_and_pending_cap_fail_closed() {
+        let temp = tempdir().unwrap();
+        let vault = temp.path().join("vault");
+        std::fs::create_dir(&vault).unwrap();
+        let store = Arc::new(TwinEventStore::new(temp.path()));
+        store.initialize().unwrap();
+        let coordinator =
+            MutationCoordinator::new(temp.path(), &vault, store, Arc::new(NoopMutationLifecycle))
+                .unwrap();
+        let pending = temp.path().join("twin/mutations/pending/v1");
+        std::fs::write(pending.join("corrupt.json"), "{not-json").unwrap();
+        assert!(coordinator.recover_pending().is_err());
+        assert_eq!(coordinator.pending_count().unwrap(), 0);
+        assert_eq!(coordinator.quarantine_count().unwrap(), 1);
+
+        for index in 0..=MAX_PENDING_INTENTS {
+            std::fs::write(pending.join(format!("{index:064x}.json")), "{}").unwrap();
+        }
+        assert!(coordinator.pending_count().is_err());
+    }
+
+    #[test]
+    fn symlinked_target_component_is_rejected_without_escape() {
+        let temp = tempdir().unwrap();
+        let vault = temp.path().join("vault");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir(&vault).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        let link = vault.join("jump");
+        #[cfg(windows)]
+        if let Err(error) = std::os::windows::fs::symlink_dir(&outside, &link) {
+            if error.kind() == std::io::ErrorKind::PermissionDenied
+                || error.raw_os_error() == Some(1314)
+            {
+                return;
+            }
+            panic!("failed to create test symlink: {error}");
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        let store = Arc::new(TwinEventStore::new(temp.path()));
+        store.initialize().unwrap();
+        let coordinator =
+            MutationCoordinator::new(temp.path(), &vault, store, Arc::new(NoopMutationLifecycle))
+                .unwrap();
+        assert!(coordinator
+            .commit_local(
+                CausalStream::LocalOnly,
+                SourceChannel::parse("note_editor").unwrap(),
+                vec![TargetMutation::put(
+                    TargetKind::Markdown,
+                    "jump/escape.md",
+                    "x"
+                )],
+                vec![draft("symlink")],
+            )
+            .is_err());
+        assert!(!outside.join("escape.md").exists());
+    }
+}

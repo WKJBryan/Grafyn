@@ -21,6 +21,7 @@
 
 mod constitution;
 mod decisions;
+mod feedback;
 mod records;
 mod shared;
 mod traces;
@@ -38,13 +39,14 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 const AUTO_PROMOTE_CONFIDENCE: f32 = 0.75;
 const AUTO_PROMOTE_SUPPORT_COUNT: usize = 3;
 
-#[derive(Debug)]
 pub struct TwinStore {
     root_path: PathBuf,
+    target_root_path: PathBuf,
     traces_path: PathBuf,
     records_path: PathBuf,
     decisions_path: PathBuf,
@@ -58,10 +60,23 @@ pub struct TwinStore {
     trace_cache: HashMap<String, SessionTrace>,
     record_cache: HashMap<String, UserRecord>,
     records_cache_ready: bool,
+    event_recorder: Arc<dyn crate::services::twin_events::EventRecorder>,
 }
 
 impl TwinStore {
     pub fn new(root_path: PathBuf) -> Self {
+        Self::with_event_recorder(
+            root_path.clone(),
+            root_path,
+            Arc::new(crate::services::twin_events::NoopEventRecorder),
+        )
+    }
+
+    pub fn with_event_recorder(
+        root_path: PathBuf,
+        target_root_path: PathBuf,
+        event_recorder: Arc<dyn crate::services::twin_events::EventRecorder>,
+    ) -> Self {
         let traces_path = root_path.join("traces");
         let records_path = root_path.join("records");
         let decisions_path = root_path.join("decisions");
@@ -83,6 +98,7 @@ impl TwinStore {
 
         Self {
             root_path,
+            target_root_path,
             traces_path,
             records_path,
             decisions_path,
@@ -96,7 +112,16 @@ impl TwinStore {
             trace_cache: HashMap::new(),
             record_cache: HashMap::new(),
             records_cache_ready: false,
+            event_recorder,
         }
+    }
+
+    pub fn replace_root_path(&mut self, root_path: PathBuf) {
+        *self = Self::with_event_recorder(
+            root_path,
+            self.target_root_path.clone(),
+            self.event_recorder.clone(),
+        );
     }
 
     fn write_pretty_json<T: Serialize>(&self, path: &Path, value: &T) -> Result<()> {
@@ -108,6 +133,114 @@ impl TwinStore {
         let content = serde_json::to_string_pretty(value)?;
         write_atomic(path, content.as_bytes())
             .with_context(|| format!("Failed to write JSON file: {}", path.display()))
+    }
+
+    fn governed_json_digest<T: Serialize>(
+        value: &T,
+    ) -> Result<crate::models::twin_event::ContentDigest> {
+        Ok(crate::services::twin_events::digest_bytes(
+            serde_json::to_string_pretty(value)?.as_bytes(),
+        ))
+    }
+
+    fn write_governed_json<T: Serialize>(
+        &self,
+        path: &Path,
+        value: &T,
+        drafts: Vec<crate::services::twin_events::TwinEventDraft>,
+    ) -> Result<()> {
+        let content = serde_json::to_string_pretty(value)?;
+        self.commit_governed_json_targets(vec![(path.to_path_buf(), content)], drafts)
+    }
+
+    fn delete_governed_json(
+        &self,
+        path: &Path,
+        drafts: Vec<crate::services::twin_events::TwinEventDraft>,
+    ) -> Result<()> {
+        if self.event_recorder.is_noop() {
+            match std::fs::remove_file(path) {
+                Ok(()) => return Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(error) => return Err(error.into()),
+            }
+        }
+        let relative = path
+            .strip_prefix(&self.target_root_path)
+            .map_err(|_| anyhow::anyhow!("Twin mutation target escaped the configured Twin root"))?
+            .to_string_lossy()
+            .replace('\\', "/");
+        self.event_recorder
+            .commit_mutation(
+                crate::services::twin_events::MutationOrigin::Local,
+                crate::models::twin_event::CausalStream::SyncEligible,
+                crate::models::twin_event::SourceChannel::parse("legacy_twin")
+                    .map_err(anyhow::Error::msg)?,
+                vec![crate::services::twin_events::TargetMutation::tombstone(
+                    crate::services::twin_events::TargetKind::TwinJson,
+                    relative,
+                )],
+                drafts,
+            )
+            .map_err(anyhow::Error::new)?;
+        Ok(())
+    }
+
+    fn commit_governed_json_targets(
+        &self,
+        values: Vec<(PathBuf, String)>,
+        drafts: Vec<crate::services::twin_events::TwinEventDraft>,
+    ) -> Result<()> {
+        self.commit_governed_json_targets_with_source(
+            crate::models::twin_event::SourceChannel::parse("legacy_twin")
+                .map_err(anyhow::Error::msg)?,
+            values,
+            drafts,
+        )
+    }
+
+    fn commit_governed_json_targets_with_source(
+        &self,
+        source_channel: crate::models::twin_event::SourceChannel,
+        values: Vec<(PathBuf, String)>,
+        drafts: Vec<crate::services::twin_events::TwinEventDraft>,
+    ) -> Result<()> {
+        if self.event_recorder.is_noop() {
+            for (path, content) in values {
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                write_atomic(&path, content.as_bytes())?;
+            }
+            return Ok(());
+        }
+        let targets = values
+            .into_iter()
+            .map(|(path, content)| {
+                let relative = path
+                    .strip_prefix(&self.target_root_path)
+                    .map_err(|_| {
+                        anyhow::anyhow!("Twin mutation target escaped the configured Twin root")
+                    })?
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                Ok(crate::services::twin_events::TargetMutation::put(
+                    crate::services::twin_events::TargetKind::TwinJson,
+                    relative,
+                    content,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.event_recorder
+            .commit_mutation(
+                crate::services::twin_events::MutationOrigin::Local,
+                crate::models::twin_event::CausalStream::SyncEligible,
+                source_channel,
+                targets,
+                drafts,
+            )
+            .map_err(anyhow::Error::new)?;
+        Ok(())
     }
 
     fn validate_file_id(id: &str) -> Result<()> {

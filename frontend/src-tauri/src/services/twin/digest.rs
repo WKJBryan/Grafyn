@@ -10,7 +10,7 @@ use crate::models::twin::{
 };
 use anyhow::{Context, Result};
 use chrono::Utc;
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -103,6 +103,17 @@ fn memory_digest_state_for_action(action: &MemoryDigestAction) -> MemoryDigestSt
         MemoryDigestAction::Private => MemoryDigestState::Private,
         MemoryDigestAction::NoTrain => MemoryDigestState::NoTrain,
         MemoryDigestAction::Reject => MemoryDigestState::Rejected,
+    }
+}
+
+fn memory_digest_action_label(action: &MemoryDigestAction) -> &'static str {
+    match action {
+        MemoryDigestAction::Keep => "keep",
+        MemoryDigestAction::Soften => "soften",
+        MemoryDigestAction::NotMe => "not_me",
+        MemoryDigestAction::Private => "private",
+        MemoryDigestAction::NoTrain => "no_train",
+        MemoryDigestAction::Reject => "reject",
     }
 }
 
@@ -231,6 +242,110 @@ impl TwinStore {
         item.state = memory_digest_state_for_action(&request.action);
         item.updated_at = Utc::now();
         items[item_index] = item.clone();
+
+        if !self.event_recorder.is_noop() {
+            if item.record_ids.len() > 63 {
+                anyhow::bail!("a digest review can update at most 63 records");
+            }
+            let mut updated_records = Vec::new();
+            for record_id in &item.record_ids {
+                let Ok(mut record) = self.get_user_record(record_id) else {
+                    continue;
+                };
+                let next_state = match request.action {
+                    MemoryDigestAction::Keep => PromotionState::Endorsed,
+                    MemoryDigestAction::Soften => PromotionState::Candidate,
+                    MemoryDigestAction::NotMe | MemoryDigestAction::Reject => {
+                        PromotionState::Rejected
+                    }
+                    MemoryDigestAction::Private => PromotionState::Private,
+                    MemoryDigestAction::NoTrain => PromotionState::NoTrain,
+                };
+                let previous_state = record.promotion_state.clone();
+                record.promotion_state = next_state.clone();
+                record.updated_at = item.updated_at;
+                super::records::append_promotion_history(
+                    &mut record.metadata,
+                    &previous_state,
+                    &next_state,
+                    request.rationale.as_deref(),
+                    false,
+                );
+                if next_state == PromotionState::Rejected {
+                    record
+                        .metadata
+                        .insert("reverted_at".to_string(), json!(item.updated_at));
+                    record.metadata.insert(
+                        "revert_reason".to_string(),
+                        json!(request.rationale.clone()),
+                    );
+                    record
+                        .metadata
+                        .insert("auto_promoted".to_string(), Value::Bool(false));
+                }
+                if request.action == MemoryDigestAction::Soften {
+                    record.confidence = (record.confidence * 0.85).max(0.35);
+                }
+                updated_records.push(record);
+            }
+
+            let digest_content = serde_json::to_string_pretty(&items)?;
+            let digest_after =
+                crate::services::twin_events::digest_bytes(digest_content.as_bytes());
+            let mut values = vec![(self.digest_path.clone(), digest_content)];
+            let action = memory_digest_action_label(&request.action);
+            let feedback_seed = format!("{}\0{}\0{}", item.id, action, item.updated_at);
+            let feedback_id = format!(
+                "feedback-{}",
+                crate::services::twin_events::digest_bytes(feedback_seed.as_bytes()).as_str()
+            );
+            let governance = if request.action == MemoryDigestAction::Private {
+                crate::services::twin_events::local_capture_governance(
+                    crate::models::twin_event::Sensitivity::Restricted,
+                )
+            } else {
+                crate::services::twin_events::standard_capture_governance()
+            };
+            let mut draft = crate::services::twin_events::feedback_draft(
+                crate::services::twin_events::FeedbackDraft {
+                    feedback_id: &feedback_id,
+                    target_id: &item.id,
+                    kind: action,
+                    content: None,
+                    rationale: request.rationale.as_deref(),
+                    rank: None,
+                    observed_at: item.updated_at,
+                    source_channel: crate::models::twin_event::SourceChannel::parse("legacy_twin")
+                        .map_err(anyhow::Error::msg)?,
+                    governance,
+                },
+            )
+            .map_err(anyhow::Error::msg)?;
+            draft.evidence.push(crate::models::twin_event::EvidenceRef {
+                evidence_type: crate::models::twin_event::EvidenceType::TwinRecord,
+                source_id: crate::models::twin_event::Identifier::parse(&item.id)
+                    .map_err(anyhow::Error::msg)?,
+                digest: Some(digest_after),
+            });
+            for record in &updated_records {
+                let content = serde_json::to_string_pretty(record)?;
+                let digest = crate::services::twin_events::digest_bytes(content.as_bytes());
+                values.push((self.record_file_path(&record.id), content));
+                draft.evidence.push(crate::models::twin_event::EvidenceRef {
+                    evidence_type: crate::models::twin_event::EvidenceType::TwinRecord,
+                    source_id: crate::models::twin_event::Identifier::parse(&record.id)
+                        .map_err(anyhow::Error::msg)?,
+                    digest: Some(digest),
+                });
+            }
+            draft.evidence.sort();
+            self.commit_governed_json_targets(values, vec![draft])?;
+            for record in updated_records {
+                self.record_cache.insert(record.id.clone(), record);
+            }
+            return Ok(item);
+        }
+
         self.write_memory_digest_file(&items)?;
 
         for record_id in &item.record_ids {
@@ -304,6 +419,79 @@ mod tests {
     use super::*;
     use crate::models::twin::{PromotionState, UserRecordKind};
     use tempfile::tempdir;
+
+    #[test]
+    fn coordinated_digest_review_is_one_feedback_event_over_digest_and_records() {
+        let root = tempdir().unwrap();
+        let data = root.path().join("data");
+        let vault = root.path().join("vault");
+        let twin_root = data.join("twin").join("scope-one");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir(&vault).unwrap();
+        let events = std::sync::Arc::new(crate::services::twin_events::TwinEventStore::new(&data));
+        events.initialize().unwrap();
+        let coordinator = std::sync::Arc::new(
+            crate::services::twin_events::MutationCoordinator::new(
+                &data,
+                &vault,
+                events.clone(),
+                std::sync::Arc::new(crate::services::twin_events::NoopMutationLifecycle),
+            )
+            .unwrap(),
+        );
+        let mut store = TwinStore::with_event_recorder(twin_root, data.join("twin"), coordinator);
+        let evidence = (0..3)
+            .map(|index| EvidenceRef {
+                trace_id: "trace-one".to_string(),
+                event_id: format!("event-{index}"),
+                session_id: "session-one".to_string(),
+                tile_id: None,
+                model_id: None,
+                note: None,
+                source_type: Some("behavior".to_string()),
+                source_id: None,
+                source_label: None,
+                excerpt: None,
+                speaker_role: None,
+            })
+            .collect();
+        store
+            .create_user_record(UserRecordCreate {
+                kind: UserRecordKind::Preference,
+                content: "Review evidence first".to_string(),
+                origin: RecordOrigin::Inferred,
+                evidence_refs: evidence,
+                confidence: 0.8,
+                promotion_state: Some(PromotionState::Candidate),
+                valid_from: None,
+                valid_until: None,
+                links: Vec::new(),
+                metadata: HashMap::new(),
+            })
+            .unwrap();
+        let item = store.list_memory_digest().unwrap().remove(0);
+        assert_eq!(events.ordered_events().unwrap().len(), 1);
+        store
+            .review_memory_digest_item(
+                &item.id,
+                MemoryDigestReviewRequest {
+                    action: MemoryDigestAction::Keep,
+                    rationale: Some("This is me".to_string()),
+                },
+            )
+            .unwrap();
+        let captured = events.ordered_events().unwrap();
+        assert_eq!(captured.len(), 2);
+        let crate::models::twin_event::TwinEventPayload::FeedbackRecorded(feedback) =
+            &captured[1].payload
+        else {
+            panic!("digest review needs one explicit feedback event");
+        };
+        assert_eq!(feedback.target_id.as_str(), item.id);
+        assert_eq!(feedback.kind.as_str(), "keep");
+        assert_eq!(feedback.content, None);
+        assert_eq!(feedback.rationale.as_ref().unwrap().as_str(), "This is me");
+    }
 
     #[test]
     fn legacy_auto_promoted_is_only_a_pending_review_trigger() {

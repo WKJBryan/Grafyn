@@ -602,6 +602,105 @@ fn action_gap_relevance(gap: &ActionGap, query_terms: &HashSet<String>) -> usize
 }
 
 impl TwinStore {
+    fn write_legacy_artifact_observation<T: serde::Serialize>(
+        &self,
+        path: &Path,
+        artifact_id: &str,
+        value: &T,
+        observed_at: chrono::DateTime<Utc>,
+        automatic: bool,
+        tag: Option<&str>,
+    ) -> Result<()> {
+        let draft = self.legacy_artifact_observation_draft(
+            artifact_id,
+            value,
+            observed_at,
+            automatic,
+            tag,
+        )?;
+        self.write_governed_json(path, value, vec![draft])
+    }
+
+    fn legacy_artifact_observation_draft<T: serde::Serialize>(
+        &self,
+        artifact_id: &str,
+        value: &T,
+        observed_at: chrono::DateTime<Utc>,
+        automatic: bool,
+        tag: Option<&str>,
+    ) -> Result<crate::services::twin_events::TwinEventDraft> {
+        let digest = Self::governed_json_digest(value)?;
+        let actor = automatic
+            .then(|| crate::models::twin_event::ActorId::parse("grafyn"))
+            .transpose()
+            .map_err(anyhow::Error::msg)?;
+        crate::services::twin_events::legacy_observation_draft(
+            &format!("legacy-observation-{}", digest.as_str()),
+            artifact_id,
+            digest,
+            observed_at,
+            crate::models::twin_event::SourceChannel::parse("legacy_twin")
+                .map_err(anyhow::Error::msg)?,
+            actor,
+            tag,
+            crate::services::twin_events::standard_capture_governance(),
+        )
+        .map_err(anyhow::Error::msg)
+    }
+
+    fn legacy_artifact_feedback_draft<T: serde::Serialize>(
+        &self,
+        artifact_id: &str,
+        value: &T,
+        observed_at: chrono::DateTime<Utc>,
+        action: &MemoryDigestAction,
+        rationale: Option<&str>,
+    ) -> Result<crate::services::twin_events::TwinEventDraft> {
+        let action_label = match action {
+            MemoryDigestAction::Keep => "keep",
+            MemoryDigestAction::Soften => "soften",
+            MemoryDigestAction::NotMe => "not_me",
+            MemoryDigestAction::Private => "private",
+            MemoryDigestAction::NoTrain => "no_train",
+            MemoryDigestAction::Reject => "reject",
+        };
+        let digest = Self::governed_json_digest(value)?;
+        let feedback_seed = format!("{artifact_id}\0{action_label}\0{observed_at}");
+        let feedback_id = format!(
+            "feedback-{}",
+            crate::services::twin_events::digest_bytes(feedback_seed.as_bytes()).as_str()
+        );
+        let governance = if *action == MemoryDigestAction::Private {
+            crate::services::twin_events::local_capture_governance(
+                crate::models::twin_event::Sensitivity::Restricted,
+            )
+        } else {
+            crate::services::twin_events::standard_capture_governance()
+        };
+        let mut draft = crate::services::twin_events::feedback_draft(
+            crate::services::twin_events::FeedbackDraft {
+                feedback_id: &feedback_id,
+                target_id: artifact_id,
+                kind: action_label,
+                content: None,
+                rationale,
+                rank: None,
+                observed_at,
+                source_channel: crate::models::twin_event::SourceChannel::parse("legacy_twin")
+                    .map_err(anyhow::Error::msg)?,
+                governance,
+            },
+        )
+        .map_err(anyhow::Error::msg)?;
+        draft.evidence.push(crate::models::twin_event::EvidenceRef {
+            evidence_type: crate::models::twin_event::EvidenceType::TwinRecord,
+            source_id: crate::models::twin_event::Identifier::parse(artifact_id)
+                .map_err(anyhow::Error::msg)?,
+            digest: Some(digest),
+        });
+        Ok(draft)
+    }
+
     pub fn list_constitution_items(&self) -> Result<Vec<ConstitutionItem>> {
         let mut items = Vec::new();
         if !self.constitution_path.exists() {
@@ -665,7 +764,18 @@ impl TwinStore {
             created_at: now,
             updated_at: now,
         };
-        self.write_constitution_file(&item)?;
+        let automatic = item
+            .source
+            .as_deref()
+            .is_some_and(|source| source.contains("inference"));
+        self.write_legacy_artifact_observation(
+            &self.constitution_file_path(&item.id),
+            &item.id,
+            &item,
+            item.updated_at,
+            automatic,
+            automatic.then_some("legacy_inference"),
+        )?;
         Ok(item)
     }
 
@@ -677,6 +787,7 @@ impl TwinStore {
         Self::validate_file_id(id)?;
         let path = self.constitution_file_path(id);
         let mut item = self.read_constitution_file(&path)?;
+        let before = serde_json::to_value(&item)?;
         if let Some(claim) = update.claim {
             item.claim = claim;
         }
@@ -698,8 +809,18 @@ impl TwinStore {
         if let Some(tensions) = update.tensions {
             item.tensions = tensions;
         }
+        if serde_json::to_value(&item)? == before {
+            return Ok(item);
+        }
         item.updated_at = Utc::now();
-        self.write_constitution_file(&item)?;
+        self.write_legacy_artifact_observation(
+            &path,
+            &item.id,
+            &item,
+            item.updated_at,
+            false,
+            None,
+        )?;
         Ok(item)
     }
 
@@ -712,8 +833,14 @@ impl TwinStore {
         let mut item = self.read_constitution_file(&self.constitution_file_path(id))?;
         item.status = constitution_status_for_action(&request.action);
         item.updated_at = Utc::now();
-        self.write_constitution_file(&item)?;
-        self.append_trace_event(
+        let draft = self.legacy_artifact_feedback_draft(
+            &item.id,
+            &item,
+            item.updated_at,
+            &request.action,
+            request.rationale.as_deref(),
+        )?;
+        let (_, trace) = self.plan_trace_event(
             "constitution-review",
             TraceEventType::ConstitutionItemReviewed,
             json!({
@@ -722,6 +849,18 @@ impl TwinStore {
                 "rationale": request.rationale,
             }),
         )?;
+        let trace_target = self.serialized_trace_target(&trace)?;
+        self.commit_governed_json_targets(
+            vec![
+                (
+                    self.constitution_file_path(&item.id),
+                    serde_json::to_string_pretty(&item)?,
+                ),
+                trace_target,
+            ],
+            vec![draft],
+        )?;
+        self.cache_committed_trace(trace);
         Ok(item)
     }
 
@@ -767,6 +906,14 @@ impl TwinStore {
     }
 
     pub fn create_action_gap(&self, create: ActionGapCreate) -> Result<ActionGap> {
+        self.create_action_gap_with_capture(create, false)
+    }
+
+    fn create_action_gap_with_capture(
+        &self,
+        create: ActionGapCreate,
+        automatic: bool,
+    ) -> Result<ActionGap> {
         let now = Utc::now();
         let gap = ActionGap {
             id: uuid::Uuid::new_v4().to_string(),
@@ -782,7 +929,14 @@ impl TwinStore {
             created_at: now,
             updated_at: now,
         };
-        self.write_action_gap_file(&gap)?;
+        self.write_legacy_artifact_observation(
+            &self.action_gap_file_path(&gap.id),
+            &gap.id,
+            &gap,
+            gap.updated_at,
+            automatic,
+            automatic.then_some("legacy_inference"),
+        )?;
         Ok(gap)
     }
 
@@ -795,8 +949,14 @@ impl TwinStore {
         let mut gap = self.read_action_gap_file(&self.action_gap_file_path(id))?;
         gap.status = constitution_status_for_action(&request.action);
         gap.updated_at = Utc::now();
-        self.write_action_gap_file(&gap)?;
-        self.append_trace_event(
+        let draft = self.legacy_artifact_feedback_draft(
+            &gap.id,
+            &gap,
+            gap.updated_at,
+            &request.action,
+            request.rationale.as_deref(),
+        )?;
+        let (_, trace) = self.plan_trace_event(
             "constitution-review",
             TraceEventType::ActionGapReviewed,
             json!({
@@ -805,6 +965,18 @@ impl TwinStore {
                 "rationale": request.rationale,
             }),
         )?;
+        let trace_target = self.serialized_trace_target(&trace)?;
+        self.commit_governed_json_targets(
+            vec![
+                (
+                    self.action_gap_file_path(&gap.id),
+                    serde_json::to_string_pretty(&gap)?,
+                ),
+                trace_target,
+            ],
+            vec![draft],
+        )?;
+        self.cache_committed_trace(trace);
         Ok(gap)
     }
 
@@ -840,9 +1012,15 @@ impl TwinStore {
         setup.somatic_cues = clean_setup_entries(setup.somatic_cues);
         setup.action_tendencies = clean_setup_entries(setup.action_tendencies);
         setup.updated_at = Some(Utc::now());
-        self.write_pretty_json(&self.setup_path, &setup)?;
-
-        let event = self.append_trace_event(
+        let observed_at = setup.updated_at.expect("setup timestamp assigned");
+        let draft = self.legacy_artifact_observation_draft(
+            "constitution-setup",
+            &setup,
+            observed_at,
+            false,
+            None,
+        )?;
+        let (event, trace) = self.plan_trace_event(
             "constitution-setup",
             TraceEventType::ConstitutionSetupSaved,
             json!({
@@ -856,6 +1034,18 @@ impl TwinStore {
                 "action_tendencies": setup.action_tendencies,
             }),
         )?;
+        let trace_target = self.serialized_trace_target(&trace)?;
+        self.commit_governed_json_targets(
+            vec![
+                (
+                    self.setup_path.clone(),
+                    serde_json::to_string_pretty(&setup)?,
+                ),
+                trace_target,
+            ],
+            vec![draft],
+        )?;
+        self.cache_committed_trace(trace);
         let evidence_ref = EvidenceRef {
             trace_id: "constitution-setup".to_string(),
             event_id: event.id,
@@ -966,7 +1156,7 @@ impl TwinStore {
             {
                 let key = action_gap_key(&stated_value, &revealed_behavior);
                 if gap_keys.insert(key) {
-                    self.create_action_gap(ActionGapCreate {
+                    self.create_action_gap_with_capture(ActionGapCreate {
                         stated_value,
                         revealed_behavior,
                         driver_hypothesis: Some(
@@ -980,7 +1170,7 @@ impl TwinStore {
                         linked_record_ids: vec![record.id.clone()],
                         confidence: record.confidence,
                         status: ConstitutionStatus::Candidate,
-                    })?;
+                    }, true)?;
                     created_action_gaps += 1;
                 }
             }
@@ -1003,7 +1193,7 @@ impl TwinStore {
             let revealed_behavior = format!("Chosen option: {}", chosen_option.trim());
             let key = action_gap_key(&stated_value, &revealed_behavior);
             if gap_keys.insert(key) {
-                self.create_action_gap(ActionGapCreate {
+                self.create_action_gap_with_capture(ActionGapCreate {
                     stated_value,
                     revealed_behavior,
                     driver_hypothesis: Some("Inferred from a decision where final action diverged from initial leaning.".to_string()),
@@ -1013,7 +1203,7 @@ impl TwinStore {
                     linked_record_ids: Vec::new(),
                     confidence: 0.68,
                     status: ConstitutionStatus::Candidate,
-                })?;
+                }, true)?;
                 created_action_gaps += 1;
             }
         }
@@ -1177,12 +1367,20 @@ impl TwinStore {
         setup.somatic_cues = clean_setup_entries(setup.somatic_cues);
         setup.action_tendencies = clean_setup_entries(setup.action_tendencies);
         setup.updated_at = Some(Utc::now());
-        self.write_pretty_json(&self.setup_path, &setup)
+        let observed_at = setup.updated_at.expect("setup timestamp assigned");
+        self.write_legacy_artifact_observation(
+            &self.setup_path,
+            "constitution-setup",
+            &setup,
+            observed_at,
+            true,
+            Some("legacy_inference"),
+        )
     }
 
     fn prune_stale_note_records(&mut self, current_note_ids: &HashSet<String>) -> Result<usize> {
         self.ensure_record_cache()?;
-        let stale_ids = self
+        let stale_records = self
             .record_cache
             .values()
             .filter(|record| record_is_vault_derived(record))
@@ -1193,20 +1391,31 @@ impl TwinStore {
                     .and_then(Value::as_str)
                     .is_some_and(|source_note_id| !current_note_ids.contains(source_note_id))
             })
-            .map(|record| record.id.clone())
+            .cloned()
             .collect::<Vec<_>>();
 
-        for id in &stale_ids {
-            self.record_cache.remove(id);
-            let path = self.records_path.join(format!("{}.json", id));
-            if path.exists() {
-                std::fs::remove_file(&path).with_context(|| {
-                    format!("Failed to remove stale Twin record: {}", path.display())
-                })?;
-            }
+        for record in &stale_records {
+            let digest = Self::governed_json_digest(record)?;
+            let draft = crate::services::twin_events::legacy_observation_draft(
+                &format!("legacy-pruned-{}", digest.as_str()),
+                &record.id,
+                digest,
+                Utc::now(),
+                crate::models::twin_event::SourceChannel::parse("legacy_twin")
+                    .map_err(anyhow::Error::msg)?,
+                Some(
+                    crate::models::twin_event::ActorId::parse("grafyn")
+                        .map_err(anyhow::Error::msg)?,
+                ),
+                Some("legacy_pruned"),
+                crate::services::twin_events::standard_capture_governance(),
+            )
+            .map_err(anyhow::Error::msg)?;
+            self.delete_governed_json(&self.record_file_path(&record.id), vec![draft])?;
+            self.record_cache.remove(&record.id);
         }
 
-        Ok(stale_ids.len())
+        Ok(stale_records.len())
     }
 
     fn prune_stale_note_constitution_items(
@@ -1226,15 +1435,23 @@ impl TwinStore {
             .collect::<Vec<_>>();
 
         for item in &stale_items {
-            let path = self.constitution_path.join(format!("{}.json", item.id));
-            if path.exists() {
-                std::fs::remove_file(&path).with_context(|| {
-                    format!(
-                        "Failed to remove stale Constitution item: {}",
-                        path.display()
-                    )
-                })?;
-            }
+            let digest = Self::governed_json_digest(item)?;
+            let draft = crate::services::twin_events::legacy_observation_draft(
+                &format!("legacy-pruned-{}", digest.as_str()),
+                &item.id,
+                digest,
+                Utc::now(),
+                crate::models::twin_event::SourceChannel::parse("legacy_twin")
+                    .map_err(anyhow::Error::msg)?,
+                Some(
+                    crate::models::twin_event::ActorId::parse("grafyn")
+                        .map_err(anyhow::Error::msg)?,
+                ),
+                Some("legacy_pruned"),
+                crate::services::twin_events::standard_capture_governance(),
+            )
+            .map_err(anyhow::Error::msg)?;
+            self.delete_governed_json(&self.constitution_file_path(&item.id), vec![draft])?;
         }
 
         Ok(stale_items.len())
@@ -1250,15 +1467,23 @@ impl TwinStore {
             .collect::<Vec<_>>();
 
         for item in &stale_items {
-            let path = self.constitution_path.join(format!("{}.json", item.id));
-            if path.exists() {
-                std::fs::remove_file(&path).with_context(|| {
-                    format!(
-                        "Failed to remove stale setup Constitution item: {}",
-                        path.display()
-                    )
-                })?;
-            }
+            let digest = Self::governed_json_digest(item)?;
+            let draft = crate::services::twin_events::legacy_observation_draft(
+                &format!("legacy-pruned-{}", digest.as_str()),
+                &item.id,
+                digest,
+                Utc::now(),
+                crate::models::twin_event::SourceChannel::parse("legacy_twin")
+                    .map_err(anyhow::Error::msg)?,
+                Some(
+                    crate::models::twin_event::ActorId::parse("grafyn")
+                        .map_err(anyhow::Error::msg)?,
+                ),
+                Some("legacy_pruned"),
+                crate::services::twin_events::standard_capture_governance(),
+            )
+            .map_err(anyhow::Error::msg)?;
+            self.delete_governed_json(&self.constitution_file_path(&item.id), vec![draft])?;
         }
 
         Ok(stale_items.len())
@@ -1333,16 +1558,6 @@ impl TwinStore {
             .with_context(|| format!("Failed to parse action gap file: {}", path.display()))
     }
 
-    fn write_constitution_file(&self, item: &ConstitutionItem) -> Result<()> {
-        let path = self.constitution_file_path(&item.id);
-        self.write_pretty_json(&path, item)
-    }
-
-    fn write_action_gap_file(&self, gap: &ActionGap) -> Result<()> {
-        let path = self.action_gap_file_path(&gap.id);
-        self.write_pretty_json(&path, gap)
-    }
-
     fn seed_constitution_setup_items(
         &self,
         setup: &ConstitutionSetup,
@@ -1397,6 +1612,170 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::models::twin::ConstitutionStatus;
+
+    #[test]
+    fn coordinated_constitution_and_action_gap_mutations_use_observations_then_feedback() {
+        let root = tempdir().unwrap();
+        let data = root.path().join("data");
+        let vault = root.path().join("vault");
+        let twin_root = data.join("twin").join("scope-one");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir(&vault).unwrap();
+        let events = std::sync::Arc::new(crate::services::twin_events::TwinEventStore::new(&data));
+        events.initialize().unwrap();
+        let coordinator = std::sync::Arc::new(
+            crate::services::twin_events::MutationCoordinator::new(
+                &data,
+                &vault,
+                events.clone(),
+                std::sync::Arc::new(crate::services::twin_events::NoopMutationLifecycle),
+            )
+            .unwrap(),
+        );
+        let mut store = TwinStore::with_event_recorder(twin_root, data.join("twin"), coordinator);
+        let item = store
+            .create_constitution_item(ConstitutionItemCreate {
+                claim: "Prefer reversible experiments".to_string(),
+                dimension: "values".to_string(),
+                scope: vec!["work".to_string()],
+                priority: 0.8,
+                confidence: 0.8,
+                status: ConstitutionStatus::Candidate,
+                evidence_refs: Vec::new(),
+                tensions: Vec::new(),
+                linked_record_ids: Vec::new(),
+                source: None,
+            })
+            .unwrap();
+        store
+            .update_constitution_item(
+                &item.id,
+                ConstitutionItemUpdate {
+                    priority: Some(0.9),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        store
+            .review_constitution_item(
+                &item.id,
+                ConstitutionReviewRequest {
+                    action: MemoryDigestAction::Keep,
+                    rationale: Some("Reviewed".to_string()),
+                },
+            )
+            .unwrap();
+        let gap = store
+            .create_action_gap(ActionGapCreate {
+                stated_value: "Move quickly".to_string(),
+                revealed_behavior: "Wait for evidence".to_string(),
+                driver_hypothesis: None,
+                somatic_taste_signal: None,
+                decision_risk: "Delay".to_string(),
+                evidence_refs: Vec::new(),
+                linked_record_ids: Vec::new(),
+                confidence: 0.7,
+                status: ConstitutionStatus::Candidate,
+            })
+            .unwrap();
+        store
+            .review_action_gap(
+                &gap.id,
+                ConstitutionReviewRequest {
+                    action: MemoryDigestAction::Reject,
+                    rationale: None,
+                },
+            )
+            .unwrap();
+        let captured = events.ordered_events().unwrap();
+        assert_eq!(captured.len(), 5);
+        assert!(matches!(
+            captured[0].payload,
+            crate::models::twin_event::TwinEventPayload::ObservationRecorded(_)
+        ));
+        assert!(matches!(
+            captured[1].payload,
+            crate::models::twin_event::TwinEventPayload::ObservationRecorded(_)
+        ));
+        assert!(matches!(
+            captured[2].payload,
+            crate::models::twin_event::TwinEventPayload::FeedbackRecorded(_)
+        ));
+        assert!(matches!(
+            captured[3].payload,
+            crate::models::twin_event::TwinEventPayload::ObservationRecorded(_)
+        ));
+        assert!(matches!(
+            captured[4].payload,
+            crate::models::twin_event::TwinEventPayload::FeedbackRecorded(_)
+        ));
+        assert!(captured.iter().all(|event| !matches!(
+            event.payload,
+            crate::models::twin_event::TwinEventPayload::MemoryProposed(_)
+                | crate::models::twin_event::TwinEventPayload::MemoryReviewed(_)
+        )));
+    }
+
+    #[test]
+    fn constitution_review_and_trace_recover_as_one_compound_mutation() {
+        let root = tempdir().unwrap();
+        let data = root.path().join("data");
+        let vault = root.path().join("vault");
+        let twin_root = data.join("twin").join("scope-one");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir(&vault).unwrap();
+        let events = std::sync::Arc::new(crate::services::twin_events::TwinEventStore::new(&data));
+        events.initialize().unwrap();
+        let coordinator = std::sync::Arc::new(
+            crate::services::twin_events::MutationCoordinator::new(
+                &data,
+                &vault,
+                events.clone(),
+                std::sync::Arc::new(crate::services::twin_events::NoopMutationLifecycle),
+            )
+            .unwrap(),
+        );
+        let mut store =
+            TwinStore::with_event_recorder(twin_root, data.join("twin"), coordinator.clone());
+        let item = store
+            .create_constitution_item(ConstitutionItemCreate {
+                claim: "Recover the review".to_string(),
+                dimension: "values".to_string(),
+                scope: Vec::new(),
+                priority: 0.8,
+                confidence: 0.8,
+                status: ConstitutionStatus::Candidate,
+                evidence_refs: Vec::new(),
+                tensions: Vec::new(),
+                linked_record_ids: Vec::new(),
+                source: None,
+            })
+            .unwrap();
+        coordinator.fail_once_at(crate::services::twin_events::MutationFaultPoint::AfterTarget(0));
+
+        assert!(store
+            .review_constitution_item(
+                &item.id,
+                ConstitutionReviewRequest {
+                    action: MemoryDigestAction::Keep,
+                    rationale: Some("Reviewed".to_string()),
+                },
+            )
+            .is_err());
+        assert!(!store.trace_cache.contains_key("constitution-review"));
+        assert_eq!(coordinator.recover_pending().unwrap(), 1);
+        assert_eq!(coordinator.recover_pending().unwrap(), 0);
+
+        assert_eq!(events.ordered_events().unwrap().len(), 2);
+        assert_eq!(
+            store
+                .get_session_trace("constitution-review")
+                .unwrap()
+                .events
+                .len(),
+            1
+        );
+    }
 
     #[test]
     fn legacy_auto_promoted_cannot_seed_or_activate_constitution() {
@@ -1770,6 +2149,60 @@ mod tests {
             .expect("records should list")
             .iter()
             .all(|record| !record.content.contains("old vault finding")));
+    }
+
+    #[test]
+    fn coordinated_prune_uses_tombstone_and_legacy_pruned_observation() {
+        let root = tempdir().unwrap();
+        let data = root.path().join("data");
+        let vault = root.path().join("vault");
+        let twin_root = data.join("twin").join("scope-one");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir(&vault).unwrap();
+        let events = std::sync::Arc::new(crate::services::twin_events::TwinEventStore::new(&data));
+        events.initialize().unwrap();
+        let coordinator = std::sync::Arc::new(
+            crate::services::twin_events::MutationCoordinator::new(
+                &data,
+                &vault,
+                events.clone(),
+                std::sync::Arc::new(crate::services::twin_events::NoopMutationLifecycle),
+            )
+            .unwrap(),
+        );
+        let mut store = TwinStore::with_event_recorder(twin_root, data.join("twin"), coordinator);
+        let stale = store
+            .create_user_record(UserRecordCreate {
+                kind: UserRecordKind::Fact,
+                content: "Stale note-derived record".to_string(),
+                origin: RecordOrigin::Inferred,
+                evidence_refs: Vec::new(),
+                confidence: 0.66,
+                promotion_state: Some(PromotionState::Candidate),
+                valid_from: None,
+                valid_until: None,
+                links: Vec::new(),
+                metadata: HashMap::from([
+                    ("source_type".to_string(), json!("interview_answer")),
+                    ("source_note_id".to_string(), json!("missing-note")),
+                ]),
+            })
+            .unwrap();
+
+        let summary = store.run_constitution_inference_with_notes(&[]).unwrap();
+        assert_eq!(summary.pruned_stale_records, 1);
+        assert!(!store.record_file_path(&stale.id).exists());
+        let captured = events.ordered_events().unwrap();
+        assert_eq!(captured.len(), 2);
+        assert!(captured[1]
+            .context
+            .tags
+            .iter()
+            .any(|tag| tag == "legacy_pruned"));
+        assert!(matches!(
+            captured[1].payload,
+            crate::models::twin_event::TwinEventPayload::ObservationRecorded(_)
+        ));
     }
 
     #[test]

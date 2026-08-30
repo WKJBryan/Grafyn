@@ -68,13 +68,14 @@ pub async fn update_settings(
         // Update KnowledgeStore to new vault
         {
             let mut ks = state.knowledge_store.write().await;
-            ks.set_vault_path(new_vault_path);
+            ks.set_vault_path(new_vault_path)
+                .map_err(|error| error.to_string())?;
         }
 
         rebuild_all_indexes(state.inner()).await?;
         if let Some(new_twin_path) = new_twin_path {
             let mut twin_store = state.twin_store.write().await;
-            *twin_store = crate::services::twin::TwinStore::new(new_twin_path);
+            twin_store.replace_root_path(new_twin_path);
         }
         log::info!("Services rebuilt for new vault path");
     }

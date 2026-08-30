@@ -19,8 +19,12 @@ enum ParsedImport {
     Conversations {
         platform: String,
         conversations: Vec<ParsedConversation>,
+        source_content: String,
     },
-    Document(document::DocumentImportBatch),
+    Document {
+        batch: document::DocumentImportBatch,
+        source_content: String,
+    },
 }
 
 /// Preview content in an import file (auto-detects format).
@@ -34,8 +38,9 @@ pub async fn preview_import(
         ParsedImport::Conversations {
             platform,
             conversations,
+            ..
         } => (platform, conversations),
-        ParsedImport::Document(batch) => (
+        ParsedImport::Document { batch, .. } => (
             "document".to_string(),
             batch
                 .items
@@ -64,18 +69,24 @@ pub async fn apply_import(
     state: State<'_, AppState>,
 ) -> Result<ImportResult, String> {
     match parse_import_file(&file_path).await? {
-        ParsedImport::Conversations { conversations, .. } => {
-            apply_conversation_import(conversations, conversation_ids, state).await
+        ParsedImport::Conversations {
+            conversations,
+            source_content,
+            ..
+        } => {
+            apply_conversation_import(conversations, conversation_ids, source_content, state).await
         }
-        ParsedImport::Document(batch) => {
-            apply_document_import(batch, conversation_ids, state).await
-        }
+        ParsedImport::Document {
+            batch,
+            source_content,
+        } => apply_document_import(batch, conversation_ids, source_content, state).await,
     }
 }
 
 async fn apply_conversation_import(
     all_conversations: Vec<ParsedConversation>,
     conversation_ids: Vec<String>,
+    source_content: String,
     state: State<'_, AppState>,
 ) -> Result<ImportResult, String> {
     let to_import: Vec<_> = if conversation_ids.is_empty() {
@@ -160,8 +171,12 @@ async fn apply_conversation_import(
         // Create the note
         let created = {
             let mut store = state.knowledge_store.write().await;
-            match store.create_note(note_create) {
-                Ok(note) => note,
+            match store.import_note_container(
+                vec![note_create],
+                &conv.id,
+                source_content.as_bytes(),
+            ) {
+                Ok(mut notes) => notes.remove(0),
                 Err(e) => {
                     errors.push(format!("Failed to create '{}': {}", conv.title, e));
                     skipped += 1;
@@ -196,6 +211,7 @@ async fn apply_conversation_import(
 async fn apply_document_import(
     batch: document::DocumentImportBatch,
     selected_ids: Vec<String>,
+    source_content: String,
     state: State<'_, AppState>,
 ) -> Result<ImportResult, String> {
     let to_import = if selected_ids.is_empty() {
@@ -209,10 +225,11 @@ async fn apply_document_import(
     };
 
     let mut note_ids = Vec::new();
-    let mut errors = Vec::new();
-    let mut skipped = 0;
+    let errors = Vec::new();
+    let skipped = 0;
     let mut imported_section_titles = Vec::new();
     let mut section_inputs = Vec::new();
+    let mut creates = Vec::with_capacity(to_import.len());
 
     for item in &to_import {
         let mut properties = item.metadata.clone();
@@ -231,24 +248,22 @@ async fn apply_document_import(
             properties,
         };
 
-        let created = {
-            let mut store = state.knowledge_store.write().await;
-            match store.create_note(note_create) {
-                Ok(note) => note,
-                Err(e) => {
-                    errors.push(format!("Failed to create '{}': {}", item.title, e));
-                    skipped += 1;
-                    continue;
-                }
-            }
-        };
-
         if item.content_kind == "document_section" {
             imported_section_titles.push(item.title.clone());
             section_inputs.push((item.title.clone(), item.content.clone()));
         }
 
-        note_ids.push(created.id.clone());
+        creates.push(note_create);
+    }
+
+    if !creates.is_empty() {
+        let created = {
+            let mut store = state.knowledge_store.write().await;
+            store
+                .import_note_container(creates, &batch.source_title, source_content.as_bytes())
+                .map_err(|error| format!("Failed to import document: {error}"))?
+        };
+        note_ids.extend(created.into_iter().map(|note| note.id));
     }
 
     commit_note_writes(state.inner(), &note_ids, "import").await?;
@@ -337,6 +352,7 @@ async fn parse_import_file(file_path: &str) -> Result<ParsedImport, String> {
         return Ok(ParsedImport::Conversations {
             platform: platform.to_string(),
             conversations,
+            source_content: content,
         });
     }
 
@@ -356,7 +372,10 @@ async fn parse_import_file(file_path: &str) -> Result<ParsedImport, String> {
         document::parse_document_text(file_name, extension, &content)
     }
     .map_err(|e| format!("Could not import content: {}", e))?;
-    Ok(ParsedImport::Document(batch))
+    Ok(ParsedImport::Document {
+        batch,
+        source_content: content,
+    })
 }
 
 async fn read_import_content(file_path: &str) -> Result<String, String> {

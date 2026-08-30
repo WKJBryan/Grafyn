@@ -86,6 +86,9 @@ impl TwinEventStore {
             .join("quarantine")
             .join("v1")
     }
+    pub(crate) fn data_path(&self) -> &Path {
+        &self.data_path
+    }
     fn lock_path(&self) -> PathBuf {
         self.data_path
             .join("twin")
@@ -478,7 +481,7 @@ fn serialize_record(event: &TwinEvent) -> Result<Vec<u8>, StoreError> {
     Ok(bytes)
 }
 
-fn ensure_real_child_directory(
+pub(crate) fn ensure_real_child_directory(
     parent: &Path,
     name: &str,
     parent_is_trusted_root: bool,
@@ -510,7 +513,7 @@ fn ensure_real_child_directory(
     Ok(path)
 }
 
-fn validate_real_directory(path: &Path, label: &str) -> Result<(), StoreError> {
+pub(crate) fn validate_real_directory(path: &Path, label: &str) -> Result<(), StoreError> {
     let metadata = fs::symlink_metadata(path)?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return Err(StoreError::Invalid(format!(
@@ -521,7 +524,7 @@ fn validate_real_directory(path: &Path, label: &str) -> Result<(), StoreError> {
     Ok(())
 }
 
-fn validate_real_file(path: &Path, label: &str) -> Result<(), StoreError> {
+pub(crate) fn validate_real_file(path: &Path, label: &str) -> Result<(), StoreError> {
     let metadata = fs::symlink_metadata(path)?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {
         return Err(StoreError::Invalid(format!(
@@ -541,7 +544,7 @@ fn validate_record_size(length: u64) -> Result<(), StoreError> {
     Ok(())
 }
 
-fn sync_directory(path: &Path) -> Result<(), StoreError> {
+pub(crate) fn sync_directory(path: &Path) -> Result<(), StoreError> {
     sync_directory_impl(path, false)
 }
 
@@ -747,9 +750,49 @@ pub fn topological_order(events: &[TwinEvent]) -> Result<Vec<TwinEvent>, StoreEr
     Ok(ordered)
 }
 
-#[allow(dead_code)] // Task 7 injects this seam into mutation-owning services.
 pub trait EventRecorder: Send + Sync {
     fn record(&self, event: TwinEvent) -> Result<AppendOutcome, StoreError>;
+
+    fn commit_mutation(
+        &self,
+        _origin: crate::services::twin_events::MutationOrigin,
+        _stream: CausalStream,
+        _source_channel: crate::models::twin_event::SourceChannel,
+        _targets: Vec<crate::services::twin_events::TargetMutation>,
+        _drafts: Vec<crate::services::twin_events::TwinEventDraft>,
+    ) -> Result<
+        crate::services::twin_events::MutationCommit,
+        crate::services::twin_events::MutationError,
+    > {
+        Err(crate::services::twin_events::MutationError::Invalid(
+            "event recorder does not support coordinated mutations".into(),
+        ))
+    }
+
+    fn recover_pending_mutations(
+        &self,
+    ) -> Result<usize, crate::services::twin_events::MutationError> {
+        Ok(0)
+    }
+
+    fn retarget_markdown_root(
+        &self,
+        _vault_path: &std::path::Path,
+    ) -> Result<(), crate::services::twin_events::MutationError> {
+        Err(crate::services::twin_events::MutationError::Invalid(
+            "event recorder does not support Markdown root retargeting".into(),
+        ))
+    }
+
+    fn recorded_events(
+        &self,
+    ) -> Result<Vec<TwinEvent>, crate::services::twin_events::MutationError> {
+        Ok(Vec::new())
+    }
+
+    fn is_noop(&self) -> bool {
+        false
+    }
 }
 
 impl EventRecorder for TwinEventStore {
@@ -759,11 +802,82 @@ impl EventRecorder for TwinEventStore {
 }
 
 #[derive(Debug, Default)]
-#[allow(dead_code)] // Compatibility recorder until Task 7 adds capture hooks.
 pub struct NoopEventRecorder;
 impl EventRecorder for NoopEventRecorder {
     fn record(&self, _event: TwinEvent) -> Result<AppendOutcome, StoreError> {
         Ok(AppendOutcome::Ignored)
+    }
+
+    fn commit_mutation(
+        &self,
+        _origin: crate::services::twin_events::MutationOrigin,
+        _stream: CausalStream,
+        _source_channel: crate::models::twin_event::SourceChannel,
+        _targets: Vec<crate::services::twin_events::TargetMutation>,
+        _drafts: Vec<crate::services::twin_events::TwinEventDraft>,
+    ) -> Result<
+        crate::services::twin_events::MutationCommit,
+        crate::services::twin_events::MutationError,
+    > {
+        Ok(crate::services::twin_events::MutationCommit {
+            mutation_id: None,
+            events: Vec::new(),
+        })
+    }
+
+    fn retarget_markdown_root(
+        &self,
+        _vault_path: &std::path::Path,
+    ) -> Result<(), crate::services::twin_events::MutationError> {
+        Ok(())
+    }
+
+    fn is_noop(&self) -> bool {
+        true
+    }
+}
+
+#[derive(Debug)]
+pub struct UnavailableEventRecorder {
+    reason: String,
+}
+
+impl UnavailableEventRecorder {
+    pub fn new(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+        }
+    }
+}
+
+impl EventRecorder for UnavailableEventRecorder {
+    fn record(&self, _event: TwinEvent) -> Result<AppendOutcome, StoreError> {
+        Err(StoreError::Invalid(self.reason.clone()))
+    }
+
+    fn commit_mutation(
+        &self,
+        _origin: crate::services::twin_events::MutationOrigin,
+        _stream: CausalStream,
+        _source_channel: crate::models::twin_event::SourceChannel,
+        _targets: Vec<crate::services::twin_events::TargetMutation>,
+        _drafts: Vec<crate::services::twin_events::TwinEventDraft>,
+    ) -> Result<
+        crate::services::twin_events::MutationCommit,
+        crate::services::twin_events::MutationError,
+    > {
+        Err(crate::services::twin_events::MutationError::Invalid(
+            self.reason.clone(),
+        ))
+    }
+
+    fn retarget_markdown_root(
+        &self,
+        _vault_path: &std::path::Path,
+    ) -> Result<(), crate::services::twin_events::MutationError> {
+        Err(crate::services::twin_events::MutationError::Invalid(
+            self.reason.clone(),
+        ))
     }
 }
 
@@ -1313,6 +1427,7 @@ mod tests {
                 options,
                 stakes: None,
                 initial_leaning: None,
+                review_date: None,
             }),
         );
         event.event_id = crate::services::twin_events::derive_event_id(&event);
@@ -1435,6 +1550,27 @@ mod tests {
         let event = valid_event(1, Vec::new());
         store.append(event.clone()).unwrap();
         assert!(canonical_path(&store, &event).is_file());
+    }
+
+    #[test]
+    fn plain_event_store_fails_closed_for_coordinated_mutations() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = TwinEventStore::new(temp.path());
+        store.initialize().unwrap();
+
+        let result = EventRecorder::commit_mutation(
+            &store,
+            crate::services::twin_events::MutationOrigin::Local,
+            CausalStream::LocalOnly,
+            crate::models::twin_event::SourceChannel::parse("note_editor").unwrap(),
+            Vec::new(),
+            Vec::new(),
+        );
+
+        assert!(matches!(
+            result,
+            Err(crate::services::twin_events::MutationError::Invalid(_))
+        ));
     }
 
     #[test]

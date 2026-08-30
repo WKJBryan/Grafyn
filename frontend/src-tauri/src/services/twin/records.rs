@@ -366,7 +366,7 @@ fn merge_promotion_history(
     next
 }
 
-fn append_promotion_history(
+pub(super) fn append_promotion_history(
     metadata: &mut HashMap<String, Value>,
     from: &PromotionState,
     to: &PromotionState,
@@ -478,6 +478,92 @@ fn looks_implementation_detailed(text: &str) -> bool {
 }
 
 impl TwinStore {
+    fn record_capture_governance(record: &UserRecord) -> crate::models::twin_event::Governance {
+        if record.promotion_state.effective() == PromotionState::Private {
+            crate::services::twin_events::local_capture_governance(
+                crate::models::twin_event::Sensitivity::Restricted,
+            )
+        } else {
+            crate::services::twin_events::standard_capture_governance()
+        }
+    }
+
+    fn write_record_observation(
+        &self,
+        record: &UserRecord,
+        automatic: bool,
+        tag: Option<&str>,
+    ) -> Result<()> {
+        let draft = self.record_observation_draft(record, automatic, tag)?;
+        self.write_governed_json(&self.record_file_path(&record.id), record, vec![draft])
+    }
+
+    pub(super) fn record_observation_draft(
+        &self,
+        record: &UserRecord,
+        automatic: bool,
+        tag: Option<&str>,
+    ) -> Result<crate::services::twin_events::TwinEventDraft> {
+        let digest = Self::governed_json_digest(record)?;
+        let actor = automatic
+            .then(|| crate::models::twin_event::ActorId::parse("grafyn"))
+            .transpose()
+            .map_err(anyhow::Error::msg)?;
+        crate::services::twin_events::legacy_observation_draft(
+            &format!("legacy-observation-{}", digest.as_str()),
+            &record.id,
+            digest,
+            record.updated_at,
+            crate::models::twin_event::SourceChannel::parse("legacy_twin")
+                .map_err(anyhow::Error::msg)?,
+            actor,
+            tag,
+            Self::record_capture_governance(record),
+        )
+        .map_err(anyhow::Error::msg)
+    }
+
+    fn write_record_feedback(
+        &self,
+        record: &UserRecord,
+        action: &str,
+        rationale: Option<&str>,
+    ) -> Result<()> {
+        let digest = Self::governed_json_digest(record)?;
+        let feedback_seed = format!(
+            "{}\0{}\0{}",
+            record.id,
+            action,
+            record.updated_at.to_rfc3339()
+        );
+        let feedback_id = format!(
+            "feedback-{}",
+            crate::services::twin_events::digest_bytes(feedback_seed.as_bytes()).as_str()
+        );
+        let mut draft = crate::services::twin_events::feedback_draft(
+            crate::services::twin_events::FeedbackDraft {
+                feedback_id: &feedback_id,
+                target_id: &record.id,
+                kind: action,
+                content: None,
+                rationale,
+                rank: None,
+                observed_at: record.updated_at,
+                source_channel: crate::models::twin_event::SourceChannel::parse("legacy_twin")
+                    .map_err(anyhow::Error::msg)?,
+                governance: Self::record_capture_governance(record),
+            },
+        )
+        .map_err(anyhow::Error::msg)?;
+        draft.evidence.push(crate::models::twin_event::EvidenceRef {
+            evidence_type: crate::models::twin_event::EvidenceType::TwinRecord,
+            source_id: crate::models::twin_event::Identifier::parse(&record.id)
+                .map_err(anyhow::Error::msg)?,
+            digest: Some(digest),
+        });
+        self.write_governed_json(&self.record_file_path(&record.id), record, vec![draft])
+    }
+
     /// Read-time compatibility overlay for artifacts materialized from the
     /// retired AutoPromoted state. Raw records and artifacts remain unchanged.
     pub(super) fn artifact_has_only_legacy_auto_support(&self, record_ids: &[String]) -> bool {
@@ -518,14 +604,22 @@ impl TwinStore {
 
     pub fn create_user_record(&mut self, create: UserRecordCreate) -> Result<UserRecord> {
         self.ensure_record_cache()?;
+        let record = Self::materialize_user_record(create);
+        let automatic = record.origin == RecordOrigin::Inferred;
+        self.write_record_observation(&record, automatic, automatic.then_some("legacy_inference"))?;
+        self.record_cache.insert(record.id.clone(), record.clone());
 
+        Ok(record)
+    }
+
+    pub(super) fn materialize_user_record(create: UserRecordCreate) -> UserRecord {
         let now = Utc::now();
         let promotion_state = create
             .promotion_state
             .unwrap_or_else(|| PromotionState::default_for_origin(&create.origin))
             .effective();
 
-        let record = UserRecord {
+        UserRecord {
             id: uuid::Uuid::new_v4().to_string(),
             kind: create.kind,
             content: create.content,
@@ -539,17 +633,13 @@ impl TwinStore {
             valid_until: create.valid_until,
             links: create.links,
             metadata: create.metadata,
-        };
-
-        self.record_cache.insert(record.id.clone(), record.clone());
-        self.write_record_file(&record)?;
-
-        Ok(record)
+        }
     }
 
     pub fn update_user_record(&mut self, id: &str, update: UserRecordUpdate) -> Result<UserRecord> {
         self.ensure_record_cache()?;
         let mut record = self.get_user_record(id)?;
+        let before = serde_json::to_value(&record)?;
 
         if let Some(content) = update.content {
             record.content = content;
@@ -573,9 +663,12 @@ impl TwinStore {
             record.metadata = metadata;
         }
 
+        if serde_json::to_value(&record)? == before {
+            return Ok(record);
+        }
         record.updated_at = Utc::now();
+        self.write_record_observation(&record, false, None)?;
         self.record_cache.insert(record.id.clone(), record.clone());
-        self.write_record_file(&record)?;
 
         Ok(record)
     }
@@ -644,8 +737,8 @@ impl TwinStore {
 
                 record.metadata = metadata;
                 record.updated_at = Utc::now();
+                self.write_record_observation(&record, true, Some("legacy_inference"))?;
                 self.record_cache.insert(record.id.clone(), record.clone());
-                self.write_record_file(&record)?;
                 updated_records += 1;
             } else {
                 self.create_user_record(UserRecordCreate {
@@ -835,8 +928,15 @@ impl TwinStore {
                 .insert("auto_promoted".to_string(), Value::Bool(false));
         }
 
+        let action = match promotion_state {
+            PromotionState::Candidate | PromotionState::AutoPromoted => "candidate",
+            PromotionState::Endorsed => "endorse",
+            PromotionState::Rejected => "reject",
+            PromotionState::Private => "private",
+            PromotionState::NoTrain => "no_train",
+        };
+        self.write_record_feedback(&record, action, rationale.as_deref())?;
         self.record_cache.insert(record.id.clone(), record.clone());
-        self.write_record_file(&record)?;
 
         Ok(record)
     }
@@ -864,7 +964,7 @@ impl TwinStore {
         Ok(())
     }
 
-    fn record_file_path(&self, record_id: &str) -> PathBuf {
+    pub(super) fn record_file_path(&self, record_id: &str) -> PathBuf {
         self.records_path.join(format!("{}.json", record_id))
     }
 
@@ -875,6 +975,7 @@ impl TwinStore {
             .with_context(|| format!("Failed to parse record file: {}", path.display()))
     }
 
+    #[cfg(test)]
     pub(super) fn write_record_file(&self, record: &UserRecord) -> Result<()> {
         let path = self.record_file_path(&record.id);
         self.write_pretty_json(&path, record)
@@ -888,6 +989,131 @@ mod tests {
         default_record_confidence, PromotionState, RecordLink, RecordLinkType, UserRecordKind,
     };
     use tempfile::tempdir;
+
+    fn coordinated_twin_store(
+        root: &std::path::Path,
+    ) -> (
+        TwinStore,
+        std::sync::Arc<crate::services::twin_events::TwinEventStore>,
+    ) {
+        let data = root.join("data");
+        let vault = root.join("vault");
+        let twin_root = data.join("twin").join("scope-one");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir(&vault).unwrap();
+        let events = std::sync::Arc::new(crate::services::twin_events::TwinEventStore::new(&data));
+        events.initialize().unwrap();
+        let coordinator = std::sync::Arc::new(
+            crate::services::twin_events::MutationCoordinator::new(
+                &data,
+                &vault,
+                events.clone(),
+                std::sync::Arc::new(crate::services::twin_events::NoopMutationLifecycle),
+            )
+            .unwrap(),
+        );
+        (
+            TwinStore::with_event_recorder(twin_root, data.join("twin"), coordinator),
+            events,
+        )
+    }
+
+    fn record_create(origin: RecordOrigin) -> UserRecordCreate {
+        UserRecordCreate {
+            kind: UserRecordKind::Preference,
+            content: "Prefers reviewable evidence".to_string(),
+            evidence_refs: Vec::new(),
+            confidence: 0.8,
+            origin,
+            promotion_state: Some(PromotionState::Candidate),
+            valid_from: None,
+            valid_until: None,
+            links: Vec::new(),
+            metadata: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn coordinated_legacy_record_mutations_emit_observations_and_explicit_feedback_only() {
+        let root = tempdir().unwrap();
+        let (mut store, events) = coordinated_twin_store(root.path());
+        let record = store
+            .create_user_record(record_create(RecordOrigin::User))
+            .unwrap();
+        store
+            .update_user_record(
+                &record.id,
+                UserRecordUpdate {
+                    content: Some("Prefers primary evidence".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        store
+            .set_user_record_promotion(
+                &record.id,
+                PromotionState::Endorsed,
+                Some("Reviewed against source".to_string()),
+            )
+            .unwrap();
+        let captured = events.ordered_events().unwrap();
+        assert_eq!(captured.len(), 3);
+        assert!(matches!(
+            captured[0].payload,
+            crate::models::twin_event::TwinEventPayload::ObservationRecorded(_)
+        ));
+        assert!(matches!(
+            captured[1].payload,
+            crate::models::twin_event::TwinEventPayload::ObservationRecorded(_)
+        ));
+        let crate::models::twin_event::TwinEventPayload::FeedbackRecorded(feedback) =
+            &captured[2].payload
+        else {
+            panic!("an explicit promotion is feedback, never a memory review");
+        };
+        assert_eq!(feedback.target_id.as_str(), record.id);
+        assert_eq!(feedback.kind.as_str(), "endorse");
+        assert_eq!(feedback.content, None);
+        assert_eq!(
+            feedback.rationale.as_ref().unwrap().as_str(),
+            "Reviewed against source"
+        );
+        assert!(captured.iter().all(|event| !matches!(
+            event.payload,
+            crate::models::twin_event::TwinEventPayload::MemoryProposed(_)
+                | crate::models::twin_event::TwinEventPayload::MemoryReviewed(_)
+        )));
+    }
+
+    #[test]
+    fn inferred_legacy_record_is_tagged_as_automatic_grafyn_observation() {
+        let root = tempdir().unwrap();
+        let (mut store, events) = coordinated_twin_store(root.path());
+        store
+            .create_user_record(record_create(RecordOrigin::Inferred))
+            .unwrap();
+        let captured = events.ordered_events().unwrap();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].actor_id.as_str(), "grafyn");
+        assert_eq!(captured[0].context.tags, vec!["legacy_inference"]);
+    }
+
+    #[test]
+    fn failed_legacy_record_persistence_does_not_poison_the_cache() {
+        let root = tempdir().unwrap();
+        let twin_root = root.path().join("twin").join("scope-one");
+        let mut store = TwinStore::with_event_recorder(
+            twin_root,
+            root.path().join("twin"),
+            std::sync::Arc::new(crate::services::twin_events::UnavailableEventRecorder::new(
+                "injected failure",
+            )),
+        );
+        assert!(store
+            .create_user_record(record_create(RecordOrigin::User))
+            .is_err());
+        assert!(store.list_user_records().unwrap().is_empty());
+    }
 
     #[test]
     fn user_record_writes_are_atomic_with_no_tmp_litter() {

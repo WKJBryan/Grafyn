@@ -133,6 +133,18 @@ impl TwinStore {
         event_type: TraceEventType,
         payload: serde_json::Value,
     ) -> Result<TraceEvent> {
+        let (event, trace) = self.plan_trace_event(session_id, event_type, payload)?;
+        self.write_trace_file(&trace)?;
+        self.cache_committed_trace(trace);
+        Ok(event)
+    }
+
+    pub(super) fn plan_trace_event(
+        &self,
+        session_id: &str,
+        event_type: TraceEventType,
+        payload: serde_json::Value,
+    ) -> Result<(TraceEvent, SessionTrace)> {
         Self::validate_file_id(session_id)?;
         let now = Utc::now();
         let event = TraceEvent {
@@ -141,14 +153,33 @@ impl TwinStore {
             created_at: now,
             payload,
         };
-
-        let trace = self.get_or_create_trace_mut(session_id)?;
+        let mut trace = if let Some(trace) = self.trace_cache.get(session_id) {
+            trace.clone()
+        } else {
+            let path = self.trace_file_path(session_id);
+            if path.exists() {
+                self.read_trace_file(&path)?
+            } else {
+                SessionTrace::new(session_id)
+            }
+        };
         trace.updated_at = now;
         trace.events.push(event.clone());
-        let trace = trace.clone();
-        self.write_trace_file(&trace)?;
+        Ok((event, trace))
+    }
 
-        Ok(event)
+    pub(super) fn serialized_trace_target(
+        &self,
+        trace: &SessionTrace,
+    ) -> Result<(PathBuf, String)> {
+        Ok((
+            self.trace_file_path(&trace.session_id),
+            serde_json::to_string_pretty(trace)?,
+        ))
+    }
+
+    pub(super) fn cache_committed_trace(&mut self, trace: SessionTrace) {
+        self.trace_cache.insert(trace.session_id.clone(), trace);
     }
 
     pub fn get_session_trace(&mut self, session_id: &str) -> Result<SessionTrace> {
@@ -216,23 +247,6 @@ impl TwinStore {
 
         resolved.sort_by(|a, b| b.created_at.cmp(&a.created_at));
         Ok(resolved)
-    }
-
-    fn get_or_create_trace_mut(&mut self, session_id: &str) -> Result<&mut SessionTrace> {
-        if !self.trace_cache.contains_key(session_id) {
-            let path = self.trace_file_path(session_id);
-            let trace = if path.exists() {
-                self.read_trace_file(&path)?
-            } else {
-                SessionTrace::new(session_id)
-            };
-            self.trace_cache.insert(session_id.to_string(), trace);
-        }
-
-        Ok(self
-            .trace_cache
-            .get_mut(session_id)
-            .expect("trace inserted"))
     }
 
     pub(super) fn trace_file_path(&self, session_id: &str) -> PathBuf {

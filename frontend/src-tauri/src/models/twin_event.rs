@@ -683,13 +683,48 @@ impl TwinEventPayload {
         }
     }
 
-    fn validate(&self) -> Result<(), String> {
+    pub(crate) fn validate(&self) -> Result<(), String> {
         match self {
             Self::ObservationRecorded(value) => {
                 validate_max_len(&value.claims, MAX_CLAIMS, "observation.claims")
             }
             Self::DecisionRecorded(value) => {
                 validate_max_len(&value.options, MAX_DECISION_OPTIONS, "decision.options")
+            }
+            Self::DecisionOutcomeRecorded(value) => {
+                if value
+                    .confidence_basis_points
+                    .is_some_and(|score| score > 10_000)
+                {
+                    return Err("decision confidence must be <= 10000 basis points".into());
+                }
+                if value.outcome.is_none()
+                    && value.chosen_option.is_none()
+                    && value.selected_response_id.is_none()
+                    && value.confidence_basis_points.is_none()
+                    && value.review_date.is_none()
+                    && value.correction_note.is_none()
+                    && value.regret_score.is_none()
+                    && value.lesson.is_none()
+                    && value.missed_something.is_none()
+                {
+                    return Err("decision outcome requires at least one supplied field".into());
+                }
+                Ok(())
+            }
+            Self::FeedbackRecorded(value) => {
+                let kind = value.kind.as_str();
+                if kind == "ranking" {
+                    if value.rank.is_none_or(|rank| rank == 0) {
+                        return Err("ranking feedback requires a 1-based rank".into());
+                    }
+                } else if value.rank.is_some() {
+                    return Err("only ranking feedback may carry rank".into());
+                }
+                if matches!(kind, "correction" | "insight") && value.content.is_none() {
+                    return Err("correction and insight feedback require content".into());
+                }
+                Ok(())
             }
             _ => Ok(()),
         }
@@ -837,15 +872,26 @@ pub struct DecisionRecorded {
     pub stakes: Option<BoundedContent>,
     #[serde(deserialize_with = "required_option")]
     pub initial_leaning: Option<BoundedContent>,
+    #[serde(deserialize_with = "required_option")]
+    pub review_date: Option<BoundedLabel>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DecisionOutcomeRecorded {
     pub decision_id: Identifier,
-    pub outcome: BoundedContent,
+    #[serde(deserialize_with = "required_option")]
+    pub outcome: Option<BoundedContent>,
     #[serde(deserialize_with = "required_option")]
     pub chosen_option: Option<BoundedContent>,
+    #[serde(deserialize_with = "required_option")]
+    pub selected_response_id: Option<Identifier>,
+    #[serde(deserialize_with = "required_option")]
+    pub confidence_basis_points: Option<u16>,
+    #[serde(deserialize_with = "required_option")]
+    pub review_date: Option<BoundedLabel>,
+    #[serde(deserialize_with = "required_option")]
+    pub correction_note: Option<BoundedContent>,
     #[serde(deserialize_with = "required_option")]
     pub regret_score: Option<u8>,
     #[serde(deserialize_with = "required_option")]
@@ -860,9 +906,12 @@ pub struct FeedbackRecorded {
     pub feedback_id: Identifier,
     pub target_id: Identifier,
     pub kind: BoundedRole,
-    pub content: BoundedContent,
+    #[serde(deserialize_with = "required_option")]
+    pub content: Option<BoundedContent>,
     #[serde(deserialize_with = "required_option")]
     pub rationale: Option<BoundedContent>,
+    #[serde(deserialize_with = "required_option")]
+    pub rank: Option<u16>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1154,6 +1203,7 @@ mod tests {
                 options,
                 stakes: None,
                 initial_leaning: None,
+                review_date: None,
             })
         };
         let event = crate::services::twin_events::test_support::event_for_payload(payload(
@@ -1162,5 +1212,123 @@ mod tests {
         assert!(event.validate().is_ok());
         let event = crate::services::twin_events::test_support::event_for_payload(payload(options));
         assert!(event.validate().is_err());
+    }
+
+    #[test]
+    fn task_seven_nullable_learning_fields_are_required_and_validated() {
+        let payloads = crate::services::twin_events::test_support::all_payloads();
+        for payload in payloads.iter().filter(|payload| {
+            matches!(
+                payload,
+                TwinEventPayload::DecisionRecorded(_)
+                    | TwinEventPayload::DecisionOutcomeRecorded(_)
+                    | TwinEventPayload::FeedbackRecorded(_)
+            )
+        }) {
+            let event =
+                crate::services::twin_events::test_support::event_for_payload(payload.clone());
+            let value = serde_json::to_value(event).unwrap();
+            let required = match payload {
+                TwinEventPayload::DecisionRecorded(_) => vec!["review_date"],
+                TwinEventPayload::DecisionOutcomeRecorded(_) => vec![
+                    "outcome",
+                    "selected_response_id",
+                    "confidence_basis_points",
+                    "review_date",
+                    "correction_note",
+                ],
+                TwinEventPayload::FeedbackRecorded(_) => vec!["content", "rank"],
+                _ => unreachable!(),
+            };
+            for key in required {
+                let mut missing = value.clone();
+                missing["payload"]["data"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove(key);
+                assert!(
+                    serde_json::from_value::<TwinEvent>(missing).is_err(),
+                    "{key}"
+                );
+            }
+            assert!(serde_json::from_value::<TwinEvent>(value).is_ok());
+        }
+
+        let outcome = |confidence_basis_points| {
+            TwinEventPayload::DecisionOutcomeRecorded(DecisionOutcomeRecorded {
+                decision_id: Identifier::parse("decision-1").unwrap(),
+                outcome: None,
+                chosen_option: None,
+                selected_response_id: None,
+                confidence_basis_points,
+                review_date: None,
+                correction_note: None,
+                regret_score: None,
+                lesson: None,
+                missed_something: None,
+            })
+        };
+        assert!(
+            crate::services::twin_events::test_support::event_for_payload(outcome(None))
+                .validate()
+                .is_err()
+        );
+        assert!(
+            crate::services::twin_events::test_support::event_for_payload(outcome(Some(10_000)))
+                .validate()
+                .is_ok()
+        );
+        assert!(
+            crate::services::twin_events::test_support::event_for_payload(outcome(Some(10_001)))
+                .validate()
+                .is_err()
+        );
+
+        let feedback = |kind: &str, content: Option<&str>, rank| {
+            TwinEventPayload::FeedbackRecorded(FeedbackRecorded {
+                feedback_id: Identifier::parse("feedback-1").unwrap(),
+                target_id: Identifier::parse("response-1").unwrap(),
+                kind: BoundedRole::parse(kind).unwrap(),
+                content: content.map(|value| BoundedContent::parse(value).unwrap()),
+                rationale: None,
+                rank,
+            })
+        };
+        assert!(
+            crate::services::twin_events::test_support::event_for_payload(feedback(
+                "ranking",
+                None,
+                Some(1)
+            ))
+            .validate()
+            .is_ok()
+        );
+        assert!(
+            crate::services::twin_events::test_support::event_for_payload(feedback(
+                "ranking",
+                None,
+                Some(0)
+            ))
+            .validate()
+            .is_err()
+        );
+        assert!(
+            crate::services::twin_events::test_support::event_for_payload(feedback(
+                "accept",
+                None,
+                Some(1)
+            ))
+            .validate()
+            .is_err()
+        );
+        assert!(
+            crate::services::twin_events::test_support::event_for_payload(feedback(
+                "correction",
+                None,
+                None
+            ))
+            .validate()
+            .is_err()
+        );
     }
 }

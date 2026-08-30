@@ -1,15 +1,14 @@
-use crate::models::canvas::{CanvasSession, ModelResponse, PromptTile};
+use crate::models::canvas::CanvasSession;
 use crate::models::twin::{
-    ActionGap, CanvasFeedbackRequest, CanvasFeedbackResult, CanvasFeedbackType, CanvasResponseRef,
+    ActionGap, CanvasFeedbackRequest, CanvasFeedbackResult, CanvasResponseRef,
     ConstitutionInferenceSummary, ConstitutionItem, ConstitutionItemCreate, ConstitutionItemUpdate,
     ConstitutionReviewRequest, ConstitutionSetup, DecisionEpisode, DecisionEpisodeWithReflections,
-    DecisionMirrorConfig, DecisionMirrorConfigUpdate, DecisionOutcomeUpdate, EvidenceRef,
-    MemoryDigestItem, MemoryDigestReviewRequest, PromotionState, RecordOrigin, ResolvedEvidenceRef,
-    SessionTrace, TraceEvent, TraceEventType, TwinExportRequest, TwinInferenceRunSummary,
-    TwinReviewRecord, UserRecord, UserRecordCreate, UserRecordKind, UserRecordUpdate,
+    DecisionMirrorConfig, DecisionMirrorConfigUpdate, DecisionOutcomeUpdate, MemoryDigestItem,
+    MemoryDigestReviewRequest, PromotionState, ResolvedEvidenceRef, SessionTrace,
+    TwinExportRequest, TwinInferenceRunSummary, TwinReviewRecord, UserRecord, UserRecordCreate,
+    UserRecordUpdate,
 };
 use crate::AppState;
-use serde_json::json;
 use tauri::State;
 
 #[tauri::command]
@@ -127,10 +126,45 @@ pub async fn update_decision_outcome(
     update: DecisionOutcomeUpdate,
     state: State<'_, AppState>,
 ) -> Result<DecisionEpisode, String> {
+    let selected_response_id = if let Some(selected) = update.selected_response.as_ref() {
+        let session_id = {
+            let store = state.twin_store.read().await;
+            store
+                .get_decision_episode(&id)
+                .map_err(|error| error.to_string())?
+                .session_id
+        };
+        let session = {
+            let mut canvas = state.canvas_store.write().await;
+            canvas
+                .get_session(&session_id)
+                .map_err(|error| error.to_string())?
+        };
+        Some(
+            resolve_persisted_response_id(&session, selected)
+                .ok_or_else(|| "Selected Canvas response no longer exists".to_string())?,
+        )
+    } else {
+        None
+    };
     let mut store = state.twin_store.write().await;
     store
-        .update_decision_outcome(&id, update)
+        .update_decision_outcome_with_response_id(&id, update, selected_response_id)
         .map_err(|error| error.to_string())
+}
+
+fn resolve_persisted_response_id(
+    session: &CanvasSession,
+    selected: &CanvasResponseRef,
+) -> Option<String> {
+    session
+        .prompt_tiles
+        .iter()
+        .find(|tile| tile.id == selected.tile_id)?
+        .responses
+        .values()
+        .find(|response| response.model_id == selected.model_id)
+        .map(|response| response.id.clone())
 }
 
 #[tauri::command]
@@ -306,386 +340,53 @@ pub async fn record_canvas_feedback(
             .map_err(|error| error.to_string())?
     };
 
-    let payload = build_feedback_payload(&session, &request)?;
-    let trace_event = {
-        let mut twin_store = state.twin_store.write().await;
-        twin_store
-            .append_trace_event(
-                &session_id,
-                trace_event_type_for_feedback(&request.feedback_type),
-                payload,
-            )
-            .map_err(|error| error.to_string())?
-    };
-
-    let mut created_record_ids = Vec::new();
-    if let Some(record_create) =
-        build_record_from_feedback(&session, &session_id, &trace_event, &request)?
-    {
-        let record = {
-            let mut twin_store = state.twin_store.write().await;
-            twin_store
-                .create_user_record(record_create)
-                .map_err(|error| error.to_string())?
-        };
-        created_record_ids.push(record.id);
-    }
-
-    Ok(CanvasFeedbackResult {
-        trace_event_id: trace_event.id,
-        created_record_ids,
-    })
-}
-
-fn trace_event_type_for_feedback(feedback_type: &CanvasFeedbackType) -> TraceEventType {
-    match feedback_type {
-        CanvasFeedbackType::Ranking => TraceEventType::RankingRecorded,
-        CanvasFeedbackType::Insight => TraceEventType::InsightCaptured,
-        CanvasFeedbackType::Accept
-        | CanvasFeedbackType::Reject
-        | CanvasFeedbackType::Correction => TraceEventType::FeedbackRecorded,
-    }
-}
-
-fn build_feedback_payload(
-    session: &CanvasSession,
-    request: &CanvasFeedbackRequest,
-) -> Result<serde_json::Value, String> {
-    let payload = match &request.feedback_type {
-        CanvasFeedbackType::Accept
-        | CanvasFeedbackType::Reject
-        | CanvasFeedbackType::Correction => {
-            let response_ref = request
-                .response
-                .as_ref()
-                .ok_or_else(|| "A response reference is required".to_string())?;
-            let (tile, response) = find_response(session, response_ref)?;
-            json!({
-                "feedback_type": request.feedback_type,
-                "response": response_snapshot(response_ref, tile, response),
-                "content": request.content,
-                "rationale": request.rationale,
-                "kind": request.kind,
-            })
-        }
-        CanvasFeedbackType::Ranking => {
-            if request.ranked_responses.len() < 2 {
-                return Err("At least two ranked responses are required".to_string());
-            }
-
-            let ranked = request
-                .ranked_responses
-                .iter()
-                .enumerate()
-                .map(|(index, response_ref)| {
-                    let (tile, response) = find_response(session, response_ref)?;
-                    Ok(json!({
-                        "rank": index + 1,
-                        "response": response_snapshot(response_ref, tile, response),
-                    }))
-                })
-                .collect::<Result<Vec<_>, String>>()?;
-
-            json!({
-                "feedback_type": request.feedback_type,
-                "ranked_responses": ranked,
-                "content": request.content,
-                "rationale": request.rationale,
-            })
-        }
-        CanvasFeedbackType::Insight => {
-            if request.kind.is_none() {
-                return Err("Insight capture requires a record kind".to_string());
-            }
-
-            let evidence = if let Some(response_ref) = request.response.as_ref() {
-                let (tile, response) = find_response(session, response_ref)?;
-                Some(response_snapshot(response_ref, tile, response))
-            } else {
-                None
-            };
-
-            json!({
-                "feedback_type": request.feedback_type,
-                "kind": request.kind,
-                "content": request.content,
-                "rationale": request.rationale,
-                "evidence": evidence,
-            })
-        }
-    };
-
-    Ok(payload)
-}
-
-fn build_record_from_feedback(
-    session: &CanvasSession,
-    session_id: &str,
-    trace_event: &TraceEvent,
-    request: &CanvasFeedbackRequest,
-) -> Result<Option<UserRecordCreate>, String> {
-    let mut evidence_refs = Vec::new();
-
-    if let Some(response_ref) = request.response.as_ref() {
-        evidence_refs.push(EvidenceRef {
-            trace_id: session_id.to_string(),
-            event_id: trace_event.id.clone(),
-            session_id: session_id.to_string(),
-            tile_id: Some(response_ref.tile_id.clone()),
-            model_id: Some(response_ref.model_id.clone()),
-            note: request.rationale.clone(),
-            source_type: Some("behavior".to_string()),
-            source_id: Some(trace_event.id.clone()),
-            source_label: Some("Canvas feedback".to_string()),
-            excerpt: request.rationale.clone(),
-            speaker_role: Some("user".to_string()),
-        });
-    } else if let Some(first_ranked) = request.ranked_responses.first() {
-        evidence_refs.push(EvidenceRef {
-            trace_id: session_id.to_string(),
-            event_id: trace_event.id.clone(),
-            session_id: session_id.to_string(),
-            tile_id: Some(first_ranked.tile_id.clone()),
-            model_id: Some(first_ranked.model_id.clone()),
-            note: request.rationale.clone(),
-            source_type: Some("behavior".to_string()),
-            source_id: Some(trace_event.id.clone()),
-            source_label: Some("Canvas ranking".to_string()),
-            excerpt: request.rationale.clone(),
-            speaker_role: Some("user".to_string()),
-        });
-    } else {
-        evidence_refs.push(EvidenceRef {
-            trace_id: session_id.to_string(),
-            event_id: trace_event.id.clone(),
-            session_id: session_id.to_string(),
-            tile_id: None,
-            model_id: None,
-            note: request.rationale.clone(),
-            source_type: Some("behavior".to_string()),
-            source_id: Some(trace_event.id.clone()),
-            source_label: Some("Canvas feedback".to_string()),
-            excerpt: request.rationale.clone(),
-            speaker_role: Some("user".to_string()),
-        });
-    }
-
-    let record = match &request.feedback_type {
-        CanvasFeedbackType::Accept | CanvasFeedbackType::Reject => {
-            let response_ref = request
-                .response
-                .as_ref()
-                .ok_or_else(|| "A response reference is required".to_string())?;
-            let (tile, response) = find_response(session, response_ref)?;
-            let label = match &request.feedback_type {
-                CanvasFeedbackType::Accept => "Accepted",
-                CanvasFeedbackType::Reject => "Rejected",
-                _ => unreachable!(),
-            };
-            let content = request.content.clone().unwrap_or_else(|| {
-                format!(
-                    "{} response from {} for prompt: {}",
-                    label, response.model_name, tile.prompt
-                )
-            });
-
-            Some(UserRecordCreate {
-                kind: request.kind.clone().unwrap_or(UserRecordKind::Preference),
-                content,
-                evidence_refs,
-                confidence: request.confidence,
-                origin: RecordOrigin::User,
-                promotion_state: Some(PromotionState::Candidate),
-                valid_from: None,
-                valid_until: None,
-                links: request.links.clone(),
-                metadata: json!({
-                    "feedback_type": request.feedback_type,
-                    "prompt": tile.prompt,
-                    "model_id": response.model_id,
-                    "model_name": response.model_name,
-                    "response_excerpt": excerpt(&response.content),
-                    "rationale": request.rationale,
-                })
-                .as_object()
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                .collect(),
-            })
-        }
-        CanvasFeedbackType::Ranking => {
-            if request.ranked_responses.len() < 2 {
-                return Err("At least two ranked responses are required".to_string());
-            }
-
-            let ranked_snapshots = request
-                .ranked_responses
-                .iter()
-                .enumerate()
-                .map(|(index, response_ref)| {
-                    let (tile, response) = find_response(session, response_ref)?;
-                    Ok(json!({
-                        "rank": index + 1,
-                        "tile_id": response_ref.tile_id,
-                        "model_id": response.model_id,
-                        "model_name": response.model_name,
-                        "prompt": tile.prompt,
-                        "response_excerpt": excerpt(&response.content),
-                    }))
-                })
-                .collect::<Result<Vec<_>, String>>()?;
-
-            let content = request.content.clone().unwrap_or_else(|| {
-                let summary = ranked_snapshots
-                    .iter()
-                    .map(|snapshot| {
-                        format!(
-                            "{}. {}",
-                            snapshot["rank"].as_u64().unwrap_or_default(),
-                            snapshot["model_name"].as_str().unwrap_or("model")
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" > ");
-                format!("Preference ranking recorded: {}", summary)
-            });
-
-            Some(UserRecordCreate {
-                kind: request.kind.clone().unwrap_or(UserRecordKind::Preference),
-                content,
-                evidence_refs,
-                confidence: request.confidence,
-                origin: RecordOrigin::User,
-                promotion_state: Some(PromotionState::Candidate),
-                valid_from: None,
-                valid_until: None,
-                links: request.links.clone(),
-                metadata: json!({
-                    "feedback_type": request.feedback_type,
-                    "rationale": request.rationale,
-                    "ranked_responses": ranked_snapshots,
-                })
-                .as_object()
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                .collect(),
-            })
-        }
-        CanvasFeedbackType::Correction => {
-            let content = request
-                .content
-                .clone()
-                .ok_or_else(|| "Correction feedback requires content".to_string())?;
-
-            Some(UserRecordCreate {
-                kind: request.kind.clone().unwrap_or(UserRecordKind::Fact),
-                content,
-                evidence_refs,
-                confidence: request.confidence,
-                origin: RecordOrigin::User,
-                promotion_state: Some(PromotionState::Candidate),
-                valid_from: None,
-                valid_until: None,
-                links: request.links.clone(),
-                metadata: json!({
-                    "feedback_type": request.feedback_type,
-                    "rationale": request.rationale,
-                })
-                .as_object()
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                .collect(),
-            })
-        }
-        CanvasFeedbackType::Insight => {
-            let content = request
-                .content
-                .clone()
-                .ok_or_else(|| "Insight capture requires content".to_string())?;
-            let kind = request
-                .kind
-                .clone()
-                .ok_or_else(|| "Insight capture requires a record kind".to_string())?;
-
-            Some(UserRecordCreate {
-                kind,
-                content,
-                evidence_refs,
-                confidence: request.confidence,
-                origin: RecordOrigin::User,
-                promotion_state: Some(PromotionState::Candidate),
-                valid_from: None,
-                valid_until: None,
-                links: request.links.clone(),
-                metadata: json!({
-                    "feedback_type": request.feedback_type,
-                    "rationale": request.rationale,
-                })
-                .as_object()
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                .collect(),
-            })
-        }
-    };
-
-    Ok(record)
-}
-
-fn response_snapshot(
-    response_ref: &CanvasResponseRef,
-    tile: &PromptTile,
-    response: &ModelResponse,
-) -> serde_json::Value {
-    json!({
-        "tile_id": response_ref.tile_id,
-        "model_id": response.model_id,
-        "model_name": response.model_name,
-        "prompt": tile.prompt,
-        "response_content": response.content,
-        "status": response.status,
-    })
-}
-
-fn find_response<'a>(
-    session: &'a CanvasSession,
-    response_ref: &CanvasResponseRef,
-) -> Result<(&'a PromptTile, &'a ModelResponse), String> {
-    let tile = session
-        .prompt_tiles
-        .iter()
-        .find(|tile| tile.id == response_ref.tile_id)
-        .ok_or_else(|| format!("Tile not found: {}", response_ref.tile_id))?;
-    let response = tile
-        .responses
-        .get(&response_ref.model_id)
-        .ok_or_else(|| format!("Response not found: {}", response_ref.model_id))?;
-
-    Ok((tile, response))
-}
-
-fn excerpt(content: &str) -> String {
-    const MAX_LEN: usize = 220;
-    if content.chars().count() <= MAX_LEN {
-        return content.to_string();
-    }
-
-    let mut excerpt: String = content.chars().take(MAX_LEN).collect();
-    excerpt.push_str("...");
-    excerpt
+    let mut twin_store = state.twin_store.write().await;
+    twin_store
+        .record_canvas_feedback(&session, request)
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
 mod tests {
+    use super::resolve_persisted_response_id;
+    use crate::models::canvas::{CanvasSession, ModelResponse, PromptTile};
     use crate::models::twin::{ConstitutionItemCreate, ConstitutionItemUpdate};
     use crate::services::twin::TwinStore;
     use std::sync::Arc;
     use tempfile::tempdir;
     use tokio::sync::RwLock;
+
+    #[test]
+    fn selected_outcome_response_resolves_the_persisted_canvas_response_id() {
+        let mut session = CanvasSession {
+            id: "session-one".to_string(),
+            ..CanvasSession::default()
+        };
+        let mut tile = PromptTile {
+            id: "tile-one".to_string(),
+            ..PromptTile::default()
+        };
+        tile.responses.insert(
+            "model-a".to_string(),
+            ModelResponse {
+                id: "response-persisted".to_string(),
+                model_id: "model-a".to_string(),
+                ..ModelResponse::default()
+            },
+        );
+        session.prompt_tiles.push(tile);
+        assert_eq!(
+            resolve_persisted_response_id(
+                &session,
+                &crate::models::twin::CanvasResponseRef {
+                    tile_id: "tile-one".to_string(),
+                    model_id: "model-a".to_string(),
+                }
+            )
+            .as_deref(),
+            Some("response-persisted")
+        );
+    }
 
     /// Regression test for the read-modify-write lock fix: `update_constitution_item`
     /// reads the current item file, applies the update's `Some` fields, and writes the

@@ -207,7 +207,7 @@ impl VaultOptimizerService {
                 store.write_overlay(&change.note_id, &overlay_before)?;
             }
         } else if let Some(note_before) = change.note_before {
-            store.update_note(
+            store.update_note_from_source(
                 &change.note_id,
                 NoteUpdate {
                     title: Some(note_before.title),
@@ -221,6 +221,7 @@ impl VaultOptimizerService {
                     optimizer_managed: Some(note_before.optimizer_managed),
                     properties: Some(note_before.properties),
                 },
+                "vault_optimizer",
             )?;
         }
 
@@ -463,7 +464,7 @@ impl VaultOptimizerService {
             return Ok(None);
         }
 
-        let write_result = store.update_note(
+        let write_result = store.update_note_from_source(
             &current.id,
             NoteUpdate {
                 title: None,
@@ -488,6 +489,7 @@ impl VaultOptimizerService {
                     proposal.properties.clone(),
                 )),
             },
+            "vault_optimizer",
         );
 
         match write_result {
@@ -961,9 +963,23 @@ mod tests {
     fn daily_write_cap_defers_third_write_in_same_day() {
         let vault_dir = tempdir().expect("vault tempdir should be created");
         let data_dir = tempdir().expect("data tempdir should be created");
-        let mut store = KnowledgeStore::new(
+        let event_store = std::sync::Arc::new(crate::services::twin_events::TwinEventStore::new(
+            data_dir.path(),
+        ));
+        event_store.initialize().unwrap();
+        let coordinator = std::sync::Arc::new(
+            crate::services::twin_events::MutationCoordinator::new(
+                data_dir.path(),
+                vault_dir.path(),
+                event_store.clone(),
+                std::sync::Arc::new(crate::services::twin_events::NoopMutationLifecycle),
+            )
+            .unwrap(),
+        );
+        let mut store = KnowledgeStore::with_event_recorder(
             vault_dir.path().to_path_buf(),
             data_dir.path().to_path_buf(),
+            coordinator,
         );
 
         let notes = vec![
@@ -1027,6 +1043,11 @@ mod tests {
             service.state.accepted_count, 2,
             "no write should be recorded past the daily cap"
         );
+        assert_eq!(
+            event_store.ordered_events().unwrap().len(),
+            3,
+            "sidecar overlays and capped no-ops must not emit beyond note creation"
+        );
     }
 
     #[test]
@@ -1039,9 +1060,23 @@ mod tests {
         // silently drops the user's fresh tag and reverts their rename.
         let vault_dir = tempdir().expect("vault tempdir should be created");
         let data_dir = tempdir().expect("data tempdir should be created");
-        let mut store = KnowledgeStore::new(
+        let event_store = std::sync::Arc::new(crate::services::twin_events::TwinEventStore::new(
+            data_dir.path(),
+        ));
+        event_store.initialize().unwrap();
+        let coordinator = std::sync::Arc::new(
+            crate::services::twin_events::MutationCoordinator::new(
+                data_dir.path(),
+                vault_dir.path(),
+                event_store.clone(),
+                std::sync::Arc::new(crate::services::twin_events::NoopMutationLifecycle),
+            )
+            .unwrap(),
+        );
+        let mut store = KnowledgeStore::with_event_recorder(
             vault_dir.path().to_path_buf(),
             data_dir.path().to_path_buf(),
+            coordinator,
         );
 
         let note = store
@@ -1108,6 +1143,11 @@ mod tests {
             final_note.relative_path, "renamed-by-user.md",
             "the user's interleaved rename must not be reverted to the snapshot path"
         );
+        let events = event_store.ordered_events().unwrap();
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].context.source_channel.as_str(), "note_editor");
+        assert_eq!(events[1].context.source_channel.as_str(), "note_editor");
+        assert_eq!(events[2].context.source_channel.as_str(), "vault_optimizer");
     }
 
     #[test]

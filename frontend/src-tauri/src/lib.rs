@@ -21,7 +21,10 @@ use services::{
     search::SearchService,
     settings::SettingsService,
     twin::TwinStore,
-    twin_events::TwinEventStore,
+    twin_events::{
+        EventRecorder, MutationCoordinator, NoopMutationLifecycle, TwinEventStore,
+        UnavailableEventRecorder,
+    },
     vault_optimizer::{OptimizerTick, VaultOptimizerService},
 };
 use std::sync::Arc;
@@ -48,6 +51,7 @@ pub struct AppState {
     pub vault_optimizer: Arc<RwLock<VaultOptimizerService>>,
     pub twin_store: Arc<RwLock<TwinStore>>,
     pub twin_event_store: Arc<TwinEventStore>,
+    pub mutation_startup_error: Option<String>,
     /// MemoryService is stateless — no lock needed, just Arc for shared ownership
     pub memory_service: Arc<MemoryService>,
     pub boot_state: Arc<RwLock<BootStatus>>,
@@ -101,8 +105,41 @@ pub fn run() {
                 );
             }
 
+            // Initialize canonical mutation capture before any command can mutate user bytes.
+            let twin_event_store = Arc::new(TwinEventStore::new(data_path.clone()));
+            let coordinator = (|| -> Result<Arc<MutationCoordinator>, String> {
+                twin_event_store
+                    .initialize()
+                    .map_err(|error| error.to_string())?;
+                let coordinator = Arc::new(
+                    MutationCoordinator::new(
+                        &data_path,
+                        &vault_path,
+                        twin_event_store.clone(),
+                        Arc::new(NoopMutationLifecycle),
+                    )
+                    .map_err(|error| error.to_string())?,
+                );
+                coordinator
+                    .recover_pending()
+                    .map_err(|error| error.to_string())?;
+                Ok(coordinator)
+            })();
+            let (event_recorder, mutation_startup_error): (Arc<dyn EventRecorder>, Option<String>) =
+                match coordinator {
+                    Ok(coordinator) => (coordinator, None),
+                    Err(error) => (
+                        Arc::new(UnavailableEventRecorder::new(error.clone())),
+                        Some(error),
+                    ),
+                };
+
             // Initialize services
-            let knowledge_store = KnowledgeStore::new(vault_path.clone(), data_path.clone());
+            let knowledge_store = KnowledgeStore::with_event_recorder(
+                vault_path.clone(),
+                data_path.clone(),
+                event_recorder.clone(),
+            );
             let graph_index = GraphIndex::new();
             let search_service = match SearchService::new(data_path.clone()) {
                 Ok(s) => s,
@@ -143,11 +180,13 @@ pub fn run() {
                 }
             };
 
-            let canvas_store = CanvasStore::new(data_path.join("canvas"));
-            let twin_store = TwinStore::new(settings_service.get().effective_twin_data_path());
-            // Construction is deliberately side-effect free. Canonical storage is
-            // opened fallibly as the first warm-start phase below.
-            let twin_event_store = TwinEventStore::new(data_path.clone());
+            let canvas_store =
+                CanvasStore::with_event_recorder(data_path.join("canvas"), event_recorder.clone());
+            let twin_store = TwinStore::with_event_recorder(
+                settings_service.get().effective_twin_data_path(),
+                data_path.join("twin"),
+                event_recorder.clone(),
+            );
 
             // Get OpenRouter API key from settings, fall back to environment
             let api_key = settings_service
@@ -189,7 +228,8 @@ pub fn run() {
                 markdown_migration: Arc::new(RwLock::new(markdown_migration)),
                 vault_optimizer: Arc::new(RwLock::new(vault_optimizer)),
                 twin_store: Arc::new(RwLock::new(twin_store)),
-                twin_event_store: Arc::new(twin_event_store),
+                twin_event_store,
+                mutation_startup_error,
                 memory_service: Arc::new(MemoryService::new()),
                 boot_state,
             };
@@ -374,6 +414,9 @@ async fn warm_start_services(app_handle: tauri::AppHandle, state: AppState) -> R
     )
     .await;
     initialize_twin_event_store_for_boot(&state.twin_event_store)?;
+    if let Some(error) = &state.mutation_startup_error {
+        return Err(error.clone());
+    }
 
     publish_boot_phase(
         &app_handle,
@@ -625,5 +668,21 @@ mod tests {
             .error
             .unwrap()
             .contains("canonical Twin event directory"));
+    }
+
+    #[test]
+    fn production_twin_store_never_falls_back_to_the_noop_constructor() {
+        let desktop = include_str!("lib.rs");
+        let settings = include_str!("commands/settings.rs");
+        assert!(desktop.contains("TwinStore::with_event_recorder("));
+        let desktop_noop = [
+            "let twin_store = TwinStore::",
+            "new(settings_service.get().effective_twin_data_path())",
+        ]
+        .concat();
+        assert!(!desktop.contains(&desktop_noop));
+        assert!(settings.contains("twin_store.replace_root_path(new_twin_path)"));
+        let settings_noop = ["TwinStore::", "new(new_twin_path)"].concat();
+        assert!(!settings.contains(&settings_noop));
     }
 }

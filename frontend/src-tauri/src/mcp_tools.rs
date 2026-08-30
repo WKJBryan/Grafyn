@@ -377,7 +377,7 @@ impl GrafynMcpServer {
         };
 
         let mut ks = self.knowledge_store.write().await;
-        match ks.create_note(create) {
+        match ks.create_note_from_source(create, "mcp") {
             Ok(note) => {
                 // Update search index (if writable)
                 {
@@ -425,7 +425,7 @@ impl GrafynMcpServer {
         };
 
         let mut ks = self.knowledge_store.write().await;
-        match ks.update_note(&id, update) {
+        match ks.update_note_from_source(&id, update, "mcp") {
             Ok(note) => {
                 // Update search index (if writable)
                 {
@@ -459,7 +459,7 @@ impl GrafynMcpServer {
         Parameters(params): Parameters<DeleteNoteParams>,
     ) -> Result<CallToolResult, McpError> {
         let mut ks = self.knowledge_store.write().await;
-        match ks.delete_note(&params.id) {
+        match ks.delete_note_from_source(&params.id, "mcp") {
             Ok(()) => {
                 // Update search index (if writable)
                 {
@@ -574,7 +574,7 @@ impl GrafynMcpServer {
             .and_then(|ext| ext.to_str())
             .unwrap_or_default();
 
-        let (platform, items) = if let Some(platform) = import::detect_platform(&content) {
+        let (platform, containers) = if let Some(platform) = import::detect_platform(&content) {
             let all_conversations = match import::parse_content(&content) {
                 Ok(c) => c,
                 Err(e) => return err_result(format!("Failed to parse: {}", e)),
@@ -587,7 +587,7 @@ impl GrafynMcpServer {
                     .filter(|c| params.conversation_ids.contains(&c.id))
                     .collect()
             };
-            let items = to_import
+            let containers = to_import
                 .iter()
                 .map(|conv| {
                     let mut props = std::collections::HashMap::new();
@@ -608,15 +608,22 @@ impl GrafynMcpServer {
                         tags.push("import".to_string());
                     }
                     tags.truncate(5);
-                    (
-                        conv.title.clone(),
-                        import::format_as_markdown(conv),
+                    let create = NoteCreate {
+                        title: conv.title.clone(),
+                        content: import::format_as_markdown(conv),
+                        relative_path: None,
+                        aliases: Vec::new(),
+                        status: NoteStatus::Evidence,
                         tags,
-                        props,
-                    )
+                        schema_version: CURRENT_NOTE_SCHEMA_VERSION,
+                        migration_source: Some("mcp-import".into()),
+                        optimizer_managed: false,
+                        properties: props,
+                    };
+                    (conv.id.clone(), vec![create])
                 })
                 .collect::<Vec<_>>();
-            (platform.to_string(), items)
+            (platform.to_string(), containers)
         } else {
             let batch = match import::document::parse_document_text(file_name, extension, &content)
             {
@@ -632,6 +639,7 @@ impl GrafynMcpServer {
                     .filter(|item| params.conversation_ids.contains(&item.id))
                     .collect()
             };
+            let source_title = batch.source_title;
             let items = to_import
                 .into_iter()
                 .map(|item| {
@@ -640,50 +648,54 @@ impl GrafynMcpServer {
                         "source_id".into(),
                         serde_json::Value::String(item.id.clone()),
                     );
-                    (item.title, item.content, item.suggested_tags, props)
+                    NoteCreate {
+                        title: item.title,
+                        content: item.content,
+                        relative_path: None,
+                        aliases: Vec::new(),
+                        status: NoteStatus::Evidence,
+                        tags: item.suggested_tags,
+                        schema_version: CURRENT_NOTE_SCHEMA_VERSION,
+                        migration_source: Some("mcp-import".into()),
+                        optimizer_managed: false,
+                        properties: props,
+                    }
                 })
                 .collect::<Vec<_>>();
-            ("document".to_string(), items)
+            ("document".to_string(), vec![(source_title, items)])
         };
 
-        let mut created_ids = Vec::new();
+        let mut created_notes = Vec::new();
         let mut errors = Vec::new();
-
-        for (title, content, tags, properties) in items {
-            let note_create = NoteCreate {
-                title: title.clone(),
-                content,
-                relative_path: None,
-                aliases: Vec::new(),
-                status: NoteStatus::Evidence,
-                tags,
-                schema_version: CURRENT_NOTE_SCHEMA_VERSION,
-                migration_source: Some("mcp-import".into()),
-                optimizer_managed: false,
-                properties,
-            };
-
+        for (container_id, creates) in containers {
+            if creates.is_empty() {
+                continue;
+            }
             let mut ks = self.knowledge_store.write().await;
-            match ks.create_note(note_create) {
-                Ok(note) => {
-                    // Index in search (if writable)
-                    {
-                        let mut search = self.search_service.write().await;
-                        let _ = index_commit::index_note_for_search(&mut search, &note);
-                        let _ = index_commit::commit_search(&mut search);
-                    }
-                    // Update graph
-                    {
-                        let mut graph = self.graph_index.write().await;
-                        graph.update_note(&note);
-                    }
-                    created_ids.push(note.id);
-                }
+            match ks.import_note_container(creates, &container_id, content.as_bytes()) {
+                Ok(notes) => created_notes.extend(notes),
                 Err(e) => {
-                    errors.push(format!("Failed to create '{}': {}", title, e));
+                    errors.push(format!("Failed to import '{}': {}", container_id, e));
                 }
             }
         }
+        if !created_notes.is_empty() {
+            let mut search = self.search_service.write().await;
+            for note in &created_notes {
+                let _ = index_commit::index_note_for_search(&mut search, note);
+            }
+            let _ = index_commit::commit_search(&mut search);
+        }
+        {
+            let mut graph = self.graph_index.write().await;
+            for note in &created_notes {
+                graph.update_note(note);
+            }
+        }
+        let created_ids = created_notes
+            .into_iter()
+            .map(|note| note.id)
+            .collect::<Vec<_>>();
 
         let result = serde_json::json!({
             "platform": platform,
@@ -830,5 +842,116 @@ impl ServerHandler for GrafynMcpServer {
             capabilities: ServerCapabilities::builder().enable_tools().build(),
             ..Default::default()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::twin_event::TwinEventPayload;
+    use crate::services::twin_events::{
+        MutationCoordinator, NoopMutationLifecycle, TwinEventStore,
+    };
+    use tempfile::tempdir;
+
+    fn test_server(root: &Path) -> (GrafynMcpServer, Arc<TwinEventStore>, std::path::PathBuf) {
+        let vault = root.join("vault");
+        let data = root.join("data");
+        std::fs::create_dir(&vault).unwrap();
+        std::fs::create_dir(&data).unwrap();
+        let events = Arc::new(TwinEventStore::new(&data));
+        events.initialize().unwrap();
+        let coordinator = Arc::new(
+            MutationCoordinator::new(
+                &data,
+                &vault,
+                events.clone(),
+                Arc::new(NoopMutationLifecycle),
+            )
+            .unwrap(),
+        );
+        let server = GrafynMcpServer::new(
+            Arc::new(RwLock::new(KnowledgeStore::with_event_recorder(
+                vault,
+                data.clone(),
+                coordinator,
+            ))),
+            Arc::new(RwLock::new(SearchService::new(data.clone()).unwrap())),
+            Arc::new(RwLock::new(GraphIndex::new())),
+            Arc::new(RwLock::new(MemoryService::new())),
+            None,
+            Arc::new(RwLock::new(RetrievalService::new(data.clone()))),
+            Arc::new(RwLock::new(PriorityScoringService::new(data.clone()))),
+        );
+        (server, events, data)
+    }
+
+    #[tokio::test]
+    async fn mcp_crud_and_import_share_coordinated_groups_without_duplicates() {
+        let root = tempdir().unwrap();
+        let (server, events, data) = test_server(root.path());
+
+        server
+            .create_note(Parameters(CreateNoteParams {
+                title: "MCP captured".into(),
+                content: "first".into(),
+                tags: Vec::new(),
+                status: "draft".into(),
+            }))
+            .await
+            .unwrap();
+        server
+            .update_note(Parameters(UpdateNoteParams {
+                id: "mcp-captured".into(),
+                title: None,
+                content: Some("second".into()),
+                tags: None,
+                status: None,
+            }))
+            .await
+            .unwrap();
+        server
+            .delete_note(Parameters(DeleteNoteParams {
+                id: "mcp-captured".into(),
+            }))
+            .await
+            .unwrap();
+
+        let after_crud = events.ordered_events().unwrap();
+        assert_eq!(after_crud.len(), 3);
+        assert!(after_crud.iter().all(|event| {
+            event.context.source_channel.as_str() == "mcp"
+                && matches!(event.payload, TwinEventPayload::NoteChanged(_))
+        }));
+
+        let import_path = data.join("chatgpt.json");
+        std::fs::write(
+            &import_path,
+            r#"[{"id":"conv1","title":"Imported Chat","create_time":1704067200,"mapping":{"msg1":{"message":{"content":{"parts":["Hello"]},"author":{"role":"user"},"create_time":1704067200}}}}]"#,
+        )
+        .unwrap();
+        server
+            .import_conversation(Parameters(ImportParams {
+                file_path: import_path.to_string_lossy().into_owned(),
+                conversation_ids: Vec::new(),
+            }))
+            .await
+            .unwrap();
+
+        let captured = events.ordered_events().unwrap();
+        assert_eq!(captured.len(), 5);
+        assert!(matches!(
+            captured[3].payload,
+            TwinEventPayload::NoteChanged(_)
+        ));
+        assert!(matches!(
+            captured[4].payload,
+            TwinEventPayload::ObservationRecorded(_)
+        ));
+        assert!(captured[3..]
+            .iter()
+            .all(|event| event.context.source_channel.as_str() == "import"));
+        assert_eq!(captured[3].device_sequence + 1, captured[4].device_sequence);
+        assert!(captured[4].causal_parents.contains(&captured[3].event_id));
     }
 }

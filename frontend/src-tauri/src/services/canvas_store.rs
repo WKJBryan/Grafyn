@@ -7,29 +7,42 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::Arc;
 use walkdir::WalkDir;
 
 /// Service for managing canvas sessions (JSON file storage) with in-memory cache.
 ///
 /// The cache eliminates repeated disk reads — every get_session/list_sessions call
 /// returns from memory. Writes update the cache first then flush to disk (write-through).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct CanvasStore {
     data_path: PathBuf,
     /// Full session cache, populated lazily on first access per session.
     session_cache: HashMap<String, CanvasSession>,
     /// Whether the session list cache has been populated from disk.
     list_cache_ready: bool,
+    event_recorder: Arc<dyn crate::services::twin_events::EventRecorder>,
 }
 
 impl CanvasStore {
     pub fn new(data_path: PathBuf) -> Self {
+        Self::with_event_recorder(
+            data_path,
+            Arc::new(crate::services::twin_events::NoopEventRecorder),
+        )
+    }
+
+    pub fn with_event_recorder(
+        data_path: PathBuf,
+        event_recorder: Arc<dyn crate::services::twin_events::EventRecorder>,
+    ) -> Self {
         // Ensure directory exists
         std::fs::create_dir_all(&data_path).ok();
         Self {
             data_path,
             session_cache: HashMap::new(),
             list_cache_ready: false,
+            event_recorder,
         }
     }
 
@@ -504,13 +517,64 @@ impl CanvasStore {
     }
 
     /// Write a session to file
-    fn write_session_file(&self, session: &CanvasSession) -> Result<()> {
+    fn write_session_file(&mut self, session: &CanvasSession) -> Result<()> {
         let path = self.session_path(&session.id);
         let content = serde_json::to_string_pretty(session)?;
-
-        write_atomic(&path, content.as_bytes())
-            .with_context(|| format!("Failed to write session: {:?}", path))?;
-
+        let before = if path.exists() {
+            Some(self.read_session_file(&path)?)
+        } else {
+            None
+        };
+        let persist = || -> Result<()> {
+            if self.event_recorder.is_noop() {
+                return write_atomic(&path, content.as_bytes())
+                    .with_context(|| format!("Failed to write session: {:?}", path));
+            }
+            let drafts = crate::services::twin_events::canvas_transition_drafts(
+                before.as_ref(),
+                session,
+                &self
+                    .event_recorder
+                    .recorded_events()
+                    .map_err(anyhow::Error::new)?,
+                crate::services::twin_events::digest_bytes(content.as_bytes()),
+            )
+            .map_err(anyhow::Error::msg)?;
+            if drafts.is_empty() {
+                return write_atomic(&path, content.as_bytes())
+                    .with_context(|| format!("Failed to write session: {:?}", path));
+            }
+            self.event_recorder
+                .commit_mutation(
+                    crate::services::twin_events::MutationOrigin::Local,
+                    crate::models::twin_event::CausalStream::SyncEligible,
+                    crate::models::twin_event::SourceChannel::parse("canvas")
+                        .map_err(anyhow::Error::msg)?,
+                    vec![crate::services::twin_events::TargetMutation::put(
+                        crate::services::twin_events::TargetKind::CanvasJson,
+                        format!("{}.json", session.id),
+                        content.clone(),
+                    )],
+                    drafts,
+                )
+                .map_err(anyhow::Error::new)?;
+            Ok(())
+        };
+        if let Err(error) = persist() {
+            match self.read_session_file(&path) {
+                Ok(durable) => {
+                    self.session_cache.insert(session.id.clone(), durable);
+                }
+                Err(_) => {
+                    if let Some(before) = before {
+                        self.session_cache.insert(session.id.clone(), before);
+                    } else {
+                        self.session_cache.remove(&session.id);
+                    }
+                }
+            }
+            return Err(error);
+        }
         Ok(())
     }
 }
@@ -518,7 +582,10 @@ impl CanvasStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::canvas::{Debate, ModelResponse, PromptTile, ResponseStatus, SessionCreate};
+    use crate::models::canvas::{
+        Debate, DebateResponse, DebateRound, ModelResponse, PromptTile, ResponseStatus,
+        SessionCreate,
+    };
     use crate::services::atomic_io::assert_no_tmp_siblings;
     use tempfile::tempdir;
 
@@ -798,5 +865,344 @@ mod tests {
         assert_eq!(root.models, vec!["model-b".to_string()]);
         assert!(!root.responses.contains_key("model-a"));
         assert_eq!(remaining_debate_ids, vec!["debate-b".to_string()]);
+    }
+
+    #[test]
+    fn coordinated_canvas_captures_persisted_prompt_and_completion_but_not_structure() {
+        let root = tempdir().unwrap();
+        let data = root.path().join("data");
+        let vault = root.path().join("vault");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::create_dir(&vault).unwrap();
+        let event_store =
+            std::sync::Arc::new(crate::services::twin_events::TwinEventStore::new(&data));
+        event_store.initialize().unwrap();
+        let coordinator = std::sync::Arc::new(
+            crate::services::twin_events::MutationCoordinator::new(
+                &data,
+                &vault,
+                event_store.clone(),
+                std::sync::Arc::new(crate::services::twin_events::NoopMutationLifecycle),
+            )
+            .unwrap(),
+        );
+        let mut store = CanvasStore::with_event_recorder(data.join("canvas"), coordinator);
+        let session = store
+            .create_session(SessionCreate {
+                title: "Captured".to_string(),
+                description: None,
+                tags: Vec::new(),
+            })
+            .unwrap();
+        assert!(event_store.ordered_events().unwrap().is_empty());
+
+        let mut tile = PromptTile {
+            id: "tile-captured".to_string(),
+            prompt: "What next?".to_string(),
+            models: vec!["model-a".to_string()],
+            ..PromptTile::default()
+        };
+        tile.responses.insert(
+            "model-a".to_string(),
+            ModelResponse {
+                id: "response-captured".to_string(),
+                model_id: "model-a".to_string(),
+                model_name: "Model A".to_string(),
+                status: ResponseStatus::Pending,
+                ..ModelResponse::default()
+            },
+        );
+        store.add_tile(&session.id, tile).unwrap();
+        let events = event_store.ordered_events().unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            events[0].payload,
+            crate::models::twin_event::TwinEventPayload::ConversationTurnRecorded(_)
+        ));
+
+        store
+            .update_tile_response(
+                &session.id,
+                "tile-captured",
+                "model-a",
+                "A durable answer",
+                ResponseStatus::Completed,
+                None,
+                Some(0.01),
+            )
+            .unwrap();
+        let events = event_store.ordered_events().unwrap();
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            events[1].payload,
+            crate::models::twin_event::TwinEventPayload::CanvasResponseRecorded(_)
+        ));
+
+        store
+            .update_viewport(
+                &session.id,
+                CanvasViewport {
+                    x: 12.0,
+                    y: 24.0,
+                    zoom: 0.8,
+                },
+            )
+            .unwrap();
+        store
+            .delete_response(&session.id, "tile-captured", "model-a")
+            .unwrap();
+        assert_eq!(event_store.ordered_events().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn coordinated_canvas_failure_restores_cache_and_persisted_session() {
+        let root = tempdir().unwrap();
+        let canvas = root.path().join("canvas");
+        let mut store = CanvasStore::with_event_recorder(
+            canvas.clone(),
+            std::sync::Arc::new(crate::services::twin_events::UnavailableEventRecorder::new(
+                "injected persistence failure",
+            )),
+        );
+        let session = store
+            .create_session(SessionCreate {
+                title: "Stable".to_string(),
+                description: None,
+                tags: Vec::new(),
+            })
+            .unwrap();
+        let before = std::fs::read(canvas.join(format!("{}.json", session.id))).unwrap();
+        let result = store.add_tile(
+            &session.id,
+            PromptTile {
+                id: "must-not-stick".to_string(),
+                prompt: "Do not persist".to_string(),
+                ..PromptTile::default()
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            std::fs::read(canvas.join(format!("{}.json", session.id))).unwrap(),
+            before
+        );
+        assert!(store
+            .get_session(&session.id)
+            .unwrap()
+            .prompt_tiles
+            .is_empty());
+    }
+
+    #[test]
+    fn interrupted_canvas_target_keeps_cache_equal_to_durable_bytes_until_recovery() {
+        let root = tempdir().unwrap();
+        let data = root.path().join("data");
+        let vault = root.path().join("vault");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::create_dir(&vault).unwrap();
+        let event_store =
+            std::sync::Arc::new(crate::services::twin_events::TwinEventStore::new(&data));
+        event_store.initialize().unwrap();
+        let coordinator = std::sync::Arc::new(
+            crate::services::twin_events::MutationCoordinator::new(
+                &data,
+                &vault,
+                event_store.clone(),
+                std::sync::Arc::new(crate::services::twin_events::NoopMutationLifecycle),
+            )
+            .unwrap(),
+        );
+        let mut store = CanvasStore::with_event_recorder(data.join("canvas"), coordinator.clone());
+        let session = store
+            .create_session(SessionCreate {
+                title: "Interrupted".into(),
+                description: None,
+                tags: Vec::new(),
+            })
+            .unwrap();
+        coordinator.fail_once_at(crate::services::twin_events::MutationFaultPoint::AfterTarget(0));
+        assert!(store
+            .add_tile(
+                &session.id,
+                PromptTile {
+                    id: "durable-before-event".into(),
+                    prompt: "Persist me once".into(),
+                    ..PromptTile::default()
+                },
+            )
+            .is_err());
+
+        let path = data.join("canvas").join(format!("{}.json", session.id));
+        let durable: CanvasSession = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let cached = store.get_session(&session.id).unwrap();
+        assert_eq!(cached.prompt_tiles.len(), durable.prompt_tiles.len());
+        assert_eq!(cached.prompt_tiles[0].id, durable.prompt_tiles[0].id);
+        assert!(event_store.ordered_events().unwrap().is_empty());
+        assert_eq!(coordinator.pending_count().unwrap(), 1);
+        assert_eq!(coordinator.recover_pending().unwrap(), 1);
+        assert_eq!(event_store.ordered_events().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn coordinated_canvas_batches_regeneration_and_debate_are_persisted_once_in_order() {
+        let root = tempdir().unwrap();
+        let data = root.path().join("data");
+        let vault = root.path().join("vault");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::create_dir(&vault).unwrap();
+        let event_store =
+            std::sync::Arc::new(crate::services::twin_events::TwinEventStore::new(&data));
+        event_store.initialize().unwrap();
+        let coordinator = std::sync::Arc::new(
+            crate::services::twin_events::MutationCoordinator::new(
+                &data,
+                &vault,
+                event_store.clone(),
+                std::sync::Arc::new(crate::services::twin_events::NoopMutationLifecycle),
+            )
+            .unwrap(),
+        );
+        let mut store = CanvasStore::with_event_recorder(data.join("canvas"), coordinator);
+        let session = store
+            .create_session(SessionCreate {
+                title: "Batch and debate".into(),
+                description: None,
+                tags: Vec::new(),
+            })
+            .unwrap();
+        let mut tile = PromptTile {
+            id: "tile-batch".into(),
+            prompt: "Compare both answers".into(),
+            models: vec!["model-z".into(), "model-a".into()],
+            ..PromptTile::default()
+        };
+        for (model_id, response_id) in [("model-z", "response-z"), ("model-a", "response-a")] {
+            tile.responses.insert(
+                model_id.into(),
+                ModelResponse {
+                    id: response_id.into(),
+                    model_id: model_id.into(),
+                    model_name: model_id.into(),
+                    status: ResponseStatus::Pending,
+                    ..ModelResponse::default()
+                },
+            );
+        }
+        store.add_tile(&session.id, tile).unwrap();
+        store
+            .batch_update_tile_responses(
+                &session.id,
+                "tile-batch",
+                &[
+                    (
+                        "model-z".into(),
+                        "z answer".into(),
+                        ResponseStatus::Completed,
+                        None,
+                        Some(0.02),
+                    ),
+                    (
+                        "model-a".into(),
+                        "a answer".into(),
+                        ResponseStatus::Completed,
+                        None,
+                        Some(0.01),
+                    ),
+                ],
+            )
+            .unwrap();
+        let events = event_store.ordered_events().unwrap();
+        assert_eq!(events.len(), 3);
+        let response_ids = events[1..]
+            .iter()
+            .map(|event| match &event.payload {
+                crate::models::twin_event::TwinEventPayload::CanvasResponseRecorded(payload) => {
+                    payload.response_id.as_str()
+                }
+                other => panic!("unexpected batch payload: {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(response_ids, vec!["response-a", "response-z"]);
+
+        store
+            .update_tile_response(
+                &session.id,
+                "tile-batch",
+                "model-a",
+                "partial",
+                ResponseStatus::Streaming,
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(event_store.ordered_events().unwrap().len(), 3);
+        let prior_a = events[1].event_id.clone();
+        store
+            .update_tile_response(
+                &session.id,
+                "tile-batch",
+                "model-a",
+                "regenerated answer",
+                ResponseStatus::Completed,
+                None,
+                Some(0.03),
+            )
+            .unwrap();
+        let events = event_store.ordered_events().unwrap();
+        assert_eq!(events.len(), 4);
+        assert_eq!(events[3].supersedes, vec![prior_a]);
+
+        let mut debate = Debate {
+            id: "debate-stable".into(),
+            participating_models: vec!["model-z".into(), "model-a".into()],
+            ..Debate::default()
+        };
+        store.add_debate(&session.id, debate.clone()).unwrap();
+        assert_eq!(event_store.ordered_events().unwrap().len(), 4);
+        debate.rounds.push(DebateRound {
+            round_number: 1,
+            topic: "Which answer is stronger?".into(),
+            responses: vec![
+                DebateResponse {
+                    model_id: "model-z".into(),
+                    model_name: "Model Z".into(),
+                    content: "Z case".into(),
+                    stance: None,
+                    cost_usd: Some(0.02),
+                },
+                DebateResponse {
+                    model_id: "model-a".into(),
+                    model_name: "Model A".into(),
+                    content: "A case".into(),
+                    stance: None,
+                    cost_usd: Some(0.01),
+                },
+            ],
+            created_at: Utc::now(),
+        });
+        store.update_debate(&session.id, &debate).unwrap();
+        let events = event_store.ordered_events().unwrap();
+        assert_eq!(events.len(), 7);
+        assert!(matches!(
+            events[4].payload,
+            crate::models::twin_event::TwinEventPayload::ConversationTurnRecorded(_)
+        ));
+        let debate_rows = events[5..]
+            .iter()
+            .map(|event| match &event.payload {
+                crate::models::twin_event::TwinEventPayload::CanvasResponseRecorded(payload) => {
+                    (payload.response_id.as_str(), payload.model_id.as_str())
+                }
+                other => panic!("unexpected debate payload: {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        let mut sorted_ids = debate_rows.iter().map(|row| row.0).collect::<Vec<_>>();
+        sorted_ids.sort_unstable();
+        assert_eq!(
+            debate_rows.iter().map(|row| row.0).collect::<Vec<_>>(),
+            sorted_ids
+        );
+        let mut debate_models = debate_rows.iter().map(|row| row.1).collect::<Vec<_>>();
+        debate_models.sort_unstable();
+        assert_eq!(debate_models, vec!["model-a", "model-z"]);
     }
 }

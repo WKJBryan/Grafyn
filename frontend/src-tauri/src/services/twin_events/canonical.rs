@@ -283,13 +283,30 @@ fn encode_payload(out: &mut Encoder, payload: &TwinEventPayload) {
                 "initial_leaning",
                 v.initial_leaning.as_ref().map(BoundedContent::as_str),
             );
+            out.optional_text(
+                "review_date",
+                v.review_date.as_ref().map(BoundedLabel::as_str),
+            );
         }
         TwinEventPayload::DecisionOutcomeRecorded(v) => {
             out.text("decision_id", v.decision_id.as_str());
-            out.text("outcome", v.outcome.as_str());
+            out.optional_text("outcome", v.outcome.as_ref().map(BoundedContent::as_str));
             out.optional_text(
                 "chosen_option",
                 v.chosen_option.as_ref().map(BoundedContent::as_str),
+            );
+            out.optional_text(
+                "selected_response_id",
+                v.selected_response_id.as_ref().map(Identifier::as_str),
+            );
+            out.optional_u16("confidence_basis_points", v.confidence_basis_points);
+            out.optional_text(
+                "review_date",
+                v.review_date.as_ref().map(BoundedLabel::as_str),
+            );
+            out.optional_text(
+                "correction_note",
+                v.correction_note.as_ref().map(BoundedContent::as_str),
             );
             out.optional_u8("regret_score", v.regret_score);
             out.optional_text("lesson", v.lesson.as_ref().map(BoundedContent::as_str));
@@ -302,11 +319,12 @@ fn encode_payload(out: &mut Encoder, payload: &TwinEventPayload) {
             out.text("feedback_id", v.feedback_id.as_str());
             out.text("target_id", v.target_id.as_str());
             out.text("kind", v.kind.as_str());
-            out.text("content", v.content.as_str());
+            out.optional_text("content", v.content.as_ref().map(BoundedContent::as_str));
             out.optional_text(
                 "rationale",
                 v.rationale.as_ref().map(BoundedContent::as_str),
             );
+            out.optional_u16("rank", v.rank);
         }
         TwinEventPayload::RelationshipContextObserved(_) => {}
     }
@@ -362,6 +380,15 @@ impl Encoder {
     }
     fn u16(&mut self, name: &str, value: u16) {
         self.field(name, &value.to_be_bytes());
+    }
+    fn optional_u16(&mut self, name: &str, value: Option<u16>) {
+        match value {
+            Some(value) => {
+                self.bool(&format!("{name}.present"), true);
+                self.u16(name, value);
+            }
+            None => self.bool(&format!("{name}.present"), false),
+        }
     }
     fn u64(&mut self, name: &str, value: u64) {
         self.field(name, &value.to_be_bytes());
@@ -586,6 +613,7 @@ mod tests {
                     .collect(),
                 stakes: None,
                 initial_leaning: None,
+                review_date: None,
             }))
         };
         let first = decision(&["alpha", "alpha", "beta"]);

@@ -565,8 +565,52 @@ impl TwinStore {
             updated_at: now,
         };
 
-        self.write_decision_file(&episode)?;
-        self.append_trace_event(
+        let digest = Self::governed_json_digest(&episode)?;
+        let mut draft = crate::services::twin_events::TwinEventDraft::observed(
+            crate::models::twin_event::TwinEventPayload::DecisionRecorded(
+                crate::models::twin_event::DecisionRecorded {
+                    decision_id: crate::models::twin_event::Identifier::parse(&episode.id)
+                        .map_err(anyhow::Error::msg)?,
+                    decision: crate::models::twin_event::BoundedContent::parse(&episode.decision)
+                        .map_err(anyhow::Error::msg)?,
+                    options: episode
+                        .options
+                        .iter()
+                        .map(crate::models::twin_event::BoundedContent::parse)
+                        .collect::<std::result::Result<Vec<_>, _>>()
+                        .map_err(anyhow::Error::msg)?,
+                    stakes: episode
+                        .stakes
+                        .as_deref()
+                        .map(crate::models::twin_event::BoundedContent::parse)
+                        .transpose()
+                        .map_err(anyhow::Error::msg)?,
+                    initial_leaning: episode
+                        .initial_leaning
+                        .as_deref()
+                        .map(crate::models::twin_event::BoundedContent::parse)
+                        .transpose()
+                        .map_err(anyhow::Error::msg)?,
+                    review_date: episode
+                        .review_date
+                        .as_deref()
+                        .map(crate::models::twin_event::BoundedLabel::parse)
+                        .transpose()
+                        .map_err(anyhow::Error::msg)?,
+                },
+            ),
+            episode.updated_at,
+            crate::models::twin_event::SourceChannel::parse("legacy_twin")
+                .map_err(anyhow::Error::msg)?,
+            crate::services::twin_events::standard_capture_governance(),
+        );
+        draft.evidence.push(crate::models::twin_event::EvidenceRef {
+            evidence_type: crate::models::twin_event::EvidenceType::TwinRecord,
+            source_id: crate::models::twin_event::Identifier::parse(&episode.id)
+                .map_err(anyhow::Error::msg)?,
+            digest: Some(digest),
+        });
+        let (_, trace) = self.plan_trace_event(
             &episode.session_id,
             TraceEventType::DecisionEpisodeCreated,
             json!({
@@ -580,6 +624,18 @@ impl TwinStore {
                 "primitive_assessment": episode.primitive_assessment,
             }),
         )?;
+        let trace_target = self.serialized_trace_target(&trace)?;
+        self.commit_governed_json_targets(
+            vec![
+                (
+                    self.decision_file_path(&episode.id),
+                    serde_json::to_string_pretty(&episode)?,
+                ),
+                trace_target,
+            ],
+            vec![draft],
+        )?;
+        self.cache_committed_trace(trace);
 
         Ok(episode)
     }
@@ -608,6 +664,11 @@ impl TwinStore {
 
         episodes.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
         Ok(episodes)
+    }
+
+    pub fn get_decision_episode(&self, id: &str) -> Result<DecisionEpisode> {
+        Self::validate_file_id(id)?;
+        self.read_decision_file(&self.decision_file_path(id))
     }
 
     /// Select past decided episodes as verbatim behavioral cases for twin
@@ -673,9 +734,27 @@ impl TwinStore {
         id: &str,
         update: DecisionOutcomeUpdate,
     ) -> Result<DecisionEpisode> {
+        self.update_decision_outcome_with_response_id(id, update, None)
+    }
+
+    pub fn update_decision_outcome_with_response_id(
+        &mut self,
+        id: &str,
+        update: DecisionOutcomeUpdate,
+        selected_response_id: Option<String>,
+    ) -> Result<DecisionEpisode> {
         Self::validate_file_id(id)?;
         let path = self.decision_file_path(id);
         let mut episode = self.read_decision_file(&path)?;
+        let before = serde_json::to_value(&episode)?;
+        let explicit_outcome = update.outcome.clone();
+        let explicit_choice = update.chosen_option.clone();
+        let explicit_confidence = update.confidence;
+        let explicit_review_date = update.review_date.clone();
+        let explicit_correction = update.correction_note.clone();
+        let explicit_regret = update.regret_score;
+        let explicit_lesson = update.lesson.clone();
+        let explicit_missed = update.missed_something.clone();
 
         if let Some(selected_response) = update.selected_response {
             episode.selected_response = Some(selected_response);
@@ -731,9 +810,87 @@ impl TwinStore {
             }
         }
 
+        if serde_json::to_value(&episode)? == before {
+            return Ok(episode);
+        }
         episode.updated_at = Utc::now();
-        self.write_decision_file(&episode)?;
-        self.append_trace_event(
+        let drafts = if self.event_recorder.is_noop() {
+            Vec::new()
+        } else {
+            let confidence_basis_points =
+                explicit_confidence.map(|value| (value.clamp(0.0, 1.0) * 10_000.0).round() as u16);
+            if explicit_outcome.is_none()
+                && explicit_choice.is_none()
+                && selected_response_id.is_none()
+                && confidence_basis_points.is_none()
+                && explicit_review_date.is_none()
+                && explicit_correction.is_none()
+                && explicit_regret.is_none()
+                && explicit_lesson.is_none()
+                && explicit_missed.is_none()
+            {
+                anyhow::bail!("decision outcome mutation has no governed follow-up field");
+            }
+            let payload = crate::models::twin_event::TwinEventPayload::DecisionOutcomeRecorded(
+                crate::models::twin_event::DecisionOutcomeRecorded {
+                    decision_id: crate::models::twin_event::Identifier::parse(&episode.id)
+                        .map_err(anyhow::Error::msg)?,
+                    outcome: explicit_outcome
+                        .as_deref()
+                        .map(crate::models::twin_event::BoundedContent::parse)
+                        .transpose()
+                        .map_err(anyhow::Error::msg)?,
+                    chosen_option: explicit_choice
+                        .as_deref()
+                        .map(crate::models::twin_event::BoundedContent::parse)
+                        .transpose()
+                        .map_err(anyhow::Error::msg)?,
+                    selected_response_id: selected_response_id
+                        .as_deref()
+                        .map(crate::models::twin_event::Identifier::parse)
+                        .transpose()
+                        .map_err(anyhow::Error::msg)?,
+                    confidence_basis_points,
+                    review_date: explicit_review_date
+                        .as_deref()
+                        .map(crate::models::twin_event::BoundedLabel::parse)
+                        .transpose()
+                        .map_err(anyhow::Error::msg)?,
+                    correction_note: explicit_correction
+                        .as_deref()
+                        .map(crate::models::twin_event::BoundedContent::parse)
+                        .transpose()
+                        .map_err(anyhow::Error::msg)?,
+                    regret_score: explicit_regret,
+                    lesson: explicit_lesson
+                        .as_deref()
+                        .map(crate::models::twin_event::BoundedContent::parse)
+                        .transpose()
+                        .map_err(anyhow::Error::msg)?,
+                    missed_something: explicit_missed
+                        .as_deref()
+                        .map(crate::models::twin_event::BoundedContent::parse)
+                        .transpose()
+                        .map_err(anyhow::Error::msg)?,
+                },
+            );
+            let digest = Self::governed_json_digest(&episode)?;
+            let mut draft = crate::services::twin_events::TwinEventDraft::observed(
+                payload,
+                episode.updated_at,
+                crate::models::twin_event::SourceChannel::parse("legacy_twin")
+                    .map_err(anyhow::Error::msg)?,
+                crate::services::twin_events::standard_capture_governance(),
+            );
+            draft.evidence.push(crate::models::twin_event::EvidenceRef {
+                evidence_type: crate::models::twin_event::EvidenceType::TwinRecord,
+                source_id: crate::models::twin_event::Identifier::parse(&episode.id)
+                    .map_err(anyhow::Error::msg)?,
+                digest: Some(digest),
+            });
+            vec![draft]
+        };
+        let (_, trace) = self.plan_trace_event(
             &episode.session_id,
             TraceEventType::OutcomeFollowUpRecorded,
             json!({
@@ -756,6 +913,15 @@ impl TwinStore {
                     .map(|prediction| prediction.context_version.clone()),
             }),
         )?;
+        let trace_target = self.serialized_trace_target(&trace)?;
+        self.commit_governed_json_targets(
+            vec![
+                (path, serde_json::to_string_pretty(&episode)?),
+                trace_target,
+            ],
+            drafts,
+        )?;
+        self.cache_committed_trace(trace);
 
         Ok(episode)
     }
@@ -1277,7 +1443,157 @@ impl TwinStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::twin::CanvasResponseRef;
     use tempfile::tempdir;
+
+    fn coordinated_decision_store(
+        root: &std::path::Path,
+    ) -> (
+        TwinStore,
+        std::sync::Arc<crate::services::twin_events::TwinEventStore>,
+        std::sync::Arc<crate::services::twin_events::MutationCoordinator>,
+    ) {
+        let data = root.join("data");
+        let vault = root.join("vault");
+        let twin_root = data.join("twin").join("scope-one");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir(&vault).unwrap();
+        let events = std::sync::Arc::new(crate::services::twin_events::TwinEventStore::new(&data));
+        events.initialize().unwrap();
+        let coordinator = std::sync::Arc::new(
+            crate::services::twin_events::MutationCoordinator::new(
+                &data,
+                &vault,
+                events.clone(),
+                std::sync::Arc::new(crate::services::twin_events::NoopMutationLifecycle),
+            )
+            .unwrap(),
+        );
+        (
+            TwinStore::with_event_recorder(twin_root, data.join("twin"), coordinator.clone()),
+            events,
+            coordinator,
+        )
+    }
+
+    #[test]
+    fn coordinated_decision_create_and_outcome_capture_only_explicit_persisted_fields() {
+        let root = tempdir().unwrap();
+        let (mut store, events, _) = coordinated_decision_store(root.path());
+        let episode = store
+            .record_decision_episode(DecisionEpisodeCreate {
+                id: "decision-one".to_string(),
+                session_id: "session-one".to_string(),
+                tile_id: "tile-one".to_string(),
+                decision: "Ship now?".to_string(),
+                options: vec!["Wait".to_string(), "Ship".to_string()],
+                stakes: Some("Release quality".to_string()),
+                initial_leaning: Some("Wait".to_string()),
+                review_date: Some("2026-09-30".to_string()),
+                primitive_assessment: Default::default(),
+                context_version: Some("context-v1".to_string()),
+            })
+            .unwrap();
+        let create_events = events.ordered_events().unwrap();
+        assert_eq!(create_events.len(), 1);
+        let crate::models::twin_event::TwinEventPayload::DecisionRecorded(created) =
+            &create_events[0].payload
+        else {
+            panic!("direct decision creation needs one typed decision event");
+        };
+        assert_eq!(created.decision_id.as_str(), "decision-one");
+        assert_eq!(created.review_date.as_ref().unwrap().as_str(), "2026-09-30");
+
+        store
+            .update_decision_outcome_with_response_id(
+                &episode.id,
+                DecisionOutcomeUpdate {
+                    selected_response: Some(CanvasResponseRef {
+                        tile_id: "tile-one".to_string(),
+                        model_id: "model-a".to_string(),
+                    }),
+                    chosen_option: Some("Ship".to_string()),
+                    confidence: Some(0.87),
+                    review_date: Some("2026-10-30".to_string()),
+                    outcome: Some("Released".to_string()),
+                    regret_score: Some(2),
+                    lesson: Some("Stage the rollout".to_string()),
+                    missed_something: Some("Support load".to_string()),
+                    primitive_assessment: None,
+                    correction_note: Some("Use a canary next time".to_string()),
+                },
+                Some("response-persisted".to_string()),
+            )
+            .unwrap();
+        let captured = events.ordered_events().unwrap();
+        assert_eq!(captured.len(), 2);
+        let crate::models::twin_event::TwinEventPayload::DecisionOutcomeRecorded(outcome) =
+            &captured[1].payload
+        else {
+            panic!("outcome mutation needs one typed follow-up event");
+        };
+        assert_eq!(outcome.outcome.as_ref().unwrap().as_str(), "Released");
+        assert_eq!(outcome.chosen_option.as_ref().unwrap().as_str(), "Ship");
+        assert_eq!(
+            outcome.selected_response_id.as_ref().unwrap().as_str(),
+            "response-persisted"
+        );
+        assert_eq!(outcome.confidence_basis_points, Some(8700));
+        assert_eq!(outcome.review_date.as_ref().unwrap().as_str(), "2026-10-30");
+        assert_eq!(
+            outcome.correction_note.as_ref().unwrap().as_str(),
+            "Use a canary next time"
+        );
+        assert_eq!(outcome.regret_score, Some(2));
+        assert_eq!(
+            outcome.lesson.as_ref().unwrap().as_str(),
+            "Stage the rollout"
+        );
+        assert_eq!(
+            outcome.missed_something.as_ref().unwrap().as_str(),
+            "Support load"
+        );
+    }
+
+    #[test]
+    fn decision_and_trace_recover_as_one_compound_mutation() {
+        let root = tempdir().unwrap();
+        let (mut store, events, coordinator) = coordinated_decision_store(root.path());
+        coordinator.fail_once_at(crate::services::twin_events::MutationFaultPoint::AfterTarget(0));
+
+        assert!(store
+            .record_decision_episode(DecisionEpisodeCreate {
+                id: "decision-crash".to_string(),
+                session_id: "session-crash".to_string(),
+                tile_id: "tile-crash".to_string(),
+                decision: "Recover both?".to_string(),
+                options: vec!["No".to_string(), "Yes".to_string()],
+                stakes: None,
+                initial_leaning: None,
+                review_date: None,
+                primitive_assessment: Default::default(),
+                context_version: None,
+            })
+            .is_err());
+        assert!(!store.trace_cache.contains_key("session-crash"));
+        assert_eq!(coordinator.recover_pending().unwrap(), 1);
+        assert_eq!(coordinator.recover_pending().unwrap(), 0);
+
+        assert_eq!(events.ordered_events().unwrap().len(), 1);
+        assert_eq!(
+            store
+                .get_decision_episode("decision-crash")
+                .unwrap()
+                .decision,
+            "Recover both?"
+        );
+        let trace = store.get_session_trace("session-crash").unwrap();
+        assert_eq!(trace.events.len(), 1);
+        assert_eq!(
+            trace.events[0].event_type,
+            TraceEventType::DecisionEpisodeCreated
+        );
+    }
 
     #[test]
     fn legacy_auto_promoted_is_not_decision_evidence() {

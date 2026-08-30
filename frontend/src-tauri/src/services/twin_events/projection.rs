@@ -145,6 +145,21 @@ fn event_target_type_allowed(event: &TwinEvent) -> bool {
     )
 }
 
+fn supersession_target_allowed(event: &TwinEvent, target: &TwinEvent) -> bool {
+    if event_target_type_allowed(target) {
+        return true;
+    }
+    matches!(
+        (&event.payload, &target.payload),
+        (
+            TwinEventPayload::CanvasResponseRecorded(current),
+            TwinEventPayload::CanvasResponseRecorded(previous),
+        ) if current.session_id == previous.session_id
+            && current.tile_id == previous.tile_id
+            && current.response_id == previous.response_id
+    )
+}
+
 fn validate_references(events: &[TwinEvent]) -> Result<(), ProjectionError> {
     let by_id = events
         .iter()
@@ -156,7 +171,15 @@ fn validate_references(events: &[TwinEvent]) -> Result<(), ProjectionError> {
                 return Err(ProjectionError::DanglingReference(parent.clone()));
             }
         }
-        for target in event.supersedes.iter().chain(&event.reinforces) {
+        for target in &event.supersedes {
+            let Some(target_event) = by_id.get(target) else {
+                return Err(ProjectionError::DanglingReference(target.clone()));
+            };
+            if !supersession_target_allowed(event, target_event) {
+                return Err(ProjectionError::WrongReferenceType(target.clone()));
+            }
+        }
+        for target in &event.reinforces {
             let Some(target_event) = by_id.get(target) else {
                 return Err(ProjectionError::DanglingReference(target.clone()));
             };
@@ -1242,6 +1265,7 @@ mod tests {
             options: Vec::new(),
             stakes: None,
             initial_leaning: None,
+            review_date: None,
         });
         source.event_type = TwinEventType::DecisionRecorded;
         source.causal_stream = CausalStream::LocalOnly;
@@ -1260,6 +1284,7 @@ mod tests {
             options: Vec::new(),
             stakes: None,
             initial_leaning: None,
+            review_date: None,
         });
         relationship_source.governance.sensitivity = Sensitivity::Standard;
         relationship_source.governance.allowed_uses.recall = true;
@@ -1660,6 +1685,7 @@ mod tests {
             options: Vec::new(),
             stakes: None,
             initial_leaning: None,
+            review_date: None,
         });
         decision.event_type = TwinEventType::DecisionRecorded;
         decision.event_id = derive_event_id(&decision);
@@ -1668,6 +1694,49 @@ mod tests {
         bad.event_id = derive_event_id(&bad);
         assert!(matches!(
             project(&[decision, bad], reference()),
+            Err(ProjectionError::WrongReferenceType(_))
+        ));
+    }
+
+    #[test]
+    fn canvas_regeneration_may_supersede_only_the_same_persisted_response_identity() {
+        let canvas_payload = |response_id: &str, response: &str| {
+            TwinEventPayload::CanvasResponseRecorded(CanvasResponseRecorded {
+                session_id: Identifier::parse("session-one").unwrap(),
+                tile_id: Identifier::parse("tile-one").unwrap(),
+                response_id: Identifier::parse(response_id).unwrap(),
+                prompt: BoundedContent::parse("prompt").unwrap(),
+                response: BoundedContent::parse(response).unwrap(),
+                model_id: ModelId::parse("openai/gpt-5").unwrap(),
+                provider: None,
+                provenance: None,
+                tokens_used: None,
+                cost_usd_decimal: None,
+                prompt_digest: None,
+                response_digest: None,
+            })
+        };
+        let mut first = valid_event_for_device("canvas-device", 1, Vec::new());
+        first.payload = canvas_payload("response-one", "first");
+        first.event_type = first.payload.event_type();
+        first.event_id = derive_event_id(&first);
+
+        let mut regeneration =
+            valid_event_for_device("canvas-device", 2, vec![first.event_id.clone()]);
+        regeneration.payload = canvas_payload("response-one", "regenerated");
+        regeneration.event_type = regeneration.payload.event_type();
+        regeneration.supersedes = vec![first.event_id.clone()];
+        regeneration.event_id = derive_event_id(&regeneration);
+        assert!(project(&[first.clone(), regeneration], reference()).is_ok());
+
+        let mut wrong_identity =
+            valid_event_for_device("canvas-device", 2, vec![first.event_id.clone()]);
+        wrong_identity.payload = canvas_payload("response-two", "other");
+        wrong_identity.event_type = wrong_identity.payload.event_type();
+        wrong_identity.supersedes = vec![first.event_id.clone()];
+        wrong_identity.event_id = derive_event_id(&wrong_identity);
+        assert!(matches!(
+            project(&[first, wrong_identity], reference()),
             Err(ProjectionError::WrongReferenceType(_))
         ));
     }

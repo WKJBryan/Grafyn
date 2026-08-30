@@ -26,6 +26,7 @@ use crate::services::priority::PriorityScoringService;
 use crate::services::retrieval::RetrievalService;
 use crate::services::search::SearchService;
 use crate::services::settings::SettingsService;
+use crate::services::twin_events::{MutationCoordinator, NoopMutationLifecycle, TwinEventStore};
 use clap::Parser;
 use rmcp::ServiceExt;
 use std::path::PathBuf;
@@ -64,8 +65,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(&vault_path)?;
     std::fs::create_dir_all(&data_path)?;
 
+    // Recover the same canonical mutation journal as desktop before stdio is served.
+    let twin_event_store = Arc::new(TwinEventStore::new(&data_path));
+    twin_event_store.initialize()?;
+    let mutation_coordinator = Arc::new(MutationCoordinator::new(
+        &data_path,
+        &vault_path,
+        twin_event_store,
+        Arc::new(NoopMutationLifecycle),
+    )?);
+    mutation_coordinator.recover_pending()?;
+
     // Initialize services
-    let knowledge_store = KnowledgeStore::new(vault_path, data_path.clone());
+    let knowledge_store =
+        KnowledgeStore::with_event_recorder(vault_path, data_path.clone(), mutation_coordinator);
 
     // Try full SearchService first; fall back to read-only if writer lock is held
     let search_service = match SearchService::new(data_path.clone()) {
