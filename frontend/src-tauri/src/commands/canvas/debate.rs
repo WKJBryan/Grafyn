@@ -37,6 +37,7 @@ pub async fn start_debate(
 
     // Collect source content from tiles
     let mut store = state.canvas_store.write().await;
+    store.reload_authoritative_state();
     let session = store.get_session(&session_id).map_err(|e| e.to_string())?;
     drop(store);
 
@@ -117,7 +118,7 @@ pub async fn start_debate(
             .map_err(|e| e.to_string())?;
     }
 
-    let root_epoch = append_canvas_trace_expecting_authority(
+    let root_epoch = match append_canvas_trace_expecting_authority(
         state.twin_store.clone(),
         &session_id,
         TraceEventType::DebateStarted,
@@ -130,12 +131,45 @@ pub async fn start_debate(
         }),
         input_root_epoch,
     )
-    .await?;
-    let root_epoch = crate::commands::rebuild_and_publish_current_authority(
+    .await
+    {
+        Ok(epoch) => epoch,
+        Err(error) => {
+            drop(root_ticket);
+            log::error!("Canvas debate was saved, but its audit trace failed: {error}");
+            let _ = window.emit(
+                "canvas-stream",
+                CanvasStreamEvent::DebateCreated {
+                    session_id,
+                    debate,
+                },
+            );
+            return Ok(debate_id);
+        }
+    };
+    let root_epoch = match crate::commands::repair_after_authority_token(
         state.inner(),
         &root_epoch,
+        "Canvas debate start",
     )
-    .await?;
+    .await
+    {
+        crate::commands::PostAuthorityRepair::Ready(epoch) => epoch,
+        crate::commands::PostAuthorityRepair::Unavailable(_) => {
+            drop(root_ticket);
+            let _ = window.emit(
+                "canvas-stream",
+                CanvasStreamEvent::DebateCreated {
+                    session_id,
+                    debate,
+                },
+            );
+            return Ok(debate_id);
+        }
+        crate::commands::PostAuthorityRepair::NotRequired => {
+            return Err("Canvas debate trace did not mutate content authority".into());
+        }
+    };
     drop(root_ticket);
 
     // Emit debate created
@@ -491,13 +525,15 @@ pub async fn start_debate(
             .authority_token
             .unwrap_or_else(|| root_epoch.clone());
         drop(root_guard);
-        if let Err(error) = crate::commands::rebuild_and_publish_current_authority(
-            &stream_root_state,
-            &root_epoch,
-        )
-        .await
-        {
-            log::error!("Failed to publish completed-debate authority: {error}");
+        if !matches!(
+            crate::commands::repair_after_authority_token(
+                &stream_root_state,
+                &root_epoch,
+                "Canvas debate",
+            )
+            .await,
+            crate::commands::PostAuthorityRepair::Ready(_)
+        ) {
             return;
         }
         let _ = window.emit(
@@ -524,6 +560,7 @@ pub async fn continue_debate(
     let root_ticket = crate::commands::acquire_derived_root_epoch(state.inner()).await?;
     let input_root_epoch = root_ticket.authority().clone();
     let mut store = state.canvas_store.write().await;
+    store.reload_authoritative_state();
     let session = store.get_session(&session_id).map_err(|e| e.to_string())?;
     drop(store);
 
@@ -567,11 +604,19 @@ pub async fn continue_debate(
         input_root_epoch,
     )
     .await?;
-    let root_epoch = crate::commands::rebuild_and_publish_current_authority(
+    let root_epoch = match crate::commands::repair_after_authority_token(
         state.inner(),
         &root_epoch,
+        "Canvas debate continue",
     )
-    .await?;
+    .await
+    {
+        crate::commands::PostAuthorityRepair::Ready(epoch) => epoch,
+        crate::commands::PostAuthorityRepair::Unavailable(_) => return Ok(()),
+        crate::commands::PostAuthorityRepair::NotRequired => {
+            return Err("Canvas debate trace did not mutate content authority".into());
+        }
+    };
     drop(root_ticket);
 
     let openrouter_arc = state.openrouter.clone();
@@ -851,13 +896,15 @@ pub async fn continue_debate(
             .authority_token
             .unwrap_or_else(|| root_epoch.clone());
         drop(root_guard);
-        if let Err(error) = crate::commands::rebuild_and_publish_current_authority(
-            &stream_root_state,
-            &root_epoch,
-        )
-        .await
-        {
-            log::error!("Failed to publish continued-debate authority: {error}");
+        if !matches!(
+            crate::commands::repair_after_authority_token(
+                &stream_root_state,
+                &root_epoch,
+                "Canvas debate continuation",
+            )
+            .await,
+            crate::commands::PostAuthorityRepair::Ready(_)
+        ) {
             return;
         }
         let _ = window.emit(

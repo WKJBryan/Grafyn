@@ -322,8 +322,8 @@ mod root_epoch_source_guards {
         let settings = include_str!("settings.rs");
         let ollama = function_body(
             settings,
-            "pub async fn get_ollama_status",
-            "#[tauri::command]\npub async fn list_ollama_models",
+            "async fn capture_ollama_request_authority",
+            "async fn finish_ollama_request_authority",
         );
         let gate = ollama
             .find("acquire_root_epoch")
@@ -351,7 +351,9 @@ mod root_epoch_source_guards {
                 body.contains("acquire_root_epoch")
                     || body.contains("acquire_derived_root_epoch")
                     || body.contains("acquire_expected_root_epoch")
-                    || body.contains("acquire_expected_derived_root_epoch"),
+                    || body.contains("acquire_expected_derived_root_epoch")
+                    || body.contains("run_twin_mutation")
+                    || body.contains("persist_canvas_mutation"),
                 "root-dependent {family} command {name} must acquire the transition gate"
             );
         }
@@ -509,6 +511,126 @@ mod root_epoch_source_guards {
             "sealed prediction must start from the visible-response publication token"
         );
     }
+
+    #[test]
+    fn every_rebuild_captures_then_reloads_authoritative_inputs_before_publication() {
+        let runtime = include_str!("../lib.rs");
+        let warm_start = function_body(
+            runtime,
+            "async fn warm_start_services_inner",
+            "async fn acquire_warm_start_root_gate",
+        );
+        let normalize = warm_start.find("sync_topic_hubs(state)").unwrap();
+        let capture = warm_start.find("capture_authority_token").unwrap();
+        let knowledge = warm_start.find("reload_authoritative_state").unwrap();
+        let twin = warm_start.find("rebuild_mutation_caches").unwrap();
+        let derive = warm_start.find("graph.build_from_notes").unwrap();
+        let publish = warm_start.find("publish_namespace_ready").unwrap();
+        assert!(normalize < capture && capture < knowledge && knowledge < twin);
+        assert!(twin < derive && derive < publish);
+
+        let commands = include_str!("mod.rs");
+        let repair_start = commands
+            .rfind("pub(crate) async fn rebuild_and_publish_current_authority")
+            .unwrap();
+        let repair = &commands[repair_start..];
+        let repair = &repair[..repair.find("#[derive(Debug)]").unwrap()];
+        let normalize = repair.find("sync_topic_hubs(state)").unwrap();
+        let capture = repair.find("current_authority_token").unwrap();
+        let knowledge = repair.find("reload_authoritative_state").unwrap();
+        let twin = repair.find("rebuild_mutation_caches").unwrap();
+        let derive = repair.find("search.reindex_all").unwrap();
+        let publish = repair.find("publish_namespace_ready").unwrap();
+        assert!(normalize < capture && capture < knowledge && knowledge < twin);
+        assert!(twin < derive && derive < publish);
+
+        let settings = include_str!("settings.rs");
+        for capture in settings.match_indices("capture_authority_token") {
+            let rest = &settings[capture.0..];
+            let derive = rest
+                .find("rebuild_indexes_from_notes")
+                .expect("root transition capture must be followed by a rebuild");
+            let before_derive = &rest[..derive];
+            assert!(before_derive.contains("reload_authoritative_state"));
+            assert!(before_derive.contains("rebuild_mutation_caches"));
+        }
+    }
+
+    #[test]
+    fn authoritative_mutation_families_use_the_central_post_commit_repair_seam() {
+        for (family, source) in [
+            ("notes", include_str!("notes.rs")),
+            ("imports", include_str!("import.rs")),
+            ("zettelkasten", include_str!("zettelkasten.rs")),
+            ("distill", include_str!("distill.rs")),
+            ("Twin", include_str!("twin.rs")),
+            ("Canvas sessions", include_str!("canvas/session.rs")),
+            ("Canvas streaming", include_str!("canvas/streaming.rs")),
+            ("Canvas debate", include_str!("canvas/debate.rs")),
+            ("migration", include_str!("migration.rs")),
+            ("optimizer worker", include_str!("../lib.rs")),
+        ] {
+            assert!(
+                source.contains("repair_after_authority_"),
+                "{family} must route committed authority through the central repair seam"
+            );
+            assert!(
+                !source.contains("commit_note_writes("),
+                "{family} must not end at the legacy partial note-index refresh"
+            );
+        }
+    }
+
+    #[test]
+    fn canvas_inputs_and_ollama_network_results_are_exact_authority_fenced() {
+        let sessions = include_str!("canvas/session.rs");
+        for name in ["list_sessions", "get_session"] {
+            let body = tauri_command_body(sessions, name);
+            assert!(body.contains("reload_authoritative_state"));
+            assert!(body.contains(".finish(state.inner()).await?"));
+        }
+
+        let streaming = include_str!("canvas/streaming.rs");
+        assert!(streaming.matches("reload_authoritative_state").count() >= 3);
+        assert!(streaming.matches("root_ticket.validate").count() >= 3);
+        let twin = include_str!("twin.rs");
+        for name in ["update_decision_outcome", "record_canvas_feedback"] {
+            let body = tauri_command_body(twin, name);
+            assert!(body.contains("reload_authoritative_state"));
+            assert!(body.contains("root_ticket.validate"));
+        }
+
+        let settings = include_str!("settings.rs");
+        for name in ["get_ollama_status", "list_ollama_models"] {
+            let body = tauri_command_body(settings, name);
+            assert!(body.contains("capture_ollama_request_authority"));
+            assert!(body.contains("finish_ollama_request_authority"));
+        }
+    }
+
+    #[test]
+    fn every_prediction_abandonment_uses_idempotent_same_root_terminalization() {
+        let context = include_str!("canvas/context.rs");
+        let terminality = include_str!("canvas/prediction_terminality.rs");
+        let streaming = include_str!("canvas/streaming.rs");
+        assert!(terminality.contains("is_same_prediction_root"));
+        assert!(
+            context
+                .matches("fail_requested_prediction_if_same_root")
+                .count()
+                >= 7
+        );
+        assert!(
+            streaming
+                .matches("fail_requested_prediction_if_same_root")
+                .count()
+                >= 8
+        );
+        assert!(streaming.contains("visible response channel closed"));
+        assert!(streaming.contains("visible response authority repair"));
+        assert!(context.contains("post-network authority validation"));
+        assert!(context.contains("provider failure"));
+    }
 }
 
 /// Shared retrieval helper — acquires the 4 retrieval-pipeline read locks, calls
@@ -569,9 +691,21 @@ pub(crate) async fn rebuild_link_discovery(
     let token = coordinator
         .current_authority_token()
         .map_err(|error| error.to_string())?;
+    rebuild_link_discovery_at(state, notes, &token).await
+}
+
+async fn rebuild_link_discovery_at(
+    state: &AppState,
+    notes: &[Note],
+    token: &crate::services::vault_namespace::VaultAuthorityTokenV1,
+) -> Result<(), String> {
+    let coordinator = state
+        .mutation_coordinator
+        .as_ref()
+        .ok_or_else(|| "mutation coordinator is unavailable".to_string())?;
     let mut discovery = state.link_discovery.write().await;
     coordinator
-        .with_locked_derived_state(&token, false, || {
+        .with_locked_derived_state(token, false, || {
             discovery.reload_from_disk_checked().map_err(|error| {
                 crate::services::twin_events::MutationError::Invalid(error.to_string())
             })?;
@@ -739,9 +873,29 @@ pub(crate) async fn rebuild_and_publish_current_authority(
     // Topic-hub normalization is authoritative. Run it before capturing the
     // generation used by the rebuild, then fence every derived publication by
     // the exact post-normalization token.
-    let notes = sync_topic_hubs(state).await?;
+    sync_topic_hubs(state).await?;
     let token = coordinator
         .current_authority_token()
+        .map_err(|error| error.to_string())?;
+
+    // The normalization above may have raced a peer writer after reading its
+    // input. Reload every authoritative source only after the exact rebuild
+    // token is captured, then reject any peer change before publishing.
+    let notes = {
+        let mut knowledge = state.knowledge_store.write().await;
+        knowledge.reload_authoritative_state();
+        knowledge
+            .list_full_notes()
+            .map_err(|error| error.to_string())?
+    };
+    state
+        .twin_store
+        .write()
+        .await
+        .rebuild_mutation_caches()
+        .map_err(|error| error.to_string())?;
+    coordinator
+        .validate_authority_token(&token, false)
         .map_err(|error| error.to_string())?;
 
     {
@@ -758,14 +912,8 @@ pub(crate) async fn rebuild_and_publish_current_authority(
         let mut graph = state.graph_index.write().await;
         graph.build_from_notes(&notes);
     }
-    rebuild_link_discovery(state, &notes).await?;
+    rebuild_link_discovery_at(state, &notes, &token).await?;
     bootstrap_vault_optimizer(state, &notes).await?;
-    state
-        .twin_store
-        .write()
-        .await
-        .rebuild_mutation_caches()
-        .map_err(|error| error.to_string())?;
 
     let guard = coordinator
         .begin_root_transition()
@@ -776,6 +924,46 @@ pub(crate) async fn rebuild_and_publish_current_authority(
     drop(guard);
     *state.loaded_authority.write().await = Some(token.clone());
     Ok(token)
+}
+
+#[derive(Debug)]
+pub(crate) enum PostAuthorityRepair {
+    NotRequired,
+    Ready(crate::services::vault_namespace::VaultAuthorityTokenV1),
+    Unavailable(String),
+}
+
+/// Repairs every desktop derived reader after a durable authority mutation.
+/// The mutation is already committed, so repair failure is surfaced as a
+/// warning and leaves readiness unavailable instead of inviting a duplicate
+/// retry of the authoritative write.
+pub(crate) async fn repair_after_authority_token(
+    state: &AppState,
+    expected: &crate::services::vault_namespace::VaultAuthorityTokenV1,
+    operation: &str,
+) -> PostAuthorityRepair {
+    match rebuild_and_publish_current_authority(state, expected).await {
+        Ok(token) => PostAuthorityRepair::Ready(token),
+        Err(error) => {
+            *state.loaded_authority.write().await = None;
+            let warning = format!(
+                "{operation} was committed, but derived state is unavailable until rebuild: {error}"
+            );
+            log::error!("{warning}");
+            PostAuthorityRepair::Unavailable(warning)
+        }
+    }
+}
+
+pub(crate) async fn repair_after_authority_mutation(
+    state: &AppState,
+    commit: &crate::services::twin_events::MutationCommit,
+    operation: &str,
+) -> PostAuthorityRepair {
+    let Some(expected) = commit.authority_token.as_ref() else {
+        return PostAuthorityRepair::NotRequired;
+    };
+    repair_after_authority_token(state, expected, operation).await
 }
 
 /// Single chokepoint for "a note was just created or edited on disk and needs to
@@ -810,6 +998,7 @@ pub(crate) async fn rebuild_and_publish_current_authority(
 /// stale index (which self-heals on the next `rebuild_all_indexes`).
 /// `sync_topic_hubs` failures do propagate, matching the pre-existing behavior
 /// of `notes::create_note` / `notes::update_note` / the zettelkasten commands.
+#[cfg(test)]
 pub(crate) async fn commit_note_write(
     state: &AppState,
     note_id: &str,
@@ -827,6 +1016,7 @@ pub(crate) async fn commit_note_write(
 /// `sync_topic_hubs` always runs, even if `note_ids` is empty — callers such
 /// as `distill_note` rely on getting the full post-sync note list back
 /// regardless of whether this particular call touched any notes.
+#[cfg(test)]
 pub(crate) async fn commit_note_writes(
     state: &AppState,
     note_ids: &[String],
@@ -958,6 +1148,7 @@ pub(crate) async fn commit_note_writes(
 /// already durably written — a stale index self-heals on the next
 /// `rebuild_all_indexes`. `sync_topic_hubs` failures DO propagate, matching
 /// `commit_note_writes`.
+#[cfg(test)]
 pub(crate) async fn commit_note_index_refresh(
     state: &AppState,
     note_id: &str,
@@ -1027,6 +1218,7 @@ pub(crate) async fn commit_note_index_refresh(
 /// failures are logged and swallowed (the note is already gone from the
 /// vault; a stale index self-heals on the next `rebuild_all_indexes`),
 /// while `sync_topic_hubs` failures propagate.
+#[cfg(test)]
 pub(crate) async fn commit_note_delete(
     state: &AppState,
     note_id: &str,
@@ -1190,6 +1382,64 @@ pub(crate) mod commit_note_write_tests {
             "expected newly created note to be search-indexed immediately, found: {:?}",
             results.iter().map(|r| &r.note.id).collect::<Vec<_>>()
         );
+    }
+
+    #[tokio::test]
+    async fn note_delete_repairs_readiness_from_its_exact_commit_token() {
+        let (state, vault_dir, _data_dir) = build_test_state();
+        let coordinator = state.mutation_coordinator.as_ref().unwrap().clone();
+        let namespace = coordinator.current_namespace_path().unwrap();
+        *state.knowledge_store.write().await = KnowledgeStore::with_event_recorder(
+            vault_dir.path().to_path_buf(),
+            namespace,
+            coordinator.clone(),
+        );
+        let create = NoteCreate {
+            title: "Delete repair sentinel".into(),
+            content: "repair-delete-marker".into(),
+            relative_path: None,
+            aliases: Vec::new(),
+            status: NoteStatus::Draft,
+            tags: Vec::new(),
+            schema_version: crate::models::note::CURRENT_NOTE_SCHEMA_VERSION,
+            migration_source: None,
+            optimizer_managed: false,
+            properties: Default::default(),
+        };
+        let (created, create_commit) = {
+            let expected = coordinator.current_authority_token().unwrap();
+            state
+                .knowledge_store
+                .write()
+                .await
+                .create_note_expecting_authority(create, "note_editor", expected)
+                .unwrap()
+        };
+        assert!(matches!(
+            repair_after_authority_mutation(&state, &create_commit, "note create").await,
+            PostAuthorityRepair::Ready(_)
+        ));
+        let delete_commit = {
+            let expected = coordinator.current_authority_token().unwrap();
+            state
+                .knowledge_store
+                .write()
+                .await
+                .delete_note_expecting_authority(&created.id, "note_editor", expected)
+                .unwrap()
+        };
+
+        assert!(matches!(
+            repair_after_authority_mutation(&state, &delete_commit, "note delete").await,
+            PostAuthorityRepair::Ready(_)
+        ));
+        coordinator.require_namespace_ready().unwrap();
+        assert!(state
+            .knowledge_store
+            .read()
+            .await
+            .get_note(&created.id)
+            .is_err());
     }
 
     #[tokio::test]

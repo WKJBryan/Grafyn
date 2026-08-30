@@ -548,13 +548,11 @@ impl TwinStore {
                     Vec::new(),
                 )))
             };
-            if let Err(error) = recorder.commit_planned_mutation(
+            let result = recorder.commit_planned_mutation(
                 crate::services::twin_events::MutationOrigin::Local,
                 &mut planner,
-            ) {
-                self.invalidate_mutation_caches();
-                return Err(anyhow::Error::new(error));
-            }
+            );
+            self.finish_mutation_commit(result)?;
             let config = committed.ok_or_else(|| anyhow::anyhow!("config update was not planned"))?;
             self.invalidate_mutation_caches();
             return Ok(config);
@@ -599,13 +597,11 @@ impl TwinStore {
                     drafts,
                 )))
             };
-            if let Err(error) = recorder.commit_planned_mutation(
+            let result = recorder.commit_planned_mutation(
                 crate::services::twin_events::MutationOrigin::Local,
                 &mut planner,
-            ) {
-                self.invalidate_mutation_caches();
-                return Err(anyhow::Error::new(error));
-            }
+            );
+            self.finish_mutation_commit(result)?;
             let (episode, trace) = committed
                 .ok_or_else(|| anyhow::anyhow!("decision episode was not planned"))?;
             self.cache_committed_trace(trace);
@@ -843,13 +839,11 @@ impl TwinStore {
                     drafts,
                 )))
             };
-            if let Err(error) = recorder.commit_planned_mutation(
+            let result = recorder.commit_planned_mutation(
                 crate::services::twin_events::MutationOrigin::Local,
                 &mut planner,
-            ) {
-                self.invalidate_mutation_caches();
-                return Err(anyhow::Error::new(error));
-            }
+            );
+            self.finish_mutation_commit(result)?;
             let (episode, trace) = committed
                 .ok_or_else(|| anyhow::anyhow!("decision outcome was not planned"))?;
             if let Some(trace) = trace {
@@ -1150,16 +1144,11 @@ impl TwinStore {
                 }
                 Ok(Some(plan))
             };
-            let commit = match recorder.commit_planned_mutation(
+            let result = recorder.commit_planned_mutation(
                 crate::services::twin_events::MutationOrigin::Local,
                 &mut planner,
-            ) {
-                Ok(commit) => commit,
-                Err(error) => {
-                    self.invalidate_mutation_caches();
-                    return Err(anyhow::Error::new(error));
-                }
-            };
+            );
+            let commit = self.finish_mutation_commit(result)?;
             let (episode, trace) = committed
                 .ok_or_else(|| anyhow::anyhow!("Twin prediction was not planned"))?;
             if let Some(trace) = trace {
@@ -1282,7 +1271,10 @@ impl TwinStore {
                 let mut episode = self.read_decision_file(&path).map_err(|error| {
                     crate::services::twin_events::MutationError::Invalid(error.to_string())
                 })?;
-                if episode.twin_prediction.is_some() || episode.chosen_option.is_some() {
+                if episode.twin_prediction.is_some()
+                    || episode.chosen_option.is_some()
+                    || episode.prediction_status.as_deref() != Some("requested")
+                {
                     return Ok(None);
                 }
                 episode.prediction_status = Some("failed".to_string());
@@ -1307,22 +1299,20 @@ impl TwinStore {
                 }
                 Ok(Some(plan))
             };
-            let commit = match recorder.commit_planned_mutation(
+            let result = recorder.commit_planned_mutation(
                 crate::services::twin_events::MutationOrigin::Local,
                 &mut planner,
-            ) {
-                Ok(commit) => commit,
-                Err(error) => {
-                    self.invalidate_mutation_caches();
-                    return Err(anyhow::Error::new(error));
-                }
-            };
+            );
+            let commit = self.finish_mutation_commit(result)?;
             self.invalidate_mutation_caches();
             return Ok(commit);
         }
         let path = self.decision_file_path(episode_id);
         let mut episode = self.read_decision_file(&path)?;
-        if episode.twin_prediction.is_some() || episode.chosen_option.is_some() {
+        if episode.twin_prediction.is_some()
+            || episode.chosen_option.is_some()
+            || episode.prediction_status.as_deref() != Some("requested")
+        {
             return Ok(crate::services::twin_events::MutationCommit {
                 mutation_id: None,
                 events: Vec::new(),
@@ -1449,16 +1439,11 @@ impl TwinStore {
                 }
                 Ok(Some(plan))
             };
-            let commit = match recorder.commit_planned_mutation(
+            let result = recorder.commit_planned_mutation(
                 crate::services::twin_events::MutationOrigin::Local,
                 &mut planner,
-            ) {
-                Ok(commit) => commit,
-                Err(error) => {
-                    self.invalidate_mutation_caches();
-                    return Err(anyhow::Error::new(error));
-                }
-            };
+            );
+            let commit = self.finish_mutation_commit(result)?;
             let (card, trace) = committed
                 .ok_or_else(|| anyhow::anyhow!("reflection card was not planned"))?;
             self.cache_committed_trace(trace);

@@ -62,6 +62,8 @@ pub struct TwinStore {
     record_cache: HashMap<String, UserRecord>,
     records_cache_ready: bool,
     event_recorder: Arc<dyn crate::services::twin_events::EventRecorder>,
+    last_mutation_commit:
+        std::sync::Mutex<Option<crate::services::twin_events::MutationCommit>>,
     root_capability: Option<crate::services::twin_events::AnchoredRoot>,
     data_capability: Option<crate::services::twin_events::AnchoredRoot>,
 }
@@ -121,6 +123,7 @@ impl TwinStore {
             record_cache: HashMap::new(),
             records_cache_ready: false,
             event_recorder,
+            last_mutation_commit: std::sync::Mutex::new(None),
             root_capability,
             data_capability,
         }
@@ -280,6 +283,49 @@ impl TwinStore {
         Ok(())
     }
 
+    fn remember_mutation_commit(
+        &self,
+        commit: &crate::services::twin_events::MutationCommit,
+    ) {
+        if let Ok(mut slot) = self.last_mutation_commit.lock() {
+            *slot = Some(commit.clone());
+        }
+    }
+
+    fn finish_mutation_commit(
+        &mut self,
+        result: Result<
+            crate::services::twin_events::MutationCommit,
+            crate::services::twin_events::MutationError,
+        >,
+    ) -> Result<crate::services::twin_events::MutationCommit> {
+        match result {
+            Ok(commit) => {
+                self.remember_mutation_commit(&commit);
+                Ok(commit)
+            }
+            Err(error) => {
+                self.invalidate_mutation_caches();
+                Err(anyhow::Error::new(error))
+            }
+        }
+    }
+
+    pub(crate) fn clear_last_mutation_commit(&self) {
+        if let Ok(mut slot) = self.last_mutation_commit.lock() {
+            *slot = None;
+        }
+    }
+
+    pub(crate) fn take_last_mutation_commit(
+        &self,
+    ) -> Option<crate::services::twin_events::MutationCommit> {
+        self.last_mutation_commit
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take())
+    }
+
     fn commit_planned_twin_mutation<F>(
         &mut self,
         mut planner: F,
@@ -299,16 +345,9 @@ impl TwinStore {
                 &mut adapter,
             )
         };
-        match result {
-            Ok(commit) => {
-                self.invalidate_mutation_caches();
-                Ok(commit)
-            }
-            Err(error) => {
-                self.invalidate_mutation_caches();
-                Err(anyhow::Error::new(error))
-            }
-        }
+        let commit = self.finish_mutation_commit(result)?;
+        self.invalidate_mutation_caches();
+        Ok(commit)
     }
 
     fn write_governed_json<T: Serialize>(
@@ -338,7 +377,8 @@ impl TwinStore {
             .map_err(|_| anyhow::anyhow!("Twin mutation target escaped the configured Twin root"))?
             .to_string_lossy()
             .replace('\\', "/");
-        self.event_recorder
+        let commit = self
+            .event_recorder
             .commit_mutation(
                 crate::services::twin_events::MutationOrigin::Local,
                 crate::models::twin_event::CausalStream::SyncEligible,
@@ -351,6 +391,7 @@ impl TwinStore {
                 drafts,
             )
             .map_err(anyhow::Error::new)?;
+        self.remember_mutation_commit(&commit);
         Ok(())
     }
 
@@ -383,7 +424,8 @@ impl TwinStore {
             return Ok(());
         }
         let targets = self.governed_json_targets(values)?;
-        self.event_recorder
+        let commit = self
+            .event_recorder
             .commit_mutation(
                 crate::services::twin_events::MutationOrigin::Local,
                 crate::models::twin_event::CausalStream::SyncEligible,
@@ -392,6 +434,7 @@ impl TwinStore {
                 drafts,
             )
             .map_err(anyhow::Error::new)?;
+        self.remember_mutation_commit(&commit);
         Ok(())
     }
 

@@ -1,4 +1,7 @@
-use super::context::{resolve_prompt_context, run_sealed_twin_prediction, TWIN_CONTEXT_VERSION};
+use super::context::{
+    fail_requested_prediction_if_same_root, resolve_prompt_context, run_sealed_twin_prediction,
+    TWIN_CONTEXT_VERSION,
+};
 use super::shared::{
     append_canvas_trace_expecting_authority, effective_model_ids, is_vault_context_prompt,
     resolve_model_route, ModelProviderRoute,
@@ -76,6 +79,7 @@ pub async fn send_prompt(
     };
     let session = {
         let mut store = state.canvas_store.write().await;
+        store.reload_authoritative_state();
         store.get_session(&session_id).map_err(|e| e.to_string())?
     };
     let resolved_context = resolve_prompt_context(state.inner(), &session, &request).await?;
@@ -201,12 +205,12 @@ pub async fn send_prompt(
                 .1
         }
     };
-    let mut root_epoch = initial_commit.authority_token.ok_or_else(|| {
+    let mut root_epoch = initial_commit.authority_token.clone().ok_or_else(|| {
         "Canvas prompt mutation did not advance the content authority generation".to_string()
     })?;
 
     if decision_episode_id.is_none() {
-        root_epoch = append_canvas_trace_expecting_authority(
+        root_epoch = match append_canvas_trace_expecting_authority(
             state.twin_store.clone(),
             &session_id,
             TraceEventType::PromptSubmitted,
@@ -233,13 +237,84 @@ pub async fn send_prompt(
             }),
             root_epoch,
         )
-        .await?;
+        .await
+        {
+            Ok(epoch) => epoch,
+            Err(error) => {
+                crate::commands::repair_after_authority_mutation(
+                    state.inner(),
+                    &initial_commit,
+                    "Canvas prompt",
+                )
+                .await;
+                drop(root_ticket);
+                let _ = window.emit(
+                    "canvas-stream",
+                    CanvasStreamEvent::TileCreated {
+                        session_id: session_id.clone(),
+                        tile: tile.clone(),
+                    },
+                );
+                for model_id in &request.models {
+                    emit_canvas_error(
+                        &window,
+                        &session_id,
+                        &tile_id,
+                        model_id,
+                        &format!("Prompt saved, but its audit trace failed: {error}"),
+                    );
+                }
+                return Ok(tile_id);
+            }
+        };
     }
-    root_epoch = crate::commands::rebuild_and_publish_current_authority(
+    root_epoch = match crate::commands::repair_after_authority_token(
         state.inner(),
         &root_epoch,
+        "Canvas prompt",
     )
-    .await?;
+    .await
+    {
+        crate::commands::PostAuthorityRepair::Ready(epoch) => epoch,
+        crate::commands::PostAuthorityRepair::Unavailable(warning) => {
+            drop(root_ticket);
+            if let Some(episode_id) = decision_episode_id.as_deref() {
+                fail_requested_prediction_if_same_root(
+                    state.inner(),
+                    &state.twin_store,
+                    episode_id,
+                    &root_epoch,
+                    "initial Canvas repair",
+                )
+                .await;
+            }
+            let _ = window.emit(
+                "canvas-stream",
+                CanvasStreamEvent::TileCreated {
+                    session_id: session_id.clone(),
+                    tile: tile.clone(),
+                },
+            );
+            for model_id in &request.models {
+                emit_canvas_error(&window, &session_id, &tile_id, model_id, &warning);
+            }
+            return Ok(tile_id);
+        }
+        crate::commands::PostAuthorityRepair::NotRequired => {
+            drop(root_ticket);
+            if let Some(episode_id) = decision_episode_id.as_deref() {
+                fail_requested_prediction_if_same_root(
+                    state.inner(),
+                    &state.twin_store,
+                    episode_id,
+                    &root_epoch,
+                    "missing initial Canvas authority",
+                )
+                .await;
+            }
+            return Ok(tile_id);
+        }
+    };
     drop(root_ticket);
 
     // Emit TileCreated event
@@ -465,6 +540,16 @@ pub async fn send_prompt(
                     &model_ids,
                     &anyhow::anyhow!(error),
                 );
+                if let Some(episode_id) = decision_episode_id_for_reflection.as_deref() {
+                    fail_requested_prediction_if_same_root(
+                        &stream_root_state,
+                        &twin_store_arc,
+                        episode_id,
+                        &stream_root_epoch,
+                        "visible response authority validation",
+                    )
+                    .await;
+                }
                 return;
             }
         };
@@ -491,6 +576,18 @@ pub async fn send_prompt(
                         &model_ids,
                         &error,
                     );
+                    drop(store);
+                    drop(root_guard);
+                    if let Some(episode_id) = decision_episode_id_for_reflection.as_deref() {
+                        fail_requested_prediction_if_same_root(
+                            &stream_root_state,
+                            &twin_store_arc,
+                            episode_id,
+                            &stream_root_epoch,
+                            "visible response persistence",
+                        )
+                        .await;
+                    }
                     return;
                 }
             }
@@ -506,18 +603,28 @@ pub async fn send_prompt(
             &tile_id_clone,
             "send_prompt",
             &results,
-            publication_epoch,
+            publication_epoch.clone(),
         )
         .await
         {
             Ok(epoch) => epoch,
             Err(error) => {
                 log::error!("Failed to append governed Canvas result trace: {error}");
+                if let Some(episode_id) = decision_episode_id_for_reflection.as_deref() {
+                    fail_requested_prediction_if_same_root(
+                        &stream_root_state,
+                        &twin_store_arc,
+                        episode_id,
+                        &publication_epoch,
+                        "visible response trace",
+                    )
+                    .await;
+                }
                 return;
             }
         };
 
-        if let Some(decision_episode_id) = decision_episode_id_for_reflection {
+        if let Some(decision_episode_id) = decision_episode_id_for_reflection.as_deref() {
             let mut twin_store = twin_store_arc.write().await;
             for (model_id, content, status, _, _) in &results {
                 if *status != ResponseStatus::Completed || content.trim().is_empty() {
@@ -525,7 +632,7 @@ pub async fn send_prompt(
                 }
 
                 let (_, commit) = match twin_store.record_reflection_card_expecting_authority(ReflectionCardCreate {
-                    decision_episode_id: decision_episode_id.clone(),
+                    decision_episode_id: decision_episode_id.to_string(),
                     session_id: session_id_clone.clone(),
                     tile_id: tile_id_clone.clone(),
                     model_id: model_id.clone(),
@@ -539,6 +646,15 @@ pub async fn send_prompt(
                     Ok(committed) => committed,
                     Err(error) => {
                         log::error!("Failed to persist governed reflection card: {error}");
+                        drop(twin_store);
+                        fail_requested_prediction_if_same_root(
+                            &stream_root_state,
+                            &twin_store_arc,
+                            decision_episode_id,
+                            &publication_epoch,
+                            "visible response reflection",
+                        )
+                        .await;
                         return;
                     }
                 };
@@ -546,25 +662,68 @@ pub async fn send_prompt(
                     Some(epoch) => epoch,
                     None => {
                         log::error!("Reflection-card mutation did not advance authority");
+                        drop(twin_store);
+                        fail_requested_prediction_if_same_root(
+                            &stream_root_state,
+                            &twin_store_arc,
+                            decision_episode_id,
+                            &publication_epoch,
+                            "visible response reflection authority",
+                        )
+                        .await;
                         return;
                     }
                 };
             }
         }
 
-        let published_epoch = match crate::commands::rebuild_and_publish_current_authority(
+        let published_epoch = match crate::commands::repair_after_authority_token(
             &stream_root_state,
             &publication_epoch,
+            "Canvas response",
         )
         .await
         {
-            Ok(epoch) => epoch,
-            Err(error) => {
-                log::error!("Failed to publish Canvas response authority: {error}");
+            crate::commands::PostAuthorityRepair::Ready(epoch) => epoch,
+            crate::commands::PostAuthorityRepair::Unavailable(_) => {
+                if let Some(episode_id) = decision_episode_id_for_reflection.as_deref() {
+                    fail_requested_prediction_if_same_root(
+                        &stream_root_state,
+                        &twin_store_arc,
+                        episode_id,
+                        &publication_epoch,
+                        "visible response authority repair",
+                    )
+                    .await;
+                }
+                return;
+            }
+            crate::commands::PostAuthorityRepair::NotRequired => {
+                if let Some(episode_id) = decision_episode_id_for_reflection.as_deref() {
+                    fail_requested_prediction_if_same_root(
+                        &stream_root_state,
+                        &twin_store_arc,
+                        episode_id,
+                        &publication_epoch,
+                        "visible response missing authority",
+                    )
+                    .await;
+                }
                 return;
             }
         };
-        let _ = sealed_epoch_sender.send(published_epoch);
+        if let Err(returned_epoch) = sealed_epoch_sender.send(published_epoch) {
+            if let Some(episode_id) = decision_episode_id_for_reflection.as_deref() {
+                fail_requested_prediction_if_same_root(
+                    &stream_root_state,
+                    &twin_store_arc,
+                    episode_id,
+                    &returned_epoch,
+                    "sealed prediction channel loss",
+                )
+                .await;
+            }
+        }
 
         // Emit session saved after all models complete — but only if the
         // batch persist above actually succeeded. If it failed, per-model
@@ -611,9 +770,21 @@ pub async fn send_prompt(
             let prediction_stakes = metadata.stakes.clone();
             let prediction_context = resolved_context.twin_context_prompt.clone();
             let prediction_metadata = tile.decision_metadata.clone();
+            let prediction_request_root = root_epoch.clone();
             tauri::async_runtime::spawn(async move {
-                let Ok(root_epoch) = sealed_epoch_receiver.await else {
-                    return;
+                let root_epoch = match sealed_epoch_receiver.await {
+                    Ok(root_epoch) => root_epoch,
+                    Err(_) => {
+                        fail_requested_prediction_if_same_root(
+                            &prediction_state,
+                            &prediction_store,
+                            &episode_id,
+                            &prediction_request_root,
+                            "visible response channel closed",
+                        )
+                        .await;
+                        return;
+                    }
                 };
                 run_sealed_twin_prediction(
                     prediction_state,
@@ -653,6 +824,7 @@ pub async fn add_models_to_tile(
     let root_epoch = root_ticket.authority().clone();
     // Get the tile's prompt
     let mut store = state.canvas_store.write().await;
+    store.reload_authoritative_state();
     let session = store.get_session(&session_id).map_err(|e| e.to_string())?;
     drop(store);
 
@@ -973,13 +1145,15 @@ pub async fn add_models_to_tile(
             }
         };
 
-        if let Err(error) = crate::commands::rebuild_and_publish_current_authority(
-            &stream_root_state,
-            &publication_epoch,
-        )
-        .await
-        {
-            log::error!("Failed to publish added-model authority: {error}");
+        if !matches!(
+            crate::commands::repair_after_authority_token(
+                &stream_root_state,
+                &publication_epoch,
+                "Canvas models added",
+            )
+            .await,
+            crate::commands::PostAuthorityRepair::Ready(_)
+        ) {
             return;
         }
         let _ = window.emit(
@@ -1004,6 +1178,7 @@ pub async fn regenerate_response(
     let root_epoch = root_ticket.authority().clone();
     // Get the tile's prompt
     let mut store = state.canvas_store.write().await;
+    store.reload_authoritative_state();
     let session = store.get_session(&session_id).map_err(|e| e.to_string())?;
     drop(store);
 
@@ -1230,13 +1405,15 @@ pub async fn regenerate_response(
                 return;
             }
         };
-        if let Err(error) = crate::commands::rebuild_and_publish_current_authority(
+        if !matches!(
+            crate::commands::repair_after_authority_token(
             &stream_root_state,
             &publication_epoch,
+            "Canvas response regeneration",
         )
-        .await
-        {
-            log::error!("Failed to publish regenerated-response authority: {error}");
+        .await,
+            crate::commands::PostAuthorityRepair::Ready(_)
+        ) {
             return;
         }
         let _ = window.emit(

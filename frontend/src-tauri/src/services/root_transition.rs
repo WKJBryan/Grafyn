@@ -24,11 +24,15 @@ const VERSIONED_KEY_PREFIX: &str = "openrouter_api_key/";
 const LEGACY_MIGRATION_KEY_VERSION: &str = "00000000-0000-4000-8000-000000000001";
 
 #[cfg(feature = "mcp")]
-pub(crate) fn reject_custom_transition_wal(data_path: &Path) -> Result<(), MutationError> {
-    if !data_path.exists() {
-        return Ok(());
+pub(crate) fn reject_custom_transition_wal_locked(
+    data_path: &Path,
+    process_lock: &crate::services::twin_events::CoordinatorProcessLock,
+) -> Result<(), MutationError> {
+    if !process_lock.covers_data_path(data_path)? {
+        return Err(MutationError::Invalid(
+            "custom MCP transition check lock belongs to another data root".into(),
+        ));
     }
-    crate::services::twin_events::validate_real_directory(data_path, "custom MCP data root")?;
     let root = AnchoredRoot::open(data_path)?;
     if root
         .read_bounded(ROOT_TRANSITION_KEY, ROOT_TRANSITION_LIMIT)?

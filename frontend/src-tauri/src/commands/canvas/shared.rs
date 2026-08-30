@@ -118,8 +118,9 @@ pub(super) async fn append_canvas_trace(
     session_id: &str,
     event_type: TraceEventType,
     payload: serde_json::Value,
-) {
+) -> Option<crate::services::twin_events::MutationCommit> {
     let mut twin_store = twin_store_arc.write().await;
+    twin_store.clear_last_mutation_commit();
     if let Err(error) = twin_store.append_trace_event(session_id, event_type, payload) {
         log::error!(
             "Failed to append twin trace for session '{}': {}",
@@ -127,6 +128,7 @@ pub(super) async fn append_canvas_trace(
             error
         );
     }
+    twin_store.take_last_mutation_commit()
 }
 
 pub(super) async fn append_canvas_trace_expecting_authority(

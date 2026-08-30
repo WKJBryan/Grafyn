@@ -214,6 +214,10 @@ impl SearchService {
         Ok(())
     }
 
+    pub fn reload_reader(&self) -> Result<()> {
+        self.reader.reload().map_err(Into::into)
+    }
+
     /// Reindex all notes
     pub fn reindex_all(&mut self, notes: &[Note]) -> Result<()> {
         let writer = self.writer.as_mut().context("Writer not available")?;

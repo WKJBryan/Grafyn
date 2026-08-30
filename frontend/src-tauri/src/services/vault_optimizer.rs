@@ -345,34 +345,83 @@ impl VaultOptimizerService {
         change_id: &str,
         store: &mut KnowledgeStore,
     ) -> Result<VaultOptimizerRollbackResult> {
+        self.rollback_change_internal(change_id, store, None)
+    }
+
+    pub(crate) fn rollback_change_expecting_authority(
+        &mut self,
+        change_id: &str,
+        store: &mut KnowledgeStore,
+        expected: crate::services::vault_namespace::VaultAuthorityTokenV1,
+    ) -> Result<VaultOptimizerRollbackResult> {
+        self.rollback_change_internal(change_id, store, Some(expected))
+    }
+
+    fn rollback_change_internal(
+        &mut self,
+        change_id: &str,
+        store: &mut KnowledgeStore,
+        expected: Option<crate::services::vault_namespace::VaultAuthorityTokenV1>,
+    ) -> Result<VaultOptimizerRollbackResult> {
         let path = self.changes_dir.join(format!("{}.json", change_id));
         let data = std::fs::read_to_string(&path)
             .with_context(|| format!("Optimizer change '{}' not found", change_id))?;
         let change: OptimizerChange = serde_json::from_str(&data)?;
 
-        if let Some(overlay_before) = change.overlay_before {
-            if overlay_before.is_null() {
-                store.delete_overlay(&change.note_id)?;
+        if change.mode == "sidecar_first" || change.overlay_after.is_some() {
+            if change
+                .overlay_before
+                .as_ref()
+                .is_none_or(serde_json::Value::is_null)
+            {
+                if let Some(expected) = expected.clone() {
+                    store.delete_overlay_from_source_expecting_authority(
+                        &change.note_id,
+                        "vault_optimizer",
+                        expected,
+                    )?;
+                } else {
+                    store.delete_overlay(&change.note_id)?;
+                }
             } else {
-                store.write_overlay(&change.note_id, &overlay_before)?;
+                let overlay_before = change
+                    .overlay_before
+                    .as_ref()
+                    .expect("non-null overlay was checked above");
+                if let Some(expected) = expected.clone() {
+                    store.write_overlay_from_source_expecting_authority(
+                        &change.note_id,
+                        overlay_before,
+                        "vault_optimizer",
+                        expected,
+                    )?;
+                } else {
+                    store.write_overlay(&change.note_id, overlay_before)?;
+                }
             }
         } else if let Some(note_before) = change.note_before {
-            store.update_note_from_source(
-                &change.note_id,
-                NoteUpdate {
-                    title: Some(note_before.title),
-                    content: Some(note_before.content),
-                    relative_path: Some(note_before.relative_path),
-                    aliases: Some(note_before.aliases),
-                    status: Some(note_before.status),
-                    tags: Some(note_before.tags),
-                    schema_version: Some(note_before.schema_version),
-                    migration_source: note_before.migration_source,
-                    optimizer_managed: Some(note_before.optimizer_managed),
-                    properties: Some(note_before.properties),
-                },
-                "vault_optimizer",
-            )?;
+            let update = NoteUpdate {
+                title: Some(note_before.title),
+                content: Some(note_before.content),
+                relative_path: Some(note_before.relative_path),
+                aliases: Some(note_before.aliases),
+                status: Some(note_before.status),
+                tags: Some(note_before.tags),
+                schema_version: Some(note_before.schema_version),
+                migration_source: note_before.migration_source,
+                optimizer_managed: Some(note_before.optimizer_managed),
+                properties: Some(note_before.properties),
+            };
+            if let Some(expected) = expected {
+                store.update_note_expecting_authority(
+                    &change.note_id,
+                    update,
+                    "vault_optimizer",
+                    expected,
+                )?;
+            } else {
+                store.update_note_from_source(&change.note_id, update, "vault_optimizer")?;
+            }
         }
 
         self.state.rollback_count += 1;
@@ -421,6 +470,24 @@ impl VaultOptimizerService {
         &mut self,
         store: &KnowledgeStore,
         settings: &UserSettings,
+    ) -> Result<OptimizerTick> {
+        self.prepare_next_internal(store, settings, None)
+    }
+
+    pub(crate) fn prepare_next_expecting_authority(
+        &mut self,
+        store: &KnowledgeStore,
+        settings: &UserSettings,
+        expected: crate::services::vault_namespace::VaultAuthorityTokenV1,
+    ) -> Result<OptimizerTick> {
+        self.prepare_next_internal(store, settings, Some(expected))
+    }
+
+    fn prepare_next_internal(
+        &mut self,
+        store: &KnowledgeStore,
+        settings: &UserSettings,
+        expected_authority: Option<crate::services::vault_namespace::VaultAuthorityTokenV1>,
     ) -> Result<OptimizerTick> {
         if !settings.background_vault_optimizer_enabled {
             return Ok(OptimizerTick::Idle);
@@ -517,7 +584,16 @@ impl VaultOptimizerService {
                     "optimizer_managed": false,
                     "properties": proposal.properties,
                 });
-                store.write_overlay(&note.id, &overlay_after)?;
+                if let Some(expected) = expected_authority.clone() {
+                    store.write_overlay_from_source_expecting_authority(
+                        &note.id,
+                        &overlay_after,
+                        "vault_optimizer",
+                        expected,
+                    )?;
+                } else {
+                    store.write_overlay(&note.id, &overlay_after)?;
+                }
                 Ok(OptimizerChange {
                     change_id: change_id.clone(),
                     note_id: note.id.clone(),
@@ -535,6 +611,9 @@ impl VaultOptimizerService {
                     Ok(OptimizerTick::Applied(note.id.clone()))
                 }
                 Err(error) => {
+                    if is_authority_conflict(&error) {
+                        return Err(error);
+                    }
                     self.defer_or_park_job(job, error)?;
                     Ok(OptimizerTick::Idle)
                 }
@@ -547,6 +626,7 @@ impl VaultOptimizerService {
             change_id,
             decision,
             edit_mode: settings.background_vault_optimizer_edit_mode.clone(),
+            expected_authority,
         })))
     }
 
@@ -586,6 +666,7 @@ impl VaultOptimizerService {
             change_id,
             decision,
             edit_mode,
+            expected_authority,
         } = pending;
 
         let current = match store.get_note(&job.note_id) {
@@ -614,9 +695,7 @@ impl VaultOptimizerService {
             return Ok(None);
         }
 
-        let write_result = store.update_note_from_source(
-            &current.id,
-            NoteUpdate {
+        let update = NoteUpdate {
                 title: None,
                 content: None,
                 // None preserves the note's CURRENT path — never reapply the
@@ -638,9 +717,18 @@ impl VaultOptimizerService {
                     current.properties.clone(),
                     proposal.properties.clone(),
                 )),
-            },
-            "vault_optimizer",
-        );
+            };
+        let write_result = match expected_authority {
+            Some(expected) => store
+                .update_note_expecting_authority(
+                    &current.id,
+                    update,
+                    "vault_optimizer",
+                    expected,
+                )
+                .map(|(note, _)| note),
+            None => store.update_note_from_source(&current.id, update, "vault_optimizer"),
+        };
 
         match write_result {
             Ok(updated) => {
@@ -660,6 +748,9 @@ impl VaultOptimizerService {
                 Ok(Some(current.id.clone()))
             }
             Err(error) => {
+                if is_authority_conflict(&error) {
+                    return Err(error);
+                }
                 self.defer_or_park_job(job, error)?;
                 Ok(None)
             }
@@ -884,6 +975,14 @@ impl VaultOptimizerService {
     }
 }
 
+fn is_authority_conflict(error: &anyhow::Error) -> bool {
+    matches!(
+        error.downcast_ref::<crate::services::twin_events::MutationError>(),
+        Some(crate::services::twin_events::MutationError::RecoveryConflict(message))
+            if message.contains("root authority changed")
+    )
+}
+
 /// Outcome of a single [`VaultOptimizerService::prepare_next`] tick.
 ///
 /// `prepare_next` handles every case that's resolvable under a read lock on
@@ -929,6 +1028,7 @@ pub struct PendingOptimizerWrite {
     change_id: String,
     decision: VaultOptimizerDecision,
     edit_mode: String,
+    expected_authority: Option<crate::services::vault_namespace::VaultAuthorityTokenV1>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1242,6 +1342,178 @@ mod tests {
             3,
             "sidecar overlays and capped no-ops must not emit beyond note creation"
         );
+    }
+
+    #[test]
+    fn stale_optimizer_source_aborts_before_overlay_and_queue_publication() {
+        let vault_dir = tempdir().unwrap();
+        let data_dir = tempdir().unwrap();
+        let events = std::sync::Arc::new(crate::services::twin_events::TwinEventStore::new(
+            data_dir.path(),
+        ));
+        events.initialize().unwrap();
+        let coordinator = std::sync::Arc::new(
+            crate::services::twin_events::MutationCoordinator::new(
+                data_dir.path(),
+                vault_dir.path(),
+                events,
+                std::sync::Arc::new(crate::services::twin_events::NoopMutationLifecycle),
+            )
+            .unwrap(),
+        );
+        let namespace = coordinator.current_namespace_path().unwrap();
+        let mut store = KnowledgeStore::with_event_recorder(
+            vault_dir.path().to_path_buf(),
+            namespace.clone(),
+            coordinator.clone(),
+        );
+        let note = store.create_note(make_note_create("Stale Topic")).unwrap();
+        let source = coordinator.current_authority_token().unwrap();
+        let mut service = VaultOptimizerService::new(namespace);
+        service.bootstrap(std::slice::from_ref(&note));
+        let queue_before = service.state.queue.clone();
+
+        store
+            .update_note(
+                &note.id,
+                NoteUpdate {
+                    tags: Some(vec!["peer".into()]),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_ne!(
+            coordinator.current_authority_token().unwrap(),
+            source,
+            "peer note update must advance the exact optimizer source authority"
+        );
+        let error = service
+            .prepare_next_expecting_authority(&store, &UserSettings::default(), source)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("authority"));
+        assert_eq!(service.state.queue, queue_before);
+        assert!(!store.overlay_path(&note.id).exists());
+        assert_eq!(service.state.accepted_count, 0);
+    }
+
+    #[test]
+    fn stale_rollback_source_aborts_before_overlay_and_rollback_state_publication() {
+        let vault_dir = tempdir().unwrap();
+        let data_dir = tempdir().unwrap();
+        let events = std::sync::Arc::new(crate::services::twin_events::TwinEventStore::new(
+            data_dir.path(),
+        ));
+        events.initialize().unwrap();
+        let coordinator = std::sync::Arc::new(
+            crate::services::twin_events::MutationCoordinator::new(
+                data_dir.path(),
+                vault_dir.path(),
+                events,
+                std::sync::Arc::new(crate::services::twin_events::NoopMutationLifecycle),
+            )
+            .unwrap(),
+        );
+        let namespace = coordinator.current_namespace_path().unwrap();
+        let mut store = KnowledgeStore::with_event_recorder(
+            vault_dir.path().to_path_buf(),
+            namespace.clone(),
+            coordinator.clone(),
+        );
+        let note = store.create_note(make_note_create("Rollback Source")).unwrap();
+        let old_overlay = serde_json::json!({"tags": ["before"]});
+        let overlay = serde_json::json!({"tags": ["optimizer"]});
+        store.write_overlay(&note.id, &old_overlay).unwrap();
+        store.write_overlay(&note.id, &overlay).unwrap();
+        let source = coordinator.current_authority_token().unwrap();
+        let mut service = VaultOptimizerService::new(namespace);
+        let change_id = "stale-rollback";
+        std::fs::write(
+            service.changes_dir.join(format!("{change_id}.json")),
+            serde_json::to_vec_pretty(&OptimizerChange {
+                change_id: change_id.to_string(),
+                note_id: note.id.clone(),
+                mode: "sidecar_first".to_string(),
+                overlay_before: Some(old_overlay),
+                overlay_after: Some(overlay.clone()),
+                note_before: None,
+                note_after: None,
+                created_at: Some(Utc::now()),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        store.create_note(make_note_create("Peer Change")).unwrap();
+        assert_ne!(coordinator.current_authority_token().unwrap(), source);
+        let error = service
+            .rollback_change_expecting_authority(change_id, &mut store, source)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("authority"));
+        assert_eq!(
+            serde_json::from_slice::<Value>(
+                &std::fs::read(store.overlay_path(&note.id)).unwrap()
+            )
+            .unwrap(),
+            overlay
+        );
+        assert_eq!(service.state.rollback_count, 0);
+        assert!(!service.events_path.exists());
+    }
+
+    #[test]
+    fn sidecar_rollback_restores_an_absent_overlay() {
+        let vault_dir = tempdir().unwrap();
+        let data_dir = tempdir().unwrap();
+        let events = std::sync::Arc::new(crate::services::twin_events::TwinEventStore::new(
+            data_dir.path(),
+        ));
+        events.initialize().unwrap();
+        let coordinator = std::sync::Arc::new(
+            crate::services::twin_events::MutationCoordinator::new(
+                data_dir.path(),
+                vault_dir.path(),
+                events,
+                std::sync::Arc::new(crate::services::twin_events::NoopMutationLifecycle),
+            )
+            .unwrap(),
+        );
+        let namespace = coordinator.current_namespace_path().unwrap();
+        let mut store = KnowledgeStore::with_event_recorder(
+            vault_dir.path().to_path_buf(),
+            namespace.clone(),
+            coordinator.clone(),
+        );
+        let note = store.create_note(make_note_create("Absent Overlay")).unwrap();
+        let overlay = serde_json::json!({"tags": ["optimizer"]});
+        store.write_overlay(&note.id, &overlay).unwrap();
+        let source = coordinator.current_authority_token().unwrap();
+        let mut service = VaultOptimizerService::new(namespace);
+        let change_id = "absent-overlay";
+        std::fs::write(
+            service.changes_dir.join(format!("{change_id}.json")),
+            serde_json::to_vec_pretty(&OptimizerChange {
+                change_id: change_id.to_string(),
+                note_id: note.id.clone(),
+                mode: "sidecar_first".to_string(),
+                overlay_before: None,
+                overlay_after: Some(overlay),
+                note_before: None,
+                note_after: None,
+                created_at: Some(Utc::now()),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let result = service
+            .rollback_change_expecting_authority(change_id, &mut store, source)
+            .unwrap();
+
+        assert!(result.rolled_back);
+        assert!(!store.overlay_path(&note.id).exists());
+        assert_eq!(service.state.rollback_count, 1);
     }
 
     #[test]

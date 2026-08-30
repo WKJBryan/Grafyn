@@ -451,6 +451,45 @@ impl MutationCoordinator {
         store: Arc<TwinEventStore>,
         lifecycle: Arc<dyn MutationLifecycle>,
     ) -> Result<Self, MutationError> {
+        Self::new_internal(data_path, vault_path, store, lifecycle, false, None)
+    }
+
+    #[cfg(feature = "mcp")]
+    pub(crate) fn new_custom_mcp(
+        data_path: impl AsRef<Path>,
+        vault_path: impl AsRef<Path>,
+        store: Arc<TwinEventStore>,
+        lifecycle: Arc<dyn MutationLifecycle>,
+    ) -> Result<Self, MutationError> {
+        Self::new_internal(data_path, vault_path, store, lifecycle, true, None)
+    }
+
+    #[cfg(all(test, feature = "mcp"))]
+    pub(crate) fn new_custom_mcp_with_hook(
+        data_path: impl AsRef<Path>,
+        vault_path: impl AsRef<Path>,
+        store: Arc<TwinEventStore>,
+        lifecycle: Arc<dyn MutationLifecycle>,
+        after_wal_check: impl FnOnce() + Send + 'static,
+    ) -> Result<Self, MutationError> {
+        Self::new_internal(
+            data_path,
+            vault_path,
+            store,
+            lifecycle,
+            true,
+            Some(Box::new(after_wal_check)),
+        )
+    }
+
+    fn new_internal(
+        data_path: impl AsRef<Path>,
+        vault_path: impl AsRef<Path>,
+        store: Arc<TwinEventStore>,
+        lifecycle: Arc<dyn MutationLifecycle>,
+        custom_mcp: bool,
+        after_custom_wal_check: Option<Box<dyn FnOnce() + Send>>,
+    ) -> Result<Self, MutationError> {
         let data_path = data_path.as_ref().to_path_buf();
         let vault_path = vault_path.as_ref().to_path_buf();
         crate::services::twin_events::validate_real_directory(&data_path, "trusted app-data root")?;
@@ -472,6 +511,21 @@ impl MutationCoordinator {
         let finalizer = StoreEventGroupFinalizer::new(store.clone(), identity);
         let journal = crate::services::twin_events::LocalMutationJournal::initialize(&data_path)?;
         let process_lock = finalizer.acquire_coordinator_lock()?;
+        #[cfg(feature = "mcp")]
+        if custom_mcp {
+            crate::services::root_transition::reject_custom_transition_wal_locked(
+                &data_path,
+                &process_lock,
+            )?;
+            if let Some(after_wal_check) = after_custom_wal_check {
+                after_wal_check();
+            }
+        }
+        #[cfg(not(feature = "mcp"))]
+        {
+            debug_assert!(!custom_mcp);
+            debug_assert!(after_custom_wal_check.is_none());
+        }
         journal.cleanup_orphan_temps_locked(&process_lock)?;
         let root_scope = markdown_root_scope_for(&vault_path)?;
         let root_lease = load_or_create_active_root_lease(&data_root, root_scope)?;

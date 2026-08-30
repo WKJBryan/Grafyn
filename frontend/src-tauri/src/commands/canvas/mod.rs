@@ -18,6 +18,8 @@
 
 mod shared;
 
+mod prediction_terminality;
+
 mod context;
 
 mod streaming;

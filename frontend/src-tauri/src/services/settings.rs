@@ -94,16 +94,50 @@ pub(crate) fn prepare_twin_data_path_locked(
         None => None,
     };
     if let Some(assignment) = &assignment {
-        if assignment.schema_version != 1
+        let matches_authority = assignment.schema_version == 1
+            && assignment.root_scope == lease.root_scope
+            && assignment.lease_epoch_uuid == lease.epoch_uuid
+            && assignment.legacy_name == legacy_name
+            && assignment.current_name == current_name;
+        if !matches_authority
+            && assignment.state == LegacyTwinAssignmentState::Prepared
+        {
+            anyhow::bail!("prepared legacy Twin assignment belongs to another root authority");
+        }
+        if !matches_authority
+            && (assignment.schema_version != 1
             || assignment.root_scope != lease.root_scope
             || assignment.lease_epoch_uuid != lease.epoch_uuid
             || assignment.legacy_name != legacy_name
-            || assignment.current_name != current_name
+            || assignment.current_name != current_name)
         {
             if has_legacy {
                 anyhow::bail!("legacy Twin namespace belongs to another root authority");
             }
             return Ok(current);
+        }
+        if assignment.state == LegacyTwinAssignmentState::Prepared {
+            match (has_legacy, has_current) {
+                (true, false) => {}
+                (false, true) => {
+                    write_legacy_twin_assignment(
+                        &root,
+                        &LegacyTwinAssignmentV1 {
+                            state: LegacyTwinAssignmentState::Committed,
+                            ..assignment.clone()
+                        },
+                    )?;
+                    return Ok(current);
+                }
+                (false, false) => {
+                    anyhow::bail!(
+                        "prepared legacy Twin assignment has neither source nor destination"
+                    )
+                }
+                (true, true) => anyhow::bail!(
+                    "legacy and current Twin namespaces both exist; refusing to merge"
+                ),
+            }
         }
     }
     if has_current && has_legacy {
@@ -659,6 +693,94 @@ mod tests {
         assert!(guard.prepare_twin_data_path(&vault, &lease).is_err());
         assert!(legacy.exists());
         assert!(current.exists());
+    }
+
+    #[test]
+    fn prepared_legacy_twin_assignment_rejects_neither_namespace() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let vault = temp.path().join("vault");
+        std::fs::create_dir_all(data.join("twin")).unwrap();
+        std::fs::create_dir(&vault).unwrap();
+        let events = Arc::new(crate::services::twin_events::TwinEventStore::new(&data));
+        events.initialize().unwrap();
+        let coordinator = crate::services::twin_events::MutationCoordinator::new(
+            &data,
+            &vault,
+            events,
+            Arc::new(crate::services::twin_events::NoopMutationLifecycle),
+        )
+        .unwrap();
+        let guard = coordinator.begin_root_transition().unwrap();
+        let lease = guard.current_lease().unwrap();
+        let current = crate::models::settings::twin_data_path_for_vault(&data, &vault).unwrap();
+        let legacy = legacy_twin_path(&data, &vault);
+        let root = crate::services::twin_events::AnchoredRoot::open(&data).unwrap();
+        write_legacy_twin_assignment(
+            &root,
+            &LegacyTwinAssignmentV1 {
+                schema_version: 1,
+                root_scope: lease.root_scope.clone(),
+                lease_epoch_uuid: lease.epoch_uuid.clone(),
+                legacy_name: legacy.file_name().unwrap().to_str().unwrap().into(),
+                current_name: current.file_name().unwrap().to_str().unwrap().into(),
+                state: LegacyTwinAssignmentState::Prepared,
+            },
+        )
+        .unwrap();
+
+        let error = guard.prepare_twin_data_path(&vault, &lease).unwrap_err();
+
+        assert!(error.to_string().contains("neither"));
+        let marker: LegacyTwinAssignmentV1 = serde_json::from_slice(
+            &root
+                .read_bounded(LEGACY_TWIN_ASSIGNMENT_KEY, LEGACY_TWIN_ASSIGNMENT_LIMIT)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(marker.state, LegacyTwinAssignmentState::Prepared);
+    }
+
+    #[test]
+    fn prepared_legacy_twin_assignment_rejects_foreign_authority() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let vault = temp.path().join("vault");
+        let foreign_vault = temp.path().join("foreign-vault");
+        std::fs::create_dir_all(data.join("twin")).unwrap();
+        std::fs::create_dir(&vault).unwrap();
+        std::fs::create_dir(&foreign_vault).unwrap();
+        let events = Arc::new(crate::services::twin_events::TwinEventStore::new(&data));
+        events.initialize().unwrap();
+        let coordinator = crate::services::twin_events::MutationCoordinator::new(
+            &data,
+            &vault,
+            events,
+            Arc::new(crate::services::twin_events::NoopMutationLifecycle),
+        )
+        .unwrap();
+        let guard = coordinator.begin_root_transition().unwrap();
+        let lease = guard.current_lease().unwrap();
+        let current = crate::models::settings::twin_data_path_for_vault(&data, &vault).unwrap();
+        let legacy = legacy_twin_path(&data, &vault);
+        let root = crate::services::twin_events::AnchoredRoot::open(&data).unwrap();
+        write_legacy_twin_assignment(
+            &root,
+            &LegacyTwinAssignmentV1 {
+                schema_version: 1,
+                root_scope: crate::services::twin_events::root_identity_for_path(&foreign_vault)
+                    .unwrap(),
+                lease_epoch_uuid: lease.epoch_uuid.clone(),
+                legacy_name: legacy.file_name().unwrap().to_str().unwrap().into(),
+                current_name: current.file_name().unwrap().to_str().unwrap().into(),
+                state: LegacyTwinAssignmentState::Prepared,
+            },
+        )
+        .unwrap();
+
+        let error = guard.prepare_twin_data_path(&vault, &lease).unwrap_err();
+        assert!(error.to_string().contains("another root authority"));
     }
 
     fn vault_update(path: impl Into<String>) -> SettingsUpdate {

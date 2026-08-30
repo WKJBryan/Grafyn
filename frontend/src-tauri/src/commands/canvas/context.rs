@@ -1,3 +1,4 @@
+pub(super) use super::prediction_terminality::fail_requested_prediction_if_same_root;
 use super::shared::ModelProviderRoute;
 use crate::commands::run_retrieval;
 use crate::models::canvas::{
@@ -987,6 +988,14 @@ pub(super) async fn run_sealed_twin_prediction(
         Ok(guard) => guard,
         Err(error) => {
             log::warn!("Sealed prediction abandoned after root transition: {error}");
+            fail_requested_prediction_if_same_root(
+                &root_state,
+                &twin_store,
+                &episode_id,
+                &root_epoch,
+                "initial authority validation",
+            )
+            .await;
             return;
         }
     };
@@ -1054,35 +1063,28 @@ pub(super) async fn run_sealed_twin_prediction(
         Ok(built) => built,
         Err(error) => {
             log::warn!("Sealed prediction input failed for {episode_id}: {error}");
-            let mut store = twin_store.write().await;
-            let commit = match store.mark_twin_prediction_failed_expecting_authority(
-                &episode_id,
-                root_epoch.clone(),
-            ) {
-                Ok(commit) => commit,
-                Err(error) => {
-                    log::warn!("Failed to record sealed-prediction input failure: {error}");
-                    return;
-                }
-            };
-            let Some(publication_epoch) = commit.authority_token else {
-                return;
-            };
-            drop(store);
             drop(initial_root_guard);
-            if let Err(error) = crate::commands::rebuild_and_publish_current_authority(
+            fail_requested_prediction_if_same_root(
                 &root_state,
-                &publication_epoch,
+                &twin_store,
+                &episode_id,
+                &root_epoch,
+                "input construction",
             )
-            .await
-            {
-                log::warn!("Failed to publish prediction-input failure authority: {error}");
-            }
+            .await;
             return;
         }
     };
     if let Err(error) = initial_root_guard.finish(&root_state).await {
         log::warn!("Sealed prediction context discarded after authority change: {error}");
+        fail_requested_prediction_if_same_root(
+            &root_state,
+            &twin_store,
+            &episode_id,
+            &root_epoch,
+            "post-context authority validation",
+        )
+        .await;
         return;
     }
 
@@ -1114,15 +1116,22 @@ pub(super) async fn run_sealed_twin_prediction(
         }
     };
 
-    let root_guard = match crate::commands::acquire_expected_root_epoch(&root_state, &root_epoch)
-        .await
-    {
-        Ok(guard) => guard,
-        Err(error) => {
-            log::warn!("Sealed prediction result discarded after root transition: {error}");
-            return;
-        }
-    };
+    let root_guard =
+        match crate::commands::acquire_expected_root_epoch(&root_state, &root_epoch).await {
+            Ok(guard) => guard,
+            Err(error) => {
+                log::warn!("Sealed prediction result discarded after root transition: {error}");
+                fail_requested_prediction_if_same_root(
+                    &root_state,
+                    &twin_store,
+                    &episode_id,
+                    &root_epoch,
+                    "post-network authority validation",
+                )
+                .await;
+                return;
+            }
+        };
     match result {
         Ok(raw) => {
             let draft = parse_twin_prediction(&raw, &options);
@@ -1137,49 +1146,58 @@ pub(super) async fn run_sealed_twin_prediction(
                 Ok((_, commit)) => commit,
                 Err(error) => {
                     log::warn!("Failed to seal twin prediction for {episode_id}: {error}");
+                    drop(store);
+                    drop(root_guard);
+                    fail_requested_prediction_if_same_root(
+                        &root_state,
+                        &twin_store,
+                        &episode_id,
+                        &root_epoch,
+                        "prediction persistence",
+                    )
+                    .await;
                     return;
                 }
             };
             let Some(publication_epoch) = commit.authority_token else {
+                drop(store);
+                drop(root_guard);
+                fail_requested_prediction_if_same_root(
+                    &root_state,
+                    &twin_store,
+                    &episode_id,
+                    &root_epoch,
+                    "prediction persistence without terminal authority",
+                )
+                .await;
                 return;
             };
             drop(store);
             drop(root_guard);
-            if let Err(error) = crate::commands::rebuild_and_publish_current_authority(
-                &root_state,
-                &publication_epoch,
-            )
-            .await
+            if let crate::commands::PostAuthorityRepair::Unavailable(error) =
+                crate::commands::repair_after_authority_token(
+                    &root_state,
+                    &publication_epoch,
+                    "sealed prediction",
+                )
+                .await
             {
+                // The sealed state is already durable; the repair seam leaves
+                // derived state unavailable without inviting a duplicate write.
                 log::warn!("Failed to publish sealed prediction authority: {error}");
             }
         }
         Err(error) => {
             log::warn!("Sealed twin prediction call failed for {episode_id}: {error}");
-            let mut store = twin_store.write().await;
-            let commit = match store.mark_twin_prediction_failed_expecting_authority(
-                &episode_id,
-                root_epoch.clone(),
-            ) {
-                Ok(commit) => commit,
-                Err(error) => {
-                    log::warn!("Failed to record sealed-prediction failure: {error}");
-                    return;
-                }
-            };
-            let Some(publication_epoch) = commit.authority_token else {
-                return;
-            };
-            drop(store);
             drop(root_guard);
-            if let Err(error) = crate::commands::rebuild_and_publish_current_authority(
+            fail_requested_prediction_if_same_root(
                 &root_state,
-                &publication_epoch,
+                &twin_store,
+                &episode_id,
+                &root_epoch,
+                "provider failure",
             )
-            .await
-            {
-                log::warn!("Failed to publish prediction-failure authority: {error}");
-            }
+            .await;
         }
     }
 }
@@ -2470,3 +2488,7 @@ mod tests {
         assert_eq!(decision, RetrievalDecisionReason::NoKeywordMatch);
     }
 }
+
+#[cfg(test)]
+#[path = "context_prediction_tests.rs"]
+mod prediction_tests;

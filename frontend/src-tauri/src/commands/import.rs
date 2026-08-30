@@ -1,4 +1,3 @@
-use crate::commands::commit_note_writes;
 use crate::models::import::{
     ConversationMetadata, ImportLinkSuggestion, ImportPreview, ImportResult, ParsedConversation,
     ParsedMessage,
@@ -96,6 +95,11 @@ async fn apply_conversation_import(
     source_content: String,
     state: State<'_, AppState>,
 ) -> Result<ImportResult, String> {
+    state
+        .knowledge_store
+        .write()
+        .await
+        .clear_last_mutation_commit();
     let to_import: Vec<_> = if conversation_ids.is_empty() {
         all_conversations
     } else {
@@ -195,7 +199,19 @@ async fn apply_conversation_import(
         note_ids.push(created.id.clone());
     }
 
-    commit_note_writes(state.inner(), &note_ids, "import").await?;
+    let commit = state
+        .knowledge_store
+        .write()
+        .await
+        .take_last_mutation_commit();
+    if let Some(commit) = commit {
+        if let crate::commands::PostAuthorityRepair::Unavailable(warning) =
+            crate::commands::repair_after_authority_mutation(state.inner(), &commit, "import")
+                .await
+        {
+            errors.push(warning);
+        }
+    }
 
     let imported = note_ids.len();
     let message = format!(
@@ -221,6 +237,11 @@ async fn apply_document_import(
     source_content: String,
     state: State<'_, AppState>,
 ) -> Result<ImportResult, String> {
+    state
+        .knowledge_store
+        .write()
+        .await
+        .clear_last_mutation_commit();
     let to_import = if selected_ids.is_empty() {
         batch.items
     } else {
@@ -232,7 +253,7 @@ async fn apply_document_import(
     };
 
     let mut note_ids = Vec::new();
-    let errors = Vec::new();
+    let mut errors = Vec::new();
     let skipped = 0;
     let mut imported_section_titles = Vec::new();
     let mut section_inputs = Vec::new();
@@ -273,7 +294,19 @@ async fn apply_document_import(
         note_ids.extend(created.into_iter().map(|note| note.id));
     }
 
-    commit_note_writes(state.inner(), &note_ids, "import").await?;
+    let commit = state
+        .knowledge_store
+        .write()
+        .await
+        .take_last_mutation_commit();
+    if let Some(commit) = commit {
+        if let crate::commands::PostAuthorityRepair::Unavailable(warning) =
+            crate::commands::repair_after_authority_mutation(state.inner(), &commit, "import")
+                .await
+        {
+            errors.push(warning);
+        }
+    }
 
     let (semantic_link_suggestions, semantic_link_error) =
         suggest_import_links_if_available(state.inner(), section_inputs).await;

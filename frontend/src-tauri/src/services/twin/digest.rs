@@ -150,13 +150,11 @@ impl TwinStore {
                     Vec::new(),
                 )))
             };
-            if let Err(error) = recorder.commit_planned_mutation(
+            let result = recorder.commit_planned_mutation(
                 crate::services::twin_events::MutationOrigin::Local,
                 &mut planner,
-            ) {
-                self.invalidate_mutation_caches();
-                return Err(anyhow::Error::new(error));
-            }
+            );
+            self.finish_mutation_commit(result)?;
             let pending = committed.ok_or_else(|| anyhow::anyhow!("memory digest was not planned"))?;
             self.invalidate_mutation_caches();
             return Ok(pending);
@@ -298,13 +296,11 @@ impl TwinStore {
                     vec![draft],
                 )))
             };
-            if let Err(error) = recorder.commit_planned_mutation(
+            let result = recorder.commit_planned_mutation(
                 crate::services::twin_events::MutationOrigin::Local,
                 &mut planner,
-            ) {
-                self.invalidate_mutation_caches();
-                return Err(anyhow::Error::new(error));
-            }
+            );
+            self.finish_mutation_commit(result)?;
             let (item, _records) = committed
                 .ok_or_else(|| anyhow::anyhow!("memory digest review was not planned"))?;
             self.invalidate_mutation_caches();

@@ -738,13 +738,11 @@ impl TwinStore {
                 vec![draft],
             )))
         };
-        if let Err(error) = recorder.commit_planned_mutation(
+        let result = recorder.commit_planned_mutation(
             crate::services::twin_events::MutationOrigin::Local,
             &mut planner,
-        ) {
-            self.invalidate_mutation_caches();
-            return Err(anyhow::Error::new(error));
-        }
+        );
+        self.finish_mutation_commit(result)?;
         let record = committed.ok_or_else(|| anyhow::anyhow!("record create was not planned"))?;
         self.invalidate_mutation_caches();
         Ok(record)
@@ -827,13 +825,11 @@ impl TwinStore {
                 vec![draft],
             )))
         };
-        if let Err(error) = recorder.commit_planned_mutation(
+        let result = recorder.commit_planned_mutation(
             crate::services::twin_events::MutationOrigin::Local,
             &mut planner,
-        ) {
-            self.invalidate_mutation_caches();
-            return Err(anyhow::Error::new(error));
-        }
+        );
+        self.finish_mutation_commit(result)?;
         let record = committed.ok_or_else(|| anyhow::anyhow!("record update was not planned"))?;
         self.invalidate_mutation_caches();
         Ok(record)
@@ -1002,13 +998,11 @@ impl TwinStore {
                     event_drafts,
                 )))
             };
-            if let Err(error) = recorder.commit_planned_mutation(
+            let result = recorder.commit_planned_mutation(
                 crate::services::twin_events::MutationOrigin::Local,
                 &mut planner,
-            ) {
-                self.invalidate_mutation_caches();
-                return Err(anyhow::Error::new(error));
-            }
+            );
+            self.finish_mutation_commit(result)?;
             let (summary, _records) = committed
                 .ok_or_else(|| anyhow::anyhow!("Twin inference was not planned"))?;
             self.invalidate_mutation_caches();
@@ -1286,13 +1280,11 @@ impl TwinStore {
                 vec![draft],
             )))
         };
-        if let Err(error) = recorder.commit_planned_mutation(
+        let result = recorder.commit_planned_mutation(
             crate::services::twin_events::MutationOrigin::Local,
             &mut planner,
-        ) {
-            self.invalidate_mutation_caches();
-            return Err(anyhow::Error::new(error));
-        }
+        );
+        self.finish_mutation_commit(result)?;
         let record = committed.ok_or_else(|| anyhow::anyhow!("promotion was not planned"))?;
         self.invalidate_mutation_caches();
         Ok(record)
@@ -1424,6 +1416,24 @@ mod tests {
                 PromotionState::Candidate
             );
         }
+    }
+
+    #[test]
+    fn ordinary_twin_mutation_exposes_its_exact_post_commit_token_for_desktop_repair() {
+        let root = tempdir().unwrap();
+        let (mut store, _events, coordinator) = coordinated_twin_store(root.path());
+        store.clear_last_mutation_commit();
+
+        store
+            .create_user_record(record_create(RecordOrigin::User))
+            .unwrap();
+
+        let commit = store.take_last_mutation_commit().unwrap();
+        assert_eq!(
+            commit.authority_token.as_ref(),
+            Some(&coordinator.current_authority_token().unwrap())
+        );
+        assert!(store.take_last_mutation_commit().is_none());
     }
 
     #[test]

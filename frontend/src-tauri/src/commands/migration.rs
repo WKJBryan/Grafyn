@@ -40,22 +40,59 @@ pub async fn apply_markdown_migration(
 ) -> Result<MarkdownMigrationApplyResult, String> {
     let root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
     let expected_epoch = crate::commands::capture_root_epoch(state.inner())?;
-    let result = {
+    let (apply_result, mutation_commit) = {
         let service = state.markdown_migration.read().await;
         let mut store = state.knowledge_store.write().await;
-        service
+        store.clear_last_mutation_commit();
+        let result = service
             .apply_scoped(
                 &preview_id,
                 request.clone(),
                 &mut store,
                 &expected_epoch.root_scope,
             )
-            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string());
+        let commit = store.take_last_mutation_commit();
+        (result, commit)
     };
     drop(root_epoch);
 
+    let mut result = match apply_result {
+        Ok(result) => result,
+        Err(error) => {
+            if let Some(commit) = mutation_commit.as_ref() {
+                crate::commands::repair_after_authority_mutation(
+                    state.inner(),
+                    commit,
+                    "Markdown migration",
+                )
+                .await;
+            }
+            return Err(error);
+        }
+    };
+
+    let repair = if let Some(commit) = mutation_commit.as_ref() {
+        crate::commands::repair_after_authority_mutation(
+            state.inner(),
+            commit,
+            "Markdown migration",
+        )
+        .await
+    } else {
+        crate::commands::PostAuthorityRepair::NotRequired
+    };
+    let repair_ready = matches!(
+        repair,
+        crate::commands::PostAuthorityRepair::Ready(_)
+            | crate::commands::PostAuthorityRepair::NotRequired
+    );
+    if let crate::commands::PostAuthorityRepair::Unavailable(warning) = &repair {
+        result.message = format!("{}; {warning}", result.message);
+    }
+
     if request.start_optimizer.unwrap_or(true) || request.enable_llm.unwrap_or(false) {
-        crate::commands::settings::apply_settings_update(
+        if let Err(error) = crate::commands::settings::apply_settings_update(
             state.inner(),
             SettingsUpdate {
                 vault_path: None,
@@ -85,14 +122,16 @@ pub async fn apply_markdown_migration(
                 canvas_model_presets: None,
             },
         )
-        .await?;
+        .await
+        {
+            result.message = format!(
+                "{}; migration was committed but optimizer settings were not updated: {error}",
+                result.message
+            );
+        }
     }
 
-    let _root_epoch =
-        crate::commands::acquire_expected_root_epoch(state.inner(), &expected_epoch).await?;
-    crate::commands::rebuild_all_indexes(state.inner()).await?;
-
-    {
+    if repair_ready {
         let mut optimizer = state.vault_optimizer.write().await;
         for note_id in result
             .touched_note_ids
@@ -137,18 +176,25 @@ pub async fn rollback_markdown_migration(
     // capture the rollback result, ALWAYS rebuild the indexes to match whatever is
     // now on disk, then propagate the original rollback error (a rebuild error is
     // only surfaced when the rollback itself succeeded).
-    let rollback_result = {
+    let (rollback_result, mutation_commit) = {
         let service = state.markdown_migration.read().await;
         let mut store = state.knowledge_store.write().await;
-        service
+        store.clear_last_mutation_commit();
+        let result = service
             .rollback_scoped(&run_id, &mut store, &epoch.root_scope)
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string());
+        (result, store.take_last_mutation_commit())
     };
 
-    let rebuild_result = crate::commands::rebuild_all_indexes(state.inner()).await;
-
-    rollback_result?;
-    rebuild_result.map(|_| ())
+    if let Some(commit) = mutation_commit.as_ref() {
+        crate::commands::repair_after_authority_mutation(
+            state.inner(),
+            commit,
+            "Markdown migration rollback",
+        )
+        .await;
+    }
+    rollback_result
 }
 
 #[tauri::command]
@@ -247,20 +293,51 @@ pub async fn rollback_vault_optimizer_change(
     change_id: String,
     state: State<'_, AppState>,
 ) -> Result<VaultOptimizerRollbackResult, String> {
-    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
-    let result = {
+    let root_ticket = crate::commands::acquire_root_epoch(state.inner()).await?;
+    let expected = root_ticket.authority().clone();
+    let (result, mutation_commit) = {
         // Lock order: knowledge_store before vault_optimizer (see commands/mod.rs
         // doc comment) — must match the background worker in main.rs to avoid
         // an ABBA deadlock.
         let mut store = state.knowledge_store.write().await;
+        store.clear_last_mutation_commit();
         let mut optimizer = state.vault_optimizer.write().await;
-        optimizer
+        let result = optimizer
             .with_locked_fresh_state(|optimizer| {
-                optimizer.rollback_change(&change_id, &mut store)
+                optimizer.rollback_change_expecting_authority(
+                    &change_id,
+                    &mut store,
+                    expected,
+                )
             })
-            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string());
+        (result, store.take_last_mutation_commit())
     };
-    crate::commands::rebuild_all_indexes(state.inner()).await?;
+    drop(root_ticket);
+    let repair = if let Some(commit) = mutation_commit.as_ref() {
+        crate::commands::repair_after_authority_mutation(
+            state.inner(),
+            commit,
+            "vault optimizer rollback",
+        )
+        .await
+    } else {
+        crate::commands::PostAuthorityRepair::NotRequired
+    };
+    let mut result = match result {
+        Ok(result) => result,
+        Err(error) if mutation_commit.is_some() => VaultOptimizerRollbackResult {
+            change_id,
+            rolled_back: true,
+            message: format!(
+                "Optimizer authority rollback committed, but audit-state publication failed: {error}"
+            ),
+        },
+        Err(error) => return Err(error),
+    };
+    if let crate::commands::PostAuthorityRepair::Unavailable(warning) = repair {
+        result.message = format!("{}; {warning}", result.message);
+    }
     Ok(result)
 }
 

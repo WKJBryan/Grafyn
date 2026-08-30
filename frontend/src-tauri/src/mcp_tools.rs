@@ -338,9 +338,20 @@ impl GrafynMcpServer {
         retrieval_service: Arc<RwLock<RetrievalService>>,
         priority_service: Arc<RwLock<PriorityScoringService>>,
         coordinator: Arc<MutationCoordinator>,
-        derived_ready: bool,
+        authoritative_token: crate::services::vault_namespace::VaultAuthorityTokenV1,
+        derived_token: Option<crate::services::vault_namespace::VaultAuthorityTokenV1>,
     ) -> Result<Self, MutationError> {
-        let expected_token = coordinator.current_authority_token()?;
+        coordinator.validate_authority_token(&authoritative_token, false)?;
+        if let Some(token) = &derived_token {
+            coordinator.validate_authority_token(token, true)?;
+            if token != &authoritative_token {
+                return Err(MutationError::RecoveryConflict(
+                    "MCP derived and authoritative startup tokens differ".into(),
+                ));
+            }
+        }
+        let derived_ready = derived_token.is_some();
+        let admitted_derived_token = derived_token.unwrap_or_else(|| authoritative_token.clone());
         Ok(Self {
             knowledge_store,
             search_service,
@@ -352,8 +363,8 @@ impl GrafynMcpServer {
             derived_ready,
             derived_authority: DerivedAuthority {
                 coordinator,
-                authoritative_token: Arc::new(std::sync::Mutex::new(expected_token.clone())),
-                derived_token: expected_token,
+                authoritative_token: Arc::new(std::sync::Mutex::new(authoritative_token)),
+                derived_token: admitted_derived_token,
             },
             tool_router: Self::tool_router(),
         })
@@ -1063,7 +1074,8 @@ mod tests {
             Arc::new(RwLock::new(RetrievalService::new(data.clone()))),
             Arc::new(RwLock::new(PriorityScoringService::new(data.clone()))),
             coordinator.clone(),
-            true,
+            coordinator.current_authority_token().unwrap(),
+            Some(coordinator.current_authority_token().unwrap()),
         )
         .unwrap();
         (server, events, data, coordinator)
@@ -1243,6 +1255,65 @@ mod tests {
         assert!(results
             .iter()
             .all(|result| format!("{result:?}").contains("Vault-derived indexes are unavailable")));
+    }
+
+    #[test]
+    fn mcp_constructor_rejects_a_stale_preconstruction_ready_token() {
+        let root = tempdir().unwrap();
+        let vault = root.path().join("vault");
+        let data = root.path().join("data");
+        std::fs::create_dir(&vault).unwrap();
+        std::fs::create_dir(&data).unwrap();
+        let events = Arc::new(TwinEventStore::new(&data));
+        events.initialize().unwrap();
+        let coordinator = Arc::new(
+            MutationCoordinator::new(
+                &data,
+                &vault,
+                events,
+                Arc::new(NoopMutationLifecycle),
+            )
+            .unwrap(),
+        );
+        let namespace = coordinator.current_namespace_path().unwrap();
+        let stale = coordinator.current_authority_token().unwrap();
+        let mut knowledge = KnowledgeStore::with_event_recorder(
+            vault.clone(),
+            namespace.clone(),
+            coordinator.clone(),
+        );
+        knowledge
+            .create_note_from_source(
+                NoteCreate {
+                    title: "Peer write".into(),
+                    content: "new generation".into(),
+                    relative_path: None,
+                    aliases: Vec::new(),
+                    status: NoteStatus::Draft,
+                    tags: Vec::new(),
+                    schema_version: CURRENT_NOTE_SCHEMA_VERSION,
+                    migration_source: None,
+                    optimizer_managed: false,
+                    properties: Default::default(),
+                },
+                "mcp",
+            )
+            .unwrap();
+
+        let result = GrafynMcpServer::new_with_governed_derived_state(
+            Arc::new(RwLock::new(knowledge)),
+            None,
+            Arc::new(RwLock::new(GraphIndex::new())),
+            Arc::new(RwLock::new(MemoryService::new())),
+            None,
+            Arc::new(RwLock::new(RetrievalService::new(data.clone()))),
+            Arc::new(RwLock::new(PriorityScoringService::new(data))),
+            coordinator,
+            stale.clone(),
+            Some(stale),
+        );
+
+        assert!(matches!(result, Err(MutationError::RecoveryConflict(_))));
     }
 
     #[tokio::test]

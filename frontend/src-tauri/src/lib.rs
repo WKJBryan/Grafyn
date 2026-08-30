@@ -542,7 +542,9 @@ async fn warm_start_services_inner(
     }
 
     warm_start_component(WarmStartComponent::Overlay, injected_failure)?;
-    let full_notes = crate::commands::sync_topic_hubs(state).await?;
+    // Finish every authoritative normalization before selecting the rebuild
+    // generation. `sync_topic_hubs` may itself commit canonical Markdown.
+    crate::commands::sync_topic_hubs(state).await?;
     let namespace_token = {
         let guard = coordinator
             .begin_root_transition()
@@ -555,6 +557,27 @@ async fn warm_start_services_inner(
             .capture_authority_token(&current_lease)
             .map_err(|error| error.to_string())?
     };
+
+    // Reload authoritative inputs only after the exact generation is captured;
+    // notes returned by normalization and previously populated Twin caches may
+    // belong to an older peer generation.
+    let full_notes = {
+        let mut knowledge = state.knowledge_store.write().await;
+        knowledge.reload_authoritative_state();
+        knowledge
+            .list_full_notes()
+            .map_err(|error| error.to_string())?
+    };
+    warm_start_component(WarmStartComponent::TwinCaches, injected_failure)?;
+    state
+        .twin_store
+        .write()
+        .await
+        .rebuild_mutation_caches()
+        .map_err(|error| error.to_string())?;
+    coordinator
+        .validate_authority_token(&namespace_token, false)
+        .map_err(|error| error.to_string())?;
 
     maybe_publish_boot_phase(
         app_handle,
@@ -615,14 +638,6 @@ async fn warm_start_services_inner(
             .bootstrap_checked(&full_notes)
             .map_err(|error| error.to_string())?;
     }
-
-    warm_start_component(WarmStartComponent::TwinCaches, injected_failure)?;
-    state
-        .twin_store
-        .write()
-        .await
-        .rebuild_mutation_caches()
-        .map_err(|error| error.to_string())?;
 
     let publish_guard = coordinator
         .begin_root_transition()
@@ -836,14 +851,20 @@ fn start_vault_optimizer_worker(state: AppState) {
             // lock, so LLM/network work (once added) and disk I/O here never
             // block other note/search/canvas commands that need
             // `knowledge_store.write()`.
-            let (tick, prepared_optimizer_revision) = {
+            let (tick, prepared_optimizer_revision, prepared_commit) = {
                 let store = state.knowledge_store.read().await;
+                store.clear_last_mutation_commit();
                 let mut optimizer = state.vault_optimizer.write().await;
                 let tick = optimizer.with_locked_fresh_state(|optimizer| {
-                    optimizer.prepare_next(&store, &settings)
+                    optimizer.prepare_next_expecting_authority(
+                        &store,
+                        &settings,
+                        root_guard.authority().clone(),
+                    )
                 });
                 let revision = optimizer.state_revision();
-                (tick, revision)
+                let commit = store.take_last_mutation_commit();
+                (tick, revision, commit)
             };
 
             // Whichever branch below reindexes a note, it does so only AFTER
@@ -852,49 +873,54 @@ fn start_vault_optimizer_worker(state: AppState) {
             // `commit_note_index_refresh` reacquires `knowledge_store` itself
             // (see its doc comment in `commands/mod.rs` for why this can't
             // just be a call to `commit_note_write`).
-            let applied_note_id = match tick {
-                Ok(OptimizerTick::Idle) => None,
-                Ok(OptimizerTick::Applied(note_id)) => Some(note_id),
+            let (applied_note_id, mutation_commit) = match tick {
+                Ok(OptimizerTick::Idle) => (None, None),
+                Ok(OptimizerTick::Applied(note_id)) => (Some(note_id), prepared_commit),
                 Ok(OptimizerTick::Pending(pending)) => {
                     // Only non-`sidecar_first` edit modes reach here, and only
                     // for the narrow `update_note` write itself — acquire the
                     // write lock just for this, in the same canonical order.
                     let result = {
                         let mut store = state.knowledge_store.write().await;
+                        store.clear_last_mutation_commit();
                         let mut optimizer = state.vault_optimizer.write().await;
-                        optimizer.with_locked_fresh_state(|optimizer| {
+                        let result = optimizer.with_locked_fresh_state(|optimizer| {
                             if optimizer.state_revision() != prepared_optimizer_revision {
                                 anyhow::bail!(
                                     "vault optimizer state changed before pending apply"
                                 );
                             }
                             optimizer.apply_pending(&mut store, *pending)
-                        })
+                        });
+                        let commit = store.take_last_mutation_commit();
+                        (result, commit)
                     };
                     match result {
-                        Ok(applied_note_id) => applied_note_id,
-                        Err(error) => {
+                        (Ok(applied_note_id), commit) => (applied_note_id, commit),
+                        (Err(error), _) => {
                             log::warn!("Background vault optimizer failed to apply: {}", error);
-                            None
+                            (None, None)
                         }
                     }
                 }
                 Err(error) => {
                     log::warn!("Background vault optimizer failed to prepare: {}", error);
-                    None
+                    (None, None)
                 }
             };
 
-            if let Some(note_id) = applied_note_id {
-                if let Err(error) =
-                    crate::commands::commit_note_index_refresh(&state, &note_id).await
-                {
-                    log::warn!(
-                        "Background vault optimizer failed to reindex note '{}': {}",
-                        note_id,
-                        error
-                    );
-                }
+            if let Some(commit) = mutation_commit {
+                crate::commands::repair_after_authority_mutation(
+                    &state,
+                    &commit,
+                    "vault optimizer",
+                )
+                .await;
+            } else if let Some(note_id) = applied_note_id {
+                log::error!(
+                    "Vault optimizer changed note '{}' without exposing its mutation commit",
+                    note_id
+                );
             }
             if let Err(error) = root_guard.finish(&state).await {
                 log::warn!("Background vault optimizer result became stale: {error}");

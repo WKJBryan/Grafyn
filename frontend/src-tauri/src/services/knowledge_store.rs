@@ -58,6 +58,8 @@ pub struct KnowledgeStore {
     alias_index: HashMap<String, String>,
     relative_path_index: HashMap<String, String>,
     event_recorder: Arc<dyn crate::services::twin_events::EventRecorder>,
+    last_mutation_commit:
+        Arc<std::sync::Mutex<Option<crate::services::twin_events::MutationCommit>>>,
 }
 
 #[derive(Clone)]
@@ -115,6 +117,7 @@ impl KnowledgeStore {
             alias_index: HashMap::new(),
             relative_path_index: HashMap::new(),
             event_recorder,
+            last_mutation_commit: Arc::new(std::sync::Mutex::new(None)),
         };
         store.refresh_cache();
         store
@@ -168,6 +171,46 @@ impl KnowledgeStore {
 
     pub fn vault_path(&self) -> &std::path::Path {
         &self.vault_path
+    }
+
+    fn remember_mutation_commit(
+        &self,
+        commit: &crate::services::twin_events::MutationCommit,
+    ) {
+        if let Ok(mut slot) = self.last_mutation_commit.lock() {
+            *slot = Some(commit.clone());
+        }
+    }
+
+    fn remember_commit_result(
+        &self,
+        result: Result<
+            crate::services::twin_events::MutationCommit,
+            crate::services::twin_events::MutationError,
+        >,
+    ) -> Result<
+        crate::services::twin_events::MutationCommit,
+        crate::services::twin_events::MutationError,
+    > {
+        if let Ok(commit) = &result {
+            self.remember_mutation_commit(commit);
+        }
+        result
+    }
+
+    pub(crate) fn clear_last_mutation_commit(&self) {
+        if let Ok(mut slot) = self.last_mutation_commit.lock() {
+            *slot = None;
+        }
+    }
+
+    pub(crate) fn take_last_mutation_commit(
+        &self,
+    ) -> Option<crate::services::twin_events::MutationCommit> {
+        self.last_mutation_commit
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take())
     }
 
     /// Rebuild the metadata cache and lookups from disk.
@@ -421,10 +464,11 @@ impl KnowledgeStore {
                 drafts,
             )))
         };
-        if let Err(error) = recorder.commit_planned_mutation(
+        let commit_result = recorder.commit_planned_mutation(
             crate::services::twin_events::MutationOrigin::Local,
             &mut planner,
-        ) {
+        );
+        if let Err(error) = self.remember_commit_result(commit_result) {
             self.refresh_cache();
             return Err(anyhow::Error::new(error));
         }
@@ -555,7 +599,9 @@ impl KnowledgeStore {
             &mut planner,
         );
         self.refresh_cache();
-        let commit = result.map_err(anyhow::Error::new)?;
+        let commit = self
+            .remember_commit_result(result)
+            .map_err(anyhow::Error::new)?;
         Ok((
             self.get_note(planned_id.as_deref().expect("planner returned a note ID"))?,
             commit,
@@ -758,7 +804,9 @@ impl KnowledgeStore {
             &mut planner,
         );
         self.refresh_cache();
-        let commit = result.map_err(anyhow::Error::new)?;
+        let commit = self
+            .remember_commit_result(result)
+            .map_err(anyhow::Error::new)?;
         Ok((
             self.get_note(planned_id.as_deref().expect("planner returned a note ID"))?,
             commit,
@@ -913,10 +961,11 @@ impl KnowledgeStore {
                     vec![draft],
                 )))
             };
-            if let Err(error) = recorder.commit_planned_mutation(
+            let commit_result = recorder.commit_planned_mutation(
                 crate::services::twin_events::MutationOrigin::Local,
                 &mut planner,
-            ) {
+            );
+            if let Err(error) = self.remember_commit_result(commit_result) {
                 self.refresh_cache();
                 return Err(anyhow::Error::new(error));
             }
@@ -985,7 +1034,9 @@ impl KnowledgeStore {
             &mut || Ok(plan.take()),
         );
         self.refresh_cache();
-        result.map(|_| ()).map_err(anyhow::Error::new)
+        self.remember_commit_result(result)
+            .map(|_| ())
+            .map_err(anyhow::Error::new)
     }
 
     pub(crate) fn delete_vault_file_target_only(
@@ -1044,7 +1095,9 @@ impl KnowledgeStore {
             &mut || Ok(plan.take()),
         );
         self.refresh_cache();
-        result.map(|_| ()).map_err(anyhow::Error::new)
+        self.remember_commit_result(result)
+            .map(|_| ())
+            .map_err(anyhow::Error::new)
     }
 
     pub(crate) fn validate_vault_file_target(
@@ -1082,12 +1135,35 @@ impl KnowledgeStore {
     }
 
     pub fn delete_note_from_source(&mut self, id: &str, source: &str) -> Result<()> {
+        self.delete_note_with_context(id, source, None).map(|_| ())
+    }
+
+    pub(crate) fn delete_note_expecting_authority(
+        &mut self,
+        id: &str,
+        source: &str,
+        expected: crate::services::vault_namespace::VaultAuthorityTokenV1,
+    ) -> Result<crate::services::twin_events::MutationCommit> {
+        self.delete_note_with_context(id, source, Some(expected))
+    }
+
+    fn delete_note_with_context(
+        &mut self,
+        id: &str,
+        source: &str,
+        expected: Option<crate::services::vault_namespace::VaultAuthorityTokenV1>,
+    ) -> Result<crate::services::twin_events::MutationCommit> {
         Self::validate_note_id(id)?;
         let context = NoteMutationContext::local(source)?;
-        if self.event_recorder.is_noop() {
+        let commit = if self.event_recorder.is_noop() {
             let path = self.note_path(id)?;
             let note = self.get_note(id)?;
             self.persist_note_delete(&note, &path, context)?;
+            crate::services::twin_events::MutationCommit {
+                mutation_id: None,
+                events: Vec::new(),
+                authority_token: None,
+            }
         } else {
             let recorder = self.event_recorder.clone();
             let note_id = id.to_string();
@@ -1099,20 +1175,28 @@ impl KnowledgeStore {
                 let path = self.note_path(&note_id).map_err(|error| {
                     crate::services::twin_events::MutationError::Invalid(error.to_string())
                 })?;
-                self.plan_note_delete(&note, &path, context.clone())
-                    .map(Some)
-                    .map_err(|error| {
+                let mut plan = self.plan_note_delete(&note, &path, context.clone()).map_err(
+                    |error| {
                         crate::services::twin_events::MutationError::Invalid(error.to_string())
-                    })
+                    },
+                )?;
+                if let Some(expected) = expected.clone() {
+                    plan = plan.expecting_authority(expected);
+                }
+                Ok(Some(plan))
             };
-            if let Err(error) = recorder.commit_planned_mutation(
+            let result = recorder.commit_planned_mutation(
                 crate::services::twin_events::MutationOrigin::Local,
                 &mut planner,
-            ) {
-                self.refresh_cache();
-                return Err(anyhow::Error::new(error));
+            );
+            match self.remember_commit_result(result) {
+                Ok(commit) => commit,
+                Err(error) => {
+                    self.refresh_cache();
+                    return Err(anyhow::Error::new(error));
+                }
             }
-        }
+        };
         if self.event_recorder.is_noop() {
             let overlay_path = self.overlay_path(id);
             if overlay_path.exists() {
@@ -1120,7 +1204,7 @@ impl KnowledgeStore {
             }
         }
         self.refresh_cache();
-        Ok(())
+        Ok(commit)
     }
 
     pub fn overlay_path(&self, note_id: &str) -> PathBuf {
@@ -1137,13 +1221,34 @@ impl KnowledgeStore {
         overlay: &serde_json::Value,
         source: &str,
     ) -> Result<()> {
+        self.write_overlay_from_source_with_authority(note_id, overlay, source, None)
+            .map(|_| ())
+    }
+
+    pub(crate) fn write_overlay_from_source_expecting_authority(
+        &self,
+        note_id: &str,
+        overlay: &serde_json::Value,
+        source: &str,
+        expected: crate::services::vault_namespace::VaultAuthorityTokenV1,
+    ) -> Result<crate::services::twin_events::MutationCommit> {
+        self.write_overlay_from_source_with_authority(note_id, overlay, source, Some(expected))
+    }
+
+    fn write_overlay_from_source_with_authority(
+        &self,
+        note_id: &str,
+        overlay: &serde_json::Value,
+        source: &str,
+        expected: Option<crate::services::vault_namespace::VaultAuthorityTokenV1>,
+    ) -> Result<crate::services::twin_events::MutationCommit> {
         Self::validate_note_id(note_id)?;
         let content = serde_json::to_string_pretty(overlay)?;
         if !self.event_recorder.is_noop() {
             let source_channel = crate::models::twin_event::SourceChannel::parse(source)
                 .map_err(anyhow::Error::msg)?;
             let target_key = format!("{note_id}.json");
-            let mut plan = Some(crate::services::twin_events::MutationPlan::new(
+            let mut mutation_plan = crate::services::twin_events::MutationPlan::new(
                 crate::models::twin_event::CausalStream::LocalOnly,
                 source_channel,
                 vec![crate::services::twin_events::TargetMutation::put(
@@ -1152,21 +1257,30 @@ impl KnowledgeStore {
                     content,
                 )],
                 Vec::new(),
-            ));
-            self.event_recorder
+            );
+            if let Some(expected) = expected {
+                mutation_plan = mutation_plan.expecting_authority(expected);
+            }
+            let mut plan = Some(mutation_plan);
+            let commit = self.event_recorder
                 .commit_planned_mutation(
                     crate::services::twin_events::MutationOrigin::Local,
                     &mut || Ok(plan.take()),
                 )
                 .map_err(anyhow::Error::new)?;
-            return Ok(());
+            self.remember_mutation_commit(&commit);
+            return Ok(commit);
         }
         if let Some(parent) = self.overlay_path(note_id).parent() {
             std::fs::create_dir_all(parent)?;
         }
         write_atomic(&self.overlay_path(note_id), content.as_bytes())
         .with_context(|| format!("Failed to write overlay for '{}'", note_id))?;
-        Ok(())
+        Ok(crate::services::twin_events::MutationCommit {
+            mutation_id: None,
+            events: Vec::new(),
+            authority_token: None,
+        })
     }
 
     pub fn delete_overlay(&self, note_id: &str) -> Result<()> {
@@ -1174,12 +1288,31 @@ impl KnowledgeStore {
     }
 
     pub fn delete_overlay_from_source(&self, note_id: &str, source: &str) -> Result<()> {
+        self.delete_overlay_from_source_with_authority(note_id, source, None)
+            .map(|_| ())
+    }
+
+    pub(crate) fn delete_overlay_from_source_expecting_authority(
+        &self,
+        note_id: &str,
+        source: &str,
+        expected: crate::services::vault_namespace::VaultAuthorityTokenV1,
+    ) -> Result<crate::services::twin_events::MutationCommit> {
+        self.delete_overlay_from_source_with_authority(note_id, source, Some(expected))
+    }
+
+    fn delete_overlay_from_source_with_authority(
+        &self,
+        note_id: &str,
+        source: &str,
+        expected: Option<crate::services::vault_namespace::VaultAuthorityTokenV1>,
+    ) -> Result<crate::services::twin_events::MutationCommit> {
         Self::validate_note_id(note_id)?;
         if !self.event_recorder.is_noop() {
             let source_channel = crate::models::twin_event::SourceChannel::parse(source)
                 .map_err(anyhow::Error::msg)?;
             let target_key = format!("{note_id}.json");
-            let mut plan = Some(crate::services::twin_events::MutationPlan::new(
+            let mut mutation_plan = crate::services::twin_events::MutationPlan::new(
                 crate::models::twin_event::CausalStream::LocalOnly,
                 source_channel,
                 vec![crate::services::twin_events::TargetMutation::tombstone(
@@ -1187,20 +1320,29 @@ impl KnowledgeStore {
                     target_key,
                 )],
                 Vec::new(),
-            ));
-            self.event_recorder
+            );
+            if let Some(expected) = expected {
+                mutation_plan = mutation_plan.expecting_authority(expected);
+            }
+            let mut plan = Some(mutation_plan);
+            let commit = self.event_recorder
                 .commit_planned_mutation(
                     crate::services::twin_events::MutationOrigin::Local,
                     &mut || Ok(plan.take()),
                 )
                 .map_err(anyhow::Error::new)?;
-            return Ok(());
+            self.remember_mutation_commit(&commit);
+            return Ok(commit);
         }
         let path = self.overlay_path(note_id);
         if path.exists() {
             std::fs::remove_file(path)?;
         }
-        Ok(())
+        Ok(crate::services::twin_events::MutationCommit {
+            mutation_id: None,
+            events: Vec::new(),
+            authority_token: None,
+        })
     }
 
     pub fn extract_wikilinks(&self, content: &str) -> Vec<String> {

@@ -137,6 +137,14 @@ impl CanvasStore {
         self.list_cache_ready = true;
     }
 
+    /// Drop every process-local Canvas snapshot so the next read is sourced
+    /// from durable bytes captured after the caller's authority ticket.
+    pub(crate) fn reload_authoritative_state(&mut self) {
+        self.session_cache.clear();
+        self.pending_bases.clear();
+        self.list_cache_ready = false;
+    }
+
     /// List all sessions (metadata only)
     pub fn list_sessions(&mut self) -> Result<Vec<SessionMeta>> {
         self.ensure_list_cache();
@@ -1010,6 +1018,33 @@ mod tests {
         assert_no_tmp_siblings(temp_dir.path());
     }
 
+    #[test]
+    fn authoritative_reload_discards_a_session_cached_before_a_peer_write() {
+        let temp_dir = tempdir().expect("temp dir should be created");
+        let mut store = CanvasStore::new(temp_dir.path().to_path_buf());
+        let session = store
+            .create_session(SessionCreate {
+                title: "Before".to_string(),
+                description: None,
+                tags: Vec::new(),
+            })
+            .unwrap();
+        assert_eq!(store.get_session(&session.id).unwrap().title, "Before");
+
+        let mut peer = CanvasStore::new(temp_dir.path().to_path_buf());
+        peer.update_session(
+            &session.id,
+            crate::models::canvas::SessionUpdate {
+                title: Some("After".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        store.reload_authoritative_state();
+        assert_eq!(store.get_session(&session.id).unwrap().title, "After");
+    }
+
     fn build_response(model_id: &str) -> ModelResponse {
         ModelResponse {
             model_id: model_id.to_string(),
@@ -1589,6 +1624,15 @@ mod tests {
             } else {
                 assert_eq!(episode.prediction_status.as_deref(), Some("failed"));
                 assert!(episode.twin_prediction.is_none());
+                let after_failure = coordinator.current_authority_token().unwrap();
+                let duplicate = twin
+                    .mark_twin_prediction_failed_expecting_authority(
+                        &episode_id,
+                        after_failure.clone(),
+                    )
+                    .unwrap();
+                assert!(duplicate.authority_token.is_none());
+                assert_eq!(coordinator.current_authority_token().unwrap(), after_failure);
             }
         }
     }

@@ -337,7 +337,12 @@ fn resume_legacy_assignment(
         let destination = format!("{scope_key}/{component}");
         let destination_exists = root.directory_exists(&destination)?;
         match (was_initial, was_moved, *source_exists, destination_exists) {
-            (false, _, false, _) | (true, true, false, true) => {}
+            (false, _, false, false) | (true, true, false, true) => {}
+            (false, _, false, true) => {
+                return Err(MutationError::RecoveryConflict(format!(
+                    "legacy-derived-state-collision-{component}"
+                )));
+            }
             (false, _, true, _) => {
                 return Err(MutationError::RecoveryConflict(
                     "legacy-derived-state-appeared-after-assignment".into(),
@@ -570,6 +575,45 @@ mod tests {
         assert_eq!(
             std::fs::read(scoped.join("chunk_index/sentinel")).unwrap(),
             b"scoped"
+        );
+        lock.unlock().unwrap();
+    }
+
+    #[test]
+    fn legacy_assignment_resume_rejects_destination_absent_from_initial_set() {
+        let (_temp, data, lease) = fixture();
+        let root = AnchoredRoot::open(&data).unwrap();
+        root.open_directory(&scope_key(&lease.root_scope), true)
+            .unwrap();
+        write_assignment(
+            &root,
+            &LegacyAssignmentV1 {
+                schema_version: LEGACY_ASSIGNMENT_SCHEMA_VERSION,
+                root_scope: lease.root_scope.clone(),
+                state: LegacyAssignmentState::Prepared,
+                initial_components: vec!["search_index".into()],
+                moved_components: vec!["search_index".into()],
+            },
+        )
+        .unwrap();
+        root.open_directory(
+            &format!("{}/search_index", scope_key(&lease.root_scope)),
+            true,
+        )
+        .unwrap();
+        root.open_directory(
+            &format!("{}/chunk_index", scope_key(&lease.root_scope)),
+            true,
+        )
+        .unwrap();
+
+        let lock = acquire_shared_coordinator_process_lock(&data).unwrap();
+        let error = initialize_locked(&data, &lease, &lock).unwrap_err();
+
+        assert!(error.to_string().contains("collision"));
+        assert_eq!(
+            read_assignment(&root).unwrap().unwrap().state,
+            LegacyAssignmentState::Prepared
         );
         lock.unlock().unwrap();
     }

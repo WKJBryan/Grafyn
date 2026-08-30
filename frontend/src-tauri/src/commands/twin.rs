@@ -11,6 +11,25 @@ use crate::models::twin::{
 use crate::AppState;
 use tauri::State;
 
+async fn run_twin_mutation<T>(
+    state: &AppState,
+    operation_name: &str,
+    operation: impl FnOnce(&mut crate::services::twin::TwinStore) -> anyhow::Result<T>,
+) -> Result<T, String> {
+    let _root_epoch = crate::commands::acquire_root_epoch(state).await?;
+    let (result, commit) = {
+        let mut store = state.twin_store.write().await;
+        store.clear_last_mutation_commit();
+        let result = operation(&mut store).map_err(|error| error.to_string());
+        let commit = store.take_last_mutation_commit();
+        (result, commit)
+    };
+    if let Some(commit) = commit {
+        crate::commands::repair_after_authority_mutation(state, &commit, operation_name).await;
+    }
+    result
+}
+
 #[tauri::command]
 pub async fn list_user_records(state: State<'_, AppState>) -> Result<Vec<UserRecord>, String> {
     let root_ticket = crate::commands::acquire_root_epoch(state.inner()).await?;
@@ -46,11 +65,10 @@ pub async fn create_user_record(
     record: UserRecordCreate,
     state: State<'_, AppState>,
 ) -> Result<UserRecord, String> {
-    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
-    let mut store = state.twin_store.write().await;
-    store
-        .create_user_record(record)
-        .map_err(|error| error.to_string())
+    run_twin_mutation(state.inner(), "user record create", move |store| {
+        store.create_user_record(record)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -59,11 +77,10 @@ pub async fn update_user_record(
     update: UserRecordUpdate,
     state: State<'_, AppState>,
 ) -> Result<UserRecord, String> {
-    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
-    let mut store = state.twin_store.write().await;
-    store
-        .update_user_record(&id, update)
-        .map_err(|error| error.to_string())
+    run_twin_mutation(state.inner(), "user record update", move |store| {
+        store.update_user_record(&id, update)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -86,11 +103,10 @@ pub async fn get_session_trace(
 pub async fn run_twin_inference(
     state: State<'_, AppState>,
 ) -> Result<TwinInferenceRunSummary, String> {
-    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
-    let mut store = state.twin_store.write().await;
-    store
-        .run_twin_inference()
-        .map_err(|error| error.to_string())
+    run_twin_mutation(state.inner(), "Twin inference", |store| {
+        store.run_twin_inference()
+    })
+    .await
 }
 
 #[tauri::command]
@@ -127,11 +143,10 @@ pub async fn set_user_record_promotion(
     rationale: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<UserRecord, String> {
-    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
-    let mut store = state.twin_store.write().await;
-    store
-        .set_user_record_promotion(&id, promotion_state, rationale)
-        .map_err(|error| error.to_string())
+    run_twin_mutation(state.inner(), "user record review", move |store| {
+        store.set_user_record_promotion(&id, promotion_state, rationale)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -171,10 +186,13 @@ pub async fn update_decision_outcome(
     update: DecisionOutcomeUpdate,
     state: State<'_, AppState>,
 ) -> Result<DecisionEpisode, String> {
-    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
+    let root_ticket = crate::commands::acquire_root_epoch(state.inner()).await?;
     let selected_response_id = if let Some(selected) = update.selected_response.as_ref() {
         let session_id = {
-            let store = state.twin_store.read().await;
+            let mut store = state.twin_store.write().await;
+            store
+                .rebuild_mutation_caches()
+                .map_err(|error| error.to_string())?;
             store
                 .get_decision_episode(&id)
                 .map_err(|error| error.to_string())?
@@ -182,6 +200,7 @@ pub async fn update_decision_outcome(
         };
         let session = {
             let mut canvas = state.canvas_store.write().await;
+            canvas.reload_authoritative_state();
             canvas
                 .get_session(&session_id)
                 .map_err(|error| error.to_string())?
@@ -193,10 +212,27 @@ pub async fn update_decision_outcome(
     } else {
         None
     };
-    let mut store = state.twin_store.write().await;
-    store
-        .update_decision_outcome_with_response_id(&id, update, selected_response_id)
-        .map_err(|error| error.to_string())
+    root_ticket.validate(state.inner()).await?;
+    let (result, commit) = {
+        let mut store = state.twin_store.write().await;
+        store.clear_last_mutation_commit();
+        let result = store
+            .update_decision_outcome_with_response_id(&id, update, selected_response_id)
+            .map_err(|error| error.to_string());
+        (result, store.take_last_mutation_commit())
+    };
+    if let Some(commit) = commit {
+        drop(root_ticket);
+        crate::commands::repair_after_authority_mutation(
+            state.inner(),
+            &commit,
+            "decision outcome update",
+        )
+        .await;
+    } else {
+        root_ticket.finish(state.inner()).await?;
+    }
+    result
 }
 
 fn resolve_persisted_response_id(
@@ -233,36 +269,30 @@ pub async fn update_decision_mirror_config(
     update: DecisionMirrorConfigUpdate,
     state: State<'_, AppState>,
 ) -> Result<DecisionMirrorConfig, String> {
-    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
-    // Read-modify-write over the config file: must hold the write lock so two
-    // concurrent updates can't both read the same on-disk state and have the
-    // second writer silently clobber the first's change.
-    let mut store = state.twin_store.write().await;
-    store
-        .update_decision_mirror_config(update)
-        .map_err(|error| error.to_string())
+    run_twin_mutation(state.inner(), "decision mirror config update", move |store| {
+        store.update_decision_mirror_config(update)
+    })
+    .await
 }
 
 #[tauri::command]
 pub async fn reset_decision_mirror_config(
     state: State<'_, AppState>,
 ) -> Result<DecisionMirrorConfig, String> {
-    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
-    let mut store = state.twin_store.write().await;
-    store
-        .reset_decision_mirror_config()
-        .map_err(|error| error.to_string())
+    run_twin_mutation(state.inner(), "decision mirror config reset", |store| {
+        store.reset_decision_mirror_config()
+    })
+    .await
 }
 
 #[tauri::command]
 pub async fn list_memory_digest(
     state: State<'_, AppState>,
 ) -> Result<Vec<MemoryDigestItem>, String> {
-    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
-    let mut store = state.twin_store.write().await;
-    store
-        .list_memory_digest()
-        .map_err(|error| error.to_string())
+    run_twin_mutation(state.inner(), "memory digest refresh", |store| {
+        store.list_memory_digest()
+    })
+    .await
 }
 
 #[tauri::command]
@@ -271,11 +301,10 @@ pub async fn review_memory_digest_item(
     request: MemoryDigestReviewRequest,
     state: State<'_, AppState>,
 ) -> Result<MemoryDigestItem, String> {
-    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
-    let mut store = state.twin_store.write().await;
-    store
-        .review_memory_digest_item(&id, request)
-        .map_err(|error| error.to_string())
+    run_twin_mutation(state.inner(), "memory digest review", move |store| {
+        store.review_memory_digest_item(&id, request)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -298,13 +327,10 @@ pub async fn create_constitution_item(
     item: ConstitutionItemCreate,
     state: State<'_, AppState>,
 ) -> Result<ConstitutionItem, String> {
-    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
-    // Write lock: create_constitution_item does a read-modify-write file
-    // sequence (see update_decision_mirror_config above for why read() is unsafe here).
-    let mut store = state.twin_store.write().await;
-    store
-        .create_constitution_item(item)
-        .map_err(|error| error.to_string())
+    run_twin_mutation(state.inner(), "constitution item create", move |store| {
+        store.create_constitution_item(item)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -313,15 +339,10 @@ pub async fn update_constitution_item(
     update: ConstitutionItemUpdate,
     state: State<'_, AppState>,
 ) -> Result<ConstitutionItem, String> {
-    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
-    // Write lock: update_constitution_item reads the current item file, applies the
-    // update, then writes it back. Two concurrent updates to the same item under a
-    // shared read lock could both read the pre-update file and the second writer
-    // would silently clobber the first's change.
-    let mut store = state.twin_store.write().await;
-    store
-        .update_constitution_item(&id, update)
-        .map_err(|error| error.to_string())
+    run_twin_mutation(state.inner(), "constitution item update", move |store| {
+        store.update_constitution_item(&id, update)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -330,11 +351,10 @@ pub async fn review_constitution_item(
     request: ConstitutionReviewRequest,
     state: State<'_, AppState>,
 ) -> Result<ConstitutionItem, String> {
-    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
-    let mut store = state.twin_store.write().await;
-    store
-        .review_constitution_item(&id, request)
-        .map_err(|error| error.to_string())
+    run_twin_mutation(state.inner(), "constitution item review", move |store| {
+        store.review_constitution_item(&id, request)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -354,11 +374,10 @@ pub async fn review_action_gap(
     request: ConstitutionReviewRequest,
     state: State<'_, AppState>,
 ) -> Result<ActionGap, String> {
-    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
-    let mut store = state.twin_store.write().await;
-    store
-        .review_action_gap(&id, request)
-        .map_err(|error| error.to_string())
+    run_twin_mutation(state.inner(), "action gap review", move |store| {
+        store.review_action_gap(&id, request)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -381,11 +400,10 @@ pub async fn save_constitution_setup(
     setup: ConstitutionSetup,
     state: State<'_, AppState>,
 ) -> Result<ConstitutionSetup, String> {
-    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
-    let mut store = state.twin_store.write().await;
-    store
-        .save_constitution_setup(setup)
-        .map_err(|error| error.to_string())
+    run_twin_mutation(state.inner(), "constitution setup save", move |store| {
+        store.save_constitution_setup(setup)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -397,10 +415,23 @@ pub async fn run_constitution_inference(
         let store = state.knowledge_store.read().await;
         store.list_full_notes().map_err(|error| error.to_string())?
     };
-    let mut store = state.twin_store.write().await;
-    store
-        .run_constitution_inference_with_notes(&notes)
-        .map_err(|error| error.to_string())
+    let (result, commit) = {
+        let mut store = state.twin_store.write().await;
+        store.clear_last_mutation_commit();
+        let result = store
+            .run_constitution_inference_with_notes(&notes)
+            .map_err(|error| error.to_string());
+        (result, store.take_last_mutation_commit())
+    };
+    if let Some(commit) = commit {
+        crate::commands::repair_after_authority_mutation(
+            state.inner(),
+            &commit,
+            "constitution inference",
+        )
+        .await;
+    }
+    result
 }
 
 #[tauri::command]
@@ -409,18 +440,36 @@ pub async fn record_canvas_feedback(
     request: CanvasFeedbackRequest,
     state: State<'_, AppState>,
 ) -> Result<CanvasFeedbackResult, String> {
-    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
+    let root_ticket = crate::commands::acquire_root_epoch(state.inner()).await?;
     let session = {
         let mut canvas_store = state.canvas_store.write().await;
+        canvas_store.reload_authoritative_state();
         canvas_store
             .get_session(&session_id)
             .map_err(|error| error.to_string())?
     };
+    root_ticket.validate(state.inner()).await?;
 
-    let mut twin_store = state.twin_store.write().await;
-    twin_store
-        .record_canvas_feedback(&session, request)
-        .map_err(|error| error.to_string())
+    let (result, commit) = {
+        let mut twin_store = state.twin_store.write().await;
+        twin_store.clear_last_mutation_commit();
+        let result = twin_store
+            .record_canvas_feedback(&session, request)
+            .map_err(|error| error.to_string());
+        (result, twin_store.take_last_mutation_commit())
+    };
+    if let Some(commit) = commit {
+        drop(root_ticket);
+        crate::commands::repair_after_authority_mutation(
+            state.inner(),
+            &commit,
+            "Canvas feedback",
+        )
+        .await;
+    } else {
+        root_ticket.finish(state.inner()).await?;
+    }
+    result
 }
 
 #[cfg(test)]

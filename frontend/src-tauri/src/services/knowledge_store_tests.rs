@@ -742,6 +742,43 @@ fn coordinated_overlay_write_invalidates_authority_without_emitting_an_event() {
 }
 
 #[test]
+fn optimizer_overlay_aborts_before_publication_when_its_source_authority_is_stale() {
+    let root = tempdir().unwrap();
+    let vault = root.path().join("vault");
+    let data = root.path().join("data");
+    std::fs::create_dir(&vault).unwrap();
+    std::fs::create_dir(&data).unwrap();
+    let events = std::sync::Arc::new(crate::services::twin_events::TwinEventStore::new(&data));
+    events.initialize().unwrap();
+    let coordinator = std::sync::Arc::new(
+        crate::services::twin_events::MutationCoordinator::new(
+            &data,
+            &vault,
+            events,
+            std::sync::Arc::new(crate::services::twin_events::NoopMutationLifecycle),
+        )
+        .unwrap(),
+    );
+    let stale = coordinator.current_authority_token().unwrap();
+    let scoped = crate::services::vault_namespace::scoped_data_path(&data, &stale.root_scope);
+    let mut store = KnowledgeStore::with_event_recorder(vault, scoped, coordinator.clone());
+    store
+        .create_note(task_seven_note_create("Peer", "changed", "peer.md"))
+        .unwrap();
+
+    let error = store
+        .write_overlay_from_source_expecting_authority(
+            "captured-overlay",
+            &serde_json::json!({"aliases": ["Must not land"]}),
+            "vault_optimizer",
+            stale,
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("authority"));
+    assert!(!store.overlay_path("captured-overlay").exists());
+}
+
+#[test]
 fn validate_note_id_rejects_colon_variants() {
     assert!(
         KnowledgeStore::validate_note_id("C:foo").is_err(),

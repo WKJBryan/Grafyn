@@ -1,4 +1,4 @@
-use crate::commands::{commit_note_write, commit_note_writes, sync_chunk_index_for_note};
+use crate::commands::sync_chunk_index_for_note;
 use crate::models::note::{
     DeduplicationAction, DistillRequest, DistillResponse, ExtractionMode, HubCreatePolicy,
     HubUpdate, NoteCreate, NoteStatus, NoteUpdate,
@@ -830,7 +830,6 @@ pub async fn distill_note(
     let hub_updates: Vec<HubUpdate>;
     let mut skipped_duplicates: usize = 0;
     let mut merged_into: Vec<String> = Vec::new();
-    let mut touched_ids: Vec<String> = Vec::new();
 
     for (i, candidate) in candidates.iter().enumerate() {
         // Check for duplicates
@@ -881,11 +880,10 @@ pub async fn distill_note(
                                 .ok()
                         };
 
-                        if let Some((updated_note, commit)) = updated {
+                        if let Some((_updated_note, commit)) = updated {
                             root_epoch = commit
                                 .authority_token
                                 .unwrap_or_else(|| root_epoch.clone());
-                            touched_ids.push(updated_note.id);
                         }
                     }
 
@@ -956,7 +954,6 @@ pub async fn distill_note(
             .authority_token
             .unwrap_or_else(|| root_epoch.clone());
 
-        touched_ids.push(created.id.clone());
         created_ids.push(created.id.clone());
     }
 
@@ -1008,11 +1005,10 @@ pub async fn distill_note(
                 .ok()
         };
 
-        if let Some((updated_note, commit)) = updated {
+        if let Some((_updated_note, commit)) = updated {
             root_epoch = commit
                 .authority_token
                 .unwrap_or_else(|| root_epoch.clone());
-            touched_ids.push(updated_note.id);
             true
         } else {
             false
@@ -1028,7 +1024,17 @@ pub async fn distill_note(
         .validate_authority_token(&root_epoch, false)
         .map_err(|error| error.to_string())?;
     drop(root_ticket);
-    let synced_notes = commit_note_writes(state.inner(), &touched_ids, "distill_note").await?;
+    let repair = crate::commands::repair_after_authority_token(
+        state.inner(),
+        &root_epoch,
+        "note distillation",
+    )
+    .await;
+    let synced_notes = {
+        let mut store = state.knowledge_store.write().await;
+        store.reload_authoritative_state();
+        store.list_full_notes().map_err(|error| error.to_string())?
+    };
     hub_updates = build_topic_hub_updates(&synced_notes, &created_ids, &existing_hub_ids);
 
     // 7. Build response message
@@ -1045,6 +1051,9 @@ pub async fn distill_note(
     }
     if let Some(fallback) = llm_fallback_msg {
         parts.push(fallback);
+    }
+    if let crate::commands::PostAuthorityRepair::Unavailable(warning) = repair {
+        parts.push(warning);
     }
     let message = parts.join(", ");
 
@@ -1066,7 +1075,8 @@ pub async fn normalize_tags(
     id: String,
     state: State<'_, AppState>,
 ) -> Result<crate::models::note::Note, String> {
-    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
+    let root_ticket = crate::commands::acquire_root_epoch(state.inner()).await?;
+    let root_epoch = root_ticket.authority().clone();
     // Get the note
     let note = {
         let store = state.knowledge_store.read().await;
@@ -1099,20 +1109,20 @@ pub async fn normalize_tags(
         ..Default::default()
     };
 
-    {
+    let (updated, commit) = {
         let mut store = state.knowledge_store.write().await;
-        store.update_note(&id, update).map_err(|e| e.to_string())?;
-    }
-
-    // Same reindex chokepoint as note create/update: a tag-only change is
-    // exactly the kind of edit `sync_topic_hubs` alone would previously miss
-    // (it only reindexes notes whose *hub* metadata changed), so this needs
-    // the full `commit_note_write` sequence too, not just `sync_topic_hubs`.
-    let synced_notes = commit_note_write(state.inner(), &id, "tags_normalized").await?;
-    synced_notes
-        .into_iter()
-        .find(|updated| updated.id == id)
-        .ok_or_else(|| "Updated note not found after topic sync".to_string())
+        store
+            .update_note_expecting_authority(&id, update, "note_editor", root_epoch)
+            .map_err(|e| e.to_string())?
+    };
+    drop(root_ticket);
+    let _ = crate::commands::repair_after_authority_mutation(
+        state.inner(),
+        &commit,
+        "tag normalization",
+    )
+    .await;
+    Ok(updated)
 }
 
 #[cfg(test)]

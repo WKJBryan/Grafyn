@@ -188,16 +188,11 @@ impl TwinStore {
                 }
                 Ok(Some(plan))
             };
-            let commit = match recorder.commit_planned_mutation(
+            let result = recorder.commit_planned_mutation(
                 crate::services::twin_events::MutationOrigin::Local,
                 &mut planner,
-            ) {
-                Ok(commit) => commit,
-                Err(error) => {
-                    self.invalidate_mutation_caches();
-                    return Err(anyhow::Error::new(error));
-                }
-            };
+            );
+            let commit = self.finish_mutation_commit(result)?;
             let (event, trace) = committed
                 .ok_or_else(|| anyhow::anyhow!("trace append was not planned"))?;
             self.cache_committed_trace(trace);

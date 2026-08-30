@@ -1,4 +1,4 @@
-use crate::commands::{commit_note_writes, enqueue_vault_optimizer_note};
+use crate::commands::enqueue_vault_optimizer_note;
 use crate::models::link_discovery::{
     DismissLinkSuggestionResponse, LinkDiscoveryStatus, LinkSuggestionQueueEntry,
 };
@@ -344,8 +344,12 @@ pub async fn apply_links(
             .validate_authority_token(&root_epoch, false)
             .map_err(|error| error.to_string())?;
         drop(root_guard);
-        let dirty_ids: Vec<String> = dirty_note_ids.iter().cloned().collect();
-        commit_note_writes(state.inner(), &dirty_ids, "links_applied").await?;
+        let _ = crate::commands::repair_after_authority_token(
+            state.inner(),
+            &root_epoch,
+            "applied note links",
+        )
+        .await;
     }
 
     Ok(ApplyLinksResponse {
@@ -439,8 +443,12 @@ pub async fn create_link(
             .validate_authority_token(&root_epoch, false)
             .map_err(|error| error.to_string())?;
         drop(root_ticket);
-        let dirty_ids: Vec<String> = dirty_note_ids.iter().cloned().collect();
-        commit_note_writes(state.inner(), &dirty_ids, "link_created").await?;
+        let _ = crate::commands::repair_after_authority_token(
+            state.inner(),
+            &root_epoch,
+            "created note link",
+        )
+        .await;
     }
 
     Ok(CreateLinkResponse {

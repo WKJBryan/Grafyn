@@ -98,9 +98,6 @@ async fn apply_settings_update_inner(
         return Err("Knowledge and durable settings roots disagree; restart required".into());
     }
     let old_twin = twin.root_path().to_path_buf();
-    let old_notes = knowledge
-        .list_full_notes()
-        .map_err(|error| error.to_string())?;
     let data_path = twin
         .target_root_path()
         .parent()
@@ -208,6 +205,7 @@ async fn apply_settings_update_inner(
                     .capture_authority_token(&transition.after.lease)
                     .map_err(|error| error.to_string())?,
             );
+            knowledge.reload_authoritative_state();
             twin.rebuild_mutation_caches()
                 .map_err(|error| error.to_string())?;
             let new_notes = knowledge
@@ -336,9 +334,13 @@ async fn apply_settings_update_inner(
                     let rebuilt_token = root_guard
                         .capture_authority_token(&transition.rollback_lease)
                         .map_err(|error| error.to_string())?;
+                    knowledge.reload_authoritative_state();
                     twin.rebuild_mutation_caches()
                         .map_err(|error| error.to_string())?;
-                    rebuild_indexes_from_notes(state, &old_namespace, &old_notes).await?;
+                    let restored_notes = knowledge
+                        .list_full_notes()
+                        .map_err(|error| error.to_string())?;
+                    rebuild_indexes_from_notes(state, &old_namespace, &restored_notes).await?;
                     root_guard
                         .publish_namespace_ready(&rebuilt_token)
                         .map_err(|error| error.to_string())?;
@@ -403,6 +405,7 @@ async fn apply_settings_update_inner(
                     let rebuilt_token = root_guard
                         .capture_authority_token(&transition.after.lease)
                         .map_err(|error| error.to_string())?;
+                    knowledge.reload_authoritative_state();
                     twin.rebuild_mutation_caches()
                         .map_err(|error| error.to_string())?;
                     let new_notes = knowledge
@@ -487,9 +490,13 @@ async fn apply_settings_update_inner(
                 let rebuilt_token = root_guard
                     .capture_authority_token(&transition.rollback_lease)
                     .map_err(|error| error.to_string())?;
+                knowledge.reload_authoritative_state();
                 twin.rebuild_mutation_caches()
                     .map_err(|error| error.to_string())?;
-                rebuild_indexes_from_notes(state, &old_namespace, &old_notes).await?;
+                let restored_notes = knowledge
+                    .list_full_notes()
+                    .map_err(|error| error.to_string())?;
+                rebuild_indexes_from_notes(state, &old_namespace, &restored_notes).await?;
                 root_guard
                     .publish_namespace_ready(&rebuilt_token)
                     .map_err(|error| error.to_string())?;
@@ -769,28 +776,94 @@ pub async fn get_openrouter_status(state: State<'_, AppState>) -> Result<OpenRou
     })
 }
 
+#[derive(Clone, PartialEq)]
+struct OllamaRequestAuthority {
+    root: crate::services::vault_namespace::VaultAuthorityTokenV1,
+    settings_base_url: String,
+    settings_model: String,
+    runtime_base_url: String,
+}
+
+async fn capture_ollama_request_authority(state: &AppState) -> Result<OllamaRequestAuthority, String> {
+    let ticket = crate::commands::acquire_root_epoch(state).await?;
+    let (settings_base_url, settings_model) = {
+        let settings = state.settings_service.read().await;
+        (
+            settings.get().ollama_base_url.clone(),
+            settings.get().ollama_model.clone(),
+        )
+    };
+    let runtime_base_url = state.ollama.read().await.base_url().to_string();
+    let authority = OllamaRequestAuthority {
+        root: ticket.authority().clone(),
+        settings_base_url,
+        settings_model,
+        runtime_base_url,
+    };
+    ticket.finish(state).await?;
+    Ok(authority)
+}
+
+async fn finish_ollama_request_authority(
+    state: &AppState,
+    expected: &OllamaRequestAuthority,
+) -> Result<(), String> {
+    let ticket = crate::commands::acquire_expected_root_epoch(state, &expected.root)
+        .await
+        .map_err(|_| "Grafyn authority changed while the Ollama request was running".to_string())?;
+    let current = capture_ollama_request_authority_without_gate(state, expected.root.clone()).await;
+    if &current != expected {
+        return Err("Grafyn authority changed while the Ollama request was running".into());
+    }
+    ticket
+        .finish(state)
+        .await
+        .map_err(|_| "Grafyn authority changed while the Ollama request was running".to_string())
+}
+
+async fn capture_ollama_request_authority_without_gate(
+    state: &AppState,
+    root: crate::services::vault_namespace::VaultAuthorityTokenV1,
+) -> OllamaRequestAuthority {
+    let (settings_base_url, settings_model) = {
+        let settings = state.settings_service.read().await;
+        (
+            settings.get().ollama_base_url.clone(),
+            settings.get().ollama_model.clone(),
+        )
+    };
+    let runtime_base_url = state.ollama.read().await.base_url().to_string();
+    OllamaRequestAuthority {
+        root,
+        settings_base_url,
+        settings_model,
+        runtime_base_url,
+    }
+}
+
 #[tauri::command]
 pub async fn get_ollama_status(state: State<'_, AppState>) -> Result<OllamaStatus, String> {
-    let root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
-    let selected_model = {
-        let settings = state.settings_service.read().await;
-        settings.get().ollama_model.clone()
-    };
-    drop(root_epoch);
-    let ollama = state.ollama.read().await;
-    ollama
+    let authority = capture_ollama_request_authority(state.inner()).await?;
+    let selected_model = authority.settings_model.clone();
+    let ollama = state.ollama.read().await.clone();
+    let result = ollama
         .status(Some(&selected_model))
         .await
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string());
+    finish_ollama_request_authority(state.inner(), &authority).await?;
+    result
 }
 
 #[tauri::command]
 pub async fn list_ollama_models(state: State<'_, AppState>) -> Result<Vec<AvailableModel>, String> {
-    let ollama = state.ollama.read().await;
-    ollama
+    let authority = capture_ollama_request_authority(state.inner()).await?;
+    let ollama = state.ollama.read().await.clone();
+    let result = ollama
         .list_models()
         .await
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string());
+    finish_ollama_request_authority(state.inner(), &authority).await?;
+    result
 }
 
 #[derive(serde::Serialize)]
@@ -1533,5 +1606,21 @@ mod tests {
             .is_none());
         assert_eq!(transition_store.recover().unwrap(), RecoveryWork::None);
         assert_eq!(transition_store.recover().unwrap(), RecoveryWork::None);
+    }
+
+    #[tokio::test]
+    async fn ollama_network_result_is_rejected_when_runtime_authority_changes() {
+        let (state, _root, _old_vault, _new_vault) = root_switch_state(false, false);
+        let before = capture_ollama_request_authority(&state).await.unwrap();
+        state
+            .ollama
+            .write()
+            .await
+            .set_base_url("http://127.0.0.1:22445".into());
+
+        let error = finish_ollama_request_authority(&state, &before)
+            .await
+            .unwrap_err();
+        assert!(error.contains("changed while the Ollama request was running"));
     }
 }
