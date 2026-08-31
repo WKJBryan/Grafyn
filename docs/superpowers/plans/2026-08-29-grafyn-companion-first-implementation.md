@@ -321,13 +321,15 @@ get_twin_event_timeline
 
 **Contract:** A transport-neutral crate seals and opens version-1 note-revision, Twin-event, attachment-manifest, and attachment-chunk operations. It verifies device identity, strict Ed25519 signature, XChaCha20-Poly1305 authentication, vault binding, canonical operation ID, and schema before returning plaintext.
 
-- [ ] Start with fixed keys/nonces and a failing golden-vector round trip.
-- [ ] Add tamper tests for protocol, vault, device, public key, nonce, ciphertext, signature, operation ID, and payload type; add wrong-key and JSON-field-order tests. Add manifest/chunk count, index, total size, duplicate chunk, full digest, and partial-materialization tests.
-- [ ] Use explicit length-prefix/domain-separated canonical bytes, HKDF-derived independent subkeys, `verify_strict`, and zeroizing secret containers.
-- [ ] Use `chacha20poly1305`, `ed25519-dalek`, `hkdf`, `hmac`, `sha2`, `getrandom`, `zeroize`, and `base64` versions that compile with pinned Rust. Do not enable legacy/hazmat features.
-- [ ] Document visible metadata, replay/DoS limits, exclusions, and protocol compatibility rules. Schema and golden vector must match generated types.
-- [ ] Run `cargo test --manifest-path crates/grafyn-sync-protocol/Cargo.toml`, `cargo audit` if installed, and the app's default/MCP compilation.
-- [ ] Commit: `feat: publish transport-neutral Grafyn sync protocol`
+- [x] Start with fixed keys/nonces and a failing golden-vector round trip.
+- [x] Add tamper tests for protocol, vault, device, public key, nonce, ciphertext, signature, operation ID, and payload type; add wrong-key and JSON-field-order tests. Add manifest/chunk count, index, total size, duplicate chunk, full digest, and partial-materialization tests.
+- [x] Use explicit length-prefix/domain-separated canonical bytes, HKDF-derived independent subkeys, `verify_strict`, and zeroizing secret containers.
+- [x] Use `chacha20poly1305`, `ed25519-dalek`, `hkdf`, `hmac`, `sha2`, `getrandom`, `zeroize`, and `base64` versions that compile with pinned Rust. Do not enable legacy/hazmat features.
+- [x] Document visible metadata, replay/DoS limits, exclusions, and protocol compatibility rules. Schema and golden vector must match generated types.
+- [x] Run `cargo test --manifest-path crates/grafyn-sync-protocol/Cargo.toml`, `cargo audit` if installed, and the app's default/MCP compilation.
+- [x] Commit: `feat: publish transport-neutral Grafyn sync protocol`
+
+**Verification (2026-08-31):** The protocol suite passed 20/20 (three unit tests, sixteen integration tests, and one compile-fail API doctest); strict all-target Clippy, scoped rustfmt, schema/canonical-Base64 probes, default application compilation, MCP compilation, and diff checks passed. `cargo audit` was not installed, so dependency auditing remains an explicit final-gate boundary. Independent security review found no cryptographic break and identified three important parser/log/schema differentials; bounded private-wire parsing, metadata-only debug formatting, and canonical Base64 schema patterns were implemented with regressions before commit.
 
 ## Task 11: Add stable vault/device identity and secure secret abstraction
 

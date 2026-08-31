@@ -241,6 +241,12 @@ Streaming commands: `send_prompt`, `start_debate`, `continue_debate`, `add_model
 
 **Canvas response costs and caching:** OpenRouter's final streaming usage chunk provides the exact `cost_usd` persisted on each `ModelResponse` and `DebateResponse`; legacy sessions have no cost and show no label. Canvas OpenRouter requests include a stable session-and-model identifier so OpenRouter can apply compatible provider-side prompt caching to follow-up context without changing model routing.
 
+### Public Encrypted Sync Protocol Foundation
+
+`frontend/src-tauri/crates/grafyn-sync-protocol` is a transport-neutral workspace crate licensed `Apache-2.0 OR MPL-2.0`. It defines strict version-1 encrypted envelopes for whole-note revisions, immutable Twin events, attachment manifests, and 256 KiB attachment chunks. Canonical domain-separated length-prefixed bytes feed HMAC-SHA-256 operation IDs; HKDF-SHA-256 derives independent per-vault/device XChaCha20-Poly1305 and operation-ID subkeys; Ed25519 signatures are verified strictly before decryption. The full routing identity and nonce are authenticated, decrypted operations are re-encoded byte-for-byte, and attachment output is withheld until every bounded chunk and the complete SHA-256 digest verify.
+
+Untrusted envelopes must enter through the raw-size-bounded `EnvelopeV1::from_json`/`from_json_bytes` boundary; generic Serde deserialization is intentionally unavailable. JSON fields and canonical Base64URL spellings are strict, secret wrappers zeroize and redact `Debug`, and plaintext-bearing types expose metadata/length-only debug output. The normative schema, golden vector, interoperability rules, visible relay metadata, and threat model live in `docs/sync/`. This is only the public protocol foundation: vault/device provisioning, a local sync engine, transport/relay, pairing/recovery/revocation, accounts, billing, and hosted operations do not yet exist and must not be represented as connected or available.
+
 ### Twin Identity, Constitution, And Decision Mirror
 
 Twin context mode is a native RAG path, not model-weight training. `frontend/src-tauri/src/commands/canvas/context.rs` assembles the model-facing prompt through `build_twin_context_prompt()`.
