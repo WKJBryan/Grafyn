@@ -90,6 +90,12 @@ bytes, retry rate, and retention time. The v1 crate caps each object but cannot 
 stream of individually valid objects. Relay quotas are an availability control, not a
 confidentiality guarantee.
 
+The current manual-transport foundation enforces hard operation, byte, per-device pending,
+attachment, staging, and quarantine bounds and fails closed when one is reached. It has no relay,
+acknowledgement protocol, unattended retry scheduler, or time-based ciphertext retention yet, so it
+does not claim retry-rate control or automatic expiry. Those controls belong to the later hosted
+relay/ack design; until then, bounded manual export/import is the only supported transport.
+
 ## Non-goals and residual risks
 
 - No protection from endpoint malware, unlocked-device access, screenshots, or user-authorized

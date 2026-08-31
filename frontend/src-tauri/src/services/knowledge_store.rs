@@ -56,6 +56,47 @@ struct OptimizerOverlaySourceV1 {
     sha256: crate::models::twin_event::ContentDigest,
 }
 
+#[derive(Deserialize)]
+struct NoteSyncFrontmatter {
+    #[serde(default)]
+    grafyn_sync: Option<String>,
+    #[serde(default)]
+    note_id: Option<String>,
+}
+
+pub(crate) fn note_allows_sync(markdown: &str) -> bool {
+    let starts_with_frontmatter = markdown
+        .lines()
+        .next()
+        .is_some_and(|line| line.trim_end() == "---");
+    let parsed = Matter::<YAML>::new().parse(markdown);
+    if parsed.matter.trim().is_empty() {
+        return !starts_with_frontmatter;
+    }
+    let Some(data) = parsed.data else {
+        return false;
+    };
+    let Ok(frontmatter) = data.deserialize::<NoteSyncFrontmatter>() else {
+        return false;
+    };
+    matches!(frontmatter.grafyn_sync.as_deref(), None | Some("inherit"))
+}
+
+pub(crate) fn note_identity_from_markdown(markdown: &str) -> Option<String> {
+    let parsed = Matter::<YAML>::new().parse(markdown);
+    parsed
+        .data?
+        .deserialize::<NoteSyncFrontmatter>()
+        .ok()?
+        .note_id
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+pub(crate) fn default_note_identity_for_relative_path(relative_path: &str) -> String {
+    slugify(relative_path)
+}
+
 /// Service for managing markdown notes with YAML frontmatter and migration overlays.
 #[derive(Clone)]
 pub struct KnowledgeStore {

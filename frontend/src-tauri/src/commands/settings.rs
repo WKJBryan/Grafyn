@@ -188,6 +188,7 @@ async fn apply_settings_update_inner(
 
     let mut commit_uncertain = false;
     let mut rebuilt_authority = None;
+    let mut prepared_sync_retarget = None;
     let result = async {
         transition_store
             .prepare_transition_cas_locked(root_guard.process_lock(), &durable_before, &transition)
@@ -195,6 +196,9 @@ async fn apply_settings_update_inner(
         transition_store
             .install_owned_candidate_vault_descriptor(&mut transition)
             .map_err(|error| error.to_string())?;
+        if transition.root_changed {
+            prepared_sync_retarget = prepare_sync_retarget(state, &candidate_vault)?;
+        }
         transition_store
             .checkpoint(crate::services::root_transition::RootTransitionFaultPoint::AfterPrepared)
             .map_err(|error| error.to_string())?;
@@ -226,6 +230,7 @@ async fn apply_settings_update_inner(
             root_guard
                 .adopt_durable_root(&candidate_vault, &transition.after.lease)
                 .map_err(|error| error.to_string())?;
+            activate_sync_retarget(state, prepared_sync_retarget.take())?;
             transition_store
                 .checkpoint(crate::services::root_transition::RootTransitionFaultPoint::AfterLease)
                 .map_err(|error| error.to_string())?;
@@ -376,9 +381,11 @@ async fn apply_settings_update_inner(
                 Ok(crate::services::root_transition::RecoveryWork::RolledBack) => {
                     async {
                         *state.loaded_authority.write().await = None;
+                        let prepared_sync = prepare_sync_retarget(state, &old_vault)?;
                         root_guard
                             .adopt_durable_root(&old_vault, &transition.rollback_lease)
                             .map_err(|error| error.to_string())?;
+                        activate_sync_retarget(state, prepared_sync)?;
                         let old_namespace = root_guard
                             .initialize_namespace(&transition.rollback_lease)
                             .map_err(|error| error.to_string())?;
@@ -455,9 +462,11 @@ async fn apply_settings_update_inner(
                 Ok(crate::services::root_transition::RecoveryWork::RolledForward) => {
                     async {
                         *state.loaded_authority.write().await = None;
+                        let prepared_sync = prepare_sync_retarget(state, &candidate_vault)?;
                         root_guard
                             .adopt_durable_root(&candidate_vault, &transition.after.lease)
                             .map_err(|error| error.to_string())?;
+                        activate_sync_retarget(state, prepared_sync)?;
                         let candidate_namespace = root_guard
                             .initialize_namespace(&transition.after.lease)
                             .map_err(|error| error.to_string())?;
@@ -556,9 +565,11 @@ async fn apply_settings_update_inner(
             let durable_rollback = transition_store.restore_prepared_authorities(&transition);
             let runtime_rollback = async {
                 *state.loaded_authority.write().await = None;
+                let prepared_sync = prepare_sync_retarget(state, &old_vault)?;
                 root_guard
                     .adopt_durable_root(&old_vault, &transition.rollback_lease)
                     .map_err(|error| error.to_string())?;
+                activate_sync_retarget(state, prepared_sync)?;
                 let old_namespace = root_guard
                     .initialize_namespace(&transition.rollback_lease)
                     .map_err(|error| error.to_string())?;
@@ -654,6 +665,36 @@ async fn apply_settings_update_inner(
         return Err(error);
     }
     result
+}
+
+fn prepare_sync_retarget(
+    state: &AppState,
+    vault_path: &std::path::Path,
+) -> Result<Option<crate::services::sync::engine::PreparedSyncRetarget>, String> {
+    state
+        .sync_engine
+        .as_ref()
+        .map(|engine| {
+            engine
+                .prepare_retarget(vault_path)
+                .map_err(|error| error.to_string())
+        })
+        .transpose()
+}
+
+fn activate_sync_retarget(
+    state: &AppState,
+    prepared: Option<crate::services::sync::engine::PreparedSyncRetarget>,
+) -> Result<(), String> {
+    let Some(prepared) = prepared else {
+        return Ok(());
+    };
+    state
+        .sync_engine
+        .as_ref()
+        .ok_or_else(|| "sync engine disappeared during vault transition".to_string())?
+        .activate_retarget(prepared)
+        .map_err(|error| error.to_string())
 }
 
 fn plan_stable_candidate_vault_identity(
@@ -1195,24 +1236,48 @@ mod tests {
         std::fs::create_dir(&data).unwrap();
         let events = Arc::new(crate::services::twin_events::TwinEventStore::new(&data));
         events.initialize().unwrap();
-        let lifecycle = Arc::new(crate::services::twin_events::NoopMutationLifecycle);
-        let coordinator = Arc::new(if stable {
-            crate::services::twin_events::MutationCoordinator::new_stable(
-                &data,
-                &old_vault,
-                events.clone(),
-                lifecycle,
-            )
-            .unwrap()
+        let (coordinator, sync_engine) = if stable {
+            let identity =
+                crate::services::sync::identity::load_or_create_vault_identity(&old_vault).unwrap();
+            let secret_store =
+                Arc::new(crate::services::sync::secrets::MemorySecretStore::default());
+            let sync_engine = Arc::new(
+                crate::services::sync::engine::SyncEngine::open_core(
+                    &data,
+                    &old_vault,
+                    identity,
+                    None,
+                    secret_store.clone(),
+                    events.clone(),
+                )
+                .unwrap(),
+            );
+            let coordinator = Arc::new(
+                crate::services::twin_events::MutationCoordinator::new_stable(
+                    &data,
+                    &old_vault,
+                    events.clone(),
+                    sync_engine.clone(),
+                )
+                .unwrap(),
+            );
+            let device = coordinator
+                .load_or_create_device_signing_identity(secret_store)
+                .unwrap();
+            sync_engine.attach_device_identity(device).unwrap();
+            (coordinator, Some(sync_engine))
         } else {
-            crate::services::twin_events::MutationCoordinator::new(
-                &data,
-                &old_vault,
-                events.clone(),
-                lifecycle,
-            )
-            .unwrap()
-        });
+            let coordinator = Arc::new(
+                crate::services::twin_events::MutationCoordinator::new(
+                    &data,
+                    &old_vault,
+                    events.clone(),
+                    Arc::new(crate::services::twin_events::NoopMutationLifecycle),
+                )
+                .unwrap(),
+            );
+            (coordinator, None)
+        };
         let lease = coordinator.current_root_epoch().unwrap();
         let derived_data = coordinator.current_namespace_path().unwrap();
         let user_settings = UserSettings {
@@ -1326,6 +1391,7 @@ mod tests {
             })),
             twin_event_store: events,
             mutation_coordinator: Some(coordinator),
+            sync_engine,
             mutation_startup_error: Arc::new(RwLock::new(None)),
             loaded_authority: Arc::new(RwLock::new(Some(loaded_authority))),
             authority_repair: Arc::new(tokio::sync::Mutex::new(())),
@@ -1447,6 +1513,7 @@ mod tests {
             )),
             twin_event_store: events,
             mutation_coordinator: None,
+            sync_engine: None,
             mutation_startup_error: Arc::new(RwLock::new(Some(
                 "configured stable vault is unavailable".into(),
             ))),
@@ -1489,6 +1556,15 @@ mod tests {
 
         assert_eq!(
             std::fs::canonicalize(state.knowledge_store.read().await.vault_path()).unwrap(),
+            std::fs::canonicalize(vault_path).unwrap()
+        );
+        assert_eq!(
+            state
+                .sync_engine
+                .as_ref()
+                .unwrap()
+                .active_vault_path()
+                .unwrap(),
             std::fs::canonicalize(vault_path).unwrap()
         );
         assert_eq!(state.twin_event_store.events_dir(), expected_events);

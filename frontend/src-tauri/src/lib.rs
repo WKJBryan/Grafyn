@@ -5,6 +5,8 @@ pub mod models;
 pub mod services;
 
 use models::boot::BootStatus;
+#[cfg(test)]
+use services::twin_events::NoopMutationLifecycle;
 use services::{
     canvas_store::CanvasStore,
     chunk_index::ChunkIndex,
@@ -20,11 +22,9 @@ use services::{
     retrieval::RetrievalService,
     search::SearchService,
     settings::SettingsService,
+    sync::engine::SyncEngine,
     twin::TwinStore,
-    twin_events::{
-        EventRecorder, MutationCoordinator, NoopMutationLifecycle, TwinEventStore,
-        UnavailableEventRecorder,
-    },
+    twin_events::{EventRecorder, MutationCoordinator, TwinEventStore, UnavailableEventRecorder},
     vault_optimizer::{OptimizerTick, VaultOptimizerService},
 };
 use std::sync::Arc;
@@ -52,6 +52,7 @@ pub struct AppState {
     pub twin_store: Arc<RwLock<TwinStore>>,
     pub twin_event_store: Arc<TwinEventStore>,
     pub mutation_coordinator: Option<Arc<MutationCoordinator>>,
+    pub(crate) sync_engine: Option<Arc<SyncEngine>>,
     pub mutation_startup_error: Arc<RwLock<Option<String>>>,
     pub(crate) loaded_authority:
         Arc<RwLock<Option<crate::services::vault_namespace::VaultAuthorityTokenV1>>>,
@@ -221,6 +222,80 @@ fn initialize_attached_namespace(
     Ok((path, lease.root_scope))
 }
 
+struct MutationStartupRuntime {
+    coordinator: Arc<MutationCoordinator>,
+    sync_engine: Arc<SyncEngine>,
+}
+
+fn initialize_stable_mutation_runtime(
+    data_path: impl AsRef<std::path::Path>,
+    vault_path: impl AsRef<std::path::Path>,
+    twin_event_store: Arc<TwinEventStore>,
+    secret_store: Arc<dyn crate::services::sync::secrets::SecretStore>,
+) -> Result<MutationStartupRuntime, String> {
+    let data_path = data_path.as_ref();
+    let vault_path = vault_path.as_ref();
+    let identity = crate::services::sync::identity::load_or_create_vault_identity(vault_path)
+        .map_err(|error| error.to_string())?;
+    let root_key = crate::services::sync::vault_keys::load_vault_root_key(
+        secret_store.as_ref(),
+        &identity.descriptor.vault_id().to_string(),
+    )
+    .map_err(|error| error.to_string())?;
+    let sync_engine = Arc::new(
+        SyncEngine::open_core(
+            data_path,
+            vault_path,
+            identity,
+            root_key,
+            secret_store.clone(),
+            twin_event_store.clone(),
+        )
+        .map_err(|error| error.to_string())?,
+    );
+    let coordinator = Arc::new(
+        MutationCoordinator::new_stable(
+            data_path,
+            vault_path,
+            twin_event_store,
+            sync_engine.clone(),
+        )
+        .map_err(|error| error.to_string())?,
+    );
+    let device = coordinator
+        .load_or_create_device_signing_identity(secret_store)
+        .map_err(|error| error.to_string())?;
+    sync_engine
+        .attach_device_identity(device)
+        .map_err(|error| error.to_string())?;
+    coordinator
+        .recover_pending()
+        .map_err(|error| error.to_string())?;
+    Ok(MutationStartupRuntime {
+        coordinator,
+        sync_engine,
+    })
+}
+
+fn bootstrap_sync_engine_before_service(
+    sync_engine: Option<&Arc<SyncEngine>>,
+    coordinator: Option<&Arc<MutationCoordinator>>,
+    knowledge_store: &KnowledgeStore,
+) -> Result<(), String> {
+    if let Some(sync_engine) = sync_engine {
+        let coordinator = coordinator.ok_or_else(|| {
+            "sync engine is unavailable without its mutation coordinator".to_string()
+        })?;
+        sync_engine
+            .recover_pending_inbox(coordinator)
+            .map_err(|error| error.to_string())?;
+        sync_engine
+            .bootstrap_existing_vault(coordinator, knowledge_store)
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
 fn build_app_state(
     mut settings_service: SettingsService,
     committed_warning_app: Option<tauri::AppHandle>,
@@ -282,33 +357,30 @@ fn build_app_state(
             None => TwinEventStore::new(data_path.clone()),
         }
     });
-    let coordinator = (|| -> Result<Arc<MutationCoordinator>, String> {
+    let mutation_runtime = (|| -> Result<MutationStartupRuntime, String> {
         let runtime_vault_path = runtime_vault_path.as_ref().map_err(Clone::clone)?;
-        let coordinator = Arc::new(
-            MutationCoordinator::new_stable(
-                &data_path,
-                runtime_vault_path.as_path(),
-                twin_event_store.clone(),
-                Arc::new(NoopMutationLifecycle),
-            )
-            .map_err(|error| error.to_string())?,
-        );
-        coordinator
-            .recover_pending()
-            .map_err(|error| error.to_string())?;
-        coordinator
-            .load_or_create_device_signing_identity(settings_service.secret_store())
-            .map_err(|error| error.to_string())?;
-        Ok(coordinator)
+        initialize_stable_mutation_runtime(
+            &data_path,
+            runtime_vault_path,
+            twin_event_store.clone(),
+            settings_service.secret_store(),
+        )
     })();
-    let (event_recorder, mutation_coordinator, mutation_startup_error): (
+    let (event_recorder, mutation_coordinator, sync_engine, mutation_startup_error): (
         Arc<dyn EventRecorder>,
         Option<Arc<MutationCoordinator>>,
+        Option<Arc<SyncEngine>>,
         Option<String>,
-    ) = match coordinator {
-        Ok(coordinator) => (coordinator.clone(), Some(coordinator), None),
+    ) = match mutation_runtime {
+        Ok(runtime) => (
+            runtime.coordinator.clone(),
+            Some(runtime.coordinator),
+            Some(runtime.sync_engine),
+            None,
+        ),
         Err(error) => (
             Arc::new(UnavailableEventRecorder::new(error.clone())),
+            None,
             None,
             Some(error),
         ),
@@ -344,6 +416,11 @@ fn build_app_state(
         derived_data_path.clone(),
         event_recorder.clone(),
     );
+    bootstrap_sync_engine_before_service(
+        sync_engine.as_ref(),
+        mutation_coordinator.as_ref(),
+        &knowledge_store,
+    )?;
     let graph_index = GraphIndex::new();
     let search_service = match SearchService::new(derived_data_path.clone()) {
         Ok(s) => s,
@@ -463,6 +540,7 @@ fn build_app_state(
         twin_store: Arc::new(RwLock::new(twin_store)),
         twin_event_store,
         mutation_coordinator,
+        sync_engine,
         mutation_startup_error: Arc::new(RwLock::new(mutation_startup_error)),
         loaded_authority: Arc::new(RwLock::new(None)),
         authority_repair: Arc::new(tokio::sync::Mutex::new(())),
@@ -728,6 +806,13 @@ async fn warm_start_services_inner_with_gap(
         .mutation_coordinator
         .as_ref()
         .ok_or_else(|| "mutation coordinator is unavailable".to_string())?;
+    let recovered_sync_authority = state
+        .sync_engine
+        .as_ref()
+        .map(|engine| engine.recover_pending_inbox(coordinator))
+        .transpose()
+        .map_err(|error| error.to_string())?
+        .and_then(|report| report.authority_token);
     let (namespace_lease, namespace_path) = {
         let namespace_guard = coordinator
             .begin_root_transition()
@@ -766,19 +851,21 @@ async fn warm_start_services_inner_with_gap(
     )
     .await;
 
-    warm_start_component(WarmStartComponent::Migration, injected_failure)?;
-    {
-        let migration = state.markdown_migration.read().await;
-        let mut store = state.knowledge_store.write().await;
-        migration
-            .backfill_legacy_grafyn_notes(&mut store)
-            .map_err(|error| error.to_string())?;
-    }
+    if recovered_sync_authority.is_none() {
+        warm_start_component(WarmStartComponent::Migration, injected_failure)?;
+        {
+            let migration = state.markdown_migration.read().await;
+            let mut store = state.knowledge_store.write().await;
+            migration
+                .backfill_legacy_grafyn_notes(&mut store)
+                .map_err(|error| error.to_string())?;
+        }
 
-    warm_start_component(WarmStartComponent::Overlay, injected_failure)?;
-    // Finish every authoritative normalization before selecting the rebuild
-    // generation. `sync_topic_hubs` may itself commit canonical Markdown.
-    crate::commands::sync_topic_hubs(state).await?;
+        warm_start_component(WarmStartComponent::Overlay, injected_failure)?;
+        // Finish every authoritative normalization before selecting the rebuild
+        // generation. `sync_topic_hubs` may itself commit canonical Markdown.
+        crate::commands::sync_topic_hubs(state).await?;
+    }
     maybe_publish_boot_phase(
         app_handle,
         state,
@@ -824,10 +911,22 @@ async fn warm_start_services_inner_with_gap(
     let expected = rebuild_guard
         .capture_authority_token(&current_lease)
         .map_err(|error| error.to_string())?;
+    if recovered_sync_authority
+        .as_ref()
+        .is_some_and(|recovered| recovered != &expected)
+    {
+        return Err("vault authority changed after pending sync recovery".into());
+    }
+    let repair_mode = if recovered_sync_authority.is_some() {
+        crate::commands::AuthorityRepairMode::RemoteSync
+    } else {
+        crate::commands::AuthorityRepairMode::Local
+    };
     crate::commands::rebuild_authority_with_retained_guard(
         &mut repair_guards,
         &rebuild_guard,
         &expected,
+        repair_mode,
         |step| {
             let component = match step {
                 crate::commands::AuthorityRepairStep::Normalized
@@ -1255,6 +1354,68 @@ mod tests {
         (settings, identity.root_scope)
     }
 
+    #[test]
+    fn provisioned_desktop_startup_promotes_local_markdown_to_the_sync_outbox() {
+        let temp = tempfile::tempdir().unwrap();
+        let vault_path = temp.path().join("vault");
+        std::fs::create_dir(&vault_path).unwrap();
+        let identity =
+            crate::services::sync::identity::load_or_create_vault_identity(&vault_path).unwrap();
+        let root_scope = identity.root_scope.clone();
+        let durable_settings = crate::models::settings::UserSettings {
+            vault_path: Some(vault_path.to_string_lossy().into_owned()),
+            ..crate::models::settings::UserSettings::default()
+        };
+        let settings =
+            SettingsService::for_test(temp.path().join("settings.json"), durable_settings.clone());
+        settings
+            .root_transition_store()
+            .unwrap()
+            .write_settings_guarded(
+                &crate::services::root_transition::NonsecretSettingsV1::from_settings(
+                    durable_settings,
+                ),
+            )
+            .unwrap();
+        crate::services::sync::vault_keys::provision_vault_root_key(
+            settings.secret_store().as_ref(),
+            &identity.descriptor.vault_id().to_string(),
+            &grafyn_sync_protocol::VaultRootKey::from_bytes([0x51; 32]),
+        )
+        .unwrap();
+        std::fs::write(vault_path.join("startup-sync.md"), b"startup lifecycle\r\n").unwrap();
+
+        let runtime = initialize_stable_mutation_runtime(
+            temp.path().join("data"),
+            &vault_path,
+            Arc::new(TwinEventStore::new(temp.path().join("data"))),
+            settings.secret_store(),
+        )
+        .unwrap();
+        let knowledge_store = KnowledgeStore::with_event_recorder(
+            vault_path.clone(),
+            temp.path().join("derived"),
+            runtime.coordinator.clone(),
+        );
+
+        bootstrap_sync_engine_before_service(
+            Some(&runtime.sync_engine),
+            Some(&runtime.coordinator),
+            &knowledge_store,
+        )
+        .unwrap();
+
+        assert_eq!(runtime.sync_engine.status().unwrap().outbox_operations, 1);
+        assert_eq!(
+            std::fs::read(vault_path.join("startup-sync.md")).unwrap(),
+            b"startup lifecycle\r\n"
+        );
+        assert_eq!(
+            runtime.coordinator.current_root_epoch().unwrap().root_scope,
+            root_scope
+        );
+    }
+
     fn assert_recoverable_detached_validation_state(
         state: &AppState,
         active_data_path: &std::path::Path,
@@ -1554,6 +1715,7 @@ mod tests {
             ))),
             twin_event_store: event_store,
             mutation_coordinator: Some(coordinator),
+            sync_engine: None,
             mutation_startup_error: Arc::new(RwLock::new(None)),
             loaded_authority: Arc::new(RwLock::new(None)),
             authority_repair: Arc::new(tokio::sync::Mutex::new(())),

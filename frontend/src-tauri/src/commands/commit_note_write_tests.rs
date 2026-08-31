@@ -81,6 +81,7 @@ pub(crate) fn build_test_state() -> (AppState, TempDir, TempDir) {
         twin_store: Arc::new(RwLock::new(TwinStore::new(data_path.join("twin")))),
         twin_event_store,
         mutation_coordinator: Some(mutation_coordinator),
+        sync_engine: None,
         mutation_startup_error: Arc::new(RwLock::new(None)),
         loaded_authority: Arc::new(RwLock::new(None)),
         authority_repair: Arc::new(tokio::sync::Mutex::new(())),
@@ -189,6 +190,75 @@ async fn normalization_prelude_failure_leaves_durable_namespace_unready() {
     assert!(coordinator.require_namespace_ready().is_err());
     assert!(state.loaded_authority.read().await.is_none());
     assert_eq!(coordinator.current_authority_token().unwrap(), expected);
+}
+
+#[tokio::test]
+async fn remote_sync_repair_rebuilds_and_publishes_without_hub_or_optimizer_echo() {
+    let (state, vault_dir, _data_dir) = build_test_state();
+    let coordinator = state.mutation_coordinator.as_ref().unwrap().clone();
+    *state.knowledge_store.write().await = KnowledgeStore::with_event_recorder(
+        vault_dir.path().to_path_buf(),
+        coordinator.current_namespace_path().unwrap(),
+        coordinator.clone(),
+    );
+    let (_, commit) = state
+        .knowledge_store
+        .write()
+        .await
+        .create_note_expecting_authority(
+            NoteCreate {
+                title: "Remote repair source".into(),
+                content: "A remotely materialized note about Rust".into(),
+                relative_path: Some("remote-repair-source.md".into()),
+                aliases: Vec::new(),
+                status: NoteStatus::Draft,
+                tags: vec!["rust".into()],
+                schema_version: crate::models::note::CURRENT_NOTE_SCHEMA_VERSION,
+                migration_source: None,
+                optimizer_managed: false,
+                properties: Default::default(),
+            },
+            "remote_sync_test",
+            coordinator.current_authority_token().unwrap(),
+        )
+        .unwrap();
+    let expected = commit.authority_token.unwrap();
+    assert_eq!(
+        state
+            .vault_optimizer
+            .read()
+            .await
+            .status(&UserSettings::default())
+            .queue_size,
+        0
+    );
+
+    let repaired = rebuild_and_publish_remote_authority(&state, &expected)
+        .await
+        .unwrap();
+
+    let notes = state
+        .knowledge_store
+        .read()
+        .await
+        .list_full_notes()
+        .unwrap();
+    assert_eq!(notes.len(), 1);
+    assert!(!notes[0].is_topic_hub());
+    assert_eq!(
+        state
+            .vault_optimizer
+            .read()
+            .await
+            .status(&UserSettings::default())
+            .queue_size,
+        0
+    );
+    coordinator.require_namespace_ready().unwrap();
+    assert_eq!(
+        state.loaded_authority.read().await.as_ref(),
+        Some(&repaired)
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -573,6 +573,7 @@ pub struct MutationPlan {
     pub source_channel: crate::models::twin_event::SourceChannel,
     pub targets: Vec<crate::services::twin_events::TargetMutation>,
     pub drafts: Vec<TwinEventDraft>,
+    finalized_events: Option<Vec<TwinEvent>>,
     pub(crate) expected_authority: Option<crate::services::vault_namespace::VaultAuthorityTokenV1>,
     pub(crate) retain_commit_receipt: bool,
 }
@@ -589,6 +590,7 @@ impl MutationPlan {
             source_channel,
             targets,
             drafts,
+            finalized_events: None,
             expected_authority: None,
             retain_commit_receipt: false,
         }
@@ -640,12 +642,27 @@ pub trait MutationLifecycle: Send + Sync {
         Ok(())
     }
 
-    fn known_failure(&self, _mutation_id: Option<&str>, _reason: &str) {}
+    fn known_failure(
+        &self,
+        _mutation_id: Option<&str>,
+        _reason: &str,
+    ) -> Result<(), MutationError> {
+        Ok(())
+    }
 }
 
 #[derive(Debug, Default)]
 pub struct NoopMutationLifecycle;
 impl MutationLifecycle for NoopMutationLifecycle {}
+
+fn mutation_uses_lifecycle(intent: &crate::services::twin_events::MutationIntentV1) -> bool {
+    intent.origin == MutationOrigin::Local
+        && (!intent.events.is_empty()
+            || intent
+                .targets
+                .iter()
+                .any(|target| target.kind == crate::services::twin_events::TargetKind::Markdown))
+}
 
 #[must_use = "a committed mutation may carry the exact authority token required for repair"]
 #[derive(Debug, Clone)]
@@ -1290,9 +1307,6 @@ impl MutationCoordinator {
             Ok(plan) => plan,
             Err(error) => {
                 process_lock.unlock()?;
-                if origin == MutationOrigin::Local {
-                    self.lifecycle.known_failure(None, &error.to_string());
-                }
                 return Err(error);
             }
         }) else {
@@ -1320,21 +1334,31 @@ impl MutationCoordinator {
                 let error = MutationError::RecoveryConflict(
                     "root authority changed while mutation was in flight".into(),
                 );
-                if origin == MutationOrigin::Local {
-                    self.lifecycle.known_failure(None, &error.to_string());
-                }
                 return Err(error);
             }
         }
-        let prepared = match self.prepare_intent(
-            &process_lock,
-            origin,
-            plan.requested_stream,
-            plan.source_channel,
-            plan.targets,
-            plan.drafts,
-            plan.retain_commit_receipt,
-        ) {
+        let MutationPlan {
+            requested_stream,
+            source_channel,
+            targets,
+            drafts,
+            finalized_events,
+            expected_authority: _,
+            retain_commit_receipt,
+        } = plan;
+        let prepared_result = match finalized_events {
+            Some(events) => self.prepare_finalized_intent(&process_lock, origin, events),
+            None => self.prepare_intent(
+                &process_lock,
+                origin,
+                requested_stream,
+                source_channel,
+                targets,
+                drafts,
+                retain_commit_receipt,
+            ),
+        };
+        let prepared = match prepared_result {
             Ok(Some(intent)) => intent,
             Ok(None) => {
                 process_lock.unlock()?;
@@ -1347,16 +1371,13 @@ impl MutationCoordinator {
             }
             Err(error) => {
                 process_lock.unlock()?;
-                if origin == MutationOrigin::Local {
-                    self.lifecycle.known_failure(None, &error.to_string());
-                }
                 return Err(error);
             }
         };
 
-        let invoke_lifecycle = origin == MutationOrigin::Local && !prepared.events.is_empty();
+        let invoke_lifecycle = mutation_uses_lifecycle(&prepared);
         let mut preauthority_expected = None;
-        if origin == MutationOrigin::Local && intent_changes_authority(&prepared) {
+        if intent_changes_authority(&prepared) {
             let lease = self
                 .root_lease
                 .lock()
@@ -1397,20 +1418,12 @@ impl MutationCoordinator {
         }
         if let Err(error) = prepared_hook(&prepared) {
             process_lock.unlock()?;
-            if origin == MutationOrigin::Local {
-                self.lifecycle
-                    .known_failure(Some(prepared.mutation_id.as_str()), &error.to_string());
-            }
             return Err(error);
         }
         let mut preauthority_marker = None;
         if let Some(expected) = preauthority_expected.as_ref() {
             if let Err(error) = self.inject(MutationFaultPoint::BeforePreAuthorityMarker) {
                 process_lock.unlock()?;
-                if origin == MutationOrigin::Local {
-                    self.lifecycle
-                        .known_failure(Some(prepared.mutation_id.as_str()), &error.to_string());
-                }
                 return Err(error);
             }
             self.journal
@@ -1428,14 +1441,11 @@ impl MutationCoordinator {
             }
         }
         if let Err(error) = self.inject(MutationFaultPoint::AfterPreparedHook) {
-            if let Some(marker) = preauthority_marker.as_ref() {
-                self.journal.abort_preauthority(&process_lock, marker)?;
-            }
+            let abort_result = preauthority_marker.as_ref().map_or(Ok(()), |marker| {
+                self.abort_before_authority_locked(&process_lock, marker, &error.to_string())
+            });
             process_lock.unlock()?;
-            if origin == MutationOrigin::Local {
-                self.lifecycle
-                    .known_failure(Some(prepared.mutation_id.as_str()), &error.to_string());
-            }
+            abort_result?;
             return Err(error);
         }
         // Exact guards are validated after the owner Prepared hook and before
@@ -1443,36 +1453,32 @@ impl MutationCoordinator {
         // `known_failure`, including restart recovery, so retained guarded
         // mutations may safely carry their governed event in the same intent.
         if let Err(error) = self.validate_exact_preconditions_locked(&prepared) {
-            if let Some(marker) = preauthority_marker.as_ref() {
-                self.journal.abort_preauthority(&process_lock, marker)?;
-            }
+            let abort_result = preauthority_marker.as_ref().map_or(Ok(()), |marker| {
+                self.abort_before_authority_locked(&process_lock, marker, &error.to_string())
+            });
             process_lock.unlock()?;
-            if invoke_lifecycle {
-                self.lifecycle
-                    .known_failure(Some(prepared.mutation_id.as_str()), &error.to_string());
-            }
+            abort_result?;
             return Err(error);
         }
         if invoke_lifecycle {
             if let Err(error) = self.lifecycle.stage_before_local(&prepared) {
-                if let Some(marker) = preauthority_marker.as_ref() {
-                    self.journal.abort_preauthority(&process_lock, marker)?;
-                }
+                let abort_result = preauthority_marker.as_ref().map_or(Ok(()), |marker| {
+                    self.abort_before_authority_locked(&process_lock, marker, &error.to_string())
+                });
                 process_lock.unlock()?;
-                self.lifecycle
-                    .known_failure(Some(prepared.mutation_id.as_str()), &error.to_string());
+                abort_result?;
                 return Err(error);
             }
         }
         if let Some(preauthority_marker) = preauthority_marker.as_ref() {
             if let Err(error) = self.validate_all_targets_before_locked(&prepared) {
-                self.journal
-                    .abort_preauthority(&process_lock, preauthority_marker)?;
+                let abort_result = self.abort_before_authority_locked(
+                    &process_lock,
+                    preauthority_marker,
+                    &error.to_string(),
+                );
                 process_lock.unlock()?;
-                if invoke_lifecycle {
-                    self.lifecycle
-                        .known_failure(Some(prepared.mutation_id.as_str()), &error.to_string());
-                }
+                abort_result?;
                 return Err(error);
             }
         }
@@ -1500,19 +1506,20 @@ impl MutationCoordinator {
                                 &process_lock,
                             )?;
                         if &current == expected {
-                            self.journal.abort_preauthority(&process_lock, marker)?;
+                            let abort_result = self.abort_before_authority_locked(
+                                &process_lock,
+                                marker,
+                                &error.to_string(),
+                            );
+                            process_lock.unlock()?;
+                            abort_result?;
+                            return Err(error);
                         } else if current.root_scope == expected.root_scope
                             && current.lease_epoch_uuid == expected.lease_epoch_uuid
                             && Some(current.authority_generation)
                                 == prepared.content_authority_generation
                         {
                             process_lock.unlock()?;
-                            if invoke_lifecycle {
-                                self.lifecycle.known_failure(
-                                    Some(prepared.mutation_id.as_str()),
-                                    &error.to_string(),
-                                );
-                            }
                             return Err(MutationError::AuthorityAdvanced {
                                 mutation_id: prepared.mutation_id.clone(),
                                 authority_token: current,
@@ -1527,10 +1534,6 @@ impl MutationCoordinator {
                         }
                     }
                     process_lock.unlock()?;
-                    if invoke_lifecycle {
-                        self.lifecycle
-                            .known_failure(Some(prepared.mutation_id.as_str()), &error.to_string());
-                    }
                     return Err(error);
                 }
             };
@@ -1539,10 +1542,6 @@ impl MutationCoordinator {
                 let error = MutationError::RecoveryConflict(
                     "content-authority-generation-cas-failed".into(),
                 );
-                if invoke_lifecycle {
-                    self.lifecycle
-                        .known_failure(Some(prepared.mutation_id.as_str()), &error.to_string());
-                }
                 return Err(error);
             }
             authority_token = Some(advanced);
@@ -1560,10 +1559,6 @@ impl MutationCoordinator {
             }
             if let Err(error) = self.inject(MutationFaultPoint::AfterAuthorityAdvance) {
                 process_lock.unlock()?;
-                if invoke_lifecycle {
-                    self.lifecycle
-                        .known_failure(Some(prepared.mutation_id.as_str()), &error.to_string());
-                }
                 return Err(MutationError::AuthorityAdvanced {
                     mutation_id: prepared.mutation_id.clone(),
                     authority_token: authority_token
@@ -1584,16 +1579,38 @@ impl MutationCoordinator {
                         .and_then(|()| {
                             self.inject(MutationFaultPoint::AfterPostAuthorityAbortProof)
                         });
+                    let acknowledge_result = if proof_result.is_ok() {
+                        self.journal
+                            .preauthority_for(&process_lock, &prepared.mutation_id)
+                            .and_then(|marker| {
+                                marker.ok_or_else(|| {
+                                    MutationError::Invalid(
+                                        "post-authority abort proof disappeared".into(),
+                                    )
+                                })
+                            })
+                            .and_then(|aborted| {
+                                self.acknowledge_definite_abort_locked(
+                                    &process_lock,
+                                    &aborted,
+                                    &error.to_string(),
+                                )
+                                .map(|_| ())
+                            })
+                    } else {
+                        Ok(())
+                    };
                     process_lock.unlock()?;
-                    if invoke_lifecycle {
-                        self.lifecycle
-                            .known_failure(Some(prepared.mutation_id.as_str()), &error.to_string());
-                    }
+                    let reason = proof_result
+                        .err()
+                        .or_else(|| acknowledge_result.err())
+                        .unwrap_or(error)
+                        .to_string();
                     return Err(MutationError::AuthorityAdvanced {
                         mutation_id: prepared.mutation_id.clone(),
                         authority_token: authority,
                         target_aborted: true,
-                        reason: proof_result.err().unwrap_or(error).to_string(),
+                        reason,
                     });
                 }
             }
@@ -1604,10 +1621,6 @@ impl MutationCoordinator {
         };
         if let Err(error) = stage_result {
             process_lock.unlock()?;
-            if invoke_lifecycle {
-                self.lifecycle
-                    .known_failure(Some(prepared.mutation_id.as_str()), &error.to_string());
-            }
             if let Some(authority_token) = authority_token {
                 return Err(MutationError::AuthorityAdvanced {
                     mutation_id: prepared.mutation_id.clone(),
@@ -1627,10 +1640,6 @@ impl MutationCoordinator {
         ) = first_replay
         {
             process_lock.unlock()?;
-            if invoke_lifecycle {
-                self.lifecycle
-                    .known_failure(Some(prepared.mutation_id.as_str()), &error.to_string());
-            }
             return Err(error);
         }
         let mut postcommit_warning = first_replay.is_err();
@@ -1643,10 +1652,6 @@ impl MutationCoordinator {
                         | MutationError::AuthorityAdvanced { .. }
                 ) {
                     process_lock.unlock()?;
-                    if invoke_lifecycle {
-                        self.lifecycle
-                            .known_failure(Some(prepared.mutation_id.as_str()), &error.to_string());
-                    }
                     return Err(error);
                 }
                 match self
@@ -1655,12 +1660,6 @@ impl MutationCoordinator {
                 {
                     Ok(false) => {
                         process_lock.unlock()?;
-                        if invoke_lifecycle {
-                            self.lifecycle.known_failure(
-                                Some(prepared.mutation_id.as_str()),
-                                &error.to_string(),
-                            );
-                        }
                         if let Some(authority_token) = authority_token.clone() {
                             return Err(MutationError::AuthorityAdvanced {
                                 mutation_id: prepared.mutation_id.clone(),
@@ -1674,12 +1673,6 @@ impl MutationCoordinator {
                     Ok(true) => {}
                     Err(classification_error) => {
                         process_lock.unlock()?;
-                        if invoke_lifecycle {
-                            self.lifecycle.known_failure(
-                                Some(prepared.mutation_id.as_str()),
-                                &classification_error.to_string(),
-                            );
-                        }
                         if let Some(authority_token) = authority_token.clone() {
                             return Err(MutationError::AuthorityAdvanced {
                                 mutation_id: prepared.mutation_id.clone(),
@@ -1724,13 +1717,27 @@ impl MutationCoordinator {
                 postcommit_warning = true;
             }
         };
-        match self.journal.remove(&process_lock, &prepared) {
-            Ok(()) => {}
-            Err(error) => {
-                log::error!("committed mutation journal cleanup failed: {error}");
-                postcommit_warning = true;
+        let lifecycle_promoted = if invoke_lifecycle {
+            match self.lifecycle.committed(&prepared) {
+                Ok(()) => true,
+                Err(error) => {
+                    log::error!("committed mutation lifecycle publication failed: {error}");
+                    postcommit_warning = true;
+                    false
+                }
             }
+        } else {
+            true
         };
+        if lifecycle_promoted {
+            match self.journal.remove(&process_lock, &prepared) {
+                Ok(()) => {}
+                Err(error) => {
+                    log::error!("committed mutation journal cleanup failed: {error}");
+                    postcommit_warning = true;
+                }
+            };
+        }
         // Retained receipts are consumed only by the owner after its
         // idempotent audit/queue publication has completed under this same
         // process-lock domain. Coordinator cleanup alone cannot prove that
@@ -1742,12 +1749,6 @@ impl MutationCoordinator {
         if let Err(error) = process_lock.unlock() {
             log::error!("committed mutation process-lock release failed: {error}");
             postcommit_warning = true;
-        }
-        if invoke_lifecycle {
-            if let Err(error) = self.lifecycle.committed(&prepared) {
-                log::error!("committed mutation lifecycle publication failed: {error}");
-                postcommit_warning = true;
-            }
         }
         commit.postcommit_warning = postcommit_warning;
         Ok(commit)
@@ -2156,6 +2157,24 @@ impl MutationRootTransitionGuard<'_> {
             .lock()
             .map_err(|_| MutationError::Invalid("Markdown root lease lock poisoned".into()))
             .map(|lease| lease.clone())
+    }
+
+    pub(crate) fn current_markdown_snapshot(
+        &self,
+        relative_key: &str,
+    ) -> Result<(crate::services::twin_events::BeforeImage, Option<Vec<u8>>), MutationError> {
+        use crate::services::twin_events::{BeforeImage, TargetKind, MAX_MARKDOWN_TWIN_BYTES};
+
+        crate::services::twin_events::validate_target_key(TargetKind::Markdown, relative_key)?;
+        let bytes = self.coordinator.read_target(
+            TargetKind::Markdown,
+            relative_key,
+            MAX_MARKDOWN_TWIN_BYTES,
+        )?;
+        let before = bytes.as_ref().map_or(BeforeImage::Absent, |bytes| {
+            BeforeImage::Sha256(crate::services::twin_events::digest_bytes(bytes))
+        });
+        Ok((before, bytes))
     }
 
     pub(crate) fn initialize_namespace(

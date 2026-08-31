@@ -1,6 +1,37 @@
 use super::*;
 
+impl MutationPlan {
+    fn from_finalized_events(events: Vec<TwinEvent>) -> Result<Self, MutationError> {
+        let first = events
+            .first()
+            .ok_or_else(|| MutationError::Invalid("remote event group cannot be empty".into()))?;
+        Ok(Self {
+            requested_stream: first.causal_stream,
+            source_channel: first.context.source_channel.clone(),
+            targets: Vec::new(),
+            drafts: Vec::new(),
+            finalized_events: Some(events),
+            expected_authority: None,
+            retain_commit_receipt: false,
+        })
+    }
+}
+
 impl MutationCoordinator {
+    pub fn apply_nonlocal_finalized_events(
+        &self,
+        origin: MutationOrigin,
+        events: Vec<TwinEvent>,
+    ) -> Result<MutationCommit, MutationError> {
+        if origin == MutationOrigin::Local {
+            return Err(MutationError::Invalid(
+                "local events must be finalized by the coordinator".into(),
+            ));
+        }
+        let mut plan = Some(MutationPlan::from_finalized_events(events)?);
+        self.commit_planned(origin, &mut || Ok(plan.take()))
+    }
+
     pub(super) fn prepare_intent(
         &self,
         process_lock: &CoordinatorProcessLock,
@@ -11,14 +42,71 @@ impl MutationCoordinator {
         drafts: Vec<TwinEventDraft>,
         retain_commit_receipt: bool,
     ) -> Result<Option<crate::services::twin_events::MutationIntentV1>, MutationError> {
+        self.prepare_intent_inner(
+            process_lock,
+            origin,
+            requested_stream,
+            source_channel,
+            targets,
+            drafts,
+            None,
+            retain_commit_receipt,
+        )
+    }
+
+    pub(super) fn prepare_finalized_intent(
+        &self,
+        process_lock: &CoordinatorProcessLock,
+        origin: MutationOrigin,
+        events: Vec<TwinEvent>,
+    ) -> Result<Option<crate::services::twin_events::MutationIntentV1>, MutationError> {
+        if origin == MutationOrigin::Local {
+            return Err(MutationError::Invalid(
+                "local events must be finalized by the coordinator".into(),
+            ));
+        }
+        let first = events
+            .first()
+            .ok_or_else(|| MutationError::Invalid("remote event group cannot be empty".into()))?;
+        self.prepare_intent_inner(
+            process_lock,
+            origin,
+            first.causal_stream,
+            first.context.source_channel.clone(),
+            Vec::new(),
+            Vec::new(),
+            Some(events),
+            false,
+        )
+    }
+
+    fn prepare_intent_inner(
+        &self,
+        process_lock: &CoordinatorProcessLock,
+        origin: MutationOrigin,
+        requested_stream: CausalStream,
+        source_channel: crate::models::twin_event::SourceChannel,
+        targets: Vec<crate::services::twin_events::TargetMutation>,
+        drafts: Vec<TwinEventDraft>,
+        finalized_events: Option<Vec<TwinEvent>>,
+        retain_commit_receipt: bool,
+    ) -> Result<Option<crate::services::twin_events::MutationIntentV1>, MutationError> {
         if targets.len() > crate::services::twin_events::MAX_INTENT_TARGETS {
             return Err(MutationError::Invalid(
                 "local mutation must contain at most 64 targets".into(),
             ));
         }
-        if targets.is_empty() && drafts.is_empty() {
+        if targets.is_empty()
+            && drafts.is_empty()
+            && finalized_events.as_ref().is_none_or(Vec::is_empty)
+        {
             return Err(MutationError::Invalid(
                 "mutation must contain a target or event draft".into(),
+            ));
+        }
+        if finalized_events.is_some() && (!targets.is_empty() || !drafts.is_empty()) {
+            return Err(MutationError::Invalid(
+                "finalized remote events cannot be mixed with local targets or drafts".into(),
             ));
         }
         let event_only = targets.is_empty();
@@ -87,7 +175,7 @@ impl MutationCoordinator {
         if prepared_targets.is_empty() && !event_only {
             return Ok(None);
         }
-        if !has_writable_target && drafts.is_empty() {
+        if !has_writable_target && drafts.is_empty() && finalized_events.is_none() {
             return Ok(None);
         }
         if origin != MutationOrigin::Local && !drafts.is_empty() {
@@ -95,18 +183,38 @@ impl MutationCoordinator {
                 "nonlocal mutations cannot generate local events".into(),
             ));
         }
-        let drafts = drafts
-            .into_iter()
-            .map(|mut draft| {
-                draft.context.source_channel = source_channel.clone();
-                draft
-            })
-            .collect::<Vec<_>>();
-        let events = if drafts.is_empty() {
-            Vec::new()
+        let events = if let Some(events) = finalized_events {
+            events
         } else {
-            self.finalizer.finalize_locked(requested_stream, &drafts)?
+            let drafts = drafts
+                .into_iter()
+                .map(|mut draft| {
+                    draft.context.source_channel = source_channel.clone();
+                    draft
+                })
+                .collect::<Vec<_>>();
+            if drafts.is_empty() {
+                Vec::new()
+            } else {
+                self.finalizer.finalize_locked(requested_stream, &drafts)?
+            }
         };
+        if origin != MutationOrigin::Local && !events.is_empty() {
+            let durable = self
+                .store
+                .ordered_events()?
+                .into_iter()
+                .map(|event| (event.event_id.clone(), event))
+                .collect::<std::collections::BTreeMap<_, _>>();
+            if events.iter().all(|event| {
+                durable.get(&event.event_id).is_some_and(|existing| {
+                    crate::services::twin_events::semantic_bytes(existing)
+                        == crate::services::twin_events::semantic_bytes(event)
+                })
+            }) {
+                return Ok(None);
+            }
+        }
         let stream = events
             .first()
             .map_or(requested_stream, |event| event.causal_stream);
@@ -148,12 +256,19 @@ impl MutationCoordinator {
         } else {
             None
         };
+        let (actor_id, device_id) = events
+            .first()
+            .filter(|_| origin != MutationOrigin::Local)
+            .map_or_else(
+                || (self.finalizer.actor_id(), self.finalizer.device_id()),
+                |event| (event.actor_id.clone(), event.device_id.clone()),
+            );
         let mut intent = crate::services::twin_events::MutationIntentV1 {
             schema_version: if retain_commit_receipt { 3 } else { 2 },
             mutation_id: crate::services::twin_events::digest_bytes(b"placeholder"),
             origin,
-            actor_id: self.finalizer.actor_id(),
-            device_id: self.finalizer.device_id(),
+            actor_id,
+            device_id,
             causal_stream: stream,
             source_channel,
             markdown_root_scope,
@@ -176,6 +291,51 @@ impl MutationCoordinator {
         Ok(Some(intent))
     }
 
+    pub(super) fn abort_before_authority_locked(
+        &self,
+        process_lock: &CoordinatorProcessLock,
+        marker: &crate::services::twin_events::PreAuthorityMutationV1,
+        reason: &str,
+    ) -> Result<(), MutationError> {
+        self.journal.abort_preauthority(process_lock, marker)?;
+        let aborted = self
+            .journal
+            .preauthority_for(process_lock, &marker.intent.mutation_id)?
+            .ok_or_else(|| MutationError::Invalid("aborted mutation proof disappeared".into()))?;
+        self.acknowledge_definite_abort_locked(process_lock, &aborted, reason)
+            .map(|_| ())
+    }
+
+    pub(super) fn acknowledge_definite_abort_locked(
+        &self,
+        process_lock: &CoordinatorProcessLock,
+        marker: &crate::services::twin_events::PreAuthorityMutationV1,
+        reason: &str,
+    ) -> Result<bool, MutationError> {
+        if marker.state == crate::services::twin_events::PreAuthorityMutationStateV1::Prepared {
+            return Err(MutationError::RecoveryConflict(
+                "prepared mutation cannot be acknowledged as aborted".into(),
+            ));
+        }
+        if mutation_uses_lifecycle(&marker.intent) {
+            self.lifecycle
+                .known_failure(Some(marker.intent.mutation_id.as_str()), reason)?;
+        }
+        let removed_wal = if marker.state
+            == crate::services::twin_events::PreAuthorityMutationStateV1::AbortedAfterAuthority
+        {
+            self.journal
+                .remove_matching_aborted_wal(process_lock, marker)?
+        } else {
+            false
+        };
+        if !marker.intent.retain_commit_receipt {
+            self.journal
+                .consume_aborted_preauthority(process_lock, &marker.intent.mutation_id)?;
+        }
+        Ok(removed_wal)
+    }
+
     pub(super) fn recover_preauthority_locked(
         &self,
         process_lock: &CoordinatorProcessLock,
@@ -185,34 +345,20 @@ impl MutationCoordinator {
         for (_, marker) in markers {
             match marker.state {
                 crate::services::twin_events::PreAuthorityMutationStateV1::AbortedBeforeAuthority => {
-                    if !marker.intent.retain_commit_receipt {
-                        self.journal.consume_aborted_preauthority(
-                            process_lock,
-                            &marker.intent.mutation_id,
-                        )?;
-                    }
+                    self.acknowledge_definite_abort_locked(
+                        process_lock,
+                        &marker,
+                        "mutation aborted before authority ownership",
+                    )?;
                     continue;
                 }
                 crate::services::twin_events::PreAuthorityMutationStateV1::AbortedAfterAuthority => {
-                    if self
-                        .journal
-                        .remove_matching_aborted_wal(process_lock, &marker)?
-                    {
+                    if self.acknowledge_definite_abort_locked(
+                        process_lock,
+                        &marker,
+                        "mutation aborted after authority ownership",
+                    )? {
                         recovered += 1;
-                    }
-                    if marker.intent.origin == MutationOrigin::Local
-                        && !marker.intent.events.is_empty()
-                    {
-                        self.lifecycle.known_failure(
-                            Some(marker.intent.mutation_id.as_str()),
-                            "mutation aborted after authority ownership",
-                        );
-                    }
-                    if !marker.intent.retain_commit_receipt {
-                        self.journal.consume_aborted_preauthority(
-                            process_lock,
-                            &marker.intent.mutation_id,
-                        )?;
                     }
                     continue;
                 }
@@ -262,14 +408,11 @@ impl MutationCoordinator {
                 // authority effect. Retiring it lets the owner revalidate its
                 // wider source snapshot before retrying and never attributes a
                 // later peer generation to this mutation.
-                self.journal.abort_preauthority(process_lock, &marker)?;
-                if marker.intent.origin == MutationOrigin::Local && !marker.intent.events.is_empty()
-                {
-                    self.lifecycle.known_failure(
-                        Some(marker.intent.mutation_id.as_str()),
-                        "mutation aborted before authority ownership",
-                    );
-                }
+                self.abort_before_authority_locked(
+                    process_lock,
+                    &marker,
+                    "mutation aborted before authority ownership",
+                )?;
                 continue;
             }
             if current.authority_generation != intended_generation {
@@ -303,13 +446,17 @@ impl MutationCoordinator {
                     &marker.intent,
                     &current,
                 )?;
-                if marker.intent.origin == MutationOrigin::Local && !marker.intent.events.is_empty()
-                {
-                    self.lifecycle.known_failure(
-                        Some(marker.intent.mutation_id.as_str()),
-                        "mutation exact guard changed after authority ownership",
-                    );
-                }
+                let aborted = self
+                    .journal
+                    .preauthority_for(process_lock, &marker.intent.mutation_id)?
+                    .ok_or_else(|| {
+                        MutationError::Invalid("post-authority abort proof disappeared".into())
+                    })?;
+                self.acknowledge_definite_abort_locked(
+                    process_lock,
+                    &aborted,
+                    "mutation exact guard changed after authority ownership",
+                )?;
                 continue;
             }
             self.journal
@@ -448,7 +595,17 @@ impl MutationCoordinator {
                     });
                 }
             }
-            self.journal.remove(process_lock, intent)?;
+            let aborted = self
+                .journal
+                .preauthority_for(process_lock, &intent.mutation_id)?
+                .ok_or_else(|| {
+                    MutationError::Invalid("post-authority abort proof disappeared".into())
+                })?;
+            self.acknowledge_definite_abort_locked(
+                process_lock,
+                &aborted,
+                "mutation exact guard changed after authority ownership",
+            )?;
             if cleanup {
                 return Ok(());
             }
@@ -514,6 +671,9 @@ impl MutationCoordinator {
             self.inject(MutationFaultPoint::BeforeCleanup)?;
         }
         if cleanup {
+            if mutation_uses_lifecycle(intent) {
+                self.lifecycle.committed(intent)?;
+            }
             self.journal.remove(process_lock, intent)?;
             if inject_faults {
                 self.inject(MutationFaultPoint::AfterCleanupBeforeFanout)?;

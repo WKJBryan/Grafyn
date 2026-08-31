@@ -412,16 +412,18 @@ get_twin_event_timeline
 
 **Contract:** Local mutations are recoverably staged before disk change; remote/recovery application never echoes; causal operations are idempotent; concurrent devices converge to identical materialized note bytes, attachment bytes, heads, event sets, and projections under reorder and duplication.
 
-- [ ] Write RED tests for journal stage-before-write, mutation failure cancellation, startup recovery, immutable outbox, duplicate no-op, collision rejection, and child-before-parent deferral.
-- [ ] Implement whole-file note put/tombstone revisions with sorted unique causal parents. Use operation IDs from the protocol; timestamps are audit-only.
-- [ ] Enforce note `grafyn_sync` and event governance before sealing. Add tests that local-only/restricted/disallowed material creates no outbox operation and that a remote operation cannot silently relax a locally enforced local-only policy.
-- [ ] Implement deterministic head selection: tombstone above put, then operation ID; retain every head and expose conflicts; never merge Markdown automatically.
-- [ ] Add origin-aware whole-file application and remote index refresh without optimizer enqueue or new events/outbox entries.
-- [ ] Sync Twin events as immutable operations and rebuild projections after inbox drain.
-- [ ] Sync content-addressed attachments as encrypted manifests plus 256 KiB chunks, capped at 24 MiB and 96 chunks. Verify each chunk and the full digest; do not expose partial materialization. Deduplicate identical digests.
-- [ ] Write the two-device harness tests: create/update/delete; reorder/duplicates; concurrent edits; delete-vs-put; explicit conflict resolution; event convergence; complete attachment convergence; duplicate/out-of-order/missing/tampered attachment chunks; remote echo suppression; existing-vault bootstrap.
-- [ ] Run all sync/storage/Twin tests, default/MCP Rust suites, and clippy.
-- [ ] Commit: `feat: add crash-safe convergent encrypted sync engine`
+- [x] Write RED tests for journal stage-before-write, mutation failure cancellation, startup recovery, immutable outbox, duplicate no-op, collision rejection, and child-before-parent deferral.
+- [x] Implement whole-file note put/tombstone revisions with sorted unique causal parents. Use operation IDs from the protocol; timestamps are audit-only.
+- [x] Enforce note `grafyn_sync` and event governance before sealing. Add tests that local-only/restricted/disallowed material creates no outbox operation and that a remote operation cannot silently relax a locally enforced local-only policy.
+- [x] Implement deterministic head selection: tombstone above put, then operation ID; retain every head and expose conflicts; never merge Markdown automatically.
+- [x] Add origin-aware whole-file application and remote index refresh without optimizer enqueue or new events/outbox entries.
+- [x] Sync Twin events as immutable operations and rebuild projections after inbox drain.
+- [x] Sync content-addressed attachments as encrypted manifests plus 256 KiB chunks, capped at 24 MiB and 96 chunks. Verify each chunk and the full digest; do not expose partial materialization. Deduplicate identical digests.
+- [x] Write the two-device harness tests: create/update/delete; reorder/duplicates; concurrent edits; delete-vs-put; explicit conflict resolution; event convergence; complete attachment convergence; duplicate/out-of-order/missing/tampered attachment chunks; remote echo suppression; existing-vault bootstrap.
+- [x] Run all sync/storage/Twin tests, default/MCP Rust suites, and clippy.
+- [x] Commit: `feat: add crash-safe convergent encrypted sync engine`
+
+**Verification (2026-09-01):** The focused sync, mutation-coordinator, and knowledge-store suites passed 122/122, 87/87, and 34/34. Fresh serial full suites passed 997/997 for the desktop library and 848/848 for the MCP binary; these rebuilt Windows test executables ran without the former `TaskDialogIndirect` entry-point dialog. Rustfmt passed. Strict full-app Clippy remains baseline-limited by pre-existing warnings outside Task 12 plus intentionally test-only/public foundation surfaces that Task 13 and later tasks consume. Two adversarial reviews closed stale bootstrap witnesses, malformed-frontmatter fail-open behavior, and external local-only identity/race handling; the final external-privacy review passed its focused tests, including 10 repeated linearization runs, with no remaining Critical or Important finding.
 
 ## Task 13: Expose optional sync status without pretending the hosted service exists
 

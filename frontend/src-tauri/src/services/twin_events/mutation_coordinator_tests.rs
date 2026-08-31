@@ -2,9 +2,13 @@ use super::*;
 use crate::models::twin_event::{
     CausalStream, Governance, NoteChangeKind, NoteChanged, TwinEventPayload, Visibility,
 };
+use crate::services::twin_events::{TargetKind, TargetMutation};
 use chrono::{TimeZone, Utc};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc, Mutex,
+};
 use tempfile::tempdir;
 
 fn tree_snapshot(root: &Path) -> std::collections::BTreeMap<PathBuf, Option<Vec<u8>>> {
@@ -3231,4 +3235,373 @@ fn production_desktop_and_mcp_use_coordinated_non_noop_construction() {
     let serve = mcp.find(".serve(rmcp::transport::stdio())").unwrap();
     assert!(recover < serve);
     assert!(!mcp.contains("KnowledgeStore::new(vault_path"));
+}
+
+fn finalized_event_group(labels: &[&str]) -> Vec<crate::models::twin_event::TwinEvent> {
+    let temp = tempdir().unwrap();
+    let vault = temp.path().join("vault");
+    std::fs::create_dir(&vault).unwrap();
+    let store = Arc::new(TwinEventStore::new(temp.path()));
+    store.initialize().unwrap();
+    let coordinator =
+        MutationCoordinator::new(temp.path(), &vault, store, Arc::new(NoopMutationLifecycle))
+            .unwrap();
+    coordinator
+        .commit_local(
+            CausalStream::SyncEligible,
+            crate::models::twin_event::SourceChannel::parse("note_editor").unwrap(),
+            Vec::new(),
+            labels.iter().map(|label| draft(label)).collect(),
+        )
+        .unwrap()
+        .events
+}
+
+#[derive(Default)]
+struct RecordingLifecycle {
+    calls: Mutex<Vec<&'static str>>,
+}
+
+impl MutationLifecycle for RecordingLifecycle {
+    fn stage_before_local(
+        &self,
+        _: &crate::services::twin_events::MutationIntentV1,
+    ) -> Result<(), MutationError> {
+        self.calls.lock().unwrap().push("stage");
+        Ok(())
+    }
+
+    fn committed(
+        &self,
+        _: &crate::services::twin_events::MutationIntentV1,
+    ) -> Result<(), MutationError> {
+        self.calls.lock().unwrap().push("committed");
+        Ok(())
+    }
+
+    fn known_failure(&self, _: Option<&str>, _: &str) -> Result<(), MutationError> {
+        self.calls.lock().unwrap().push("known_failure");
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct FailFirstCommitLifecycle {
+    attempts: AtomicUsize,
+    calls: Mutex<Vec<&'static str>>,
+}
+
+impl MutationLifecycle for FailFirstCommitLifecycle {
+    fn stage_before_local(
+        &self,
+        _: &crate::services::twin_events::MutationIntentV1,
+    ) -> Result<(), MutationError> {
+        self.calls.lock().unwrap().push("stage");
+        Ok(())
+    }
+
+    fn committed(
+        &self,
+        _: &crate::services::twin_events::MutationIntentV1,
+    ) -> Result<(), MutationError> {
+        self.calls.lock().unwrap().push("committed");
+        if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+            return Err(MutationError::Io("injected sync promotion failure".into()));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct FailFirstCancelLifecycle {
+    attempts: AtomicUsize,
+    calls: Mutex<Vec<&'static str>>,
+}
+
+impl MutationLifecycle for FailFirstCancelLifecycle {
+    fn stage_before_local(
+        &self,
+        _: &crate::services::twin_events::MutationIntentV1,
+    ) -> Result<(), MutationError> {
+        self.calls.lock().unwrap().push("stage");
+        Err(MutationError::Io(
+            "injected failure after durable sync staging".into(),
+        ))
+    }
+
+    fn known_failure(&self, _: Option<&str>, _: &str) -> Result<(), MutationError> {
+        self.calls.lock().unwrap().push("known_failure");
+        if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+            return Err(MutationError::Io(
+                "injected sync cancellation failure".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn markdown_only_local_mutation_uses_sync_lifecycle_but_remote_never_echoes() {
+    let temp = tempdir().unwrap();
+    let vault = temp.path().join("vault");
+    std::fs::create_dir(&vault).unwrap();
+    let store = Arc::new(TwinEventStore::new(temp.path()));
+    store.initialize().unwrap();
+    let lifecycle = Arc::new(RecordingLifecycle::default());
+    let coordinator =
+        MutationCoordinator::new(temp.path(), &vault, store, lifecycle.clone()).unwrap();
+
+    let _ = coordinator
+        .commit_local(
+            CausalStream::SyncEligible,
+            crate::models::twin_event::SourceChannel::parse("note_editor").unwrap(),
+            vec![TargetMutation::put(TargetKind::Markdown, "note.md", "note")],
+            Vec::new(),
+        )
+        .unwrap();
+    let _ = coordinator
+        .apply_nonlocal(
+            MutationOrigin::Remote,
+            vec![TargetMutation::put(
+                TargetKind::Markdown,
+                "remote.md",
+                "remote",
+            )],
+        )
+        .unwrap();
+    assert_eq!(*lifecycle.calls.lock().unwrap(), vec!["stage", "committed"]);
+}
+
+#[test]
+fn lifecycle_promotion_failure_retains_local_wal_for_recovery() {
+    let temp = tempdir().unwrap();
+    let vault = temp.path().join("vault");
+    std::fs::create_dir(&vault).unwrap();
+    let store = Arc::new(TwinEventStore::new(temp.path()));
+    store.initialize().unwrap();
+    let lifecycle = Arc::new(FailFirstCommitLifecycle::default());
+    let coordinator =
+        MutationCoordinator::new(temp.path(), &vault, store, lifecycle.clone()).unwrap();
+
+    let commit = coordinator
+        .commit_local(
+            CausalStream::SyncEligible,
+            crate::models::twin_event::SourceChannel::parse("note_editor").unwrap(),
+            vec![TargetMutation::put(
+                TargetKind::Markdown,
+                "recover.md",
+                "durable",
+            )],
+            Vec::new(),
+        )
+        .unwrap();
+    assert!(commit.postcommit_warning);
+    assert_eq!(coordinator.pending_count().unwrap(), 1);
+    assert_eq!(coordinator.recover_pending().unwrap(), 1);
+    assert_eq!(coordinator.pending_count().unwrap(), 0);
+    assert_eq!(
+        *lifecycle.calls.lock().unwrap(),
+        vec!["stage", "committed", "committed"]
+    );
+}
+
+#[test]
+fn failed_lifecycle_cancel_retains_abort_proof_across_restart() {
+    let temp = tempdir().unwrap();
+    let vault = temp.path().join("vault");
+    std::fs::create_dir(&vault).unwrap();
+    let store = Arc::new(TwinEventStore::new(temp.path()));
+    store.initialize().unwrap();
+    let lifecycle = Arc::new(FailFirstCancelLifecycle::default());
+    let coordinator =
+        MutationCoordinator::new(temp.path(), &vault, store, lifecycle.clone()).unwrap();
+    let before = coordinator.current_authority_token().unwrap();
+
+    assert!(coordinator
+        .commit_local(
+            CausalStream::SyncEligible,
+            crate::models::twin_event::SourceChannel::parse("note_editor").unwrap(),
+            vec![TargetMutation::put(
+                TargetKind::Markdown,
+                "cancel-retry.md",
+                "must not commit",
+            )],
+            Vec::new(),
+        )
+        .is_err());
+    assert_eq!(coordinator.pending_count().unwrap(), 1);
+    assert_eq!(
+        *lifecycle.calls.lock().unwrap(),
+        vec!["stage", "known_failure"]
+    );
+
+    drop(coordinator);
+    let reopened_store = Arc::new(TwinEventStore::new(temp.path()));
+    reopened_store.initialize().unwrap();
+    let reopened =
+        MutationCoordinator::new(temp.path(), &vault, reopened_store, lifecycle.clone()).unwrap();
+    assert_eq!(reopened.pending_count().unwrap(), 0);
+    assert_eq!(reopened.current_authority_token().unwrap(), before);
+    assert!(!vault.join("cancel-retry.md").exists());
+    assert_eq!(
+        *lifecycle.calls.lock().unwrap(),
+        vec!["stage", "known_failure", "known_failure"]
+    );
+}
+
+#[test]
+fn post_authority_fault_restarts_into_commit_without_canceling_staged_lifecycle() {
+    let temp = tempdir().unwrap();
+    let vault = temp.path().join("vault");
+    std::fs::create_dir(&vault).unwrap();
+    let store = Arc::new(TwinEventStore::new(temp.path()));
+    store.initialize().unwrap();
+    let lifecycle = Arc::new(RecordingLifecycle::default());
+    let coordinator =
+        MutationCoordinator::new(temp.path(), &vault, store.clone(), lifecycle.clone()).unwrap();
+
+    coordinator.fail_once_at(MutationFaultPoint::AfterAuthorityAdvance);
+    assert!(matches!(
+        coordinator.commit_local(
+            CausalStream::SyncEligible,
+            crate::models::twin_event::SourceChannel::parse("note_editor").unwrap(),
+            vec![TargetMutation::put(
+                TargetKind::Markdown,
+                "recover-after-authority.md",
+                "durable",
+            )],
+            vec![draft("recover-after-authority")],
+        ),
+        Err(MutationError::AuthorityAdvanced { .. })
+    ));
+    assert_eq!(*lifecycle.calls.lock().unwrap(), vec!["stage"]);
+
+    drop(coordinator);
+    drop(store);
+    let reopened_store = Arc::new(TwinEventStore::new(temp.path()));
+    reopened_store.initialize().unwrap();
+    let reopened = MutationCoordinator::new(
+        temp.path(),
+        &vault,
+        reopened_store.clone(),
+        lifecycle.clone(),
+    )
+    .unwrap();
+    assert_eq!(*lifecycle.calls.lock().unwrap(), vec!["stage", "committed"]);
+    assert_eq!(reopened.pending_count().unwrap(), 0);
+    assert_eq!(
+        std::fs::read_to_string(vault.join("recover-after-authority.md")).unwrap(),
+        "durable"
+    );
+    assert_eq!(reopened_store.ordered_events().unwrap().len(), 1);
+}
+
+#[test]
+fn nonlocal_finalized_event_is_exact_idempotent_and_never_echoes() {
+    let event = finalized_event_group(&["remote-exact"]).remove(0);
+    let temp = tempdir().unwrap();
+    let vault = temp.path().join("vault");
+    std::fs::create_dir(&vault).unwrap();
+    let store = Arc::new(TwinEventStore::new(temp.path()));
+    store.initialize().unwrap();
+    let lifecycle = Arc::new(RecordingLifecycle::default());
+    let coordinator =
+        MutationCoordinator::new(temp.path(), &vault, store.clone(), lifecycle.clone()).unwrap();
+    let before = coordinator.current_authority_token().unwrap();
+
+    let first = coordinator
+        .apply_nonlocal_finalized_events(MutationOrigin::Remote, vec![event.clone()])
+        .unwrap();
+    assert_eq!(first.events, vec![event.clone()]);
+    assert_eq!(
+        coordinator
+            .current_authority_token()
+            .unwrap()
+            .authority_generation,
+        before.authority_generation + 1
+    );
+    let after_first = coordinator.current_authority_token().unwrap();
+    let duplicate = coordinator
+        .apply_nonlocal_finalized_events(MutationOrigin::Remote, vec![event.clone()])
+        .unwrap();
+    assert!(duplicate.mutation_id.is_none());
+    assert_eq!(coordinator.current_authority_token().unwrap(), after_first);
+    assert_eq!(store.ordered_events().unwrap(), vec![event]);
+    assert!(lifecycle.calls.lock().unwrap().is_empty());
+}
+
+#[test]
+fn nonlocal_finalized_event_recovers_after_authority_advance_without_echo() {
+    let event = finalized_event_group(&["remote-recovery"]).remove(0);
+    let temp = tempdir().unwrap();
+    let vault = temp.path().join("vault");
+    std::fs::create_dir(&vault).unwrap();
+    let store = Arc::new(TwinEventStore::new(temp.path()));
+    store.initialize().unwrap();
+    let lifecycle = Arc::new(RecordingLifecycle::default());
+    let coordinator =
+        MutationCoordinator::new(temp.path(), &vault, store.clone(), lifecycle.clone()).unwrap();
+
+    coordinator.fail_once_at(MutationFaultPoint::AfterAuthorityAdvance);
+    assert!(matches!(
+        coordinator.apply_nonlocal_finalized_events(MutationOrigin::Remote, vec![event.clone()]),
+        Err(MutationError::AuthorityAdvanced { .. })
+    ));
+    assert_eq!(coordinator.pending_count().unwrap(), 1);
+    assert!(store.ordered_events().unwrap().is_empty());
+
+    drop(coordinator);
+    drop(store);
+    let reopened_store = Arc::new(TwinEventStore::new(temp.path()));
+    reopened_store.initialize().unwrap();
+    let reopened = MutationCoordinator::new(
+        temp.path(),
+        &vault,
+        reopened_store.clone(),
+        lifecycle.clone(),
+    )
+    .unwrap();
+    assert_eq!(reopened.pending_count().unwrap(), 0);
+    assert_eq!(reopened_store.ordered_events().unwrap(), vec![event]);
+    assert!(lifecycle.calls.lock().unwrap().is_empty());
+}
+
+#[test]
+fn nonlocal_finalized_events_reject_wrong_id_governance_and_mixed_identity() {
+    let event = finalized_event_group(&["remote-invalid"]).remove(0);
+    let mut mixed = finalized_event_group(&["remote-group-a", "remote-group-b"]);
+    let temp = tempdir().unwrap();
+    let vault = temp.path().join("vault");
+    std::fs::create_dir(&vault).unwrap();
+    let store = Arc::new(TwinEventStore::new(temp.path()));
+    store.initialize().unwrap();
+    let coordinator = MutationCoordinator::new(
+        temp.path(),
+        &vault,
+        store.clone(),
+        Arc::new(NoopMutationLifecycle),
+    )
+    .unwrap();
+    let before = coordinator.current_authority_token().unwrap();
+
+    let mut wrong_id = event.clone();
+    wrong_id.event_id = crate::models::twin_event::EventId::parse("0".repeat(64)).unwrap();
+    assert!(coordinator
+        .apply_nonlocal_finalized_events(MutationOrigin::Remote, vec![wrong_id])
+        .is_err());
+
+    let mut disallowed = event;
+    disallowed.governance.allowed_uses.sync = false;
+    disallowed.event_id = derive_event_id(&disallowed);
+    assert!(coordinator
+        .apply_nonlocal_finalized_events(MutationOrigin::Remote, vec![disallowed])
+        .is_err());
+
+    mixed[1].actor_id = crate::models::twin_event::ActorId::parse("other-owner").unwrap();
+    mixed[1].event_id = derive_event_id(&mixed[1]);
+    assert!(coordinator
+        .apply_nonlocal_finalized_events(MutationOrigin::Remote, mixed)
+        .is_err());
+    assert_eq!(coordinator.current_authority_token().unwrap(), before);
+    assert!(store.ordered_events().unwrap().is_empty());
 }

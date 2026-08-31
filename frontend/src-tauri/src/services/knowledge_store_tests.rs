@@ -3,6 +3,37 @@ use crate::models::note::NoteStatus;
 use crate::services::atomic_io::assert_no_tmp_siblings;
 use tempfile::tempdir;
 
+#[test]
+fn sync_policy_is_opt_out_and_fails_closed_on_invalid_frontmatter() {
+    assert!(note_allows_sync("# No frontmatter\n"));
+    assert!(note_allows_sync(
+        "---\ngrafyn_sync: inherit\ntitle: Shared\n---\n\nShared"
+    ));
+    assert!(!note_allows_sync(
+        "---\ngrafyn_sync: local_only\ntitle: Private\n---\n\nPrivate"
+    ));
+    assert!(!note_allows_sync(
+        "---\ngrafyn_sync: unexpected\n---\n\nUnknown policy"
+    ));
+    assert!(!note_allows_sync("---\ngrafyn_sync: [broken\n---\n"));
+    assert_eq!(
+        note_identity_from_markdown("---\nnote_id: private-memory\ngrafyn_sync: local_only\n---\n")
+            .as_deref(),
+        Some("private-memory")
+    );
+}
+
+#[test]
+fn sync_policy_fails_closed_on_unterminated_frontmatter() {
+    for markdown in [
+        "---\ngrafyn_sync: local_only\nprivate body\n",
+        "---\r\ntitle: Unterminated\r\nshared body\r\n",
+        "---\ngrafyn_sync: [broken\nprivate body\n",
+    ] {
+        assert!(!note_allows_sync(markdown), "accepted {markdown:?}");
+    }
+}
+
 fn task_seven_note_create(title: &str, content: &str, relative_path: &str) -> NoteCreate {
     NoteCreate {
         title: title.into(),

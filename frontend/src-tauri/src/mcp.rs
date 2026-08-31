@@ -21,16 +21,26 @@ use crate::mcp_tools::GrafynMcpServer;
 use crate::services::chunk_index::ChunkIndex;
 use crate::services::graph_index::GraphIndex;
 use crate::services::knowledge_store::KnowledgeStore;
+use crate::services::link_discovery::LinkDiscoveryService;
 use crate::services::memory::MemoryService;
 use crate::services::priority::PriorityScoringService;
 use crate::services::retrieval::RetrievalService;
 use crate::services::search::SearchService;
 use crate::services::settings::SettingsService;
-use crate::services::twin_events::{MutationCoordinator, NoopMutationLifecycle, TwinEventStore};
+use crate::services::sync::engine::SyncEngine;
+use crate::services::sync::identity::VaultIdentity;
+use crate::services::sync::secrets::{SecretAccount, SecretBytes, SecretStore, SecretStoreError};
+use crate::services::twin::TwinStore;
+#[cfg(test)]
+use crate::services::twin_events::NoopMutationLifecycle;
+use crate::services::twin_events::{
+    MutationCoordinator, MutationError, MutationIntentV1, MutationLifecycle, TwinEventStore,
+};
+use crate::services::vault_optimizer::VaultOptimizerService;
 use clap::Parser;
 use rmcp::ServiceExt;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::sync::RwLock;
 
 /// Grafyn MCP Server — exposes your knowledge base to Claude Desktop
@@ -49,53 +59,318 @@ struct Args {
 fn prepare_mcp_root_directories(
     vault_path: &std::path::Path,
     data_path: &std::path::Path,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<Option<VaultIdentity>, Box<dyn std::error::Error>> {
     std::fs::create_dir_all(data_path)?;
     crate::services::twin_events::validate_real_directory(data_path, "MCP data root")?;
     crate::services::twin_events::AnchoredRoot::open(data_path)?
         .open_directory("twin/events", true)?;
     let process_lock =
         crate::services::twin_events::acquire_shared_coordinator_process_lock(data_path)?;
-    let result = (|| -> Result<(), crate::services::twin_events::MutationError> {
-        crate::services::root_transition::reject_transition_wal_locked(data_path, &process_lock)?;
-        let prepared_scope = crate::services::twin_events::prepared_stable_migration_scope_locked(
-            data_path,
-            &process_lock,
-        )?;
-        let durable_scope =
-            crate::services::root_transition::stable_root_scope_locked(data_path, &process_lock)?;
-        if durable_scope
-            .as_ref()
-            .zip(prepared_scope.as_ref())
-            .is_some_and(|(durable, prepared)| durable != prepared)
-        {
-            return Err(
-                crate::services::twin_events::MutationError::RecoveryConflict(
-                    "prepared stable migration conflicts with the durable stable lease".into(),
-                ),
-            );
-        }
-        if let Some(stable_scope) = durable_scope.or(prepared_scope) {
-            crate::services::twin_events::validate_real_directory(
-                vault_path,
-                "stable MCP vault root",
+    let result =
+        (|| -> Result<Option<VaultIdentity>, crate::services::twin_events::MutationError> {
+            crate::services::root_transition::reject_transition_wal_locked(
+                data_path,
+                &process_lock,
             )?;
-            let identity = crate::services::sync::identity::load_vault_identity(vault_path)?;
-            if identity.root_scope != stable_scope {
+            let prepared_scope =
+                crate::services::twin_events::prepared_stable_migration_scope_locked(
+                    data_path,
+                    &process_lock,
+                )?;
+            let durable_scope = crate::services::root_transition::stable_root_scope_locked(
+                data_path,
+                &process_lock,
+            )?;
+            if durable_scope
+                .as_ref()
+                .zip(prepared_scope.as_ref())
+                .is_some_and(|(durable, prepared)| durable != prepared)
+            {
                 return Err(
                     crate::services::twin_events::MutationError::RecoveryConflict(
-                        "configured MCP vault does not match the durable stable lease".into(),
+                        "prepared stable migration conflicts with the durable stable lease".into(),
                     ),
                 );
             }
-        } else {
-            std::fs::create_dir_all(vault_path)?;
-            crate::services::twin_events::validate_real_directory(vault_path, "MCP vault root")?;
-        }
-        Ok(())
-    })();
+            let identity = if let Some(stable_scope) = durable_scope.or(prepared_scope) {
+                crate::services::twin_events::validate_real_directory(
+                    vault_path,
+                    "stable MCP vault root",
+                )?;
+                let identity = crate::services::sync::identity::load_vault_identity(vault_path)?;
+                if identity.root_scope != stable_scope {
+                    return Err(
+                        crate::services::twin_events::MutationError::RecoveryConflict(
+                            "configured MCP vault does not match the durable stable lease".into(),
+                        ),
+                    );
+                }
+                Some(identity)
+            } else {
+                std::fs::create_dir_all(vault_path)?;
+                crate::services::twin_events::validate_real_directory(
+                    vault_path,
+                    "MCP vault root",
+                )?;
+                None
+            };
+            Ok(identity)
+        })();
     process_lock.unlock()?;
-    result?;
+    Ok(result?)
+}
+
+#[derive(Debug)]
+struct UnavailableSyncSecretStore;
+
+impl SecretStore for UnavailableSyncSecretStore {
+    fn put(&self, _account: &SecretAccount, _secret: &SecretBytes) -> Result<(), SecretStoreError> {
+        Err(SecretStoreError::BackendUnavailable)
+    }
+
+    fn get(&self, _account: &SecretAccount) -> Result<Option<SecretBytes>, SecretStoreError> {
+        Err(SecretStoreError::BackendUnavailable)
+    }
+
+    fn delete(&self, _account: &SecretAccount) -> Result<(), SecretStoreError> {
+        Err(SecretStoreError::BackendUnavailable)
+    }
+}
+
+struct McpMutationRuntime {
+    coordinator: Arc<MutationCoordinator>,
+    sync_engine: Arc<SyncEngine>,
+}
+
+struct McpStartupAuthority {
+    startup_token: crate::services::vault_namespace::VaultAuthorityTokenV1,
+    derived_token: Option<crate::services::vault_namespace::VaultAuthorityTokenV1>,
+}
+
+// A fresh custom root has no identity until the coordinator completes its
+// legacy-ownership audit. Recovery must fail closed during that narrow gap.
+#[derive(Debug, Default)]
+struct FreshCustomSyncLifecycle {
+    engine: Mutex<Option<Arc<SyncEngine>>>,
+}
+
+impl FreshCustomSyncLifecycle {
+    fn bind(&self, engine: Arc<SyncEngine>) -> Result<(), MutationError> {
+        let mut current = self
+            .engine
+            .lock()
+            .map_err(|_| MutationError::Invalid("custom sync lifecycle lock poisoned".into()))?;
+        if current.is_some() {
+            return Err(MutationError::RecoveryConflict(
+                "custom sync lifecycle is already bound".into(),
+            ));
+        }
+        *current = Some(engine);
+        Ok(())
+    }
+
+    fn with_engine(
+        &self,
+        action: impl FnOnce(&SyncEngine) -> Result<(), MutationError>,
+    ) -> Result<(), MutationError> {
+        let current = self
+            .engine
+            .lock()
+            .map_err(|_| MutationError::Invalid("custom sync lifecycle lock poisoned".into()))?;
+        let engine = current.as_ref().ok_or_else(|| {
+            MutationError::RecoveryConflict(
+                "custom sync lifecycle is not bound during startup recovery".into(),
+            )
+        })?;
+        action(engine)
+    }
+}
+
+impl MutationLifecycle for FreshCustomSyncLifecycle {
+    fn stage_before_local(&self, intent: &MutationIntentV1) -> Result<(), MutationError> {
+        self.with_engine(|engine| engine.stage_before_local(intent))
+    }
+
+    fn committed(&self, intent: &MutationIntentV1) -> Result<(), MutationError> {
+        self.with_engine(|engine| engine.committed(intent))
+    }
+
+    fn known_failure(&self, mutation_id: Option<&str>, reason: &str) -> Result<(), MutationError> {
+        self.with_engine(|engine| engine.known_failure(mutation_id, reason))
+    }
+}
+
+fn initialize_mcp_mutation_runtime(
+    data_path: &std::path::Path,
+    vault_path: &std::path::Path,
+    custom_data: bool,
+    identity: Option<VaultIdentity>,
+    secret_store: Option<Arc<dyn SecretStore>>,
+    twin_event_store: Arc<TwinEventStore>,
+) -> Result<McpMutationRuntime, MutationError> {
+    let attach_device = secret_store.is_some();
+    let secret_store: Arc<dyn SecretStore> =
+        secret_store.unwrap_or_else(|| Arc::new(UnavailableSyncSecretStore));
+    let (coordinator, sync_engine) = if let Some(identity) = identity {
+        let root_key = if attach_device {
+            crate::services::sync::vault_keys::load_vault_root_key(
+                secret_store.as_ref(),
+                &identity.descriptor.vault_id().to_string(),
+            )
+            .map_err(|error| MutationError::Invalid(error.to_string()))?
+        } else {
+            None
+        };
+        let sync_engine = Arc::new(SyncEngine::open_core(
+            data_path,
+            vault_path,
+            identity,
+            root_key,
+            secret_store.clone(),
+            twin_event_store.clone(),
+        )?);
+        let coordinator = Arc::new(if custom_data {
+            MutationCoordinator::new_custom_mcp(
+                data_path,
+                vault_path,
+                twin_event_store,
+                sync_engine.clone(),
+            )?
+        } else {
+            MutationCoordinator::new_stable(
+                data_path,
+                vault_path,
+                twin_event_store,
+                sync_engine.clone(),
+            )?
+        });
+        (coordinator, sync_engine)
+    } else {
+        if !custom_data {
+            return Err(MutationError::Invalid(
+                "default MCP startup requires a validated vault identity".into(),
+            ));
+        }
+        let lifecycle = Arc::new(FreshCustomSyncLifecycle::default());
+        let coordinator = Arc::new(MutationCoordinator::new_custom_mcp(
+            data_path,
+            vault_path,
+            twin_event_store.clone(),
+            lifecycle.clone(),
+        )?);
+        let identity = crate::services::sync::identity::load_vault_identity(vault_path)?;
+        let root_key = if attach_device {
+            crate::services::sync::vault_keys::load_vault_root_key(
+                secret_store.as_ref(),
+                &identity.descriptor.vault_id().to_string(),
+            )
+            .map_err(|error| MutationError::Invalid(error.to_string()))?
+        } else {
+            None
+        };
+        let sync_engine = Arc::new(SyncEngine::open_core(
+            data_path,
+            vault_path,
+            identity,
+            root_key,
+            secret_store.clone(),
+            twin_event_store,
+        )?);
+        lifecycle.bind(sync_engine.clone())?;
+        (coordinator, sync_engine)
+    };
+    if attach_device {
+        let device = coordinator.load_or_create_device_signing_identity(secret_store)?;
+        sync_engine.attach_device_identity(device)?;
+    }
+    coordinator.recover_pending()?;
+    Ok(McpMutationRuntime {
+        coordinator,
+        sync_engine,
+    })
+}
+
+fn prepare_mcp_startup_authority(
+    data_path: &std::path::Path,
+    runtime: &McpMutationRuntime,
+    knowledge_store: &mut KnowledgeStore,
+) -> Result<McpStartupAuthority, Box<dyn std::error::Error>> {
+    runtime
+        .sync_engine
+        .recover_pending_inbox(&runtime.coordinator)?;
+    runtime
+        .sync_engine
+        .bootstrap_existing_vault(&runtime.coordinator, knowledge_store)?;
+
+    let startup_token = runtime.coordinator.current_authority_token()?;
+    runtime
+        .coordinator
+        .validate_authority_token(&startup_token, false)?;
+    if runtime
+        .coordinator
+        .validate_authority_token(&startup_token, true)
+        .is_err()
+    {
+        rebuild_mcp_remote_authority(
+            data_path,
+            &runtime.coordinator,
+            knowledge_store,
+            &startup_token,
+        )?;
+    }
+    runtime
+        .coordinator
+        .validate_authority_token(&startup_token, true)?;
+    Ok(McpStartupAuthority {
+        startup_token: startup_token.clone(),
+        derived_token: Some(startup_token),
+    })
+}
+
+fn rebuild_mcp_remote_authority(
+    data_path: &std::path::Path,
+    coordinator: &Arc<MutationCoordinator>,
+    knowledge_store: &mut KnowledgeStore,
+    expected: &crate::services::vault_namespace::VaultAuthorityTokenV1,
+) -> Result<(), Box<dyn std::error::Error>> {
+    knowledge_store.reload_authoritative_state();
+    let notes = knowledge_store.list_full_notes()?;
+    let twin_path =
+        crate::models::settings::twin_data_path_for_scope(data_path, &expected.root_scope);
+    let mut twin_store = TwinStore::with_event_recorder_scoped(
+        twin_path,
+        data_path.join("twin"),
+        expected.root_scope.clone(),
+        coordinator.clone(),
+    );
+    let derived_path =
+        crate::services::vault_namespace::scoped_data_path(data_path, &expected.root_scope);
+    let mut search = SearchService::new(derived_path.clone())?;
+    let mut chunks = ChunkIndex::new(derived_path.clone())?;
+    let mut discovery = LinkDiscoveryService::try_new(derived_path.clone())?;
+    let mut optimizer = VaultOptimizerService::try_new(derived_path)?;
+    let _optimizer_state_lock = optimizer.acquire_state_lock()?;
+
+    let guard = coordinator.begin_root_transition()?;
+    let lease = guard.current_lease()?;
+    let authority = guard.capture_authority_token(&lease)?;
+    if &authority != expected {
+        return Err("vault authority changed before MCP remote repair".into());
+    }
+    guard.invalidate_namespace(&lease)?;
+
+    twin_store.rebuild_mutation_caches()?;
+    search.reindex_all(&notes)?;
+    chunks.reindex_all(&notes)?;
+    let mut graph = GraphIndex::new();
+    graph.build_from_notes(&notes);
+    discovery.reload_from_disk_checked()?;
+    discovery.bootstrap_checked(&notes)?;
+    optimizer.reload_from_disk_checked()?;
+    optimizer.recover_pending_publications_locked(knowledge_store, &guard)?;
+
+    guard.validate_authority_token(&authority, false)?;
+    guard.publish_namespace_ready(&authority)?;
     Ok(())
 }
 
@@ -121,42 +396,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // A stable lease owns its vault identity. Never manufacture a replacement
     // root or descriptor when the configured vault was moved or is unavailable.
-    prepare_mcp_root_directories(&vault_path, &data_path)?;
+    let prepared_identity = prepare_mcp_root_directories(&vault_path, &data_path)?;
+    let vault_identity = if custom_data {
+        prepared_identity
+    } else {
+        Some(match prepared_identity {
+            Some(identity) => identity,
+            None => crate::services::sync::identity::load_or_create_vault_identity(&vault_path)?,
+        })
+    };
     // Recover the same canonical mutation journal as desktop before stdio is served.
     let twin_event_store = Arc::new(TwinEventStore::new(&data_path));
-    let mutation_coordinator = Arc::new(if custom_data {
-        MutationCoordinator::new_custom_mcp(
-            &data_path,
-            &vault_path,
-            twin_event_store,
-            Arc::new(NoopMutationLifecycle),
-        )?
-    } else {
-        MutationCoordinator::new_stable(
-            &data_path,
-            &vault_path,
-            twin_event_store,
-            Arc::new(NoopMutationLifecycle),
-        )?
-    });
-    mutation_coordinator.recover_pending()?;
-    if let Some(secret_store) = secret_store {
-        mutation_coordinator.load_or_create_device_signing_identity(secret_store)?;
-    }
-    let startup_token = mutation_coordinator.current_authority_token()?;
+    let mutation_runtime = initialize_mcp_mutation_runtime(
+        &data_path,
+        &vault_path,
+        custom_data,
+        vault_identity,
+        secret_store,
+        twin_event_store,
+    )?;
+    let mutation_coordinator = mutation_runtime.coordinator.clone();
+    log::info!(
+        "Sync foundation initialized (provisioned: {})",
+        mutation_runtime.sync_engine.status()?.provisioned
+    );
     let derived_data_path = mutation_coordinator.current_namespace_path()?;
-    let derived_token = mutation_coordinator
-        .validate_authority_token(&startup_token, true)
-        .is_ok()
-        .then(|| startup_token.clone());
-    let derived_ready = derived_token.is_some();
 
     // Initialize services
-    let knowledge_store = KnowledgeStore::with_event_recorder(
+    let mut knowledge_store = KnowledgeStore::with_event_recorder(
         vault_path,
         derived_data_path.clone(),
         mutation_coordinator.clone(),
     );
+    let startup_authority =
+        prepare_mcp_startup_authority(&data_path, &mutation_runtime, &mut knowledge_store)?;
+    let startup_token = startup_authority.startup_token;
+    let derived_token = startup_authority.derived_token;
+    let derived_ready = derived_token.is_some();
 
     // A namespace without the matching durable readiness marker may still serve
     // authoritative note CRUD, but must never expose global or stale indexes.
@@ -415,6 +691,332 @@ mod tests {
         let paths = resolve_paths(Some(vault), Some(data)).unwrap();
 
         assert!(paths.secret_store.is_none());
+    }
+
+    #[test]
+    fn fresh_custom_sync_lifecycle_fails_closed_before_binding() {
+        let lifecycle = FreshCustomSyncLifecycle::default();
+
+        let error = lifecycle
+            .known_failure(None, "startup recovery probe")
+            .unwrap_err();
+
+        assert!(matches!(error, MutationError::RecoveryConflict(_)));
+        assert!(error.to_string().contains("not bound"));
+    }
+
+    #[test]
+    fn custom_mcp_runtime_uses_an_explicit_unprovisioned_sync_engine() {
+        let temp = tempfile::tempdir().unwrap();
+        let vault = temp.path().join("vault");
+        let data = temp.path().join("data");
+        let identity = prepare_mcp_root_directories(&vault, &data).unwrap();
+        let runtime = initialize_mcp_mutation_runtime(
+            &data,
+            &vault,
+            true,
+            identity,
+            None,
+            Arc::new(TwinEventStore::new(&data)),
+        )
+        .unwrap();
+
+        assert!(!runtime.sync_engine.status().unwrap().provisioned);
+        let _ = runtime
+            .coordinator
+            .commit_local(
+                crate::models::twin_event::CausalStream::SyncEligible,
+                crate::models::twin_event::SourceChannel::parse("mcp").unwrap(),
+                vec![crate::services::twin_events::TargetMutation::put(
+                    crate::services::twin_events::TargetKind::Markdown,
+                    "custom-unprovisioned.md",
+                    "local only until a vault key is provisioned",
+                )],
+                Vec::new(),
+            )
+            .unwrap();
+        let status = runtime.sync_engine.status().unwrap();
+        assert!(!status.provisioned);
+        assert_eq!(status.outbox_operations, 0);
+        let mut knowledge = KnowledgeStore::with_event_recorder(
+            vault,
+            runtime.coordinator.current_namespace_path().unwrap(),
+            runtime.coordinator.clone(),
+        );
+        let startup = prepare_mcp_startup_authority(&data, &runtime, &mut knowledge).unwrap();
+        assert_eq!(runtime.sync_engine.status().unwrap().outbox_operations, 0);
+        assert_eq!(
+            startup.startup_token,
+            runtime.coordinator.current_authority_token().unwrap()
+        );
+    }
+
+    #[test]
+    fn provisioned_mcp_startup_recovers_a_durable_remote_inbox_before_bootstrap() {
+        use grafyn_sync_protocol::{
+            seal_operation, DeviceId, DeviceSigningKey, NoteRevisionV1, OperationPayloadV1,
+            OperationV1, VaultRootKey,
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let vault = temp.path().join("vault");
+        let data = temp.path().join("data");
+        std::fs::create_dir(&vault).unwrap();
+        std::fs::create_dir(&data).unwrap();
+        std::fs::create_dir_all(data.join("twin/events")).unwrap();
+        let identity =
+            crate::services::sync::identity::load_or_create_vault_identity(&vault).unwrap();
+        let secrets = Arc::new(crate::services::sync::secrets::MemorySecretStore::default());
+        let root_key = VaultRootKey::from_bytes([0xd4; 32]);
+        crate::services::sync::vault_keys::provision_vault_root_key(
+            secrets.as_ref(),
+            &identity.descriptor.vault_id().to_string(),
+            &root_key,
+        )
+        .unwrap();
+        std::fs::write(vault.join("existing.md"), b"existing MCP bytes  \r\n").unwrap();
+        let runtime = initialize_mcp_mutation_runtime(
+            &data,
+            &vault,
+            false,
+            Some(identity.clone()),
+            Some(secrets),
+            Arc::new(TwinEventStore::new(&data)),
+        )
+        .unwrap();
+        let remote_id = DeviceId::parse_str("123e4567-e89b-42d3-a456-4266141740d4").unwrap();
+        let remote_key = DeviceSigningKey::from_seed([0xd4; 32]);
+        runtime
+            .sync_engine
+            .trust_device(remote_id, remote_key.public_key())
+            .unwrap();
+        let remote_note_id = "remote-md";
+        let remote_markdown = "---\nnote_id: remote-md\n---\n\nremote startup recovery term\r\n";
+        let operation = OperationV1::new(
+            1_800_000_000_000,
+            Vec::new(),
+            OperationPayloadV1::NoteRevision(
+                NoteRevisionV1::put(remote_note_id, remote_markdown.into()).unwrap(),
+            ),
+        )
+        .unwrap();
+        let envelope = seal_operation(
+            &root_key,
+            identity.descriptor.vault_id(),
+            &remote_id,
+            &remote_key,
+            &operation,
+        )
+        .unwrap();
+        crate::services::sync::operation_store::OperationStore::open(
+            &data,
+            identity.root_scope,
+            *identity.descriptor.vault_id(),
+        )
+        .unwrap()
+        .receive(&envelope)
+        .unwrap();
+        let projected_key = format!(
+            "synced/{}.md",
+            crate::services::twin_events::digest_bytes(
+                format!("grafyn.sync.remote-path.v1:{remote_note_id}").as_bytes()
+            )
+            .as_str()
+        );
+        let derived_data_path = runtime.coordinator.current_namespace_path().unwrap();
+        let mut knowledge = KnowledgeStore::with_event_recorder(
+            vault.clone(),
+            derived_data_path.clone(),
+            runtime.coordinator.clone(),
+        );
+
+        let startup = prepare_mcp_startup_authority(&data, &runtime, &mut knowledge).unwrap();
+
+        assert_eq!(runtime.sync_engine.status().unwrap().outbox_operations, 1);
+        assert_eq!(runtime.sync_engine.status().unwrap().pending_operations, 0);
+        assert_eq!(
+            std::fs::read(vault.join("existing.md")).unwrap(),
+            b"existing MCP bytes  \r\n"
+        );
+        assert_eq!(
+            std::fs::read(vault.join(projected_key)).unwrap(),
+            remote_markdown.as_bytes()
+        );
+        let derived = startup
+            .derived_token
+            .expect("remote recovery must publish its exact derived authority");
+        assert_eq!(derived, startup.startup_token);
+        runtime
+            .coordinator
+            .validate_authority_token(&derived, true)
+            .unwrap();
+        let readonly = SearchService::new_readonly(derived_data_path).unwrap();
+        readonly.reload_reader().unwrap();
+        let results = readonly.search("recovery term", 5).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].note.id, remote_note_id);
+    }
+
+    #[test]
+    fn mcp_restart_repairs_missing_ready_after_exact_remote_replay_without_outbox_echo() {
+        use grafyn_sync_protocol::{
+            seal_operation, DeviceId, DeviceSigningKey, NoteRevisionV1, OperationPayloadV1,
+            OperationV1, VaultRootKey,
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let vault = temp.path().join("vault");
+        let data = temp.path().join("data");
+        std::fs::create_dir(&vault).unwrap();
+        std::fs::create_dir(&data).unwrap();
+        std::fs::create_dir_all(data.join("twin/events")).unwrap();
+        let identity =
+            crate::services::sync::identity::load_or_create_vault_identity(&vault).unwrap();
+        let secrets = Arc::new(crate::services::sync::secrets::MemorySecretStore::default());
+        let root_key = VaultRootKey::from_bytes([0xe6; 32]);
+        crate::services::sync::vault_keys::provision_vault_root_key(
+            secrets.as_ref(),
+            &identity.descriptor.vault_id().to_string(),
+            &root_key,
+        )
+        .unwrap();
+        let runtime = initialize_mcp_mutation_runtime(
+            &data,
+            &vault,
+            false,
+            Some(identity.clone()),
+            Some(secrets.clone()),
+            Arc::new(TwinEventStore::new(&data)),
+        )
+        .unwrap();
+        let remote_id = DeviceId::parse_str("123e4567-e89b-42d3-a456-4266141740e6").unwrap();
+        let remote_key = DeviceSigningKey::from_seed([0xe6; 32]);
+        runtime
+            .sync_engine
+            .trust_device(remote_id, remote_key.public_key())
+            .unwrap();
+        let note_id = "mcp-crash-exact";
+        let markdown = "---\nnote_id: mcp-crash-exact\n---\n\nMCP exact replay recovery term\n";
+        let operation = OperationV1::new(
+            1_800_000_000_001,
+            Vec::new(),
+            OperationPayloadV1::NoteRevision(
+                NoteRevisionV1::put(note_id, markdown.into()).unwrap(),
+            ),
+        )
+        .unwrap();
+        let envelope = seal_operation(
+            &root_key,
+            identity.descriptor.vault_id(),
+            &remote_id,
+            &remote_key,
+            &operation,
+        )
+        .unwrap();
+        let derived_data_path = runtime.coordinator.current_namespace_path().unwrap();
+        let mut knowledge = KnowledgeStore::with_event_recorder(
+            vault.clone(),
+            derived_data_path.clone(),
+            runtime.coordinator.clone(),
+        );
+        let initially_ready = runtime.coordinator.current_authority_token().unwrap();
+        rebuild_mcp_remote_authority(
+            &data,
+            &runtime.coordinator,
+            &mut knowledge,
+            &initially_ready,
+        )
+        .unwrap();
+        runtime
+            .coordinator
+            .validate_authority_token(&initially_ready, true)
+            .unwrap();
+        let projected_key = format!(
+            "synced/{}.md",
+            crate::services::twin_events::digest_bytes(
+                format!("grafyn.sync.remote-path.v1:{note_id}").as_bytes()
+            )
+            .as_str()
+        );
+        runtime
+            .coordinator
+            .fail_once_at(crate::services::twin_events::MutationFaultPoint::AfterAuthorityAdvance);
+        assert!(runtime
+            .sync_engine
+            .receive_envelopes(
+                &runtime.coordinator,
+                &[envelope.to_json().unwrap().into_bytes()],
+            )
+            .is_err());
+        let committed_authority = runtime.coordinator.current_authority_token().unwrap();
+        assert!(runtime
+            .coordinator
+            .validate_authority_token(&committed_authority, true)
+            .is_err());
+        assert!(!vault.join(&projected_key).exists());
+        assert_eq!(runtime.sync_engine.status().unwrap().pending_operations, 1);
+        assert_eq!(runtime.sync_engine.status().unwrap().outbox_operations, 0);
+        drop(knowledge);
+        drop(runtime);
+
+        let restarted = initialize_mcp_mutation_runtime(
+            &data,
+            &vault,
+            false,
+            Some(identity),
+            Some(secrets),
+            Arc::new(TwinEventStore::new(&data)),
+        )
+        .unwrap();
+        assert_eq!(
+            restarted.sync_engine.status().unwrap().pending_operations,
+            1
+        );
+        assert_eq!(restarted.sync_engine.status().unwrap().outbox_operations, 0);
+        // Test coordinators publish readiness during construction. Clear that
+        // test-only marker to reproduce the production crash state on restart.
+        let crash_authority = restarted.coordinator.current_authority_token().unwrap();
+        assert_eq!(crash_authority, committed_authority);
+        restarted
+            .coordinator
+            .invalidate_namespace_before_recovery(&crash_authority)
+            .unwrap();
+        assert!(restarted
+            .coordinator
+            .validate_authority_token(&crash_authority, true)
+            .is_err());
+        let mut restarted_knowledge = KnowledgeStore::with_event_recorder(
+            vault.clone(),
+            restarted.coordinator.current_namespace_path().unwrap(),
+            restarted.coordinator.clone(),
+        );
+
+        let startup =
+            prepare_mcp_startup_authority(&data, &restarted, &mut restarted_knowledge).unwrap();
+
+        assert_eq!(
+            restarted.sync_engine.status().unwrap().pending_operations,
+            0
+        );
+        assert_eq!(restarted.sync_engine.status().unwrap().outbox_operations, 0);
+        assert_eq!(startup.startup_token, crash_authority);
+        let derived = startup
+            .derived_token
+            .expect("exact remote replay must still rebuild and publish current readiness");
+        assert_eq!(derived, startup.startup_token);
+        restarted
+            .coordinator
+            .validate_authority_token(&derived, true)
+            .unwrap();
+        assert_eq!(
+            std::fs::read(vault.join(projected_key)).unwrap(),
+            markdown.as_bytes()
+        );
+        let readonly = SearchService::new_readonly(derived_data_path).unwrap();
+        readonly.reload_reader().unwrap();
+        let results = readonly.search("exact replay recovery", 5).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].note.id, note_id);
     }
 
     #[test]

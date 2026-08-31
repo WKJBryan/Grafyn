@@ -993,6 +993,13 @@ pub(crate) enum AuthorityRepairStep {
     Optimizer,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AuthorityRepairMode {
+    Local,
+    Migration,
+    RemoteSync,
+}
+
 /// Every local guard used by a complete rebuild. They are acquired before the
 /// cross-process coordinator guard so a note/Twin mutation that already holds
 /// its service lock while committing cannot form an ABBA deadlock with repair.
@@ -1048,6 +1055,7 @@ pub(crate) fn rebuild_authority_with_retained_guard(
     guards: &mut AuthorityRepairGuards<'_>,
     guard: &crate::services::twin_events::MutationRootTransitionGuard<'_>,
     expected_root: &crate::services::vault_namespace::VaultAuthorityTokenV1,
+    mode: AuthorityRepairMode,
     mut checkpoint: impl FnMut(AuthorityRepairStep) -> Result<(), String>,
 ) -> Result<crate::services::vault_namespace::VaultAuthorityTokenV1, String> {
     let lease = guard.current_lease().map_err(|error| error.to_string())?;
@@ -1115,10 +1123,12 @@ pub(crate) fn rebuild_authority_with_retained_guard(
         .optimizer
         .recover_pending_publications_locked(&guards.knowledge, guard)
         .map_err(|error| error.to_string())?;
-    guards
-        .optimizer
-        .bootstrap_checked(&notes)
-        .map_err(|error| error.to_string())?;
+    if mode != AuthorityRepairMode::RemoteSync {
+        guards
+            .optimizer
+            .bootstrap_checked(&notes)
+            .map_err(|error| error.to_string())?;
+    }
     checkpoint(AuthorityRepairStep::Optimizer)?;
 
     guard
@@ -1134,7 +1144,7 @@ pub(crate) fn rebuild_authority_with_retained_guard(
 async fn rebuild_and_publish_current_authority_inner(
     state: &AppState,
     expected: &crate::services::vault_namespace::VaultAuthorityTokenV1,
-    normalize_hubs: bool,
+    mode: AuthorityRepairMode,
     mut checkpoint: impl FnMut(AuthorityRepairStep) -> Result<(), String>,
 ) -> Result<crate::services::vault_namespace::VaultAuthorityTokenV1, String> {
     let _repair = state.authority_repair.lock().await;
@@ -1167,7 +1177,7 @@ async fn rebuild_and_publish_current_authority_inner(
         .await
         .reload_authoritative_state();
     let mut rebuild_expected = expected.clone();
-    if normalize_hubs {
+    if mode == AuthorityRepairMode::Local {
         for attempt in 0..2 {
             match normalize_topic_hubs_only(state, rebuild_expected.clone()).await {
                 Ok(mut result) => {
@@ -1238,6 +1248,7 @@ async fn rebuild_and_publish_current_authority_inner(
         &mut guards,
         &process_guard,
         &rebuild_expected,
+        mode,
         checkpoint,
     )
 }
@@ -1246,7 +1257,10 @@ pub(crate) async fn rebuild_and_publish_current_authority(
     state: &AppState,
     expected: &crate::services::vault_namespace::VaultAuthorityTokenV1,
 ) -> Result<crate::services::vault_namespace::VaultAuthorityTokenV1, String> {
-    rebuild_and_publish_current_authority_inner(state, expected, true, |_| Ok(())).await
+    rebuild_and_publish_current_authority_inner(state, expected, AuthorityRepairMode::Local, |_| {
+        Ok(())
+    })
+    .await
 }
 
 #[cfg(test)]
@@ -1255,7 +1269,26 @@ pub(crate) async fn rebuild_and_publish_current_authority_with_checkpoint(
     expected: &crate::services::vault_namespace::VaultAuthorityTokenV1,
     checkpoint: impl FnMut(AuthorityRepairStep) -> Result<(), String>,
 ) -> Result<crate::services::vault_namespace::VaultAuthorityTokenV1, String> {
-    rebuild_and_publish_current_authority_inner(state, expected, true, checkpoint).await
+    rebuild_and_publish_current_authority_inner(
+        state,
+        expected,
+        AuthorityRepairMode::Local,
+        checkpoint,
+    )
+    .await
+}
+
+pub(crate) async fn rebuild_and_publish_remote_authority(
+    state: &AppState,
+    expected: &crate::services::vault_namespace::VaultAuthorityTokenV1,
+) -> Result<crate::services::vault_namespace::VaultAuthorityTokenV1, String> {
+    rebuild_and_publish_current_authority_inner(
+        state,
+        expected,
+        AuthorityRepairMode::RemoteSync,
+        |_| Ok(()),
+    )
+    .await
 }
 
 async fn rebuild_and_publish_migration_authority(
@@ -1264,7 +1297,13 @@ async fn rebuild_and_publish_migration_authority(
 ) -> Result<crate::services::vault_namespace::VaultAuthorityTokenV1, String> {
     // Migration manifests bind exact after-images. Topic-hub normalization is
     // itself authoritative and would invalidate those rollback proofs.
-    rebuild_and_publish_current_authority_inner(state, expected, false, |_| Ok(())).await
+    rebuild_and_publish_current_authority_inner(
+        state,
+        expected,
+        AuthorityRepairMode::Migration,
+        |_| Ok(()),
+    )
+    .await
 }
 
 #[must_use = "committed mutations must inspect and propagate repair readiness"]

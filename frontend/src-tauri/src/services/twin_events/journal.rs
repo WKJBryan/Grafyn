@@ -156,10 +156,24 @@ impl MutationIntentV1 {
             ));
         }
         if self.origin != crate::services::twin_events::MutationOrigin::Local
-            && !self.events.is_empty()
+            && self.events.iter().any(|event| {
+                event.causal_stream != CausalStream::SyncEligible
+                    || event.governance.visibility
+                        != crate::models::twin_event::Visibility::SyncedVault
+                    || event.governance.sensitivity
+                        == crate::models::twin_event::Sensitivity::Restricted
+                    || !event.governance.allowed_uses.sync
+                    || event.context.relationships.iter().any(|relationship| {
+                        relationship.governance.visibility
+                            != crate::models::twin_event::Visibility::SyncedVault
+                            || relationship.governance.sensitivity
+                                == crate::models::twin_event::Sensitivity::Restricted
+                            || !relationship.governance.allowed_uses.sync
+                    })
+            })
         {
             return Err(MutationError::Invalid(
-                "nonlocal mutation intents cannot contain local events".into(),
+                "nonlocal mutation intents require sync-eligible governed events".into(),
             ));
         }
         if self.targets.len() > MAX_INTENT_TARGETS {
@@ -302,6 +316,8 @@ impl MutationIntentV1 {
             if event.device_id != self.device_id
                 || event.causal_stream != self.causal_stream
                 || event.context.source_channel != self.source_channel
+                || (self.origin != crate::services::twin_events::MutationOrigin::Local
+                    && event.actor_id != self.actor_id)
             {
                 return Err(MutationError::Invalid(
                     "mutation event group identity, stream, or source mismatch".into(),
@@ -555,7 +571,6 @@ impl PreAuthorityMutationV1 {
             });
         if self.schema_version != 1
             || !supported_intent
-            || self.intent.origin != crate::services::twin_events::MutationOrigin::Local
             || self.intent.content_authority_generation != Some(intended_generation)
             || !scope_matches
             || Uuid::parse_str(&self.expected_authority.lease_epoch_uuid)
@@ -781,15 +796,6 @@ impl LocalMutationJournal {
         marker.validate()?;
         if marker.state != PreAuthorityMutationStateV1::Prepared {
             return Ok(());
-        }
-        if !marker.intent.retain_commit_receipt {
-            // Schema-2 mutations have no external owner witness to
-            // acknowledge an abort tombstone. At the unchanged authority the
-            // marker itself proves there was no effect, so retiring it is the
-            // complete durable outcome and the caller may replan.
-            return self
-                .root
-                .delete(&self.preauthority_path_for(&marker.intent.mutation_id));
         }
         let aborted = PreAuthorityMutationV1 {
             state: PreAuthorityMutationStateV1::AbortedBeforeAuthority,
@@ -1892,7 +1898,7 @@ mod tests {
     }
 
     #[test]
-    fn target_only_local_and_nonlocal_mutations_are_journaled_without_lifecycle_or_events() {
+    fn canvas_only_local_and_nonlocal_mutations_are_journaled_without_lifecycle_or_events() {
         let temp = tempdir().unwrap();
         let vault = temp.path().join("vault");
         std::fs::create_dir(&vault).unwrap();
@@ -1909,8 +1915,8 @@ mod tests {
                 CausalStream::LocalOnly,
                 SourceChannel::parse("canvas").unwrap(),
                 vec![TargetMutation::put(
-                    TargetKind::Markdown,
-                    "layout.md",
+                    TargetKind::CanvasJson,
+                    "layout.json",
                     "one",
                 )],
                 Vec::new(),
@@ -2108,8 +2114,13 @@ mod tests {
             Ok(())
         }
 
-        fn known_failure(&self, _: Option<&str>, _: &str) {
+        fn known_failure(
+            &self,
+            _: Option<&str>,
+            _: &str,
+        ) -> Result<(), crate::services::twin_events::MutationError> {
             self.calls.lock().unwrap().push("known_failure");
+            Ok(())
         }
     }
 
@@ -2170,10 +2181,7 @@ mod tests {
                 vec![draft("too-large")],
             )
             .is_err());
-        assert_eq!(
-            *lifecycle.calls.lock().unwrap(),
-            vec!["stage", "committed", "known_failure"]
-        );
+        assert_eq!(*lifecycle.calls.lock().unwrap(), vec!["stage", "committed"]);
     }
 
     #[test]

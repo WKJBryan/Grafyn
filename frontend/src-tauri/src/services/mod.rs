@@ -1,4 +1,5 @@
 pub mod atomic_io;
+pub mod attachment_store;
 pub mod canvas_store;
 pub mod chunk_index;
 pub mod feedback;
