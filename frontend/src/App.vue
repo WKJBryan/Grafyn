@@ -1,9 +1,12 @@
 <template>
   <div id="app">
-    <router-view />
+    <CompanionShell v-if="isCompact">
+      <router-view />
+    </CompanionShell>
+    <router-view v-else />
     <ToastNotification />
-    <GuidePanel />
-    <GuideTip />
+    <GuidePanel v-if="!isCompact" />
+    <GuideTip v-if="!isCompact" />
     <Transition name="startup-splash">
       <StartupSplash
         v-if="boot.isVisible"
@@ -21,11 +24,13 @@ import ToastNotification from '@/components/ToastNotification.vue'
 import GuidePanel from '@/components/GuidePanel.vue'
 import GuideTip from '@/components/GuideTip.vue'
 import StartupSplash from '@/components/StartupSplash.vue'
+import CompanionShell from '@/components/companion/CompanionShell.vue'
 import { isDesktopApp, isTauriApp } from '@/api/client'
 import { getRuntimeProfile, getTransport } from '@/api/transport'
 import { useBootStore } from '@/stores/boot'
 import { useGuide } from '@/composables/useGuide'
 import { useToast } from '@/composables/useToast'
+import { useCompanionLayout } from '@/composables/useCompanionLayout'
 
 const COMMITTED_WARNING_EVENT = 'grafyn://committed-warning'
 const DEGRADED_READINESS_MESSAGE =
@@ -52,6 +57,7 @@ const route = useRoute()
 const guide = useGuide()
 const boot = useBootStore()
 const toast = useToast()
+const { isCompact } = useCompanionLayout()
 
 const seenCommittedWarnings = new Set()
 let committedWarningRegistrationStarted = false

@@ -484,13 +484,15 @@ rebuild_sync_state
 
 **Contract:** Wide `/` renders the existing desktop Home unchanged. Compact `/` is fast capture; `/recall` is full-screen search/detail with attention explanations. Path import deep links fail closed on Android.
 
-- [ ] Write RED tests for layout selection, navigation, 44px targets, safe-area classes, blank capture, title derivation, save failure retention, recent captures, optional person/role/relationship/environment/activity/goal context, attachment association, sync-policy selection, debounce, stale-response suppression, backend result normalization, and recall states.
-- [ ] Add one transactional `create_companion_capture` command that writes a draft note tagged `inbox` and its contextual `ObservationRecorded` event through the Task 7 coordinator. Represent the capture kind and attachment digests in existing note `properties`; do not invent a nonexistent `note_type` field. Accept `grafyn_sync: inherit | local_only`, with local-only enforced before outbox creation.
-- [ ] Derive title from first non-empty Markdown-stripped line, cap at 80 characters, fallback to timestamp using an injected clock.
-- [ ] Move shared search behavior into `useRecallSearch` while retaining `SearchBar` as the desktop consumer.
-- [ ] Use `100dvh`, safe-area insets, non-hover actions, visible focus, and no horizontal overflow at 393px.
-- [ ] Run focused tests, full tests/build, and a browser mobile viewport smoke.
-- [ ] Commit: `feat: add adaptive companion capture and recall`
+- [x] Write RED tests for layout selection, navigation, 44px targets, safe-area classes, blank capture, title derivation, save failure retention, recent captures, optional person/role/relationship/environment/activity/goal context, attachment association, sync-policy selection, debounce, stale-response suppression, backend result normalization, and recall states.
+- [x] Add one transactional `create_companion_capture` command that writes a draft note tagged `inbox` and its contextual `ObservationRecorded` event through the Task 7 coordinator. Represent the capture kind and attachment digests in existing note `properties`; do not invent a nonexistent `note_type` field. Accept `grafyn_sync: inherit | local_only`, with local-only enforced before outbox creation.
+- [x] Derive title from first non-empty Markdown-stripped line, cap at 80 characters, fallback to timestamp using an injected clock.
+- [x] Move shared search behavior into `useRecallSearch` while retaining `SearchBar` as the desktop consumer.
+- [x] Use `100dvh`, safe-area insets, non-hover actions, visible focus, and no horizontal overflow at 393px.
+- [x] Run focused tests, full tests/build, and a browser mobile viewport smoke.
+- [x] Commit: `feat: add adaptive companion capture and recall`
+
+**Verification (2026-09-01):** Companion-focused frontend tests passed 160/160; the final shared working tree passed 596/596 Vue tests, selected ESLint, and the production build. Rust command, projection, and Knowledge Store sets passed 19/19, 27/27, and 34/34, and the final full desktop run passed 1014/1014. A 393x852 browser smoke exercised capture through success and candidate-bound Recall through the governed explanation/detail flow with equal scroll widths, safe-area/`100dvh` layout, and 44px-or-larger actions. Review found and closed stale-response, uncertain-commit retry, recent-list generation, recovered-event identity, post-commit root-retarget, and same-vault normalization-authority races. The final regressions derive observation identity from the committed intent, propagate repair's exact continuation authority, and full-token-fence optimizer enqueue. Rustfmt and targeted diff checks passed. Windows recorded no Grafyn application-popup event during or after the final suite.
 
 ## Task 15: Build companion Twin review/chat and linear Canvas
 

@@ -1,8 +1,9 @@
 use super::proposals::effective_exposure;
 use super::{build_proposal_drafts, topological_order, ATTENTION_PROFILE_VERSION};
 use crate::models::twin_event::{
-    AuthorityClass, CausalStream, ClaimAssertion, EventId, EvidenceType, Governance, Identifier,
-    MemoryReviewDecision, ReviewState, Sensitivity, TwinEvent, TwinEventPayload,
+    AuthorityClass, CausalStream, ClaimAssertion, ClaimObject, ClaimPolarity, ClaimPredicate,
+    EntityId, EventId, EvidenceType, Governance, Identifier, MemoryReviewDecision, ReviewState,
+    Sensitivity, TwinEvent, TwinEventPayload,
 };
 use crate::models::twin_state::{
     ContradictionCluster, ProjectedItemKind, ProjectedStateItem, ProjectionSnapshot, ProposalDraft,
@@ -420,18 +421,17 @@ fn event_evidence(event: &TwinEvent) -> Result<Vec<EventId>, ProjectionError> {
     Ok(ids)
 }
 
-fn observation_item(
+fn projected_observation_item(
     event: &TwinEvent,
     claim: &ClaimAssertion,
-    claim_index: usize,
-    events: &[TwinEvent],
+    item_suffix: &str,
+    support_count: u16,
+    opposition_count: u16,
+    mut evidence_event_ids: Vec<EventId>,
     by_id: &BTreeMap<EventId, &TwinEvent>,
-    active_superseded: &BTreeSet<EventId>,
+    events: &[TwinEvent],
     reference_time: DateTime<Utc>,
 ) -> Result<ProjectedStateItem, ProjectionError> {
-    let variant = relationship_variant(event, reference_time);
-    let (support_count, opposition_count, mut evidence_event_ids) =
-        matching_observation_counts(events, active_superseded, claim, &variant, reference_time);
     evidence_event_ids.extend(event_evidence(event)?);
     evidence_event_ids.sort();
     evidence_event_ids.dedup();
@@ -454,7 +454,7 @@ fn observation_item(
     let mut tags = event.context.tags.clone();
     tags.sort();
     Ok(ProjectedStateItem {
-        item_id: Identifier::parse(format!("observation:{}:{claim_index}", event.event_id))
+        item_id: Identifier::parse(format!("observation:{}:{item_suffix}", event.event_id))
             .map_err(ProjectionError::InvalidIdentifier)?,
         kind: ProjectedItemKind::Observation,
         claim: claim.clone(),
@@ -463,7 +463,7 @@ fn observation_item(
         review_event_ids: Vec::new(),
         causal_stream,
         governance,
-        relationship_variant: variant,
+        relationship_variant: relationship_variant(event, reference_time),
         evidence_event_ids,
         support_count,
         opposition_count,
@@ -475,6 +475,87 @@ fn observation_item(
         goals,
         tags,
     })
+}
+
+fn observation_item(
+    event: &TwinEvent,
+    claim: &ClaimAssertion,
+    claim_index: usize,
+    events: &[TwinEvent],
+    by_id: &BTreeMap<EventId, &TwinEvent>,
+    active_superseded: &BTreeSet<EventId>,
+    reference_time: DateTime<Utc>,
+) -> Result<ProjectedStateItem, ProjectionError> {
+    let variant = relationship_variant(event, reference_time);
+    let (support_count, opposition_count, evidence_event_ids) =
+        matching_observation_counts(events, active_superseded, claim, &variant, reference_time);
+    projected_observation_item(
+        event,
+        claim,
+        &claim_index.to_string(),
+        support_count,
+        opposition_count,
+        evidence_event_ids,
+        by_id,
+        events,
+        reference_time,
+    )
+}
+
+fn companion_capture_note_id(event: &TwinEvent) -> Option<Identifier> {
+    let TwinEventPayload::ObservationRecorded(observation) = &event.payload else {
+        return None;
+    };
+    if event.context.source_channel.as_str() != "companion_capture"
+        || !observation.claims.is_empty()
+    {
+        return None;
+    }
+    let content_digest = observation.content_digest.as_ref()?;
+    let mut notes = event
+        .evidence
+        .iter()
+        .filter(|evidence| evidence.evidence_type == EvidenceType::Note);
+    let note = notes.next()?;
+    if notes.next().is_some() || note.digest.as_ref() != Some(content_digest) {
+        return None;
+    }
+    if observation.observation_id.as_str()
+        != format!("companion-capture-{}", note.source_id).as_str()
+    {
+        return None;
+    }
+    Some(note.source_id.clone())
+}
+
+fn companion_capture_observation_item(
+    event: &TwinEvent,
+    events: &[TwinEvent],
+    by_id: &BTreeMap<EventId, &TwinEvent>,
+    reference_time: DateTime<Utc>,
+) -> Result<Option<ProjectedStateItem>, ProjectionError> {
+    let Some(note_id) = companion_capture_note_id(event) else {
+        return Ok(None);
+    };
+    let claim = ClaimAssertion {
+        subject_id: EntityId::parse("owner").map_err(ProjectionError::InvalidIdentifier)?,
+        predicate: ClaimPredicate::parse("recorded_note")
+            .map_err(ProjectionError::InvalidIdentifier)?,
+        object: ClaimObject::parse(note_id.as_str()).map_err(ProjectionError::InvalidIdentifier)?,
+        polarity: ClaimPolarity::Affirmed,
+    };
+    projected_observation_item(
+        event,
+        &claim,
+        "capture",
+        1,
+        0,
+        vec![event.event_id.clone()],
+        by_id,
+        events,
+        reference_time,
+    )
+    .map(Some)
 }
 
 fn pending_draft_item(
@@ -729,6 +810,27 @@ pub fn project(
     let mut recent_observations = Vec::new();
     for event in &applied {
         if let TwinEventPayload::ObservationRecorded(observation) = &event.payload {
+            if let Some(item) =
+                companion_capture_observation_item(event, &applied, &by_id, reference_time)?
+            {
+                timeline.push(TemporalStateEntry {
+                    item_id: item.item_id.clone(),
+                    source_event_id: event.event_id.clone(),
+                    state: TimelineState::Observed,
+                    effective_at: fallback_confirmation(event, reference_time),
+                    valid_from: event.valid_from,
+                    valid_to: event.valid_to,
+                });
+                if item.is_temporally_active(reference_time)
+                    && event.governance.sensitivity != Sensitivity::Restricted
+                    && !matches!(
+                        event.governance.review,
+                        ReviewState::Rejected | ReviewState::Superseded
+                    )
+                {
+                    recent_observations.push(item);
+                }
+            }
             for (index, claim) in observation.claims.iter().enumerate() {
                 let item = observation_item(
                     event,
@@ -1065,6 +1167,26 @@ mod tests {
         event
     }
 
+    fn companion_capture_observation(device: &str, note_id: &str) -> TwinEvent {
+        let mut event = contextual_observation(device);
+        let digest = ContentDigest::parse("d".repeat(64)).unwrap();
+        event.context.source_channel = SourceChannel::parse("companion_capture").unwrap();
+        event.context.goals = vec!["Ship Grafyn".into()];
+        event.evidence = vec![EvidenceRef {
+            evidence_type: EvidenceType::Note,
+            source_id: Identifier::parse(note_id).unwrap(),
+            digest: Some(digest.clone()),
+        }];
+        event.payload = TwinEventPayload::ObservationRecorded(ObservationRecorded {
+            observation_id: Identifier::parse(format!("companion-capture-{note_id}")).unwrap(),
+            claims: Vec::new(),
+            summary: Some(BoundedSummary::parse("Captured preference").unwrap()),
+            content_digest: Some(digest),
+        });
+        event.event_id = derive_event_id(&event);
+        event
+    }
+
     #[derive(Debug, Clone, Copy)]
     enum InapplicableRelationshipCase {
         ExpiredLocalOnly,
@@ -1152,6 +1274,117 @@ mod tests {
             canonical_snapshot_json(&snapshot).unwrap(),
             serde_json::to_vec(&snapshot).unwrap()
         );
+    }
+
+    #[test]
+    fn valid_companion_capture_projects_one_evidence_only_observation() {
+        let event = companion_capture_observation("companion-device", "captured-note");
+        let TwinEventPayload::ObservationRecorded(raw) = &event.payload else {
+            unreachable!()
+        };
+        assert!(raw.claims.is_empty());
+
+        let first = project(&[event.clone()], reference()).unwrap();
+        let second = project(&[event.clone()], reference()).unwrap();
+
+        assert_eq!(first.projection_version, 2);
+        assert_eq!(first.recent_observations.len(), 1);
+        assert!(first.pending_proposals.is_empty());
+        assert!(first.reviewed_memories.is_empty());
+        let item = &first.recent_observations[0];
+        assert_eq!(
+            item.item_id.as_str(),
+            format!("observation:{}:capture", event.event_id)
+        );
+        assert_eq!(item.kind, ProjectedItemKind::Observation);
+        assert_eq!(item.claim.subject_id.as_str(), "owner");
+        assert_eq!(item.claim.predicate.as_str(), "recorded_note");
+        assert_eq!(item.claim.object.as_str(), "captured-note");
+        assert_eq!(item.claim.polarity, ClaimPolarity::Affirmed);
+        assert_eq!(item.support_count, 1);
+        assert_eq!(item.opposition_count, 0);
+        assert_eq!(item.prior_exact_support_count, 0);
+        assert_eq!(item.evidence_event_ids, vec![event.event_id.clone()]);
+        assert_eq!(
+            item.summary.as_ref().unwrap().as_str(),
+            "Captured preference"
+        );
+        assert_eq!(item.goals, vec!["Ship Grafyn"]);
+        assert_eq!(item.relationship_variant.relationships.len(), 1);
+        assert_eq!(item.last_confirmed_at, event.observed_at);
+        assert_eq!(item.causal_stream, CausalStream::LocalOnly);
+        assert_eq!(item.governance.visibility, Visibility::LocalOnly);
+        assert_eq!(first.timeline.len(), 1);
+        assert_eq!(first.timeline[0].state, TimelineState::Observed);
+        assert_eq!(first.timeline[0].item_id, item.item_id);
+        assert_eq!(
+            canonical_snapshot_json(&first).unwrap(),
+            canonical_snapshot_json(&second).unwrap()
+        );
+    }
+
+    #[test]
+    fn malformed_or_noncompanion_empty_observations_do_not_gain_capture_state() {
+        let base = companion_capture_observation("companion-device", "captured-note");
+
+        let mut wrong_source = base.clone();
+        wrong_source.context.source_channel = SourceChannel::parse("import").unwrap();
+        wrong_source.event_id = derive_event_id(&wrong_source);
+
+        let mut wrong_identity = base.clone();
+        let TwinEventPayload::ObservationRecorded(payload) = &mut wrong_identity.payload else {
+            unreachable!()
+        };
+        payload.observation_id = Identifier::parse("not-a-companion-capture").unwrap();
+        wrong_identity.event_id = derive_event_id(&wrong_identity);
+
+        let mut claim_bearing = base.clone();
+        let TwinEventPayload::ObservationRecorded(payload) = &mut claim_bearing.payload else {
+            unreachable!()
+        };
+        payload.claims.push(ClaimAssertion {
+            subject_id: EntityId::parse("owner").unwrap(),
+            predicate: ClaimPredicate::parse("prefers").unwrap(),
+            object: ClaimObject::parse("quiet work").unwrap(),
+            polarity: ClaimPolarity::Affirmed,
+        });
+        claim_bearing.event_id = derive_event_id(&claim_bearing);
+
+        let mut missing_note = base.clone();
+        missing_note.evidence.clear();
+        missing_note.event_id = derive_event_id(&missing_note);
+
+        let mut multiple_notes = base.clone();
+        multiple_notes.evidence.push(EvidenceRef {
+            evidence_type: EvidenceType::Note,
+            source_id: Identifier::parse("another-note").unwrap(),
+            digest: Some(ContentDigest::parse("e".repeat(64)).unwrap()),
+        });
+        multiple_notes.evidence.sort();
+        multiple_notes.event_id = derive_event_id(&multiple_notes);
+
+        let mut mismatched_digest = base;
+        mismatched_digest.evidence[0].digest = Some(ContentDigest::parse("e".repeat(64)).unwrap());
+        mismatched_digest.event_id = derive_event_id(&mismatched_digest);
+
+        for event in [
+            wrong_source,
+            wrong_identity,
+            claim_bearing,
+            missing_note,
+            multiple_notes,
+            mismatched_digest,
+        ] {
+            let snapshot = project(&[event], reference()).unwrap();
+            assert!(snapshot
+                .recent_observations
+                .iter()
+                .all(|item| !item.item_id.as_str().ends_with(":capture")));
+            assert!(snapshot
+                .timeline
+                .iter()
+                .all(|item| !item.item_id.as_str().ends_with(":capture")));
+        }
     }
 
     #[test]

@@ -14,6 +14,7 @@ const tauriPlugins = vi.hoisted(() => ({
   runtime: {
     isTauri: true,
     isDesktop: true,
+    compact: false,
     platform: 'windows',
   },
 }))
@@ -33,6 +34,10 @@ vi.mock('@/api/transport', () => ({
 
 vi.mock('@/composables/useToast', () => ({
   useToast: () => ({ warning: tauriPlugins.toastWarning }),
+}))
+
+vi.mock('@/composables/useCompanionLayout', () => ({
+  useCompanionLayout: () => ({ isCompact: tauriPlugins.runtime.compact }),
 }))
 
 vi.mock('@tauri-apps/plugin-dialog', () => ({
@@ -74,6 +79,10 @@ function mountApp() {
     global: {
       stubs: {
         RouterView: true,
+        CompanionShell: {
+          name: 'CompanionShell',
+          template: '<div class="companion-shell-test"><slot /></div>',
+        },
         ToastNotification: true,
         GuidePanel: true,
         GuideTip: true,
@@ -88,6 +97,7 @@ describe('desktop Tauri shell', () => {
     vi.clearAllMocks()
     tauriPlugins.runtime.isTauri = true
     tauriPlugins.runtime.isDesktop = true
+    tauriPlugins.runtime.compact = false
     tauriPlugins.runtime.platform = 'windows'
     tauriPlugins.check.mockResolvedValue(null)
     tauriPlugins.listen.mockResolvedValue(tauriPlugins.unlisten)
@@ -311,6 +321,27 @@ describe('desktop Tauri shell', () => {
     await flushPromises()
 
     expect(tauriPlugins.check).not.toHaveBeenCalled()
+    wrapper.unmount()
+  })
+
+  it('wraps only compact routes in the companion shell and hides desktop guide chrome', () => {
+    tauriPlugins.runtime.compact = true
+
+    const wrapper = mountApp()
+
+    expect(wrapper.find('.companion-shell-test').exists()).toBe(true)
+    expect(wrapper.find('router-view-stub').exists()).toBe(true)
+    expect(wrapper.find('guide-panel-stub').exists()).toBe(false)
+    expect(wrapper.find('guide-tip-stub').exists()).toBe(false)
+    wrapper.unmount()
+  })
+
+  it('leaves the wide router view outside the companion shell', () => {
+    const wrapper = mountApp()
+
+    expect(wrapper.find('.companion-shell-test').exists()).toBe(false)
+    expect(wrapper.find('router-view-stub').exists()).toBe(true)
+    expect(wrapper.find('guide-panel-stub').exists()).toBe(true)
     wrapper.unmount()
   })
 })

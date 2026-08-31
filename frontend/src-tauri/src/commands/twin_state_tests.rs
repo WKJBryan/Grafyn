@@ -7,6 +7,556 @@ use crate::models::twin_event::{
 use crate::models::twin_state::{ExclusionReasonCode, ProjectedItemKind, TimelineState};
 use chrono::{Duration, TimeZone};
 
+fn companion_test_state() -> (crate::AppState, tempfile::TempDir, tempfile::TempDir) {
+    let (mut state, vault, data) = crate::commands::commit_note_write_tests::build_test_state();
+    let coordinator = state.mutation_coordinator.as_ref().unwrap().clone();
+    state.knowledge_store = std::sync::Arc::new(tokio::sync::RwLock::new(
+        crate::services::knowledge_store::KnowledgeStore::with_event_recorder(
+            vault.path().to_path_buf(),
+            coordinator.current_namespace_path().unwrap(),
+            coordinator,
+        ),
+    ));
+    (state, vault, data)
+}
+
+fn companion_capture_request(
+    content: &str,
+    grafyn_sync: CompanionSyncPolicy,
+) -> CreateCompanionCaptureRequest {
+    CreateCompanionCaptureRequest {
+        content: content.to_string(),
+        capture_kind: CompanionCaptureKind::Text,
+        context: CompanionCaptureContextInput::default(),
+        attachment_digests: Vec::new(),
+        grafyn_sync,
+    }
+}
+
+#[test]
+fn companion_capture_request_is_strict_at_every_boundary() {
+    let request = serde_json::json!({
+        "content": "A thought",
+        "captureKind": "text",
+        "context": {
+            "person": null,
+            "role": null,
+            "relationship": null,
+            "environment": null,
+            "activity": null,
+            "goal": null
+        },
+        "attachmentDigests": [],
+        "grafynSync": "inherit"
+    });
+    assert!(serde_json::from_value::<CreateCompanionCaptureRequest>(request.clone()).is_ok());
+
+    let mut unknown_request = request.clone();
+    unknown_request["unexpected"] = serde_json::json!(true);
+    assert!(serde_json::from_value::<CreateCompanionCaptureRequest>(unknown_request).is_err());
+
+    let mut unknown_context = request.clone();
+    unknown_context["context"]["unexpected"] = serde_json::json!(true);
+    assert!(serde_json::from_value::<CreateCompanionCaptureRequest>(unknown_context).is_err());
+
+    let mut unsupported_kind = request.clone();
+    unsupported_kind["captureKind"] = serde_json::json!("video");
+    assert!(serde_json::from_value::<CreateCompanionCaptureRequest>(unsupported_kind).is_err());
+
+    let mut unsupported_policy = request.clone();
+    unsupported_policy["grafynSync"] = serde_json::json!("public");
+    assert!(serde_json::from_value::<CreateCompanionCaptureRequest>(unsupported_policy).is_err());
+
+    let mut malformed_digest = request;
+    malformed_digest["attachmentDigests"] = serde_json::json!(["../attachment"]);
+    assert!(serde_json::from_value::<CreateCompanionCaptureRequest>(malformed_digest).is_err());
+}
+
+#[test]
+fn companion_title_is_markdown_stripped_bounded_and_clock_deterministic() {
+    let at = Utc.with_ymd_and_hms(2026, 9, 1, 4, 5, 0).unwrap();
+    assert_eq!(
+        derive_companion_capture_title("\n## **Build Grafyn** _carefully_\nDetails", at),
+        "Build Grafyn carefully"
+    );
+    assert_eq!(
+        derive_companion_capture_title(&format!("# {}", "a".repeat(90)), at)
+            .chars()
+            .count(),
+        80
+    );
+    assert_eq!(
+        derive_companion_capture_title("---\n***", at),
+        "Capture 2026-09-01 04:05 UTC"
+    );
+}
+
+#[tokio::test]
+async fn blank_companion_capture_fails_before_any_durable_write() {
+    let (state, _vault, _data) = companion_test_state();
+    let at = Utc.with_ymd_and_hms(2026, 9, 1, 4, 5, 0).unwrap();
+
+    let error = create_companion_capture_inner(
+        &state,
+        companion_capture_request(" \n\t ", CompanionSyncPolicy::Inherit),
+        at,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(error.contains("blank"), "{error}");
+    assert!(state
+        .knowledge_store
+        .read()
+        .await
+        .list_notes()
+        .unwrap()
+        .is_empty());
+    assert!(state.twin_event_store.ordered_events().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn companion_capture_commits_note_and_contextual_observation_as_one_group() {
+    let (state, _vault, _data) = companion_test_state();
+    let at = Utc.with_ymd_and_hms(2026, 9, 1, 4, 5, 0).unwrap();
+    let attachment = ContentDigest::parse("a".repeat(64)).unwrap();
+    let before = state
+        .mutation_coordinator
+        .as_ref()
+        .unwrap()
+        .current_authority_token()
+        .unwrap();
+    let request = CreateCompanionCaptureRequest {
+        content: "## **Prefers quiet work**\nEspecially in the morning.".into(),
+        capture_kind: CompanionCaptureKind::Text,
+        context: CompanionCaptureContextInput {
+            person: Some("Alex Chen".into()),
+            role: Some("manager".into()),
+            relationship: Some("works with".into()),
+            environment: Some("home office".into()),
+            activity: Some("planning".into()),
+            goal: Some("Ship Grafyn".into()),
+        },
+        attachment_digests: vec![attachment.clone(), attachment.clone()],
+        grafyn_sync: CompanionSyncPolicy::Inherit,
+    };
+
+    let response = create_companion_capture_inner(&state, request, at)
+        .await
+        .unwrap();
+
+    assert_eq!(response.note.title, "Prefers quiet work");
+    assert_eq!(response.note.status, crate::models::note::NoteStatus::Draft);
+    assert_eq!(response.note.tags, vec!["inbox"]);
+    assert_eq!(
+        response.note.properties.get("capture_kind"),
+        Some(&serde_json::json!("text"))
+    );
+    assert_eq!(
+        response.note.properties.get("attachment_digests"),
+        Some(&serde_json::json!([attachment.as_str()]))
+    );
+    assert_eq!(
+        response.note.properties.get("grafyn_sync"),
+        Some(&serde_json::json!("inherit"))
+    );
+
+    let after = state
+        .mutation_coordinator
+        .as_ref()
+        .unwrap()
+        .current_authority_token()
+        .unwrap();
+    assert_eq!(after.authority_generation, before.authority_generation + 1);
+    let events = state.twin_event_store.ordered_events().unwrap();
+    assert_eq!(events.len(), 2);
+    let TwinEventPayload::NoteChanged(note_changed) = &events[0].payload else {
+        panic!("the first event must be NoteChanged");
+    };
+    assert_eq!(note_changed.note_id.as_str(), response.note.id);
+    let TwinEventPayload::ObservationRecorded(observation) = &events[1].payload else {
+        panic!("the second event must be ObservationRecorded");
+    };
+    assert_eq!(events[1].event_id, response.observation_event_id);
+    assert_eq!(
+        observation.observation_id.as_str(),
+        format!("companion-capture-{}", response.note.id)
+    );
+    assert!(observation.claims.is_empty());
+    assert_eq!(observation.content_digest, note_changed.content_digest);
+    assert_eq!(events[1].observed_at, at);
+    assert_eq!(events[1].context.environments, vec!["home office"]);
+    assert_eq!(events[1].context.activities, vec!["planning"]);
+    assert_eq!(events[1].context.goals, vec!["Ship Grafyn"]);
+    assert_eq!(events[1].context.entities.len(), 1);
+    assert_eq!(
+        events[1].context.entities[0]
+            .display_label
+            .as_ref()
+            .unwrap()
+            .as_str(),
+        "Alex Chen"
+    );
+    assert_eq!(events[1].context.relationships.len(), 1);
+    assert_eq!(
+        events[1].context.relationships[0].predicate.as_str(),
+        "works_with"
+    );
+    assert_eq!(
+        events[1]
+            .evidence
+            .iter()
+            .filter(|value| value.evidence_type == EvidenceType::Attachment)
+            .count(),
+        1
+    );
+    assert_eq!(events[1].causal_parents, vec![events[0].event_id.clone()]);
+}
+
+#[tokio::test]
+async fn companion_capture_recovers_one_plan_without_duplicate_note_or_event() {
+    let (state, _vault, _data) = companion_test_state();
+    let at = Utc.with_ymd_and_hms(2026, 9, 1, 4, 5, 0).unwrap();
+    state
+        .mutation_coordinator
+        .as_ref()
+        .unwrap()
+        .fail_next_replays_before_targets(2);
+
+    let response = create_companion_capture_inner(
+        &state,
+        companion_capture_request("Recovered capture", CompanionSyncPolicy::Inherit),
+        at,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        state
+            .knowledge_store
+            .read()
+            .await
+            .list_notes()
+            .unwrap()
+            .len(),
+        1
+    );
+    let events = state.twin_event_store.ordered_events().unwrap();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[1].event_id, response.observation_event_id);
+    assert_eq!(
+        state
+            .mutation_coordinator
+            .as_ref()
+            .unwrap()
+            .pending_count()
+            .unwrap(),
+        0
+    );
+}
+
+async fn companion_optimizer_queue_size(state: &crate::AppState) -> usize {
+    let settings = crate::models::settings::UserSettings::default();
+    let mut optimizer = state.vault_optimizer.write().await;
+    optimizer
+        .with_locked_fresh_state(|optimizer| Ok(optimizer.status(&settings).queue_size))
+        .unwrap()
+}
+
+async fn companion_optimizer_queue_ids(state: &crate::AppState) -> Vec<String> {
+    let mut optimizer = state.vault_optimizer.write().await;
+    optimizer
+        .with_locked_fresh_state(|optimizer| Ok(optimizer.queued_note_ids()))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn companion_capture_enqueues_at_authority_returned_by_same_vault_repair() {
+    let (state, _vault, _data) = companion_test_state();
+    let coordinator = state.mutation_coordinator.as_ref().unwrap();
+    let setup = state
+        .knowledge_store
+        .write()
+        .await
+        .create_note_expecting_authority(
+            NoteCreate {
+                title: "Pending topic normalization".into(),
+                content: "A tagged setup note".into(),
+                relative_path: Some("pending-topic-normalization.md".into()),
+                aliases: Vec::new(),
+                status: crate::models::note::NoteStatus::Draft,
+                tags: vec!["rust".into()],
+                schema_version: crate::models::note::CURRENT_NOTE_SCHEMA_VERSION,
+                migration_source: None,
+                optimizer_managed: false,
+                properties: Default::default(),
+            },
+            "test",
+            coordinator.current_authority_token().unwrap(),
+        )
+        .unwrap()
+        .0;
+    crate::commands::enqueue_vault_optimizer_note(&state, &setup.id, "test_setup")
+        .await
+        .unwrap();
+    assert_eq!(
+        companion_optimizer_queue_ids(&state).await,
+        vec![setup.id.clone()]
+    );
+    let before_capture = coordinator.current_authority_token().unwrap();
+
+    let capture = create_companion_capture_inner(
+        &state,
+        companion_capture_request(
+            "Capture while topic normalization is pending",
+            CompanionSyncPolicy::Inherit,
+        ),
+        Utc.with_ymd_and_hms(2026, 9, 1, 4, 5, 0).unwrap(),
+    )
+    .await
+    .unwrap();
+
+    let repaired = coordinator.current_authority_token().unwrap();
+    assert!(
+        repaired.authority_generation > before_capture.authority_generation + 1,
+        "same-vault repair must advance beyond the capture commit"
+    );
+    let queued = companion_optimizer_queue_ids(&state).await;
+    assert!(queued.contains(&setup.id));
+    assert!(
+        queued.contains(&capture.note.id),
+        "the captured note must be enqueued under repair's continuation authority; queued={queued:?}"
+    );
+}
+
+#[tokio::test]
+async fn companion_capture_root_retarget_keeps_commit_identity_and_skips_stale_optimizer() {
+    let at = Utc.with_ymd_and_hms(2026, 9, 1, 4, 5, 0).unwrap();
+
+    let (state, _vault, _data) = companion_test_state();
+    let replacement_vault = tempfile::tempdir().unwrap();
+    let response = create_companion_capture_inner_with_post_commit_checkpoint(
+        &state,
+        companion_capture_request("Capture before a root switch", CompanionSyncPolicy::Inherit),
+        at,
+        async {
+            let coordinator = state.mutation_coordinator.as_ref().unwrap();
+            coordinator
+                .retarget_markdown_root(replacement_vault.path())
+                .unwrap();
+            let replacement = coordinator.current_authority_token().unwrap();
+            state
+                .twin_event_store
+                .activate_vault_scope(replacement.root_scope)
+                .unwrap();
+        },
+    )
+    .await
+    .expect("the response identity must come from the committed event group");
+    assert!(!response.observation_event_id.as_str().is_empty());
+
+    let (state, _vault, _data) = companion_test_state();
+    let replacement_vault = tempfile::tempdir().unwrap();
+    let empty_optimizer_root = tempfile::tempdir().unwrap();
+    create_companion_capture_inner_with_post_commit_checkpoint(
+        &state,
+        companion_capture_request("Do not enqueue across roots", CompanionSyncPolicy::Inherit),
+        at,
+        async {
+            *state.vault_optimizer.write().await =
+                crate::services::vault_optimizer::VaultOptimizerService::new(
+                    empty_optimizer_root.path().to_path_buf(),
+                );
+            state
+                .mutation_coordinator
+                .as_ref()
+                .unwrap()
+                .retarget_markdown_root(replacement_vault.path())
+                .unwrap();
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(companion_optimizer_queue_size(&state).await, 0);
+}
+
+fn companion_recall_rank_request(
+    reference_time: DateTime<Utc>,
+    note_ids: &[String],
+    destination: SelectionDestination,
+) -> TwinAttentionRankRequest {
+    serde_json::from_value(serde_json::json!({
+        "referenceTime": reference_time,
+        "profile": "recall",
+        "query": "quiet work",
+        "relationshipVariant": { "relationships": [] },
+        "goals": [],
+        "destination": destination,
+        "filter": { "relationships": [], "goals": [], "tags": [] },
+        "limit": 10,
+        "candidateNoteIds": note_ids,
+    }))
+    .unwrap()
+}
+
+#[tokio::test]
+async fn companion_recall_ranking_is_candidate_bound_and_deterministic() {
+    let (state, _vault, _data) = companion_test_state();
+    let at = Utc.with_ymd_and_hms(2026, 9, 1, 4, 5, 0).unwrap();
+    let unrelated = create_companion_capture_inner(
+        &state,
+        companion_capture_request("An unrelated capture", CompanionSyncPolicy::Inherit),
+        at - Duration::minutes(1),
+    )
+    .await
+    .unwrap();
+    let capture = create_companion_capture_inner(
+        &state,
+        companion_capture_request("Quiet work helps me focus", CompanionSyncPolicy::Inherit),
+        at,
+    )
+    .await
+    .unwrap();
+    let events = state.twin_event_store.ordered_events().unwrap();
+    assert!(events
+        .iter()
+        .filter_map(|event| match &event.payload {
+            TwinEventPayload::ObservationRecorded(value) => Some(value),
+            _ => None,
+        })
+        .all(|observation| observation.claims.is_empty()));
+
+    let request = companion_recall_rank_request(
+        at,
+        std::slice::from_ref(&capture.note.id),
+        SelectionDestination::Local,
+    );
+    let first = rank_twin_attention_inner(&state, request.clone())
+        .await
+        .unwrap();
+    let second = rank_twin_attention_inner(&state, request).await.unwrap();
+
+    assert_eq!(first, second);
+    assert_eq!(first.trace.selected.len(), 1);
+    assert!(first.trace.excluded.is_empty());
+    let selected = &first.trace.selected[0];
+    assert_eq!(
+        selected.item_id.as_str(),
+        format!("observation:{}:capture", capture.observation_event_id)
+    );
+    assert_ne!(
+        selected.item_id.as_str(),
+        format!("observation:{}:capture", unrelated.observation_event_id)
+    );
+    assert_eq!(selected.attention.profile, AttentionProfile::Recall);
+    assert_eq!(selected.attention.profile_version, 1);
+    assert_eq!(selected.attention.vector.confidence.get(), 2_000);
+    assert_eq!(selected.attention.vector.recency.get(), 10_000);
+
+    let encoded = serde_json::to_value(&first).unwrap();
+    assert_eq!(
+        encoded["noteBindings"],
+        serde_json::json!([{
+            "itemId": selected.item_id.as_str(),
+            "noteId": capture.note.id,
+        }])
+    );
+
+    let mut limited_request = companion_recall_rank_request(
+        at,
+        &[capture.note.id, unrelated.note.id],
+        SelectionDestination::Local,
+    );
+    limited_request.limit = 1;
+    let limited = rank_twin_attention_inner(&state, limited_request)
+        .await
+        .unwrap();
+    assert_eq!(limited.trace.selected.len(), 1);
+    assert_eq!(limited.note_bindings.len(), 1);
+    assert_eq!(
+        limited.note_bindings[0].item_id,
+        limited.trace.selected[0].item_id
+    );
+}
+
+#[tokio::test]
+async fn companion_note_binding_is_emitted_only_after_governance_selection() {
+    let (state, _vault, _data) = companion_test_state();
+    let at = Utc.with_ymd_and_hms(2026, 9, 1, 4, 5, 0).unwrap();
+    let capture = create_companion_capture_inner(
+        &state,
+        companion_capture_request("Local quiet work", CompanionSyncPolicy::LocalOnly),
+        at,
+    )
+    .await
+    .unwrap();
+
+    let network = rank_twin_attention_inner(
+        &state,
+        companion_recall_rank_request(
+            at,
+            std::slice::from_ref(&capture.note.id),
+            SelectionDestination::Network,
+        ),
+    )
+    .await
+    .unwrap();
+    assert!(network.trace.selected.is_empty());
+    assert_eq!(network.trace.excluded.len(), 1);
+    assert_eq!(
+        network.trace.excluded[0].reason,
+        ExclusionReasonCode::Visibility
+    );
+    assert_eq!(
+        serde_json::to_value(&network).unwrap()["noteBindings"],
+        serde_json::json!([])
+    );
+
+    let local = rank_twin_attention_inner(
+        &state,
+        companion_recall_rank_request(
+            at,
+            std::slice::from_ref(&capture.note.id),
+            SelectionDestination::Local,
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(local.trace.selected.len(), 1);
+    assert_eq!(
+        serde_json::to_value(&local).unwrap()["noteBindings"][0]["noteId"],
+        capture.note.id
+    );
+}
+
+#[tokio::test]
+async fn attention_candidate_note_ids_default_and_reject_oversized_requests() {
+    let reference_time = Utc.with_ymd_and_hms(2026, 9, 1, 4, 5, 0).unwrap();
+    let defaulted = serde_json::json!({
+        "referenceTime": reference_time,
+        "profile": "recall",
+        "query": "quiet work",
+        "relationshipVariant": { "relationships": [] },
+        "goals": [],
+        "destination": "local",
+        "filter": { "relationships": [], "goals": [], "tags": [] },
+        "limit": 10,
+    });
+    let defaulted = serde_json::from_value::<TwinAttentionRankRequest>(defaulted).unwrap();
+    assert!(defaulted.candidate_note_ids.is_empty());
+
+    let oversized = (0..=MAX_PAGE_LIMIT)
+        .map(|index| format!("note-{index}"))
+        .collect::<Vec<_>>();
+    let request =
+        companion_recall_rank_request(reference_time, &oversized, SelectionDestination::Local);
+    let (state, _vault, _data) = companion_test_state();
+    assert!(rank_twin_attention_inner(&state, request)
+        .await
+        .unwrap_err()
+        .contains("candidate note"));
+}
+
 #[test]
 fn command_requests_reject_unknown_fields_and_initial_supersede() {
     let page = serde_json::json!({
@@ -385,6 +935,7 @@ async fn read_commands_page_filter_rank_and_hold_snapshot_stable() {
         destination,
         filter,
         limit: 100,
+        candidate_note_ids: Vec::new(),
     };
     let capture = rank_twin_attention_inner(
         &state,
@@ -428,6 +979,7 @@ async fn read_commands_page_filter_rank_and_hold_snapshot_stable() {
             destination: SelectionDestination::Network,
             filter: state_filter(None, &[], &["private"]),
             limit: 100,
+            candidate_note_ids: Vec::new(),
         },
     )
     .await
@@ -456,6 +1008,7 @@ async fn read_commands_page_filter_rank_and_hold_snapshot_stable() {
             destination: SelectionDestination::Export,
             filter: state_filter(None, &[], &["private"]),
             limit: 100,
+            candidate_note_ids: Vec::new(),
         },
     )
     .await
@@ -479,6 +1032,7 @@ async fn read_commands_page_filter_rank_and_hold_snapshot_stable() {
             destination: SelectionDestination::Network,
             filter: state_filter(None, &[], &["restricted"]),
             limit: 100,
+            candidate_note_ids: Vec::new(),
         },
     )
     .await

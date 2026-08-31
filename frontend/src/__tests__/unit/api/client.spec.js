@@ -302,6 +302,34 @@ describe('API Client (Tauri)', () => {
       expect(mockInvoke).toHaveBeenCalledWith('get_twin_review', {})
     })
 
+    it('createCompanionCapture() invokes the exact command and normalizes its response', async () => {
+      const request = {
+        content: 'A field note',
+        captureKind: 'text',
+        context: {
+          person: '',
+          role: '',
+          relationship: '',
+          environment: 'train',
+          activity: 'reading',
+          goal: '',
+        },
+        attachmentDigests: [],
+        grafynSync: 'inherit',
+      }
+      mockInvoke.mockResolvedValue({
+        note: { id: 'note-1', title: 'A field note' },
+        observation_event_id: 'event-1',
+      })
+
+      await expect(twin.createCompanionCapture(request)).resolves.toEqual({
+        note: { id: 'note-1', title: 'A field note' },
+        observationEventId: 'event-1',
+      })
+      expect(mockInvoke).toHaveBeenCalledWith('create_companion_capture', { request })
+      expect(request).not.toHaveProperty('title')
+    })
+
     it('listObservations() invokes list_twin_observations with its exact request', async () => {
       const request = {
         referenceTime: '2026-08-31T10:00:00Z',

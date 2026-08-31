@@ -1468,6 +1468,7 @@ fn is_structural_tag(tag: &str) -> bool {
         tag.trim().to_ascii_lowercase().as_str(),
         "hub"
             | "grafyn"
+            | "inbox"
             | "draft"
             | "evidence"
             | "canonical"
@@ -1494,6 +1495,11 @@ fn is_structural_tag(tag: &str) -> bool {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn companion_inbox_tag_is_structural() {
+        assert!(is_structural_tag("inbox"));
+    }
 
     fn write_note(
         store: &mut KnowledgeStore,

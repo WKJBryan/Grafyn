@@ -1,23 +1,26 @@
+use crate::models::note::{Note, NoteCreate, NoteStatus, CURRENT_NOTE_SCHEMA_VERSION};
 use crate::models::twin_event::{
-    AuthorityClass, BoundedContent, ClaimAssertion, EntityId, EventContext, EventId, EvidenceRef,
+    AuthorityClass, BoundedContent, BoundedLabel, BoundedRole, ClaimAssertion, ClaimPolarity,
+    ContentDigest, ContextEntity, EntityId, EntityType, EventContext, EventId, EvidenceRef,
     EvidenceType, Governance, Identifier, MemoryProposed, MemoryReviewDecision, MemoryReviewed,
     ProvenanceLabel, RelationshipAssertion, RelationshipDirection, RelationshipPredicate,
     ReviewState, Sensitivity, SourceChannel, TwinEvent, TwinEventPayload,
     MAX_CONTEXT_RELATIONSHIPS,
 };
 use crate::models::twin_state::{
-    AttentionCandidate, AttentionProfile, AttentionRequest, ProjectedStateItem, ProjectionSnapshot,
-    RelationshipKey, RelationshipVariant, SelectionDestination, SelectionTrace, SnapshotId,
-    TemporalStateEntry,
+    AttentionCandidate, AttentionProfile, AttentionRequest, ProjectedItemKind, ProjectedStateItem,
+    ProjectionSnapshot, RelationshipKey, RelationshipVariant, SelectionDestination, SelectionTrace,
+    SnapshotId, TemporalStateEntry,
 };
 use crate::services::twin_events::{
-    project, rank, MutationError, MutationOrigin, MutationPlan, TwinEventDraft,
+    local_capture_governance, project, rank, standard_capture_governance,
+    CompanionObservationInput, MutationError, MutationOrigin, MutationPlan, TwinEventDraft,
 };
 use crate::AppState;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use tauri::State;
 
 const TWIN_STATE_COMMAND_SCHEMA_VERSION: u16 = 1;
@@ -27,6 +30,333 @@ const MAX_CONTEXT_VALUE_BYTES: usize = 256;
 const MAX_CURSOR_BYTES: usize = 8_192;
 const FILTER_DIGEST_DOMAIN: &[u8] = b"grafyn.twin-state-filter.v1";
 const CURSOR_VERSION: u16 = 1;
+const COMPANION_PERSON_ID_DOMAIN: &[u8] = b"grafyn.companion-person.v1";
+const MAX_COMPANION_TITLE_CHARACTERS: usize = 80;
+const MAX_COMPANION_ATTACHMENTS: usize = 63;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum CompanionCaptureKind {
+    Text,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum CompanionSyncPolicy {
+    Inherit,
+    LocalOnly,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CompanionCaptureContextInput {
+    #[serde(default)]
+    pub person: Option<String>,
+    #[serde(default)]
+    pub role: Option<String>,
+    #[serde(default)]
+    pub relationship: Option<String>,
+    #[serde(default)]
+    pub environment: Option<String>,
+    #[serde(default)]
+    pub activity: Option<String>,
+    #[serde(default)]
+    pub goal: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CreateCompanionCaptureRequest {
+    pub content: String,
+    pub capture_kind: CompanionCaptureKind,
+    pub context: CompanionCaptureContextInput,
+    #[serde(default)]
+    pub attachment_digests: Vec<ContentDigest>,
+    pub grafyn_sync: CompanionSyncPolicy,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateCompanionCaptureResponse {
+    pub note: Note,
+    pub observation_event_id: EventId,
+}
+
+fn companion_horizontal_rule(line: &str) -> bool {
+    let compact = line
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect::<String>();
+    compact.len() >= 3
+        && compact
+            .chars()
+            .next()
+            .is_some_and(|marker| matches!(marker, '-' | '*' | '_'))
+        && compact
+            .chars()
+            .all(|character| Some(character) == compact.chars().next())
+}
+
+fn strip_companion_block_prefix(mut line: &str) -> &str {
+    loop {
+        line = line.trim_start();
+        let previous = line;
+        if let Some(rest) = line.strip_prefix('>') {
+            line = rest;
+        } else {
+            let heading_length = line
+                .chars()
+                .take_while(|character| *character == '#')
+                .count();
+            if (1..=6).contains(&heading_length)
+                && line[heading_length..]
+                    .chars()
+                    .next()
+                    .is_some_and(char::is_whitespace)
+            {
+                line = &line[heading_length..];
+            } else if ["- ", "+ ", "* "]
+                .iter()
+                .find_map(|prefix| line.strip_prefix(prefix))
+                .is_some()
+            {
+                line = &line[2..];
+            } else {
+                let digits = line.bytes().take_while(u8::is_ascii_digit).count();
+                let suffix = line.get(digits..).unwrap_or_default();
+                if digits > 0 && (suffix.starts_with(". ") || suffix.starts_with(") ")) {
+                    line = &suffix[2..];
+                }
+            }
+        }
+        line = line.trim_start();
+        if line.starts_with("[ ] ") || line.starts_with("[x] ") || line.starts_with("[X] ") {
+            line = &line[4..];
+        }
+        if line == previous {
+            return line;
+        }
+    }
+}
+
+fn strip_companion_inline_markdown(line: &str) -> String {
+    let characters = line.chars().collect::<Vec<_>>();
+    let mut output = String::new();
+    let mut index = 0;
+    while index < characters.len() {
+        match characters[index] {
+            '\\' if index + 1 < characters.len() => {
+                output.push(characters[index + 1]);
+                index += 2;
+            }
+            '!' if characters.get(index + 1) == Some(&'[') => {
+                index += 1;
+            }
+            '[' => {
+                if let Some(close_offset) = characters[index + 1..]
+                    .iter()
+                    .position(|character| *character == ']')
+                {
+                    let close = index + 1 + close_offset;
+                    for character in &characters[index + 1..close] {
+                        if !matches!(character, '*' | '_' | '~' | '`') {
+                            output.push(*character);
+                        }
+                    }
+                    index = close + 1;
+                    if characters.get(index) == Some(&'(') {
+                        if let Some(target_end) = characters[index + 1..]
+                            .iter()
+                            .position(|character| *character == ')')
+                        {
+                            index += target_end + 2;
+                        }
+                    }
+                } else {
+                    index += 1;
+                }
+            }
+            '<' => {
+                if let Some(close_offset) = characters[index + 1..]
+                    .iter()
+                    .position(|character| *character == '>')
+                {
+                    index += close_offset + 2;
+                } else {
+                    index += 1;
+                }
+            }
+            '*' | '_' | '~' | '`' => index += 1,
+            character => {
+                output.push(character);
+                index += 1;
+            }
+        }
+    }
+    output.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+pub(crate) fn derive_companion_capture_title(content: &str, captured_at: DateTime<Utc>) -> String {
+    for raw_line in content.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || companion_horizontal_rule(line) {
+            continue;
+        }
+        let title = strip_companion_inline_markdown(strip_companion_block_prefix(line));
+        if !title.is_empty() {
+            return title.chars().take(MAX_COMPANION_TITLE_CHARACTERS).collect();
+        }
+    }
+    captured_at.format("Capture %Y-%m-%d %H:%M UTC").to_string()
+}
+
+fn normalize_companion_context_value(
+    value: Option<String>,
+    name: &str,
+) -> Result<Option<String>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value.trim().is_empty() {
+        return Ok(None);
+    }
+    if value.len() > MAX_CONTEXT_VALUE_BYTES || value.chars().any(char::is_control) {
+        return Err(format!(
+            "Companion capture {name} must be at most 256 bytes without controls"
+        ));
+    }
+    Ok(Some(value.split_whitespace().collect::<Vec<_>>().join(" ")))
+}
+
+fn companion_person_id(label: &str) -> Result<EntityId, String> {
+    let normalized = label
+        .split_whitespace()
+        .map(str::to_lowercase)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut hasher = Sha256::new();
+    hasher.update((COMPANION_PERSON_ID_DOMAIN.len() as u64).to_be_bytes());
+    hasher.update(COMPANION_PERSON_ID_DOMAIN);
+    hasher.update((normalized.len() as u64).to_be_bytes());
+    hasher.update(normalized.as_bytes());
+    EntityId::parse(format!("person-{:x}", hasher.finalize()))
+}
+
+fn companion_relationship_predicate(value: &str) -> Result<RelationshipPredicate, String> {
+    let mut normalized = String::new();
+    let mut pending_separator = false;
+    for character in value.chars() {
+        if character.is_ascii_alphanumeric() {
+            if pending_separator && !normalized.is_empty() {
+                normalized.push('_');
+            }
+            normalized.push(character.to_ascii_lowercase());
+            pending_separator = false;
+        } else if !normalized.is_empty() {
+            pending_separator = true;
+        }
+    }
+    if normalized.is_empty() {
+        return Err("Companion capture relationship must contain a letter or number".into());
+    }
+    RelationshipPredicate::parse(normalized)
+}
+
+fn plan_companion_capture(
+    request: CreateCompanionCaptureRequest,
+    captured_at: DateTime<Utc>,
+) -> Result<(NoteCreate, CompanionObservationInput), String> {
+    if request.content.trim().is_empty() {
+        return Err("Companion capture content cannot be blank".into());
+    }
+    if request.attachment_digests.len() > MAX_COMPANION_ATTACHMENTS {
+        return Err("Companion capture cannot cite more than 63 attachments".into());
+    }
+
+    let mut attachment_digests = request.attachment_digests;
+    attachment_digests.sort();
+    attachment_digests.dedup();
+    let person = normalize_companion_context_value(request.context.person, "person")?;
+    let role = normalize_companion_context_value(request.context.role, "role")?;
+    let relationship =
+        normalize_companion_context_value(request.context.relationship, "relationship")?;
+    let environment =
+        normalize_companion_context_value(request.context.environment, "environment")?;
+    let activity = normalize_companion_context_value(request.context.activity, "activity")?;
+    let goal = normalize_companion_context_value(request.context.goal, "goal")?;
+    if person.is_none() && (role.is_some() || relationship.is_some()) {
+        return Err("Companion capture role and relationship require a person".into());
+    }
+
+    let governance = match request.grafyn_sync {
+        CompanionSyncPolicy::Inherit => standard_capture_governance(),
+        CompanionSyncPolicy::LocalOnly => local_capture_governance(Sensitivity::Standard),
+    };
+    let source_channel = SourceChannel::parse("companion_capture")?;
+    let mut context = EventContext {
+        source_channel,
+        tags: vec!["inbox".into()],
+        environments: environment.into_iter().collect(),
+        activities: activity.into_iter().collect(),
+        goals: goal.into_iter().collect(),
+        ..EventContext::default()
+    };
+    if let Some(person) = person {
+        let person_id = companion_person_id(&person)?;
+        context.entities.push(ContextEntity {
+            entity_id: person_id.clone(),
+            entity_type: EntityType::parse("person")?,
+            display_label: Some(BoundedLabel::parse(person)?),
+            role_in_event: role.map(BoundedRole::parse).transpose()?,
+        });
+        if let Some(relationship) = relationship {
+            context.relationships.push(RelationshipAssertion {
+                subject_id: EntityId::parse("owner")?,
+                predicate: companion_relationship_predicate(&relationship)?,
+                object_id: person_id,
+                direction: RelationshipDirection::Directed,
+                valid_from: Some(captured_at),
+                valid_to: None,
+                evidence: Vec::new(),
+                governance: governance.clone(),
+            });
+        }
+    }
+
+    let grafyn_sync = match request.grafyn_sync {
+        CompanionSyncPolicy::Inherit => "inherit",
+        CompanionSyncPolicy::LocalOnly => "local_only",
+    };
+    let mut properties = HashMap::new();
+    properties.insert("capture_kind".into(), serde_json::json!("text"));
+    properties.insert(
+        "attachment_digests".into(),
+        serde_json::json!(attachment_digests
+            .iter()
+            .map(ContentDigest::as_str)
+            .collect::<Vec<_>>()),
+    );
+    properties.insert("grafyn_sync".into(), serde_json::json!(grafyn_sync));
+    let note = NoteCreate {
+        title: derive_companion_capture_title(&request.content, captured_at),
+        content: request.content,
+        relative_path: None,
+        aliases: Vec::new(),
+        status: NoteStatus::Draft,
+        tags: vec!["inbox".into()],
+        schema_version: CURRENT_NOTE_SCHEMA_VERSION,
+        migration_source: None,
+        optimizer_managed: false,
+        properties,
+    };
+    let observation = CompanionObservationInput {
+        observed_at: captured_at,
+        context,
+        attachment_digests,
+        governance,
+    };
+    Ok((note, observation))
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -77,6 +407,8 @@ pub struct TwinAttentionRankRequest {
     pub destination: SelectionDestination,
     pub filter: TwinStateFilter,
     pub limit: u16,
+    #[serde(default)]
+    pub candidate_note_ids: Vec<Identifier>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -120,6 +452,14 @@ pub struct TwinAttentionRankResponse {
     pub reference_time: DateTime<Utc>,
     pub filter_digest: String,
     pub trace: SelectionTrace,
+    pub note_bindings: Vec<TwinAttentionNoteBinding>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TwinAttentionNoteBinding {
+    pub item_id: Identifier,
+    pub note_id: Identifier,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -350,6 +690,19 @@ fn item_matches_filter(item: &ProjectedStateItem, filter: &NormalizedFilter) -> 
         && filter.tags.iter().all(|tag| tags.contains(tag))
 }
 
+fn companion_note_id_from_item(item: &ProjectedStateItem) -> Option<Identifier> {
+    if item.kind != ProjectedItemKind::Observation
+        || !item.item_id.as_str().starts_with("observation:")
+        || !item.item_id.as_str().ends_with(":capture")
+        || item.claim.subject_id.as_str() != "owner"
+        || item.claim.predicate.as_str() != "recorded_note"
+        || item.claim.polarity != ClaimPolarity::Affirmed
+    {
+        return None;
+    }
+    Identifier::parse(item.claim.object.as_str()).ok()
+}
+
 fn event_matches_filter(event: &TwinEvent, filter: &NormalizedFilter) -> bool {
     let relationships = event
         .context
@@ -482,6 +835,14 @@ async fn rank_twin_attention_inner(
     request: TwinAttentionRankRequest,
 ) -> Result<TwinAttentionRankResponse, String> {
     validate_limit(request.limit)?;
+    if request.candidate_note_ids.len() > usize::from(MAX_PAGE_LIMIT) {
+        return Err("Twin attention candidate note IDs exceed 100 values".into());
+    }
+    let requested_note_ids = request
+        .candidate_note_ids
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
     if request.relationship_variant.relationships.len() > MAX_FILTER_VALUES {
         return Err("Twin attention relationship context exceeds 64 values".into());
     }
@@ -504,15 +865,30 @@ async fn rank_twin_attention_inner(
     let ticket = crate::commands::acquire_root_epoch(state).await?;
     let result = (|| {
         let (_, snapshot) = build_snapshot(state, request.reference_time)?;
-        let mut candidates = snapshot
+        let items = snapshot
             .reviewed_memories
             .iter()
             .chain(&snapshot.pending_proposals)
             .chain(&snapshot.recent_observations)
             .filter(|item| item_matches_filter(item, &filter))
             .cloned()
-            .map(|item| AttentionCandidate { item })
             .collect::<Vec<_>>();
+        let mut note_ids_by_item = BTreeMap::new();
+        let mut candidates = Vec::new();
+        for item in items {
+            let note_id = companion_note_id_from_item(&item);
+            if !requested_note_ids.is_empty()
+                && note_id
+                    .as_ref()
+                    .is_none_or(|note_id| !requested_note_ids.contains(note_id))
+            {
+                continue;
+            }
+            if let Some(note_id) = note_id {
+                note_ids_by_item.insert(item.item_id.clone(), note_id);
+            }
+            candidates.push(AttentionCandidate { item });
+        }
         candidates.sort_by(|left, right| left.item.item_id.cmp(&right.item.item_id));
         candidates.dedup_by(|left, right| left.item.item_id == right.item.item_id);
         let trace = rank(
@@ -529,12 +905,26 @@ async fn rank_twin_attention_inner(
             },
         )
         .map_err(|error| error.to_string())?;
+        let note_bindings = trace
+            .selected
+            .iter()
+            .filter_map(|selection| {
+                note_ids_by_item
+                    .get(&selection.item_id)
+                    .cloned()
+                    .map(|note_id| TwinAttentionNoteBinding {
+                        item_id: selection.item_id.clone(),
+                        note_id,
+                    })
+            })
+            .collect();
         Ok(TwinAttentionRankResponse {
             schema_version: TWIN_STATE_COMMAND_SCHEMA_VERSION,
             snapshot_id: snapshot.snapshot_id,
             reference_time: snapshot.reference_time,
             filter_digest: digest,
             trace,
+            note_bindings,
         })
     })();
     finish_root_read(state, ticket, result).await
@@ -1046,6 +1436,98 @@ async fn review_twin_proposal_inner(
     })
 }
 
+pub(crate) async fn create_companion_capture_inner(
+    state: &AppState,
+    request: CreateCompanionCaptureRequest,
+    captured_at: DateTime<Utc>,
+) -> Result<CreateCompanionCaptureResponse, String> {
+    create_companion_capture_inner_with_post_commit_checkpoint(
+        state,
+        request,
+        captured_at,
+        std::future::ready(()),
+    )
+    .await
+}
+
+async fn create_companion_capture_inner_with_post_commit_checkpoint(
+    state: &AppState,
+    request: CreateCompanionCaptureRequest,
+    captured_at: DateTime<Utc>,
+    post_commit_checkpoint: impl std::future::Future<Output = ()>,
+) -> Result<CreateCompanionCaptureResponse, String> {
+    let (note_create, observation) = plan_companion_capture(request, captured_at)?;
+    let root_ticket = crate::commands::acquire_root_epoch(state).await?;
+    let expected = root_ticket.authority().clone();
+    let mutation = {
+        let mut store = state.knowledge_store.write().await;
+        store.create_companion_capture_expecting_authority(
+            note_create,
+            observation,
+            expected.clone(),
+        )
+    };
+    let completed = crate::commands::complete_knowledge_note_mutation(
+        state,
+        &expected,
+        None,
+        mutation,
+        "companion capture",
+    )
+    .await?;
+    let note = completed.note;
+    let observation_id = format!("companion-capture-{}", note.id);
+    let observation_event_id = completed.commit.as_ref().and_then(|commit| {
+        commit.events.iter().find_map(|event| match &event.payload {
+            TwinEventPayload::ObservationRecorded(observation)
+                if observation.observation_id.as_str() == observation_id =>
+            {
+                Some(event.event_id.clone())
+            }
+            _ => None,
+        })
+    });
+    let mut continuation_authority = completed.continuation_authority.clone();
+    let repaired = completed.repaired;
+    if let Some(commit) = completed.commit.as_ref() {
+        drop(root_ticket);
+        if !repaired {
+            match crate::commands::repair_after_authority_mutation(
+                state,
+                commit,
+                "companion capture",
+            )
+            .await
+            {
+                crate::commands::PostAuthorityRepair::Ready(authority) => {
+                    continuation_authority = authority;
+                }
+                repair => crate::commands::acknowledge_reported_repair(repair),
+            }
+        }
+    } else {
+        root_ticket.finish(state).await?;
+    }
+    post_commit_checkpoint.await;
+    let observation_event_id = observation_event_id.ok_or_else(|| {
+        "Companion capture committed without its observation identity; do not retry".to_string()
+    })?;
+    if let Err(error) = crate::commands::enqueue_vault_optimizer_note_at_authority(
+        state,
+        &continuation_authority,
+        &note.id,
+        "companion_capture",
+    )
+    .await
+    {
+        log::warn!("Companion capture committed but optimizer enqueue failed: {error}");
+    }
+    Ok(CreateCompanionCaptureResponse {
+        note,
+        observation_event_id,
+    })
+}
+
 #[tauri::command]
 pub async fn list_twin_observations(
     state: State<'_, AppState>,
@@ -1060,6 +1542,14 @@ pub async fn list_twin_proposals(
     request: TwinStatePageRequest,
 ) -> Result<TwinProposalPage, String> {
     list_twin_proposals_inner(state.inner(), request).await
+}
+
+#[tauri::command]
+pub async fn create_companion_capture(
+    state: State<'_, AppState>,
+    request: CreateCompanionCaptureRequest,
+) -> Result<CreateCompanionCaptureResponse, String> {
+    create_companion_capture_inner(state.inner(), request, Utc::now()).await
 }
 
 #[tauri::command]

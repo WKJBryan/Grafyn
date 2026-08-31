@@ -9,7 +9,7 @@ pub const BASIS_POINTS_MAX: u16 = 10_000;
 pub const MAX_PROJECTED_ITEMS: usize = 16_384;
 pub const MAX_STATE_LINKS: usize = 64;
 pub const EXPECTED_PROJECTION_SCHEMA_VERSION: u16 = 1;
-pub const EXPECTED_PROJECTION_VERSION: u16 = 1;
+pub const EXPECTED_PROJECTION_VERSION: u16 = 2;
 pub const EXPECTED_ATTENTION_PROFILE_VERSION: u16 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]

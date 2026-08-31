@@ -768,6 +768,32 @@ pub(crate) async fn enqueue_vault_optimizer_note(
         .map_err(|error| error.to_string())
 }
 
+pub(crate) async fn enqueue_vault_optimizer_note_at_authority(
+    state: &AppState,
+    expected: &crate::services::vault_namespace::VaultAuthorityTokenV1,
+    note_id: &str,
+    reason: &str,
+) -> Result<(), String> {
+    let root_ticket = acquire_expected_root_epoch(state, expected).await?;
+    let coordinator = state
+        .mutation_coordinator
+        .as_ref()
+        .ok_or_else(|| "mutation coordinator is unavailable".to_string())?;
+    let mut optimizer = state.vault_optimizer.write().await;
+    let result = coordinator.with_locked_derived_state(expected, false, || {
+        optimizer
+            .with_locked_fresh_state(|optimizer| {
+                optimizer.enqueue_note_checked(note_id, reason).map(|_| ())
+            })
+            .map_err(|error| {
+                crate::services::twin_events::MutationError::Invalid(error.to_string())
+            })
+    });
+    drop(optimizer);
+    drop(root_ticket);
+    result.map_err(|error| error.to_string())
+}
+
 pub(crate) async fn remove_link_discovery_note(
     state: &AppState,
     note_id: &str,

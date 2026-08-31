@@ -15,11 +15,15 @@
         @keydown.down.prevent="handleArrowDown"
         @keydown.up.prevent="handleArrowUp"
       >
-      <span
+      <button
         v-if="query"
+        type="button"
         class="clear-btn"
+        aria-label="Clear search"
         @click="handleClear"
-      >×</span>
+      >
+        ×
+      </button>
     </div>
 
     <div
@@ -27,95 +31,68 @@
       class="search-results"
       role="listbox"
     >
-      <template v-if="results.length > 0">
-        <div
-          v-for="(result, index) in results"
-          :id="`search-result-${index}`"
-          :key="result.note_id"
-          class="search-result-item"
-          :class="{ 'active': index === activeIndex }"
-          role="option"
-          :aria-selected="index === activeIndex"
-          @click="handleSelect(result.note_id)"
-          @mouseenter="activeIndex = index"
-        >
-          <div class="result-title">
-            {{ result.title }}
-            <span
-              v-if="result.graph_boost > 0"
-              class="graph-badge"
-            >linked</span>
-          </div>
-          <div
-            v-if="result.snippet"
-            class="result-snippet"
-          >
-            {{ result.snippet }}
-          </div>
-          <div class="result-score">
-            <div
-              class="score-bar"
-              :style="{ width: `${(result.total_score || result.score || 0) * 100}%` }"
-            />
-          </div>
-        </div>
-      </template>
       <div
-        v-else
-        class="no-results"
+        v-for="(result, index) in results"
+        :id="`search-result-${index}`"
+        :key="result.note_id"
+        class="search-result-item"
+        :class="{ 'active': index === activeIndex }"
+        role="option"
+        :aria-selected="index === activeIndex"
+        @click="handleSelect(result.note_id)"
+        @mouseenter="activeIndex = index"
       >
-        No results found for "{{ query }}"
+        <div class="result-title">
+          {{ result.title }}
+          <span
+            v-if="result.graph_boost > 0"
+            class="graph-badge"
+          >linked</span>
+        </div>
+        <div
+          v-if="result.snippet"
+          class="result-snippet"
+        >
+          {{ result.snippet }}
+        </div>
+        <div class="result-score">
+          <div
+            class="score-bar"
+            :style="{ width: `${(result.total_score || result.score || 0) * 100}%` }"
+          />
+        </div>
       </div>
     </div>
   </div>
 </template>
 
 <script setup>
-import { ref, onMounted, onBeforeUnmount } from 'vue'
-import { memory } from '../api/client'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { useRecallSearch } from '@/composables/useRecallSearch'
 
 const emit = defineEmits(['select'])
 
-const query = ref('')
-const results = ref([])
-const showResults = ref(false)
+const { query, results, status } = useRecallSearch({
+  onError: () => console.error(
+    'Search failed:',
+    new Error('Recall is temporarily unavailable.'),
+  ),
+})
+const resultsVisible = ref(true)
+const showResults = computed(() => (
+  resultsVisible.value && status.value === 'ready' && results.value.length > 0
+))
 const activeIndex = ref(-1)
-let debounceTimer = null
 
 function handleInput() {
-  clearTimeout(debounceTimer)
-  
-  if (!query.value.trim()) {
-    results.value = []
-    showResults.value = false
-    return
-  }
-
-  debounceTimer = setTimeout(async () => {
-    try {
-      const data = await memory.recall(query.value, [], 5)
-      const items = data.results || data // unwrap Pydantic wrapper (web) or flat array (Tauri)
-      results.value = (Array.isArray(items) ? items : []).map(r => ({
-        note_id: r.note_id,
-        title: r.title,
-        snippet: r.snippet || r.content?.substring(0, 200) || '',
-        score: r.score ?? r.relevance_score ?? 0,
-        total_score: r.total_score ?? r.relevance_score ?? 0,
-        graph_boost: r.graph_boost ?? (r.connection_type === 'both' || r.connection_type === 'graph' ? 1 : 0),
-      }))
-      showResults.value = true
-      activeIndex.value = -1
-    } catch (error) {
-      console.error('Search failed:', error)
-    }
-  }, 300)
+  resultsVisible.value = true
 }
 
 function handleSelect(noteId) {
   emit('select', noteId)
   query.value = ''
   results.value = []
-  showResults.value = false
+  resultsVisible.value = false
   activeIndex.value = -1
 }
 
@@ -130,14 +107,14 @@ function handleEnter() {
 function handleEscape() {
   query.value = ''
   results.value = []
-  showResults.value = false
+  resultsVisible.value = false
   activeIndex.value = -1
 }
 
 function handleClear() {
   query.value = ''
   results.value = []
-  showResults.value = false
+  resultsVisible.value = false
   activeIndex.value = -1
 }
 
@@ -156,9 +133,14 @@ function handleArrowUp() {
 // Store event handler reference
 const handleClickOutside = (e) => {
   if (!e.target.closest('.search-bar')) {
-    showResults.value = false
+    resultsVisible.value = false
   }
 }
+
+watch(results, () => {
+  activeIndex.value = -1
+  if (results.value.length > 0) resultsVisible.value = true
+})
 
 onMounted(() => {
   document.addEventListener('click', handleClickOutside)
@@ -166,7 +148,6 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   document.removeEventListener('click', handleClickOutside)
-  clearTimeout(debounceTimer)
 })
 </script>
 
@@ -207,6 +188,9 @@ onBeforeUnmount(() => {
   font-size: 1.25rem;
   line-height: 1;
   padding: 0 4px;
+  background: transparent;
+  border: 0;
+  font-family: inherit;
 }
 
 .clear-btn:hover {
@@ -278,10 +262,4 @@ onBeforeUnmount(() => {
   transition: width var(--transition-normal);
 }
 
-.no-results {
-  padding: var(--spacing-md);
-  text-align: center;
-  color: var(--text-muted);
-  font-size: 0.875rem;
-}
 </style>

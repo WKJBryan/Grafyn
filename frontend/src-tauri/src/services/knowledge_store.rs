@@ -151,9 +151,18 @@ fn preserve_knowledge_authority_error(
     error: crate::services::twin_events::MutationError,
     note_ids: Vec<String>,
 ) -> anyhow::Error {
-    let Some(commit) = error.authority_advanced_commit() else {
+    preserve_knowledge_authority_error_with_events(error, note_ids, Vec::new())
+}
+
+fn preserve_knowledge_authority_error_with_events(
+    error: crate::services::twin_events::MutationError,
+    note_ids: Vec<String>,
+    prepared_events: Vec<crate::models::twin_event::TwinEvent>,
+) -> anyhow::Error {
+    let Some(mut commit) = error.authority_advanced_commit() else {
         return anyhow::Error::new(error);
     };
+    commit.events = prepared_events;
     anyhow::Error::new(KnowledgeAuthorityAdvancedError {
         outcome: KnowledgeAuthorityAdvancedOutcome {
             commit,
@@ -969,6 +978,23 @@ impl KnowledgeStore {
         self.create_note_with_context(create, NoteMutationContext::local(source)?, Some(expected))
     }
 
+    pub(crate) fn create_companion_capture_expecting_authority(
+        &mut self,
+        create: NoteCreate,
+        observation: crate::services::twin_events::CompanionObservationInput,
+        expected: crate::services::vault_namespace::VaultAuthorityTokenV1,
+    ) -> Result<(Note, crate::services::twin_events::MutationCommit)> {
+        if self.event_recorder.is_noop() {
+            anyhow::bail!("companion capture requires the mutation coordinator");
+        }
+        self.create_note_with_locked_plan(
+            create,
+            NoteMutationContext::local("companion_capture")?,
+            Some(expected),
+            Some(observation),
+        )
+    }
+
     pub fn import_note_container(
         &mut self,
         creates: Vec<NoteCreate>,
@@ -1147,7 +1173,7 @@ impl KnowledgeStore {
         expected: Option<crate::services::vault_namespace::VaultAuthorityTokenV1>,
     ) -> Result<(Note, crate::services::twin_events::MutationCommit)> {
         if !self.event_recorder.is_noop() {
-            return self.create_note_with_locked_plan(create, context, expected);
+            return self.create_note_with_locked_plan(create, context, expected, None);
         }
         let id = self.generate_note_id(&create.title);
         let relative_path = match create.relative_path {
@@ -1204,6 +1230,7 @@ impl KnowledgeStore {
         create: NoteCreate,
         context: NoteMutationContext,
         expected: Option<crate::services::vault_namespace::VaultAuthorityTokenV1>,
+        companion_observation: Option<crate::services::twin_events::CompanionObservationInput>,
     ) -> Result<(Note, crate::services::twin_events::MutationCommit)> {
         let recorder = self.event_recorder.clone();
         let mut planned_id = None;
@@ -1218,7 +1245,10 @@ impl KnowledgeStore {
                 ),
                 None => self.make_unique_relative_path(&format!("{id}.md")),
             };
-            let now = Utc::now();
+            let now = companion_observation
+                .as_ref()
+                .map(|observation| observation.observed_at)
+                .unwrap_or_else(Utc::now);
             let mut note = Note {
                 id: id.clone(),
                 title: create.title.clone(),
@@ -1249,21 +1279,50 @@ impl KnowledgeStore {
                 .map_err(|error| {
                     crate::services::twin_events::MutationError::Invalid(error.to_string())
                 })?;
+            if let Some(observation) = companion_observation.as_ref() {
+                let (_, note_bytes) =
+                    Self::canonical_serialized_note_bytes(&note).map_err(|error| {
+                        crate::services::twin_events::MutationError::Invalid(error.to_string())
+                    })?;
+                let note_digest = crate::services::twin_events::digest_bytes(&note_bytes);
+                plan.drafts.push(
+                    crate::services::twin_events::companion_capture_observation_draft(
+                        &note,
+                        note_digest,
+                        observation,
+                    )
+                    .map_err(crate::services::twin_events::MutationError::Invalid)?,
+                );
+            }
             if let Some(expected) = expected.clone() {
                 plan = plan.expecting_authority(expected);
             }
             planned_id = Some(id);
             Ok(Some(plan))
         };
-        let result = recorder.commit_planned_mutation(
-            crate::services::twin_events::MutationOrigin::Local,
-            &mut planner,
-        );
+        let mut prepared_events = Vec::new();
+        let result = if companion_observation.is_some() {
+            recorder.commit_planned_mutation_with_hooks(
+                crate::services::twin_events::MutationOrigin::Local,
+                &mut planner,
+                &mut |intent| {
+                    prepared_events = intent.events.clone();
+                    Ok(())
+                },
+                &mut |_| Ok(()),
+            )
+        } else {
+            recorder.commit_planned_mutation(
+                crate::services::twin_events::MutationOrigin::Local,
+                &mut planner,
+            )
+        };
         self.refresh_cache();
         let commit = result.map_err(|error| {
-            preserve_knowledge_authority_error(
+            preserve_knowledge_authority_error_with_events(
                 error,
                 planned_id.iter().cloned().collect::<Vec<_>>(),
+                prepared_events,
             )
         })?;
         Ok((

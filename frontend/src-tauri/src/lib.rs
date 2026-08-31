@@ -665,6 +665,7 @@ pub fn run() {
             // Twin state commands
             commands::twin_state::list_twin_observations,
             commands::twin_state::list_twin_proposals,
+            commands::twin_state::create_companion_capture,
             commands::twin_state::review_twin_proposal,
             commands::twin_state::get_twin_state_projection,
             commands::twin_state::rank_twin_attention,
@@ -1419,6 +1420,70 @@ mod tests {
             runtime.coordinator.current_root_epoch().unwrap().root_scope,
             root_scope
         );
+    }
+
+    #[tokio::test]
+    async fn provisioned_companion_capture_seals_inherited_group_and_excludes_local_only_group() {
+        use crate::commands::twin_state::{
+            create_companion_capture_inner, CompanionCaptureContextInput, CompanionCaptureKind,
+            CompanionSyncPolicy, CreateCompanionCaptureRequest,
+        };
+        use crate::models::twin_event::CausalStream;
+        use chrono::TimeZone;
+
+        for (policy, expected_outbox, expected_stream) in [
+            (CompanionSyncPolicy::Inherit, 3, CausalStream::SyncEligible),
+            (CompanionSyncPolicy::LocalOnly, 0, CausalStream::LocalOnly),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let vault_path = temp.path().join("vault");
+            let (settings, _) = stable_boot_settings(&temp, &vault_path);
+            crate::services::twin_events::PersistedMutationIdentityProvider::load_or_create(
+                temp.path().join("data"),
+            )
+            .unwrap();
+            let identity =
+                crate::services::sync::identity::load_or_create_vault_identity(&vault_path)
+                    .unwrap();
+            crate::services::sync::vault_keys::provision_vault_root_key(
+                settings.secret_store().as_ref(),
+                &identity.descriptor.vault_id().to_string(),
+                &grafyn_sync_protocol::VaultRootKey::from_bytes([0x61; 32]),
+            )
+            .unwrap();
+            let state = build_app_state(settings, None).unwrap();
+            let sync_engine = state.sync_engine.as_ref().unwrap_or_else(|| {
+                panic!(
+                    "provisioned test runtime failed: {:?}",
+                    state.mutation_startup_error.try_read().unwrap().as_deref()
+                )
+            });
+            assert_eq!(sync_engine.status().unwrap().outbox_operations, 0);
+
+            create_companion_capture_inner(
+                &state,
+                CreateCompanionCaptureRequest {
+                    content: "Private or inherited thought".into(),
+                    capture_kind: CompanionCaptureKind::Text,
+                    context: CompanionCaptureContextInput::default(),
+                    attachment_digests: Vec::new(),
+                    grafyn_sync: policy,
+                },
+                chrono::Utc.with_ymd_and_hms(2026, 9, 1, 4, 5, 0).unwrap(),
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(
+                sync_engine.status().unwrap().outbox_operations,
+                expected_outbox
+            );
+            let events = state.twin_event_store.ordered_events().unwrap();
+            assert_eq!(events.len(), 2);
+            assert!(events
+                .iter()
+                .all(|event| event.causal_stream == expected_stream));
+        }
     }
 
     fn assert_recoverable_detached_validation_state(

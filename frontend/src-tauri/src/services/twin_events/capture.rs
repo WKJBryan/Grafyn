@@ -1,12 +1,14 @@
 use crate::models::canvas::{CanvasSession, ResponseStatus};
+use crate::models::note::Note;
 use crate::models::twin_event::{
     ActorId, CanvasResponseRecorded, ConversationTurnRecorded, DecimalCost, ModelId,
     ProvenanceLabel,
 };
 use crate::models::twin_event::{
-    AllowedUses, AuthorityClass, BoundedContent, BoundedRole, ContentDigest, EvidenceRef,
-    EvidenceType, FeedbackRecorded, Governance, Identifier, NoteChangeKind, NoteChanged,
-    ObservationRecorded, ReviewState, Sensitivity, SourceChannel, TwinEventPayload, Visibility,
+    AllowedUses, AuthorityClass, BoundedContent, BoundedRole, BoundedSummary, ContentDigest,
+    EventContext, EvidenceRef, EvidenceType, FeedbackRecorded, Governance, Identifier,
+    NoteChangeKind, NoteChanged, ObservationRecorded, ReviewState, Sensitivity, SourceChannel,
+    TwinEventPayload, Visibility,
 };
 use crate::services::twin_events::TwinEventDraft;
 use chrono::{DateTime, Utc};
@@ -70,6 +72,49 @@ pub fn note_changed_draft(
         source_id: note_id,
         digest: Some(evidence_digest),
     });
+    Ok(draft)
+}
+
+#[derive(Debug, Clone)]
+pub struct CompanionObservationInput {
+    pub observed_at: DateTime<Utc>,
+    pub context: EventContext,
+    pub attachment_digests: Vec<ContentDigest>,
+    pub governance: Governance,
+}
+
+pub fn companion_capture_observation_draft(
+    note: &Note,
+    note_digest: ContentDigest,
+    input: &CompanionObservationInput,
+) -> Result<TwinEventDraft, String> {
+    let note_id = Identifier::parse(&note.id)?;
+    let mut draft = TwinEventDraft::observed(
+        TwinEventPayload::ObservationRecorded(ObservationRecorded {
+            observation_id: Identifier::parse(format!("companion-capture-{}", note.id))?,
+            claims: Vec::new(),
+            summary: Some(BoundedSummary::parse(&note.title)?),
+            content_digest: Some(note_digest.clone()),
+        }),
+        input.observed_at,
+        input.context.source_channel.clone(),
+        input.governance.clone(),
+    );
+    draft.context = input.context.clone();
+    draft.evidence.push(EvidenceRef {
+        evidence_type: EvidenceType::Note,
+        source_id: note_id,
+        digest: Some(note_digest),
+    });
+    for digest in &input.attachment_digests {
+        draft.evidence.push(EvidenceRef {
+            evidence_type: EvidenceType::Attachment,
+            source_id: Identifier::parse(digest.as_str())?,
+            digest: Some(digest.clone()),
+        });
+    }
+    draft.evidence.sort();
+    draft.evidence.dedup();
     Ok(draft)
 }
 

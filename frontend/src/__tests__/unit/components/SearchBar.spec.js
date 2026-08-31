@@ -62,6 +62,15 @@ describe('SearchBar', () => {
       expect(wrapper.find('.clear-btn').exists()).toBe(true)
     })
 
+    it('uses a labelled button for clearing search', async () => {
+      wrapper = mount(SearchBar)
+      await wrapper.find('input').setValue('test query')
+
+      const clear = wrapper.get('button.clear-btn')
+      expect(clear.attributes('type')).toBe('button')
+      expect(clear.attributes('aria-label')).toBe('Clear search')
+    })
+
     it('does not show results dropdown initially', () => {
       wrapper = mount(SearchBar)
 

@@ -584,6 +584,15 @@ impl VaultOptimizerService {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn queued_note_ids(&self) -> Vec<String> {
+        self.state
+            .queue
+            .iter()
+            .map(|job| job.note_id.clone())
+            .collect()
+    }
+
     pub fn list_decisions(&self, limit: usize) -> Result<Vec<VaultOptimizerDecision>> {
         let mut decisions = self.load_decisions()?;
         decisions.reverse();

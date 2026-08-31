@@ -97,6 +97,14 @@ export const canvas = {
 export const twin = {
   listRecords: () => invoke('list_user_records', {}),
 
+  createCompanionCapture: async (request) => {
+    const response = await invoke('create_companion_capture', { request })
+    return {
+      note: response.note,
+      observationEventId: response.observationEventId ?? response.observation_event_id,
+    }
+  },
+
   getRecord: (id) => invoke('get_user_record', { id }),
 
   createRecord: (record) => invoke('create_user_record', { record }),
