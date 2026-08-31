@@ -42,6 +42,7 @@ import {
   twin,
   feedback,
   settings,
+  sync,
   mcp,
   memory,
   zettelkasten,
@@ -574,6 +575,28 @@ describe('API Client (Tauri)', () => {
       mockInvoke.mockResolvedValue([])
       await settings.listOllamaModels()
       expect(mockInvoke).toHaveBeenCalledWith('list_ollama_models', {})
+    })
+  })
+
+  // ============================================================================
+  // Sync foundation API
+  // ============================================================================
+
+  describe('Sync foundation API', () => {
+    it('uses only the local status, conflict, ciphertext, import, and rebuild commands', async () => {
+      const bundle = { schemaVersion: 1, envelopes: ['{"ciphertext":"opaque"}'] }
+      mockInvoke.mockResolvedValue({})
+
+      await sync.getStatus()
+      expect(mockInvoke).toHaveBeenLastCalledWith('get_sync_status', {})
+      await sync.listConflicts()
+      expect(mockInvoke).toHaveBeenLastCalledWith('list_sync_conflicts', {})
+      await sync.exportOutbox()
+      expect(mockInvoke).toHaveBeenLastCalledWith('export_sync_outbox', {})
+      await sync.importEnvelopes(bundle)
+      expect(mockInvoke).toHaveBeenLastCalledWith('import_sync_envelopes', { bundle })
+      await sync.rebuildState()
+      expect(mockInvoke).toHaveBeenLastCalledWith('rebuild_sync_state', {})
     })
   })
 

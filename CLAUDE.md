@@ -109,7 +109,7 @@ Until a task lands and its tests pass, the current implementation facts in the r
 
 ### Tauri IPC Commands
 
-The normal desktop shell registers 15 command modules from `frontend/src-tauri/src/commands/`. `canvas` is a directory module (split — see below); every other normal module is a single file. The `mcp` command module and both MCP invoke registrations are compiled only on desktop targets, so the shared/mobile library surface has 14 normal command modules. A sixteenth desktop source module, `twin_eval`, is compiled and registered only with the non-default `twin-eval-lab` feature. Enumerate exact command names with `grep -rn "#\[tauri::command\]" -A1 src/commands/` — purposes only below, to avoid drift.
+The normal desktop shell registers 16 command modules from `frontend/src-tauri/src/commands/`. `canvas` is a directory module (split — see below); every other normal module is a single file. The `mcp` command module and both MCP invoke registrations are compiled only on desktop targets, so the shared/mobile library surface has 15 normal command modules. A seventeenth desktop source module, `twin_eval`, is compiled and registered only with the non-default `twin-eval-lab` feature. Enumerate exact command names with `grep -rn "#\[tauri::command\]" -A1 src/commands/` — purposes only below, to avoid drift.
 
 | Module | Purpose |
 |--------|---------|
@@ -119,6 +119,7 @@ The normal desktop shell registers 15 command modules from `frontend/src-tauri/s
 | `canvas/` | Multi-LLM canvas (18 commands) with note context; streaming via `canvas-stream` Tauri events. Split across `session.rs` (session/tile CRUD), `streaming.rs` (`send_prompt`/`add_models_to_tile`/`regenerate_response`), `debate.rs` (`start_debate`/`continue_debate`), `context.rs` (retrieval + twin-context prompt assembly, incl. `build_twin_context_prompt()`), `shared.rs` (common helpers), and `mod.rs` (re-exports) |
 | `distill.rs` | LLM + rules-based distillation, tag normalization |
 | `settings.rs` | Settings, first-run setup, OpenRouter key validation, Ollama status/models |
+| `sync.rs` | Honest local E2EE foundation status, conflict inspection, bounded ciphertext export/import, and deterministic state repair; no relay/account claims |
 | `feedback.rs` | Feedback with offline queue |
 | `mcp.rs` | MCP status + config snippet for Claude Desktop |
 | `memory.rs` | Memory recall, contradiction detection, claim extraction |

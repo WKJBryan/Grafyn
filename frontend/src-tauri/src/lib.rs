@@ -699,6 +699,11 @@ pub fn run() {
             commands::settings::get_openrouter_status,
             commands::settings::get_ollama_status,
             commands::settings::list_ollama_models,
+            commands::sync::get_sync_status,
+            commands::sync::list_sync_conflicts,
+            commands::sync::export_sync_outbox,
+            commands::sync::import_sync_envelopes,
+            commands::sync::rebuild_sync_state,
             // Migration + optimizer commands
             commands::migration::preview_markdown_migration,
             commands::migration::apply_markdown_migration,

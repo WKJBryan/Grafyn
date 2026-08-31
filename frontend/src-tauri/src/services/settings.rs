@@ -536,7 +536,7 @@ impl SettingsService {
 
     /// Get the effective data path
     pub fn data_path(&self) -> PathBuf {
-        self.settings.effective_data_path()
+        self.data_path.clone()
     }
 
     /// Get OpenRouter API key (if configured)

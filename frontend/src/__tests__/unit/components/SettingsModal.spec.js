@@ -1,8 +1,9 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { mount, flushPromises } from '@vue/test-utils'
+import { createPinia, setActivePinia } from 'pinia'
 import SettingsModal from '@/components/SettingsModal.vue'
 
-const { settingsGet, settingsStatus, settingsUpdate, pickVaultFolder, validateOpenRouterKey, getOllamaStatus, listOllamaModels, getModels, getMcpStatus, optimizerStatus, desktopRuntime, themeStore, toast, routerPush } = vi.hoisted(() => ({
+const { settingsGet, settingsStatus, settingsUpdate, pickVaultFolder, validateOpenRouterKey, getOllamaStatus, listOllamaModels, getModels, getMcpStatus, optimizerStatus, syncApi, desktopRuntime, themeStore, toast, routerPush } = vi.hoisted(() => ({
   settingsGet: vi.fn(),
   settingsStatus: vi.fn(),
   settingsUpdate: vi.fn(),
@@ -13,6 +14,13 @@ const { settingsGet, settingsStatus, settingsUpdate, pickVaultFolder, validateOp
   getModels: vi.fn(),
   getMcpStatus: vi.fn(),
   optimizerStatus: vi.fn(),
+  syncApi: {
+    getStatus: vi.fn(),
+    listConflicts: vi.fn(),
+    exportOutbox: vi.fn(),
+    importEnvelopes: vi.fn(),
+    rebuildState: vi.fn()
+  },
   desktopRuntime: { value: true },
   themeStore: {
     setTheme: vi.fn()
@@ -43,6 +51,7 @@ vi.mock('@/api/client', () => ({
   optimizer: {
     status: optimizerStatus
   },
+  sync: syncApi,
   isDesktopApp: () => desktopRuntime.value
 }))
 
@@ -62,6 +71,7 @@ vi.mock('vue-router', () => ({
 
 describe('SettingsModal', () => {
   beforeEach(() => {
+    setActivePinia(createPinia())
     vi.clearAllMocks()
     desktopRuntime.value = true
     settingsGet.mockResolvedValue({
@@ -88,6 +98,15 @@ describe('SettingsModal', () => {
     getModels.mockResolvedValue([])
     getMcpStatus.mockResolvedValue({ available: false, config_snippet: '' })
     optimizerStatus.mockResolvedValue({ queue_size: 0, inbox_count: 0, rollback_rate: 0 })
+    syncApi.getStatus.mockResolvedValue({
+      status: 'not_provisioned',
+      provisioned: false,
+      outboxOperations: 0,
+      pendingOperations: 0,
+      conflicts: 0,
+      error: null
+    })
+    syncApi.listConflicts.mockResolvedValue([])
     themeStore.setTheme.mockReset()
     window.matchMedia = vi.fn().mockReturnValue({
       matches: false,
@@ -143,6 +162,21 @@ describe('SettingsModal', () => {
     expect(wrapper.text()).toContain('Turn live web search on by default for normal Canvas prompts')
     expect(wrapper.text()).toContain('On by default')
     expect(wrapper.text()).not.toContain('Smart Web Search')
+  })
+
+  it('shows the honest local sync foundation without claiming a relay exists', async () => {
+    const wrapper = mount(SettingsModal, {
+      props: {
+        modelValue: true,
+        isSetup: false
+      }
+    })
+
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('Sync foundation')
+    expect(wrapper.text()).toContain('Relay not configured')
+    expect(syncApi.getStatus).toHaveBeenCalledOnce()
   })
 
   it('shows a masked stored key in the input instead of looking empty', async () => {

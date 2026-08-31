@@ -462,6 +462,11 @@
       </div>
     </div>
 
+    <SyncStatusCard
+      v-if="!isSetup && isDesktop"
+      class="setting-section"
+    />
+
     <!-- MCP Integration Section (desktop only, non-setup only) -->
     <div
       v-if="!isSetup && isDesktop"
@@ -579,6 +584,7 @@ import { useToast } from '@/composables/useToast'
 import { useThemeStore } from '@/stores/theme'
 import BaseModal from '@/components/BaseModal.vue'
 import MarkdownMigrationModal from '@/components/MarkdownMigrationModal.vue'
+import SyncStatusCard from '@/components/sync/SyncStatusCard.vue'
 
 const props = defineProps({
   modelValue: {

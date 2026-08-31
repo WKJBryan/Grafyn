@@ -204,6 +204,19 @@ export const settings = {
   listOllamaModels: () => invoke('list_ollama_models', {}),
 }
 
+// Local E2EE sync foundation API. Transport remains manual until a relay exists.
+export const sync = {
+  getStatus: () => invoke('get_sync_status', {}),
+
+  listConflicts: () => invoke('list_sync_conflicts', {}),
+
+  exportOutbox: () => invoke('export_sync_outbox', {}),
+
+  importEnvelopes: (bundle) => invoke('import_sync_envelopes', { bundle }),
+
+  rebuildState: () => invoke('rebuild_sync_state', {}),
+}
+
 export const migration = {
   preview: (vaultPath, request) => invoke('preview_markdown_migration', { vaultPath, request }),
 

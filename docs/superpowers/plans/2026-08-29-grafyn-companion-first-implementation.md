@@ -449,11 +449,13 @@ rebuild_sync_state
 
 **Contract:** Foundation mode can inspect, export, and deterministically import encrypted envelopes for testing/manual transport. It clearly reports `not_provisioned`, `local_only`, `pending`, `conflict`, or `error`. No endpoint URL, account, subscription, or “connected” fiction is added.
 
-- [ ] Write failing command/store/component tests including secret redaction, malformed envelope rejection, unavailable capability, and conflict display.
-- [ ] Implement thin commands over `SyncEngine`; envelope export/import operates on ciphertext bytes/files only.
-- [ ] Show status in desktop settings and later compact settings, labelled “sync foundation / relay not configured.”
-- [ ] Run focused and full suites.
-- [ ] Commit: `feat: expose honest local E2EE sync status`
+- [x] Write failing command/store/component tests including secret redaction, malformed envelope rejection, unavailable capability, and conflict display.
+- [x] Implement thin commands over `SyncEngine`; envelope export/import operates on ciphertext bytes/files only.
+- [x] Show status in desktop settings and later compact settings, labelled “sync foundation / relay not configured.”
+- [x] Run focused and full suites.
+- [x] Commit: `feat: expose honest local E2EE sync status`
+
+**Verification (2026-09-01):** The command layer passed 11 focused Rust tests, including same-authority recovery after an exact/no-op import. The sync store/card and settings/API focused frontend set passed 96/96, the full Vue suite passed 522/522, and the production frontend build completed. Fresh serial Rust suites passed 1000/1000 for the desktop library and 848/848 for the MCP binary; neither rebuilt Windows executable reproduced the former `TaskDialogIndirect` loader dialog. Rustfmt and `git diff --check` passed. Recovery-pending results remain visibly non-successful and IPC/store boundaries expose only allowlisted status, counts, IDs, and ciphertext envelopes.
 
 ## Task 14: Build the adaptive companion shell, capture, and recall
 

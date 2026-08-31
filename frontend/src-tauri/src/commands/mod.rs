@@ -33,10 +33,11 @@ pub mod priority;
 pub mod retrieval;
 pub mod search;
 pub mod settings;
+pub mod sync;
 pub mod twin;
-pub mod twin_state;
 #[cfg(feature = "twin-eval-lab")]
 pub mod twin_eval;
+pub mod twin_state;
 pub mod zettelkasten;
 
 use crate::models::note::Note;
