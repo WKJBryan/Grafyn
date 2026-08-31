@@ -851,6 +851,7 @@ pub(crate) struct DetachedStableVault {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RootTransitionFaultPoint {
     AfterPrepared,
+    AfterCandidateDescriptorLiveInstall,
     AfterSecretStage,
     AfterLease,
     AfterSettings,
@@ -1271,16 +1272,14 @@ impl RootTransitionStore {
             )
         })?;
         self.record_owned_candidate_descriptor_witness(transition, witness_identity)?;
-        let link_outcome = root.hard_link_no_clobber(
+        // Moving the owned witness makes its absence durable proof that this transaction
+        // published the live descriptor, unlike an external same-inode hard-link race.
+        root.rename_no_replace(
             &witness_key,
             crate::services::sync::identity::VAULT_DESCRIPTOR_KEY,
             false,
         )?;
-        if link_outcome != crate::services::twin_events::NoClobberInstallOutcome::Installed {
-            return Err(MutationError::RecoveryConflict(
-                "owned candidate vault descriptor destination was already occupied".into(),
-            ));
-        }
+        self.checkpoint(RootTransitionFaultPoint::AfterCandidateDescriptorLiveInstall)?;
         if root
             .read_bounded(
                 crate::services::sync::identity::VAULT_DESCRIPTOR_KEY,
@@ -1420,16 +1419,18 @@ impl RootTransitionStore {
         }
         let root = AnchoredRoot::open(candidate)?;
         let witness_key = transition.candidate_descriptor_rollback_key();
-        if witness.live_installed {
+        let durable_witness = root.read_bounded(
+            &witness_key,
+            crate::services::sync::identity::VAULT_DESCRIPTOR_LIMIT,
+        )?;
+        // The move can be durable before the follow-up WAL flag update is.
+        if witness.live_installed || durable_witness.is_none() {
             let _ = root.quarantine_regular_file_if_identity(
                 crate::services::sync::identity::VAULT_DESCRIPTOR_KEY,
                 witness_identity,
             )?;
         }
-        if let Some(durable_witness) = root.read_bounded(
-            &witness_key,
-            crate::services::sync::identity::VAULT_DESCRIPTOR_LIMIT,
-        )? {
+        if let Some(durable_witness) = durable_witness {
             if durable_witness != expected
                 || !root.quarantine_regular_file_if_identity(&witness_key, witness_identity)?
             {

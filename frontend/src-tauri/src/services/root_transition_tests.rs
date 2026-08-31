@@ -822,6 +822,35 @@ fn raced_live_link_after_witness_claim_is_preserved_without_live_install_proof()
 }
 
 #[test]
+fn prepared_recovery_removes_descriptor_published_before_live_install_wal_update() {
+    let (_temp, store, mut transition, candidate, descriptor_bytes) =
+        stable_owned_descriptor_fixture();
+    store.write_authority_for_test(&transition.before).unwrap();
+    store.prepare_transition(&transition).unwrap();
+    store.fail_once_at(RootTransitionFaultPoint::AfterCandidateDescriptorLiveInstall);
+
+    assert!(store
+        .install_owned_candidate_vault_descriptor(&mut transition)
+        .is_err());
+    let descriptor_path = candidate.join(VAULT_DESCRIPTOR_KEY);
+    assert_eq!(std::fs::read(&descriptor_path).unwrap(), descriptor_bytes);
+    assert!(
+        !transition
+            .owned_candidate_vault_descriptor_witness
+            .unwrap()
+            .live_installed
+    );
+
+    assert_eq!(store.recover().unwrap(), RecoveryWork::RolledBack);
+
+    assert!(!descriptor_path.exists());
+    assert!(!candidate
+        .join(transition.candidate_descriptor_rollback_key())
+        .exists());
+    assert!(!store.transition_exists_for_test().unwrap());
+}
+
+#[test]
 fn prepared_recovery_preserves_a_preexisting_candidate_descriptor() {
     let (_temp, store, transition) = stable_fixture();
     store.write_authority_for_test(&transition.before).unwrap();
