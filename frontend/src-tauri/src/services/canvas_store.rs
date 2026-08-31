@@ -304,6 +304,7 @@ impl CanvasStore {
         tile: PromptTile,
         expected: Option<crate::services::vault_namespace::VaultAuthorityTokenV1>,
     ) -> Result<(CanvasSession, crate::services::twin_events::MutationCommit)> {
+        Self::validate_tile_twin_evidence(&tile)?;
         let session = self.get_session_mut(session_id)?;
         session.prompt_tiles.push(tile);
         session.updated_at = Utc::now();
@@ -342,6 +343,7 @@ impl CanvasStore {
         decision: crate::models::twin::DecisionEpisodeCreate,
         expected: Option<crate::services::vault_namespace::VaultAuthorityTokenV1>,
     ) -> Result<(CanvasSession, crate::services::twin_events::MutationCommit)> {
+        Self::validate_tile_twin_evidence(&tile)?;
         let session = self.get_session_mut(session_id)?;
         session.prompt_tiles.push(tile);
         session.updated_at = Utc::now();
@@ -715,6 +717,7 @@ impl CanvasStore {
         session: &CanvasSession,
         expected: Option<crate::services::vault_namespace::VaultAuthorityTokenV1>,
     ) -> Result<crate::services::twin_events::MutationCommit> {
+        Self::validate_session_twin_evidence(session)?;
         if let Some(base) = self.session_cache.get(&session.id).cloned() {
             self.pending_bases.insert(session.id.clone(), base);
         }
@@ -727,6 +730,20 @@ impl CanvasStore {
     fn validate_session_id(id: &str) -> Result<()> {
         if id.is_empty() || id.contains('/') || id.contains('\\') || id.contains("..") {
             anyhow::bail!("Invalid session ID: {}", id);
+        }
+        Ok(())
+    }
+
+    fn validate_tile_twin_evidence(tile: &PromptTile) -> Result<()> {
+        if let Some(metadata) = &tile.twin_evidence_snapshot {
+            metadata.validate().map_err(anyhow::Error::msg)?;
+        }
+        Ok(())
+    }
+
+    fn validate_session_twin_evidence(session: &CanvasSession) -> Result<()> {
+        for tile in &session.prompt_tiles {
+            Self::validate_tile_twin_evidence(tile)?;
         }
         Ok(())
     }
@@ -759,9 +776,11 @@ impl CanvasStore {
         else {
             return Ok(None);
         };
-        serde_json::from_slice(&bytes)
-            .with_context(|| format!("Failed to parse session: {:?}", path))
-            .map(Some)
+        let session = serde_json::from_slice(&bytes)
+            .with_context(|| format!("Failed to parse session: {:?}", path))?;
+        Self::validate_session_twin_evidence(&session)
+            .with_context(|| format!("Invalid Twin evidence in session: {:?}", path))?;
+        Ok(Some(session))
     }
 
     /// Write a session to file
@@ -779,6 +798,7 @@ impl CanvasStore {
         )>,
         expected_authority: Option<crate::services::vault_namespace::VaultAuthorityTokenV1>,
     ) -> Result<crate::services::twin_events::MutationCommit> {
+        Self::validate_session_twin_evidence(session)?;
         let path = self.session_path(&session.id);
         let candidate = session.clone();
         let cached_base = self.pending_bases.remove(&session.id);
@@ -817,6 +837,9 @@ impl CanvasStore {
                 }
                 _ => candidate.clone(),
             };
+            Self::validate_session_twin_evidence(&after).map_err(|error| {
+                crate::services::twin_events::MutationError::Invalid(error.to_string())
+            })?;
             let content = serde_json::to_string_pretty(&after).map_err(|error| {
                 crate::services::twin_events::MutationError::Invalid(error.to_string())
             })?;
@@ -996,7 +1019,7 @@ mod tests {
     use super::*;
     use crate::models::canvas::{
         Debate, DebateResponse, DebateRound, ModelResponse, PromptTile, ResponseStatus,
-        SessionCreate,
+        SessionCreate, TwinEvidenceSnapshot,
     };
     use crate::services::atomic_io::assert_no_tmp_siblings;
     use tempfile::tempdir;
@@ -1044,6 +1067,76 @@ mod tests {
         let persisted = std::fs::read_to_string(&session_file).expect("session file should exist");
         assert!(persisted.contains("Atomic Session"));
         assert_no_tmp_siblings(temp_dir.path());
+    }
+
+    #[test]
+    fn canvas_rejects_noncanonical_twin_evidence_before_persisting() {
+        let temp_dir = tempdir().unwrap();
+        let mut store = CanvasStore::new(temp_dir.path().to_path_buf());
+        let session = store
+            .create_session(SessionCreate {
+                title: "Evidence validation".into(),
+                description: None,
+                tags: Vec::new(),
+            })
+            .unwrap();
+        let mut tile = PromptTile::default();
+        tile.twin_evidence_snapshot = Some(TwinEvidenceSnapshot {
+            projection_snapshot_id: crate::models::twin_state::SnapshotId::parse("a".repeat(64))
+                .unwrap(),
+            reference_time: Utc::now(),
+            prompt_context_digest: crate::models::twin_event::ContentDigest::parse("d".repeat(64))
+                .unwrap(),
+            evidence_event_ids: Vec::new(),
+            note_ids: vec!["note-b".into(), "note-a".into()],
+        });
+
+        let error = store.add_tile(&session.id, tile).unwrap_err();
+
+        assert!(error.to_string().contains("sorted and unique"));
+        store.reload_authoritative_state();
+        assert!(store
+            .get_session(&session.id)
+            .unwrap()
+            .prompt_tiles
+            .is_empty());
+    }
+
+    #[test]
+    fn canvas_round_trips_twin_evidence_for_replay() {
+        let temp_dir = tempdir().unwrap();
+        let mut store = CanvasStore::new(temp_dir.path().to_path_buf());
+        let session = store
+            .create_session(SessionCreate {
+                title: "Reproducible evidence".into(),
+                description: None,
+                tags: Vec::new(),
+            })
+            .unwrap();
+        let expected = TwinEvidenceSnapshot {
+            projection_snapshot_id: crate::models::twin_state::SnapshotId::parse("a".repeat(64))
+                .unwrap(),
+            reference_time: Utc::now(),
+            prompt_context_digest: crate::models::twin_event::ContentDigest::parse("d".repeat(64))
+                .unwrap(),
+            evidence_event_ids: vec![
+                crate::models::twin_event::EventId::parse("b".repeat(64)).unwrap(),
+                crate::models::twin_event::EventId::parse("c".repeat(64)).unwrap(),
+            ],
+            note_ids: vec!["notes/project/a".into()],
+        };
+        let tile = PromptTile {
+            twin_evidence_snapshot: Some(expected.clone()),
+            ..PromptTile::default()
+        };
+        store.add_tile(&session.id, tile).unwrap();
+
+        store.reload_authoritative_state();
+        let reloaded = store.get_session(&session.id).unwrap();
+        assert_eq!(
+            reloaded.prompt_tiles[0].twin_evidence_snapshot.as_ref(),
+            Some(&expected)
+        );
     }
 
     #[test]

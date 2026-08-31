@@ -42,12 +42,27 @@ pub(super) fn resolve_model_route(
     twin_provider_override: Option<&str>,
     settings: &UserSettings,
 ) -> Result<ModelRoute, String> {
-    let twin_provider = twin_provider_override
-        .map(|provider| provider.trim().to_ascii_lowercase())
-        .filter(|provider| provider == "ollama" || provider == "openrouter")
-        .unwrap_or_else(|| settings.twin_llm_provider.to_ascii_lowercase());
+    let vault_context = is_vault_context_prompt(prompt_type, context_mode);
+    let twin_provider = if let Some(provider) = twin_provider_override {
+        let provider = provider.trim().to_ascii_lowercase();
+        if provider != "ollama" && provider != "openrouter" {
+            return Err(format!(
+                "Unsupported Canvas provider override: {}",
+                provider
+            ));
+        }
+        provider
+    } else if vault_context {
+        let provider = settings.twin_llm_provider.trim().to_ascii_lowercase();
+        if provider != "ollama" && provider != "openrouter" {
+            return Err(format!("Unsupported Canvas provider setting: {}", provider));
+        }
+        provider
+    } else {
+        "openrouter".to_string()
+    };
 
-    if is_vault_context_prompt(prompt_type, context_mode) && twin_provider == "ollama" {
+    if twin_provider == "ollama" {
         let model = settings.ollama_model.trim();
         if model.is_empty() {
             return Err(
@@ -93,6 +108,7 @@ pub(super) fn is_vault_context_prompt(
             ContextMode::KnowledgeSearch
                 | ContextMode::Semantic
                 | ContextMode::Twin
+                | ContextMode::TwinHistory
                 | ContextMode::FullHistory
                 | ContextMode::Compact
         )
@@ -557,6 +573,13 @@ mod tests {
         let twin_route =
             resolve_model_route(&PromptType::Standard, &ContextMode::Twin, None, &settings)
                 .unwrap();
+        let twin_history_route = resolve_model_route(
+            &PromptType::Standard,
+            &ContextMode::TwinHistory,
+            None,
+            &settings,
+        )
+        .unwrap();
         let normal_route =
             resolve_model_route(&PromptType::Standard, &ContextMode::None, None, &settings)
                 .unwrap();
@@ -564,6 +587,7 @@ mod tests {
         assert_eq!(decision_route.provider, ModelProviderRoute::Ollama);
         assert_eq!(decision_route.model_ids, vec!["llama3.1:8b".to_string()]);
         assert_eq!(twin_route.provider, ModelProviderRoute::Ollama);
+        assert_eq!(twin_history_route.provider, ModelProviderRoute::Ollama);
         assert_eq!(normal_route.provider, ModelProviderRoute::OpenRouter);
         assert!(normal_route.model_ids.is_empty());
     }
@@ -624,5 +648,39 @@ mod tests {
         .unwrap_err();
 
         assert!(error.contains("Select an Ollama model"));
+    }
+
+    #[test]
+    fn model_route_rejects_an_unknown_explicit_provider() {
+        let mut settings = crate::models::settings::UserSettings::default();
+        settings.twin_llm_provider = "openrouter".to_string();
+
+        let error = resolve_model_route(
+            &PromptType::Standard,
+            &ContextMode::TwinHistory,
+            Some("ollmaa"),
+            &settings,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("Unsupported Canvas provider"));
+    }
+
+    #[test]
+    fn model_route_honors_an_explicit_local_provider_for_plain_companion_prompts() {
+        let mut settings = crate::models::settings::UserSettings::default();
+        settings.twin_llm_provider = "openrouter".to_string();
+        settings.ollama_model = "llama3.1:8b".to_string();
+
+        let route = resolve_model_route(
+            &PromptType::Standard,
+            &ContextMode::None,
+            Some("ollama"),
+            &settings,
+        )
+        .unwrap();
+
+        assert_eq!(route.provider, ModelProviderRoute::Ollama);
+        assert_eq!(route.model_ids, vec!["llama3.1:8b".to_string()]);
     }
 }

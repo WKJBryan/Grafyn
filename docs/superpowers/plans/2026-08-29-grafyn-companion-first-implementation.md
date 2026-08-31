@@ -292,13 +292,15 @@ get_twin_event_timeline
 
 **Contract:** `ContextMode::TwinHistory` composes compact ancestor history, then the existing Twin operating contract and reviewed contextual projection. Each prompt tile persists the projection snapshot ID and evidence event/note IDs used.
 
-- [ ] Write failing serialization, parent-order, provider-route, Advisor default, Simulation identity-gate, reviewed-only, and persisted-replay tests.
-- [ ] Add the enum variant with backward-compatible serde.
-- [ ] Refactor context assembly only enough to share compact history between FullHistory and TwinHistory; preserve existing modes.
-- [ ] Record snapshot/evidence metadata in a backward-compatible optional field on `PromptTile`.
-- [ ] Add `sendCompanionPrompt({ prompt, modelId, mode, parentTileId, parentModelId, provider })` as an object wrapper without changing existing positional `sendPrompt`.
-- [ ] Run Canvas focused tests and the full Rust/frontend suites.
-- [ ] Commit: `feat: add history-aware reproducible Twin chat`
+- [x] Write failing serialization, parent-order, provider-route, Advisor default, Simulation identity-gate, reviewed-only, and persisted-replay tests.
+- [x] Add the enum variant with backward-compatible serde.
+- [x] Refactor context assembly only enough to share compact history between FullHistory and TwinHistory; preserve existing modes.
+- [x] Record snapshot/evidence metadata in a backward-compatible optional field on `PromptTile`.
+- [x] Add `sendCompanionPrompt({ prompt, modelId, mode, parentTileId, parentModelId, provider })` as an object wrapper without changing existing positional `sendPrompt`.
+- [x] Run Canvas focused tests and the full Rust/frontend suites.
+- [x] Commit: `feat: add history-aware reproducible Twin chat`
+
+**Verification (2026-08-31):** Focused Canvas Rust tests passed 95/95, Canvas-store tests passed 35/35, the serial full Rust library suite passed 717/717, the MCP feature suite passed 585/585, the full frontend suite passed 508/508, and the production frontend build passed. Scoped ESLint, rustfmt, and diff checks passed. Two earlier parallel Rust runs each met a different Windows tempfile ACL error; both exact tests passed alone, and the complete single-threaded run passed. Independent review found and fixed four provider/replay/session-state defects before commit: provider overrides now fail closed and freeze the effective route, replay binds the exact prompt/Constitution digest, late events cannot mutate another session, and rejected regeneration restores the prior response.
 
 ## Task 10: Create the public encrypted sync protocol crate
 

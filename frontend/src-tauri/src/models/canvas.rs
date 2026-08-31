@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use crate::models::twin::TwinContextRecord;
+use crate::models::twin_event::{ContentDigest, EventId};
+use crate::models::twin_state::SnapshotId;
 
 /// Canvas session containing prompts and model responses
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -100,6 +102,49 @@ pub struct DecisionPromptMetadata {
     pub review_date: Option<String>,
 }
 
+/// Immutable provenance needed to reproduce the governed Twin evidence used
+/// for one prompt. Both vectors are canonical sets: sorted and unique.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TwinEvidenceSnapshot {
+    pub projection_snapshot_id: SnapshotId,
+    pub reference_time: DateTime<Utc>,
+    pub prompt_context_digest: ContentDigest,
+    #[serde(default)]
+    pub evidence_event_ids: Vec<EventId>,
+    #[serde(default)]
+    pub note_ids: Vec<String>,
+}
+
+impl TwinEvidenceSnapshot {
+    pub fn validate(&self) -> Result<(), String> {
+        const MAX_EVIDENCE_EVENT_IDS: usize = 24 * (1 + 64 + 64);
+        const MAX_EVIDENCE_NOTE_IDS: usize = 64;
+        if self.evidence_event_ids.len() > MAX_EVIDENCE_EVENT_IDS
+            || self.note_ids.len() > MAX_EVIDENCE_NOTE_IDS
+        {
+            return Err("Twin evidence snapshot exceeds its bounded collection limits".into());
+        }
+        if self
+            .evidence_event_ids
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1])
+        {
+            return Err("Twin evidence event IDs must be sorted and unique".into());
+        }
+        if self.note_ids.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err("Twin evidence note IDs must be sorted and unique".into());
+        }
+        if self
+            .note_ids
+            .iter()
+            .any(|id| id.trim().is_empty() || id.len() > 256 || id.chars().any(char::is_control))
+        {
+            return Err("Twin evidence note IDs must be bounded non-control text".into());
+        }
+        Ok(())
+    }
+}
+
 /// A tile on the canvas containing a prompt and model responses
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PromptTile {
@@ -126,6 +171,8 @@ pub struct PromptTile {
     pub approved_twin_records: Vec<TwinContextRecord>,
     #[serde(default)]
     pub candidate_twin_records: Vec<TwinContextRecord>,
+    #[serde(default)]
+    pub twin_evidence_snapshot: Option<TwinEvidenceSnapshot>,
     #[serde(default)]
     pub twin_answer_mode: TwinAnswerMode,
     #[serde(default)]
@@ -161,6 +208,7 @@ impl Default for PromptTile {
             context_notes: Vec::new(),
             approved_twin_records: Vec::new(),
             candidate_twin_records: Vec::new(),
+            twin_evidence_snapshot: None,
             twin_answer_mode: TwinAnswerMode::default(),
             twin_context_policy: None,
             twin_llm_provider: None,
@@ -204,6 +252,7 @@ pub enum ContextMode {
     Compact,
     KnowledgeSearch,
     Twin,
+    TwinHistory,
     /// Legacy alias for KnowledgeSearch — accept "semantic" from old saved sessions
     #[serde(rename = "semantic")]
     Semantic,
@@ -460,7 +509,7 @@ pub struct PromptRequest {
     pub position: Option<TilePosition>,
     #[serde(default)]
     pub context_mode: ContextMode,
-    #[serde(default)]
+    #[serde(default = "default_prompt_twin_answer_mode")]
     pub twin_answer_mode: TwinAnswerMode,
     #[serde(default)]
     pub twin_context_policy: Option<String>,
@@ -486,6 +535,10 @@ pub struct PromptRequest {
 
 fn default_temperature() -> f64 {
     0.7
+}
+
+fn default_prompt_twin_answer_mode() -> TwinAnswerMode {
+    TwinAnswerMode::Advisor
 }
 
 fn default_web_search_max_results() -> u32 {
@@ -590,6 +643,86 @@ mod tests {
 
         assert_eq!(request.context_mode, ContextMode::Twin);
         assert_eq!(request.twin_answer_mode, TwinAnswerMode::Simulation);
+    }
+
+    #[test]
+    fn twin_history_serializes_and_defaults_new_requests_to_advisor() {
+        let request: PromptRequest = serde_json::from_value(json!({
+            "prompt": "What should I do next?",
+            "models": ["openai/gpt-4"],
+            "context_mode": "twin_history"
+        }))
+        .unwrap();
+
+        assert_eq!(request.context_mode, ContextMode::TwinHistory);
+        assert_eq!(request.twin_answer_mode, TwinAnswerMode::Advisor);
+        assert_eq!(
+            serde_json::to_value(request.context_mode).unwrap(),
+            "twin_history"
+        );
+    }
+
+    #[test]
+    fn prompt_tile_evidence_snapshot_is_optional_and_canonical() {
+        let legacy: PromptTile = serde_json::from_value(json!({
+            "id": "tile-legacy",
+            "prompt": "hello",
+            "models": [],
+            "responses": {},
+            "position": { "x": 0.0, "y": 0.0, "width": 400.0, "height": 300.0 },
+            "created_at": "2026-08-29T00:00:00Z"
+        }))
+        .unwrap();
+        assert!(legacy.twin_evidence_snapshot.is_none());
+
+        let metadata = TwinEvidenceSnapshot {
+            projection_snapshot_id: crate::models::twin_state::SnapshotId::parse("a".repeat(64))
+                .unwrap(),
+            reference_time: "2026-08-29T00:00:00Z".parse().unwrap(),
+            prompt_context_digest: ContentDigest::parse("d".repeat(64)).unwrap(),
+            evidence_event_ids: vec![
+                crate::models::twin_event::EventId::parse("b".repeat(64)).unwrap(),
+                crate::models::twin_event::EventId::parse("c".repeat(64)).unwrap(),
+            ],
+            note_ids: vec!["note-a".into(), "note-b".into()],
+        };
+        assert!(metadata.validate().is_ok());
+
+        let mut noncanonical = metadata;
+        noncanonical.note_ids.reverse();
+        assert!(noncanonical.validate().is_err());
+
+        noncanonical.note_ids = (0..65).map(|index| format!("note-{index:02}")).collect();
+        assert!(noncanonical.validate().is_err());
+    }
+
+    #[test]
+    fn twin_evidence_snapshot_requires_a_canonical_prompt_context_digest() {
+        let without_digest = json!({
+            "projection_snapshot_id": "a".repeat(64),
+            "reference_time": "2026-08-29T00:00:00Z",
+            "evidence_event_ids": [],
+            "note_ids": []
+        });
+        assert!(serde_json::from_value::<TwinEvidenceSnapshot>(without_digest).is_err());
+
+        let invalid_digest = json!({
+            "projection_snapshot_id": "a".repeat(64),
+            "reference_time": "2026-08-29T00:00:00Z",
+            "evidence_event_ids": [],
+            "note_ids": [],
+            "prompt_context_digest": "not-a-sha256"
+        });
+        assert!(serde_json::from_value::<TwinEvidenceSnapshot>(invalid_digest).is_err());
+
+        let valid = json!({
+            "projection_snapshot_id": "a".repeat(64),
+            "reference_time": "2026-08-29T00:00:00Z",
+            "evidence_event_ids": [],
+            "note_ids": [],
+            "prompt_context_digest": "b".repeat(64)
+        });
+        assert!(serde_json::from_value::<TwinEvidenceSnapshot>(valid).is_ok());
     }
 }
 

@@ -13,6 +13,25 @@ vi.mock('@tauri-apps/api/event', () => ({
   listen: listenMock,
 }))
 
+function mockCompletedSendPrompt(tileId, modelId) {
+  let streamHandler
+  listenMock.mockImplementation(async (_eventName, handler) => {
+    streamHandler = handler
+    return unlistenMock
+  })
+  return vi.spyOn(apiClient.canvas, 'sendPrompt').mockImplementation(async () => {
+    streamHandler({
+      payload: {
+        session_id: 'session-1',
+        type: 'complete',
+        tile_id: tileId,
+        model_id: modelId
+      }
+    })
+    return tileId
+  })
+}
+
 describe('Canvas Store', () => {
   it('keeps the provider-reported cost when a streamed response completes', async () => {
     let streamHandler
@@ -39,6 +58,89 @@ describe('Canvas Store', () => {
     setActivePinia(createPinia())
     vi.clearAllMocks()
     listenMock.mockResolvedValue(unlistenMock)
+  })
+
+  it('sendCompanionPrompt defaults to a single-model Twin-history Advisor request', async () => {
+    const sendPromptSpy = mockCompletedSendPrompt('tile-companion', 'openai/gpt-4')
+    const store = useCanvasStore()
+    store.currentSession = { id: 'session-1', prompt_tiles: [], debates: [] }
+
+    const tileId = await store.sendCompanionPrompt({
+      prompt: 'What should I do next?',
+      modelId: 'openai/gpt-4'
+    })
+
+    expect(sendPromptSpy).toHaveBeenCalledWith('session-1', expect.objectContaining({
+      prompt: 'What should I do next?',
+      models: ['openai/gpt-4'],
+      context_mode: 'twin_history',
+      twin_answer_mode: 'advisor'
+    }))
+    expect(tileId).toBe('tile-companion')
+    expect(store.isStreaming).toBe(false)
+    expect(store.error).toBeNull()
+  })
+
+  it.each([
+    ['plain', 'none'],
+    ['knowledge', 'knowledge_search'],
+    ['twin', 'twin_history']
+  ])('sendCompanionPrompt maps %s mode to %s context', async (mode, contextMode) => {
+    const sendPromptSpy = mockCompletedSendPrompt(`tile-${mode}`, 'openai/gpt-4')
+    const store = useCanvasStore()
+    store.currentSession = { id: 'session-1', prompt_tiles: [], debates: [] }
+
+    await store.sendCompanionPrompt({
+      prompt: 'Continue',
+      modelId: 'openai/gpt-4',
+      mode
+    })
+
+    expect(sendPromptSpy).toHaveBeenCalledWith('session-1', expect.objectContaining({
+      context_mode: contextMode
+    }))
+  })
+
+  it.each(['semantic', 'constructor'])(
+    'sendCompanionPrompt rejects unknown mode %s before starting a stream',
+    async (mode) => {
+      const sendPromptSpy = mockCompletedSendPrompt('tile-invalid', 'openai/gpt-4')
+      const store = useCanvasStore()
+      store.currentSession = { id: 'session-1', prompt_tiles: [], debates: [] }
+
+      await expect(store.sendCompanionPrompt({
+        prompt: 'Continue',
+        modelId: 'openai/gpt-4',
+        mode
+      })).rejects.toThrow(/companion mode/i)
+
+      expect(sendPromptSpy).not.toHaveBeenCalled()
+      expect(listenMock).not.toHaveBeenCalled()
+      expect(store.isStreaming).toBe(false)
+    }
+  )
+
+  it('sendCompanionPrompt forwards parent IDs and provider without changing them', async () => {
+    const sendPromptSpy = mockCompletedSendPrompt('tile-child', 'llama3.2')
+    const store = useCanvasStore()
+    store.currentSession = { id: 'session-1', prompt_tiles: [], debates: [] }
+
+    await store.sendCompanionPrompt({
+      prompt: 'Continue from that answer',
+      modelId: 'llama3.2',
+      mode: 'knowledge',
+      parentTileId: 'tile-parent',
+      parentModelId: 'openai/gpt-4',
+      provider: 'ollama'
+    })
+
+    expect(sendPromptSpy).toHaveBeenCalledWith('session-1', expect.objectContaining({
+      models: ['llama3.2'],
+      context_mode: 'knowledge_search',
+      parent_tile_id: 'tile-parent',
+      parent_model_id: 'openai/gpt-4',
+      twin_llm_provider: 'ollama'
+    }))
   })
 
   it('thinkHarderFromResponse creates a same-model full-history request with deeper defaults and no max token cap', async () => {
@@ -506,6 +608,87 @@ describe('Canvas Store', () => {
       status: 'error',
       content: '',
       error_message: 'OpenRouter request failed: rate limit exceeded'
+    })
+  })
+
+  it('regenerateResponse restores the exact completed response when replay is rejected before streaming', async () => {
+    vi.spyOn(apiClient.canvas, 'regenerateResponse').mockRejectedValue(
+      new Error('Twin History persisted prompt context can no longer be reproduced')
+    )
+    const previousResponse = {
+      id: 'response-1',
+      model_id: 'openai/gpt-4',
+      model_name: 'GPT-4',
+      status: 'completed',
+      content: 'Durable prior answer',
+      error: null,
+      error_message: null,
+      cost_usd: 0.003,
+      provider: 'openrouter',
+      provenance: 'canvas_openrouter',
+      position: { x: 0, y: 0, width: 280, height: 200 }
+    }
+    const store = useCanvasStore()
+    store.currentSession = {
+      id: 'session-1',
+      prompt_tiles: [{
+        id: 'tile-1',
+        prompt: 'Hello',
+        responses: { 'openai/gpt-4': { ...previousResponse, position: { ...previousResponse.position } } }
+      }],
+      debates: []
+    }
+
+    await expect(store.regenerateResponse('tile-1', 'openai/gpt-4')).rejects.toThrow(
+      'can no longer be reproduced'
+    )
+
+    expect(store.currentSession.prompt_tiles[0].responses['openai/gpt-4']).toEqual(previousResponse)
+    expect(store.streamingModels.size).toBe(0)
+  })
+
+  it('regenerateResponse rejection does not restore into a different current session', async () => {
+    const store = useCanvasStore()
+    vi.spyOn(apiClient.canvas, 'regenerateResponse').mockImplementation(async () => {
+      store.currentSession = {
+        id: 'session-B',
+        prompt_tiles: [{
+          id: 'tile-1',
+          responses: {
+            'openai/gpt-4': {
+              status: 'completed',
+              content: 'Session B answer',
+              position: { x: 10, y: 10, width: 280, height: 200 }
+            }
+          }
+        }],
+        debates: []
+      }
+      throw new Error('Twin History replay rejected')
+    })
+    store.currentSession = {
+      id: 'session-A',
+      prompt_tiles: [{
+        id: 'tile-1',
+        responses: {
+          'openai/gpt-4': {
+            status: 'completed',
+            content: 'Session A answer',
+            position: { x: 0, y: 0, width: 280, height: 200 }
+          }
+        }
+      }],
+      debates: []
+    }
+
+    await expect(store.regenerateResponse('tile-1', 'openai/gpt-4')).rejects.toThrow(
+      'replay rejected'
+    )
+
+    expect(store.currentSession.id).toBe('session-B')
+    expect(store.currentSession.prompt_tiles[0].responses['openai/gpt-4']).toMatchObject({
+      status: 'completed',
+      content: 'Session B answer'
     })
   })
 
@@ -1091,6 +1274,59 @@ describe('Canvas Store', () => {
     // Let A's stream finish so the operation resolves cleanly
     broadcast({ session_id: 'session-A', type: 'complete', tile_id: 'tile-A1', model_id: 'openai/gpt-4' })
     await promise
+    expect(store.streamingModels.size).toBe(0)
+  })
+
+  it('drops late tile and response mutations after switching sessions but clears the stream tracker', async () => {
+    let streamHandler
+    listenMock.mockImplementation(async (_eventName, handler) => {
+      streamHandler = handler
+      return unlistenMock
+    })
+    vi.spyOn(apiClient.canvas, 'sendPrompt').mockResolvedValue('tile-A1')
+    const store = useCanvasStore()
+    store.currentSession = { id: 'session-A', prompt_tiles: [], debates: [] }
+
+    const promise = store.sendCompanionPrompt({
+      prompt: 'Background Twin prompt',
+      modelId: 'openai/gpt-4'
+    })
+    await flushPromises()
+    store.currentSession = {
+      id: 'session-B',
+      prompt_tiles: [{ id: 'tile-B1', prompt: 'Foreground', responses: {} }],
+      debates: []
+    }
+
+    streamHandler({ payload: {
+      session_id: 'session-A',
+      type: 'tile_created',
+      tile: {
+        id: 'tile-A1',
+        prompt: 'Background Twin prompt',
+        responses: {
+          'openai/gpt-4': { status: 'pending', content: '', position: { x: 0, y: 0, width: 280, height: 200 } }
+        }
+      }
+    } })
+    streamHandler({ payload: {
+      session_id: 'session-A',
+      type: 'chunk',
+      tile_id: 'tile-A1',
+      model_id: 'openai/gpt-4',
+      chunk: 'must not appear'
+    } })
+    streamHandler({ payload: {
+      session_id: 'session-A',
+      type: 'complete',
+      tile_id: 'tile-A1',
+      model_id: 'openai/gpt-4'
+    } })
+
+    await promise
+
+    expect(store.currentSession.id).toBe('session-B')
+    expect(store.currentSession.prompt_tiles.map(tile => tile.id)).toEqual(['tile-B1'])
     expect(store.streamingModels.size).toBe(0)
   })
 

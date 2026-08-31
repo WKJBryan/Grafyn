@@ -167,6 +167,10 @@ export const useCanvasStore = defineStore('canvas', () => {
     return { ...fetchedResponse, position: localResponse.position || fetchedResponse.position }
   }
 
+  function isCurrentSession(sessionId) {
+    return currentSession.value?.id === sessionId
+  }
+
   function mergeSavedSession(fetched) {
     // Stale-save guard: session_saved can arrive for a session the user has already
     // switched away from (its stream finishing in the background). Applying that fetch
@@ -439,21 +443,26 @@ export const useCanvasStore = defineStore('canvas', () => {
       }
 
       const applyContextNotes = (data) => {
-        if (currentSession.value) {
+        if (isCurrentSession(sessionId)) {
           const tile = currentSession.value.prompt_tiles.find(t => t.id === data.tile_id)
           if (tile) tile.context_notes = data.notes || []
         }
       }
       const applyChunk = (data) => {
+        if (!isCurrentSession(sessionId)) return
         modelContent[data.model_id] = (modelContent[data.model_id] || '') + data.chunk
         updateTileResponseLocal(data.tile_id, data.model_id, modelContent[data.model_id], 'streaming')
       }
       const applyComplete = (data) => {
-        updateTileResponseLocal(data.tile_id, data.model_id, modelContent[data.model_id], 'completed', null, data.cost_usd)
+        if (isCurrentSession(sessionId)) {
+          updateTileResponseLocal(data.tile_id, data.model_id, modelContent[data.model_id], 'completed', null, data.cost_usd)
+        }
         tracker.clear(`${ownTileId}:${data.model_id}`)
       }
       const applyError = (data) => {
-        updateTileResponseLocal(data.tile_id, data.model_id, '', 'error', data.error)
+        if (isCurrentSession(sessionId)) {
+          updateTileResponseLocal(data.tile_id, data.model_id, '', 'error', data.error)
+        }
         tracker.clear(`${ownTileId}:${data.model_id}`)
       }
       const scopedAppliers = { context_notes: applyContextNotes, chunk: applyChunk, complete: applyComplete, error: applyError }
@@ -464,7 +473,7 @@ export const useCanvasStore = defineStore('canvas', () => {
           // Safe for every concurrent listener: push-if-absent dedupes the tile so N
           // concurrent operations broadcasting to each other's listeners still result
           // in exactly one push per tile, regardless of which operation it belongs to.
-          if (currentSession.value && data.tile) {
+          if (isCurrentSession(sessionId) && data.tile) {
             const exists = currentSession.value.prompt_tiles.some(t => t.id === data.tile.id)
             if (!exists) currentSession.value.prompt_tiles.push(data.tile)
           }
@@ -996,7 +1005,7 @@ export const useCanvasStore = defineStore('canvas', () => {
 
       const unlisten = await setupTauriStreamListener(sessionId, {
         models_added: (data) => {
-          if (data.tile_id !== tileId) return
+          if (data.tile_id !== tileId || !isCurrentSession(sessionId)) return
           const targetTile = currentSession.value.prompt_tiles.find(t => t.id === data.tile_id)
           if (targetTile) {
             for (const [modelId, response] of Object.entries(data.responses)) {
@@ -1005,18 +1014,22 @@ export const useCanvasStore = defineStore('canvas', () => {
           }
         },
         chunk: (data) => {
-          if (data.tile_id !== tileId || !newModelIds.includes(data.model_id)) return
+          if (data.tile_id !== tileId || !newModelIds.includes(data.model_id) || !isCurrentSession(sessionId)) return
           modelContent[data.model_id] = (modelContent[data.model_id] || '') + data.chunk
           updateTileResponseLocal(tileId, data.model_id, modelContent[data.model_id], 'streaming')
         },
         complete: (data) => {
           if (data.tile_id !== tileId || !newModelIds.includes(data.model_id)) return
-          updateTileResponseLocal(tileId, data.model_id, modelContent[data.model_id], 'completed', null, data.cost_usd)
+          if (isCurrentSession(sessionId)) {
+            updateTileResponseLocal(tileId, data.model_id, modelContent[data.model_id], 'completed', null, data.cost_usd)
+          }
           tracker.clear(`${tileId}:${data.model_id}`)
         },
         error: (data) => {
           if (data.tile_id !== tileId || !newModelIds.includes(data.model_id)) return
-          updateTileResponseLocal(tileId, data.model_id, '', 'error', data.error)
+          if (isCurrentSession(sessionId)) {
+            updateTileResponseLocal(tileId, data.model_id, '', 'error', data.error)
+          }
           tracker.clear(`${tileId}:${data.model_id}`)
         },
         session_saved: async () => {
@@ -1052,6 +1065,13 @@ export const useCanvasStore = defineStore('canvas', () => {
 
     const sessionId = currentSession.value.id
     error.value = null
+    const previousResponse = {
+      ...tile.responses[modelId],
+      position: tile.responses[modelId].position
+        ? { ...tile.responses[modelId].position }
+        : tile.responses[modelId].position
+    }
+    let invokeAccepted = false
 
     // tileId is known synchronously (an existing tile), so the streaming key can be
     // marked immediately.
@@ -1067,18 +1087,22 @@ export const useCanvasStore = defineStore('canvas', () => {
 
       const unlisten = await setupTauriStreamListener(sessionId, {
         chunk: (data) => {
-          if (data.tile_id !== tileId || data.model_id !== modelId) return
+          if (data.tile_id !== tileId || data.model_id !== modelId || !isCurrentSession(sessionId)) return
           content += data.chunk
           updateTileResponseLocal(tileId, modelId, content, 'streaming')
         },
         complete: (data) => {
           if (data.tile_id !== tileId || data.model_id !== modelId) return
-          updateTileResponseLocal(tileId, modelId, content, 'completed', null, data.cost_usd)
+          if (isCurrentSession(sessionId)) {
+            updateTileResponseLocal(tileId, modelId, content, 'completed', null, data.cost_usd)
+          }
           tracker.clear(streamingKey)
         },
         error: (data) => {
           if (data.tile_id !== tileId || data.model_id !== modelId) return
-          updateTileResponseLocal(tileId, modelId, '', 'error', data.error)
+          if (isCurrentSession(sessionId)) {
+            updateTileResponseLocal(tileId, modelId, '', 'error', data.error)
+          }
           tracker.clear(streamingKey)
         },
         session_saved: async () => {
@@ -1088,12 +1112,22 @@ export const useCanvasStore = defineStore('canvas', () => {
 
       try {
         await canvasApi.regenerateResponse(sessionId, tileId, modelId)
+        invokeAccepted = true
         await waitForModelsComplete([streamingKey], 120000)
       } finally {
         unlisten()
       }
     } catch (err) {
-      error.value = err.message || 'Failed to regenerate response'
+      if (!invokeAccepted && isCurrentSession(sessionId)) {
+        const currentTile = currentSession.value.prompt_tiles.find(item => item.id === tileId)
+        const currentResponse = currentTile?.responses?.[modelId]
+        if (currentResponse?.status === 'streaming' && currentResponse.content === '') {
+          currentTile.responses[modelId] = previousResponse
+        }
+      }
+      if (isCurrentSession(sessionId)) {
+        error.value = err.message || 'Failed to regenerate response'
+      }
       console.error('Failed to regenerate response:', err)
       throw err
     } finally {
@@ -1179,6 +1213,48 @@ export const useCanvasStore = defineStore('canvas', () => {
       decisionMetadata,
       reasoningEffort,
       twinLlmProvider
+    )
+  }
+
+  async function sendCompanionPrompt({
+    prompt,
+    modelId,
+    mode = 'twin',
+    parentTileId = null,
+    parentModelId = null,
+    provider = null
+  }) {
+    let contextMode
+    switch (mode) {
+      case 'plain':
+        contextMode = 'none'
+        break
+      case 'knowledge':
+        contextMode = 'knowledge_search'
+        break
+      case 'twin':
+        contextMode = 'twin_history'
+        break
+      default:
+        throw new Error(`Unsupported companion mode: ${mode}`)
+    }
+
+    return sendPrompt(
+      prompt,
+      [modelId],
+      null,
+      0.7,
+      null,
+      parentTileId,
+      parentModelId,
+      contextMode,
+      'advisor',
+      false,
+      DEFAULT_WEB_SEARCH_MAX_RESULTS,
+      'standard',
+      null,
+      'none',
+      provider
     )
   }
 
@@ -1345,6 +1421,7 @@ export const useCanvasStore = defineStore('canvas', () => {
     reset,
     getParentResponseContent,
     branchFromResponse,
+    sendCompanionPrompt,
     thinkHarderFromResponse,
     addModelToTile,
     regenerateResponse,

@@ -78,8 +78,10 @@ pub async fn send_prompt(
     };
     request.models = effective_model_ids(&model_route, &request.models);
     let response_provider = model_route.provider.provider_label().to_string();
-    let response_provenance = if request.context_mode == ContextMode::Twin
-        && request.twin_answer_mode == TwinAnswerMode::Simulation
+    let response_provenance = if matches!(
+        request.context_mode,
+        ContextMode::Twin | ContextMode::TwinHistory
+    ) && request.twin_answer_mode == TwinAnswerMode::Simulation
     {
         "twin_simulation".to_string()
     } else {
@@ -90,8 +92,14 @@ pub async fn send_prompt(
         store.reload_authoritative_state();
         store.get_session(&session_id).map_err(|e| e.to_string())?
     };
-    let resolved_context = resolve_prompt_context(state.inner(), &session, &request).await?;
+    let resolved_context =
+        resolve_prompt_context(state.inner(), &session, &request, None, &model_route).await?;
     root_ticket.validate(state.inner()).await?;
+    let persisted_twin_provider = persisted_twin_provider(
+        &request.context_mode,
+        request.twin_llm_provider.clone(),
+        &model_route.provider,
+    );
     let decision_episode_id = if request.prompt_type == PromptType::Decision {
         Some(uuid::Uuid::new_v4().to_string())
     } else {
@@ -147,9 +155,10 @@ pub async fn send_prompt(
         context_notes: resolved_context.context_notes.clone(),
         approved_twin_records: resolved_context.approved_twin_records.clone(),
         candidate_twin_records: resolved_context.candidate_twin_records.clone(),
+        twin_evidence_snapshot: resolved_context.twin_evidence_snapshot.clone(),
         twin_answer_mode: request.twin_answer_mode.clone(),
         twin_context_policy: request.twin_context_policy.clone(),
-        twin_llm_provider: request.twin_llm_provider.clone(),
+        twin_llm_provider: persisted_twin_provider,
         decision_metadata: request.decision_metadata.clone(),
         decision_episode_id: decision_episode_id.clone(),
         web_search: request.web_search,
@@ -963,15 +972,24 @@ pub async fn add_models_to_tile(
     };
     let model_ids = effective_model_ids(&model_route, &request.model_ids);
     let response_provider = model_route.provider.provider_label().to_string();
-    let response_provenance = if tile.context_mode == ContextMode::Twin
-        && tile.twin_answer_mode == TwinAnswerMode::Simulation
+    let response_provenance = if matches!(
+        tile.context_mode,
+        ContextMode::Twin | ContextMode::TwinHistory
+    ) && tile.twin_answer_mode == TwinAnswerMode::Simulation
     {
         "twin_simulation".to_string()
     } else {
         model_route.provider.provenance_label(false).to_string()
     };
     let prompt_request = prompt_request_from_tile(&tile, model_ids.clone(), 0.7);
-    let resolved_context = resolve_prompt_context(state.inner(), &session, &prompt_request).await?;
+    let resolved_context = resolve_prompt_context(
+        state.inner(),
+        &session,
+        &prompt_request,
+        Some(&tile),
+        &model_route,
+    )
+    .await?;
     root_ticket.validate(state.inner()).await?;
 
     let now = Utc::now();
@@ -1384,7 +1402,8 @@ pub async fn regenerate_response(
     }
 
     let request = prompt_request_from_tile(tile, vec![effective_model_id.clone()], 0.7);
-    let resolved_context = resolve_prompt_context(state.inner(), &session, &request).await?;
+    let resolved_context =
+        resolve_prompt_context(state.inner(), &session, &request, Some(tile), &model_route).await?;
     root_ticket.validate(state.inner()).await?;
 
     // Reset response to streaming
@@ -1661,6 +1680,18 @@ fn prompt_request_from_tile(
     }
 }
 
+fn persisted_twin_provider(
+    context_mode: &ContextMode,
+    requested_provider: Option<String>,
+    resolved_provider: &ModelProviderRoute,
+) -> Option<String> {
+    if context_mode == &ContextMode::TwinHistory {
+        Some(resolved_provider.provider_label().to_string())
+    } else {
+        requested_provider
+    }
+}
+
 async fn append_model_result_traces(
     twin_store_arc: Arc<RwLock<TwinStore>>,
     session_id: &str,
@@ -1858,6 +1889,25 @@ mod tests {
             Some("approved_plus_relevant_candidates")
         );
         assert_eq!(request.twin_llm_provider.as_deref(), Some("ollama"));
+    }
+
+    #[test]
+    fn twin_history_tiles_persist_the_effective_provider_instead_of_a_nullable_override() {
+        let provider =
+            persisted_twin_provider(&ContextMode::TwinHistory, None, &ModelProviderRoute::Ollama);
+
+        assert_eq!(provider.as_deref(), Some("ollama"));
+    }
+
+    #[test]
+    fn non_history_tiles_preserve_the_existing_provider_field() {
+        let provider = persisted_twin_provider(
+            &ContextMode::Twin,
+            Some("ollama".to_string()),
+            &ModelProviderRoute::OpenRouter,
+        );
+
+        assert_eq!(provider.as_deref(), Some("ollama"));
     }
 
     #[test]

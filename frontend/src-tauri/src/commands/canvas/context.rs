@@ -1,16 +1,18 @@
 pub(super) use super::prediction_terminality::fail_requested_prediction_if_same_root;
+mod twin_history;
 use super::shared::{
-    preserve_canvas_mutation_error, repair_canvas_trace_error, ModelProviderRoute,
+    preserve_canvas_mutation_error, repair_canvas_trace_error, ModelProviderRoute, ModelRoute,
 };
 use crate::commands::run_retrieval;
 use crate::models::canvas::{
-    CanvasSession, ContextMode, DecisionPromptMetadata, PromptRequest, PromptType, TileContextNote,
-    TwinAnswerMode,
+    CanvasSession, ContextMode, DecisionPromptMetadata, PromptRequest, PromptTile, PromptType,
+    TileContextNote, TwinAnswerMode, TwinEvidenceSnapshot,
 };
 use crate::models::note::ChunkResult;
 use crate::models::twin::{
     ActionGap, ConstitutionItem, ConstitutionSetup, DecisionEpisode, TwinContextRecord,
 };
+use crate::models::twin_state::SelectionDestination;
 use crate::services::ollama::OllamaService;
 use crate::services::openrouter::{ChatMessage, OpenRouterService};
 use crate::services::retrieval::RetrievalResult;
@@ -19,9 +21,8 @@ use crate::AppState;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use twin_history::build_compact_history_messages;
 
-const COMPACT_HISTORY_RECENT_TURNS: usize = 2;
-const COMPACT_HISTORY_EXCERPT_CHARS: usize = 240;
 const MIN_RETRIEVAL_SCORE_FOR_NOTES: f32 = 5.0;
 const MIN_CANVAS_QUERY_TOKEN_LEN: usize = 3;
 const CANVAS_RETRIEVAL_STOPWORDS: &[&str] = &[
@@ -60,6 +61,7 @@ pub(super) struct ResolvedPromptContext {
     pub(super) twin_context_prompt: Option<String>,
     pub(super) context_version: Option<String>,
     pub(super) decision_case_ids: Vec<String>,
+    pub(super) twin_evidence_snapshot: Option<TwinEvidenceSnapshot>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -175,8 +177,25 @@ pub(super) async fn resolve_prompt_context(
     state: &AppState,
     session: &CanvasSession,
     request: &PromptRequest,
+    replay_tile: Option<&PromptTile>,
+    model_route: &ModelRoute,
 ) -> Result<ResolvedPromptContext, String> {
     let messages = build_canvas_messages(session, request)?;
+
+    if request.context_mode == ContextMode::TwinHistory {
+        return twin_history::resolve_twin_history_prompt_context(
+            state,
+            messages,
+            session,
+            request,
+            replay_tile,
+            match model_route.provider {
+                ModelProviderRoute::Ollama => SelectionDestination::Local,
+                ModelProviderRoute::OpenRouter => SelectionDestination::Network,
+            },
+        )
+        .await;
+    }
 
     if request.context_mode == ContextMode::Twin {
         return resolve_twin_prompt_context(state, messages, session, request).await;
@@ -211,6 +230,7 @@ pub(super) async fn resolve_prompt_context(
                 twin_context_prompt: None,
                 context_version: None,
                 decision_case_ids: Vec::new(),
+                twin_evidence_snapshot: None,
             });
         }
 
@@ -301,6 +321,7 @@ pub(super) async fn resolve_prompt_context(
                 twin_context_prompt: None,
                 context_version: None,
                 decision_case_ids: Vec::new(),
+                twin_evidence_snapshot: None,
             })
         } else {
             log::info!("Canvas using note-level context (chunk retrieval disabled)");
@@ -325,6 +346,7 @@ pub(super) async fn resolve_prompt_context(
             twin_context_prompt: None,
             context_version: None,
             decision_case_ids: Vec::new(),
+            twin_evidence_snapshot: None,
         })
     }
 }
@@ -486,6 +508,7 @@ async fn resolve_twin_prompt_context(
         twin_context_prompt: Some(twin_prompt),
         context_version: Some(TWIN_CONTEXT_VERSION.to_string()),
         decision_case_ids,
+        twin_evidence_snapshot: None,
     })
 }
 
@@ -545,6 +568,7 @@ async fn resolve_note_level_context(
         twin_context_prompt: None,
         context_version: None,
         decision_case_ids: Vec::new(),
+        twin_evidence_snapshot: None,
     })
 }
 
@@ -555,6 +579,16 @@ fn build_canvas_messages(
     match request.context_mode {
         ContextMode::FullHistory => build_full_history_messages(session, request),
         ContextMode::Compact => build_compact_history_messages(session, request),
+        ContextMode::TwinHistory => {
+            if request.parent_tile_id.is_none() && request.parent_model_id.is_none() {
+                Ok(vec![ChatMessage {
+                    role: "user".to_string(),
+                    content: request.prompt.clone(),
+                }])
+            } else {
+                build_compact_history_messages(session, request)
+            }
+        }
         _ => Ok(vec![ChatMessage {
             role: "user".to_string(),
             content: request.prompt.clone(),
@@ -578,52 +612,6 @@ fn build_full_history_messages(
             role: "assistant".to_string(),
             content: turn.response,
         });
-    }
-
-    messages.push(ChatMessage {
-        role: "user".to_string(),
-        content: request.prompt.clone(),
-    });
-
-    Ok(messages)
-}
-
-fn build_compact_history_messages(
-    session: &CanvasSession,
-    request: &PromptRequest,
-) -> Result<Vec<ChatMessage>, String> {
-    let turns = build_selected_parent_chain(session, request)?;
-    let mut messages = Vec::new();
-
-    if turns.len() > COMPACT_HISTORY_RECENT_TURNS {
-        let split_at = turns.len() - COMPACT_HISTORY_RECENT_TURNS;
-        let summary = build_compact_history_summary(&turns[..split_at]);
-        messages.push(ChatMessage {
-            role: "user".to_string(),
-            content: summary,
-        });
-
-        for turn in &turns[split_at..] {
-            messages.push(ChatMessage {
-                role: "user".to_string(),
-                content: turn.prompt.clone(),
-            });
-            messages.push(ChatMessage {
-                role: "assistant".to_string(),
-                content: turn.response.clone(),
-            });
-        }
-    } else {
-        for turn in turns {
-            messages.push(ChatMessage {
-                role: "user".to_string(),
-                content: turn.prompt,
-            });
-            messages.push(ChatMessage {
-                role: "assistant".to_string(),
-                content: turn.response,
-            });
-        }
     }
 
     messages.push(ChatMessage {
@@ -690,35 +678,6 @@ fn build_selected_parent_chain(
 
     turns.reverse();
     Ok(turns)
-}
-
-fn build_compact_history_summary(turns: &[ConversationTurn]) -> String {
-    let mut summary = String::from("Conversation summary before the most recent turns:\n");
-
-    for (index, turn) in turns.iter().enumerate() {
-        summary.push_str(&format!(
-            "\nTurn {}:\nUser: {}\nAssistant ({}): {}\n",
-            index + 1,
-            truncate_for_compact_history(&turn.prompt),
-            turn.model_id,
-            truncate_for_compact_history(&turn.response),
-        ));
-    }
-
-    summary
-}
-
-fn truncate_for_compact_history(content: &str) -> String {
-    if content.chars().count() <= COMPACT_HISTORY_EXCERPT_CHARS {
-        return content.to_string();
-    }
-
-    let mut truncated = content
-        .chars()
-        .take(COMPACT_HISTORY_EXCERPT_CHARS)
-        .collect::<String>();
-    truncated.push_str("...");
-    truncated
 }
 
 /// Build a system prompt that includes retrieved note context.
