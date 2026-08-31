@@ -269,12 +269,14 @@ get_twin_event_timeline
 
 **Contract:** The UI layer can review a proposal, rebuild/read contextual state, and explain a ranking. Export JSONL adds eligible events and projection manifests while preserving existing train/eval/holdout semantics and hard allowed-use gates.
 
-- [ ] Write command tests for paging, context filters, profile selection, invalid review transitions, rejected/pending/private/disallowed exclusion, deterministic exclusion reason codes, snapshot ID stability, and redaction.
-- [ ] Implement commands as thin adapters over event/projection services.
-- [ ] Extend export with versioned `twin_events.jsonl` and `projection_manifest.json`; never add in-app scoring.
-- [ ] Add client/store methods and focused store tests.
-- [ ] Run focused Rust/frontend tests and inspect an export fixture for secrets and path leakage.
-- [ ] Commit: `feat: expose governed Twin state and event exports`
+- [x] Write command tests for paging, context filters, profile selection, invalid review transitions, rejected/pending/private/disallowed exclusion, deterministic exclusion reason codes, snapshot ID stability, and redaction.
+- [x] Implement commands as thin adapters over event/projection services.
+- [x] Extend export with versioned `twin_events.jsonl` and `projection_manifest.json`; never add in-app scoring.
+- [x] Add client/store methods and focused store tests.
+- [x] Run focused Rust/frontend tests and inspect an export fixture for secrets and path leakage.
+- [x] Commit: `feat: expose governed Twin state and event exports`
+
+**Verification (2026-08-31):** 709 desktop Rust tests, 584 MCP tests, and 505 frontend tests passed; focused Twin-state/export/client-store regressions passed 12/7/92. Production frontend build, source-size and license checks, scoped rustfmt, and diff checks passed. ESLint reported zero errors and the same seven pre-existing warnings. Independent review found four stale-frontier/time/provenance/UI-binding defects; all four were fixed and covered by regressions before commit.
 
 ## Task 9: Add conversational Twin history with reproducible evidence snapshots
 

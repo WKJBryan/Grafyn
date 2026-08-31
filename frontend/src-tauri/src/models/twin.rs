@@ -948,6 +948,8 @@ pub struct TwinExportRequest {
     pub holdout_percentage: Option<u8>,
     #[serde(default)]
     pub bundle_name: Option<String>,
+    #[serde(default)]
+    pub reference_time: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -959,6 +961,9 @@ pub struct ExportFileSummary {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExportBundle {
     pub output_dir: String,
+    pub reference_time: DateTime<Utc>,
+    pub twin_events: ExportFileSummary,
+    pub projection_manifest: ExportFileSummary,
     pub train: ExportFileSummary,
     pub eval: ExportFileSummary,
     pub holdout: ExportFileSummary,

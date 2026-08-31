@@ -301,6 +301,112 @@ describe('API Client (Tauri)', () => {
       expect(mockInvoke).toHaveBeenCalledWith('get_twin_review', {})
     })
 
+    it('listObservations() invokes list_twin_observations with its exact request', async () => {
+      const request = {
+        referenceTime: '2026-08-31T10:00:00Z',
+        filter: {
+          relationships: [{
+            subjectId: 'owner',
+            predicate: 'works_with',
+            objectId: 'person-a',
+            direction: 'directed'
+          }],
+          goals: ['ship'],
+          tags: ['work']
+        },
+        cursor: 'cursor-observation',
+        limit: 25
+      }
+
+      mockInvoke.mockResolvedValue({ items: [] })
+      await twin.listObservations(request)
+
+      expect(mockInvoke).toHaveBeenCalledWith('list_twin_observations', { request })
+    })
+
+    it('listProposals() invokes list_twin_proposals with its exact request', async () => {
+      const request = {
+        referenceTime: '2026-08-31T10:00:00Z',
+        filter: { relationships: [], goals: [], tags: ['planning'] },
+        cursor: null,
+        limit: 20
+      }
+
+      mockInvoke.mockResolvedValue({ items: [] })
+      await twin.listProposals(request)
+
+      expect(mockInvoke).toHaveBeenCalledWith('list_twin_proposals', { request })
+    })
+
+    it('reviewProposal() invokes review_twin_proposal with optimistic snapshot fields', async () => {
+      const request = {
+        memoryId: 'memory-1',
+        decision: 'accept',
+        reviewedClaim: {
+          subject_id: 'owner',
+          predicate: 'prefers',
+          object: 'evidence first',
+          polarity: 'affirmed'
+        },
+        rationale: 'This matches my intent.',
+        expectedSnapshotId: 'a'.repeat(64),
+        snapshotReferenceTime: '2026-08-31T10:00:00Z'
+      }
+
+      mockInvoke.mockResolvedValue({ reviewEventId: 'event-1' })
+      await twin.reviewProposal(request)
+
+      expect(mockInvoke).toHaveBeenCalledWith('review_twin_proposal', { request })
+    })
+
+    it('getStateProjection() invokes get_twin_state_projection with its exact request', async () => {
+      const request = { referenceTime: '2026-08-31T10:00:00Z' }
+
+      mockInvoke.mockResolvedValue({ snapshot_id: 'a'.repeat(64) })
+      await twin.getStateProjection(request)
+
+      expect(mockInvoke).toHaveBeenCalledWith('get_twin_state_projection', { request })
+    })
+
+    it('rankAttention() invokes rank_twin_attention with its exact request', async () => {
+      const request = {
+        referenceTime: '2026-08-31T10:00:00Z',
+        profile: 'decision',
+        query: 'What should I prioritize?',
+        relationshipVariant: {
+          relationships: [{
+            subject_id: 'owner',
+            predicate: 'works_with',
+            object_id: 'person-a',
+            direction: 'directed'
+          }]
+        },
+        goals: ['ship'],
+        destination: 'local',
+        filter: { relationships: [], goals: ['ship'], tags: [] },
+        limit: 10
+      }
+
+      mockInvoke.mockResolvedValue({ trace: { selected: [], excluded: [] } })
+      await twin.rankAttention(request)
+
+      expect(mockInvoke).toHaveBeenCalledWith('rank_twin_attention', { request })
+    })
+
+    it('getEventTimeline() invokes get_twin_event_timeline with its exact request', async () => {
+      const request = {
+        referenceTime: '2026-08-31T10:00:00Z',
+        filter: { relationships: [], goals: ['ship'], tags: ['work'] },
+        cursor: 'cursor-timeline',
+        limit: 30
+      }
+
+      mockInvoke.mockResolvedValue({ items: [] })
+      await twin.getEventTimeline(request)
+
+      expect(mockInvoke).toHaveBeenCalledWith('get_twin_event_timeline', { request })
+    })
+
     it('resolveEvidence() invokes resolve_user_record_evidence', async () => {
       mockInvoke.mockResolvedValue([])
       await twin.resolveEvidence('record-1')

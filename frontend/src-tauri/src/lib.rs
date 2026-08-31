@@ -379,6 +379,13 @@ pub fn run() {
             commands::twin::get_constitution_setup,
             commands::twin::save_constitution_setup,
             commands::twin::run_constitution_inference,
+            // Twin state commands
+            commands::twin_state::list_twin_observations,
+            commands::twin_state::list_twin_proposals,
+            commands::twin_state::review_twin_proposal,
+            commands::twin_state::get_twin_state_projection,
+            commands::twin_state::rank_twin_attention,
+            commands::twin_state::get_twin_event_timeline,
             #[cfg(feature = "twin-eval-lab")]
             // Twin evaluation commands
             commands::twin_eval::get_twin_eval_model_matrix,

@@ -18,6 +18,27 @@ export const useTwinStore = defineStore('twin', () => {
   const constitutionItems = ref([])
   const actionGaps = ref([])
   const decisions = ref([])
+  const observationPage = ref(null)
+  const proposalPage = ref(null)
+  const projection = ref(null)
+  const timelinePage = ref(null)
+  const attention = ref(null)
+  const twinStateLoading = reactive({
+    observations: false,
+    proposals: false,
+    projection: false,
+    timeline: false,
+    attention: false,
+    review: false
+  })
+  const twinStateError = reactive({
+    observations: null,
+    proposals: null,
+    projection: null,
+    timeline: null,
+    attention: null,
+    review: null
+  })
   const selectedRecordState = ref('candidate')
   const selectedRecordId = ref(null)
   const selectedEvidence = ref([])
@@ -77,8 +98,159 @@ export const useTwinStore = defineStore('twin', () => {
       .sort(([a], [b]) => a.localeCompare(b))
       .map(([dimension, items]) => ({ dimension, items }))
   })
+  const observations = computed(() => observationPage.value?.items || [])
+  const observationCursor = computed(() => observationPage.value?.nextCursor || null)
+  const proposals = computed(() => proposalPage.value?.items || [])
+  const proposalCursor = computed(() => proposalPage.value?.nextCursor || null)
+  const timeline = computed(() => timelinePage.value?.items || [])
+  const timelineCursor = computed(() => timelinePage.value?.nextCursor || null)
 
   // Actions
+  let observationRequest = null
+  let proposalRequest = null
+  let timelineRequest = null
+
+  async function runTwinStateOperation(key, operation) {
+    twinStateLoading[key] = true
+    twinStateError[key] = null
+    try {
+      return await operation()
+    } catch (err) {
+      twinStateError[key] = err?.message || String(err)
+      return null
+    } finally {
+      twinStateLoading[key] = false
+    }
+  }
+
+  function mergePage(currentPage, nextPage, append) {
+    if (!append) return nextPage
+    return {
+      ...nextPage,
+      items: [...(currentPage?.items || []), ...(nextPage.items || [])]
+    }
+  }
+
+  async function loadObservations(request, append = false) {
+    return runTwinStateOperation('observations', async () => {
+      const page = await twinApi.listObservations(request)
+      observationPage.value = mergePage(observationPage.value, page, append)
+      if (!append) observationRequest = { ...request, cursor: null }
+      return observationPage.value
+    })
+  }
+
+  async function loadMoreObservations() {
+    if (!observationRequest || !observationCursor.value) return observationPage.value
+    return loadObservations({
+      ...observationRequest,
+      cursor: observationCursor.value
+    }, true)
+  }
+
+  async function loadProposals(request, append = false) {
+    return runTwinStateOperation('proposals', async () => {
+      const page = await twinApi.listProposals(request)
+      proposalPage.value = mergePage(proposalPage.value, page, append)
+      if (!append) proposalRequest = { ...request, cursor: null }
+      return proposalPage.value
+    })
+  }
+
+  async function loadMoreProposals() {
+    if (!proposalRequest || !proposalCursor.value) return proposalPage.value
+    return loadProposals({
+      ...proposalRequest,
+      cursor: proposalCursor.value
+    }, true)
+  }
+
+  async function loadProjection(request) {
+    return runTwinStateOperation('projection', async () => {
+      projection.value = await twinApi.getStateProjection(request)
+      return projection.value
+    })
+  }
+
+  async function loadTimeline(request, append = false) {
+    return runTwinStateOperation('timeline', async () => {
+      const page = await twinApi.getEventTimeline(request)
+      timelinePage.value = mergePage(timelinePage.value, page, append)
+      if (!append) timelineRequest = { ...request, cursor: null }
+      return timelinePage.value
+    })
+  }
+
+  async function loadMoreTimeline() {
+    if (!timelineRequest || !timelineCursor.value) return timelinePage.value
+    return loadTimeline({
+      ...timelineRequest,
+      cursor: timelineCursor.value
+    }, true)
+  }
+
+  async function rankAttention(request) {
+    return runTwinStateOperation('attention', async () => {
+      attention.value = await twinApi.rankAttention(request)
+      return attention.value
+    })
+  }
+
+  function refreshedPageRequest(request, referenceTime) {
+    return {
+      referenceTime,
+      filter: request?.filter || { relationships: [], goals: [], tags: [] },
+      cursor: null,
+      limit: request?.limit ?? 50
+    }
+  }
+
+  async function reviewProposal(
+    memoryId,
+    decision,
+    reviewedClaim = null,
+    rationale = null
+  ) {
+    return runTwinStateOperation('review', async () => {
+      const displayedItem = proposalPage.value?.items?.find(item => item.item_id === memoryId)
+      const expectedSnapshotId = proposalPage.value?.snapshotId
+      const snapshotReferenceTime = proposalPage.value?.referenceTime
+      if (!displayedItem || !expectedSnapshotId || !snapshotReferenceTime) {
+        throw new Error('Load the displayed proposal page before reviewing a proposal')
+      }
+      if (
+        projection.value?.snapshot_id !== expectedSnapshotId ||
+        projection.value?.reference_time !== snapshotReferenceTime
+      ) {
+        throw new Error('Proposal page and projection must use the same Twin snapshot')
+      }
+      const projectedItem = projection.value.pending_proposals?.find(
+        item => item.item_id === memoryId
+      )
+      if (!projectedItem || JSON.stringify(projectedItem) !== JSON.stringify(displayedItem)) {
+        throw new Error('Twin proposal changed since it was displayed; refresh before reviewing')
+      }
+
+      const response = await twinApi.reviewProposal({
+        memoryId,
+        decision,
+        reviewedClaim,
+        rationale,
+        expectedSnapshotId,
+        snapshotReferenceTime
+      })
+      projection.value = response.snapshot
+      attention.value = null
+      await Promise.all([
+        loadObservations(refreshedPageRequest(observationRequest, response.referenceTime)),
+        loadProposals(refreshedPageRequest(proposalRequest, response.referenceTime)),
+        loadProjection({ referenceTime: response.referenceTime }),
+        loadTimeline(refreshedPageRequest(timelineRequest, response.referenceTime))
+      ])
+      return response
+    })
+  }
+
   async function loadWorkspace() {
     try {
       const [
@@ -312,6 +484,13 @@ export const useTwinStore = defineStore('twin', () => {
     constitutionItems,
     actionGaps,
     decisions,
+    observationPage,
+    proposalPage,
+    projection,
+    timelinePage,
+    attention,
+    twinStateLoading,
+    twinStateError,
     selectedRecordState,
     selectedRecordId,
     selectedEvidence,
@@ -335,7 +514,22 @@ export const useTwinStore = defineStore('twin', () => {
     topActionGaps,
     filteredReviewRecords,
     groupedConstitution,
+    observations,
+    observationCursor,
+    proposals,
+    proposalCursor,
+    timeline,
+    timelineCursor,
     // Actions
+    loadObservations,
+    loadMoreObservations,
+    loadProposals,
+    loadMoreProposals,
+    loadProjection,
+    loadTimeline,
+    loadMoreTimeline,
+    rankAttention,
+    reviewProposal,
     loadWorkspace,
     runTwinInference,
     runConstitutionInference,

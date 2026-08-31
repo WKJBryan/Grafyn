@@ -109,6 +109,18 @@ export const twin = {
 
   getReview: () => invoke('get_twin_review', {}),
 
+  listObservations: (request) => invoke('list_twin_observations', { request }),
+
+  listProposals: (request) => invoke('list_twin_proposals', { request }),
+
+  reviewProposal: (request) => invoke('review_twin_proposal', { request }),
+
+  getStateProjection: (request) => invoke('get_twin_state_projection', { request }),
+
+  rankAttention: (request) => invoke('rank_twin_attention', { request }),
+
+  getEventTimeline: (request) => invoke('get_twin_event_timeline', { request }),
+
   resolveEvidence: (id) => invoke('resolve_user_record_evidence', { id }),
 
   setPromotion: (id, promotionState, rationale = null) =>
