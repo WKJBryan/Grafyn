@@ -781,15 +781,37 @@ impl MutationCoordinator {
                 .join("notes")
             }
             crate::services::twin_events::TargetKind::TwinJson => self.data_path.join("twin"),
-            crate::services::twin_events::TargetKind::CanvasJson => self.data_path.join("canvas"),
+            crate::services::twin_events::TargetKind::CanvasJson => {
+                let lease = self
+                    .root_lease
+                    .lock()
+                    .map_err(|_| {
+                        MutationError::Invalid("Markdown root lease lock poisoned".into())
+                    })?
+                    .clone();
+                if lease.is_stable() {
+                    crate::services::canvas_store::scoped_canvas_path(
+                        &self.data_path,
+                        &lease.root_scope,
+                    )
+                } else {
+                    self.data_path.join("canvas")
+                }
+            }
         })
     }
 
     pub(super) fn current_markdown_root_scope(
         &self,
     ) -> Result<crate::models::twin_event::ContentDigest, MutationError> {
-        markdown_root_scope_for(
+        let lease = self
+            .root_lease
+            .lock()
+            .map_err(|_| MutationError::Invalid("Markdown root lease lock poisoned".into()))?
+            .clone();
+        root_scope_for_lease(
             &self.target_root(crate::services::twin_events::TargetKind::Markdown)?,
+            &lease,
         )
     }
 
@@ -831,7 +853,15 @@ impl MutationCoordinator {
                 format!("twin/{relative_key}")
             }
             crate::services::twin_events::TargetKind::CanvasJson => {
-                format!("canvas/{relative_key}")
+                let root = self.target_root(kind)?;
+                let relative_root = root.strip_prefix(&self.data_path).map_err(|_| {
+                    MutationError::Invalid("Canvas target root escaped app data".into())
+                })?;
+                format!(
+                    "{}/{}",
+                    relative_root.to_string_lossy().replace('\\', "/"),
+                    relative_key
+                )
             }
         })
     }

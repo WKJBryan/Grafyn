@@ -65,6 +65,7 @@ pub struct TwinStore {
     event_recorder: Arc<dyn crate::services::twin_events::EventRecorder>,
     root_capability: Option<crate::services::twin_events::AnchoredRoot>,
     data_capability: Option<crate::services::twin_events::AnchoredRoot>,
+    canvas_root_key: String,
 }
 
 impl TwinStore {
@@ -88,6 +89,34 @@ impl TwinStore {
     pub fn with_event_recorder(
         root_path: PathBuf,
         target_root_path: PathBuf,
+        event_recorder: Arc<dyn crate::services::twin_events::EventRecorder>,
+    ) -> Self {
+        Self::with_event_recorder_and_canvas_root(
+            root_path,
+            target_root_path,
+            "canvas".into(),
+            event_recorder,
+        )
+    }
+
+    pub fn with_event_recorder_scoped(
+        root_path: PathBuf,
+        target_root_path: PathBuf,
+        root_scope: crate::models::twin_event::ContentDigest,
+        event_recorder: Arc<dyn crate::services::twin_events::EventRecorder>,
+    ) -> Self {
+        Self::with_event_recorder_and_canvas_root(
+            root_path,
+            target_root_path,
+            format!("canvas/v1/{}", root_scope.as_str()),
+            event_recorder,
+        )
+    }
+
+    fn with_event_recorder_and_canvas_root(
+        root_path: PathBuf,
+        target_root_path: PathBuf,
+        canvas_root_key: String,
         event_recorder: Arc<dyn crate::services::twin_events::EventRecorder>,
     ) -> Self {
         let traces_path = root_path.join("traces");
@@ -133,6 +162,7 @@ impl TwinStore {
             event_recorder,
             root_capability,
             data_capability,
+            canvas_root_key,
         }
     }
 
@@ -144,6 +174,24 @@ impl TwinStore {
         *self = Self::with_event_recorder(
             root_path,
             self.target_root_path.clone(),
+            self.event_recorder.clone(),
+        );
+        Ok(())
+    }
+
+    pub fn replace_root_path_scoped(
+        &mut self,
+        root_path: PathBuf,
+        root_scope: crate::models::twin_event::ContentDigest,
+    ) -> Result<()> {
+        std::fs::create_dir_all(&root_path)
+            .with_context(|| format!("Failed to create Twin root: {}", root_path.display()))?;
+        crate::services::twin_events::validate_real_directory(&root_path, "Twin root")
+            .map_err(anyhow::Error::new)?;
+        *self = Self::with_event_recorder_scoped(
+            root_path,
+            self.target_root_path.clone(),
+            root_scope,
             self.event_recorder.clone(),
         );
         Ok(())
@@ -259,7 +307,7 @@ impl TwinStore {
         let root = self.data_capability.as_ref().ok_or_else(|| {
             anyhow::anyhow!("coordinator data-root capability could not be acquired")
         })?;
-        let key = format!("canvas/{session_id}.json");
+        let key = format!("{}/{session_id}.json", self.canvas_root_key);
         let Some(bytes) = root
             .read_bounded(&key, CANVAS_JSON_LIMIT)
             .map_err(anyhow::Error::new)?
@@ -496,6 +544,48 @@ mod cache_tests {
     use crate::models::twin::{PromotionState, RecordOrigin, UserRecordCreate, UserRecordKind};
     use std::collections::{HashMap, HashSet};
     use tempfile::tempdir;
+
+    #[test]
+    fn scoped_twin_store_reads_canvas_feedback_from_the_same_vault_scope() {
+        let temp = tempdir().unwrap();
+        let data = temp.path().join("data");
+        let scope = crate::services::twin_events::digest_bytes(b"scoped-twin-canvas");
+        let twin_root = crate::models::settings::twin_data_path_for_scope(&data, &scope);
+        let scoped_canvas = crate::services::canvas_store::scoped_canvas_path(&data, &scope);
+        std::fs::create_dir_all(&scoped_canvas).unwrap();
+        std::fs::create_dir_all(data.join("canvas")).unwrap();
+        let mut scoped = crate::models::canvas::CanvasSession::default();
+        scoped.id = "session".into();
+        scoped.title = "scoped".into();
+        let mut legacy = scoped.clone();
+        legacy.title = "legacy".into();
+        std::fs::write(
+            scoped_canvas.join("session.json"),
+            serde_json::to_vec(&scoped).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            data.join("canvas/session.json"),
+            serde_json::to_vec(&legacy).unwrap(),
+        )
+        .unwrap();
+
+        let store = TwinStore::with_event_recorder_scoped(
+            twin_root,
+            data.join("twin"),
+            scope,
+            Arc::new(crate::services::twin_events::NoopEventRecorder),
+        );
+
+        assert_eq!(
+            store
+                .read_canvas_session_bounded("session")
+                .unwrap()
+                .unwrap()
+                .title,
+            "scoped"
+        );
+    }
 
     fn record(content: &str) -> UserRecord {
         TwinStore::materialize_user_record(UserRecordCreate {

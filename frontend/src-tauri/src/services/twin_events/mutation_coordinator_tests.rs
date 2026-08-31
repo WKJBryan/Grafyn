@@ -3,8 +3,34 @@ use crate::models::twin_event::{
     CausalStream, Governance, NoteChangeKind, NoteChanged, TwinEventPayload, Visibility,
 };
 use chrono::{TimeZone, Utc};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tempfile::tempdir;
+
+fn tree_snapshot(root: &Path) -> std::collections::BTreeMap<PathBuf, Option<Vec<u8>>> {
+    walkdir::WalkDir::new(root)
+        .into_iter()
+        .map(Result::unwrap)
+        .map(|entry| {
+            let relative = entry.path().strip_prefix(root).unwrap().to_path_buf();
+            let contents = if entry.file_type().is_dir() {
+                None
+            } else if entry.file_type().is_file() {
+                Some(std::fs::read(entry.path()).unwrap())
+            } else {
+                panic!("unexpected test tree entry: {}", entry.path().display());
+            };
+            (relative, contents)
+        })
+        .collect()
+}
+
+fn assert_transition_wal_error(error: MutationError) {
+    assert!(
+        error.to_string().contains("root-transition"),
+        "unexpected WAL preflight error: {error}"
+    );
+}
 
 fn draft(label: &str) -> TwinEventDraft {
     TwinEventDraft {
@@ -25,6 +51,33 @@ fn draft(label: &str) -> TwinEventDraft {
             change: NoteChangeKind::Created,
             content_digest: None,
         }),
+    }
+}
+
+#[test]
+fn active_root_lease_read_and_write_reject_nil_and_noncanonical_epochs() {
+    let temp = tempdir().unwrap();
+    let root = crate::services::twin_events::AnchoredRoot::open(temp.path()).unwrap();
+    let scope = crate::models::twin_event::ContentDigest::parse("a".repeat(64)).unwrap();
+
+    for schema_version in [
+        ACTIVE_ROOT_LEASE_SCHEMA_VERSION,
+        STABLE_ROOT_LEASE_SCHEMA_VERSION,
+    ] {
+        for epoch_uuid in [
+            uuid::Uuid::nil().to_string(),
+            "123E4567-E89B-42D3-A456-426614174000".to_string(),
+            "123e4567e89b42d3a456426614174000".to_string(),
+        ] {
+            let lease = ActiveMarkdownRootLeaseV1 {
+                schema_version,
+                root_scope: scope.clone(),
+                epoch_uuid,
+            };
+            let encoded = serde_json::to_vec(&lease).unwrap();
+            assert!(parse_active_root_lease(&encoded).is_err());
+            assert!(write_active_root_lease(&root, &lease).is_err());
+        }
     }
 }
 
@@ -73,6 +126,1307 @@ fn writer_identity_is_stable_nonsecret_and_finalizer_chains_one_group() {
 }
 
 #[test]
+fn coordinator_exposes_the_exact_persisted_writer_uuid_for_sync_binding() {
+    let temp = tempdir().unwrap();
+    let data = temp.path().join("data");
+    let vault = temp.path().join("vault");
+    std::fs::create_dir(&data).unwrap();
+    std::fs::create_dir(&vault).unwrap();
+    std::fs::create_dir_all(data.join("twin/events")).unwrap();
+    let store = Arc::new(TwinEventStore::new(&data));
+    store.initialize().unwrap();
+
+    let coordinator =
+        MutationCoordinator::new(&data, &vault, store, Arc::new(NoopMutationLifecycle)).unwrap();
+    let exposed = coordinator.writer_device_id();
+    let persisted: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(data.join("twin/events/writer-v1.json")).unwrap())
+            .unwrap();
+
+    assert_eq!(persisted["device_id"].as_str(), Some(exposed.as_str()));
+    uuid::Uuid::parse_str(exposed.as_str()).unwrap();
+}
+
+#[test]
+fn coordinator_binds_sync_signing_identity_after_recovery_under_its_process_lock() {
+    let temp = tempdir().unwrap();
+    let data = temp.path().join("data");
+    let vault = temp.path().join("vault");
+    std::fs::create_dir(&data).unwrap();
+    std::fs::create_dir(&vault).unwrap();
+    let store = Arc::new(TwinEventStore::new(&data));
+    store.initialize().unwrap();
+
+    let coordinator =
+        MutationCoordinator::new(&data, &vault, store, Arc::new(NoopMutationLifecycle)).unwrap();
+    let writer = coordinator.writer_device_id();
+    let identity = coordinator
+        .load_or_create_device_signing_identity(Arc::new(
+            crate::services::sync::secrets::MemorySecretStore::default(),
+        ))
+        .unwrap();
+
+    assert_eq!(identity.device_id().to_string(), writer.as_str());
+    assert!(data.join("twin/events/device-signing-v1.json").is_file());
+}
+
+#[test]
+fn stable_bootstrap_refuses_missing_writer_for_bound_history_without_writes() {
+    let temp = tempdir().unwrap();
+    let data = temp.path().join("data");
+    let vault = temp.path().join("vault");
+    std::fs::create_dir(&data).unwrap();
+    std::fs::create_dir(&vault).unwrap();
+    std::fs::create_dir_all(data.join("twin/events")).unwrap();
+    let store = Arc::new(TwinEventStore::new(&data));
+    let coordinator =
+        MutationCoordinator::new_stable(&data, &vault, store, Arc::new(NoopMutationLifecycle))
+            .unwrap();
+    let original_writer = coordinator.writer_device_id();
+    coordinator
+        .load_or_create_device_signing_identity(Arc::new(
+            crate::services::sync::secrets::MemorySecretStore::default(),
+        ))
+        .unwrap();
+    let _ = coordinator
+        .commit_local(
+            CausalStream::LocalOnly,
+            crate::models::twin_event::SourceChannel::parse("note_editor").unwrap(),
+            Vec::new(),
+            vec![draft("bound-history")],
+        )
+        .unwrap();
+    drop(coordinator);
+
+    std::fs::remove_file(data.join("twin/events/writer-v1.json")).unwrap();
+    let data_before = tree_snapshot(&data);
+    let vault_before = tree_snapshot(&vault);
+
+    let error = match MutationCoordinator::new_stable(
+        &data,
+        &vault,
+        Arc::new(TwinEventStore::new(&data)),
+        Arc::new(NoopMutationLifecycle),
+    ) {
+        Ok(_) => panic!("established bound history must not mint a replacement writer"),
+        Err(error) => error,
+    };
+
+    assert!(matches!(
+        error,
+        MutationError::RecoveryConflict(message)
+            if message == "writer-identity-missing-for-established-data-root"
+    ));
+    assert!(!data.join("twin/events/writer-v1.json").exists());
+    assert_eq!(tree_snapshot(&data), data_before);
+    assert_eq!(tree_snapshot(&vault), vault_before);
+    assert_ne!(original_writer.as_str(), "");
+}
+
+#[test]
+fn stable_bootstrap_refuses_missing_writer_for_unleased_legacy_binding_and_events_before_descriptor(
+) {
+    let temp = tempdir().unwrap();
+    let data = temp.path().join("data");
+    let vault = temp.path().join("vault");
+    std::fs::create_dir(&data).unwrap();
+    std::fs::create_dir(&vault).unwrap();
+    let store = Arc::new(TwinEventStore::new(&data));
+    store.initialize().unwrap();
+    let coordinator =
+        MutationCoordinator::new(&data, &vault, store, Arc::new(NoopMutationLifecycle)).unwrap();
+    coordinator
+        .load_or_create_device_signing_identity(Arc::new(
+            crate::services::sync::secrets::MemorySecretStore::default(),
+        ))
+        .unwrap();
+    let _ = coordinator
+        .commit_local(
+            CausalStream::LocalOnly,
+            crate::models::twin_event::SourceChannel::parse("note_editor").unwrap(),
+            Vec::new(),
+            vec![draft("legacy-bound-history")],
+        )
+        .unwrap();
+    drop(coordinator);
+
+    std::fs::remove_file(data.join("twin/events/active-markdown-root-v1.json")).unwrap();
+    std::fs::remove_file(data.join("twin/events/writer-v1.json")).unwrap();
+    let data_before = tree_snapshot(&data);
+    let vault_before = tree_snapshot(&vault);
+
+    let error = match MutationCoordinator::new_stable(
+        &data,
+        &vault,
+        Arc::new(TwinEventStore::new(&data)),
+        Arc::new(NoopMutationLifecycle),
+    ) {
+        Ok(_) => panic!("unleased legacy binding and event history must not mint a writer"),
+        Err(error) => error,
+    };
+
+    assert!(matches!(
+        error,
+        MutationError::RecoveryConflict(message)
+            if message == "writer-identity-missing-for-established-data-root"
+    ));
+    assert!(!vault.join("_grafyn/vault.json").exists());
+    assert!(!data
+        .join("twin/events/active-markdown-root-v1.json")
+        .exists());
+    assert!(!data.join("twin/events/writer-v1.json").exists());
+    assert_eq!(tree_snapshot(&data), data_before);
+    assert_eq!(tree_snapshot(&vault), vault_before);
+}
+
+#[test]
+fn stable_first_install_mints_one_writer_and_reopens_it() {
+    let temp = tempdir().unwrap();
+    let data = temp.path().join("data");
+    let vault = temp.path().join("vault");
+    std::fs::create_dir(&data).unwrap();
+    std::fs::create_dir(&vault).unwrap();
+    std::fs::create_dir_all(data.join("twin/events")).unwrap();
+
+    let first = MutationCoordinator::new_stable(
+        &data,
+        &vault,
+        Arc::new(TwinEventStore::new(&data)),
+        Arc::new(NoopMutationLifecycle),
+    )
+    .unwrap();
+    let writer = first.writer_device_id();
+    drop(first);
+
+    let reopened = MutationCoordinator::new_stable(
+        &data,
+        &vault,
+        Arc::new(TwinEventStore::new(&data)),
+        Arc::new(NoopMutationLifecycle),
+    )
+    .unwrap();
+
+    assert_eq!(reopened.writer_device_id(), writer);
+}
+
+#[test]
+fn stable_first_install_tolerates_a_retained_orphaned_writer_install_temp() {
+    let temp = tempdir().unwrap();
+    let data = temp.path().join("data");
+    let vault = temp.path().join("vault");
+    let staging = data.join(WRITER_STAGING_KEY);
+    std::fs::create_dir_all(&staging).unwrap();
+    std::fs::create_dir(&vault).unwrap();
+    let orphan_name = format!(".{}.tmp", uuid::Uuid::new_v4());
+    let orphan_path = staging.join(&orphan_name);
+    std::fs::write(&orphan_path, b"crash-left writer installer bytes").unwrap();
+
+    let first = MutationCoordinator::new_stable(
+        &data,
+        &vault,
+        Arc::new(TwinEventStore::new(&data)),
+        Arc::new(NoopMutationLifecycle),
+    )
+    .unwrap();
+    let writer = first.writer_device_id();
+
+    assert!(orphan_path.is_file());
+    assert!(data.join(WRITER_KEY).is_file());
+    drop(first);
+
+    let reopened = MutationCoordinator::new_stable(
+        &data,
+        &vault,
+        Arc::new(TwinEventStore::new(&data)),
+        Arc::new(NoopMutationLifecycle),
+    )
+    .unwrap();
+    assert_eq!(reopened.writer_device_id(), writer);
+}
+
+#[test]
+fn missing_writer_rejects_foreign_staging_file_without_mutating_it() {
+    let temp = tempdir().unwrap();
+    let data = temp.path().join("data");
+    let staging = data.join(WRITER_STAGING_KEY);
+    std::fs::create_dir_all(&staging).unwrap();
+    std::fs::write(staging.join(".crashed.tmp"), b"foreign staging bytes").unwrap();
+    let root = crate::services::twin_events::AnchoredRoot::open(&data).unwrap();
+    let process_lock = acquire_shared_coordinator_process_lock(&data).unwrap();
+    let before = tree_snapshot(&staging);
+
+    let error =
+        reject_missing_writer_for_established_data_root_locked(&root, &process_lock).unwrap_err();
+
+    assert!(matches!(
+        error,
+        MutationError::RecoveryConflict(message)
+            if message == "writer-identity-missing-for-established-data-root"
+    ));
+    assert_eq!(tree_snapshot(&staging), before);
+    assert!(!data.join(WRITER_KEY).exists());
+}
+
+#[test]
+fn missing_writer_never_reconciles_a_uuid_temp_from_legacy_event_staging() {
+    let temp = tempdir().unwrap();
+    let data = temp.path().join("data");
+    let event_staging = data.join("twin/events/staging/v1");
+    std::fs::create_dir_all(&event_staging).unwrap();
+    let event_temp = event_staging.join(format!(".{}.tmp", uuid::Uuid::new_v4()));
+    std::fs::write(&event_temp, b"possibly durable event bytes").unwrap();
+    let root = crate::services::twin_events::AnchoredRoot::open(&data).unwrap();
+    let process_lock = acquire_shared_coordinator_process_lock(&data).unwrap();
+    let before = tree_snapshot(&event_staging);
+
+    let error =
+        reject_missing_writer_for_established_data_root_locked(&root, &process_lock).unwrap_err();
+
+    assert!(matches!(
+        error,
+        MutationError::RecoveryConflict(message)
+            if message == "writer-identity-missing-for-established-data-root"
+    ));
+    assert_eq!(tree_snapshot(&event_staging), before);
+    assert!(event_temp.is_file());
+    assert!(!data.join(WRITER_KEY).exists());
+}
+
+#[test]
+fn missing_writer_keeps_orphan_temp_when_other_established_evidence_exists() {
+    let temp = tempdir().unwrap();
+    let data = temp.path().join("data");
+    let staging = data.join(WRITER_STAGING_KEY);
+    std::fs::create_dir_all(&staging).unwrap();
+    let orphan_path = staging.join(format!(".{}.tmp", uuid::Uuid::new_v4()));
+    std::fs::write(&orphan_path, b"crash-left writer installer bytes").unwrap();
+    std::fs::write(
+        data.join("twin/events/content-authority-v1.json"),
+        b"established authority",
+    )
+    .unwrap();
+    let root = crate::services::twin_events::AnchoredRoot::open(&data).unwrap();
+    let process_lock = acquire_shared_coordinator_process_lock(&data).unwrap();
+    let before = tree_snapshot(&staging);
+
+    let error =
+        reject_missing_writer_for_established_data_root_locked(&root, &process_lock).unwrap_err();
+
+    assert!(matches!(
+        error,
+        MutationError::RecoveryConflict(message)
+            if message == "writer-identity-missing-for-established-data-root"
+    ));
+    assert_eq!(tree_snapshot(&staging), before);
+    assert!(orphan_path.is_file());
+    assert_eq!(
+        std::fs::read(data.join("twin/events/content-authority-v1.json")).unwrap(),
+        b"established authority"
+    );
+    assert!(!data.join(WRITER_KEY).exists());
+}
+
+#[test]
+fn writer_install_temp_name_must_match_the_exact_uuid_v4_shape() {
+    let random = uuid::Uuid::new_v4().to_string();
+    assert!(is_canonical_writer_install_temp(&format!(".{random}.tmp")));
+    assert!(!is_canonical_writer_install_temp(&format!(
+        ".{}.tmp",
+        random.to_uppercase()
+    )));
+    assert!(!is_canonical_writer_install_temp(
+        ".00000000-0000-0000-0000-000000000000.tmp"
+    ));
+    assert!(!is_canonical_writer_install_temp(
+        ".67e55044-10b1-11ed-861d-0242ac120002.tmp"
+    ));
+    assert!(!is_canonical_writer_install_temp(
+        ".67e55044-10b1-426f-9247-bb680e5fe0c8.partial"
+    ));
+    assert!(!is_canonical_writer_install_temp(".crashed.tmp"));
+}
+
+#[test]
+fn existing_writer_tolerates_the_retained_post_link_install_temp() {
+    let temp = tempdir().unwrap();
+    let data = temp.path().join("data");
+    std::fs::create_dir_all(data.join("twin/events")).unwrap();
+    let expected = PersistedMutationIdentityProvider::load_or_create(&data).unwrap();
+    let staging = data.join(WRITER_STAGING_KEY);
+    let orphan = staging.join(format!(".{}.tmp", uuid::Uuid::new_v4()));
+    std::fs::write(&orphan, std::fs::read(data.join(WRITER_KEY)).unwrap()).unwrap();
+    let root = crate::services::twin_events::AnchoredRoot::open(&data).unwrap();
+    let process_lock = acquire_shared_coordinator_process_lock(&data).unwrap();
+
+    let recovered = reject_missing_writer_for_established_data_root_locked(&root, &process_lock)
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(recovered.device_id(), expected.device_id());
+    assert!(orphan.is_file());
+}
+
+#[test]
+fn existing_writer_rejects_foreign_writer_staging_without_mutation() {
+    let temp = tempdir().unwrap();
+    let data = temp.path().join("data");
+    std::fs::create_dir_all(data.join("twin/events")).unwrap();
+    PersistedMutationIdentityProvider::load_or_create(&data).unwrap();
+    let staging = data.join(WRITER_STAGING_KEY);
+    std::fs::write(staging.join("foreign.bin"), b"foreign staging bytes").unwrap();
+    let root = crate::services::twin_events::AnchoredRoot::open(&data).unwrap();
+    let process_lock = acquire_shared_coordinator_process_lock(&data).unwrap();
+    let before = tree_snapshot(&staging);
+
+    let error =
+        reject_missing_writer_for_established_data_root_locked(&root, &process_lock).unwrap_err();
+
+    assert!(matches!(
+        error,
+        MutationError::RecoveryConflict(message)
+            if message == "writer-install-staging-contains-unrecognized-entry"
+    ));
+    assert_eq!(tree_snapshot(&staging), before);
+}
+
+#[test]
+fn writer_evidence_recursion_spends_one_total_entry_budget() {
+    let temp = tempdir().unwrap();
+    let data = temp.path().join("data");
+    std::fs::create_dir_all(data.join("first/empty-a")).unwrap();
+    std::fs::create_dir_all(data.join("second/empty-b")).unwrap();
+    let root = crate::services::twin_events::AnchoredRoot::open(&data).unwrap();
+    let mut remaining_entries = 1;
+
+    assert!(
+        !anchored_directory_contains_regular_file(&root, "first", 0, &mut remaining_entries,)
+            .unwrap()
+    );
+    assert_eq!(remaining_entries, 0);
+    let error =
+        anchored_directory_contains_regular_file(&root, "second", 0, &mut remaining_entries)
+            .unwrap_err();
+
+    assert!(error.to_string().contains("exceeds its 0-entry limit"));
+}
+
+#[test]
+fn stable_bootstrap_mints_writer_for_coherent_prewriter_legacy_state_and_binds_marker() {
+    let temp = tempdir().unwrap();
+    let data = temp.path().join("data");
+    let vault = temp.path().join("vault");
+    std::fs::create_dir(&data).unwrap();
+    std::fs::create_dir(&vault).unwrap();
+    let legacy_scope = markdown_root_scope_for(&vault).unwrap();
+    let legacy_twin = crate::models::settings::twin_data_path_for_scope(&data, &legacy_scope);
+    std::fs::create_dir_all(&legacy_twin).unwrap();
+    std::fs::write(legacy_twin.join("legacy.json"), b"legacy-twin").unwrap();
+    std::fs::create_dir(data.join("search_index")).unwrap();
+    std::fs::write(data.join("search_index/legacy.json"), b"legacy-derived").unwrap();
+    std::fs::create_dir(data.join("canvas")).unwrap();
+    std::fs::write(data.join("canvas/session.json"), b"legacy-canvas").unwrap();
+    std::fs::create_dir_all(data.join("twin/events")).unwrap();
+
+    let coordinator = MutationCoordinator::new_stable(
+        &data,
+        &vault,
+        Arc::new(TwinEventStore::new(&data)),
+        Arc::new(NoopMutationLifecycle),
+    )
+    .unwrap();
+    let lease = coordinator.current_root_epoch().unwrap();
+    let writer = coordinator.writer_device_id();
+    let marker: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(
+            data.join("twin/stable-vault-migrations/v1")
+                .join(lease.root_scope.as_str())
+                .join("marker.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(marker["writer_device_id"].as_str(), Some(writer.as_str()));
+}
+
+#[test]
+fn stable_coordinator_initializes_twin_events_only_after_its_wal_preflight() {
+    let temp = tempdir().unwrap();
+    let data = temp.path().join("data");
+    let config = temp.path().join("config");
+    let vault = temp.path().join("vault");
+    std::fs::create_dir(&data).unwrap();
+    std::fs::create_dir(&config).unwrap();
+    std::fs::create_dir(&vault).unwrap();
+    let identity = crate::services::sync::identity::load_or_create_vault_identity(&vault).unwrap();
+    let transition_store = crate::services::root_transition::RootTransitionStore::new(
+        &data,
+        config.join("settings.json"),
+        Arc::new(crate::services::root_transition::MemoryVersionedSecretStore::default()),
+    )
+    .unwrap();
+    transition_store
+        .write_settings(
+            &crate::services::root_transition::NonsecretSettingsV1::from_settings(
+                crate::models::settings::UserSettings {
+                    vault_path: Some(vault.to_string_lossy().into_owned()),
+                    ..crate::models::settings::UserSettings::default()
+                },
+            ),
+        )
+        .unwrap();
+    transition_store
+        .write_lease(&ActiveMarkdownRootLeaseV1::new_stable(identity.root_scope))
+        .unwrap();
+    transition_store
+        .write_key_authority(
+            crate::services::root_transition::OpenRouterKeySource::Unset,
+            None,
+        )
+        .unwrap();
+    PersistedMutationIdentityProvider::load_or_create(&data).unwrap();
+    let events = Arc::new(TwinEventStore::new(&data));
+    assert!(matches!(
+        events.ordered_events(),
+        Err(crate::services::twin_events::StoreError::NotInitialized)
+    ));
+
+    let coordinator = MutationCoordinator::new_stable(
+        &data,
+        &vault,
+        events.clone(),
+        Arc::new(NoopMutationLifecycle),
+    )
+    .unwrap();
+
+    assert!(events.ordered_events().unwrap().is_empty());
+    assert!(coordinator.current_root_epoch().unwrap().is_stable());
+}
+
+#[test]
+fn coordinator_rejects_a_foreign_event_store_before_writing_either_data_root() {
+    let temp = tempdir().unwrap();
+    let data_a = temp.path().join("data-a");
+    let data_b = temp.path().join("data-b");
+    let config = temp.path().join("config");
+    let vault = temp.path().join("vault");
+    std::fs::create_dir(&data_a).unwrap();
+    std::fs::create_dir(&data_b).unwrap();
+    std::fs::create_dir(&config).unwrap();
+    std::fs::create_dir(&vault).unwrap();
+    let identity = crate::services::sync::identity::load_or_create_vault_identity(&vault).unwrap();
+    let transition_store = crate::services::root_transition::RootTransitionStore::new(
+        &data_a,
+        config.join("settings.json"),
+        Arc::new(crate::services::root_transition::MemoryVersionedSecretStore::default()),
+    )
+    .unwrap();
+    transition_store
+        .write_settings(
+            &crate::services::root_transition::NonsecretSettingsV1::from_settings(
+                crate::models::settings::UserSettings {
+                    vault_path: Some(vault.to_string_lossy().into_owned()),
+                    ..crate::models::settings::UserSettings::default()
+                },
+            ),
+        )
+        .unwrap();
+    transition_store
+        .write_lease(&ActiveMarkdownRootLeaseV1::new_stable(identity.root_scope))
+        .unwrap();
+    transition_store
+        .write_key_authority(
+            crate::services::root_transition::OpenRouterKeySource::Unset,
+            None,
+        )
+        .unwrap();
+    let foreign_events = Arc::new(TwinEventStore::new(&data_b));
+    let data_a_before = tree_snapshot(&data_a);
+    let data_b_before = tree_snapshot(&data_b);
+    let vault_before = tree_snapshot(&vault);
+
+    let error = match MutationCoordinator::new_stable(
+        &data_a,
+        &vault,
+        foreign_events,
+        Arc::new(NoopMutationLifecycle),
+    ) {
+        Ok(_) => panic!("a coordinator must not accept an event store for another data root"),
+        Err(error) => error,
+    };
+
+    assert_eq!(tree_snapshot(&data_a), data_a_before);
+    assert_eq!(tree_snapshot(&data_b), data_b_before);
+    assert_eq!(tree_snapshot(&vault), vault_before);
+    assert!(error.to_string().contains("Twin event store data root"));
+}
+
+#[test]
+fn coordinator_rejects_a_same_root_scoped_event_store_before_any_write() {
+    let temp = tempdir().unwrap();
+    let data = temp.path().join("data");
+    let config = temp.path().join("config");
+    let vault = temp.path().join("vault");
+    std::fs::create_dir(&data).unwrap();
+    std::fs::create_dir(&config).unwrap();
+    std::fs::create_dir(&vault).unwrap();
+    let identity = crate::services::sync::identity::load_or_create_vault_identity(&vault).unwrap();
+    let transition_store = crate::services::root_transition::RootTransitionStore::new(
+        &data,
+        config.join("settings.json"),
+        Arc::new(crate::services::root_transition::MemoryVersionedSecretStore::default()),
+    )
+    .unwrap();
+    transition_store
+        .write_settings(
+            &crate::services::root_transition::NonsecretSettingsV1::from_settings(
+                crate::models::settings::UserSettings {
+                    vault_path: Some(vault.to_string_lossy().into_owned()),
+                    ..crate::models::settings::UserSettings::default()
+                },
+            ),
+        )
+        .unwrap();
+    transition_store
+        .write_lease(&ActiveMarkdownRootLeaseV1::new_stable(identity.root_scope))
+        .unwrap();
+    transition_store
+        .write_key_authority(
+            crate::services::root_transition::OpenRouterKeySource::Unset,
+            None,
+        )
+        .unwrap();
+    let scoped_events = Arc::new(TwinEventStore::new_scoped(
+        &data,
+        crate::models::twin_event::ContentDigest::parse("f".repeat(64)).unwrap(),
+    ));
+    let data_before = tree_snapshot(&data);
+    let vault_before = tree_snapshot(&vault);
+
+    let error = match MutationCoordinator::new_stable(
+        &data,
+        &vault,
+        scoped_events,
+        Arc::new(NoopMutationLifecycle),
+    ) {
+        Ok(_) => panic!("a writable coordinator must begin with the legacy event namespace"),
+        Err(error) => error,
+    };
+
+    assert_eq!(tree_snapshot(&data), data_before);
+    assert_eq!(tree_snapshot(&vault), vault_before);
+    assert!(error.to_string().contains("legacy namespace"));
+}
+
+#[test]
+fn stable_coordinator_rechecks_transition_wal_under_its_retained_process_lock() {
+    let temp = tempdir().unwrap();
+    let data = temp.path().join("data");
+    let config = temp.path().join("config");
+    let vault_a = temp.path().join("vault-a");
+    let vault_b = temp.path().join("vault-b");
+    std::fs::create_dir(&data).unwrap();
+    std::fs::create_dir(&config).unwrap();
+    std::fs::create_dir(&vault_a).unwrap();
+    std::fs::create_dir(&vault_b).unwrap();
+    let identity_a =
+        crate::services::sync::identity::load_or_create_vault_identity(&vault_a).unwrap();
+    let identity_b =
+        crate::services::sync::identity::load_or_create_vault_identity(&vault_b).unwrap();
+    let transition_store = crate::services::root_transition::RootTransitionStore::new(
+        &data,
+        config.join("settings.json"),
+        Arc::new(crate::services::root_transition::MemoryVersionedSecretStore::default()),
+    )
+    .unwrap();
+    let before = crate::services::root_transition::RootAuthorityV1::new(
+        &vault_a,
+        crate::models::settings::UserSettings {
+            vault_path: Some(vault_a.to_string_lossy().into_owned()),
+            ..crate::models::settings::UserSettings::default()
+        },
+        ActiveMarkdownRootLeaseV1::new_stable(identity_a.root_scope),
+        None,
+    )
+    .unwrap();
+    let after = crate::services::root_transition::RootAuthorityV1::new(
+        &vault_b,
+        crate::models::settings::UserSettings {
+            vault_path: Some(vault_b.to_string_lossy().into_owned()),
+            ..crate::models::settings::UserSettings::default()
+        },
+        ActiveMarkdownRootLeaseV1::new_stable(identity_b.root_scope),
+        None,
+    )
+    .unwrap();
+    transition_store
+        .write_settings(&before.nonsecret_settings)
+        .unwrap();
+    transition_store.write_lease(&before.lease).unwrap();
+    transition_store
+        .write_key_authority(
+            crate::services::root_transition::OpenRouterKeySource::Unset,
+            None,
+        )
+        .unwrap();
+    PersistedMutationIdentityProvider::load_or_create(&data).unwrap();
+    let events = Arc::new(TwinEventStore::new(&data));
+
+    transition_store
+        .load_startup_settings(|| Ok(None), || Ok(()))
+        .unwrap();
+    let transition = crate::services::root_transition::RootTransitionV1::prepared(
+        before,
+        after,
+        transition_store.authority_binding(),
+    )
+    .unwrap();
+    transition_store.prepare_transition(&transition).unwrap();
+    assert!(!data.join("canvas").exists());
+    assert!(data.join("twin/events/writer-v1.json").exists());
+    assert!(!data.join("twin/mutations").exists());
+    let tree_before = tree_snapshot(&data);
+    let settings_before = std::fs::read(config.join("settings.json")).unwrap();
+
+    let error = match MutationCoordinator::new_stable(
+        &data,
+        &vault_a,
+        events,
+        Arc::new(NoopMutationLifecycle),
+    ) {
+        Ok(_) => panic!("stable coordinator must reject a prepared transition WAL"),
+        Err(error) => error,
+    };
+
+    assert!(error.to_string().contains("root-transition"));
+    assert_eq!(tree_snapshot(&data), tree_before);
+    assert!(!data.join("canvas").exists());
+    assert!(data.join("twin/events/writer-v1.json").exists());
+    assert!(!data.join("twin/mutations").exists());
+    assert_eq!(
+        std::fs::read(config.join("settings.json")).unwrap(),
+        settings_before
+    );
+}
+
+#[test]
+fn live_stable_coordinator_rejects_every_fresh_entry_after_peer_prepares_transition() {
+    let temp = tempdir().unwrap();
+    let data = temp.path().join("data");
+    let config = temp.path().join("config");
+    let vault_a = temp.path().join("vault-a");
+    let vault_b = temp.path().join("vault-b");
+    std::fs::create_dir(&data).unwrap();
+    std::fs::create_dir(&config).unwrap();
+    std::fs::create_dir(&vault_a).unwrap();
+    std::fs::create_dir(&vault_b).unwrap();
+    let identity_a =
+        crate::services::sync::identity::load_or_create_vault_identity(&vault_a).unwrap();
+    let identity_b =
+        crate::services::sync::identity::load_or_create_vault_identity(&vault_b).unwrap();
+    let settings_a = crate::models::settings::UserSettings {
+        vault_path: Some(vault_a.to_string_lossy().into_owned()),
+        ..crate::models::settings::UserSettings::default()
+    };
+    let settings_b = crate::models::settings::UserSettings {
+        vault_path: Some(vault_b.to_string_lossy().into_owned()),
+        ..crate::models::settings::UserSettings::default()
+    };
+    let lease_a = ActiveMarkdownRootLeaseV1::new_stable(identity_a.root_scope);
+    let transition_store = crate::services::root_transition::RootTransitionStore::new(
+        &data,
+        config.join("settings.json"),
+        Arc::new(crate::services::root_transition::MemoryVersionedSecretStore::default()),
+    )
+    .unwrap();
+    transition_store
+        .write_settings(
+            &crate::services::root_transition::NonsecretSettingsV1::from_settings(
+                settings_a.clone(),
+            ),
+        )
+        .unwrap();
+    transition_store.write_lease(&lease_a).unwrap();
+    transition_store
+        .write_key_authority(
+            crate::services::root_transition::OpenRouterKeySource::Unset,
+            None,
+        )
+        .unwrap();
+    PersistedMutationIdentityProvider::load_or_create(&data).unwrap();
+    let events = Arc::new(TwinEventStore::new(&data));
+    events.initialize().unwrap();
+    let coordinator = MutationCoordinator::new_stable(
+        &data,
+        &vault_a,
+        events.clone(),
+        Arc::new(NoopMutationLifecycle),
+    )
+    .unwrap();
+    let actual_lease = coordinator.current_root_epoch().unwrap();
+    assert_eq!(actual_lease, lease_a);
+    let authority_before = coordinator.current_authority_token().unwrap();
+    let before = crate::services::root_transition::RootAuthorityV1::new(
+        &vault_a,
+        settings_a,
+        actual_lease,
+        None,
+    )
+    .unwrap();
+    let after = crate::services::root_transition::RootAuthorityV1::new(
+        &vault_b,
+        settings_b,
+        ActiveMarkdownRootLeaseV1::new_stable(identity_b.root_scope),
+        None,
+    )
+    .unwrap();
+    let transition = crate::services::root_transition::RootTransitionV1::prepared(
+        before,
+        after,
+        transition_store.authority_binding(),
+    )
+    .unwrap();
+    transition_store.prepare_transition(&transition).unwrap();
+
+    let data_before = tree_snapshot(&data);
+    let vault_before = tree_snapshot(&vault_a);
+    let events_before = events.ordered_events().unwrap();
+    assert!(!vault_a.join("blocked.md").exists());
+
+    let error = coordinator
+        .commit_local(
+            CausalStream::SyncEligible,
+            crate::models::twin_event::SourceChannel::parse("note_editor").unwrap(),
+            vec![crate::services::twin_events::TargetMutation::put(
+                crate::services::twin_events::TargetKind::Markdown,
+                "blocked.md",
+                "must not be written",
+            )],
+            vec![draft("blocked")],
+        )
+        .expect_err("a live stable coordinator must stop before mutation planning");
+    assert_transition_wal_error(error);
+
+    assert_transition_wal_error(
+        coordinator
+            .recover_pending()
+            .expect_err("recovery must stop at the WAL preflight"),
+    );
+    assert_transition_wal_error(
+        coordinator
+            .pending_count()
+            .expect_err("pending reads must not clean state while a root transition is prepared"),
+    );
+    assert_transition_wal_error(
+        coordinator
+            .quarantine_count()
+            .expect_err("quarantine reads must stop at the WAL preflight"),
+    );
+    assert_transition_wal_error(
+        coordinator
+            .current_root_epoch()
+            .expect_err("root reads must stop at the WAL preflight"),
+    );
+    assert_transition_wal_error(
+        coordinator
+            .current_authority_token()
+            .expect_err("authority reads must stop at the WAL preflight"),
+    );
+    let begin_error = coordinator
+        .begin_root_transition()
+        .err()
+        .expect("a second root-transition guard must not enter through a peer WAL");
+    assert_transition_wal_error(begin_error);
+    assert_transition_wal_error(
+        coordinator
+            .invalidate_namespace_before_recovery(&authority_before)
+            .expect_err("repair entry must stop at the WAL preflight"),
+    );
+    let derived_ran = std::cell::Cell::new(false);
+    assert_transition_wal_error(
+        coordinator
+            .with_locked_derived_state(&authority_before, true, || {
+                derived_ran.set(true);
+                Ok(())
+            })
+            .expect_err("derived-state access must stop at the WAL preflight"),
+    );
+    assert!(!derived_ran.get());
+    assert_transition_wal_error(
+        coordinator
+            .finalizer
+            .finalize(CausalStream::LocalOnly, &[draft("finalizer-blocked")])
+            .expect_err("the public finalizer lock entry must share the WAL preflight"),
+    );
+
+    assert_eq!(tree_snapshot(&data), data_before);
+    assert_eq!(tree_snapshot(&vault_a), vault_before);
+    assert_eq!(events.ordered_events().unwrap(), events_before);
+    assert!(!vault_a.join("blocked.md").exists());
+    assert!(data.join("twin/events/root-transition-v1.json").is_file());
+}
+
+#[test]
+fn stable_bootstrap_migrates_legacy_vault_data_once_without_merging() {
+    let temp = tempdir().unwrap();
+    let data = temp.path().join("data");
+    let vault = temp.path().join("vault");
+    std::fs::create_dir(&data).unwrap();
+    std::fs::create_dir(&vault).unwrap();
+    let legacy_store = Arc::new(TwinEventStore::new(&data));
+    legacy_store.initialize().unwrap();
+    let legacy = MutationCoordinator::new(
+        &data,
+        &vault,
+        legacy_store.clone(),
+        Arc::new(NoopMutationLifecycle),
+    )
+    .unwrap();
+    let guard = legacy.begin_root_transition().unwrap();
+    let legacy_lease = guard.current_lease().unwrap();
+    let legacy_twin = guard.prepare_twin_data_path(&vault, &legacy_lease).unwrap();
+    std::fs::create_dir_all(&legacy_twin).unwrap();
+    std::fs::write(legacy_twin.join("sentinel.json"), b"legacy-twin").unwrap();
+    let legacy_derived = guard.initialize_namespace(&legacy_lease).unwrap();
+    std::fs::write(legacy_derived.join("sentinel.json"), b"legacy-derived").unwrap();
+    std::fs::write(data.join("canvas/session.json"), b"legacy-canvas").unwrap();
+    drop(guard);
+    let _commit = legacy
+        .commit_local(
+            CausalStream::SyncEligible,
+            crate::models::twin_event::SourceChannel::parse("note_editor").unwrap(),
+            Vec::new(),
+            vec![draft("legacy-event")],
+        )
+        .unwrap();
+    drop(legacy);
+    drop(legacy_store);
+
+    let stable_store = Arc::new(TwinEventStore::new(&data));
+    stable_store.initialize().unwrap();
+    let stable = MutationCoordinator::new_stable(
+        &data,
+        &vault,
+        stable_store.clone(),
+        Arc::new(NoopMutationLifecycle),
+    )
+    .unwrap();
+    let stable_lease = stable.current_root_epoch().unwrap();
+    assert!(stable_lease.is_stable());
+    assert_ne!(stable_lease.root_scope, legacy_lease.root_scope);
+    assert_eq!(
+        std::fs::read(
+            crate::models::settings::twin_data_path_for_scope(&data, &stable_lease.root_scope)
+                .join("sentinel.json")
+        )
+        .unwrap(),
+        b"legacy-twin"
+    );
+    assert_eq!(
+        std::fs::read(
+            crate::services::vault_namespace::scoped_data_path(&data, &stable_lease.root_scope)
+                .join("sentinel.json")
+        )
+        .unwrap(),
+        b"legacy-derived"
+    );
+    assert_eq!(
+        std::fs::read(
+            crate::services::canvas_store::scoped_canvas_path(&data, &stable_lease.root_scope)
+                .join("session.json")
+        )
+        .unwrap(),
+        b"legacy-canvas"
+    );
+    assert_eq!(stable_store.ordered_events().unwrap().len(), 1);
+
+    drop(stable);
+    drop(stable_store);
+    let reopened_events = Arc::new(TwinEventStore::new(&data));
+    reopened_events.initialize().unwrap();
+    let reopened = MutationCoordinator::new_stable(
+        &data,
+        &vault,
+        reopened_events.clone(),
+        Arc::new(NoopMutationLifecycle),
+    )
+    .unwrap();
+    assert_eq!(reopened.current_root_epoch().unwrap(), stable_lease);
+    assert_eq!(reopened_events.ordered_events().unwrap().len(), 1);
+}
+
+#[test]
+fn stable_bootstrap_migrates_a_coherent_legacy_install_without_an_active_lease() {
+    let temp = tempdir().unwrap();
+    let data = temp.path().join("data");
+    let vault = temp.path().join("vault");
+    std::fs::create_dir(&data).unwrap();
+    std::fs::create_dir(&vault).unwrap();
+    let legacy_scope = markdown_root_scope_for(&vault).unwrap();
+    let legacy_twin = crate::models::settings::twin_data_path_for_scope(&data, &legacy_scope);
+    std::fs::create_dir_all(&legacy_twin).unwrap();
+    std::fs::write(legacy_twin.join("sentinel.json"), b"legacy-twin").unwrap();
+    std::fs::create_dir(data.join("search_index")).unwrap();
+    std::fs::write(data.join("search_index/sentinel.json"), b"legacy-derived").unwrap();
+    std::fs::create_dir(data.join("canvas")).unwrap();
+    std::fs::write(data.join("canvas/session.json"), b"legacy-canvas").unwrap();
+
+    let legacy_events = Arc::new(TwinEventStore::new(&data));
+    legacy_events.initialize().unwrap();
+    let identity = Arc::new(PersistedMutationIdentityProvider::load_or_create(&data).unwrap());
+    let finalized = StoreEventGroupFinalizer::new(legacy_events.clone(), identity)
+        .finalize(CausalStream::SyncEligible, &[draft("legacy-event")])
+        .unwrap();
+    for event in finalized {
+        legacy_events.append(event).unwrap();
+    }
+    assert_eq!(legacy_events.ordered_events().unwrap().len(), 1);
+    assert!(!data
+        .join("twin/events/active-markdown-root-v1.json")
+        .exists());
+
+    let stable_events = Arc::new(TwinEventStore::new(&data));
+    let coordinator = MutationCoordinator::new_stable(
+        &data,
+        &vault,
+        stable_events.clone(),
+        Arc::new(NoopMutationLifecycle),
+    )
+    .unwrap();
+    let stable_lease = coordinator.current_root_epoch().unwrap();
+
+    assert!(stable_lease.is_stable());
+    assert_ne!(stable_lease.root_scope, legacy_scope);
+    assert_eq!(
+        std::fs::read(
+            crate::models::settings::twin_data_path_for_scope(&data, &stable_lease.root_scope)
+                .join("sentinel.json")
+        )
+        .unwrap(),
+        b"legacy-twin"
+    );
+    assert_eq!(
+        std::fs::read(
+            crate::services::vault_namespace::scoped_data_path(&data, &stable_lease.root_scope)
+                .join("search_index/sentinel.json")
+        )
+        .unwrap(),
+        b"legacy-derived"
+    );
+    assert_eq!(
+        std::fs::read(
+            crate::services::canvas_store::scoped_canvas_path(&data, &stable_lease.root_scope)
+                .join("session.json")
+        )
+        .unwrap(),
+        b"legacy-canvas"
+    );
+    assert_eq!(stable_events.ordered_events().unwrap().len(), 1);
+    assert!(data
+        .join("twin/stable-vault-migrations/v1")
+        .join(stable_lease.root_scope.as_str())
+        .join("marker.json")
+        .is_file());
+}
+
+#[test]
+fn stable_bootstrap_recovers_schema_one_pending_before_a_failed_unscoped_assignment() {
+    let temp = tempdir().unwrap();
+    let data = temp.path().join("data");
+    let vault = temp.path().join("vault");
+    std::fs::create_dir(&data).unwrap();
+    std::fs::create_dir(&vault).unwrap();
+    let store = Arc::new(TwinEventStore::new(&data));
+    store.initialize().unwrap();
+    let legacy =
+        MutationCoordinator::new(&data, &vault, store, Arc::new(NoopMutationLifecycle)).unwrap();
+    let legacy_lease = legacy.current_root_epoch().unwrap();
+    std::fs::create_dir_all(crate::models::settings::twin_data_path_for_scope(
+        &data,
+        &legacy_lease.root_scope,
+    ))
+    .unwrap();
+    let process_lock = legacy.finalizer.acquire_coordinator_lock().unwrap();
+    let intent = legacy
+        .prepare_intent(
+            &process_lock,
+            MutationOrigin::Local,
+            CausalStream::LocalOnly,
+            crate::models::twin_event::SourceChannel::parse("note_editor").unwrap(),
+            vec![crate::services::twin_events::TargetMutation::put(
+                crate::services::twin_events::TargetKind::Markdown,
+                "recovered.md",
+                "recovered-before-assignment",
+            )],
+            Vec::new(),
+            false,
+        )
+        .unwrap()
+        .unwrap();
+    crate::services::vault_namespace::advance_authority_locked(&data, &legacy_lease, &process_lock)
+        .unwrap();
+    legacy.journal.stage(&process_lock, &intent).unwrap();
+    process_lock.unlock().unwrap();
+    drop(legacy);
+
+    let legacy_derived =
+        crate::services::vault_namespace::scoped_data_path(&data, &legacy_lease.root_scope);
+    std::fs::remove_dir_all(&legacy_derived).unwrap();
+    std::fs::create_dir_all(&legacy_derived).unwrap();
+    std::fs::write(legacy_derived.join("foreign.json"), b"foreign").unwrap();
+    std::fs::create_dir(data.join("search_index")).unwrap();
+    std::fs::write(data.join("search_index/sentinel.json"), b"legacy-derived").unwrap();
+
+    let error = match MutationCoordinator::new_stable(
+        &data,
+        &vault,
+        Arc::new(TwinEventStore::new(&data)),
+        Arc::new(NoopMutationLifecycle),
+    ) {
+        Ok(_) => panic!("the derived assignment collision must remain fail-closed"),
+        Err(error) => error,
+    };
+
+    assert!(error
+        .to_string()
+        .contains("legacy-derived-state-collision-scoped-namespace"));
+    assert_eq!(
+        std::fs::read(vault.join("recovered.md")).unwrap(),
+        b"recovered-before-assignment"
+    );
+    assert_eq!(
+        std::fs::read_dir(data.join("twin/mutations/pending/v1"))
+            .unwrap()
+            .count(),
+        0
+    );
+    assert!(data.join("search_index/sentinel.json").is_file());
+}
+
+#[test]
+fn stable_bootstrap_rejects_ambiguous_no_lease_twin_sources_before_publishing_a_lease() {
+    let temp = tempdir().unwrap();
+    let data = temp.path().join("data");
+    let vault = temp.path().join("vault");
+    std::fs::create_dir(&data).unwrap();
+    std::fs::create_dir(&vault).unwrap();
+    let legacy_scope = markdown_root_scope_for(&vault).unwrap();
+    std::fs::create_dir_all(crate::models::settings::twin_data_path_for_scope(
+        &data,
+        &legacy_scope,
+    ))
+    .unwrap();
+    std::fs::create_dir_all(crate::models::settings::legacy_twin_data_path_for_vault(
+        &data, &vault,
+    ))
+    .unwrap();
+    std::fs::create_dir(data.join("search_index")).unwrap();
+    std::fs::create_dir(data.join("canvas")).unwrap();
+    std::fs::create_dir_all(data.join("twin/events")).unwrap();
+    let lock = acquire_shared_coordinator_process_lock(&data).unwrap();
+    lock.unlock().unwrap();
+    let data_before = tree_snapshot(&data);
+    let vault_before = tree_snapshot(&vault);
+
+    let error = match MutationCoordinator::new_stable(
+        &data,
+        &vault,
+        Arc::new(TwinEventStore::new(&data)),
+        Arc::new(NoopMutationLifecycle),
+    ) {
+        Ok(_) => panic!("two no-lease legacy Twin sources must not be merged"),
+        Err(error) => error,
+    };
+
+    assert!(error.to_string().contains("legacy Twin"));
+    assert!(!data
+        .join("twin/events/active-markdown-root-v1.json")
+        .exists());
+    assert_eq!(tree_snapshot(&data), data_before);
+    assert_eq!(tree_snapshot(&vault), vault_before);
+}
+
+#[test]
+fn stable_bootstrap_rejects_unleased_authority_owners_before_publishing_a_lease() {
+    let temp = tempdir().unwrap();
+    let data = temp.path().join("data");
+    let vault = temp.path().join("vault");
+    std::fs::create_dir(&data).unwrap();
+    std::fs::create_dir(&vault).unwrap();
+    let legacy_scope = markdown_root_scope_for(&vault).unwrap();
+    std::fs::create_dir_all(crate::models::settings::twin_data_path_for_scope(
+        &data,
+        &legacy_scope,
+    ))
+    .unwrap();
+    std::fs::create_dir(data.join("search_index")).unwrap();
+    std::fs::create_dir(data.join("canvas")).unwrap();
+    std::fs::create_dir_all(data.join("twin/events")).unwrap();
+    std::fs::create_dir_all(data.join("twin/mutations/preauthority/v1")).unwrap();
+    std::fs::write(
+        data.join("twin/mutations/preauthority/v1/orphan.json"),
+        b"unprovable owner",
+    )
+    .unwrap();
+    let lock = acquire_shared_coordinator_process_lock(&data).unwrap();
+    lock.unlock().unwrap();
+    let data_before = tree_snapshot(&data);
+    let vault_before = tree_snapshot(&vault);
+
+    let error = match MutationCoordinator::new_stable(
+        &data,
+        &vault,
+        Arc::new(TwinEventStore::new(&data)),
+        Arc::new(NoopMutationLifecycle),
+    ) {
+        Ok(_) => panic!("an authority owner without its lease must not be rebound"),
+        Err(error) => error,
+    };
+
+    assert!(error
+        .to_string()
+        .contains("writer-identity-missing-for-established-data-root"));
+    assert!(!data
+        .join("twin/events/active-markdown-root-v1.json")
+        .exists());
+    assert!(!vault.join("_grafyn/vault.json").exists());
+    assert_eq!(tree_snapshot(&data), data_before);
+    assert_eq!(tree_snapshot(&vault), vault_before);
+}
+
+#[test]
+fn stable_bootstrap_keeps_a_truly_empty_no_lease_root_markerless() {
+    let temp = tempdir().unwrap();
+    let data = temp.path().join("data");
+    let vault = temp.path().join("vault");
+    std::fs::create_dir(&data).unwrap();
+    std::fs::create_dir(&vault).unwrap();
+    std::fs::create_dir_all(data.join("twin/events")).unwrap();
+    let lock = acquire_shared_coordinator_process_lock(&data).unwrap();
+    lock.unlock().unwrap();
+
+    let coordinator = MutationCoordinator::new_stable(
+        &data,
+        &vault,
+        Arc::new(TwinEventStore::new(&data)),
+        Arc::new(NoopMutationLifecycle),
+    )
+    .unwrap();
+    let lease = coordinator.current_root_epoch().unwrap();
+
+    assert!(lease.is_stable());
+    assert!(!data
+        .join("twin/stable-vault-migrations/v1")
+        .join(lease.root_scope.as_str())
+        .exists());
+}
+
+#[test]
+fn stable_bootstrap_restarts_a_then_fresh_b_then_a_without_cross_vault_marker_binding() {
+    let temp = tempdir().unwrap();
+    let data = temp.path().join("data");
+    let vault_a = temp.path().join("vault-a");
+    let vault_b = temp.path().join("vault-b");
+    std::fs::create_dir(&data).unwrap();
+    std::fs::create_dir(&vault_a).unwrap();
+    std::fs::create_dir(&vault_b).unwrap();
+
+    let legacy_store = Arc::new(TwinEventStore::new(&data));
+    legacy_store.initialize().unwrap();
+    let legacy = MutationCoordinator::new(
+        &data,
+        &vault_a,
+        legacy_store.clone(),
+        Arc::new(NoopMutationLifecycle),
+    )
+    .unwrap();
+    let guard = legacy.begin_root_transition().unwrap();
+    let legacy_lease = guard.current_lease().unwrap();
+    let legacy_twin = guard
+        .prepare_twin_data_path(&vault_a, &legacy_lease)
+        .unwrap();
+    std::fs::create_dir_all(&legacy_twin).unwrap();
+    std::fs::write(legacy_twin.join("a.json"), b"vault-a").unwrap();
+    guard.initialize_namespace(&legacy_lease).unwrap();
+    drop(guard);
+    let _ = legacy
+        .commit_local(
+            CausalStream::SyncEligible,
+            crate::models::twin_event::SourceChannel::parse("note_editor").unwrap(),
+            Vec::new(),
+            vec![draft("vault-a-event")],
+        )
+        .unwrap();
+    drop(legacy);
+    drop(legacy_store);
+
+    let events_a = Arc::new(TwinEventStore::new(&data));
+    events_a.initialize().unwrap();
+    let coordinator_a = MutationCoordinator::new_stable(
+        &data,
+        &vault_a,
+        events_a.clone(),
+        Arc::new(NoopMutationLifecycle),
+    )
+    .unwrap();
+    let lease_a = coordinator_a.current_root_epoch().unwrap();
+    assert_eq!(events_a.ordered_events().unwrap().len(), 1);
+    assert!(data
+        .join("twin/stable-vault-migrations/v1")
+        .join(lease_a.root_scope.as_str())
+        .join("marker.json")
+        .is_file());
+    assert!(!data.join("twin/stable-vault-migration-v1.json").exists());
+    assert!(!data.join("twin/legacy-assignment-v1.json").exists());
+    assert!(!data
+        .join("vault_derived/legacy-assignment-v1.json")
+        .exists());
+    drop(coordinator_a);
+    drop(events_a);
+
+    let identity_b =
+        crate::services::sync::identity::load_or_create_vault_identity(&vault_b).unwrap();
+    let lease_b = ActiveMarkdownRootLeaseV1::new_stable(identity_b.root_scope.clone());
+    let data_root = crate::services::twin_events::AnchoredRoot::open(&data).unwrap();
+    write_active_root_lease(&data_root, &lease_b).unwrap();
+    let events_b = Arc::new(TwinEventStore::new(&data));
+    events_b.initialize().unwrap();
+    let coordinator_b = MutationCoordinator::new_stable(
+        &data,
+        &vault_b,
+        events_b.clone(),
+        Arc::new(NoopMutationLifecycle),
+    )
+    .unwrap();
+    assert_eq!(coordinator_b.current_root_epoch().unwrap(), lease_b);
+    assert!(events_b.ordered_events().unwrap().is_empty());
+    drop(coordinator_b);
+    drop(events_b);
+
+    write_active_root_lease(&data_root, &lease_a).unwrap();
+    let reopened_events_a = Arc::new(TwinEventStore::new(&data));
+    reopened_events_a.initialize().unwrap();
+    let reopened_a = MutationCoordinator::new_stable(
+        &data,
+        &vault_a,
+        reopened_events_a.clone(),
+        Arc::new(NoopMutationLifecycle),
+    )
+    .unwrap();
+
+    assert_eq!(reopened_a.current_root_epoch().unwrap(), lease_a);
+    assert_eq!(reopened_events_a.ordered_events().unwrap().len(), 1);
+    assert_eq!(
+        std::fs::read(
+            crate::models::settings::twin_data_path_for_scope(&data, &lease_a.root_scope)
+                .join("a.json")
+        )
+        .unwrap(),
+        b"vault-a"
+    );
+}
+
+#[test]
 fn concurrent_writer_identity_installers_converge_without_staging_litter() {
     let temp = tempdir().unwrap();
     let store = crate::services::twin_events::TwinEventStore::new(temp.path());
@@ -93,7 +1447,7 @@ fn concurrent_writer_identity_installers_converge_without_staging_litter() {
     assert_eq!(first.actor_id(), second.actor_id());
     assert_eq!(first.device_id(), second.device_id());
     assert_eq!(
-        std::fs::read_dir(temp.path().join("twin/events/staging/v1"))
+        std::fs::read_dir(temp.path().join(WRITER_STAGING_KEY))
             .unwrap()
             .count(),
         0
@@ -1451,10 +2805,10 @@ fn post_authority_owner_replays_before_a_later_peer_advances() {
         },
         &mut |_| Ok(()),
     );
-    assert!(matches!(
-        result,
-        Err(MutationError::AuthorityAdvanced { .. })
-    ));
+    assert!(
+        matches!(&result, Err(MutationError::AuthorityAdvanced { .. })),
+        "unexpected result: {result:?}"
+    );
     assert!(!vault.join(target_key).exists());
 
     let _ = coordinator
@@ -1868,6 +3222,11 @@ fn production_desktop_and_mcp_use_coordinated_non_noop_construction() {
     assert!(desktop.contains("recover_pending()"));
     assert!(desktop.contains("UnavailableEventRecorder"));
     assert!(mcp.contains("KnowledgeStore::with_event_recorder"));
+    let desktop_coordinator = desktop.find("MutationCoordinator::new_stable(").unwrap();
+    assert!(!desktop[..desktop_coordinator]
+        .contains("twin_event_store\n                    .initialize()"));
+    let mcp_coordinator = mcp.find("MutationCoordinator::new_custom_mcp(").unwrap();
+    assert!(!mcp[..mcp_coordinator].contains("twin_event_store.initialize()?"));
     let recover = mcp.find("recover_pending()").unwrap();
     let serve = mcp.find(".serve(rmcp::transport::stdio())").unwrap();
     assert!(recover < serve);

@@ -16,7 +16,7 @@ fn default_canvas_model_presets() -> Vec<CanvasModelPreset> {
 }
 
 /// User-configurable settings for the desktop app
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UserSettings {
     /// Path to the vault (markdown notes folder)
@@ -99,6 +99,62 @@ pub struct UserSettings {
     /// Saved model presets for canvas prompts
     #[serde(default = "default_canvas_model_presets")]
     pub canvas_model_presets: Vec<CanvasModelPreset>,
+}
+
+impl std::fmt::Debug for UserSettings {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let openrouter_api_key = self.openrouter_api_key.as_ref().map(|_| "[REDACTED]");
+        formatter
+            .debug_struct("UserSettings")
+            .field("vault_path", &self.vault_path)
+            .field("openrouter_api_key", &openrouter_api_key)
+            .field("setup_completed", &self.setup_completed)
+            .field("theme", &self.theme)
+            .field("mcp_enabled", &self.mcp_enabled)
+            .field("llm_model", &self.llm_model)
+            .field("twin_llm_provider", &self.twin_llm_provider)
+            .field("ollama_base_url", &self.ollama_base_url)
+            .field("ollama_model", &self.ollama_model)
+            .field("smart_web_search", &self.smart_web_search)
+            .field(
+                "background_link_discovery_enabled",
+                &self.background_link_discovery_enabled,
+            )
+            .field(
+                "background_link_discovery_llm_enabled",
+                &self.background_link_discovery_llm_enabled,
+            )
+            .field(
+                "background_vault_optimizer_enabled",
+                &self.background_vault_optimizer_enabled,
+            )
+            .field(
+                "background_vault_optimizer_llm_enabled",
+                &self.background_vault_optimizer_llm_enabled,
+            )
+            .field(
+                "background_vault_optimizer_budget_monthly",
+                &self.background_vault_optimizer_budget_monthly,
+            )
+            .field(
+                "background_vault_optimizer_max_daily_writes",
+                &self.background_vault_optimizer_max_daily_writes,
+            )
+            .field(
+                "background_vault_optimizer_edit_mode",
+                &self.background_vault_optimizer_edit_mode,
+            )
+            .field(
+                "background_vault_optimizer_program_enabled",
+                &self.background_vault_optimizer_program_enabled,
+            )
+            .field(
+                "vault_optimizer_program_path",
+                &self.vault_optimizer_program_path,
+            )
+            .field("canvas_model_presets", &self.canvas_model_presets)
+            .finish()
+    }
 }
 
 fn default_theme() -> String {
@@ -227,8 +283,15 @@ pub fn twin_data_path_for_vault(
     data_path: &std::path::Path,
     vault_path: &std::path::Path,
 ) -> Result<std::path::PathBuf, crate::services::twin_events::MutationError> {
-    let scope = crate::services::twin_events::root_identity_for_path(vault_path)?;
-    Ok(data_path.join("twin").join(scope.as_str()))
+    let identity = crate::services::sync::identity::load_or_create_vault_identity(vault_path)?;
+    Ok(twin_data_path_for_scope(data_path, &identity.root_scope))
+}
+
+pub(crate) fn twin_data_path_for_scope(
+    data_path: &std::path::Path,
+    scope: &crate::models::twin_event::ContentDigest,
+) -> std::path::PathBuf {
+    data_path.join("twin").join(scope.as_str())
 }
 
 pub(crate) fn legacy_twin_data_path_for_vault(
@@ -249,7 +312,7 @@ pub(crate) fn legacy_twin_data_path_for_vault(
 }
 
 /// Settings update request from frontend
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct SettingsUpdate {
     pub vault_path: Option<String>,
     pub openrouter_api_key: Option<String>,
@@ -271,6 +334,62 @@ pub struct SettingsUpdate {
     pub background_vault_optimizer_program_enabled: Option<bool>,
     pub vault_optimizer_program_path: Option<String>,
     pub canvas_model_presets: Option<Vec<CanvasModelPreset>>,
+}
+
+impl std::fmt::Debug for SettingsUpdate {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let openrouter_api_key = self.openrouter_api_key.as_ref().map(|_| "[REDACTED]");
+        formatter
+            .debug_struct("SettingsUpdate")
+            .field("vault_path", &self.vault_path)
+            .field("openrouter_api_key", &openrouter_api_key)
+            .field("setup_completed", &self.setup_completed)
+            .field("theme", &self.theme)
+            .field("mcp_enabled", &self.mcp_enabled)
+            .field("llm_model", &self.llm_model)
+            .field("twin_llm_provider", &self.twin_llm_provider)
+            .field("ollama_base_url", &self.ollama_base_url)
+            .field("ollama_model", &self.ollama_model)
+            .field("smart_web_search", &self.smart_web_search)
+            .field(
+                "background_link_discovery_enabled",
+                &self.background_link_discovery_enabled,
+            )
+            .field(
+                "background_link_discovery_llm_enabled",
+                &self.background_link_discovery_llm_enabled,
+            )
+            .field(
+                "background_vault_optimizer_enabled",
+                &self.background_vault_optimizer_enabled,
+            )
+            .field(
+                "background_vault_optimizer_llm_enabled",
+                &self.background_vault_optimizer_llm_enabled,
+            )
+            .field(
+                "background_vault_optimizer_budget_monthly",
+                &self.background_vault_optimizer_budget_monthly,
+            )
+            .field(
+                "background_vault_optimizer_max_daily_writes",
+                &self.background_vault_optimizer_max_daily_writes,
+            )
+            .field(
+                "background_vault_optimizer_edit_mode",
+                &self.background_vault_optimizer_edit_mode,
+            )
+            .field(
+                "background_vault_optimizer_program_enabled",
+                &self.background_vault_optimizer_program_enabled,
+            )
+            .field(
+                "vault_optimizer_program_path",
+                &self.vault_optimizer_program_path,
+            )
+            .field("canvas_model_presets", &self.canvas_model_presets)
+            .finish()
+    }
 }
 
 /// Response for settings status check
@@ -398,9 +517,29 @@ mod tests {
             Some(data_path.join("twin"))
         );
         assert_eq!(
-            first.file_name().and_then(|value| value.to_str()).unwrap().len(),
+            first
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap()
+                .len(),
             64
         );
+    }
+
+    #[test]
+    fn twin_data_path_follows_the_descriptor_across_a_directory_move() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_path = temp.path().join("data");
+        let original = temp.path().join("original");
+        let moved = temp.path().join("moved");
+        std::fs::create_dir(&data_path).unwrap();
+        std::fs::create_dir(&original).unwrap();
+        let before = twin_data_path_for_vault(&data_path, &original).unwrap();
+
+        std::fs::rename(&original, &moved).unwrap();
+        let after = twin_data_path_for_vault(&data_path, &moved).unwrap();
+
+        assert_eq!(after, before);
     }
 
     #[cfg(unix)]
@@ -415,5 +554,33 @@ mod tests {
             twin_data_path_for_vault(temp.path(), &upper).unwrap(),
             twin_data_path_for_vault(temp.path(), &lower).unwrap()
         );
+    }
+
+    #[test]
+    fn user_settings_debug_redacts_openrouter_plaintext() {
+        let secret = "settings-debug-super-secret";
+        let settings = UserSettings {
+            openrouter_api_key: Some(secret.to_string()),
+            ..UserSettings::default()
+        };
+
+        let debug = format!("{settings:?}");
+
+        assert!(!debug.contains(secret));
+        assert!(debug.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn settings_update_debug_redacts_openrouter_plaintext() {
+        let secret = "settings-update-debug-super-secret";
+        let update: SettingsUpdate = serde_json::from_value(serde_json::json!({
+            "openrouter_api_key": secret,
+        }))
+        .unwrap();
+
+        let debug = format!("{update:?}");
+
+        assert!(!debug.contains(secret));
+        assert!(debug.contains("[REDACTED]"));
     }
 }

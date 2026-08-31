@@ -11,6 +11,7 @@ const KEYRING_SERVICE: &str = "com.grafyn.app";
 const OPENROUTER_KEY_ACCOUNT: &str = "openrouter_api_key";
 
 const LEGACY_TWIN_ASSIGNMENT_KEY: &str = "twin/legacy-assignment-v1.json";
+const LEGACY_TWIN_ASSIGNMENT_STAGING_KEY: &str = "twin/mutations/staging/v1";
 const LEGACY_TWIN_ASSIGNMENT_LIMIT: usize = 4096;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -37,12 +38,65 @@ pub(crate) fn prepare_twin_data_path_locked(
     lease: &crate::services::twin_events::ActiveMarkdownRootLeaseV1,
     process_lock: &crate::services::twin_events::CoordinatorProcessLock,
 ) -> Result<PathBuf> {
+    prepare_twin_data_path_locked_inner(
+        data_path,
+        vault_path,
+        lease,
+        process_lock,
+        &mut || {},
+        &mut || {},
+    )
+}
+
+#[cfg(test)]
+fn prepare_twin_data_path_locked_with_rename_hook(
+    data_path: &Path,
+    vault_path: &Path,
+    lease: &crate::services::twin_events::ActiveMarkdownRootLeaseV1,
+    process_lock: &crate::services::twin_events::CoordinatorProcessLock,
+    mut rename_hook: impl FnMut(),
+) -> Result<PathBuf> {
+    prepare_twin_data_path_locked_inner(
+        data_path,
+        vault_path,
+        lease,
+        process_lock,
+        &mut || {},
+        &mut rename_hook,
+    )
+}
+
+#[cfg(test)]
+fn prepare_twin_data_path_locked_with_marker_install_hook(
+    data_path: &Path,
+    vault_path: &Path,
+    lease: &crate::services::twin_events::ActiveMarkdownRootLeaseV1,
+    process_lock: &crate::services::twin_events::CoordinatorProcessLock,
+    mut marker_install_hook: impl FnMut(),
+) -> Result<PathBuf> {
+    prepare_twin_data_path_locked_inner(
+        data_path,
+        vault_path,
+        lease,
+        process_lock,
+        &mut marker_install_hook,
+        &mut || {},
+    )
+}
+
+fn prepare_twin_data_path_locked_inner(
+    data_path: &Path,
+    vault_path: &Path,
+    lease: &crate::services::twin_events::ActiveMarkdownRootLeaseV1,
+    process_lock: &crate::services::twin_events::CoordinatorProcessLock,
+    marker_install_hook: &mut impl FnMut(),
+    rename_hook: &mut impl FnMut(),
+) -> Result<PathBuf> {
     crate::services::twin_events::validate_real_directory(data_path, "Grafyn data root")
         .map_err(anyhow::Error::new)?;
     crate::services::twin_events::validate_real_directory(vault_path, "Markdown vault root")
         .map_err(anyhow::Error::new)?;
-    let current = crate::models::settings::twin_data_path_for_vault(data_path, vault_path)
-        .map_err(anyhow::Error::new)?;
+    let current = crate::models::settings::twin_data_path_for_scope(data_path, &lease.root_scope);
     let legacy = crate::models::settings::legacy_twin_data_path_for_vault(data_path, vault_path);
     let current_name = current
         .file_name()
@@ -52,16 +106,22 @@ pub(crate) fn prepare_twin_data_path_locked(
         .file_name()
         .and_then(|value| value.to_str())
         .ok_or_else(|| anyhow::anyhow!("legacy Twin namespace is not UTF-8"))?;
-    let root = crate::services::twin_events::AnchoredRoot::open(data_path)
-        .map_err(anyhow::Error::new)?;
+    let root =
+        crate::services::twin_events::AnchoredRoot::open(data_path).map_err(anyhow::Error::new)?;
     if !process_lock
         .covers_data_path(data_path)
         .map_err(anyhow::Error::new)?
     {
         anyhow::bail!("legacy Twin assignment lock belongs to another data root");
     }
-    let expected_scope = crate::services::twin_events::root_identity_for_path(vault_path)
-        .map_err(anyhow::Error::new)?;
+    let expected_scope = if lease.is_stable() {
+        crate::services::sync::identity::load_vault_identity(vault_path)
+            .map_err(anyhow::Error::new)?
+            .root_scope
+    } else {
+        crate::services::twin_events::root_identity_for_path(vault_path)
+            .map_err(anyhow::Error::new)?
+    };
     let durable_lease: crate::services::twin_events::ActiveMarkdownRootLeaseV1 =
         serde_json::from_slice(
             &root
@@ -72,6 +132,12 @@ pub(crate) fn prepare_twin_data_path_locked(
         .context("invalid active Markdown root lease")?;
     if &durable_lease != lease || lease.root_scope != expected_scope {
         anyhow::bail!("legacy Twin assignment lease changed");
+    }
+    if lease.is_stable() {
+        std::fs::create_dir_all(&current)?;
+        crate::services::twin_events::validate_real_directory(&current, "Twin namespace")
+            .map_err(anyhow::Error::new)?;
+        return Ok(current);
     }
     root.open_directory("twin", true)
         .map_err(anyhow::Error::new)?;
@@ -99,17 +165,15 @@ pub(crate) fn prepare_twin_data_path_locked(
             && assignment.lease_epoch_uuid == lease.epoch_uuid
             && assignment.legacy_name == legacy_name
             && assignment.current_name == current_name;
-        if !matches_authority
-            && assignment.state == LegacyTwinAssignmentState::Prepared
-        {
+        if !matches_authority && assignment.state == LegacyTwinAssignmentState::Prepared {
             anyhow::bail!("prepared legacy Twin assignment belongs to another root authority");
         }
         if !matches_authority
             && (assignment.schema_version != 1
-            || assignment.root_scope != lease.root_scope
-            || assignment.lease_epoch_uuid != lease.epoch_uuid
-            || assignment.legacy_name != legacy_name
-            || assignment.current_name != current_name)
+                || assignment.root_scope != lease.root_scope
+                || assignment.lease_epoch_uuid != lease.epoch_uuid
+                || assignment.legacy_name != legacy_name
+                || assignment.current_name != current_name)
         {
             if has_legacy {
                 anyhow::bail!("legacy Twin namespace belongs to another root authority");
@@ -159,11 +223,10 @@ pub(crate) fn prepare_twin_data_path_locked(
                 state: LegacyTwinAssignmentState::Prepared,
             };
             if assignment.is_none() {
-                write_legacy_twin_assignment(&root, &prepared)?;
+                install_initial_legacy_twin_assignment(&root, &prepared, marker_install_hook)?;
             }
         }
-        root.rename(&legacy_key, &current_key, false)
-            .map_err(anyhow::Error::new)?;
+        rename_twin_namespace_no_replace(&root, &legacy_key, &current_key, rename_hook)?;
     }
     if assignment
         .as_ref()
@@ -185,17 +248,68 @@ pub(crate) fn prepare_twin_data_path_locked(
     Ok(current)
 }
 
+fn rename_twin_namespace_no_replace(
+    root: &crate::services::twin_events::AnchoredRoot,
+    legacy_key: &str,
+    current_key: &str,
+    rename_hook: &mut impl FnMut(),
+) -> Result<()> {
+    #[cfg(test)]
+    {
+        root.rename_no_replace_with_hook(legacy_key, current_key, false, || rename_hook())
+            .map_err(anyhow::Error::new)
+    }
+    #[cfg(not(test))]
+    {
+        let _ = rename_hook;
+        root.rename_no_replace(legacy_key, current_key, false)
+            .map_err(anyhow::Error::new)
+    }
+}
+
 fn write_legacy_twin_assignment(
     root: &crate::services::twin_events::AnchoredRoot,
     assignment: &LegacyTwinAssignmentV1,
 ) -> Result<()> {
+    root.put_atomic(
+        LEGACY_TWIN_ASSIGNMENT_KEY,
+        &encoded_legacy_twin_assignment(assignment)?,
+    )
+    .map_err(anyhow::Error::new)
+}
+
+fn install_initial_legacy_twin_assignment(
+    root: &crate::services::twin_events::AnchoredRoot,
+    assignment: &LegacyTwinAssignmentV1,
+    marker_install_hook: &mut impl FnMut(),
+) -> Result<()> {
+    let bytes = encoded_legacy_twin_assignment(assignment)?;
+    marker_install_hook();
+    root.install_no_clobber(
+        LEGACY_TWIN_ASSIGNMENT_KEY,
+        LEGACY_TWIN_ASSIGNMENT_STAGING_KEY,
+        &bytes,
+    )
+    .map_err(anyhow::Error::new)?;
+    let durable = root
+        .read_bounded(LEGACY_TWIN_ASSIGNMENT_KEY, LEGACY_TWIN_ASSIGNMENT_LIMIT)
+        .map_err(anyhow::Error::new)?
+        .ok_or_else(|| anyhow::anyhow!("legacy Twin assignment disappeared after install"))?;
+    let durable: LegacyTwinAssignmentV1 =
+        serde_json::from_slice(&durable).context("invalid legacy Twin assignment")?;
+    if &durable != assignment {
+        anyhow::bail!("legacy Twin assignment was concurrently installed by another authority");
+    }
+    Ok(())
+}
+
+fn encoded_legacy_twin_assignment(assignment: &LegacyTwinAssignmentV1) -> Result<Vec<u8>> {
     let mut bytes = serde_json::to_vec_pretty(assignment)?;
     bytes.push(b'\n');
     if bytes.len() > LEGACY_TWIN_ASSIGNMENT_LIMIT {
         anyhow::bail!("legacy Twin assignment exceeds its size limit");
     }
-    root.put_atomic(LEGACY_TWIN_ASSIGNMENT_KEY, &bytes)
-        .map_err(anyhow::Error::new)
+    Ok(bytes)
 }
 
 /// Service for managing user settings
@@ -207,7 +321,7 @@ pub struct SettingsService {
     key_source: crate::services::root_transition::OpenRouterKeySource,
     active_key_version: Option<String>,
     environment_runtime_secret: bool,
-    secret_store: Arc<dyn crate::services::root_transition::VersionedSecretStore>,
+    secret_store: Arc<dyn crate::services::sync::secrets::SecretStore>,
 }
 
 impl SettingsService {
@@ -217,13 +331,12 @@ impl SettingsService {
             .or_else(dirs::data_local_dir)
             .unwrap_or_else(|| PathBuf::from("."))
             .join("Grafyn");
-        std::fs::create_dir_all(&config_dir)
-            .context("Failed to create Grafyn config directory")?;
+        std::fs::create_dir_all(&config_dir).context("Failed to create Grafyn config directory")?;
         std::fs::create_dir_all(data_path).context("Failed to create Grafyn data directory")?;
         let store = crate::services::root_transition::RootTransitionStore::new(
             data_path,
             config_dir.join("settings.json"),
-            Arc::new(crate::services::root_transition::KeyringVersionedSecretStore),
+            Arc::new(crate::services::sync::secrets::KeyringSecretStore),
         )
         .map_err(anyhow::Error::new)?;
         store.recover().map_err(anyhow::Error::new)?;
@@ -272,9 +385,7 @@ impl SettingsService {
             key_source: crate::services::root_transition::OpenRouterKeySource::Unset,
             active_key_version: None,
             environment_runtime_secret: false,
-            secret_store: Arc::new(
-                crate::services::root_transition::KeyringVersionedSecretStore,
-            ),
+            secret_store: Arc::new(crate::services::sync::secrets::KeyringSecretStore),
         }
     }
 
@@ -295,8 +406,8 @@ impl SettingsService {
         let config_path = config_dir.join("settings.json");
         let data_path = UserSettings::default().effective_data_path();
         std::fs::create_dir_all(&data_path).context("Failed to create Grafyn data directory")?;
-        let secret_store: Arc<dyn crate::services::root_transition::VersionedSecretStore> =
-            Arc::new(crate::services::root_transition::KeyringVersionedSecretStore);
+        let secret_store: Arc<dyn crate::services::sync::secrets::SecretStore> =
+            Arc::new(crate::services::sync::secrets::KeyringSecretStore);
         let transition_store = crate::services::root_transition::RootTransitionStore::new(
             &data_path,
             &config_path,
@@ -337,6 +448,10 @@ impl SettingsService {
         &self.settings
     }
 
+    pub(crate) fn secret_store(&self) -> Arc<dyn crate::services::sync::secrets::SecretStore> {
+        self.secret_store.clone()
+    }
+
     /// Get settings status for frontend
     pub fn status(&self) -> SettingsStatus {
         SettingsStatus::from(&self.settings)
@@ -355,15 +470,14 @@ impl SettingsService {
         let snapshot = self
             .root_transition_store()?
             .patch_settings_guarded(|fresh| {
-                apply_update_fields(fresh, &update)
-                    .map_err(|error| crate::services::twin_events::MutationError::Invalid(error.to_string()))
+                apply_update_fields(fresh, &update).map_err(|error| {
+                    crate::services::twin_events::MutationError::Invalid(error.to_string())
+                })
             })
             .map_err(anyhow::Error::new)?;
         self.settings = snapshot.settings;
         self.key_source = snapshot.key_source;
-        if snapshot.key_source
-            == crate::services::root_transition::OpenRouterKeySource::Unset
-        {
+        if snapshot.key_source == crate::services::root_transition::OpenRouterKeySource::Unset {
             self.settings.openrouter_api_key = environment_runtime_secret;
         }
         self.active_key_version = snapshot.active_key_version;
@@ -439,18 +553,17 @@ impl SettingsService {
     pub fn mcp_enabled(&self) -> bool {
         self.settings.mcp_enabled
     }
-
 }
 
 #[cfg(test)]
-fn choose_legacy_authority(
-    keychain: Option<String>,
-    plaintext: Option<String>,
-) -> Option<String> {
+fn choose_legacy_authority(keychain: Option<String>, plaintext: Option<String>) -> Option<String> {
     keychain.or(plaintext)
 }
 
-pub(crate) fn apply_update_fields(settings: &mut UserSettings, update: &SettingsUpdate) -> Result<()> {
+pub(crate) fn apply_update_fields(
+    settings: &mut UserSettings,
+    update: &SettingsUpdate,
+) -> Result<()> {
     if let Some(vault_path) = update.vault_path.as_deref() {
         let path = PathBuf::from(vault_path);
         crate::services::twin_events::validate_real_directory(&path, "vault directory")
@@ -619,7 +732,9 @@ fn load_openrouter_api_key() -> Result<Option<String>> {
     match entry.get_password() {
         Ok(password) if !password.is_empty() => Ok(Some(password)),
         Ok(_) | Err(keyring::Error::NoEntry) => Ok(None),
-        Err(error) => Err(anyhow::Error::new(error).context("Failed to read legacy OpenRouter key")),
+        Err(error) => {
+            Err(anyhow::Error::new(error).context("Failed to read legacy OpenRouter key"))
+        }
     }
 }
 
@@ -627,9 +742,9 @@ fn clear_openrouter_api_key() -> Result<()> {
     let entry = keyring_entry()?;
     match entry.delete_password() {
         Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-        Err(error) => Err(
-            anyhow::Error::new(error).context("Failed to delete legacy OpenRouter API key")
-        ),
+        Err(error) => {
+            Err(anyhow::Error::new(error).context("Failed to delete legacy OpenRouter API key"))
+        }
     }
 }
 
@@ -695,6 +810,101 @@ mod tests {
         assert!(current.exists());
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn legacy_twin_assignment_preserves_a_raced_destination() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let vault = temp.path().join("vault");
+        std::fs::create_dir_all(data.join("twin")).unwrap();
+        std::fs::create_dir(&vault).unwrap();
+        let legacy = legacy_twin_path(&data, &vault);
+        std::fs::create_dir(&legacy).unwrap();
+        std::fs::write(legacy.join("record.json"), "legacy").unwrap();
+
+        let events = Arc::new(crate::services::twin_events::TwinEventStore::new(&data));
+        events.initialize().unwrap();
+        let coordinator = crate::services::twin_events::MutationCoordinator::new(
+            &data,
+            &vault,
+            events,
+            Arc::new(crate::services::twin_events::NoopMutationLifecycle),
+        )
+        .unwrap();
+        let guard = coordinator.begin_root_transition().unwrap();
+        let lease = guard.current_lease().unwrap();
+        drop(guard);
+        drop(coordinator);
+        let current = crate::models::settings::twin_data_path_for_scope(&data, &lease.root_scope);
+        let lock =
+            crate::services::twin_events::acquire_shared_coordinator_process_lock(&data).unwrap();
+
+        let error =
+            prepare_twin_data_path_locked_with_rename_hook(&data, &vault, &lease, &lock, || {
+                std::fs::create_dir(&current).unwrap();
+                std::fs::write(current.join("record.json"), "foreign").unwrap();
+            })
+            .unwrap_err();
+
+        assert!(error.to_string().contains("no-replace rename failed"));
+        assert_eq!(
+            std::fs::read_to_string(legacy.join("record.json")).unwrap(),
+            "legacy"
+        );
+        assert_eq!(
+            std::fs::read_to_string(current.join("record.json")).unwrap(),
+            "foreign"
+        );
+        lock.unlock().unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn legacy_twin_assignment_preserves_a_raced_marker() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let vault = temp.path().join("vault");
+        std::fs::create_dir_all(data.join("twin")).unwrap();
+        std::fs::create_dir(&vault).unwrap();
+        let legacy = legacy_twin_path(&data, &vault);
+        std::fs::create_dir(&legacy).unwrap();
+        std::fs::write(legacy.join("record.json"), "legacy").unwrap();
+
+        let events = Arc::new(crate::services::twin_events::TwinEventStore::new(&data));
+        events.initialize().unwrap();
+        let coordinator = crate::services::twin_events::MutationCoordinator::new(
+            &data,
+            &vault,
+            events,
+            Arc::new(crate::services::twin_events::NoopMutationLifecycle),
+        )
+        .unwrap();
+        let guard = coordinator.begin_root_transition().unwrap();
+        let lease = guard.current_lease().unwrap();
+        drop(guard);
+        drop(coordinator);
+        let marker = data.join(LEGACY_TWIN_ASSIGNMENT_KEY.replace('/', "\\"));
+        let lock =
+            crate::services::twin_events::acquire_shared_coordinator_process_lock(&data).unwrap();
+
+        let error = prepare_twin_data_path_locked_with_marker_install_hook(
+            &data,
+            &vault,
+            &lease,
+            &lock,
+            || std::fs::write(&marker, b"foreign-marker").unwrap(),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("invalid legacy Twin assignment"));
+        assert_eq!(std::fs::read(&marker).unwrap(), b"foreign-marker");
+        assert_eq!(
+            std::fs::read_to_string(legacy.join("record.json")).unwrap(),
+            "legacy"
+        );
+        lock.unlock().unwrap();
+    }
+
     #[test]
     fn prepared_legacy_twin_assignment_rejects_neither_namespace() {
         let temp = tempfile::tempdir().unwrap();
@@ -713,7 +923,7 @@ mod tests {
         .unwrap();
         let guard = coordinator.begin_root_transition().unwrap();
         let lease = guard.current_lease().unwrap();
-        let current = crate::models::settings::twin_data_path_for_vault(&data, &vault).unwrap();
+        let current = crate::models::settings::twin_data_path_for_scope(&data, &lease.root_scope);
         let legacy = legacy_twin_path(&data, &vault);
         let root = crate::services::twin_events::AnchoredRoot::open(&data).unwrap();
         write_legacy_twin_assignment(
@@ -762,7 +972,7 @@ mod tests {
         .unwrap();
         let guard = coordinator.begin_root_transition().unwrap();
         let lease = guard.current_lease().unwrap();
-        let current = crate::models::settings::twin_data_path_for_vault(&data, &vault).unwrap();
+        let current = crate::models::settings::twin_data_path_for_scope(&data, &lease.root_scope);
         let legacy = legacy_twin_path(&data, &vault);
         let root = crate::services::twin_events::AnchoredRoot::open(&data).unwrap();
         write_legacy_twin_assignment(
@@ -983,8 +1193,7 @@ mod tests {
     fn failed_settings_persistence_does_not_publish_runtime_values() {
         let temp = tempfile::tempdir().unwrap();
         let before = UserSettings::default();
-        let mut service =
-            SettingsService::for_test(temp.path().to_path_buf(), before.clone());
+        let mut service = SettingsService::for_test(temp.path().to_path_buf(), before.clone());
         let mut update = vault_update(temp.path().to_string_lossy());
         update.vault_path = None;
         update.theme = Some("dark".into());

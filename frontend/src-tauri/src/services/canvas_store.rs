@@ -6,7 +6,7 @@ use crate::services::atomic_io::write_atomic;
 use anyhow::{Context, Result};
 use chrono::Utc;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use walkdir::WalkDir;
 
@@ -17,6 +17,17 @@ pub type TileResponseUpdate = (
     Option<String>,
     Option<f64>,
 );
+
+pub(crate) fn scoped_canvas_path(
+    data_path: impl AsRef<Path>,
+    root_scope: &crate::models::twin_event::ContentDigest,
+) -> PathBuf {
+    data_path
+        .as_ref()
+        .join("canvas")
+        .join("v1")
+        .join(root_scope.as_str())
+}
 
 pub(crate) fn require_canvas_only_commit(
     commit: &crate::services::twin_events::MutationCommit,
@@ -69,6 +80,19 @@ impl CanvasStore {
             event_recorder,
             root_capability,
         }
+    }
+
+    pub fn replace_root_path(&mut self, data_path: PathBuf) -> Result<()> {
+        std::fs::create_dir_all(&data_path)
+            .with_context(|| format!("Failed to create Canvas root: {}", data_path.display()))?;
+        crate::services::twin_events::validate_real_directory(&data_path, "Canvas root")
+            .map_err(anyhow::Error::new)?;
+        let root_capability = crate::services::twin_events::AnchoredRoot::open(&data_path)
+            .map_err(anyhow::Error::new)?;
+        self.data_path = data_path;
+        self.root_capability = Some(Arc::new(root_capability));
+        self.reload_authoritative_state();
+        Ok(())
     }
 
     fn collect_descendant_tile_ids(
@@ -1022,6 +1046,7 @@ mod tests {
         SessionCreate, TwinEvidenceSnapshot,
     };
     use crate::services::atomic_io::assert_no_tmp_siblings;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::tempdir;
 
     #[derive(Debug)]
@@ -1048,6 +1073,143 @@ mod tests {
                 postcommit_warning: false,
             })
         }
+    }
+
+    #[derive(Debug)]
+    struct CountingCanvasRecorder(Arc<AtomicUsize>);
+
+    impl crate::services::twin_events::EventRecorder for CountingCanvasRecorder {
+        fn commit_mutation(
+            &self,
+            _origin: crate::services::twin_events::MutationOrigin,
+            _stream: crate::models::twin_event::CausalStream,
+            _source_channel: crate::models::twin_event::SourceChannel,
+            _targets: Vec<crate::services::twin_events::TargetMutation>,
+            _drafts: Vec<crate::services::twin_events::TwinEventDraft>,
+        ) -> Result<
+            crate::services::twin_events::MutationCommit,
+            crate::services::twin_events::MutationError,
+        > {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(crate::services::twin_events::MutationCommit {
+                mutation_id: None,
+                events: Vec::new(),
+                authority_token: None,
+                postcommit_warning: false,
+            })
+        }
+    }
+
+    fn canvas_scope(hex: char) -> crate::models::twin_event::ContentDigest {
+        crate::models::twin_event::ContentDigest::parse(hex.to_string().repeat(64)).unwrap()
+    }
+
+    fn session_named(title: &str) -> SessionCreate {
+        SessionCreate {
+            title: title.into(),
+            description: None,
+            tags: Vec::new(),
+        }
+    }
+
+    fn try_symlink_directory(original: &std::path::Path, link: &std::path::Path) -> bool {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(original, link).unwrap();
+            true
+        }
+        #[cfg(windows)]
+        {
+            match std::os::windows::fs::symlink_dir(original, link) {
+                Ok(()) => true,
+                Err(error) if error.raw_os_error() == Some(1314) => false,
+                Err(error) => panic!("failed to create directory symlink: {error}"),
+            }
+        }
+    }
+
+    #[test]
+    fn scoped_canvas_roots_are_isolated_and_retargeting_reloads_each_scope() {
+        let temp = tempdir().unwrap();
+        let root_a = scoped_canvas_path(temp.path(), &canvas_scope('a'));
+        let root_b = scoped_canvas_path(temp.path(), &canvas_scope('b'));
+        assert_eq!(root_a, temp.path().join("canvas/v1").join("a".repeat(64)));
+        let mut store = CanvasStore::new(root_a.clone());
+        let session_a = store.create_session(session_named("Vault A")).unwrap();
+        let mut peer_b = CanvasStore::new(root_b.clone());
+        peer_b.create_session(session_named("Vault B")).unwrap();
+        store.list_sessions().unwrap();
+        store.get_session_mut(&session_a.id).unwrap();
+
+        store.replace_root_path(root_b).unwrap();
+
+        assert!(store.session_cache.is_empty());
+        assert!(store.pending_bases.is_empty());
+        assert!(!store.list_cache_ready);
+        assert_eq!(store.list_sessions().unwrap()[0].title, "Vault B");
+        store.replace_root_path(root_a).unwrap();
+        assert_eq!(store.list_sessions().unwrap()[0].title, "Vault A");
+        let empty_root = scoped_canvas_path(temp.path(), &canvas_scope('f'));
+        store.replace_root_path(empty_root.clone()).unwrap();
+        assert!(empty_root.is_dir());
+        assert!(store.list_sessions().unwrap().is_empty());
+    }
+
+    #[test]
+    fn invalid_or_symlink_retarget_preserves_the_current_root_and_cache() {
+        let temp = tempdir().unwrap();
+        let root = scoped_canvas_path(temp.path(), &canvas_scope('c'));
+        let mut store = CanvasStore::new(root.clone());
+        let session = store
+            .create_session(session_named("Cached current vault"))
+            .unwrap();
+        store.list_sessions().unwrap();
+        let root_capability = store.root_capability.as_ref().unwrap().clone();
+        let invalid = temp.path().join("not-a-directory");
+        std::fs::write(&invalid, b"file").unwrap();
+
+        assert!(store.replace_root_path(invalid).is_err());
+        assert_eq!(store.data_path, root);
+        assert!(Arc::ptr_eq(
+            store.root_capability.as_ref().unwrap(),
+            &root_capability
+        ));
+        assert_eq!(
+            store.get_session(&session.id).unwrap().title,
+            "Cached current vault"
+        );
+
+        let real = temp.path().join("real-directory");
+        let symlink = temp.path().join("directory-symlink");
+        std::fs::create_dir(&real).unwrap();
+        if try_symlink_directory(&real, &symlink) {
+            assert!(store.replace_root_path(symlink).is_err());
+            assert_eq!(store.data_path, root);
+            assert_eq!(
+                store.get_session(&session.id).unwrap().title,
+                "Cached current vault"
+            );
+        }
+    }
+
+    #[test]
+    fn retarget_preserves_the_event_recorder_for_governed_writes() {
+        let temp = tempdir().unwrap();
+        let root_a = scoped_canvas_path(temp.path(), &canvas_scope('d'));
+        let root_b = scoped_canvas_path(temp.path(), &canvas_scope('e'));
+        let session_b = CanvasStore::new(root_b.clone())
+            .create_session(session_named("Delete through recorder"))
+            .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut store = CanvasStore::with_event_recorder(
+            root_a,
+            Arc::new(CountingCanvasRecorder(calls.clone())),
+        );
+
+        store.replace_root_path(root_b).unwrap();
+        store.delete_session(&session_b.id).unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]

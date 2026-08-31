@@ -17,6 +17,7 @@ pub mod root_transition;
 pub mod search;
 pub mod settings;
 pub mod similarity;
+pub mod sync;
 pub mod texttiling;
 pub mod topic_hub;
 pub mod twin;

@@ -1,8 +1,8 @@
-use super::AnchoredRoot;
+use super::{AnchoredRoot, NoClobberInstallOutcome};
 use fs2::FileExt;
 use std::fs;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tempfile::tempdir;
 
 #[cfg(unix)]
@@ -124,7 +124,10 @@ fn exclusive_lock_retries_or_denies_leaf_replacement_and_holds_the_current_entry
     current.try_lock_exclusive().unwrap();
     FileExt::unlock(&current).unwrap();
     if replaced.load(Ordering::SeqCst) {
-        assert_eq!(fs::read(anchor.join("locks/mutation.lock")).unwrap(), b"replacement");
+        assert_eq!(
+            fs::read(anchor.join("locks/mutation.lock")).unwrap(),
+            b"replacement"
+        );
     }
 }
 
@@ -145,4 +148,191 @@ fn exclusive_lock_parent_replacement_never_follows_outside_anchor() {
         lock.unlock().unwrap();
     }
     assert!(!outside.join("mutation.lock").exists());
+}
+
+#[test]
+fn no_replace_rename_preserves_a_racing_regular_file_destination() {
+    let temp = tempdir().unwrap();
+    let anchor = temp.path().join("anchor");
+    fs::create_dir_all(anchor.join("from")).unwrap();
+    fs::create_dir_all(anchor.join("to")).unwrap();
+    fs::write(anchor.join("from/source.json"), b"source").unwrap();
+    let root = AnchoredRoot::open(&anchor).unwrap();
+
+    let result =
+        root.rename_no_replace_with_hook("from/source.json", "to/destination.json", false, || {
+            fs::write(anchor.join("to/destination.json"), b"foreign").unwrap()
+        });
+
+    assert!(result.is_err());
+    assert_eq!(
+        fs::read(anchor.join("from/source.json")).unwrap(),
+        b"source"
+    );
+    assert_eq!(
+        fs::read(anchor.join("to/destination.json")).unwrap(),
+        b"foreign"
+    );
+}
+
+#[test]
+fn no_replace_rename_preserves_a_racing_directory_destination() {
+    let temp = tempdir().unwrap();
+    let anchor = temp.path().join("anchor");
+    fs::create_dir_all(anchor.join("from/source")).unwrap();
+    fs::create_dir_all(anchor.join("to")).unwrap();
+    fs::write(anchor.join("from/source/source.json"), b"source").unwrap();
+    let root = AnchoredRoot::open(&anchor).unwrap();
+
+    let result = root.rename_no_replace_with_hook("from/source", "to/destination", false, || {
+        fs::create_dir(anchor.join("to/destination")).unwrap();
+        fs::write(anchor.join("to/destination/foreign.json"), b"foreign").unwrap();
+    });
+
+    assert!(result.is_err());
+    assert_eq!(
+        fs::read(anchor.join("from/source/source.json")).unwrap(),
+        b"source"
+    );
+    assert_eq!(
+        fs::read(anchor.join("to/destination/foreign.json")).unwrap(),
+        b"foreign"
+    );
+}
+
+#[test]
+fn no_replace_rename_remains_bound_to_the_resolved_destination_parent() {
+    let temp = tempdir().unwrap();
+    let anchor = temp.path().join("anchor");
+    fs::create_dir_all(anchor.join("from")).unwrap();
+    fs::create_dir_all(anchor.join("to")).unwrap();
+    fs::write(anchor.join("from/source.json"), b"source").unwrap();
+    let root = AnchoredRoot::open(&anchor).unwrap();
+    let parent_replaced = AtomicBool::new(false);
+
+    root.rename_no_replace_with_hook("from/source.json", "to/destination.json", false, || {
+        if fs::rename(anchor.join("to"), anchor.join("resolved-to")).is_ok() {
+            fs::create_dir(anchor.join("to")).unwrap();
+            fs::write(anchor.join("to/replacement.json"), b"replacement").unwrap();
+            parent_replaced.store(true, Ordering::SeqCst);
+        }
+    })
+    .unwrap();
+
+    assert!(parent_replaced.load(Ordering::SeqCst));
+    assert_eq!(
+        fs::read(anchor.join("resolved-to/destination.json")).unwrap(),
+        b"source"
+    );
+    assert!(!anchor.join("to/destination.json").exists());
+    assert_eq!(
+        fs::read(anchor.join("to/replacement.json")).unwrap(),
+        b"replacement"
+    );
+}
+
+#[test]
+fn no_clobber_install_reports_whether_it_created_the_destination() {
+    let temp = tempdir().unwrap();
+    let anchor = temp.path().join("anchor");
+    fs::create_dir(&anchor).unwrap();
+    let root = AnchoredRoot::open(&anchor).unwrap();
+
+    assert_eq!(
+        root.install_no_clobber_with_outcome("owned.json", "staging", b"owned")
+            .unwrap(),
+        NoClobberInstallOutcome::Installed
+    );
+    assert_eq!(
+        root.install_no_clobber_with_outcome("owned.json", "staging", b"foreign")
+            .unwrap(),
+        NoClobberInstallOutcome::AlreadyExists
+    );
+    assert_eq!(fs::read(anchor.join("owned.json")).unwrap(), b"owned");
+}
+
+#[test]
+fn hard_link_install_preserves_the_source_file_identity() {
+    let temp = tempdir().unwrap();
+    let anchor = temp.path().join("anchor");
+    fs::create_dir(&anchor).unwrap();
+    fs::write(anchor.join("witness.json"), b"owned").unwrap();
+    let root = AnchoredRoot::open(&anchor).unwrap();
+
+    assert_eq!(
+        root.hard_link_no_clobber("witness.json", "descriptor.json", false)
+            .unwrap(),
+        NoClobberInstallOutcome::Installed
+    );
+    assert_eq!(
+        root.hard_link_no_clobber("witness.json", "descriptor.json", false)
+            .unwrap(),
+        NoClobberInstallOutcome::AlreadyExists
+    );
+    assert!(root
+        .same_regular_file("witness.json", "descriptor.json")
+        .unwrap());
+    assert_eq!(
+        root.regular_file_identity("witness.json").unwrap(),
+        root.regular_file_identity("descriptor.json").unwrap()
+    );
+}
+
+#[test]
+fn identity_bound_quarantine_removes_the_matching_regular_file_from_its_live_name() {
+    let temp = tempdir().unwrap();
+    let anchor = temp.path().join("anchor");
+    fs::create_dir(&anchor).unwrap();
+    fs::write(anchor.join("owned.json"), b"owned").unwrap();
+    let root = AnchoredRoot::open(&anchor).unwrap();
+    let identity = root.regular_file_identity("owned.json").unwrap().unwrap();
+
+    assert!(root
+        .quarantine_regular_file_if_identity("owned.json", identity)
+        .unwrap());
+    assert!(!anchor.join("owned.json").exists());
+    let retained = fs::read_dir(&anchor)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(retained.len(), 1);
+    assert!(retained[0].starts_with('.'));
+    assert!(retained[0].ends_with(".delete"));
+    assert_eq!(fs::read(anchor.join(&retained[0])).unwrap(), b"owned");
+    assert_eq!(
+        root.regular_file_identity(&retained[0]).unwrap(),
+        Some(identity)
+    );
+}
+
+#[test]
+fn identity_bound_quarantine_preserves_a_racing_same_byte_replacement() {
+    let temp = tempdir().unwrap();
+    let anchor = temp.path().join("anchor");
+    fs::create_dir(&anchor).unwrap();
+    let target = anchor.join("owned.json");
+    fs::write(&target, b"same bytes").unwrap();
+    fs::hard_link(&target, anchor.join("original-witness.json")).unwrap();
+    let root = AnchoredRoot::open(&anchor).unwrap();
+    let original_identity = root.regular_file_identity("owned.json").unwrap().unwrap();
+
+    let deleted = root
+        .quarantine_regular_file_if_identity_with_hook("owned.json", original_identity, || {
+            fs::remove_file(&target).unwrap();
+            fs::write(&target, b"same bytes").unwrap();
+        })
+        .unwrap();
+
+    assert!(!deleted);
+    assert_eq!(fs::read(&target).unwrap(), b"same bytes");
+    assert_ne!(
+        root.regular_file_identity("owned.json").unwrap().unwrap(),
+        original_identity
+    );
+    assert_eq!(
+        root.regular_file_identity("original-witness.json")
+            .unwrap()
+            .unwrap(),
+        original_identity
+    );
 }

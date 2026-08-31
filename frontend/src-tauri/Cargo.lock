@@ -2202,6 +2202,7 @@ dependencies = [
  "regex",
  "reqwest 0.12.28",
  "rmcp",
+ "rustix 1.1.4",
  "schemars 1.2.2",
  "serde",
  "serde_json",
@@ -2219,6 +2220,8 @@ dependencies = [
  "tokio",
  "uuid",
  "walkdir",
+ "windows-sys 0.61.2",
+ "zeroize",
  "zip 0.6.6",
 ]
 

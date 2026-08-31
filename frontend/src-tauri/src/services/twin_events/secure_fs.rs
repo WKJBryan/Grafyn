@@ -28,6 +28,18 @@ pub(crate) enum AnchoredEntryKind {
     Directory,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NoClobberInstallOutcome {
+    Installed,
+    AlreadyExists,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RegularFileIdentity {
+    pub(crate) device: u64,
+    pub(crate) inode: u64,
+}
+
 pub(crate) struct AnchoredExclusiveLock {
     file: std::fs::File,
     root: AnchoredRoot,
@@ -215,12 +227,164 @@ impl AnchoredRoot {
         Ok(())
     }
 
+    pub(crate) fn rename_no_replace(
+        &self,
+        from: &str,
+        to: &str,
+        create_to_parents: bool,
+    ) -> Result<(), MutationError> {
+        self.rename_no_replace_inner(from, to, create_to_parents, || {})
+    }
+
+    pub(crate) fn hard_link_no_clobber(
+        &self,
+        from: &str,
+        to: &str,
+        create_to_parents: bool,
+    ) -> Result<NoClobberInstallOutcome, MutationError> {
+        let from = self.resolve_target(from, false)?;
+        let to = self.resolve_target(to, create_to_parents)?;
+        if from.open_regular()?.is_none() {
+            return Err(io::Error::from(io::ErrorKind::NotFound).into());
+        }
+        let outcome = match from.parent.hard_link(&from.leaf, &to.parent, &to.leaf) {
+            Ok(()) => NoClobberInstallOutcome::Installed,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                NoClobberInstallOutcome::AlreadyExists
+            }
+            Err(error) => return Err(error.into()),
+        };
+        sync_dir(&to.parent)?;
+        Ok(outcome)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn same_regular_file(&self, left: &str, right: &str) -> Result<bool, MutationError> {
+        let left = self.resolve_target(left, false)?;
+        let right = self.resolve_target(right, false)?;
+        let (Some(left), Some(right)) = (left.open_regular()?, right.open_regular()?) else {
+            return Ok(false);
+        };
+        same_cap_file(&left, &right)
+    }
+
+    pub(crate) fn regular_file_identity(
+        &self,
+        relative_key: &str,
+    ) -> Result<Option<RegularFileIdentity>, MutationError> {
+        let Some(target) = self.try_resolve_target(relative_key, false)? else {
+            return Ok(None);
+        };
+        target
+            .open_regular()?
+            .map(|file| cap_file_identity(&file))
+            .transpose()
+    }
+
+    pub(crate) fn quarantine_regular_file_if_identity(
+        &self,
+        relative_key: &str,
+        expected: RegularFileIdentity,
+    ) -> Result<bool, MutationError> {
+        self.quarantine_regular_file_if_identity_inner(relative_key, expected, || {})
+    }
+
+    #[cfg(test)]
+    pub(crate) fn quarantine_regular_file_if_identity_with_hook(
+        &self,
+        relative_key: &str,
+        expected: RegularFileIdentity,
+        hook: impl FnOnce(),
+    ) -> Result<bool, MutationError> {
+        self.quarantine_regular_file_if_identity_inner(relative_key, expected, hook)
+    }
+
+    fn quarantine_regular_file_if_identity_inner(
+        &self,
+        relative_key: &str,
+        expected: RegularFileIdentity,
+        hook: impl FnOnce(),
+    ) -> Result<bool, MutationError> {
+        if self.regular_file_identity(relative_key)? != Some(expected) {
+            return Ok(false);
+        }
+        hook();
+
+        let cleanup_key = random_sibling_key(relative_key)?;
+        self.rename_no_replace(relative_key, &cleanup_key, false)?;
+        let quarantined_identity = self.regular_file_identity(&cleanup_key)?.ok_or_else(|| {
+            MutationError::RecoveryConflict(
+                "identity-bound delete quarantine disappeared before validation".into(),
+            )
+        })?;
+        if quarantined_identity != expected {
+            self.rename_no_replace(&cleanup_key, relative_key, false)
+                .map_err(|error| {
+                    MutationError::RecoveryConflict(format!(
+                        "identity-bound delete preserved a replacement in quarantine but could not restore its path: {error}"
+                    ))
+                })?;
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn delete_if_same_regular_file(
+        &self,
+        reference: &str,
+        target: &str,
+    ) -> Result<bool, MutationError> {
+        let Some(reference_identity) = self.regular_file_identity(reference)? else {
+            return Ok(false);
+        };
+        self.quarantine_regular_file_if_identity(target, reference_identity)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn rename_no_replace_with_hook(
+        &self,
+        from: &str,
+        to: &str,
+        create_to_parents: bool,
+        hook: impl FnOnce(),
+    ) -> Result<(), MutationError> {
+        self.rename_no_replace_inner(from, to, create_to_parents, hook)
+    }
+
+    fn rename_no_replace_inner(
+        &self,
+        from: &str,
+        to: &str,
+        create_to_parents: bool,
+        hook: impl FnOnce(),
+    ) -> Result<(), MutationError> {
+        let from_target = self.resolve_target(from, false)?;
+        let to_target = self.resolve_target(to, create_to_parents)?;
+        if let Err(error) = rename_target_no_replace(from_target, to_target, hook) {
+            return Err(MutationError::RecoveryConflict(format!(
+                "capability no-replace rename failed at destination {to}: {error}"
+            )));
+        }
+        Ok(())
+    }
+
     pub(crate) fn install_no_clobber(
         &self,
         destination: &str,
         staging_directory: &str,
         bytes: &[u8],
     ) -> Result<(), MutationError> {
+        self.install_no_clobber_with_outcome(destination, staging_directory, bytes)
+            .map(|_| ())
+    }
+
+    pub(crate) fn install_no_clobber_with_outcome(
+        &self,
+        destination: &str,
+        staging_directory: &str,
+        bytes: &[u8],
+    ) -> Result<NoClobberInstallOutcome, MutationError> {
         validate_relative_key(staging_directory)?;
         let temporary = format!("{staging_directory}/.{}.tmp", Uuid::new_v4());
         let staging = self.resolve_target(&temporary, true)?;
@@ -233,11 +397,11 @@ impl AnchoredRoot {
             {
                 Ok(()) => {
                     sync_dir(&destination.parent)?;
-                    Ok(())
+                    Ok(NoClobberInstallOutcome::Installed)
                 }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                     sync_dir(&destination.parent)?;
-                    Ok(())
+                    Ok(NoClobberInstallOutcome::AlreadyExists)
                 }
                 Err(error) => Err(error.into()),
             };
@@ -294,6 +458,14 @@ impl AnchoredRoot {
         &self,
         relative_directory: &str,
     ) -> Result<Vec<(String, AnchoredEntryKind)>, MutationError> {
+        self.directory_entries_bounded(relative_directory, usize::MAX)
+    }
+
+    pub(crate) fn directory_entries_bounded(
+        &self,
+        relative_directory: &str,
+        max_entries: usize,
+    ) -> Result<Vec<(String, AnchoredEntryKind)>, MutationError> {
         validate_relative_key(relative_directory)?;
         let directory = self.open_directory(relative_directory, false)?;
         let mut entries = Vec::new();
@@ -321,6 +493,11 @@ impl AnchoredRoot {
                 .to_str()
                 .ok_or_else(|| MutationError::Invalid("filename is not UTF-8".into()))?;
             validate_relative_key(name)?;
+            if entries.len() >= max_entries {
+                return Err(MutationError::Invalid(format!(
+                    "capability directory exceeds its {max_entries}-entry limit"
+                )));
+            }
             entries.push((name.to_string(), kind));
         }
         entries.sort_by(|left, right| left.0.cmp(&right.0));
@@ -368,6 +545,129 @@ impl AnchoredRoot {
 pub(crate) struct AnchoredTarget {
     parent: Dir,
     leaf: OsString,
+}
+
+#[cfg(unix)]
+fn rename_target_no_replace(
+    from: AnchoredTarget,
+    to: AnchoredTarget,
+    hook: impl FnOnce(),
+) -> Result<(), MutationError> {
+    use rustix::fs::{renameat_with, RenameFlags};
+
+    hook();
+    renameat_with(
+        &from.parent,
+        from.leaf.as_os_str(),
+        &to.parent,
+        to.leaf.as_os_str(),
+        RenameFlags::NOREPLACE,
+    )
+    .map_err(io::Error::from)?;
+    sync_dir(&from.parent)?;
+    sync_dir(&to.parent)
+}
+
+#[cfg(windows)]
+fn rename_target_no_replace(
+    from: AnchoredTarget,
+    to: AnchoredTarget,
+    hook: impl FnOnce(),
+) -> Result<(), MutationError> {
+    use cap_std::fs::OpenOptionsExt;
+    use std::mem::size_of;
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Wdk::Storage::FileSystem::{
+        FileRenameInformation, NtSetInformationFile, FILE_RENAME_INFORMATION,
+    };
+    use windows_sys::Win32::Foundation::RtlNtStatusToDosError;
+    use windows_sys::Win32::Storage::FileSystem::{
+        DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, FILE_WRITE_DATA, SYNCHRONIZE,
+    };
+    use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
+
+    let metadata = from.parent.symlink_metadata(&from.leaf)?;
+    if metadata.is_symlink() || !(metadata.is_file() || metadata.is_dir()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "capability rename source is not a real file or directory",
+        )
+        .into());
+    }
+    let mut options = OpenOptions::new();
+    options
+        .access_mode(DELETE)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .follow(FollowSymlinks::No);
+    let source = from.parent.open_with(&from.leaf, &options)?;
+    let mut destination_options = OpenOptions::new();
+    destination_options
+        .access_mode(FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .follow(FollowSymlinks::No);
+    let destination_parent = to.parent.open_with(".", &destination_options)?;
+    let mut destination_sync_options = OpenOptions::new();
+    destination_sync_options
+        .access_mode(FILE_WRITE_DATA | SYNCHRONIZE)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .follow(FollowSymlinks::No);
+    let destination_sync = to.parent.open_with(".", &destination_sync_options)?;
+    let destination_name = to.leaf.encode_wide().collect::<Vec<_>>();
+    let name_bytes = destination_name
+        .len()
+        .checked_mul(size_of::<u16>())
+        .and_then(|length| u32::try_from(length).ok())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "rename name is too long"))?;
+    let buffer_bytes = size_of::<FILE_RENAME_INFORMATION>()
+        .checked_add(name_bytes as usize)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "rename buffer overflow"))?;
+    let mut buffer = vec![0_u64; buffer_bytes.div_ceil(size_of::<u64>())];
+    let information = buffer.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
+    unsafe {
+        (*information).Anonymous.ReplaceIfExists = false;
+        (*information).RootDirectory = destination_parent.as_raw_handle();
+        (*information).FileNameLength = name_bytes;
+        std::ptr::copy_nonoverlapping(
+            destination_name.as_ptr(),
+            std::ptr::addr_of_mut!((*information).FileName).cast::<u16>(),
+            destination_name.len(),
+        );
+    }
+
+    drop(to.parent);
+    hook();
+    let mut io_status = IO_STATUS_BLOCK::default();
+    let status = unsafe {
+        NtSetInformationFile(
+            source.as_raw_handle(),
+            &mut io_status,
+            information.cast_const().cast(),
+            u32::try_from(buffer_bytes).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "rename buffer is too large")
+            })?,
+            FileRenameInformation,
+        )
+    };
+    if status < 0 {
+        let error = io::Error::from_raw_os_error(unsafe { RtlNtStatusToDosError(status) } as i32);
+        return Err(io::Error::new(
+            error.kind(),
+            format!("handle-relative rename failed: {error}"),
+        )
+        .into());
+    }
+    sync_dir(&from.parent)?;
+    destination_sync.sync_all().map_err(|error| {
+        MutationError::Io(format!(
+            "destination directory durability flush failed: {error}"
+        ))
+    })?;
+    Ok(())
 }
 
 impl AnchoredTarget {
@@ -503,9 +803,31 @@ impl AnchoredTarget {
 
 fn same_file(left: &std::fs::File, right: &cap_std::fs::File) -> Result<bool, MutationError> {
     let left = cap_std::fs::File::from_std(left.try_clone()?);
-    let left = left.metadata()?;
-    let right = right.metadata()?;
-    Ok(left.dev() == right.dev() && left.ino() == right.ino())
+    same_cap_file(&left, right)
+}
+
+fn same_cap_file(
+    left: &cap_std::fs::File,
+    right: &cap_std::fs::File,
+) -> Result<bool, MutationError> {
+    Ok(cap_file_identity(left)? == cap_file_identity(right)?)
+}
+
+fn cap_file_identity(file: &cap_std::fs::File) -> Result<RegularFileIdentity, MutationError> {
+    let metadata = file.metadata()?;
+    Ok(RegularFileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+fn random_sibling_key(relative_key: &str) -> Result<String, MutationError> {
+    validate_relative_key(relative_key)?;
+    let temporary = format!(".{}.delete", Uuid::new_v4());
+    Ok(match relative_key.rsplit_once('/') {
+        Some((parent, _)) => format!("{parent}/{temporary}"),
+        None => temporary,
+    })
 }
 
 #[cfg(windows)]

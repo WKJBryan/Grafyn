@@ -10,7 +10,17 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use uuid::Uuid;
+#[cfg(feature = "mcp")]
+mod custom_mcp;
 mod engine;
+mod root_lease;
+mod stable_migration;
+
+pub(crate) use root_lease::root_identity_for_path;
+use root_lease::*;
+
+#[cfg(all(feature = "mcp", test))]
+pub(crate) use custom_mcp::{CustomMcpRootBindingV1, CUSTOM_MCP_ROOT_BINDING_KEY};
 
 pub(crate) struct CoordinatorProcessLock {
     lock: crate::services::twin_events::AnchoredExclusiveLock,
@@ -37,6 +47,10 @@ impl CoordinatorProcessLock {
 
 const WRITER_SCHEMA_VERSION: u16 = 1;
 const WRITER_FILE_LIMIT: u64 = 4096;
+const WRITER_KEY: &str = "twin/events/writer-v1.json";
+const WRITER_STAGING_KEY: &str = "twin/events/writer-staging/v1";
+const WRITER_EVIDENCE_MAX_DEPTH: usize = 32;
+const WRITER_EVIDENCE_MAX_ENTRIES: usize = 8 * 1024;
 
 #[derive(Debug)]
 #[allow(private_interfaces)] // Public recorder errors carry crate-internal repair authority.
@@ -185,15 +199,20 @@ pub struct PersistedMutationIdentityProvider {
 }
 
 impl PersistedMutationIdentityProvider {
+    pub fn load_optional(data_path: impl AsRef<Path>) -> Result<Option<Self>, MutationError> {
+        let root = crate::services::twin_events::AnchoredRoot::open(data_path)?;
+        root.read_bounded(WRITER_KEY, WRITER_FILE_LIMIT as usize)?
+            .map(|bytes| Self::load(&bytes))
+            .transpose()
+    }
+
     pub fn load_or_create(data_path: impl AsRef<Path>) -> Result<Self, MutationError> {
-        const WRITER_KEY: &str = "twin/events/writer-v1.json";
-        const STAGING_KEY: &str = "twin/events/staging/v1";
+        if let Some(identity) = Self::load_optional(data_path.as_ref())? {
+            return Ok(identity);
+        }
         let root = crate::services::twin_events::AnchoredRoot::open(data_path)?;
         root.open_directory("twin/events", false)?;
-        root.open_directory(STAGING_KEY, true)?;
-        if let Some(bytes) = root.read_bounded(WRITER_KEY, WRITER_FILE_LIMIT as usize)? {
-            return Self::load(&bytes);
-        }
+        root.open_directory(WRITER_STAGING_KEY, true)?;
 
         let identity = WriterIdentityV1 {
             schema_version: WRITER_SCHEMA_VERSION,
@@ -204,7 +223,7 @@ impl PersistedMutationIdentityProvider {
         let mut bytes = serde_json::to_vec_pretty(&identity)
             .map_err(|error| MutationError::Invalid(error.to_string()))?;
         bytes.push(b'\n');
-        root.install_no_clobber(WRITER_KEY, STAGING_KEY, &bytes)?;
+        root.install_no_clobber(WRITER_KEY, WRITER_STAGING_KEY, &bytes)?;
         let installed = root
             .read_bounded(WRITER_KEY, WRITER_FILE_LIMIT as usize)?
             .ok_or_else(|| {
@@ -225,6 +244,136 @@ impl PersistedMutationIdentityProvider {
             .map_err(|_| MutationError::Invalid("writer device ID must be a UUID".into()))?;
         Ok(Self { identity })
     }
+}
+
+fn reject_missing_writer_for_established_data_root_locked(
+    data_root: &crate::services::twin_events::AnchoredRoot,
+    process_lock: &CoordinatorProcessLock,
+) -> Result<Option<PersistedMutationIdentityProvider>, MutationError> {
+    if !process_lock.covers_data_path(data_root.canonical_path())? {
+        return Err(MutationError::Invalid(
+            "writer identity scan lock belongs to another data root".into(),
+        ));
+    }
+    let identity = PersistedMutationIdentityProvider::load_optional(data_root.canonical_path())?;
+    let mut remaining_entries = WRITER_EVIDENCE_MAX_ENTRIES;
+    if identity.is_none()
+        && writer_aware_established_evidence_exists(data_root, &mut remaining_entries)?
+    {
+        return Err(MutationError::RecoveryConflict(
+            "writer-identity-missing-for-established-data-root".into(),
+        ));
+    }
+    if writer_staging_contains_unrecognized_entry(data_root, &mut remaining_entries)? {
+        let reason = if identity.is_none() {
+            "writer-identity-missing-for-established-data-root"
+        } else {
+            "writer-install-staging-contains-unrecognized-entry"
+        };
+        return Err(MutationError::RecoveryConflict(reason.into()));
+    }
+    Ok(identity)
+}
+
+fn writer_staging_contains_unrecognized_entry(
+    data_root: &crate::services::twin_events::AnchoredRoot,
+    remaining_entries: &mut usize,
+) -> Result<bool, MutationError> {
+    if !data_root.directory_exists(WRITER_STAGING_KEY)? {
+        return Ok(false);
+    }
+    let entries = data_root.directory_entries_bounded(WRITER_STAGING_KEY, *remaining_entries)?;
+    *remaining_entries -= entries.len();
+    for (name, kind) in entries {
+        let is_recognized_writer_temp = kind
+            == crate::services::twin_events::AnchoredEntryKind::File
+            && is_canonical_writer_install_temp(&name);
+        if !is_recognized_writer_temp {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn is_canonical_writer_install_temp(name: &str) -> bool {
+    let Some(uuid_text) = name
+        .strip_prefix('.')
+        .and_then(|name| name.strip_suffix(".tmp"))
+    else {
+        return false;
+    };
+    Uuid::parse_str(uuid_text).is_ok_and(|uuid| {
+        !uuid.is_nil() && uuid.get_version_num() == 4 && uuid.to_string() == uuid_text
+    })
+}
+
+fn writer_aware_established_evidence_exists(
+    data_root: &crate::services::twin_events::AnchoredRoot,
+    remaining_entries: &mut usize,
+) -> Result<bool, MutationError> {
+    for key in [
+        ACTIVE_ROOT_LEASE_KEY,
+        crate::services::sync::device::DEVICE_SIGNING_BINDING_KEY,
+        "twin/events/content-authority-v1.json",
+    ] {
+        if data_root
+            .read_bounded(key, WRITER_FILE_LIMIT as usize)?
+            .is_some()
+        {
+            return Ok(true);
+        }
+    }
+    for directory in [
+        "twin/stable-vault-migrations/v1",
+        "twin/events/v1",
+        "twin/events/quarantine/v1",
+        "twin/events/staging/v1",
+        "twin/events/vaults/v1",
+        "twin/mutations/pending/v1",
+        "twin/mutations/preauthority/v1",
+        "twin/mutations/quarantine/v1",
+        "twin/mutations/receipts/v1",
+    ] {
+        if anchored_directory_contains_regular_file(data_root, directory, 0, remaining_entries)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn anchored_directory_contains_regular_file(
+    data_root: &crate::services::twin_events::AnchoredRoot,
+    directory: &str,
+    depth: usize,
+    remaining_entries: &mut usize,
+) -> Result<bool, MutationError> {
+    if !data_root.directory_exists(directory)? {
+        return Ok(false);
+    }
+    if depth >= WRITER_EVIDENCE_MAX_DEPTH {
+        return Err(MutationError::Invalid(
+            "writer identity evidence tree exceeds its depth limit".into(),
+        ));
+    }
+    let entries = data_root.directory_entries_bounded(directory, *remaining_entries)?;
+    *remaining_entries -= entries.len();
+    for (name, kind) in entries {
+        let child = format!("{directory}/{name}");
+        match kind {
+            crate::services::twin_events::AnchoredEntryKind::File => return Ok(true),
+            crate::services::twin_events::AnchoredEntryKind::Directory => {
+                if anchored_directory_contains_regular_file(
+                    data_root,
+                    &child,
+                    depth + 1,
+                    remaining_entries,
+                )? {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+    Ok(false)
 }
 
 impl MutationIdentityProvider for PersistedMutationIdentityProvider {
@@ -248,15 +397,36 @@ pub trait EventGroupFinalizer: Send + Sync {
 pub struct StoreEventGroupFinalizer {
     store: Arc<TwinEventStore>,
     identity: Arc<dyn MutationIdentityProvider>,
+    reject_root_transition_wal: bool,
 }
 
 impl StoreEventGroupFinalizer {
     pub fn new(store: Arc<TwinEventStore>, identity: Arc<dyn MutationIdentityProvider>) -> Self {
-        Self { store, identity }
+        Self {
+            store,
+            identity,
+            reject_root_transition_wal: false,
+        }
+    }
+
+    fn new_stable(store: Arc<TwinEventStore>, identity: Arc<dyn MutationIdentityProvider>) -> Self {
+        Self {
+            store,
+            identity,
+            reject_root_transition_wal: true,
+        }
     }
 
     pub(crate) fn acquire_coordinator_lock(&self) -> Result<CoordinatorProcessLock, MutationError> {
-        acquire_shared_coordinator_process_lock(self.store.data_path())
+        let lock = acquire_shared_coordinator_process_lock(self.store.data_path())?;
+        if self.reject_root_transition_wal {
+            crate::services::root_transition::reject_transition_wal_locked(
+                self.store.data_path(),
+                &lock,
+            )?;
+        }
+        reject_prepared_stable_migration_locked(self.store.data_path(), &lock)?;
+        Ok(lock)
     }
 
     pub(crate) fn finalize_locked(
@@ -342,6 +512,23 @@ pub(crate) fn acquire_shared_coordinator_process_lock(
     root.open_directory("twin/events", false)?;
     let lock = root.lock_exclusive("twin/events/mutation-v1.lock")?;
     Ok(CoordinatorProcessLock { lock })
+}
+
+pub(crate) fn reject_prepared_stable_migration_locked(
+    data_path: &Path,
+    process_lock: &CoordinatorProcessLock,
+) -> Result<(), MutationError> {
+    let root = crate::services::twin_events::AnchoredRoot::open(data_path)?;
+    stable_migration::reject_prepared_migration_locked(&root, process_lock)
+}
+
+#[cfg_attr(not(feature = "mcp"), allow(dead_code))]
+pub(crate) fn prepared_stable_migration_scope_locked(
+    data_path: &Path,
+    process_lock: &CoordinatorProcessLock,
+) -> Result<Option<crate::models::twin_event::ContentDigest>, MutationError> {
+    let root = crate::services::twin_events::AnchoredRoot::open(data_path)?;
+    stable_migration::inspect_prepared_migration_locked(&root, process_lock)
 }
 
 impl EventGroupFinalizer for StoreEventGroupFinalizer {
@@ -505,7 +692,14 @@ pub(crate) enum WitnessedMutationRecovery {
 }
 
 const ACTIVE_ROOT_LEASE_SCHEMA_VERSION: u16 = 1;
+const STABLE_ROOT_LEASE_SCHEMA_VERSION: u16 = 2;
 const ACTIVE_ROOT_LEASE_LIMIT: u64 = 4096;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RootIdentityMode {
+    LegacyPath,
+    StableVault,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -523,6 +717,18 @@ impl ActiveMarkdownRootLeaseV1 {
             epoch_uuid: Uuid::new_v4().to_string(),
         }
     }
+
+    pub(crate) fn new_stable(root_scope: crate::models::twin_event::ContentDigest) -> Self {
+        Self {
+            schema_version: STABLE_ROOT_LEASE_SCHEMA_VERSION,
+            root_scope,
+            epoch_uuid: Uuid::new_v4().to_string(),
+        }
+    }
+
+    pub(crate) fn is_stable(&self) -> bool {
+        self.schema_version == STABLE_ROOT_LEASE_SCHEMA_VERSION
+    }
 }
 
 impl MutationCoordinator {
@@ -532,7 +738,32 @@ impl MutationCoordinator {
         store: Arc<TwinEventStore>,
         lifecycle: Arc<dyn MutationLifecycle>,
     ) -> Result<Self, MutationError> {
-        Self::new_internal(data_path, vault_path, store, lifecycle, false, None)
+        Self::new_internal(
+            data_path,
+            vault_path,
+            store,
+            lifecycle,
+            false,
+            None,
+            RootIdentityMode::LegacyPath,
+        )
+    }
+
+    pub(crate) fn new_stable(
+        data_path: impl AsRef<Path>,
+        vault_path: impl AsRef<Path>,
+        store: Arc<TwinEventStore>,
+        lifecycle: Arc<dyn MutationLifecycle>,
+    ) -> Result<Self, MutationError> {
+        Self::new_internal(
+            data_path,
+            vault_path,
+            store,
+            lifecycle,
+            false,
+            None,
+            RootIdentityMode::StableVault,
+        )
     }
 
     #[cfg(feature = "mcp")]
@@ -542,7 +773,15 @@ impl MutationCoordinator {
         store: Arc<TwinEventStore>,
         lifecycle: Arc<dyn MutationLifecycle>,
     ) -> Result<Self, MutationError> {
-        Self::new_internal(data_path, vault_path, store, lifecycle, true, None)
+        Self::new_internal(
+            data_path,
+            vault_path,
+            store,
+            lifecycle,
+            true,
+            None,
+            RootIdentityMode::StableVault,
+        )
     }
 
     #[cfg(all(test, feature = "mcp"))]
@@ -560,6 +799,7 @@ impl MutationCoordinator {
             lifecycle,
             true,
             Some(Box::new(after_wal_check)),
+            RootIdentityMode::StableVault,
         )
     }
 
@@ -570,6 +810,7 @@ impl MutationCoordinator {
         lifecycle: Arc<dyn MutationLifecycle>,
         custom_mcp: bool,
         after_custom_wal_check: Option<Box<dyn FnOnce() + Send>>,
+        identity_mode: RootIdentityMode,
     ) -> Result<Self, MutationError> {
         let data_path = data_path.as_ref().to_path_buf();
         let vault_path = vault_path.as_ref().to_path_buf();
@@ -579,25 +820,40 @@ impl MutationCoordinator {
             "trusted Markdown vault root",
         )?;
         let data_path = fs::canonicalize(data_path)?;
+        crate::services::twin_events::validate_real_directory(
+            store.data_path(),
+            "Twin event store data root",
+        )?;
+        if fs::canonicalize(store.data_path())? != data_path {
+            return Err(MutationError::Invalid(
+                "Twin event store data root does not match the coordinator data root".into(),
+            ));
+        }
+        if !store.is_legacy_namespace().map_err(MutationError::Store)? {
+            return Err(MutationError::Invalid(
+                "Twin event store must begin in the legacy namespace".into(),
+            ));
+        }
         let vault_path = fs::canonicalize(vault_path)?;
         let data_root = crate::services::twin_events::AnchoredRoot::open(&data_path)?;
-        data_root.open_directory("canvas", true)?;
-        let twin_path = fs::canonicalize(data_path.join("twin"))?;
-        let canvas_path = fs::canonicalize(data_path.join("canvas"))?;
-        validate_disjoint_roots(&vault_path, &canvas_path, &twin_path)?;
-        let vault_root = crate::services::twin_events::AnchoredRoot::open(&vault_path)?;
-        let identity = Arc::new(PersistedMutationIdentityProvider::load_or_create(
-            &data_path,
-        )?);
-        let finalizer = StoreEventGroupFinalizer::new(store.clone(), identity);
-        let journal = crate::services::twin_events::LocalMutationJournal::initialize(&data_path)?;
-        let process_lock = finalizer.acquire_coordinator_lock()?;
-        #[cfg(feature = "mcp")]
-        if custom_mcp {
-            crate::services::root_transition::reject_custom_transition_wal_locked(
+        let process_lock = acquire_shared_coordinator_process_lock(&data_path)?;
+        let persisted_writer =
+            reject_missing_writer_for_established_data_root_locked(&data_root, &process_lock)?;
+        if identity_mode == RootIdentityMode::StableVault {
+            crate::services::root_transition::reject_transition_wal_locked(
                 &data_path,
                 &process_lock,
             )?;
+        }
+        let prepared_migration_scope =
+            stable_migration::inspect_prepared_migration_locked(&data_root, &process_lock)?;
+        if identity_mode == RootIdentityMode::LegacyPath && prepared_migration_scope.is_some() {
+            return Err(MutationError::RecoveryConflict(
+                "prepared stable migration requires stable recovery".into(),
+            ));
+        }
+        #[cfg(feature = "mcp")]
+        if custom_mcp {
             if let Some(after_wal_check) = after_custom_wal_check {
                 after_wal_check();
             }
@@ -607,15 +863,197 @@ impl MutationCoordinator {
             debug_assert!(!custom_mcp);
             debug_assert!(after_custom_wal_check.is_none());
         }
-        journal.cleanup_orphan_temps_locked(&process_lock)?;
-        let root_scope = markdown_root_scope_for(&vault_path)?;
-        let root_lease = load_or_create_active_root_lease(&data_root, root_scope)?;
-        crate::services::vault_namespace::initialize_locked(
-            &data_path,
-            &root_lease,
-            &process_lock,
+        let existing_root_lease = load_optional_active_root_lease(&data_root)?;
+        #[cfg(feature = "mcp")]
+        // Read an established custom binding before identity creation, but do not
+        // publish a new one until the no-lease legacy ownership audit below passes.
+        let custom_mcp_binding = if custom_mcp {
+            custom_mcp::load_for_vault_locked(&data_root, &vault_path, &process_lock)?
+        } else {
+            None
+        };
+        if prepared_migration_scope.is_some() && existing_root_lease.is_none() {
+            return Err(MutationError::RecoveryConflict(
+                "prepared stable migration is missing its active lease".into(),
+            ));
+        }
+        #[cfg(feature = "mcp")]
+        if custom_mcp
+            && custom_mcp_binding.is_none()
+            && (prepared_migration_scope.is_some()
+                || existing_root_lease
+                    .as_ref()
+                    .is_some_and(ActiveMarkdownRootLeaseV1::is_stable))
+        {
+            return Err(MutationError::RecoveryConflict(
+                "stable custom MCP data has no durable vault-path binding".into(),
+            ));
+        }
+        let legacy_scope = markdown_root_scope_for(&vault_path)?;
+        let bootstrap_schema_one = identity_mode == RootIdentityMode::StableVault
+            && existing_root_lease.is_none()
+            && prepared_migration_scope.is_none()
+            && stable_migration::requires_schema_one_bootstrap_without_lease(
+                &data_root,
+                &vault_path,
+                &legacy_scope,
+            )?;
+        if let Some(lease) = existing_root_lease.as_ref() {
+            match (identity_mode, lease.schema_version) {
+                (_, ACTIVE_ROOT_LEASE_SCHEMA_VERSION) if lease.root_scope != legacy_scope => {
+                    return Err(MutationError::RecoveryConflict(
+                        "configured-markdown-root-is-not-active".into(),
+                    ));
+                }
+                (RootIdentityMode::LegacyPath, STABLE_ROOT_LEASE_SCHEMA_VERSION) => {
+                    return Err(MutationError::RecoveryConflict(
+                        "stable-vault-authority-requires-stable-bootstrap".into(),
+                    ));
+                }
+                _ => {}
+            }
+        }
+        let stable_identity = if identity_mode == RootIdentityMode::StableVault {
+            let require_existing_identity = existing_root_lease
+                .as_ref()
+                .is_some_and(ActiveMarkdownRootLeaseV1::is_stable)
+                || prepared_migration_scope.is_some();
+            #[cfg(feature = "mcp")]
+            let require_existing_identity =
+                require_existing_identity || (custom_mcp && custom_mcp_binding.is_some());
+            let identity = if require_existing_identity {
+                crate::services::sync::identity::load_vault_identity(&vault_path)?
+            } else {
+                crate::services::sync::identity::load_or_create_vault_identity(&vault_path)?
+            };
+            #[cfg(feature = "mcp")]
+            if custom_mcp_binding
+                .as_ref()
+                .is_some_and(|binding| binding.root_scope != identity.root_scope)
+            {
+                return Err(MutationError::RecoveryConflict(
+                    "custom MCP root binding does not match the configured vault path and identity"
+                        .into(),
+                ));
+            }
+            if prepared_migration_scope
+                .as_ref()
+                .is_some_and(|scope| scope != &identity.root_scope)
+            {
+                return Err(MutationError::RecoveryConflict(
+                    "prepared stable migration belongs to another vault".into(),
+                ));
+            }
+            if existing_root_lease
+                .as_ref()
+                .is_some_and(|lease| lease.is_stable() && lease.root_scope != identity.root_scope)
+            {
+                return Err(MutationError::RecoveryConflict(
+                    "configured-markdown-root-is-not-active".into(),
+                ));
+            }
+            Some(identity)
+        } else {
+            None
+        };
+        let expected_scope = stable_identity.as_ref().map_or_else(
+            || legacy_scope.clone(),
+            |identity| identity.root_scope.clone(),
+        );
+        let (mut root_lease, root_lease_needs_write) = validate_or_prepare_active_root_lease(
+            existing_root_lease,
+            expected_scope,
+            legacy_scope.clone(),
+            identity_mode,
+            bootstrap_schema_one,
         )?;
-        ensure_overlay_target_root(&data_root, &root_lease.root_scope)?;
+        store.initialize().map_err(MutationError::Store)?;
+        data_root.open_directory("canvas", true)?;
+        let twin_path = fs::canonicalize(data_path.join("twin"))?;
+        let canvas_path = fs::canonicalize(data_path.join("canvas"))?;
+        validate_disjoint_roots(&vault_path, &canvas_path, &twin_path)?;
+        #[cfg(feature = "mcp")]
+        if custom_mcp && custom_mcp_binding.is_none() && root_lease_needs_write {
+            custom_mcp::verify_or_install_locked(
+                &data_root,
+                &vault_path,
+                stable_identity
+                    .as_ref()
+                    .expect("custom MCP uses stable identity")
+                    .root_scope
+                    .clone(),
+                &process_lock,
+                true,
+            )?;
+        }
+        // A writer must be durable before the first writer-aware artifact
+        // (the active-root lease) can make this root established.
+        let identity = Arc::new(match persisted_writer {
+            Some(identity) => identity,
+            None => PersistedMutationIdentityProvider::load_or_create(&data_path)?,
+        });
+        if root_lease_needs_write {
+            write_active_root_lease(&data_root, &root_lease)?;
+        }
+        let vault_root = crate::services::twin_events::AnchoredRoot::open(&vault_path)?;
+        let finalizer = if identity_mode == RootIdentityMode::StableVault {
+            StoreEventGroupFinalizer::new_stable(store.clone(), identity)
+        } else {
+            StoreEventGroupFinalizer::new(store.clone(), identity)
+        };
+        let journal = crate::services::twin_events::LocalMutationJournal::initialize(&data_path)?;
+        journal.cleanup_orphan_temps_locked(&process_lock)?;
+        crate::services::vault_namespace::initialize_authority_locked(&data_path, &process_lock)?;
+        let resume_stable_migration = match stable_identity.as_ref() {
+            Some(identity) => stable_migration::marker_exists(&data_root, &identity.root_scope)?,
+            None => false,
+        };
+        if resume_stable_migration {
+            let was_legacy = !root_lease.is_stable();
+            root_lease = stable_migration::migrate_legacy_to_stable_locked(
+                &data_path,
+                &data_root,
+                &vault_path,
+                stable_identity.as_ref().expect("stable identity checked"),
+                &legacy_scope,
+                &root_lease,
+                &finalizer.device_id(),
+                &journal,
+                &process_lock,
+            )?;
+            store
+                .activate_vault_scope_locked(root_lease.root_scope.clone(), &process_lock)
+                .map_err(MutationError::Store)?;
+            crate::services::vault_namespace::initialize_locked(
+                &data_path,
+                &root_lease,
+                &process_lock,
+            )?;
+            ensure_overlay_target_root(&data_root, &root_lease.root_scope)?;
+            if was_legacy {
+                crate::services::vault_namespace::invalidate_locked(
+                    &data_path,
+                    &root_lease,
+                    &process_lock,
+                )?;
+            }
+        } else {
+            if root_lease.is_stable() {
+                store
+                    .activate_vault_scope_locked(root_lease.root_scope.clone(), &process_lock)
+                    .map_err(MutationError::Store)?;
+            }
+            let delay_schema_one_assignment =
+                identity_mode == RootIdentityMode::StableVault && !root_lease.is_stable();
+            if !delay_schema_one_assignment {
+                crate::services::vault_namespace::initialize_locked(
+                    &data_path,
+                    &root_lease,
+                    &process_lock,
+                )?;
+                ensure_overlay_target_root(&data_root, &root_lease.root_scope)?;
+            }
+        }
         let coordinator = Self {
             data_path,
             data_root,
@@ -632,18 +1070,116 @@ impl MutationCoordinator {
             pause_after_authority_advance_once: std::sync::Mutex::new(None),
             root_lease: std::sync::Mutex::new(root_lease),
         };
-        // Version-1 intents predate content generations. Replay them first so an
-        // upgrade cannot advance authority ahead of a still-pending mutation.
+        // Version-1 intents predate content generations. Stable bootstrap drains
+        // every intent before it changes the authority namespace; the legacy
+        // constructor preserves its historical schema-1-only bootstrap behavior.
         coordinator.recover_preauthority_locked(&process_lock)?;
         for (_, pending) in coordinator.journal.load_pending(&process_lock)? {
-            if pending.schema_version == 1 {
+            if identity_mode == RootIdentityMode::StableVault || pending.schema_version == 1 {
                 coordinator.replay_intent_locked(&process_lock, &pending, false, true)?;
             }
         }
-        crate::services::vault_namespace::initialize_authority_locked(
-            &coordinator.data_path,
-            &process_lock,
-        )?;
+        if let Some(stable_identity) = stable_identity
+            .as_ref()
+            .filter(|_| !resume_stable_migration)
+        {
+            let current_lease = coordinator
+                .root_lease
+                .lock()
+                .map_err(|_| MutationError::Invalid("Markdown root lease lock poisoned".into()))?
+                .clone();
+            let was_legacy = !current_lease.is_stable();
+            if was_legacy {
+                stable_migration::require_no_retained_mutation_owners(
+                    &coordinator.journal,
+                    &process_lock,
+                )?;
+                crate::services::vault_namespace::initialize_locked(
+                    &coordinator.data_path,
+                    &current_lease,
+                    &process_lock,
+                )?;
+                ensure_overlay_target_root(&coordinator.data_root, &current_lease.root_scope)?;
+                crate::services::settings::prepare_twin_data_path_locked(
+                    &coordinator.data_path,
+                    &vault_path,
+                    &current_lease,
+                    &process_lock,
+                )
+                .map_err(|error| MutationError::Invalid(error.to_string()))?;
+            }
+            #[cfg(feature = "mcp")]
+            let stable_lease = if custom_mcp && custom_mcp_binding.is_none() {
+                let mut publish_custom_binding = || {
+                    custom_mcp::verify_or_install_locked(
+                        &coordinator.data_root,
+                        &vault_path,
+                        stable_identity.root_scope.clone(),
+                        &process_lock,
+                        true,
+                    )
+                    .map(|_| ())
+                };
+                stable_migration::migrate_legacy_to_stable_locked_with_initial_publication(
+                    &coordinator.data_path,
+                    &coordinator.data_root,
+                    &vault_path,
+                    stable_identity,
+                    &legacy_scope,
+                    &current_lease,
+                    &coordinator.finalizer.device_id(),
+                    &coordinator.journal,
+                    &process_lock,
+                    &mut publish_custom_binding,
+                )?
+            } else {
+                stable_migration::migrate_legacy_to_stable_locked(
+                    &coordinator.data_path,
+                    &coordinator.data_root,
+                    &vault_path,
+                    stable_identity,
+                    &legacy_scope,
+                    &current_lease,
+                    &coordinator.finalizer.device_id(),
+                    &coordinator.journal,
+                    &process_lock,
+                )?
+            };
+            #[cfg(not(feature = "mcp"))]
+            let stable_lease = stable_migration::migrate_legacy_to_stable_locked(
+                &coordinator.data_path,
+                &coordinator.data_root,
+                &vault_path,
+                stable_identity,
+                &legacy_scope,
+                &current_lease,
+                &coordinator.finalizer.device_id(),
+                &coordinator.journal,
+                &process_lock,
+            )?;
+            if was_legacy {
+                coordinator
+                    .store
+                    .activate_vault_scope_locked(stable_lease.root_scope.clone(), &process_lock)
+                    .map_err(MutationError::Store)?;
+            }
+            crate::services::vault_namespace::initialize_locked(
+                &coordinator.data_path,
+                &stable_lease,
+                &process_lock,
+            )?;
+            ensure_overlay_target_root(&coordinator.data_root, &stable_lease.root_scope)?;
+            if was_legacy {
+                crate::services::vault_namespace::invalidate_locked(
+                    &coordinator.data_path,
+                    &stable_lease,
+                    &process_lock,
+                )?;
+            }
+            *coordinator.root_lease.lock().map_err(|_| {
+                MutationError::Invalid("Markdown root lease lock poisoned".into())
+            })? = stable_lease;
+        }
         #[cfg(test)]
         crate::services::vault_namespace::publish_ready_locked(
             &coordinator.data_path,
@@ -656,6 +1192,23 @@ impl MutationCoordinator {
         )?;
         process_lock.unlock()?;
         Ok(coordinator)
+    }
+
+    pub(crate) fn writer_device_id(&self) -> DeviceId {
+        self.finalizer.device_id()
+    }
+
+    pub(crate) fn load_or_create_device_signing_identity(
+        &self,
+        secret_store: Arc<dyn crate::services::sync::secrets::SecretStore>,
+    ) -> Result<crate::services::sync::device::DeviceSigningIdentity, MutationError> {
+        let guard = self.begin_root_transition()?;
+        crate::services::sync::device::load_or_create_device_signing_identity(
+            &self.data_path,
+            guard.process_lock(),
+            secret_store,
+            &self.writer_device_id(),
+        )
     }
 
     #[cfg(test)]
@@ -911,12 +1464,10 @@ impl MutationCoordinator {
                 return Err(error);
             }
         }
-        if preauthority_marker.is_some() {
+        if let Some(preauthority_marker) = preauthority_marker.as_ref() {
             if let Err(error) = self.validate_all_targets_before_locked(&prepared) {
-                self.journal.abort_preauthority(
-                    &process_lock,
-                    preauthority_marker.as_ref().expect("staged marker"),
-                )?;
+                self.journal
+                    .abort_preauthority(&process_lock, preauthority_marker)?;
                 process_lock.unlock()?;
                 if invoke_lifecycle {
                     self.lifecycle
@@ -1263,6 +1814,7 @@ impl MutationCoordinator {
         self.journal.pending_count(&process_lock)
     }
 
+    #[cfg_attr(not(feature = "mcp"), allow(dead_code))]
     pub(crate) fn current_root_epoch(&self) -> Result<ActiveMarkdownRootLeaseV1, MutationError> {
         let _in_process = self
             .in_process
@@ -1280,6 +1832,7 @@ impl MutationCoordinator {
         result
     }
 
+    #[cfg_attr(not(feature = "mcp"), allow(dead_code))]
     pub(crate) fn current_namespace_path(&self) -> Result<PathBuf, MutationError> {
         let lease = self.current_root_epoch()?;
         Ok(crate::services::vault_namespace::scoped_data_path(
@@ -1777,7 +2330,7 @@ impl MutationRootTransitionGuard<'_> {
                 .as_path(),
         )?;
         let durable = load_active_root_lease(&self.coordinator.data_root)?;
-        if &durable != lease || lease.root_scope != markdown_root_scope_for(&canonical)? {
+        if &durable != lease || lease.root_scope != root_scope_for_lease(&canonical, lease)? {
             return Err(MutationError::RecoveryConflict(
                 "root-transition-lease-mismatch".into(),
             ));
@@ -1789,6 +2342,12 @@ impl MutationRootTransitionGuard<'_> {
             &self._process_lock,
         )?;
         ensure_overlay_target_root(&self.coordinator.data_root, &lease.root_scope)?;
+        if lease.is_stable() {
+            self.coordinator
+                .store
+                .activate_vault_scope_locked(lease.root_scope.clone(), &self._process_lock)
+                .map_err(MutationError::Store)?;
+        }
         *self
             .coordinator
             .vault_root
@@ -1803,158 +2362,6 @@ impl MutationRootTransitionGuard<'_> {
             lease.clone();
         Ok(())
     }
-}
-
-fn ensure_overlay_target_root(
-    data_root: &crate::services::twin_events::AnchoredRoot,
-    root_scope: &crate::models::twin_event::ContentDigest,
-) -> Result<(), MutationError> {
-    data_root.open_directory(
-        &format!(
-            "vault_derived/v1/{}/vault_migration/overlay/notes",
-            root_scope.as_str()
-        ),
-        true,
-    )?;
-    Ok(())
-}
-
-fn markdown_root_scope_for(
-    root: &Path,
-) -> Result<crate::models::twin_event::ContentDigest, MutationError> {
-    root_identity_for_path(root)
-}
-
-pub(crate) fn root_identity_for_path(
-    root: &Path,
-) -> Result<crate::models::twin_event::ContentDigest, MutationError> {
-    crate::services::twin_events::validate_real_directory(root, "trusted Markdown vault root")?;
-    let encoded = platform_canonical_path_bytes(root)?;
-    let platform: &[u8] = if cfg!(windows) { b"windows" } else { b"unix" };
-    let mut scoped = Vec::with_capacity(encoded.len() + 64);
-    scoped.extend_from_slice(b"grafyn.root_identity.v1");
-    scoped.extend_from_slice(&(platform.len() as u64).to_be_bytes());
-    scoped.extend_from_slice(platform);
-    scoped.extend_from_slice(&(encoded.len() as u64).to_be_bytes());
-    scoped.extend_from_slice(&encoded);
-    Ok(crate::services::twin_events::digest_bytes(&scoped))
-}
-
-fn validate_disjoint_roots(
-    markdown: &Path,
-    canvas: &Path,
-    twin: &Path,
-) -> Result<(), MutationError> {
-    let roots = [
-        ("Markdown", platform_canonical_path_bytes(markdown)?),
-        ("Canvas", platform_canonical_path_bytes(canvas)?),
-        ("Twin", platform_canonical_path_bytes(twin)?),
-    ];
-    for left in 0..roots.len() {
-        for right in left + 1..roots.len() {
-            if physical_paths_overlap(&roots[left].1, &roots[right].1) {
-                return Err(MutationError::Invalid(format!(
-                    "{} and {} roots overlap",
-                    roots[left].0, roots[right].0
-                )));
-            }
-        }
-    }
-    Ok(())
-}
-
-fn physical_paths_overlap(left: &[u8], right: &[u8]) -> bool {
-    fn is_ancestor(ancestor: &[u8], descendant: &[u8]) -> bool {
-        descendant.starts_with(ancestor)
-            && (descendant.len() == ancestor.len()
-                || descendant
-                    .get(ancestor.len())
-                    .is_some_and(|separator| *separator == b'/' || *separator == b'\\'))
-    }
-    is_ancestor(left, right) || is_ancestor(right, left)
-}
-
-#[cfg(unix)]
-fn platform_canonical_path_bytes(path: &Path) -> Result<Vec<u8>, MutationError> {
-    use std::os::unix::ffi::OsStrExt;
-    Ok(fs::canonicalize(path)?.as_os_str().as_bytes().to_vec())
-}
-
-#[cfg(windows)]
-fn platform_canonical_path_bytes(path: &Path) -> Result<Vec<u8>, MutationError> {
-    let canonical = fs::canonicalize(path)?;
-    let encoded = canonical
-        .to_str()
-        .ok_or_else(|| MutationError::Invalid("canonical root path must be Unicode".into()))?;
-    let normalized = encoded
-        .strip_prefix(r"\\?\")
-        .unwrap_or(encoded)
-        .replace('/', "\\")
-        .to_lowercase();
-    Ok(normalized.into_bytes())
-}
-
-const ACTIVE_ROOT_LEASE_KEY: &str = "twin/events/active-markdown-root-v1.json";
-
-fn load_or_create_active_root_lease(
-    data_root: &crate::services::twin_events::AnchoredRoot,
-    root_scope: crate::models::twin_event::ContentDigest,
-) -> Result<ActiveMarkdownRootLeaseV1, MutationError> {
-    if let Some(bytes) =
-        data_root.read_bounded(ACTIVE_ROOT_LEASE_KEY, ACTIVE_ROOT_LEASE_LIMIT as usize)?
-    {
-        let lease = parse_active_root_lease(&bytes)?;
-        if lease.root_scope != root_scope {
-            return Err(MutationError::RecoveryConflict(
-                "configured-markdown-root-is-not-active".into(),
-            ));
-        }
-        return Ok(lease);
-    }
-    let lease = ActiveMarkdownRootLeaseV1 {
-        schema_version: ACTIVE_ROOT_LEASE_SCHEMA_VERSION,
-        root_scope,
-        epoch_uuid: Uuid::new_v4().to_string(),
-    };
-    write_active_root_lease(data_root, &lease)?;
-    Ok(lease)
-}
-
-fn load_active_root_lease(
-    data_root: &crate::services::twin_events::AnchoredRoot,
-) -> Result<ActiveMarkdownRootLeaseV1, MutationError> {
-    let bytes = data_root
-        .read_bounded(ACTIVE_ROOT_LEASE_KEY, ACTIVE_ROOT_LEASE_LIMIT as usize)?
-        .ok_or_else(|| MutationError::Invalid("active Markdown root lease is missing".into()))?;
-    parse_active_root_lease(&bytes)
-}
-
-fn parse_active_root_lease(bytes: &[u8]) -> Result<ActiveMarkdownRootLeaseV1, MutationError> {
-    let lease: ActiveMarkdownRootLeaseV1 = serde_json::from_slice(bytes)
-        .map_err(|error| MutationError::Invalid(format!("invalid root lease: {error}")))?;
-    if lease.schema_version != ACTIVE_ROOT_LEASE_SCHEMA_VERSION
-        || Uuid::parse_str(&lease.epoch_uuid).is_err()
-    {
-        return Err(MutationError::Invalid(
-            "invalid active Markdown root lease".into(),
-        ));
-    }
-    Ok(lease)
-}
-
-fn write_active_root_lease(
-    data_root: &crate::services::twin_events::AnchoredRoot,
-    lease: &ActiveMarkdownRootLeaseV1,
-) -> Result<(), MutationError> {
-    let mut bytes = serde_json::to_vec_pretty(lease)
-        .map_err(|error| MutationError::Invalid(error.to_string()))?;
-    bytes.push(b'\n');
-    if bytes.len() > ACTIVE_ROOT_LEASE_LIMIT as usize {
-        return Err(MutationError::Invalid(
-            "active Markdown root lease exceeds its size limit".into(),
-        ));
-    }
-    data_root.put_atomic(ACTIVE_ROOT_LEASE_KEY, &bytes)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

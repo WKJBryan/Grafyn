@@ -8,6 +8,7 @@ pub mod migration;
 pub mod mutation;
 pub mod note;
 pub mod settings;
+pub mod sync;
 pub mod twin;
 pub mod twin_event;
 pub mod twin_state;

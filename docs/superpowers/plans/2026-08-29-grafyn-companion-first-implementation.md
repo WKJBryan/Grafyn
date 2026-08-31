@@ -339,21 +339,54 @@ get_twin_event_timeline
 - Create: `frontend/src-tauri/src/services/sync/mod.rs`
 - Create: `frontend/src-tauri/src/services/sync/identity.rs`
 - Create: `frontend/src-tauri/src/services/sync/secrets.rs`
+- Create: `frontend/src-tauri/src/services/sync/device.rs`
+- Create: `frontend/src-tauri/src/services/sync/vault_keys.rs`
+- Create: `frontend/src-tauri/src/services/root_transition_tests.rs`
+- Create: `frontend/src-tauri/src/services/twin_events/mutation_coordinator/custom_mcp.rs`
+- Create: `frontend/src-tauri/src/services/twin_events/mutation_coordinator/root_lease.rs`
+- Create: `frontend/src-tauri/src/services/twin_events/mutation_coordinator/stable_migration.rs`
+- Create: `frontend/src-tauri/src/services/twin_events/mutation_coordinator/stable_migration_tests.rs`
 - Modify: `frontend/src-tauri/src/models/mod.rs`
 - Modify: `frontend/src-tauri/src/models/settings.rs`
 - Modify: `frontend/src-tauri/src/services/mod.rs`
 - Modify: `frontend/src-tauri/src/services/settings.rs`
 - Modify: `frontend/src-tauri/src/services/twin/mod.rs`
+- Modify: `frontend/src-tauri/src/services/twin_events/mutation_coordinator.rs`
+- Modify: `frontend/src-tauri/src/services/twin_events/mutation_coordinator/engine.rs`
+- Modify: `frontend/src-tauri/src/services/twin_events/mutation_coordinator_tests.rs`
+- Modify: `frontend/src-tauri/src/services/twin_events/journal.rs`
+- Modify: `frontend/src-tauri/src/services/twin_events/secure_fs.rs`
+- Modify: `frontend/src-tauri/src/services/twin_events/secure_fs_contract_tests.rs`
+- Modify: `frontend/src-tauri/src/services/twin_events/store.rs`
+- Modify: `frontend/src-tauri/src/services/vault_namespace.rs`
+- Modify: `frontend/src-tauri/src/services/root_transition.rs`
+- Modify: `frontend/src-tauri/src/services/canvas_store.rs`
+- Modify: `frontend/src-tauri/src/commands/commit_note_write_tests.rs`
+- Modify: `frontend/src-tauri/src/commands/settings.rs`
+- Modify: `frontend/src-tauri/src/lib.rs`
+- Modify: `frontend/src-tauri/src/mcp.rs`
+- Modify: `frontend/src-tauri/crates/grafyn-sync-protocol/src/crypto.rs`
+- Modify: `frontend/src-tauri/Cargo.toml`
+- Modify: `frontend/src-tauri/Cargo.lock`
+- Modify: `CLAUDE.md`
 
-**Contract:** Vault identity survives path moves; corrupt descriptors fail without rotation; devices remain distinct; keys never serialize. Legacy path-hash Twin data migrates once to the UUID scope.
+**Contract:** Vault identity survives path moves; corrupt descriptors fail without replacement or identity rotation; devices remain distinct; keys never serialize. The canonical vault UUID is domain-separated into the existing `ContentDigest` root-scope type so authority tokens remain strongly typed, while canonical paths are retained only as capability bindings. Schema-1 path authorities and transitions are recovered using their original semantics before a schema-2 UUID authority is installed; old durable bytes are never silently reinterpreted. A path change or UUID change rotates the lease epoch; a same-UUID move preserves the data namespace while retargeting the runtime capability, and a missing-old-path move uses an explicit forward-only reattach path. Replacing the descriptor UUID at the same canonical path fails closed. A candidate descriptor is planned before WAL publication but is installed only after a strict-created rollback witness's filesystem identity is durably recorded in that exact prepared transaction; the live descriptor is a no-clobber hard link to that identity, with a second durable phase recorded only after Grafyn wins the live-name install. Prepared rollback removes the live name only with that proof, preserving pre-existing, raced, or byte-identical replacement files. Identity-bound cleanup atomically moves the verified entry to a retained unpredictable quarantine and never follows it with a racy pathname unlink; committed cleanup keeps the live descriptor and quarantines only its recorded witness. Legacy FNV/path-SHA Twin, derived, Canvas, and unscoped event data is assigned exactly once without merging, only after pending mutation and retained workflow recovery. Canonical Twin events, Twin state, Canvas, derived state, and vault-root secret/account identity are vault-scoped; vault-scoped sync operation state is reserved for Task 12. The coordinator lock, mutation journal, root-transition WAL, authority generation, writer identity, and active namespace pointer remain data-root-global.
 
-- [ ] Write failing tests: vault move; corrupt descriptor; stable reopen; two devices/one vault key; no settings serialization; legacy Twin path migration; keyring account naming.
-- [ ] Atomically create `vault/_grafyn/vault.json` schema 1. Add `SecretStore`, desktop `KeyringSecretStore`, and test `MemorySecretStore`.
-- [ ] Use accounts `sync.device.ed25519.v1` and `sync.vault.<vault_uuid>.root.v1`.
-- [ ] Scope Twin/event/sync app data by UUID and retain the old path hash helper only for migration.
-- [ ] Keep sync disabled until a root key is deliberately provisioned; do not invent pairing.
-- [ ] Run identity/settings/Twin tests and scan serialized settings fixtures for key material.
-- [ ] Commit: `feat: add stable vault identity and secure sync keys`
+- [x] Write failing tests: vault move/reopen/concurrent creation; corrupt, symlinked, noncanonical, nil, and unsupported descriptor rejection without replacement; same-UUID path retarget with fresh epoch; descriptor replacement invalidates active authority; desktop/MCP parity.
+- [x] Atomically create strict, bounded `vault/_grafyn/vault.json` schema 1 through retained no-follow capability I/O. Install absent descriptors with no-clobber semantics and reread the winner; never rewrite invalid existing bytes.
+- [x] Generalize the existing OpenRouter key backend into one account-keyed `SecretStore`, desktop `KeyringSecretStore`, and test `MemorySecretStore`. Preserve service `com.grafyn.app`, every `openrouter_api_key/<version>` account, root-authority binding bytes, and root-transition recovery compatibility.
+- [x] Use accounts `sync.device.ed25519.v1` and `sync.vault.<vault_uuid>.root.v1`.
+- [x] Reuse the stable global `writer-v1.json` UUID as device ID. Persist and validate its signing-public-key binding; a missing or mismatched previously bound secret fails closed rather than rotating the device. Custom MCP mode may read public identity but remains keyring/sync-secret disabled.
+- [x] Recover legacy pending mutations under the old lease before a crash-resumable, retained-lock assignment of exactly one recognized legacy source. Reject FNV plus path-SHA, source plus destination, occupied cross-vault destinations, and unexplained partial migration states; publish the UUID-derived lease last and rebuild before readiness.
+- [x] Version the active lease/root authority transition instead of reinterpreting schema 1. Bind the migration marker to UUID/scope, legacy scope/epoch, writer UUID, exact component inventory, destination, and per-component progress; test crash recovery around initial marker publication, representative Twin/derived assignment and component rename boundaries, and lease publication.
+- [x] Make the event store route canonical records/quarantine through the active UUID namespace while keeping its global process lock. Retarget event, Canvas, Twin, and derived roots atomically on a live vault switch; assign legacy global event/Canvas data only once because those records contain no prior vault ID.
+- [x] Revalidate the live descriptor-derived scope during durable lease verification. Split canonical-path change from identity change so a same-UUID directory move rotates the epoch and capability without moving namespaces.
+- [x] Block migration while any pre-authority owner, receipt, optimizer publication/rollback owner, or Markdown migration transaction still binds the legacy authority. Rebuild disposable indexes, but preserve authority-bearing audit/decision state and never discard it as cache.
+- [x] Keep sync `not_provisioned` until a root key is deliberately provisioned; do not invent pairing, relay, or automatic vault-root keys. Test that two device stores share only an explicitly provisioned vault root.
+- [x] Run identity/secret/settings/root-transition/coordinator/event/Canvas/Twin tests, desktop and MCP construction tests, strict Clippy, and scans of settings, WAL, IPC, debug, and test fixtures for serialized key material.
+- [x] Commit: `feat: add stable vault identity and secure sync keys`
+
+**Verification (2026-08-31):** Focused root-transition, secure-filesystem, writer, stable-migration, and detached-boot regressions passed 44/44, 12/12, 21/21, 25/25, and 2/2. The Windows-controlled full desktop and MCP suites passed 882/882 and 739/739 with four test workers; the protocol suite passed 21/21, desktop/MCP compilation passed, and the source-size gate passed after extracting the root-lease helpers. Unrestricted Windows parallel runs produced different non-repeating failures in independent temporary roots, including raw `Access is denied` filesystem errors; each reported test passed alone, the authority race passed 100/100 repeated runs, and both serial and four-worker full runs passed. Strict protocol Clippy passed. Full-app strict Clippy remains baseline-limited by 46 pre-existing warning errors outside the Task 11 identity/transition/security paths; no Task 11 warning remains. Scoped rustfmt, diff checks, key-material scans, and an independent adversarial review passed with no remaining Critical or Important finding.
 
 ## Task 12: Implement crash-safe note/event synchronization and convergence
 

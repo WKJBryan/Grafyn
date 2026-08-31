@@ -64,6 +64,414 @@ pub struct AppState {
     /// MemoryService is stateless — no lock needed, just Arc for shared ownership
     pub memory_service: Arc<MemoryService>,
     pub boot_state: Arc<RwLock<BootStatus>>,
+    // Declared last so recovery files are removed only after the service
+    // handles that use them have been dropped.
+    _recovery_runtime: Option<Arc<tempfile::TempDir>>,
+}
+
+struct ServiceRuntimeRoots {
+    data_path: std::path::PathBuf,
+    vault_path: std::path::PathBuf,
+    derived_data_path: std::path::PathBuf,
+    active_scope: crate::models::twin_event::ContentDigest,
+    recovery_runtime: Option<Arc<tempfile::TempDir>>,
+}
+
+fn canonical_path_components(path: &std::path::Path) -> Result<Vec<String>, String> {
+    let canonical = std::fs::canonicalize(path)
+        .map_err(|error| format!("Failed to canonicalize {}: {error}", path.display()))?;
+    Ok(canonical
+        .components()
+        .map(|component| {
+            let encoded = component.as_os_str().to_string_lossy();
+            #[cfg(windows)]
+            {
+                encoded.to_lowercase()
+            }
+            #[cfg(not(windows))]
+            {
+                encoded.into_owned()
+            }
+        })
+        .collect())
+}
+
+fn canonical_paths_overlap(
+    left: &std::path::Path,
+    right: &std::path::Path,
+) -> Result<bool, String> {
+    let left = canonical_path_components(left)?;
+    let right = canonical_path_components(right)?;
+    Ok(path_components_are_prefix(&left, &right) || path_components_are_prefix(&right, &left))
+}
+
+fn canonical_path_is_within(
+    path: &std::path::Path,
+    root: &std::path::Path,
+) -> Result<bool, String> {
+    let path = canonical_path_components(path)?;
+    let root = canonical_path_components(root)?;
+    Ok(path_components_are_prefix(&root, &path))
+}
+
+fn path_components_are_prefix(prefix: &[String], path: &[String]) -> bool {
+    prefix.len() <= path.len()
+        && prefix
+            .iter()
+            .zip(path.iter())
+            .all(|(left, right)| left == right)
+}
+
+fn isolated_recovery_runtime_roots(
+    active_data_path: &std::path::Path,
+    active_vault_path: &std::path::Path,
+) -> Result<ServiceRuntimeRoots, String> {
+    isolated_recovery_runtime_roots_in(&std::env::temp_dir(), active_data_path, active_vault_path)
+}
+
+fn isolated_recovery_runtime_roots_in(
+    temporary_base: &std::path::Path,
+    active_data_path: &std::path::Path,
+    active_vault_path: &std::path::Path,
+) -> Result<ServiceRuntimeRoots, String> {
+    for (label, active_root) in [
+        ("active data root", active_data_path),
+        ("active vault root", active_vault_path),
+    ] {
+        match std::fs::symlink_metadata(active_root) {
+            Ok(_) => {
+                if canonical_path_is_within(temporary_base, active_root)? {
+                    return Err(format!(
+                        "Isolated recovery temporary base overlaps the {label}: {}",
+                        active_root.display()
+                    ));
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "Failed to inspect {label} {}: {error}",
+                    active_root.display()
+                ));
+            }
+        }
+    }
+    let recovery_runtime = Arc::new(
+        tempfile::Builder::new()
+            .prefix("grafyn-recovery-runtime-v1-")
+            .tempdir_in(temporary_base)
+            .map_err(|error| format!("Failed to create isolated recovery runtime: {error}"))?,
+    );
+    for (label, active_root) in [
+        ("active data root", active_data_path),
+        ("active vault root", active_vault_path),
+    ] {
+        match std::fs::symlink_metadata(active_root) {
+            Ok(_) => {
+                if canonical_paths_overlap(recovery_runtime.path(), active_root)? {
+                    return Err(format!(
+                        "Isolated recovery runtime overlaps the {label}: {}",
+                        active_root.display()
+                    ));
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "Failed to inspect {label} {}: {error}",
+                    active_root.display()
+                ));
+            }
+        }
+    }
+    let data_path = recovery_runtime.path().join("data");
+    let vault_path = recovery_runtime.path().join("vault");
+    std::fs::create_dir(&data_path)
+        .map_err(|error| format!("Failed to create recovery data root: {error}"))?;
+    std::fs::create_dir(&vault_path)
+        .map_err(|error| format!("Failed to create recovery vault root: {error}"))?;
+    let active_scope = crate::services::twin_events::root_identity_for_path(&vault_path)
+        .map_err(|error| error.to_string())?;
+    let derived_data_path =
+        crate::services::vault_namespace::scoped_data_path(&data_path, &active_scope);
+    std::fs::create_dir_all(&derived_data_path)
+        .map_err(|error| format!("Failed to create recovery derived root: {error}"))?;
+    Ok(ServiceRuntimeRoots {
+        data_path,
+        vault_path,
+        derived_data_path,
+        active_scope,
+        recovery_runtime: Some(recovery_runtime),
+    })
+}
+
+fn initialize_attached_namespace(
+    coordinator: &MutationCoordinator,
+) -> Result<(std::path::PathBuf, crate::models::twin_event::ContentDigest), String> {
+    let guard = coordinator
+        .begin_root_transition()
+        .map_err(|error| error.to_string())?;
+    let lease = guard.current_lease().map_err(|error| error.to_string())?;
+    let path = guard
+        .initialize_namespace(&lease)
+        .map_err(|error| error.to_string())?;
+    guard
+        .invalidate_namespace(&lease)
+        .map_err(|error| error.to_string())?;
+    Ok((path, lease.root_scope))
+}
+
+fn build_app_state(
+    mut settings_service: SettingsService,
+    committed_warning_app: Option<tauri::AppHandle>,
+) -> Result<AppState, String> {
+    let vault_path = settings_service.vault_path();
+    let data_path = settings_service.data_path();
+    let root_transition_store = settings_service
+        .root_transition_store()
+        .map_err(|error| error.to_string())?;
+    let (detached_stable_vault, detached_validation_error) = match root_transition_store
+        .detached_stable_vault()
+    {
+        Ok(detached) => (detached, None),
+        Err(error) => {
+            let recoverable_validation = matches!(
+                &error,
+                crate::services::twin_events::MutationError::RecoveryConflict(reason)
+                    if reason == "configured stable vault path is not a real directory"
+                        || reason == "configured stable vault descriptor was replaced"
+            );
+            if !recoverable_validation {
+                return Err(error.to_string());
+            }
+            let recovery_guidance = format!(
+                "{error}. Restore the configured vault, or select the original vault's correct location in Settings to reattach it."
+            );
+            (None, Some(recovery_guidance))
+        }
+    };
+
+    log::info!("Vault path: {:?}", vault_path);
+    log::info!("Data path: {:?}", data_path);
+
+    let mut validation_recovery_roots = if detached_validation_error.is_some() {
+        Some(isolated_recovery_runtime_roots(&data_path, &vault_path)?)
+    } else {
+        None
+    };
+    let runtime_vault_path = if let Some(error) = detached_validation_error {
+        Err(error)
+    } else if let Some(detached) = detached_stable_vault.as_ref() {
+        Err(format!(
+            "Configured stable vault {} is unavailable; select its new location to reattach vault {}",
+            detached.configured_path.display(),
+            detached.root_scope.as_str()
+        ))
+    } else {
+        root_transition_store
+            .prepare_runtime_vault_path(&vault_path)
+            .map_err(|error| error.to_string())
+    };
+
+    // Initialize canonical mutation capture before any command can mutate user bytes.
+    let twin_event_store = Arc::new(if let Some(recovery) = validation_recovery_roots.as_ref() {
+        TwinEventStore::new_scoped(&recovery.data_path, recovery.active_scope.clone())
+    } else {
+        match detached_stable_vault.as_ref() {
+            Some(detached) => TwinEventStore::new_scoped(&data_path, detached.root_scope.clone()),
+            None => TwinEventStore::new(data_path.clone()),
+        }
+    });
+    let coordinator = (|| -> Result<Arc<MutationCoordinator>, String> {
+        let runtime_vault_path = runtime_vault_path.as_ref().map_err(Clone::clone)?;
+        let coordinator = Arc::new(
+            MutationCoordinator::new_stable(
+                &data_path,
+                runtime_vault_path.as_path(),
+                twin_event_store.clone(),
+                Arc::new(NoopMutationLifecycle),
+            )
+            .map_err(|error| error.to_string())?,
+        );
+        coordinator
+            .recover_pending()
+            .map_err(|error| error.to_string())?;
+        coordinator
+            .load_or_create_device_signing_identity(settings_service.secret_store())
+            .map_err(|error| error.to_string())?;
+        Ok(coordinator)
+    })();
+    let (event_recorder, mutation_coordinator, mutation_startup_error): (
+        Arc<dyn EventRecorder>,
+        Option<Arc<MutationCoordinator>>,
+        Option<String>,
+    ) = match coordinator {
+        Ok(coordinator) => (coordinator.clone(), Some(coordinator), None),
+        Err(error) => (
+            Arc::new(UnavailableEventRecorder::new(error.clone())),
+            None,
+            Some(error),
+        ),
+    };
+    let service_roots = if let Some(coordinator) = mutation_coordinator.as_ref() {
+        let (derived_data_path, active_scope) = initialize_attached_namespace(coordinator)?;
+        ServiceRuntimeRoots {
+            data_path: data_path.clone(),
+            vault_path: runtime_vault_path
+                .as_ref()
+                .expect("coordinator success requires runtime preparation")
+                .clone(),
+            derived_data_path,
+            active_scope,
+            recovery_runtime: None,
+        }
+    } else if let Some(recovery) = validation_recovery_roots.take() {
+        recovery
+    } else {
+        isolated_recovery_runtime_roots(&data_path, &vault_path)?
+    };
+    let ServiceRuntimeRoots {
+        data_path: service_data_path,
+        vault_path: service_vault_path,
+        derived_data_path,
+        active_scope,
+        recovery_runtime,
+    } = service_roots;
+
+    // Initialize services
+    let knowledge_store = KnowledgeStore::with_event_recorder(
+        service_vault_path.clone(),
+        derived_data_path.clone(),
+        event_recorder.clone(),
+    );
+    let graph_index = GraphIndex::new();
+    let search_service = match SearchService::new(derived_data_path.clone()) {
+        Ok(s) => s,
+        Err(e) if e.is_corrupt_or_incompatible() => {
+            log::error!(
+                "Search index is explicitly corrupt or incompatible: {}. Attempting rebuild.",
+                e
+            );
+            // Try deleting corrupted index and retrying
+            let index_path = derived_data_path.join("search_index");
+            if index_path.exists() {
+                if let Err(rm_err) = std::fs::remove_dir_all(&index_path) {
+                    log::error!("Failed to remove corrupted index: {}", rm_err);
+                }
+            }
+            SearchService::new(derived_data_path.clone()).unwrap_or_else(|e2| {
+                log::error!("Search service initialization failed after rebuild: {}", e2);
+                std::process::exit(1);
+            })
+        }
+        Err(e) => return Err(e.to_string()),
+    };
+    // Initialize chunk index (parallel to search index)
+    let chunk_index = match ChunkIndex::new(derived_data_path.clone()) {
+        Ok(c) => c,
+        Err(e) => {
+            log::error!(
+                "Failed to initialize chunk index: {}. Attempting rebuild.",
+                e
+            );
+            let chunk_path = derived_data_path.join("chunk_index");
+            if chunk_path.exists() {
+                let _ = std::fs::remove_dir_all(&chunk_path);
+            }
+            ChunkIndex::new(derived_data_path.clone()).unwrap_or_else(|e2| {
+                log::error!("Chunk index initialization failed: {}", e2);
+                std::process::exit(1);
+            })
+        }
+    };
+
+    let canvas_store = CanvasStore::with_event_recorder(
+        crate::services::canvas_store::scoped_canvas_path(&service_data_path, &active_scope),
+        event_recorder.clone(),
+    );
+    let twin_data_path = if let Some(coordinator) = mutation_coordinator.as_ref() {
+        let guard = coordinator
+            .begin_root_transition()
+            .map_err(|error| error.to_string())?;
+        let lease = guard.current_lease().map_err(|error| error.to_string())?;
+        guard
+            .prepare_twin_data_path(&vault_path, &lease)
+            .map_err(|error| error.to_string())?
+    } else {
+        crate::models::settings::twin_data_path_for_scope(&service_data_path, &active_scope)
+    };
+    let twin_store = TwinStore::with_event_recorder_scoped(
+        twin_data_path,
+        service_data_path.join("twin"),
+        active_scope,
+        event_recorder.clone(),
+    );
+
+    // Get OpenRouter API key from settings, fall back to environment
+    let environment_api_key = settings_service
+        .allows_environment_fallback()
+        .then(|| std::env::var("OPENROUTER_API_KEY").ok())
+        .flatten();
+    if settings_service.openrouter_api_key().is_none() {
+        if let Some(secret) = environment_api_key {
+            settings_service.adopt_environment_runtime_secret(secret);
+        }
+    }
+    let api_key = settings_service
+        .openrouter_api_key()
+        .map(str::to_string)
+        .unwrap_or_default();
+    let openrouter = OpenRouterService::new(api_key);
+    let ollama = OllamaService::new(settings_service.get().ollama_base_url.clone());
+
+    // Initialize priority scoring service
+    let priority_service = PriorityScoringService::new(service_data_path.clone());
+
+    // Initialize retrieval service
+    let retrieval_service = RetrievalService::new(service_data_path.clone());
+    let link_discovery = LinkDiscoveryService::try_new(derived_data_path.clone())
+        .map_err(|error| error.to_string())?;
+    let markdown_migration = MarkdownMigrationService::try_new(derived_data_path.clone())
+        .map_err(|error| error.to_string())?;
+    let vault_optimizer =
+        VaultOptimizerService::try_new(derived_data_path).map_err(|error| error.to_string())?;
+
+    // Initialize feedback service using runtime environment only.
+    // Release builds must not embed repository credentials.
+    let feedback_service = FeedbackService::new(service_data_path.join("feedback"));
+    let boot_state = Arc::new(RwLock::new(match mutation_startup_error.as_ref() {
+        Some(error) => BootStatus::failed("failed", "Startup failed", error.clone()),
+        None => BootStatus::default(),
+    }));
+
+    // Create app state (MemoryService is stateless — no RwLock needed)
+    Ok(AppState {
+        knowledge_store: Arc::new(RwLock::new(knowledge_store)),
+        graph_index: Arc::new(RwLock::new(graph_index)),
+        search_service: Arc::new(RwLock::new(search_service)),
+        canvas_store: Arc::new(RwLock::new(canvas_store)),
+        openrouter: Arc::new(RwLock::new(openrouter)),
+        ollama: Arc::new(RwLock::new(ollama)),
+        feedback_service: Arc::new(RwLock::new(feedback_service)),
+        settings_service: Arc::new(RwLock::new(settings_service)),
+        priority_service: Arc::new(RwLock::new(priority_service)),
+        retrieval_service: Arc::new(RwLock::new(retrieval_service)),
+        chunk_index: Arc::new(RwLock::new(chunk_index)),
+        link_discovery: Arc::new(RwLock::new(link_discovery)),
+        markdown_migration: Arc::new(RwLock::new(markdown_migration)),
+        vault_optimizer: Arc::new(RwLock::new(vault_optimizer)),
+        twin_store: Arc::new(RwLock::new(twin_store)),
+        twin_event_store,
+        mutation_coordinator,
+        mutation_startup_error: Arc::new(RwLock::new(mutation_startup_error)),
+        loaded_authority: Arc::new(RwLock::new(None)),
+        authority_repair: Arc::new(tokio::sync::Mutex::new(())),
+        committed_warning_app,
+        vault_transition: Arc::new(RwLock::new(())),
+        memory_service: Arc::new(MemoryService::new()),
+        boot_state,
+        _recovery_runtime: recovery_runtime,
+    })
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -85,210 +493,7 @@ pub fn run() {
         .setup(|app| {
             // Root/settings recovery is part of SettingsService::load and must fail closed
             // before any store constructs itself from a possibly split authority.
-            let mut settings_service = SettingsService::load()?;
-
-            let vault_path = settings_service.vault_path();
-            let data_path = settings_service.data_path();
-
-            log::info!("Vault path: {:?}", vault_path);
-            log::info!("Data path: {:?}", data_path);
-
-            // Create directories if they don't exist
-            if let Err(e) = std::fs::create_dir_all(&vault_path) {
-                log::error!(
-                    "Failed to create vault directory {}: {}",
-                    vault_path.display(),
-                    e
-                );
-            }
-            if let Err(e) = std::fs::create_dir_all(&data_path) {
-                log::error!(
-                    "Failed to create data directory {}: {}",
-                    data_path.display(),
-                    e
-                );
-            }
-
-            // Initialize canonical mutation capture before any command can mutate user bytes.
-            let twin_event_store = Arc::new(TwinEventStore::new(data_path.clone()));
-            let coordinator = (|| -> Result<Arc<MutationCoordinator>, String> {
-                twin_event_store
-                    .initialize()
-                    .map_err(|error| error.to_string())?;
-                let coordinator = Arc::new(
-                    MutationCoordinator::new(
-                        &data_path,
-                        &vault_path,
-                        twin_event_store.clone(),
-                        Arc::new(NoopMutationLifecycle),
-                    )
-                    .map_err(|error| error.to_string())?,
-                );
-                coordinator
-                    .recover_pending()
-                    .map_err(|error| error.to_string())?;
-                Ok(coordinator)
-            })();
-            let (event_recorder, mutation_coordinator, mutation_startup_error): (
-                Arc<dyn EventRecorder>,
-                Option<Arc<MutationCoordinator>>,
-                Option<String>,
-            ) = match coordinator {
-                    Ok(coordinator) => (coordinator.clone(), Some(coordinator), None),
-                    Err(error) => (
-                        Arc::new(UnavailableEventRecorder::new(error.clone())),
-                        None,
-                        Some(error),
-                    ),
-                };
-            let derived_data_path = if let Some(coordinator) = mutation_coordinator.as_ref() {
-                let guard = coordinator
-                    .begin_root_transition()
-                    .map_err(|error| error.to_string())?;
-                let lease = guard.current_lease().map_err(|error| error.to_string())?;
-                guard
-                    .initialize_namespace(&lease)
-                    .map_err(|error| error.to_string())?;
-                guard
-                    .invalidate_namespace(&lease)
-                    .map_err(|error| error.to_string())?;
-                coordinator
-                    .current_namespace_path()
-                    .map_err(|error| error.to_string())?
-            } else {
-                let scope = crate::services::twin_events::root_identity_for_path(&vault_path)
-                    .map_err(|error| error.to_string())?;
-                crate::services::vault_namespace::scoped_data_path(&data_path, &scope)
-            };
-
-            // Initialize services
-            let knowledge_store = KnowledgeStore::with_event_recorder(
-                vault_path.clone(),
-                derived_data_path.clone(),
-                event_recorder.clone(),
-            );
-            let graph_index = GraphIndex::new();
-            let search_service = match SearchService::new(derived_data_path.clone()) {
-                Ok(s) => s,
-                Err(e) if e.is_corrupt_or_incompatible() => {
-                    log::error!(
-                        "Search index is explicitly corrupt or incompatible: {}. Attempting rebuild.",
-                        e
-                    );
-                    // Try deleting corrupted index and retrying
-                    let index_path = derived_data_path.join("search_index");
-                    if index_path.exists() {
-                        if let Err(rm_err) = std::fs::remove_dir_all(&index_path) {
-                            log::error!("Failed to remove corrupted index: {}", rm_err);
-                        }
-                    }
-                    SearchService::new(derived_data_path.clone()).unwrap_or_else(|e2| {
-                        log::error!("Search service initialization failed after rebuild: {}", e2);
-                        std::process::exit(1);
-                    })
-                }
-                Err(e) => return Err(e.into()),
-            };
-            // Initialize chunk index (parallel to search index)
-            let chunk_index = match ChunkIndex::new(derived_data_path.clone()) {
-                Ok(c) => c,
-                Err(e) => {
-                    log::error!(
-                        "Failed to initialize chunk index: {}. Attempting rebuild.",
-                        e
-                    );
-                    let chunk_path = derived_data_path.join("chunk_index");
-                    if chunk_path.exists() {
-                        let _ = std::fs::remove_dir_all(&chunk_path);
-                    }
-                    ChunkIndex::new(derived_data_path.clone()).unwrap_or_else(|e2| {
-                        log::error!("Chunk index initialization failed: {}", e2);
-                        std::process::exit(1);
-                    })
-                }
-            };
-
-            let canvas_store =
-                CanvasStore::with_event_recorder(data_path.join("canvas"), event_recorder.clone());
-            let twin_data_path = if let Some(coordinator) = mutation_coordinator.as_ref() {
-                let guard = coordinator
-                    .begin_root_transition()
-                    .map_err(|error| error.to_string())?;
-                let lease = guard.current_lease().map_err(|error| error.to_string())?;
-                guard
-                    .prepare_twin_data_path(&vault_path, &lease)
-                    .map_err(|error| error.to_string())?
-            } else {
-                crate::models::settings::twin_data_path_for_vault(&data_path, &vault_path)
-                    .map_err(|error| error.to_string())?
-            };
-            let twin_store = TwinStore::with_event_recorder(
-                twin_data_path,
-                data_path.join("twin"),
-                event_recorder.clone(),
-            );
-
-            // Get OpenRouter API key from settings, fall back to environment
-            let environment_api_key = settings_service
-                .allows_environment_fallback()
-                .then(|| std::env::var("OPENROUTER_API_KEY").ok())
-                .flatten();
-            if settings_service.openrouter_api_key().is_none() {
-                if let Some(secret) = environment_api_key {
-                    settings_service.adopt_environment_runtime_secret(secret);
-                }
-            }
-            let api_key = settings_service
-                .openrouter_api_key()
-                .map(str::to_string)
-                .unwrap_or_default();
-            let openrouter = OpenRouterService::new(api_key);
-            let ollama = OllamaService::new(settings_service.get().ollama_base_url.clone());
-
-            // Initialize priority scoring service
-            let priority_service = PriorityScoringService::new(data_path.clone());
-
-            // Initialize retrieval service
-            let retrieval_service = RetrievalService::new(data_path.clone());
-            let link_discovery = LinkDiscoveryService::try_new(derived_data_path.clone())
-                .map_err(|error| error.to_string())?;
-            let markdown_migration = MarkdownMigrationService::try_new(derived_data_path.clone())
-                .map_err(|error| error.to_string())?;
-            let vault_optimizer = VaultOptimizerService::try_new(derived_data_path)
-                .map_err(|error| error.to_string())?;
-
-            // Initialize feedback service using runtime environment only.
-            // Release builds must not embed repository credentials.
-            let feedback_service = FeedbackService::new(data_path.join("feedback"));
-            let boot_state = Arc::new(RwLock::new(BootStatus::default()));
-
-            // Create app state (MemoryService is stateless — no RwLock needed)
-            let state = AppState {
-                knowledge_store: Arc::new(RwLock::new(knowledge_store)),
-                graph_index: Arc::new(RwLock::new(graph_index)),
-                search_service: Arc::new(RwLock::new(search_service)),
-                canvas_store: Arc::new(RwLock::new(canvas_store)),
-                openrouter: Arc::new(RwLock::new(openrouter)),
-                ollama: Arc::new(RwLock::new(ollama)),
-                feedback_service: Arc::new(RwLock::new(feedback_service)),
-                settings_service: Arc::new(RwLock::new(settings_service)),
-                priority_service: Arc::new(RwLock::new(priority_service)),
-                retrieval_service: Arc::new(RwLock::new(retrieval_service)),
-                chunk_index: Arc::new(RwLock::new(chunk_index)),
-                link_discovery: Arc::new(RwLock::new(link_discovery)),
-                markdown_migration: Arc::new(RwLock::new(markdown_migration)),
-                vault_optimizer: Arc::new(RwLock::new(vault_optimizer)),
-                twin_store: Arc::new(RwLock::new(twin_store)),
-                twin_event_store,
-                mutation_coordinator,
-                mutation_startup_error: Arc::new(RwLock::new(mutation_startup_error)),
-                loaded_authority: Arc::new(RwLock::new(None)),
-                authority_repair: Arc::new(tokio::sync::Mutex::new(())),
-                committed_warning_app: Some(app.handle().clone()),
-                vault_transition: Arc::new(RwLock::new(())),
-                memory_service: Arc::new(MemoryService::new()),
-                boot_state,
-            };
+            let state = build_app_state(SettingsService::load()?, Some(app.handle().clone()))?;
 
             app.manage(state);
 
@@ -508,6 +713,15 @@ async fn warm_start_services_inner(
     state: &AppState,
     injected_failure: Option<WarmStartComponent>,
 ) -> Result<(), String> {
+    warm_start_services_inner_with_gap(app_handle, state, injected_failure, || Ok(())).await
+}
+
+async fn warm_start_services_inner_with_gap(
+    app_handle: Option<&tauri::AppHandle>,
+    state: &AppState,
+    injected_failure: Option<WarmStartComponent>,
+    after_namespace: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
     let _root_epoch = acquire_warm_start_root_gate(state).await?;
     let _authority_repair = state.authority_repair.lock().await;
     let coordinator = state
@@ -529,6 +743,12 @@ async fn warm_start_services_inner(
             .map_err(|error| error.to_string())?;
         (namespace_lease, namespace_path)
     };
+    after_namespace()?;
+    drop(
+        coordinator
+            .begin_root_transition()
+            .map_err(|error| error.to_string())?,
+    );
     let boot_started = Instant::now();
 
     maybe_publish_boot_phase(
@@ -538,7 +758,6 @@ async fn warm_start_services_inner(
         BootStatus::new("opening_twin_events", "Opening governed Twin history"),
     )
     .await;
-    initialize_twin_event_store_for_boot(&state.twin_event_store)?;
     maybe_publish_boot_phase(
         app_handle,
         state,
@@ -645,6 +864,7 @@ async fn acquire_warm_start_root_gate(
     Ok(guard)
 }
 
+#[cfg(test)]
 fn initialize_twin_event_store_for_boot(store: &TwinEventStore) -> Result<(), String> {
     store.initialize().map_err(|error| error.to_string())
 }
@@ -978,6 +1198,173 @@ fn start_vault_optimizer_worker(state: AppState) {
 mod tests {
     use super::*;
 
+    fn snapshot_tree(root: &std::path::Path) -> Vec<(String, Option<Vec<u8>>)> {
+        let mut snapshot = walkdir::WalkDir::new(root)
+            .min_depth(1)
+            .into_iter()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                let relative = entry
+                    .path()
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let contents = entry.file_type().is_file().then(|| {
+                    std::fs::read(entry.path()).unwrap_or_else(|error| {
+                        format!("unreadable:{:?}", error.kind()).into_bytes()
+                    })
+                });
+                (relative, contents)
+            })
+            .collect::<Vec<_>>();
+        snapshot.sort_by(|left, right| left.0.cmp(&right.0));
+        snapshot
+    }
+
+    fn stable_boot_settings(
+        temp: &tempfile::TempDir,
+        vault_path: &std::path::Path,
+    ) -> (SettingsService, crate::models::twin_event::ContentDigest) {
+        let data_path = temp.path().join("data");
+        std::fs::create_dir(&data_path).unwrap();
+        std::fs::create_dir(vault_path).unwrap();
+        let identity =
+            crate::services::sync::identity::load_or_create_vault_identity(vault_path).unwrap();
+        let durable_settings = crate::models::settings::UserSettings {
+            vault_path: Some(vault_path.to_string_lossy().into_owned()),
+            ..crate::models::settings::UserSettings::default()
+        };
+        let settings =
+            SettingsService::for_test(temp.path().join("settings.json"), durable_settings.clone());
+        let transition_store = settings.root_transition_store().unwrap();
+        transition_store
+            .write_settings_guarded(
+                &crate::services::root_transition::NonsecretSettingsV1::from_settings(
+                    durable_settings,
+                ),
+            )
+            .unwrap();
+        transition_store
+            .write_lease(
+                &crate::services::twin_events::ActiveMarkdownRootLeaseV1::new_stable(
+                    identity.root_scope.clone(),
+                ),
+            )
+            .unwrap();
+        (settings, identity.root_scope)
+    }
+
+    fn assert_recoverable_detached_validation_state(
+        state: &AppState,
+        active_data_path: &std::path::Path,
+        source_error: &str,
+    ) {
+        assert!(state.mutation_coordinator.is_none());
+        let startup_error = state
+            .mutation_startup_error
+            .try_read()
+            .unwrap()
+            .clone()
+            .expect("detached validation must keep authoritative commands unavailable");
+        assert!(startup_error.contains(source_error));
+        assert!(startup_error.contains("reattach"));
+        let boot = state.boot_state.try_read().unwrap().clone();
+        assert_eq!(boot.phase, "failed");
+        assert!(!boot.ready);
+        assert!(boot.error.as_deref().unwrap().contains(source_error));
+        assert!(boot.error.as_deref().unwrap().contains("reattach"));
+        let recovery_root = state
+            ._recovery_runtime
+            .as_ref()
+            .expect("recoverable boot must retain isolated service roots")
+            .path();
+        assert!(state
+            .twin_event_store
+            .data_path()
+            .starts_with(recovery_root));
+        assert!(!state
+            .twin_event_store
+            .data_path()
+            .starts_with(active_data_path));
+        assert!(state
+            .knowledge_store
+            .try_read()
+            .unwrap()
+            .vault_path()
+            .starts_with(recovery_root));
+    }
+
+    #[test]
+    fn descriptor_mismatch_constructs_failed_app_state_on_isolated_roots() {
+        let temp = tempfile::tempdir().unwrap();
+        let vault_path = temp.path().join("configured-vault");
+        let (settings, expected_scope) = stable_boot_settings(&temp, &vault_path);
+        let replacement_vault = temp.path().join("replacement-vault");
+        std::fs::create_dir(&replacement_vault).unwrap();
+        let replacement =
+            crate::services::sync::identity::load_or_create_vault_identity(&replacement_vault)
+                .unwrap();
+        assert_ne!(replacement.root_scope, expected_scope);
+        std::fs::copy(
+            replacement_vault.join("_grafyn/vault.json"),
+            vault_path.join("_grafyn/vault.json"),
+        )
+        .unwrap();
+        let before = snapshot_tree(temp.path());
+
+        let state = build_app_state(settings, None)
+            .expect("descriptor replacement must leave the reattach UI available");
+
+        assert_recoverable_detached_validation_state(
+            &state,
+            &temp.path().join("data"),
+            "configured stable vault descriptor was replaced",
+        );
+        assert_eq!(snapshot_tree(temp.path()), before);
+    }
+
+    #[test]
+    fn configured_vault_file_constructs_failed_app_state_on_isolated_roots() {
+        let temp = tempfile::tempdir().unwrap();
+        let vault_path = temp.path().join("configured-vault");
+        let (settings, _scope) = stable_boot_settings(&temp, &vault_path);
+        std::fs::remove_dir_all(&vault_path).unwrap();
+        std::fs::write(&vault_path, b"not a vault directory").unwrap();
+        let before = snapshot_tree(temp.path());
+
+        let state = build_app_state(settings, None)
+            .expect("invalid configured path must leave the reattach UI available");
+
+        assert_recoverable_detached_validation_state(
+            &state,
+            &temp.path().join("data"),
+            "configured stable vault path is not a real directory",
+        );
+        assert_eq!(snapshot_tree(temp.path()), before);
+    }
+
+    #[test]
+    fn invalid_root_transition_still_aborts_app_state_construction() {
+        let temp = tempfile::tempdir().unwrap();
+        let vault_path = temp.path().join("configured-vault");
+        let (settings, _scope) = stable_boot_settings(&temp, &vault_path);
+        std::fs::write(
+            temp.path().join("data/twin/events/root-transition-v1.json"),
+            b"not a root transition",
+        )
+        .unwrap();
+        let before = snapshot_tree(temp.path());
+
+        let error = match build_app_state(settings, None) {
+            Ok(_) => panic!("root-transition recovery errors must remain strict"),
+            Err(error) => error,
+        };
+
+        assert!(error.contains("invalid root transition"));
+        assert_eq!(snapshot_tree(temp.path()), before);
+    }
+
     #[test]
     fn optimizer_worker_failure_preserves_exact_authority_for_repair() {
         let (state, _vault, _data) = crate::commands::commit_note_write_tests::build_test_state();
@@ -1065,6 +1452,120 @@ mod tests {
         (state, vault, data)
     }
 
+    fn build_stable_warm_start_state() -> (AppState, tempfile::TempDir, tempfile::TempDir) {
+        let vault = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let identity =
+            crate::services::sync::identity::load_or_create_vault_identity(vault.path()).unwrap();
+        let transition_store = crate::services::root_transition::RootTransitionStore::new(
+            data.path(),
+            data.path().join("settings.json"),
+            Arc::new(crate::services::root_transition::MemoryVersionedSecretStore::default()),
+        )
+        .unwrap();
+        crate::services::twin_events::PersistedMutationIdentityProvider::load_or_create(
+            data.path(),
+        )
+        .unwrap();
+        let durable_settings = crate::models::settings::UserSettings {
+            vault_path: Some(vault.path().to_string_lossy().into_owned()),
+            ..crate::models::settings::UserSettings::default()
+        };
+        transition_store
+            .write_settings(
+                &crate::services::root_transition::NonsecretSettingsV1::from_settings(
+                    durable_settings.clone(),
+                ),
+            )
+            .unwrap();
+        transition_store
+            .write_lease(
+                &crate::services::twin_events::ActiveMarkdownRootLeaseV1::new_stable(
+                    identity.root_scope,
+                ),
+            )
+            .unwrap();
+        transition_store
+            .write_key_authority(
+                crate::services::root_transition::OpenRouterKeySource::Unset,
+                None,
+            )
+            .unwrap();
+        let event_store = Arc::new(TwinEventStore::new(data.path()));
+        let coordinator = Arc::new(
+            MutationCoordinator::new_stable(
+                data.path(),
+                vault.path(),
+                event_store.clone(),
+                Arc::new(NoopMutationLifecycle),
+            )
+            .unwrap(),
+        );
+        let namespace = coordinator.current_namespace_path().unwrap();
+        let scope = coordinator.current_root_epoch().unwrap().root_scope;
+        let twin_path = {
+            let guard = coordinator.begin_root_transition().unwrap();
+            let lease = guard.current_lease().unwrap();
+            guard.prepare_twin_data_path(vault.path(), &lease).unwrap()
+        };
+        let settings = crate::services::settings::SettingsService::for_test(
+            data.path().join("settings.json"),
+            durable_settings,
+        );
+        let state = AppState {
+            knowledge_store: Arc::new(RwLock::new(KnowledgeStore::with_event_recorder(
+                vault.path().to_path_buf(),
+                namespace.clone(),
+                coordinator.clone(),
+            ))),
+            graph_index: Arc::new(RwLock::new(GraphIndex::new())),
+            search_service: Arc::new(RwLock::new(SearchService::new(namespace.clone()).unwrap())),
+            canvas_store: Arc::new(RwLock::new(CanvasStore::with_event_recorder(
+                crate::services::canvas_store::scoped_canvas_path(data.path(), &scope),
+                coordinator.clone(),
+            ))),
+            openrouter: Arc::new(RwLock::new(OpenRouterService::new(String::new()))),
+            ollama: Arc::new(RwLock::new(OllamaService::new(String::new()))),
+            feedback_service: Arc::new(RwLock::new(FeedbackService::new(
+                data.path().join("feedback"),
+            ))),
+            settings_service: Arc::new(RwLock::new(settings)),
+            priority_service: Arc::new(RwLock::new(PriorityScoringService::new(
+                data.path().to_path_buf(),
+            ))),
+            retrieval_service: Arc::new(RwLock::new(RetrievalService::new(
+                data.path().to_path_buf(),
+            ))),
+            chunk_index: Arc::new(RwLock::new(ChunkIndex::new(namespace.clone()).unwrap())),
+            link_discovery: Arc::new(RwLock::new(
+                LinkDiscoveryService::try_new(namespace.clone()).unwrap(),
+            )),
+            markdown_migration: Arc::new(RwLock::new(
+                MarkdownMigrationService::try_new(namespace.clone()).unwrap(),
+            )),
+            vault_optimizer: Arc::new(RwLock::new(
+                VaultOptimizerService::try_new(namespace).unwrap(),
+            )),
+            twin_store: Arc::new(RwLock::new(TwinStore::with_event_recorder_scoped(
+                twin_path,
+                data.path().join("twin"),
+                scope,
+                coordinator.clone(),
+            ))),
+            twin_event_store: event_store,
+            mutation_coordinator: Some(coordinator),
+            mutation_startup_error: Arc::new(RwLock::new(None)),
+            loaded_authority: Arc::new(RwLock::new(None)),
+            authority_repair: Arc::new(tokio::sync::Mutex::new(())),
+            committed_warning_app: None,
+            vault_transition: Arc::new(RwLock::new(())),
+            memory_service: Arc::new(MemoryService::new()),
+            boot_state: Arc::new(RwLock::new(BootStatus::default())),
+            _recovery_runtime: None,
+        };
+        (state, vault, data)
+    }
+
     #[tokio::test]
     async fn update_boot_state_replaces_existing_status() {
         let boot_state = Arc::new(RwLock::new(BootStatus::default()));
@@ -1088,6 +1589,65 @@ mod tests {
         );
         drop(transition);
         drop(task.await.unwrap().unwrap());
+    }
+
+    #[tokio::test]
+    async fn peer_root_wal_in_warm_start_gap_fails_before_any_further_data_change() {
+        let (state, vault, data) = build_stable_warm_start_state();
+        let data_snapshot = Arc::new(std::sync::Mutex::new(None));
+        let vault_snapshot = Arc::new(std::sync::Mutex::new(None));
+        let data_snapshot_hook = data_snapshot.clone();
+        let vault_snapshot_hook = vault_snapshot.clone();
+        let data_path = data.path().to_path_buf();
+        let vault_path = vault.path().to_path_buf();
+
+        let error = warm_start_services_inner_with_gap(None, &state, None, move || {
+            std::fs::write(
+                data_path.join("twin/events/root-transition-v1.json"),
+                b"peer-prepared",
+            )
+            .map_err(|error| error.to_string())?;
+            *data_snapshot_hook.lock().unwrap() = Some(snapshot_tree(&data_path));
+            *vault_snapshot_hook.lock().unwrap() = Some(snapshot_tree(&vault_path));
+            Ok(())
+        })
+        .await
+        .unwrap_err();
+
+        assert!(error.contains("root-transition"));
+        assert_eq!(
+            snapshot_tree(data.path()),
+            data_snapshot.lock().unwrap().clone().unwrap()
+        );
+        assert_eq!(
+            snapshot_tree(vault.path()),
+            vault_snapshot.lock().unwrap().clone().unwrap()
+        );
+        assert!(state.twin_event_store.ordered_events().unwrap().is_empty());
+    }
+
+    #[test]
+    fn attached_boot_namespace_initialization_does_not_self_deadlock() {
+        let (state, _vault, _data) = crate::commands::commit_note_write_tests::build_test_state();
+        let coordinator = state.mutation_coordinator.unwrap();
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let _ = sender.send(initialize_attached_namespace(&coordinator));
+        });
+
+        let result = receiver
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("attached namespace initialization must not self-deadlock");
+        let (namespace, scope) = result.unwrap();
+        assert!(namespace.is_dir());
+        assert_eq!(
+            namespace,
+            std::fs::canonicalize(crate::services::vault_namespace::scoped_data_path(
+                state.twin_event_store.data_path(),
+                &scope,
+            ))
+            .unwrap()
+        );
     }
 
     #[tokio::test]
@@ -1146,21 +1706,360 @@ mod tests {
     fn production_twin_store_never_falls_back_to_the_noop_constructor() {
         let desktop = include_str!("lib.rs");
         let settings = include_str!("commands/settings.rs");
-        assert!(desktop.contains("TwinStore::with_event_recorder("));
+        assert!(desktop.contains("TwinStore::with_event_recorder_scoped("));
         let desktop_noop = [
             "let twin_store = TwinStore::",
             "new(settings_service.get().effective_twin_data_path())",
         ]
         .concat();
         assert!(!desktop.contains(&desktop_noop));
-        let retarget = settings
-            .find("twin.replace_root_path(candidate_twin)")
-            .unwrap();
+        let retarget = settings.find("replace_twin_and_canvas_roots(").unwrap();
         let publish = settings
             .find("settings.publish_runtime_authority(")
             .unwrap();
         assert!(retarget < publish);
+        assert!(settings.contains("twin.replace_root_path_scoped("));
         let settings_noop = ["TwinStore::", "new(new_twin_path)"].concat();
         assert!(!settings.contains(&settings_noop));
+    }
+
+    #[test]
+    fn first_install_without_a_stable_lease_creates_the_configured_vault() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_path = temp.path().join("data");
+        let configured_vault = temp.path().join("first-install-vault");
+        std::fs::create_dir(&data_path).unwrap();
+        let transition_store = crate::services::root_transition::RootTransitionStore::new(
+            &data_path,
+            temp.path().join("settings.json"),
+            Arc::new(crate::services::root_transition::MemoryVersionedSecretStore::default()),
+        )
+        .unwrap();
+        transition_store
+            .write_settings_guarded(
+                &crate::services::root_transition::NonsecretSettingsV1::from_settings(
+                    crate::models::settings::UserSettings {
+                        vault_path: Some(configured_vault.to_string_lossy().into_owned()),
+                        ..crate::models::settings::UserSettings::default()
+                    },
+                ),
+            )
+            .unwrap();
+
+        let runtime = transition_store
+            .prepare_runtime_vault_path(&configured_vault)
+            .unwrap();
+
+        assert_eq!(runtime, configured_vault);
+        assert!(runtime.is_dir());
+    }
+
+    #[test]
+    fn stable_attached_vault_removed_after_detachment_probe_is_not_recreated() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_path = temp.path().join("data");
+        let configured_vault = temp.path().join("stable-vault");
+        std::fs::create_dir(&data_path).unwrap();
+        std::fs::create_dir(&configured_vault).unwrap();
+        let identity =
+            crate::services::sync::identity::load_or_create_vault_identity(&configured_vault)
+                .unwrap();
+        let transition_store = crate::services::root_transition::RootTransitionStore::new(
+            &data_path,
+            temp.path().join("settings.json"),
+            Arc::new(crate::services::root_transition::MemoryVersionedSecretStore::default()),
+        )
+        .unwrap();
+        let settings = crate::models::settings::UserSettings {
+            vault_path: Some(configured_vault.to_string_lossy().into_owned()),
+            ..crate::models::settings::UserSettings::default()
+        };
+        transition_store
+            .write_settings_guarded(
+                &crate::services::root_transition::NonsecretSettingsV1::from_settings(settings),
+            )
+            .unwrap();
+        transition_store
+            .write_lease(
+                &crate::services::twin_events::ActiveMarkdownRootLeaseV1::new_stable(
+                    identity.root_scope,
+                ),
+            )
+            .unwrap();
+
+        assert!(transition_store.detached_stable_vault().unwrap().is_none());
+        std::fs::remove_dir_all(&configured_vault).unwrap();
+
+        let error = transition_store
+            .prepare_runtime_vault_path(&configured_vault)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            crate::services::twin_events::MutationError::Io(_)
+                | crate::services::twin_events::MutationError::Store(_)
+        ));
+        assert!(
+            !configured_vault.exists(),
+            "a stable vault removed after the probe must remain available for reattachment"
+        );
+    }
+
+    #[test]
+    fn production_boot_probes_detachment_before_any_runtime_root_preparation() {
+        let desktop = include_str!("lib.rs");
+        let probe = desktop.find(".detached_stable_vault()").unwrap();
+        let prepare = desktop
+            .find(".prepare_runtime_vault_path(&vault_path)")
+            .unwrap();
+
+        assert!(probe < prepare);
+        let unconditional_vault_create = ["std::fs::create_dir_all", "(&vault_path)"].concat();
+        assert!(!desktop.contains(&unconditional_vault_create));
+    }
+
+    #[test]
+    fn peer_wal_after_a_no_lease_probe_prevents_first_install_creation() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_path = temp.path().join("data");
+        let configured_vault = temp.path().join("first-install-vault");
+        std::fs::create_dir(&data_path).unwrap();
+        let transition_store = crate::services::root_transition::RootTransitionStore::new(
+            &data_path,
+            temp.path().join("settings.json"),
+            Arc::new(crate::services::root_transition::MemoryVersionedSecretStore::default()),
+        )
+        .unwrap();
+        transition_store
+            .write_settings_guarded(
+                &crate::services::root_transition::NonsecretSettingsV1::from_settings(
+                    crate::models::settings::UserSettings {
+                        vault_path: Some(configured_vault.to_string_lossy().into_owned()),
+                        ..crate::models::settings::UserSettings::default()
+                    },
+                ),
+            )
+            .unwrap();
+        assert!(transition_store.detached_stable_vault().unwrap().is_none());
+        std::fs::write(
+            data_path.join("twin/events/root-transition-v1.json"),
+            b"peer-prepared",
+        )
+        .unwrap();
+
+        let error = transition_store
+            .prepare_runtime_vault_path(&configured_vault)
+            .unwrap_err();
+        assert!(error.to_string().contains("root-transition"));
+        assert!(!configured_vault.exists());
+    }
+
+    #[test]
+    fn peer_stable_lease_after_a_no_lease_probe_prevents_first_install_creation() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_path = temp.path().join("data");
+        let configured_vault = temp.path().join("first-install-vault");
+        std::fs::create_dir(&data_path).unwrap();
+        let transition_store = crate::services::root_transition::RootTransitionStore::new(
+            &data_path,
+            temp.path().join("settings.json"),
+            Arc::new(crate::services::root_transition::MemoryVersionedSecretStore::default()),
+        )
+        .unwrap();
+        transition_store
+            .write_settings_guarded(
+                &crate::services::root_transition::NonsecretSettingsV1::from_settings(
+                    crate::models::settings::UserSettings {
+                        vault_path: Some(configured_vault.to_string_lossy().into_owned()),
+                        ..crate::models::settings::UserSettings::default()
+                    },
+                ),
+            )
+            .unwrap();
+        assert!(transition_store.detached_stable_vault().unwrap().is_none());
+        transition_store
+            .write_lease(
+                &crate::services::twin_events::ActiveMarkdownRootLeaseV1::new_stable(
+                    crate::models::twin_event::ContentDigest::parse("a".repeat(64)).unwrap(),
+                ),
+            )
+            .unwrap();
+
+        let error = transition_store
+            .prepare_runtime_vault_path(&configured_vault)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            crate::services::twin_events::MutationError::Io(_)
+                | crate::services::twin_events::MutationError::Store(_)
+        ));
+        assert!(!configured_vault.exists());
+    }
+
+    #[test]
+    fn coordinator_failure_branch_never_creates_or_adopts_a_vault_descriptor() {
+        let desktop = include_str!("lib.rs");
+        let coordinator_result = desktop
+            .find("let (event_recorder, mutation_coordinator")
+            .unwrap();
+        let services = desktop.find("// Initialize services").unwrap();
+        assert!(
+            !desktop[coordinator_result..services].contains("load_or_create_vault_identity"),
+            "a failed coordinator must enter isolated recovery without touching vault identity"
+        );
+    }
+
+    #[test]
+    fn warm_start_does_not_reinitialize_events_after_releasing_the_root_guard() {
+        let desktop = include_str!("lib.rs");
+        let warm_start = desktop.find("async fn warm_start_services_inner(").unwrap();
+        let root_gate = desktop
+            .find("async fn acquire_warm_start_root_gate(")
+            .unwrap();
+        assert!(
+            !desktop[warm_start..root_gate]
+                .contains("initialize_twin_event_store_for_boot(&state.twin_event_store)"),
+            "coordinator construction already initializes and activates the event store"
+        );
+    }
+
+    #[test]
+    fn pending_root_wal_failure_uses_only_ephemeral_recovery_service_roots() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_path = temp.path().join("active-data");
+        let vault_path = temp.path().join("active-vault");
+        std::fs::create_dir(&data_path).unwrap();
+        std::fs::create_dir(&vault_path).unwrap();
+        let identity =
+            crate::services::sync::identity::load_or_create_vault_identity(&vault_path).unwrap();
+        let transition_store = crate::services::root_transition::RootTransitionStore::new(
+            &data_path,
+            temp.path().join("settings.json"),
+            Arc::new(crate::services::root_transition::MemoryVersionedSecretStore::default()),
+        )
+        .unwrap();
+        crate::services::twin_events::PersistedMutationIdentityProvider::load_or_create(&data_path)
+            .unwrap();
+        let settings = crate::models::settings::UserSettings {
+            vault_path: Some(vault_path.to_string_lossy().into_owned()),
+            ..crate::models::settings::UserSettings::default()
+        };
+        transition_store
+            .write_settings_guarded(
+                &crate::services::root_transition::NonsecretSettingsV1::from_settings(settings),
+            )
+            .unwrap();
+        transition_store
+            .write_lease(
+                &crate::services::twin_events::ActiveMarkdownRootLeaseV1::new_stable(
+                    identity.root_scope,
+                ),
+            )
+            .unwrap();
+
+        // Model the peer gap after the desktop's detachment/lease probes: the
+        // descriptor disappears and a peer publishes a prepared root WAL before
+        // this process enters coordinator construction.
+        std::fs::remove_file(vault_path.join("_grafyn/vault.json")).unwrap();
+        std::fs::write(
+            data_path.join("twin/events/root-transition-v1.json"),
+            b"peer-prepared",
+        )
+        .unwrap();
+        let event_store = Arc::new(TwinEventStore::new(&data_path));
+        let coordinator_error = match MutationCoordinator::new_stable(
+            &data_path,
+            &vault_path,
+            event_store,
+            Arc::new(NoopMutationLifecycle),
+        ) {
+            Ok(_) => panic!("the pending root WAL must reject coordinator construction"),
+            Err(error) => error,
+        };
+        assert!(coordinator_error.to_string().contains("root-transition"));
+        let data_before = snapshot_tree(&data_path);
+        let vault_before = snapshot_tree(&vault_path);
+
+        let recovery = isolated_recovery_runtime_roots(&data_path, &vault_path).unwrap();
+        assert!(!recovery.data_path.starts_with(&data_path));
+        assert!(!recovery.vault_path.starts_with(&vault_path));
+        assert!(!recovery.derived_data_path.starts_with(&data_path));
+        let recovery_path = recovery
+            .recovery_runtime
+            .as_ref()
+            .unwrap()
+            .path()
+            .to_path_buf();
+        let unavailable: Arc<dyn EventRecorder> =
+            Arc::new(UnavailableEventRecorder::new(coordinator_error.to_string()));
+        {
+            let _knowledge = KnowledgeStore::with_event_recorder(
+                recovery.vault_path.clone(),
+                recovery.derived_data_path.clone(),
+                unavailable.clone(),
+            );
+            let _search = SearchService::new(recovery.derived_data_path.clone()).unwrap();
+            let _chunk = ChunkIndex::new(recovery.derived_data_path.clone()).unwrap();
+            let _canvas = CanvasStore::with_event_recorder(
+                crate::services::canvas_store::scoped_canvas_path(
+                    &recovery.data_path,
+                    &recovery.active_scope,
+                ),
+                unavailable.clone(),
+            );
+            let _twin = TwinStore::with_event_recorder_scoped(
+                crate::models::settings::twin_data_path_for_scope(
+                    &recovery.data_path,
+                    &recovery.active_scope,
+                ),
+                recovery.data_path.join("twin"),
+                recovery.active_scope.clone(),
+                unavailable,
+            );
+            let _link = LinkDiscoveryService::try_new(recovery.derived_data_path.clone()).unwrap();
+            let _migration =
+                MarkdownMigrationService::try_new(recovery.derived_data_path.clone()).unwrap();
+            let _optimizer =
+                VaultOptimizerService::try_new(recovery.derived_data_path.clone()).unwrap();
+            let _priority = PriorityScoringService::new(recovery.data_path.clone());
+            let _retrieval = RetrievalService::new(recovery.data_path.clone());
+            let _feedback = FeedbackService::new(recovery.data_path.join("feedback"));
+        }
+
+        assert_eq!(snapshot_tree(&data_path), data_before);
+        assert_eq!(snapshot_tree(&vault_path), vault_before);
+        assert!(!vault_path.join("_grafyn/vault.json").exists());
+        let retained_runtime = recovery.recovery_runtime.as_ref().unwrap().clone();
+        drop(recovery);
+        assert!(recovery_path.exists());
+        drop(retained_runtime);
+        assert!(!recovery_path.exists());
+    }
+
+    #[test]
+    fn recovery_runtime_rejects_a_temporary_base_inside_the_active_vault() {
+        let active_vault = tempfile::tempdir().unwrap();
+        let active_data = tempfile::tempdir().unwrap();
+        let before = snapshot_tree(active_vault.path());
+        let source = include_str!("lib.rs");
+        let precheck = source
+            .find("canonical_path_is_within(temporary_base, active_root)")
+            .unwrap();
+        let create = source.find(".tempdir_in(temporary_base)").unwrap();
+        assert!(
+            precheck < create,
+            "overlap must be rejected before creation"
+        );
+
+        let error = match isolated_recovery_runtime_roots_in(
+            active_vault.path(),
+            active_data.path(),
+            active_vault.path(),
+        ) {
+            Ok(_) => panic!("recovery runtime must not overlap an active vault"),
+            Err(error) => error,
+        };
+
+        assert!(error.contains("overlaps the active vault root"));
+        assert_eq!(snapshot_tree(active_vault.path()), before);
     }
 }

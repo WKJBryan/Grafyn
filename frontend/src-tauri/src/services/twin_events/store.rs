@@ -57,10 +57,53 @@ impl From<io::Error> for StoreError {
     }
 }
 
-#[derive(Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EventNamespace {
+    Legacy,
+    Vault(crate::models::twin_event::ContentDigest),
+}
+
+impl EventNamespace {
+    fn records_dir(&self) -> String {
+        match self {
+            Self::Legacy => "twin/events/v1".into(),
+            Self::Vault(scope) => {
+                format!("twin/events/vaults/v1/{}/records/v1", scope.as_str())
+            }
+        }
+    }
+
+    fn quarantine_dir(&self) -> String {
+        match self {
+            Self::Legacy => "twin/events/quarantine/v1".into(),
+            Self::Vault(scope) => format!("twin/events/vaults/v1/{}/quarantine/v1", scope.as_str()),
+        }
+    }
+
+    fn staging_dir(&self) -> String {
+        match self {
+            Self::Legacy => "twin/events/staging/v1".into(),
+            Self::Vault(scope) => {
+                format!("twin/events/vaults/v1/{}/staging/v1", scope.as_str())
+            }
+        }
+    }
+}
+
 struct StoreState {
     initialized: bool,
     events: BTreeMap<EventId, TwinEvent>,
+    namespace: EventNamespace,
+}
+
+impl Default for StoreState {
+    fn default() -> Self {
+        Self {
+            initialized: false,
+            events: BTreeMap::new(),
+            namespace: EventNamespace::Legacy,
+        }
+    }
 }
 
 pub struct TwinEventStore {
@@ -73,9 +116,23 @@ pub struct TwinEventStore {
 
 impl TwinEventStore {
     pub fn new(data_path: impl AsRef<Path>) -> Self {
+        Self::new_in_namespace(data_path, EventNamespace::Legacy)
+    }
+
+    pub fn new_scoped(
+        data_path: impl AsRef<Path>,
+        vault_scope: crate::models::twin_event::ContentDigest,
+    ) -> Self {
+        Self::new_in_namespace(data_path, EventNamespace::Vault(vault_scope))
+    }
+
+    fn new_in_namespace(data_path: impl AsRef<Path>, namespace: EventNamespace) -> Self {
         Self {
             data_path: data_path.as_ref().to_path_buf(),
-            state: Mutex::new(StoreState::default()),
+            state: Mutex::new(StoreState {
+                namespace,
+                ..StoreState::default()
+            }),
             root: Mutex::new(None),
             #[cfg(test)]
             after_enumeration_hook: Mutex::new(None),
@@ -83,17 +140,31 @@ impl TwinEventStore {
     }
 
     pub fn events_dir(&self) -> PathBuf {
-        self.data_path.join("twin").join("events").join("v1")
+        self.data_path.join(
+            self.state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .namespace
+                .records_dir(),
+        )
     }
     pub fn quarantine_dir(&self) -> PathBuf {
-        self.data_path
-            .join("twin")
-            .join("events")
-            .join("quarantine")
-            .join("v1")
+        self.data_path.join(
+            self.state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .namespace
+                .quarantine_dir(),
+        )
     }
     pub(crate) fn data_path(&self) -> &Path {
         &self.data_path
+    }
+    pub(crate) fn is_legacy_namespace(&self) -> Result<bool, StoreError> {
+        self.state
+            .lock()
+            .map_err(|_| StoreError::Invalid("Twin event store lock poisoned".into()))
+            .map(|state| matches!(state.namespace, EventNamespace::Legacy))
     }
     #[cfg(test)]
     fn set_after_enumeration_hook(&self, hook: impl FnOnce() + Send + 'static) {
@@ -120,9 +191,9 @@ impl TwinEventStore {
             .state
             .lock()
             .map_err(|_| StoreError::Invalid("Twin event store lock poisoned".into()))?;
-        let root = self.ensure_store_layout()?;
-        let lock = self.acquire_process_lock(&root)?;
-        let events = self.load_records(&root)?;
+        let root = self.ensure_store_layout(&state.namespace)?;
+        let lock = self.acquire_process_lock(&root, &state.namespace)?;
+        let events = self.load_records(&root, &state.namespace)?;
         lock.unlock()?;
         *self
             .root
@@ -143,8 +214,8 @@ impl TwinEventStore {
             return Err(StoreError::NotInitialized);
         }
         let root = self.root_capability()?;
-        let lock = self.acquire_process_lock(&root)?;
-        state.events = self.load_records(&root)?;
+        let lock = self.acquire_process_lock(&root, &state.namespace)?;
+        state.events = self.load_records(&root, &state.namespace)?;
         let outcome = validate_candidate_append(&state.events, &mut event);
         let outcome = match outcome {
             Ok(outcome) => outcome,
@@ -158,7 +229,7 @@ impl TwinEventStore {
             return Ok(outcome);
         }
         let bytes = serialize_record(&event)?;
-        self.install_no_clobber(&root, &event, &bytes)?;
+        self.install_no_clobber(&root, &state.namespace, &event, &bytes)?;
         state.events.insert(event.event_id.clone(), event);
         lock.unlock()?;
         Ok(outcome)
@@ -176,8 +247,8 @@ impl TwinEventStore {
             return Err(StoreError::NotInitialized);
         }
         let root = self.root_capability()?;
-        let lock = self.acquire_process_lock(&root)?;
-        state.events = self.load_records(&root)?;
+        let lock = self.acquire_process_lock(&root, &state.namespace)?;
+        state.events = self.load_records(&root, &state.namespace)?;
         let result = (|| {
             let mut simulated = state.events.clone();
             for candidate in group {
@@ -202,8 +273,8 @@ impl TwinEventStore {
             return Err(StoreError::NotInitialized);
         }
         let root = self.root_capability()?;
-        let lock = self.acquire_process_lock(&root)?;
-        state.events = self.load_records(&root)?;
+        let lock = self.acquire_process_lock(&root, &state.namespace)?;
+        state.events = self.load_records(&root, &state.namespace)?;
         lock.unlock()?;
         topological_order(&state.events.values().cloned().collect::<Vec<_>>())
     }
@@ -220,8 +291,8 @@ impl TwinEventStore {
             return Err(StoreError::NotInitialized);
         }
         let root = self.root_capability()?;
-        let lock = self.acquire_process_lock(&root)?;
-        state.events = self.load_records(&root)?;
+        let lock = self.acquire_process_lock(&root, &state.namespace)?;
+        state.events = self.load_records(&root, &state.namespace)?;
         lock.unlock()?;
         topological_order(
             &state
@@ -233,16 +304,66 @@ impl TwinEventStore {
         )
     }
 
+    pub fn activate_vault_scope(
+        &self,
+        vault_scope: crate::models::twin_event::ContentDigest,
+    ) -> Result<(), StoreError> {
+        let process_lock = super::acquire_shared_coordinator_process_lock(&self.data_path)
+            .map_err(store_capability_error)?;
+        let result = self.activate_vault_scope_locked(vault_scope, &process_lock);
+        process_lock.unlock()?;
+        result
+    }
+
+    pub(crate) fn activate_vault_scope_locked(
+        &self,
+        vault_scope: crate::models::twin_event::ContentDigest,
+        process_lock: &super::CoordinatorProcessLock,
+    ) -> Result<(), StoreError> {
+        if !process_lock
+            .covers_data_path(&self.data_path)
+            .map_err(store_capability_error)?
+        {
+            return Err(StoreError::Invalid(
+                "coordinator process lock does not cover the Twin event data root".into(),
+            ));
+        }
+        let namespace = EventNamespace::Vault(vault_scope);
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| StoreError::Invalid("Twin event store lock poisoned".into()))?;
+        if !state.initialized {
+            return Err(StoreError::NotInitialized);
+        }
+        if state.namespace == namespace {
+            return Ok(());
+        }
+        let root = self.root_capability()?;
+        self.ensure_namespace_layout(&root, &namespace)?;
+        let append_lock = self.acquire_process_lock(&root, &namespace)?;
+        let events = self.load_records(&root, &namespace);
+        append_lock.unlock()?;
+        let events = events?;
+        state.namespace = namespace;
+        state.events = events;
+        Ok(())
+    }
+
     fn acquire_process_lock(
         &self,
         root: &super::AnchoredRoot,
+        namespace: &EventNamespace,
     ) -> Result<super::AnchoredExclusiveLock, StoreError> {
-        self.validate_store_layout(root)?;
+        self.validate_store_layout(root, namespace)?;
         root.lock_exclusive("twin/events/append-v1.lock")
             .map_err(store_capability_error)
     }
 
-    fn ensure_store_layout(&self) -> Result<super::AnchoredRoot, StoreError> {
+    fn ensure_store_layout(
+        &self,
+        namespace: &EventNamespace,
+    ) -> Result<super::AnchoredRoot, StoreError> {
         if !self.data_path.exists() {
             fs::create_dir_all(&self.data_path)?;
         }
@@ -252,35 +373,45 @@ impl TwinEventStore {
             .map_err(store_capability_error)?;
         root.open_directory("twin/events", true)
             .map_err(store_capability_error)?;
-        root.open_directory("twin/events/v1", true)
+        self.ensure_namespace_layout(&root, namespace)?;
+        Ok(root)
+    }
+
+    fn ensure_namespace_layout(
+        &self,
+        root: &super::AnchoredRoot,
+        namespace: &EventNamespace,
+    ) -> Result<(), StoreError> {
+        root.open_directory(&namespace.records_dir(), true)
             .map_err(|error| {
                 StoreError::Io(format!(
                     "failed to initialize canonical Twin event directory: {error}"
                 ))
             })?;
-        root.open_directory("twin/events/quarantine", true)
-            .map_err(store_capability_error)?;
-        root.open_directory("twin/events/quarantine/v1", true)
+        root.open_directory(&namespace.quarantine_dir(), true)
             .map_err(|error| {
                 StoreError::Io(format!(
                     "failed to initialize Twin event quarantine: {error}"
                 ))
             })?;
-        root.open_directory("twin/events/staging/v1", true)
+        root.open_directory(&namespace.staging_dir(), true)
             .map_err(store_capability_error)?;
-        Ok(root)
+        Ok(())
     }
 
-    fn validate_store_layout(&self, root: &super::AnchoredRoot) -> Result<(), StoreError> {
+    fn validate_store_layout(
+        &self,
+        root: &super::AnchoredRoot,
+        namespace: &EventNamespace,
+    ) -> Result<(), StoreError> {
         for directory in [
-            "twin",
-            "twin/events",
-            "twin/events/v1",
-            "twin/events/quarantine",
-            "twin/events/quarantine/v1",
-            "twin/events/staging/v1",
+            "twin".into(),
+            "twin/events".into(),
+            namespace.records_dir(),
+            namespace.quarantine_dir(),
+            namespace.staging_dir(),
         ] {
-            root.open_directory(directory, false)
+            root.open_directory(&directory, false)
                 .map_err(store_capability_error)?;
         }
         Ok(())
@@ -299,10 +430,11 @@ impl TwinEventStore {
     fn load_records(
         &self,
         root: &super::AnchoredRoot,
+        namespace: &EventNamespace,
     ) -> Result<BTreeMap<EventId, TwinEvent>, StoreError> {
-        self.validate_store_layout(root)?;
+        self.validate_store_layout(root, namespace)?;
         let mut parsed = Vec::new();
-        let keys = self.event_record_keys(root)?;
+        let keys = self.event_record_keys(root, namespace)?;
         #[cfg(test)]
         if let Some(hook) = self.after_enumeration_hook.lock().unwrap().take() {
             hook();
@@ -316,7 +448,7 @@ impl TwinEventStore {
                     )))
                 }
                 Err(super::MutationError::Invalid(message)) if message.contains("exceeds its") => {
-                    self.quarantine(root, &key)?;
+                    self.quarantine(root, namespace, &key)?;
                     continue;
                 }
                 Err(error) => return Err(store_capability_error(error)),
@@ -324,18 +456,18 @@ impl TwinEventStore {
             let event = match serde_json::from_slice::<TwinEvent>(&bytes) {
                 Ok(mut event) => {
                     if event.validate().is_err() || derive_event_id(&event) != event.event_id {
-                        self.quarantine(root, &key)?;
+                        self.quarantine(root, namespace, &key)?;
                         continue;
                     }
-                    if key != canonical_event_key(&event.event_id) {
-                        self.quarantine(root, &key)?;
+                    if key != canonical_event_key(namespace, &event.event_id) {
+                        self.quarantine(root, namespace, &key)?;
                         continue;
                     }
                     event.normalize();
                     event
                 }
                 Err(_) => {
-                    self.quarantine(root, &key)?;
+                    self.quarantine(root, namespace, &key)?;
                     continue;
                 }
             };
@@ -357,7 +489,7 @@ impl TwinEventStore {
             let mut retained = Vec::with_capacity(parsed.len() - invalid.len());
             for (path, event) in parsed {
                 if invalid.contains(&event.event_id) {
-                    self.quarantine(root, &path)?;
+                    self.quarantine(root, namespace, &path)?;
                 } else {
                     retained.push((path, event));
                 }
@@ -373,7 +505,7 @@ impl TwinEventStore {
                 if semantic_bytes(existing) != semantic_bytes(&event) {
                     return Err(StoreError::Collision(event.event_id));
                 }
-                self.quarantine(root, &path)?;
+                self.quarantine(root, namespace, &path)?;
                 continue;
             }
             events.insert(event.event_id.clone(), event);
@@ -383,19 +515,24 @@ impl TwinEventStore {
         Ok(events)
     }
 
-    fn event_record_keys(&self, root: &super::AnchoredRoot) -> Result<Vec<String>, StoreError> {
+    fn event_record_keys(
+        &self,
+        root: &super::AnchoredRoot,
+        namespace: &EventNamespace,
+    ) -> Result<Vec<String>, StoreError> {
         let mut keys = Vec::new();
+        let records_dir = namespace.records_dir();
         for (name, kind) in root
-            .directory_entries("twin/events/v1")
+            .directory_entries(&records_dir)
             .map_err(store_capability_error)?
         {
             match kind {
                 super::AnchoredEntryKind::File if name.ends_with(".json") => {
-                    keys.push(format!("twin/events/v1/{name}"));
+                    keys.push(format!("{records_dir}/{name}"));
                 }
                 super::AnchoredEntryKind::File => {}
                 super::AnchoredEntryKind::Directory => {
-                    let directory = format!("twin/events/v1/{name}");
+                    let directory = format!("{records_dir}/{name}");
                     for (leaf, leaf_kind) in root
                         .directory_entries(&directory)
                         .map_err(store_capability_error)?
@@ -419,10 +556,15 @@ impl TwinEventStore {
         Ok(keys)
     }
 
-    fn quarantine(&self, root: &super::AnchoredRoot, source: &str) -> Result<(), StoreError> {
-        self.validate_store_layout(root)?;
+    fn quarantine(
+        &self,
+        root: &super::AnchoredRoot,
+        namespace: &EventNamespace,
+        source: &str,
+    ) -> Result<(), StoreError> {
+        self.validate_store_layout(root, namespace)?;
         let name = source.rsplit('/').next().unwrap_or("event.json");
-        let target = format!("twin/events/quarantine/v1/{}-{name}", Uuid::new_v4());
+        let target = format!("{}/{}-{name}", namespace.quarantine_dir(), Uuid::new_v4());
         root.rename(source, &target, false)
             .map_err(store_capability_error)
     }
@@ -430,14 +572,15 @@ impl TwinEventStore {
     fn install_no_clobber(
         &self,
         root: &super::AnchoredRoot,
+        namespace: &EventNamespace,
         event: &TwinEvent,
         bytes: &[u8],
     ) -> Result<(), StoreError> {
-        self.validate_store_layout(root)?;
-        let target = canonical_event_key(&event.event_id);
-        root.install_no_clobber(&target, "twin/events/staging/v1", bytes)
+        self.validate_store_layout(root, namespace)?;
+        let target = canonical_event_key(namespace, &event.event_id);
+        root.install_no_clobber(&target, &namespace.staging_dir(), bytes)
             .map_err(store_capability_error)?;
-        let existing = self.read_existing_canonical(root, &target, &event.event_id)?;
+        let existing = self.read_existing_canonical(root, namespace, &target, &event.event_id)?;
         if semantic_bytes(&existing) == semantic_bytes(event) {
             Ok(())
         } else {
@@ -448,6 +591,7 @@ impl TwinEventStore {
     fn read_existing_canonical(
         &self,
         root: &super::AnchoredRoot,
+        namespace: &EventNamespace,
         key: &str,
         expected_id: &EventId,
     ) -> Result<TwinEvent, StoreError> {
@@ -461,7 +605,7 @@ impl TwinEventStore {
         event.validate().map_err(StoreError::Invalid)?;
         if &event.event_id != expected_id
             || derive_event_id(&event) != event.event_id
-            || key != canonical_event_key(&event.event_id)
+            || key != canonical_event_key(namespace, &event.event_id)
         {
             return Err(StoreError::Invalid(
                 "existing Twin event is not a canonical record".into(),
@@ -472,9 +616,10 @@ impl TwinEventStore {
     }
 }
 
-fn canonical_event_key(event_id: &EventId) -> String {
+fn canonical_event_key(namespace: &EventNamespace, event_id: &EventId) -> String {
     format!(
-        "twin/events/v1/{}/{}.json",
+        "{}/{}/{}.json",
+        namespace.records_dir(),
         &event_id.as_str()[..2],
         event_id
     )
@@ -987,9 +1132,9 @@ impl EventRecorder for UnavailableEventRecorder {
 mod tests {
     use super::*;
     use crate::models::twin_event::{
-        BoundedContent, CausalStream, DecisionRecorded, EvidenceRef, EvidenceType, Governance,
-        Identifier, RelationshipAssertion, RelationshipDirection, RelationshipPredicate,
-        TwinEventPayload, MAX_DECISION_OPTIONS,
+        BoundedContent, CausalStream, ContentDigest, DecisionRecorded, EvidenceRef, EvidenceType,
+        Governance, Identifier, RelationshipAssertion, RelationshipDirection,
+        RelationshipPredicate, TwinEventPayload, MAX_DECISION_OPTIONS,
     };
     use crate::services::twin_events::test_support::{
         valid_event, valid_event_for_device, valid_event_for_device_and_stream,
@@ -1018,10 +1163,10 @@ mod tests {
         let event_store = include_str!("store.rs");
         for required in [
             "root.lock_exclusive(\"twin/events/append-v1.lock\")",
-            ".directory_entries(\"twin/events/v1\")",
+            ".directory_entries(&records_dir)",
             "root.read_bounded(&key, MAX_TWIN_EVENT_BYTES)",
             "root.rename(source, &target, false)",
-            "root.install_no_clobber(&target, \"twin/events/staging/v1\", bytes)",
+            "root.install_no_clobber(&target, &namespace.staging_dir(), bytes)",
         ] {
             assert!(
                 event_store.contains(required),
@@ -1034,7 +1179,7 @@ mod tests {
         for required in [
             "root.lock_exclusive(\"twin/events/mutation-v1.lock\")",
             "root.read_bounded(WRITER_KEY, WRITER_FILE_LIMIT as usize)",
-            "root.install_no_clobber(WRITER_KEY, STAGING_KEY, &bytes)",
+            "root.install_no_clobber(WRITER_KEY, WRITER_STAGING_KEY, &bytes)",
         ] {
             assert!(
                 coordinator.contains(required),
@@ -1053,6 +1198,107 @@ mod tests {
             .events_dir()
             .join(&event.event_id.as_str()[..2])
             .join(format!("{}.json", event.event_id))
+    }
+
+    fn vault_scope(hex: char) -> ContentDigest {
+        ContentDigest::parse(hex.to_string().repeat(64)).unwrap()
+    }
+
+    #[test]
+    fn scoped_namespaces_are_disjoint_and_switching_back_restores_exact_events() {
+        let temp = tempfile::tempdir().unwrap();
+        let scope_a = vault_scope('a');
+        let scope_b = vault_scope('b');
+        let event_a = valid_event_for_device("device-a", 1, Vec::new());
+        let event_b = valid_event_for_device("device-b", 1, Vec::new());
+        let store = TwinEventStore::new_scoped(temp.path(), scope_a.clone());
+        store.initialize().unwrap();
+
+        assert_eq!(
+            store.events_dir(),
+            temp.path()
+                .join("twin/events/vaults/v1")
+                .join(scope_a.as_str())
+                .join("records/v1")
+        );
+        store.append(event_a.clone()).unwrap();
+
+        store.activate_vault_scope(scope_b.clone()).unwrap();
+        assert_eq!(store.ordered_events().unwrap(), Vec::<TwinEvent>::new());
+        store.append(event_b.clone()).unwrap();
+        assert_eq!(store.ordered_events().unwrap(), vec![event_b.clone()]);
+
+        store.activate_vault_scope(scope_a).unwrap();
+        assert_eq!(store.ordered_events().unwrap(), vec![event_a]);
+        store.activate_vault_scope(scope_b).unwrap();
+        assert_eq!(store.ordered_events().unwrap(), vec![event_b]);
+    }
+
+    #[test]
+    fn scoped_activation_hides_legacy_events_and_keeps_the_global_append_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let legacy_event = valid_event(1, Vec::new());
+        let store = TwinEventStore::new(temp.path());
+        store.initialize().unwrap();
+        store.append(legacy_event.clone()).unwrap();
+        let global_lock = temp.path().join("twin/events/append-v1.lock");
+        assert_eq!(store.lock_path(), global_lock);
+
+        let scope = vault_scope('c');
+        store.activate_vault_scope(scope.clone()).unwrap();
+
+        assert_eq!(store.ordered_events().unwrap(), Vec::<TwinEvent>::new());
+        assert!(canonical_path(&TwinEventStore::new(temp.path()), &legacy_event).exists());
+        assert_eq!(store.lock_path(), global_lock);
+        assert_eq!(
+            store.quarantine_dir(),
+            temp.path()
+                .join("twin/events/vaults/v1")
+                .join(scope.as_str())
+                .join("quarantine/v1")
+        );
+    }
+
+    #[test]
+    fn scoped_activation_uses_an_existing_covering_coordinator_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = TwinEventStore::new(temp.path());
+        store.initialize().unwrap();
+        let lock =
+            crate::services::twin_events::acquire_shared_coordinator_process_lock(temp.path())
+                .unwrap();
+
+        store
+            .activate_vault_scope_locked(vault_scope('d'), &lock)
+            .unwrap();
+
+        assert_eq!(store.ordered_events().unwrap(), Vec::<TwinEvent>::new());
+        lock.unlock().unwrap();
+    }
+
+    #[test]
+    fn scoped_activation_rejects_a_coordinator_lock_for_another_data_root() {
+        let owned = tempfile::tempdir().unwrap();
+        let foreign = tempfile::tempdir().unwrap();
+        let store = TwinEventStore::new(owned.path());
+        let foreign_store = TwinEventStore::new(foreign.path());
+        store.initialize().unwrap();
+        foreign_store.initialize().unwrap();
+        let legacy_event = valid_event(1, Vec::new());
+        store.append(legacy_event.clone()).unwrap();
+        let foreign_lock =
+            crate::services::twin_events::acquire_shared_coordinator_process_lock(foreign.path())
+                .unwrap();
+
+        let error = store
+            .activate_vault_scope_locked(vault_scope('e'), &foreign_lock)
+            .unwrap_err();
+
+        assert!(
+            matches!(error, StoreError::Invalid(message) if message.contains("does not cover"))
+        );
+        assert_eq!(store.ordered_events().unwrap(), vec![legacy_event]);
+        foreign_lock.unlock().unwrap();
     }
 
     fn event_reference(event: &TwinEvent) -> EvidenceRef {

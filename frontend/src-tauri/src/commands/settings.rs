@@ -11,6 +11,11 @@ use tauri_plugin_dialog::DialogExt;
 /// Get current settings
 #[tauri::command]
 pub async fn get_settings(state: State<'_, AppState>) -> Result<UserSettings, String> {
+    if state.mutation_coordinator.is_none() {
+        let _transition_gate = state.vault_transition.read().await;
+        let settings = state.settings_service.read().await;
+        return Ok(redact_sensitive_settings(settings.get()));
+    }
     let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
     let settings = state.settings_service.read().await;
     Ok(redact_sensitive_settings(settings.get()))
@@ -19,6 +24,11 @@ pub async fn get_settings(state: State<'_, AppState>) -> Result<UserSettings, St
 /// Get settings status (for checking if setup is needed)
 #[tauri::command]
 pub async fn get_settings_status(state: State<'_, AppState>) -> Result<SettingsStatus, String> {
+    if state.mutation_coordinator.is_none() {
+        let _transition_gate = state.vault_transition.read().await;
+        let settings = state.settings_service.read().await;
+        return Ok(settings.status());
+    }
     let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
     let settings = state.settings_service.read().await;
     Ok(settings.status())
@@ -48,6 +58,9 @@ async fn apply_settings_update_inner(
 ) -> Result<UserSettings, String> {
     let _transition_gate = state.vault_transition.write().await;
     let _authority_repair = state.authority_repair.lock().await;
+    if let Some(reattached) = try_forward_reattach(state, &update).await? {
+        return Ok(reattached);
+    }
     crate::commands::ensure_root_healthy(state).await?;
     let coordinator = state
         .mutation_coordinator
@@ -93,6 +106,7 @@ async fn apply_settings_update_inner(
 
     let mut knowledge = state.knowledge_store.write().await;
     let mut twin = state.twin_store.write().await;
+    let mut canvas = state.canvas_store.write().await;
     if std::fs::canonicalize(knowledge.vault_path()).map_err(|error| error.to_string())?
         != old_vault
     {
@@ -104,8 +118,6 @@ async fn apply_settings_update_inner(
         .parent()
         .ok_or_else(|| "Twin target root has no data parent".to_string())?
         .to_path_buf();
-    crate::models::settings::twin_data_path_for_vault(&data_path, &candidate_vault)
-        .map_err(|error| error.to_string())?;
 
     let (after_key_source, after_key_version) = match update.openrouter_api_key.as_deref() {
         None => (
@@ -121,26 +133,57 @@ async fn apply_settings_update_inner(
             Some(uuid::Uuid::new_v4().to_string()),
         ),
     };
-    let after_scope = crate::services::twin_events::root_identity_for_path(&candidate_vault)
-        .map_err(|error| error.to_string())?;
-    let after_lease = if after_scope == durable_before.authority.lease.root_scope {
+    let (after_scope, owned_candidate_vault_descriptor) =
+        if durable_before.authority.lease.is_stable() {
+            plan_stable_candidate_vault_identity(&candidate_vault)
+                .map_err(|error| error.to_string())?
+        } else {
+            (
+                crate::services::twin_events::root_identity_for_path(&candidate_vault)
+                    .map_err(|error| error.to_string())?,
+                None,
+            )
+        };
+    let path_changed = candidate_vault != old_vault;
+    let identity_changed = after_scope != durable_before.authority.lease.root_scope;
+    let after_lease = if !path_changed && !identity_changed {
         durable_before.authority.lease.clone()
+    } else if durable_before.authority.lease.is_stable() {
+        crate::services::twin_events::ActiveMarkdownRootLeaseV1::new_stable(after_scope)
     } else {
         crate::services::twin_events::ActiveMarkdownRootLeaseV1::new(after_scope)
     };
-    let after_authority = crate::services::root_transition::RootAuthorityV1::new_with_key_source(
-        &candidate_vault,
-        candidate.clone(),
-        after_lease,
-        after_key_source,
-        after_key_version.clone(),
-    )
+    let after_authority = if owned_candidate_vault_descriptor.is_some() {
+        crate::services::root_transition::RootAuthorityV1::new_with_pending_stable_descriptor(
+            &candidate_vault,
+            candidate.clone(),
+            after_lease,
+            after_key_source,
+            after_key_version.clone(),
+        )
+    } else {
+        crate::services::root_transition::RootAuthorityV1::new_with_key_source(
+            &candidate_vault,
+            candidate.clone(),
+            after_lease,
+            after_key_source,
+            after_key_version.clone(),
+        )
+    }
     .map_err(|error| error.to_string())?;
-    let mut transition = crate::services::root_transition::RootTransitionV1::prepared(
-        durable_before.authority.clone(),
-        after_authority,
-        transition_store.authority_binding(),
-    )
+    let mut transition = match owned_candidate_vault_descriptor {
+        Some(descriptor) => crate::services::root_transition::RootTransitionV1::prepared_with_owned_candidate_descriptor(
+            durable_before.authority.clone(),
+            after_authority,
+            transition_store.authority_binding(),
+            Some(descriptor),
+        ),
+        None => crate::services::root_transition::RootTransitionV1::prepared(
+            durable_before.authority.clone(),
+            after_authority,
+            transition_store.authority_binding(),
+        ),
+    }
     .map_err(|error| error.to_string())?;
 
     let mut commit_uncertain = false;
@@ -148,6 +191,9 @@ async fn apply_settings_update_inner(
     let result = async {
         transition_store
             .prepare_transition_cas_locked(root_guard.process_lock(), &durable_before, &transition)
+            .map_err(|error| error.to_string())?;
+        transition_store
+            .install_owned_candidate_vault_descriptor(&mut transition)
             .map_err(|error| error.to_string())?;
         transition_store
             .checkpoint(crate::services::root_transition::RootTransitionFaultPoint::AfterPrepared)
@@ -195,8 +241,13 @@ async fn apply_settings_update_inner(
             let candidate_twin = root_guard
                 .prepare_twin_data_path(&candidate_vault, &transition.after.lease)
                 .map_err(|error| error.to_string())?;
-            twin.replace_root_path(candidate_twin)
-                .map_err(|error| error.to_string())?;
+            replace_twin_and_canvas_roots(
+                &mut twin,
+                &mut canvas,
+                &data_path,
+                candidate_twin,
+                &transition.after.lease,
+            )?;
             rebuilt_authority = Some(
                 root_guard
                     .capture_authority_token(&transition.after.lease)
@@ -292,6 +343,14 @@ async fn apply_settings_update_inner(
             )
             .map_err(|error| error.to_string())?;
         transition_store
+            .finalize_committed_candidate_vault_descriptor(&transition)
+            .map_err(|error| error.to_string())?;
+        transition_store
+            .checkpoint(
+                crate::services::root_transition::RootTransitionFaultPoint::AfterCommittedCandidateDescriptor,
+            )
+            .map_err(|error| error.to_string())?;
+        transition_store
             .remove_transition()
             .map_err(|error| error.to_string())?;
         transition_store
@@ -329,8 +388,13 @@ async fn apply_settings_update_inner(
                         knowledge
                             .adopt_coordinated_vault_path(old_vault.clone(), &old_namespace)
                             .map_err(|error| error.to_string())?;
-                        twin.replace_root_path(old_twin.clone())
-                            .map_err(|error| error.to_string())?;
+                        replace_twin_and_canvas_roots(
+                            &mut twin,
+                            &mut canvas,
+                            &data_path,
+                            old_twin.clone(),
+                            &transition.rollback_lease,
+                        )?;
                         let rebuilt_token = root_guard
                             .capture_authority_token(&transition.rollback_lease)
                             .map_err(|error| error.to_string())?;
@@ -409,8 +473,13 @@ async fn apply_settings_update_inner(
                         let candidate_twin = root_guard
                             .prepare_twin_data_path(&candidate_vault, &transition.after.lease)
                             .map_err(|error| error.to_string())?;
-                        twin.replace_root_path(candidate_twin)
-                            .map_err(|error| error.to_string())?;
+                        replace_twin_and_canvas_roots(
+                            &mut twin,
+                            &mut canvas,
+                            &data_path,
+                            candidate_twin,
+                            &transition.after.lease,
+                        )?;
                         let rebuilt_token = root_guard
                             .capture_authority_token(&transition.after.lease)
                             .map_err(|error| error.to_string())?;
@@ -499,8 +568,13 @@ async fn apply_settings_update_inner(
                 knowledge
                     .adopt_coordinated_vault_path(old_vault.clone(), &old_namespace)
                     .map_err(|error| error.to_string())?;
-                twin.replace_root_path(old_twin.clone())
-                    .map_err(|error| error.to_string())?;
+                replace_twin_and_canvas_roots(
+                    &mut twin,
+                    &mut canvas,
+                    &data_path,
+                    old_twin.clone(),
+                    &transition.rollback_lease,
+                )?;
                 let rebuilt_token = root_guard
                     .capture_authority_token(&transition.rollback_lease)
                     .map_err(|error| error.to_string())?;
@@ -580,6 +654,107 @@ async fn apply_settings_update_inner(
         return Err(error);
     }
     result
+}
+
+fn plan_stable_candidate_vault_identity(
+    candidate_vault: &std::path::Path,
+) -> Result<
+    (crate::models::twin_event::ContentDigest, Option<Vec<u8>>),
+    crate::services::twin_events::MutationError,
+> {
+    let root = crate::services::twin_events::AnchoredRoot::open(candidate_vault)?;
+    if root
+        .read_bounded(
+            crate::services::sync::identity::VAULT_DESCRIPTOR_KEY,
+            crate::services::sync::identity::VAULT_DESCRIPTOR_LIMIT,
+        )?
+        .is_some()
+    {
+        let identity = crate::services::sync::identity::load_vault_identity(candidate_vault)?;
+        return Ok((identity.root_scope, None));
+    }
+
+    let descriptor = crate::models::sync::VaultDescriptorV1::generate();
+    let root_scope = crate::services::sync::identity::stable_vault_scope(descriptor.vault_id());
+    let mut bytes = serde_json::to_vec_pretty(&descriptor).map_err(|error| {
+        crate::services::twin_events::MutationError::Invalid(format!(
+            "invalid vault descriptor: {error}"
+        ))
+    })?;
+    bytes.push(b'\n');
+    if bytes.len() > crate::services::sync::identity::VAULT_DESCRIPTOR_LIMIT {
+        return Err(crate::services::twin_events::MutationError::Invalid(
+            "vault descriptor exceeds its size limit".into(),
+        ));
+    }
+    Ok((root_scope, Some(bytes)))
+}
+
+async fn try_forward_reattach(
+    state: &AppState,
+    update: &SettingsUpdate,
+) -> Result<Option<UserSettings>, String> {
+    if state.mutation_startup_error.read().await.is_none() {
+        return Ok(None);
+    }
+    let Some(candidate) = update.vault_path.as_deref() else {
+        return Ok(None);
+    };
+    if !is_vault_only_update(update) {
+        return Err("A detached vault must be reattached before changing any other setting".into());
+    }
+    let transition_store = state
+        .settings_service
+        .read()
+        .await
+        .root_transition_store()
+        .map_err(|error| error.to_string())?;
+    if transition_store
+        .detached_stable_vault()
+        .map_err(|error| error.to_string())?
+        .is_none()
+    {
+        return Ok(None);
+    }
+    let reattached = transition_store
+        .reattach_missing_stable_vault(std::path::Path::new(candidate))
+        .map_err(|error| error.to_string())?;
+    {
+        let mut settings = state.settings_service.write().await;
+        settings.publish_runtime_authority(
+            reattached.settings.clone(),
+            reattached.key_source,
+            reattached.active_key_version,
+            reattached.resolved_secret,
+        );
+    }
+    *state.loaded_authority.write().await = None;
+    *state.mutation_startup_error.write().await =
+        Some("Vault reattached durably. Restart Grafyn to activate the recovered vault.".into());
+    Ok(Some(reattached.settings))
+}
+
+fn is_vault_only_update(update: &SettingsUpdate) -> bool {
+    update.vault_path.is_some()
+        && update.openrouter_api_key.is_none()
+        && update.setup_completed.is_none()
+        && update.theme.is_none()
+        && update.mcp_enabled.is_none()
+        && update.llm_model.is_none()
+        && update.twin_llm_provider.is_none()
+        && update.ollama_base_url.is_none()
+        && update.ollama_model.is_none()
+        && update.smart_web_search.is_none()
+        && update.background_link_discovery_enabled.is_none()
+        && update.background_link_discovery_llm_enabled.is_none()
+        && update.background_vault_optimizer_enabled.is_none()
+        && update.background_vault_optimizer_llm_enabled.is_none()
+        && update.background_vault_optimizer_budget_monthly.is_none()
+        && update.background_vault_optimizer_max_daily_writes.is_none()
+        && update.background_vault_optimizer_edit_mode.is_none()
+        && update.background_vault_optimizer_program_enabled.is_none()
+        && update.vault_optimizer_program_path.is_none()
+        && update.canvas_model_presets.is_none()
 }
 
 async fn rebuild_indexes_from_notes(
@@ -680,6 +855,43 @@ async fn rebuild_indexes_from_notes(
     *state.vault_optimizer.write().await = optimizer;
     *state.markdown_migration.write().await = migration;
     Ok(())
+}
+
+fn canvas_path_for_lease(
+    data_path: &std::path::Path,
+    lease: &crate::services::twin_events::ActiveMarkdownRootLeaseV1,
+) -> std::path::PathBuf {
+    if lease.is_stable() {
+        crate::services::canvas_store::scoped_canvas_path(data_path, &lease.root_scope)
+    } else {
+        data_path.join("canvas")
+    }
+}
+
+fn replace_twin_and_canvas_roots(
+    twin: &mut crate::services::twin::TwinStore,
+    canvas: &mut crate::services::canvas_store::CanvasStore,
+    data_path: &std::path::Path,
+    twin_path: std::path::PathBuf,
+    lease: &crate::services::twin_events::ActiveMarkdownRootLeaseV1,
+) -> Result<(), String> {
+    let canvas_path = canvas_path_for_lease(data_path, lease);
+    std::fs::create_dir_all(&twin_path).map_err(|error| error.to_string())?;
+    std::fs::create_dir_all(&canvas_path).map_err(|error| error.to_string())?;
+    crate::services::twin_events::validate_real_directory(&twin_path, "Twin root")
+        .map_err(|error| error.to_string())?;
+    crate::services::twin_events::validate_real_directory(&canvas_path, "Canvas root")
+        .map_err(|error| error.to_string())?;
+    if lease.is_stable() {
+        twin.replace_root_path_scoped(twin_path, lease.root_scope.clone())
+            .map_err(|error| error.to_string())?;
+    } else {
+        twin.replace_root_path(twin_path)
+            .map_err(|error| error.to_string())?;
+    }
+    canvas
+        .replace_root_path(canvas_path)
+        .map_err(|error| error.to_string())
 }
 
 fn runtime_secret_for_authority(
@@ -959,6 +1171,21 @@ mod tests {
         settings_path_is_directory: bool,
         readonly_search: bool,
     ) -> (AppState, TempDir, std::path::PathBuf, std::path::PathBuf) {
+        root_switch_state_with_mode(settings_path_is_directory, readonly_search, false)
+    }
+
+    fn stable_root_switch_state(
+        settings_path_is_directory: bool,
+        readonly_search: bool,
+    ) -> (AppState, TempDir, std::path::PathBuf, std::path::PathBuf) {
+        root_switch_state_with_mode(settings_path_is_directory, readonly_search, true)
+    }
+
+    fn root_switch_state_with_mode(
+        settings_path_is_directory: bool,
+        readonly_search: bool,
+        stable: bool,
+    ) -> (AppState, TempDir, std::path::PathBuf, std::path::PathBuf) {
         let root = tempfile::tempdir().unwrap();
         let old_vault = root.path().join("vault-a");
         let new_vault = root.path().join("vault-b");
@@ -968,15 +1195,25 @@ mod tests {
         std::fs::create_dir(&data).unwrap();
         let events = Arc::new(crate::services::twin_events::TwinEventStore::new(&data));
         events.initialize().unwrap();
-        let coordinator = Arc::new(
+        let lifecycle = Arc::new(crate::services::twin_events::NoopMutationLifecycle);
+        let coordinator = Arc::new(if stable {
+            crate::services::twin_events::MutationCoordinator::new_stable(
+                &data,
+                &old_vault,
+                events.clone(),
+                lifecycle,
+            )
+            .unwrap()
+        } else {
             crate::services::twin_events::MutationCoordinator::new(
                 &data,
                 &old_vault,
                 events.clone(),
-                Arc::new(crate::services::twin_events::NoopMutationLifecycle),
+                lifecycle,
             )
-            .unwrap(),
-        );
+            .unwrap()
+        });
+        let lease = coordinator.current_root_epoch().unwrap();
         let derived_data = coordinator.current_namespace_path().unwrap();
         let user_settings = UserSettings {
             vault_path: Some(old_vault.to_string_lossy().into_owned()),
@@ -1003,16 +1240,29 @@ mod tests {
                 .unwrap();
         }
         if readonly_search {
-            let candidate_scope =
-                crate::services::twin_events::root_identity_for_path(&new_vault).unwrap();
+            let candidate_scope = if stable {
+                crate::services::sync::identity::load_or_create_vault_identity(&new_vault)
+                    .unwrap()
+                    .root_scope
+            } else {
+                crate::services::twin_events::root_identity_for_path(&new_vault).unwrap()
+            };
             let candidate_derived =
                 crate::services::vault_namespace::scoped_data_path(&data, &candidate_scope);
             std::fs::create_dir_all(&candidate_derived).unwrap();
             std::fs::write(candidate_derived.join("search_index"), b"not-a-directory").unwrap();
         }
         let search = crate::services::search::SearchService::new(derived_data.clone()).unwrap();
-        let twin_root =
-            crate::models::settings::twin_data_path_for_vault(&data, &old_vault).unwrap();
+        let twin_root = if stable {
+            crate::models::settings::twin_data_path_for_scope(&data, &lease.root_scope)
+        } else {
+            crate::models::settings::twin_data_path_for_vault(&data, &old_vault).unwrap()
+        };
+        let canvas_root = if stable {
+            crate::services::canvas_store::scoped_canvas_path(&data, &lease.root_scope)
+        } else {
+            data.join("canvas")
+        };
         let loaded_authority = coordinator.current_authority_token().unwrap();
         let state = AppState {
             knowledge_store: Arc::new(RwLock::new(
@@ -1026,7 +1276,7 @@ mod tests {
             search_service: Arc::new(RwLock::new(search)),
             canvas_store: Arc::new(RwLock::new(
                 crate::services::canvas_store::CanvasStore::with_event_recorder(
-                    data.join("canvas"),
+                    canvas_root,
                     coordinator.clone(),
                 ),
             )),
@@ -1060,13 +1310,20 @@ mod tests {
             vault_optimizer: Arc::new(RwLock::new(
                 crate::services::vault_optimizer::VaultOptimizerService::new(derived_data),
             )),
-            twin_store: Arc::new(RwLock::new(
+            twin_store: Arc::new(RwLock::new(if stable {
+                crate::services::twin::TwinStore::with_event_recorder_scoped(
+                    twin_root,
+                    data.join("twin"),
+                    lease.root_scope,
+                    coordinator.clone(),
+                )
+            } else {
                 crate::services::twin::TwinStore::with_event_recorder(
                     twin_root,
                     data.join("twin"),
                     coordinator.clone(),
-                ),
-            )),
+                )
+            })),
             twin_event_store: events,
             mutation_coordinator: Some(coordinator),
             mutation_startup_error: Arc::new(RwLock::new(None)),
@@ -1076,8 +1333,209 @@ mod tests {
             vault_transition: Arc::new(tokio::sync::RwLock::new(())),
             memory_service: Arc::new(crate::services::memory::MemoryService::new()),
             boot_state: Arc::new(RwLock::new(crate::models::boot::BootStatus::default())),
+            _recovery_runtime: None,
         };
         (state, root, old_vault, new_vault)
+    }
+
+    fn detached_reattach_state() -> (
+        AppState,
+        TempDir,
+        std::path::PathBuf,
+        std::path::PathBuf,
+        std::path::PathBuf,
+        crate::services::sync::identity::VaultIdentity,
+        String,
+    ) {
+        let root = tempfile::tempdir().unwrap();
+        let old_vault = root.path().join("missing-old-vault");
+        let moved_vault = root.path().join("moved-vault");
+        let data = root.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::create_dir(&moved_vault).unwrap();
+        let identity =
+            crate::services::sync::identity::load_or_create_vault_identity(&moved_vault).unwrap();
+        let settings = crate::services::settings::SettingsService::for_test(
+            root.path().join("settings.json"),
+            UserSettings {
+                vault_path: Some(old_vault.to_string_lossy().into_owned()),
+                ..UserSettings::default()
+            },
+        );
+        let transition_store = settings.root_transition_store().unwrap();
+        transition_store
+            .write_settings_guarded(
+                &crate::services::root_transition::NonsecretSettingsV1::from_settings(
+                    settings.get().clone(),
+                ),
+            )
+            .unwrap();
+        let original_lease = crate::services::twin_events::ActiveMarkdownRootLeaseV1::new_stable(
+            identity.root_scope.clone(),
+        );
+        transition_store.write_lease(&original_lease).unwrap();
+        let derived_data =
+            crate::services::vault_namespace::scoped_data_path(&data, &identity.root_scope);
+        std::fs::create_dir_all(&derived_data).unwrap();
+        let events = Arc::new(crate::services::twin_events::TwinEventStore::new_scoped(
+            &data,
+            identity.root_scope.clone(),
+        ));
+        events.initialize().unwrap();
+        let unavailable: Arc<dyn crate::services::twin_events::EventRecorder> =
+            Arc::new(crate::services::twin_events::UnavailableEventRecorder::new(
+                "configured stable vault is unavailable",
+            ));
+        let runtime_vault = data.join("detached-vault-runtime-v1");
+        let twin_root =
+            crate::models::settings::twin_data_path_for_scope(&data, &identity.root_scope);
+        let state = AppState {
+            knowledge_store: Arc::new(RwLock::new(
+                crate::services::knowledge_store::KnowledgeStore::with_event_recorder(
+                    runtime_vault,
+                    derived_data.clone(),
+                    unavailable.clone(),
+                ),
+            )),
+            graph_index: Arc::new(RwLock::new(crate::services::graph_index::GraphIndex::new())),
+            search_service: Arc::new(RwLock::new(
+                crate::services::search::SearchService::new(derived_data.clone()).unwrap(),
+            )),
+            canvas_store: Arc::new(RwLock::new(
+                crate::services::canvas_store::CanvasStore::with_event_recorder(
+                    crate::services::canvas_store::scoped_canvas_path(&data, &identity.root_scope),
+                    unavailable.clone(),
+                ),
+            )),
+            openrouter: Arc::new(RwLock::new(
+                crate::services::openrouter::OpenRouterService::new(String::new()),
+            )),
+            ollama: Arc::new(RwLock::new(crate::services::ollama::OllamaService::new(
+                "http://localhost:11434".into(),
+            ))),
+            feedback_service: Arc::new(RwLock::new(
+                crate::services::feedback::FeedbackService::new(data.join("feedback")),
+            )),
+            settings_service: Arc::new(RwLock::new(settings)),
+            priority_service: Arc::new(RwLock::new(
+                crate::services::priority::PriorityScoringService::new(data.clone()),
+            )),
+            retrieval_service: Arc::new(RwLock::new(
+                crate::services::retrieval::RetrievalService::new(data.clone()),
+            )),
+            chunk_index: Arc::new(RwLock::new(
+                crate::services::chunk_index::ChunkIndex::new(derived_data.clone()).unwrap(),
+            )),
+            link_discovery: Arc::new(RwLock::new(
+                crate::services::link_discovery::LinkDiscoveryService::new(derived_data.clone()),
+            )),
+            markdown_migration: Arc::new(RwLock::new(
+                crate::services::markdown_migration::MarkdownMigrationService::new(
+                    derived_data.clone(),
+                ),
+            )),
+            vault_optimizer: Arc::new(RwLock::new(
+                crate::services::vault_optimizer::VaultOptimizerService::new(derived_data),
+            )),
+            twin_store: Arc::new(RwLock::new(
+                crate::services::twin::TwinStore::with_event_recorder_scoped(
+                    twin_root,
+                    data.join("twin"),
+                    identity.root_scope.clone(),
+                    unavailable,
+                ),
+            )),
+            twin_event_store: events,
+            mutation_coordinator: None,
+            mutation_startup_error: Arc::new(RwLock::new(Some(
+                "configured stable vault is unavailable".into(),
+            ))),
+            loaded_authority: Arc::new(RwLock::new(None)),
+            authority_repair: Arc::new(tokio::sync::Mutex::new(())),
+            committed_warning_app: None,
+            vault_transition: Arc::new(tokio::sync::RwLock::new(())),
+            memory_service: Arc::new(crate::services::memory::MemoryService::new()),
+            boot_state: Arc::new(RwLock::new(crate::models::boot::BootStatus::default())),
+            _recovery_runtime: None,
+        };
+        (
+            state,
+            root,
+            old_vault,
+            moved_vault,
+            data,
+            identity,
+            original_lease.epoch_uuid,
+        )
+    }
+
+    async fn assert_stable_runtime_roots(
+        state: &AppState,
+        data_path: &std::path::Path,
+        vault_path: &std::path::Path,
+        root_scope: &crate::models::twin_event::ContentDigest,
+        canvas_title: &str,
+    ) -> String {
+        let expected_events = data_path
+            .join("twin/events/vaults/v1")
+            .join(root_scope.as_str())
+            .join("records/v1");
+        let expected_canvas = data_path.join("canvas/v1").join(root_scope.as_str());
+        let expected_twin = data_path.join("twin").join(root_scope.as_str());
+        let expected_derived = std::fs::canonicalize(data_path)
+            .unwrap()
+            .join("vault_derived/v1")
+            .join(root_scope.as_str());
+
+        assert_eq!(
+            std::fs::canonicalize(state.knowledge_store.read().await.vault_path()).unwrap(),
+            std::fs::canonicalize(vault_path).unwrap()
+        );
+        assert_eq!(state.twin_event_store.events_dir(), expected_events);
+        assert_eq!(
+            comparable_path(state.twin_store.read().await.root_path().to_path_buf()),
+            comparable_path(expected_twin)
+        );
+        assert!(state
+            .search_service
+            .read()
+            .await
+            .uses_data_path(&expected_derived));
+        assert!(state
+            .chunk_index
+            .read()
+            .await
+            .uses_data_path(&expected_derived));
+        assert!(state
+            .link_discovery
+            .read()
+            .await
+            .uses_data_path(&expected_derived));
+        assert!(state
+            .vault_optimizer
+            .read()
+            .await
+            .uses_data_path(&expected_derived));
+        assert!(state
+            .markdown_migration
+            .read()
+            .await
+            .uses_data_path(&expected_derived));
+
+        let session = state
+            .canvas_store
+            .write()
+            .await
+            .create_session(crate::models::canvas::SessionCreate {
+                title: canvas_title.to_string(),
+                description: None,
+                tags: Vec::new(),
+            })
+            .unwrap();
+        assert!(expected_canvas
+            .join(format!("{}.json", session.id))
+            .is_file());
+        session.id
     }
 
     #[test]
@@ -1098,6 +1556,44 @@ mod tests {
         };
 
         assert!(vault_path_update_changed(&settings, Some("C:/OtherVault")));
+    }
+
+    #[tokio::test]
+    async fn detached_startup_accepts_only_the_same_vault_at_its_new_path() {
+        let (state, _root, old_vault, moved_vault, data_path, identity, original_epoch) =
+            detached_reattach_state();
+        let transition_store = state
+            .settings_service
+            .read()
+            .await
+            .root_transition_store()
+            .unwrap();
+        let detached = transition_store.detached_stable_vault().unwrap().unwrap();
+        assert_eq!(detached.root_scope, identity.root_scope);
+
+        let updated = apply_settings_update(&state, vault_update(&moved_vault))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            std::fs::canonicalize(updated.effective_vault_path()).unwrap(),
+            std::fs::canonicalize(&moved_vault).unwrap()
+        );
+        assert!(!old_vault.exists());
+        let lock =
+            crate::services::twin_events::acquire_shared_coordinator_process_lock(&data_path)
+                .unwrap();
+        let durable = transition_store.read_authority_locked(&lock).unwrap();
+        lock.unlock().unwrap();
+        assert_eq!(durable.authority.root_scope, identity.root_scope);
+        assert!(durable.authority.lease.is_stable());
+        assert_ne!(durable.authority.lease.epoch_uuid, original_epoch);
+        assert!(state
+            .mutation_startup_error
+            .read()
+            .await
+            .as_deref()
+            .is_some_and(|error| error.to_ascii_lowercase().contains("restart")));
     }
 
     #[tokio::test]
@@ -1122,15 +1618,18 @@ mod tests {
             comparable_path(new_vault.clone())
         );
         let twin = state.twin_store.read().await;
+        let lease = state
+            .mutation_coordinator
+            .as_ref()
+            .unwrap()
+            .current_root_epoch()
+            .unwrap();
         assert_eq!(
             comparable_path(twin.root_path().to_path_buf()),
-            comparable_path(
-                crate::models::settings::twin_data_path_for_vault(
-                    twin.target_root_path().parent().unwrap(),
-                    &new_vault,
-                )
-                .unwrap()
-            )
+            comparable_path(crate::models::settings::twin_data_path_for_scope(
+                twin.target_root_path().parent().unwrap(),
+                &lease.root_scope,
+            ))
         );
         drop(twin);
         let namespace = state
@@ -1159,6 +1658,177 @@ mod tests {
             .require_namespace_ready()
             .unwrap();
         assert_ne!(comparable_path(old_vault), comparable_path(new_vault));
+    }
+
+    #[tokio::test]
+    async fn rejected_stable_switch_before_wal_never_creates_a_descriptor() {
+        let (state, _root, _old_vault, new_vault) = stable_root_switch_state(true, false);
+        let descriptor_path = new_vault.join(crate::services::sync::identity::VAULT_DESCRIPTOR_KEY);
+        assert!(!descriptor_path.exists());
+
+        assert!(apply_settings_update(&state, vault_update(&new_vault))
+            .await
+            .is_err());
+
+        assert!(!descriptor_path.exists());
+    }
+
+    #[tokio::test]
+    async fn failed_stable_switch_removes_descriptor_created_by_the_attempt() {
+        let (state, _root, _old_vault, new_vault) = stable_root_switch_state(false, false);
+        let descriptor_path = new_vault.join(crate::services::sync::identity::VAULT_DESCRIPTOR_KEY);
+        assert!(!descriptor_path.exists());
+
+        assert!(apply_settings_update_inner(
+            &state,
+            vault_update(&new_vault),
+            Some(crate::services::root_transition::RootTransitionFaultPoint::AfterPrepared),
+        )
+        .await
+        .is_err());
+
+        assert!(!descriptor_path.exists());
+    }
+
+    #[tokio::test]
+    async fn failed_stable_switch_preserves_a_preexisting_candidate_descriptor() {
+        let (state, _root, _old_vault, new_vault) = stable_root_switch_state(false, false);
+        let identity =
+            crate::services::sync::identity::load_or_create_vault_identity(&new_vault).unwrap();
+        let descriptor_path = new_vault.join(crate::services::sync::identity::VAULT_DESCRIPTOR_KEY);
+        let descriptor_before = std::fs::read(&descriptor_path).unwrap();
+
+        assert!(apply_settings_update_inner(
+            &state,
+            vault_update(&new_vault),
+            Some(crate::services::root_transition::RootTransitionFaultPoint::AfterPrepared),
+        )
+        .await
+        .is_err());
+
+        assert_eq!(std::fs::read(descriptor_path).unwrap(), descriptor_before);
+        assert_eq!(
+            crate::services::sync::identity::load_vault_identity(&new_vault)
+                .unwrap()
+                .root_scope,
+            identity.root_scope
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_stable_switch_keeps_the_generated_candidate_descriptor() {
+        let (state, _root, _old_vault, new_vault) = stable_root_switch_state(false, false);
+        let descriptor_path = new_vault.join(crate::services::sync::identity::VAULT_DESCRIPTOR_KEY);
+        assert!(!descriptor_path.exists());
+
+        let updated = apply_settings_update(&state, vault_update(&new_vault))
+            .await
+            .unwrap();
+        let identity = crate::services::sync::identity::load_vault_identity(&new_vault).unwrap();
+        let lease = state
+            .mutation_coordinator
+            .as_ref()
+            .unwrap()
+            .current_root_epoch()
+            .unwrap();
+
+        assert!(descriptor_path.is_file());
+        assert_eq!(lease.root_scope, identity.root_scope);
+        assert_eq!(
+            comparable_path(updated.effective_vault_path()),
+            comparable_path(new_vault)
+        );
+    }
+
+    #[tokio::test]
+    async fn stable_live_switch_keeps_all_runtime_roots_on_one_authority() {
+        let (success, success_root, old_vault, new_vault) = stable_root_switch_state(false, false);
+        let success_data = success_root.path().join("data");
+        let old_identity =
+            crate::services::sync::identity::load_or_create_vault_identity(&old_vault).unwrap();
+        let new_identity =
+            crate::services::sync::identity::load_or_create_vault_identity(&new_vault).unwrap();
+        assert_ne!(old_identity.root_scope, new_identity.root_scope);
+        assert_stable_runtime_roots(
+            &success,
+            &success_data,
+            &old_vault,
+            &old_identity.root_scope,
+            "before successful switch",
+        )
+        .await;
+
+        apply_settings_update(&success, vault_update(&new_vault))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            success
+                .mutation_coordinator
+                .as_ref()
+                .unwrap()
+                .current_root_epoch()
+                .unwrap()
+                .root_scope,
+            new_identity.root_scope
+        );
+        let success_session_id = assert_stable_runtime_roots(
+            &success,
+            &success_data,
+            &new_vault,
+            &new_identity.root_scope,
+            "after successful switch",
+        )
+        .await;
+        assert!(!success_data
+            .join("canvas/v1")
+            .join(old_identity.root_scope.as_str())
+            .join(format!("{success_session_id}.json"))
+            .exists());
+
+        let (failed, failed_root, failed_old_vault, failed_new_vault) =
+            stable_root_switch_state(false, true);
+        let failed_data = failed_root.path().join("data");
+        let failed_old_identity =
+            crate::services::sync::identity::load_or_create_vault_identity(&failed_old_vault)
+                .unwrap();
+        let failed_new_identity =
+            crate::services::sync::identity::load_or_create_vault_identity(&failed_new_vault)
+                .unwrap();
+        assert_ne!(
+            failed_old_identity.root_scope,
+            failed_new_identity.root_scope
+        );
+
+        assert!(
+            apply_settings_update(&failed, vault_update(&failed_new_vault))
+                .await
+                .is_err()
+        );
+
+        assert_eq!(
+            failed
+                .mutation_coordinator
+                .as_ref()
+                .unwrap()
+                .current_root_epoch()
+                .unwrap()
+                .root_scope,
+            failed_old_identity.root_scope
+        );
+        let failed_session_id = assert_stable_runtime_roots(
+            &failed,
+            &failed_data,
+            &failed_old_vault,
+            &failed_old_identity.root_scope,
+            "after failed switch",
+        )
+        .await;
+        assert!(!failed_data
+            .join("canvas/v1")
+            .join(failed_new_identity.root_scope.as_str())
+            .join(format!("{failed_session_id}.json"))
+            .exists());
     }
 
     #[tokio::test]

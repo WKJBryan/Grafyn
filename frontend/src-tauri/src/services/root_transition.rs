@@ -1,11 +1,15 @@
 use crate::models::settings::{CanvasModelPreset, UserSettings};
+use crate::models::sync::VaultDescriptorV1;
 use crate::models::twin_event::ContentDigest;
+#[cfg(test)]
+use crate::services::sync::secrets::MemorySecretStore;
+use crate::services::sync::secrets::{
+    SecretAccount, SecretBytes, SecretStore, SecretStoreError, SECRET_STORE_SERVICE,
+};
 use crate::services::twin_events::{
     root_identity_for_path, ActiveMarkdownRootLeaseV1, AnchoredRoot, MutationError,
 };
 use serde::{Deserialize, Serialize};
-#[cfg(test)]
-use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
@@ -17,20 +21,24 @@ const ROOT_TRANSITION_KEY: &str = "twin/events/root-transition-v1.json";
 const ACTIVE_ROOT_LEASE_KEY: &str = "twin/events/active-markdown-root-v1.json";
 const OPENROUTER_KEY_REF: &str = "twin/events/openrouter-key-ref-v1.json";
 const ROOT_TRANSITION_SCHEMA_VERSION: u16 = 1;
+const STABLE_ROOT_TRANSITION_SCHEMA_VERSION: u16 = 2;
+const FORWARD_REATTACH_TRANSITION_SCHEMA_VERSION: u16 = 3;
 const KEY_REF_SCHEMA_VERSION: u16 = 1;
 const LEASE_SCHEMA_VERSION: u16 = 1;
-const KEYRING_SERVICE: &str = "com.grafyn.app";
+const STABLE_LEASE_SCHEMA_VERSION: u16 = 2;
 const VERSIONED_KEY_PREFIX: &str = "openrouter_api_key/";
 const LEGACY_MIGRATION_KEY_VERSION: &str = "00000000-0000-4000-8000-000000000001";
 
-#[cfg(feature = "mcp")]
-pub(crate) fn reject_custom_transition_wal_locked(
+#[cfg(test)]
+pub(crate) type MemoryVersionedSecretStore = MemorySecretStore;
+
+pub(crate) fn reject_transition_wal_locked(
     data_path: &Path,
     process_lock: &crate::services::twin_events::CoordinatorProcessLock,
 ) -> Result<(), MutationError> {
     if !process_lock.covers_data_path(data_path)? {
         return Err(MutationError::Invalid(
-            "custom MCP transition check lock belongs to another data root".into(),
+            "root transition check lock belongs to another data root".into(),
         ));
     }
     let root = AnchoredRoot::open(data_path)?;
@@ -39,10 +47,29 @@ pub(crate) fn reject_custom_transition_wal_locked(
         .is_some()
     {
         return Err(MutationError::RecoveryConflict(
-            "custom-mcp-root-transition-requires-default-authority-recovery".into(),
+            "root-transition-requires-authority-recovery".into(),
         ));
     }
     Ok(())
+}
+
+#[cfg(feature = "mcp")]
+pub(crate) fn stable_root_scope_locked(
+    data_path: &Path,
+    process_lock: &crate::services::twin_events::CoordinatorProcessLock,
+) -> Result<Option<ContentDigest>, MutationError> {
+    if !process_lock.covers_data_path(data_path)? {
+        return Err(MutationError::Invalid(
+            "stable root probe lock belongs to another data root".into(),
+        ));
+    }
+    let root = AnchoredRoot::open(data_path)?;
+    root.open_directory("twin/events", true)?;
+    let Some(bytes) = root.read_bounded(ACTIVE_ROOT_LEASE_KEY, KEY_REF_LIMIT)? else {
+        return Ok(None);
+    };
+    let lease = parse_active_root_lease(&bytes)?;
+    Ok(lease.is_stable().then_some(lease.root_scope))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -199,7 +226,7 @@ impl RootAuthorityV1 {
             .to_str()
             .ok_or_else(|| MutationError::Invalid("canonical vault path must be Unicode".into()))?
             .to_string();
-        let root_scope = root_identity_for_path(&canonical)?;
+        let root_scope = authority_scope_for(&canonical, &lease)?;
         let authority = Self {
             canonical_vault_path,
             root_scope,
@@ -212,11 +239,48 @@ impl RootAuthorityV1 {
         Ok(authority)
     }
 
+    pub(crate) fn new_with_pending_stable_descriptor(
+        vault_path: &Path,
+        settings: UserSettings,
+        lease: ActiveMarkdownRootLeaseV1,
+        openrouter_key_source: OpenRouterKeySource,
+        openrouter_key_version: Option<String>,
+    ) -> Result<Self, MutationError> {
+        if !lease.is_stable() {
+            return Err(MutationError::Invalid(
+                "pending vault descriptor requires a stable lease".into(),
+            ));
+        }
+        let canonical = std::fs::canonicalize(vault_path)?;
+        let canonical_vault_path = canonical
+            .to_str()
+            .ok_or_else(|| MutationError::Invalid("canonical vault path must be Unicode".into()))?
+            .to_string();
+        let settings_vault = std::fs::canonicalize(settings.effective_vault_path())?;
+        if settings_vault != canonical {
+            return Err(MutationError::Invalid(
+                "pending vault descriptor settings path is inconsistent".into(),
+            ));
+        }
+        let authority = Self {
+            canonical_vault_path,
+            root_scope: lease.root_scope.clone(),
+            lease,
+            nonsecret_settings: NonsecretSettingsV1::from_settings(settings),
+            openrouter_key_source,
+            openrouter_key_version,
+        };
+        authority.validate_serialized_stable()?;
+        Ok(authority)
+    }
+
     fn validate(&self) -> Result<(), MutationError> {
         self.nonsecret_settings.validate()?;
-        if self.lease.schema_version != LEASE_SCHEMA_VERSION
-            || self.lease.root_scope != self.root_scope
-            || Uuid::parse_str(&self.lease.epoch_uuid).is_err()
+        if !matches!(
+            self.lease.schema_version,
+            LEASE_SCHEMA_VERSION | STABLE_LEASE_SCHEMA_VERSION
+        ) || self.lease.root_scope != self.root_scope
+            || !is_canonical_non_nil_uuid(&self.lease.epoch_uuid)
         {
             return Err(MutationError::Invalid(
                 "root transition contains an invalid lease".into(),
@@ -235,11 +299,64 @@ impl RootAuthorityV1 {
                 .effective_vault_path(),
         )?;
         if canonical.to_string_lossy() != self.canonical_vault_path
-            || root_identity_for_path(&canonical)? != self.root_scope
+            || authority_scope_for(&canonical, &self.lease)? != self.root_scope
             || settings_vault != canonical
         {
             return Err(MutationError::Invalid(
                 "root transition vault identity is inconsistent".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_detached_stable(&self) -> Result<(), MutationError> {
+        self.nonsecret_settings.validate()?;
+        if !self.lease.is_stable()
+            || self.lease.root_scope != self.root_scope
+            || !is_canonical_non_nil_uuid(&self.lease.epoch_uuid)
+        {
+            return Err(MutationError::Invalid(
+                "forward reattach contains an invalid detached lease".into(),
+            ));
+        }
+        validate_key_version(self.openrouter_key_version.as_deref())?;
+        validate_key_authority(
+            self.openrouter_key_source,
+            self.openrouter_key_version.as_deref(),
+        )?;
+        let configured = self
+            .nonsecret_settings
+            .clone()
+            .into_settings()
+            .effective_vault_path();
+        let recorded = Path::new(&self.canonical_vault_path);
+        if configured != recorded || !is_normal_absolute_path(recorded) {
+            return Err(MutationError::Invalid(
+                "forward reattach detached vault path is invalid".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_serialized_stable(&self) -> Result<(), MutationError> {
+        self.nonsecret_settings.validate()?;
+        if !self.lease.is_stable()
+            || self.lease.root_scope != self.root_scope
+            || !is_canonical_non_nil_uuid(&self.lease.epoch_uuid)
+        {
+            return Err(MutationError::Invalid(
+                "root transition contains an invalid serialized stable lease".into(),
+            ));
+        }
+        validate_key_version(self.openrouter_key_version.as_deref())?;
+        validate_key_authority(
+            self.openrouter_key_source,
+            self.openrouter_key_version.as_deref(),
+        )?;
+        let recorded = Path::new(&self.canonical_vault_path);
+        if !is_normal_absolute_path(recorded) {
+            return Err(MutationError::Invalid(
+                "root transition contains an invalid serialized stable vault path".into(),
             ));
         }
         Ok(())
@@ -261,6 +378,15 @@ pub(crate) enum RootTransitionDecision {
     Committed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct OwnedCandidateDescriptorWitnessV1 {
+    pub(crate) device: u64,
+    pub(crate) inode: u64,
+    #[serde(default)]
+    pub(crate) live_installed: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RootTransitionV1 {
@@ -269,6 +395,16 @@ pub(crate) struct RootTransitionV1 {
     pub(crate) decision: RootTransitionDecision,
     pub(crate) authority_binding: ContentDigest,
     pub(crate) root_changed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) path_changed: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) vault_identity_changed: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) forward_only_reattach: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) owned_candidate_vault_descriptor: Option<Vec<u8>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) owned_candidate_vault_descriptor_witness: Option<OwnedCandidateDescriptorWitnessV1>,
     pub(crate) before: RootAuthorityV1,
     pub(crate) after: RootAuthorityV1,
     pub(crate) rollback_lease: ActiveMarkdownRootLeaseV1,
@@ -280,36 +416,330 @@ impl RootTransitionV1 {
         after: RootAuthorityV1,
         authority_binding: ContentDigest,
     ) -> Result<Self, MutationError> {
-        let rollback_lease = ActiveMarkdownRootLeaseV1::new(before.root_scope.clone());
+        Self::prepared_with_owned_candidate_descriptor(before, after, authority_binding, None)
+    }
+
+    pub(crate) fn prepared_with_owned_candidate_descriptor(
+        before: RootAuthorityV1,
+        after: RootAuthorityV1,
+        authority_binding: ContentDigest,
+        owned_candidate_vault_descriptor: Option<Vec<u8>>,
+    ) -> Result<Self, MutationError> {
+        let stable = before.lease.is_stable() && after.lease.is_stable();
+        let path_changed = before.canonical_vault_path != after.canonical_vault_path;
+        let vault_identity_changed = before.root_scope != after.root_scope;
+        let rollback_lease = if stable {
+            ActiveMarkdownRootLeaseV1::new_stable(before.root_scope.clone())
+        } else {
+            ActiveMarkdownRootLeaseV1::new(before.root_scope.clone())
+        };
         let transition = Self {
-            schema_version: ROOT_TRANSITION_SCHEMA_VERSION,
+            schema_version: if stable {
+                STABLE_ROOT_TRANSITION_SCHEMA_VERSION
+            } else {
+                ROOT_TRANSITION_SCHEMA_VERSION
+            },
             transaction_id: Uuid::new_v4().to_string(),
             decision: RootTransitionDecision::Prepared,
             authority_binding,
-            root_changed: before.root_scope != after.root_scope,
+            root_changed: if stable {
+                path_changed || vault_identity_changed
+            } else {
+                vault_identity_changed
+            },
+            path_changed: stable.then_some(path_changed),
+            vault_identity_changed: stable.then_some(vault_identity_changed),
+            forward_only_reattach: None,
+            owned_candidate_vault_descriptor,
+            owned_candidate_vault_descriptor_witness: None,
             before,
             after,
             rollback_lease,
         };
-        transition.validate()?;
+        transition.validate_preparation()?;
         Ok(transition)
     }
 
+    fn validate_preparation(&self) -> Result<(), MutationError> {
+        self.validate()?;
+        if self.schema_version == STABLE_ROOT_TRANSITION_SCHEMA_VERSION
+            && self.decision == RootTransitionDecision::Prepared
+        {
+            if self.owned_candidate_vault_descriptor_witness.is_some() {
+                return Err(MutationError::Invalid(
+                    "new root transition cannot already claim a candidate descriptor witness"
+                        .into(),
+                ));
+            }
+            if self.owned_candidate_vault_descriptor.is_some() {
+                self.validate_owned_candidate_descriptor_state(true)?;
+            } else {
+                self.after.validate()?;
+            }
+        }
+        Ok(())
+    }
+
     fn validate(&self) -> Result<(), MutationError> {
-        if self.schema_version != ROOT_TRANSITION_SCHEMA_VERSION
+        let transition_flags_valid = match self.schema_version {
+            ROOT_TRANSITION_SCHEMA_VERSION => {
+                self.path_changed.is_none()
+                    && self.vault_identity_changed.is_none()
+                    && self.forward_only_reattach.is_none()
+                    && self.owned_candidate_vault_descriptor.is_none()
+                    && self.owned_candidate_vault_descriptor_witness.is_none()
+                    && self.root_changed == (self.before.root_scope != self.after.root_scope)
+                    && !self.before.lease.is_stable()
+                    && !self.after.lease.is_stable()
+                    && self.rollback_lease.schema_version == LEASE_SCHEMA_VERSION
+            }
+            STABLE_ROOT_TRANSITION_SCHEMA_VERSION => {
+                let path_changed =
+                    self.before.canonical_vault_path != self.after.canonical_vault_path;
+                let vault_identity_changed = self.before.root_scope != self.after.root_scope;
+                self.path_changed == Some(path_changed)
+                    && self.vault_identity_changed == Some(vault_identity_changed)
+                    && self.forward_only_reattach.is_none()
+                    && self.root_changed == (path_changed || vault_identity_changed)
+                    && self
+                        .owned_candidate_vault_descriptor
+                        .as_ref()
+                        .is_none_or(|_| path_changed && vault_identity_changed)
+                    && self
+                        .owned_candidate_vault_descriptor_witness
+                        .as_ref()
+                        .is_none_or(|_| self.owned_candidate_vault_descriptor.is_some())
+                    && (self.decision != RootTransitionDecision::Committed
+                        || self.owned_candidate_vault_descriptor.is_none()
+                        || self
+                            .owned_candidate_vault_descriptor_witness
+                            .is_some_and(|witness| witness.live_installed))
+                    && self.before.lease.is_stable()
+                    && self.after.lease.is_stable()
+                    && self.rollback_lease.is_stable()
+            }
+            FORWARD_REATTACH_TRANSITION_SCHEMA_VERSION => {
+                self.forward_only_reattach == Some(true)
+                    && self.owned_candidate_vault_descriptor.is_none()
+                    && self.owned_candidate_vault_descriptor_witness.is_none()
+                    && self.path_changed == Some(true)
+                    && self.vault_identity_changed == Some(false)
+                    && self.root_changed
+                    && self.before.lease.is_stable()
+                    && self.after.lease.is_stable()
+                    && self.before.root_scope == self.after.root_scope
+                    && self.before.canonical_vault_path != self.after.canonical_vault_path
+                    && self.before.lease.epoch_uuid != self.after.lease.epoch_uuid
+                    && self.rollback_lease == self.after.lease
+                    && same_nonsecret_settings_except_vault(
+                        &self.before.nonsecret_settings,
+                        &self.after.nonsecret_settings,
+                    )
+                    && self.before.openrouter_key_source == self.after.openrouter_key_source
+                    && self.before.openrouter_key_version == self.after.openrouter_key_version
+            }
+            _ => false,
+        };
+        if !transition_flags_valid
             || Uuid::parse_str(&self.transaction_id).is_err()
-            || self.root_changed != (self.before.root_scope != self.after.root_scope)
-            || self.rollback_lease.schema_version != LEASE_SCHEMA_VERSION
             || self.rollback_lease.root_scope != self.before.root_scope
-            || Uuid::parse_str(&self.rollback_lease.epoch_uuid).is_err()
+            || !is_canonical_non_nil_uuid(&self.rollback_lease.epoch_uuid)
         {
             return Err(MutationError::Invalid(
                 "invalid root transition metadata".into(),
             ));
         }
-        self.before.validate()?;
-        self.after.validate()?;
+        match self.schema_version {
+            ROOT_TRANSITION_SCHEMA_VERSION => {
+                self.before.validate()?;
+                self.after.validate()?;
+            }
+            STABLE_ROOT_TRANSITION_SCHEMA_VERSION => match self.decision {
+                RootTransitionDecision::Prepared => {
+                    self.before.validate()?;
+                    self.after.validate_serialized_stable()?;
+                    if self.owned_candidate_vault_descriptor.is_some() {
+                        self.validate_owned_candidate_descriptor_state(false)?;
+                    }
+                }
+                RootTransitionDecision::Committed => {
+                    self.before.validate_serialized_stable()?;
+                    self.after.validate()?;
+                    if self.owned_candidate_vault_descriptor.is_some() {
+                        self.validate_owned_candidate_descriptor_state(false)?;
+                    }
+                }
+            },
+            FORWARD_REATTACH_TRANSITION_SCHEMA_VERSION => {
+                self.before.validate_detached_stable()?;
+                self.after.validate()?;
+            }
+            _ => unreachable!("unsupported transition schema passed metadata validation"),
+        }
         Ok(())
+    }
+
+    fn owned_candidate_descriptor_bytes(&self) -> Result<Option<&[u8]>, MutationError> {
+        let Some(bytes) = self.owned_candidate_vault_descriptor.as_deref() else {
+            return Ok(None);
+        };
+        if bytes.len() > crate::services::sync::identity::VAULT_DESCRIPTOR_LIMIT {
+            return Err(MutationError::Invalid(
+                "owned candidate vault descriptor exceeds its size limit".into(),
+            ));
+        }
+        let descriptor: VaultDescriptorV1 = serde_json::from_slice(bytes).map_err(|error| {
+            MutationError::Invalid(format!("invalid owned candidate vault descriptor: {error}"))
+        })?;
+        let mut canonical = serde_json::to_vec_pretty(&descriptor)
+            .map_err(|error| MutationError::Invalid(error.to_string()))?;
+        canonical.push(b'\n');
+        if canonical != bytes
+            || crate::services::sync::identity::stable_vault_scope(descriptor.vault_id())
+                != self.after.root_scope
+        {
+            return Err(MutationError::Invalid(
+                "owned candidate vault descriptor is not canonical for the after authority".into(),
+            ));
+        }
+        Ok(Some(bytes))
+    }
+
+    fn candidate_descriptor_rollback_key(&self) -> String {
+        format!(
+            "_grafyn/.root-transition-{}.vault-descriptor-rollback",
+            self.transaction_id
+        )
+    }
+
+    fn validate_owned_candidate_descriptor_state(
+        &self,
+        preparing: bool,
+    ) -> Result<(), MutationError> {
+        let expected = self
+            .owned_candidate_descriptor_bytes()?
+            .ok_or_else(|| MutationError::Invalid("owned vault descriptor is missing".into()))?;
+        let candidate = Path::new(&self.after.canonical_vault_path);
+        match std::fs::symlink_metadata(candidate) {
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    && !preparing
+                    && self.decision == RootTransitionDecision::Prepared =>
+            {
+                return Ok(())
+            }
+            Err(error) => return Err(error.into()),
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                return Err(MutationError::RecoveryConflict(
+                    "owned candidate vault path is not a real directory".into(),
+                ));
+            }
+            Ok(_) => {}
+        }
+        let canonical = std::fs::canonicalize(candidate)?;
+        let settings_vault = std::fs::canonicalize(
+            self.after
+                .nonsecret_settings
+                .clone()
+                .into_settings()
+                .effective_vault_path(),
+        )?;
+        if canonical.to_string_lossy() != self.after.canonical_vault_path
+            || settings_vault != canonical
+        {
+            return Err(MutationError::Invalid(
+                "owned candidate vault descriptor path is inconsistent".into(),
+            ));
+        }
+        let root = AnchoredRoot::open(&canonical)?;
+        let live = root.read_bounded(
+            crate::services::sync::identity::VAULT_DESCRIPTOR_KEY,
+            crate::services::sync::identity::VAULT_DESCRIPTOR_LIMIT,
+        )?;
+        let witness_key = self.candidate_descriptor_rollback_key();
+        let rollback = root.read_bounded(
+            &witness_key,
+            crate::services::sync::identity::VAULT_DESCRIPTOR_LIMIT,
+        )?;
+        if preparing {
+            if live.is_some() || rollback.is_some() {
+                return Err(MutationError::RecoveryConflict(
+                    "owned candidate vault descriptor destination is not empty".into(),
+                ));
+            }
+            return Ok(());
+        }
+
+        let Some(witness) = self.owned_candidate_vault_descriptor_witness else {
+            if self.decision == RootTransitionDecision::Committed {
+                return Err(MutationError::Invalid(
+                    "committed owned candidate vault descriptor has no durable witness identity"
+                        .into(),
+                ));
+            }
+            return Ok(());
+        };
+        let witness_identity = crate::services::twin_events::RegularFileIdentity {
+            device: witness.device,
+            inode: witness.inode,
+        };
+        if let Some(rollback) = rollback {
+            if rollback != expected
+                || root.regular_file_identity(&witness_key)? != Some(witness_identity)
+            {
+                return Err(MutationError::RecoveryConflict(
+                    "owned candidate vault descriptor witness changed".into(),
+                ));
+            }
+        }
+        let live_identity =
+            root.regular_file_identity(crate::services::sync::identity::VAULT_DESCRIPTOR_KEY)?;
+        match self.decision {
+            RootTransitionDecision::Prepared => {
+                if live_identity == Some(witness_identity) && live.as_deref() != Some(expected) {
+                    return Err(MutationError::RecoveryConflict(
+                        "owned candidate vault descriptor changed".into(),
+                    ));
+                }
+            }
+            RootTransitionDecision::Committed => {
+                if live.as_deref() != Some(expected) || live_identity != Some(witness_identity) {
+                    return Err(MutationError::RecoveryConflict(
+                        "committed owned candidate vault descriptor is missing or changed".into(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn prepared_forward_reattach(
+        before: RootAuthorityV1,
+        after: RootAuthorityV1,
+        authority_binding: ContentDigest,
+    ) -> Result<Self, MutationError> {
+        let transition = Self {
+            schema_version: FORWARD_REATTACH_TRANSITION_SCHEMA_VERSION,
+            transaction_id: Uuid::new_v4().to_string(),
+            decision: RootTransitionDecision::Prepared,
+            authority_binding,
+            root_changed: true,
+            path_changed: Some(true),
+            vault_identity_changed: Some(false),
+            forward_only_reattach: Some(true),
+            owned_candidate_vault_descriptor: None,
+            owned_candidate_vault_descriptor_witness: None,
+            rollback_lease: after.lease.clone(),
+            before,
+            after,
+        };
+        transition.validate_preparation()?;
+        Ok(transition)
+    }
+
+    fn is_forward_only_reattach(&self) -> bool {
+        self.schema_version == FORWARD_REATTACH_TRANSITION_SCHEMA_VERSION
+            && self.forward_only_reattach == Some(true)
     }
 }
 
@@ -321,98 +751,51 @@ struct OpenRouterKeyRefV1 {
     active_version: Option<String>,
 }
 
-pub(crate) trait VersionedSecretStore: Send + Sync {
-    fn put_new(&self, version: &str, secret: &str) -> Result<(), MutationError>;
-    fn get(&self, version: &str) -> Result<Option<String>, MutationError>;
-    fn delete(&self, version: &str) -> Result<(), MutationError>;
+#[derive(Clone)]
+struct VersionedOpenRouterSecrets {
+    store: Arc<dyn SecretStore>,
 }
 
-#[derive(Debug, Default)]
-pub(crate) struct KeyringVersionedSecretStore;
+impl VersionedOpenRouterSecrets {
+    fn new(store: Arc<dyn SecretStore>) -> Self {
+        Self { store }
+    }
 
-impl VersionedSecretStore for KeyringVersionedSecretStore {
-    fn put_new(&self, version: &str, secret: &str) -> Result<(), MutationError> {
+    fn account(version: &str) -> Result<SecretAccount, MutationError> {
         validate_key_version(Some(version))?;
-        let entry =
-            keyring::Entry::new(KEYRING_SERVICE, &format!("{VERSIONED_KEY_PREFIX}{version}"))
-                .map_err(|error| MutationError::Io(error.to_string()))?;
-        match entry.get_password() {
-            Ok(_) => {
-                return Err(MutationError::Invalid(
-                    "OpenRouter key version already exists".into(),
-                ));
-            }
-            Err(keyring::Error::NoEntry) => {}
-            Err(error) => return Err(MutationError::Io(error.to_string())),
-        }
-        entry
-            .set_password(secret)
-            .map_err(|error| MutationError::Io(error.to_string()))?;
-        Ok(())
+        SecretAccount::openrouter_key(version).map_err(secret_store_error)
+    }
+
+    fn put_new(&self, version: &str, secret: &str) -> Result<(), MutationError> {
+        let account = Self::account(version)?;
+        let secret = SecretBytes::from_slice(secret.as_bytes()).map_err(secret_store_error)?;
+        self.store
+            .put(&account, &secret)
+            .map_err(secret_store_error)
     }
 
     fn get(&self, version: &str) -> Result<Option<String>, MutationError> {
-        validate_key_version(Some(version))?;
-        let entry =
-            keyring::Entry::new(KEYRING_SERVICE, &format!("{VERSIONED_KEY_PREFIX}{version}"))
-                .map_err(|error| MutationError::Io(error.to_string()))?;
-        match entry.get_password() {
-            Ok(secret) => Ok(Some(secret)),
-            Err(keyring::Error::NoEntry) => Ok(None),
-            Err(error) => Err(MutationError::Io(error.to_string())),
-        }
+        let account = Self::account(version)?;
+        let Some(secret) = self.store.get(&account).map_err(secret_store_error)? else {
+            return Ok(None);
+        };
+        String::from_utf8(secret.expose().to_vec())
+            .map(Some)
+            .map_err(|_| MutationError::Invalid("stored OpenRouter secret is not UTF-8".into()))
     }
 
     fn delete(&self, version: &str) -> Result<(), MutationError> {
-        validate_key_version(Some(version))?;
-        let entry =
-            keyring::Entry::new(KEYRING_SERVICE, &format!("{VERSIONED_KEY_PREFIX}{version}"))
-                .map_err(|error| MutationError::Io(error.to_string()))?;
-        match entry.delete_password() {
-            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-            Err(error) => Err(MutationError::Io(error.to_string())),
-        }
+        let account = Self::account(version)?;
+        self.store.delete(&account).map_err(secret_store_error)
     }
 }
 
-#[cfg(test)]
-#[derive(Debug, Default)]
-pub(crate) struct MemoryVersionedSecretStore {
-    values: Mutex<BTreeMap<String, String>>,
-}
-
-#[cfg(test)]
-impl VersionedSecretStore for MemoryVersionedSecretStore {
-    fn put_new(&self, version: &str, secret: &str) -> Result<(), MutationError> {
-        validate_key_version(Some(version))?;
-        let mut values = self
-            .values
-            .lock()
-            .map_err(|_| MutationError::Invalid("secret store lock poisoned".into()))?;
-        if values.contains_key(version) {
-            return Err(MutationError::Invalid(
-                "secret version already exists".into(),
-            ));
+fn secret_store_error(error: SecretStoreError) -> MutationError {
+    match error {
+        SecretStoreError::BackendUnavailable => {
+            MutationError::Io("secret store is unavailable".into())
         }
-        values.insert(version.to_string(), secret.to_string());
-        Ok(())
-    }
-
-    fn get(&self, version: &str) -> Result<Option<String>, MutationError> {
-        Ok(self
-            .values
-            .lock()
-            .map_err(|_| MutationError::Invalid("secret store lock poisoned".into()))?
-            .get(version)
-            .cloned())
-    }
-
-    fn delete(&self, version: &str) -> Result<(), MutationError> {
-        self.values
-            .lock()
-            .map_err(|_| MutationError::Invalid("secret store lock poisoned".into()))?
-            .remove(version);
-        Ok(())
+        other => MutationError::Invalid(other.to_string()),
     }
 }
 
@@ -430,7 +813,7 @@ pub(crate) enum MarkCommittedResult {
     Uncertain(MutationError),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct DurableSettingsSnapshot {
     pub(crate) settings: UserSettings,
     pub(crate) settings_generation: ContentDigest,
@@ -439,12 +822,30 @@ pub(crate) struct DurableSettingsSnapshot {
     pub(crate) resolved_secret: Option<String>,
 }
 
+impl std::fmt::Debug for DurableSettingsSnapshot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DurableSettingsSnapshot")
+            .field("settings_generation", &self.settings_generation)
+            .field("active_key_version", &self.active_key_version)
+            .field("key_source", &self.key_source)
+            .field("resolved_secret_present", &self.resolved_secret.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct DurableRootAuthoritySnapshot {
     pub(crate) authority: RootAuthorityV1,
     pub(crate) settings: UserSettings,
     pub(crate) settings_generation: ContentDigest,
     pub(crate) resolved_secret: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DetachedStableVault {
+    pub(crate) configured_path: std::path::PathBuf,
+    pub(crate) root_scope: ContentDigest,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -464,6 +865,8 @@ pub(crate) enum RootTransitionFaultPoint {
     AfterRollbackSettings,
     AfterRollbackKeyRef,
     AfterRollbackSecretDelete,
+    AfterRollbackCandidateDescriptor,
+    AfterCommittedCandidateDescriptor,
     AfterRecoveryWalDelete,
 }
 
@@ -473,7 +876,7 @@ pub(crate) struct RootTransitionStore {
     config_root: AnchoredRoot,
     settings_key: String,
     authority_binding: ContentDigest,
-    secrets: Arc<dyn VersionedSecretStore>,
+    secrets: VersionedOpenRouterSecrets,
     fault_once: Mutex<Option<RootTransitionFaultPoint>>,
 }
 
@@ -481,7 +884,7 @@ impl RootTransitionStore {
     pub(crate) fn new(
         data_path: impl AsRef<Path>,
         config_path: impl AsRef<Path>,
-        secrets: Arc<dyn VersionedSecretStore>,
+        secrets: Arc<dyn SecretStore>,
     ) -> Result<Self, MutationError> {
         let data_path = std::fs::canonicalize(data_path.as_ref())?;
         let data_root = AnchoredRoot::open(&data_path)?;
@@ -504,7 +907,7 @@ impl RootTransitionStore {
             config_root,
             settings_key,
             authority_binding,
-            secrets,
+            secrets: VersionedOpenRouterSecrets::new(secrets),
             fault_once: Mutex::new(None),
         })
     }
@@ -513,8 +916,225 @@ impl RootTransitionStore {
         self.authority_binding.clone()
     }
 
+    pub(crate) fn detached_stable_vault(
+        &self,
+    ) -> Result<Option<DetachedStableVault>, MutationError> {
+        let process_lock =
+            crate::services::twin_events::acquire_shared_coordinator_process_lock(&self.data_path)?;
+        let result = self.detached_stable_vault_locked();
+        process_lock.unlock()?;
+        result
+    }
+
+    pub(crate) fn prepare_runtime_vault_path(
+        &self,
+        configured_vault: &Path,
+    ) -> Result<std::path::PathBuf, MutationError> {
+        let process_lock =
+            crate::services::twin_events::acquire_shared_coordinator_process_lock(&self.data_path)?;
+        let result = (|| {
+            reject_transition_wal_locked(&self.data_path, &process_lock)?;
+            let durable_vault = self
+                .read_settings_snapshot()?
+                .settings
+                .effective_vault_path();
+            if durable_vault != configured_vault {
+                return Err(MutationError::RecoveryConflict(
+                    "runtime vault path does not match durable settings".into(),
+                ));
+            }
+            let stable = self
+                .read_optional_lease()?
+                .is_some_and(|lease| lease.is_stable());
+            if stable {
+                crate::services::twin_events::validate_real_directory(
+                    configured_vault,
+                    "configured stable vault",
+                )?;
+            } else {
+                std::fs::create_dir_all(configured_vault)?;
+                crate::services::twin_events::validate_real_directory(
+                    configured_vault,
+                    "vault runtime directory",
+                )?;
+            }
+            Ok(configured_vault.to_path_buf())
+        })();
+        process_lock.unlock()?;
+        result
+    }
+
+    pub(crate) fn reattach_missing_stable_vault(
+        &self,
+        candidate: &Path,
+    ) -> Result<DurableSettingsSnapshot, MutationError> {
+        self.reattach_missing_stable_vault_with_metadata(candidate, |path| {
+            std::fs::symlink_metadata(path)
+        })
+    }
+
+    fn reattach_missing_stable_vault_with_metadata(
+        &self,
+        candidate: &Path,
+        metadata: impl FnOnce(&Path) -> std::io::Result<std::fs::Metadata>,
+    ) -> Result<DurableSettingsSnapshot, MutationError> {
+        let process_lock =
+            crate::services::twin_events::acquire_shared_coordinator_process_lock(&self.data_path)?;
+        let result = (|| {
+            crate::services::twin_events::reject_prepared_stable_migration_locked(
+                &self.data_path,
+                &process_lock,
+            )?;
+            let detached = self
+                .detached_stable_vault_locked_with_metadata(metadata)?
+                .ok_or_else(|| {
+                    MutationError::RecoveryConflict(
+                        "forward reattach requires a genuinely unavailable stable vault".into(),
+                    )
+                })?;
+            crate::services::twin_events::validate_real_directory(
+                candidate,
+                "forward reattach candidate vault",
+            )?;
+            let candidate = std::fs::canonicalize(candidate)?;
+            if candidate == detached.configured_path {
+                return Err(MutationError::RecoveryConflict(
+                    "forward reattach candidate is the unavailable configured path".into(),
+                ));
+            }
+            let candidate_identity =
+                crate::services::sync::identity::load_vault_identity(&candidate)?;
+            if candidate_identity.root_scope != detached.root_scope {
+                return Err(MutationError::RecoveryConflict(
+                    "forward reattach candidate has a different vault identity".into(),
+                ));
+            }
+
+            let current = self.read_settings_snapshot()?;
+            let current_lease = self.read_lease()?;
+            if !current_lease.is_stable() || current_lease.root_scope != detached.root_scope {
+                return Err(MutationError::RecoveryConflict(
+                    "forward reattach stable lease changed".into(),
+                ));
+            }
+            let before_path = detached.configured_path.to_str().ok_or_else(|| {
+                MutationError::Invalid("detached vault path must be Unicode".into())
+            })?;
+            let before = RootAuthorityV1 {
+                canonical_vault_path: before_path.to_string(),
+                root_scope: detached.root_scope.clone(),
+                lease: current_lease,
+                nonsecret_settings: NonsecretSettingsV1::from_settings(current.settings.clone()),
+                openrouter_key_source: current.key_source,
+                openrouter_key_version: current.active_key_version.clone(),
+            };
+            before.validate_detached_stable()?;
+
+            let mut after_settings = current.settings;
+            after_settings.vault_path = Some(
+                candidate
+                    .to_str()
+                    .ok_or_else(|| {
+                        MutationError::Invalid("reattached vault path must be Unicode".into())
+                    })?
+                    .to_string(),
+            );
+            let after = RootAuthorityV1::new_with_key_source(
+                &candidate,
+                after_settings,
+                ActiveMarkdownRootLeaseV1::new_stable(detached.root_scope),
+                current.key_source,
+                current.active_key_version,
+            )?;
+            let transition = RootTransitionV1::prepared_forward_reattach(
+                before,
+                after,
+                self.authority_binding.clone(),
+            )?;
+            self.prepare_transition(&transition)?;
+            self.checkpoint(RootTransitionFaultPoint::AfterPrepared)?;
+            if self.recover_locked()? != RecoveryWork::RolledForward {
+                return Err(MutationError::RecoveryConflict(
+                    "forward reattach did not roll forward".into(),
+                ));
+            }
+            self.read_settings_snapshot()
+        })();
+        process_lock.unlock()?;
+        result
+    }
+
+    fn detached_stable_vault_locked(&self) -> Result<Option<DetachedStableVault>, MutationError> {
+        self.detached_stable_vault_locked_with_metadata(|path| std::fs::symlink_metadata(path))
+    }
+
+    fn detached_stable_vault_locked_with_metadata(
+        &self,
+        metadata: impl FnOnce(&Path) -> std::io::Result<std::fs::Metadata>,
+    ) -> Result<Option<DetachedStableVault>, MutationError> {
+        if self.read_transition()?.is_some() {
+            return Err(MutationError::RecoveryConflict(
+                "root-transition-already-pending".into(),
+            ));
+        }
+        let settings = self.read_settings_snapshot()?;
+        let Some(lease) = self.read_optional_lease()? else {
+            return Ok(None);
+        };
+        if !lease.is_stable() {
+            return Ok(None);
+        }
+        let configured_path = settings.settings.effective_vault_path();
+        match metadata(&configured_path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(Some(DetachedStableVault {
+                    configured_path,
+                    root_scope: lease.root_scope,
+                }))
+            }
+            Err(error) => Err(MutationError::Io(error.to_string())),
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                Err(MutationError::RecoveryConflict(
+                    "configured stable vault path is not a real directory".into(),
+                ))
+            }
+            Ok(_) => {
+                crate::services::twin_events::validate_real_directory(
+                    &configured_path,
+                    "configured stable vault",
+                )?;
+                let identity =
+                    crate::services::sync::identity::load_vault_identity(&configured_path)?;
+                if identity.root_scope != lease.root_scope {
+                    return Err(MutationError::RecoveryConflict(
+                        "configured stable vault descriptor was replaced".into(),
+                    ));
+                }
+                Ok(None)
+            }
+        }
+    }
+
     fn encoded_transition(&self, transition: &RootTransitionV1) -> Result<Vec<u8>, MutationError> {
+        match transition.decision {
+            RootTransitionDecision::Prepared => transition.validate_preparation()?,
+            RootTransitionDecision::Committed => transition.validate()?,
+        }
+        self.serialize_transition(transition)
+    }
+
+    fn encoded_durable_transition(
+        &self,
+        transition: &RootTransitionV1,
+    ) -> Result<Vec<u8>, MutationError> {
         transition.validate()?;
+        self.serialize_transition(transition)
+    }
+
+    fn serialize_transition(
+        &self,
+        transition: &RootTransitionV1,
+    ) -> Result<Vec<u8>, MutationError> {
         let mut bytes = serde_json::to_vec_pretty(transition)
             .map_err(|error| MutationError::Invalid(error.to_string()))?;
         bytes.push(b'\n');
@@ -609,6 +1229,266 @@ impl RootTransitionStore {
             ));
         }
         self.prepare_transition(transition)
+    }
+
+    pub(crate) fn install_owned_candidate_vault_descriptor(
+        &self,
+        transition: &mut RootTransitionV1,
+    ) -> Result<(), MutationError> {
+        self.require_exact_prepared_transition(transition)?;
+        let Some(expected) = transition
+            .owned_candidate_descriptor_bytes()?
+            .map(<[u8]>::to_vec)
+        else {
+            return Ok(());
+        };
+        let root = AnchoredRoot::open(&transition.after.canonical_vault_path)?;
+        let witness_key = transition.candidate_descriptor_rollback_key();
+        let witness_outcome =
+            root.install_no_clobber_with_outcome(&witness_key, "_grafyn", &expected)?;
+        if witness_outcome != crate::services::twin_events::NoClobberInstallOutcome::Installed {
+            return Err(MutationError::RecoveryConflict(
+                "owned candidate vault descriptor witness was already occupied".into(),
+            ));
+        }
+        if root
+            .read_bounded(
+                &witness_key,
+                crate::services::sync::identity::VAULT_DESCRIPTOR_LIMIT,
+            )?
+            .as_deref()
+            != Some(expected.as_slice())
+        {
+            return Err(MutationError::RecoveryConflict(
+                "owned candidate vault descriptor witness changed before ownership was recorded"
+                    .into(),
+            ));
+        }
+        let witness_identity = root.regular_file_identity(&witness_key)?.ok_or_else(|| {
+            MutationError::RecoveryConflict(
+                "owned candidate vault descriptor witness disappeared before ownership was recorded"
+                    .into(),
+            )
+        })?;
+        self.record_owned_candidate_descriptor_witness(transition, witness_identity)?;
+        let link_outcome = root.hard_link_no_clobber(
+            &witness_key,
+            crate::services::sync::identity::VAULT_DESCRIPTOR_KEY,
+            false,
+        )?;
+        if link_outcome != crate::services::twin_events::NoClobberInstallOutcome::Installed {
+            return Err(MutationError::RecoveryConflict(
+                "owned candidate vault descriptor destination was already occupied".into(),
+            ));
+        }
+        if root
+            .read_bounded(
+                crate::services::sync::identity::VAULT_DESCRIPTOR_KEY,
+                crate::services::sync::identity::VAULT_DESCRIPTOR_LIMIT,
+            )?
+            .as_deref()
+            != Some(expected.as_slice())
+        {
+            return Err(MutationError::RecoveryConflict(
+                "owned candidate vault descriptor install lost its no-clobber race".into(),
+            ));
+        }
+        if root.regular_file_identity(crate::services::sync::identity::VAULT_DESCRIPTOR_KEY)?
+            != Some(witness_identity)
+        {
+            return Err(MutationError::RecoveryConflict(
+                "owned candidate vault descriptor is not linked to its witness".into(),
+            ));
+        }
+        self.record_owned_candidate_descriptor_live_install(transition, witness_identity)?;
+        Ok(())
+    }
+
+    fn record_owned_candidate_descriptor_witness(
+        &self,
+        transition: &mut RootTransitionV1,
+        identity: crate::services::twin_events::RegularFileIdentity,
+    ) -> Result<(), MutationError> {
+        self.require_exact_prepared_transition(transition)?;
+        if transition.owned_candidate_vault_descriptor.is_none()
+            || transition
+                .owned_candidate_vault_descriptor_witness
+                .is_some()
+        {
+            return Err(MutationError::Invalid(
+                "candidate descriptor witness ownership cannot be recorded in this transition"
+                    .into(),
+            ));
+        }
+        let mut claimed = transition.clone();
+        claimed.owned_candidate_vault_descriptor_witness =
+            Some(OwnedCandidateDescriptorWitnessV1 {
+                device: identity.device,
+                inode: identity.inode,
+                live_installed: false,
+            });
+        let bytes = self.encoded_durable_transition(&claimed)?;
+        self.data_root.put_atomic(ROOT_TRANSITION_KEY, &bytes)?;
+        if self.read_transition()?.as_ref() != Some(&claimed) {
+            return Err(MutationError::RecoveryConflict(
+                "candidate descriptor witness ownership write was not durable".into(),
+            ));
+        }
+        *transition = claimed;
+        Ok(())
+    }
+
+    fn record_owned_candidate_descriptor_live_install(
+        &self,
+        transition: &mut RootTransitionV1,
+        identity: crate::services::twin_events::RegularFileIdentity,
+    ) -> Result<(), MutationError> {
+        self.require_exact_prepared_transition(transition)?;
+        let Some(witness) = transition.owned_candidate_vault_descriptor_witness else {
+            return Err(MutationError::Invalid(
+                "candidate descriptor live install has no durable witness identity".into(),
+            ));
+        };
+        if witness.live_installed
+            || witness.device != identity.device
+            || witness.inode != identity.inode
+        {
+            return Err(MutationError::Invalid(
+                "candidate descriptor live install does not match its prepared witness".into(),
+            ));
+        }
+        let expected = transition
+            .owned_candidate_descriptor_bytes()?
+            .ok_or_else(|| MutationError::Invalid("owned vault descriptor is missing".into()))?
+            .to_vec();
+        let root = AnchoredRoot::open(&transition.after.canonical_vault_path)?;
+        if root
+            .read_bounded(
+                crate::services::sync::identity::VAULT_DESCRIPTOR_KEY,
+                crate::services::sync::identity::VAULT_DESCRIPTOR_LIMIT,
+            )?
+            .as_deref()
+            != Some(expected.as_slice())
+            || root.regular_file_identity(crate::services::sync::identity::VAULT_DESCRIPTOR_KEY)?
+                != Some(identity)
+        {
+            return Err(MutationError::RecoveryConflict(
+                "candidate descriptor live install changed before ownership was recorded".into(),
+            ));
+        }
+        let mut claimed = transition.clone();
+        claimed
+            .owned_candidate_vault_descriptor_witness
+            .as_mut()
+            .expect("witness was checked")
+            .live_installed = true;
+        let bytes = self.encoded_durable_transition(&claimed)?;
+        self.data_root.put_atomic(ROOT_TRANSITION_KEY, &bytes)?;
+        if self.read_transition()?.as_ref() != Some(&claimed) {
+            return Err(MutationError::RecoveryConflict(
+                "candidate descriptor live-install ownership write was not durable".into(),
+            ));
+        }
+        *transition = claimed;
+        Ok(())
+    }
+
+    fn remove_owned_candidate_vault_descriptor(
+        &self,
+        transition: &RootTransitionV1,
+    ) -> Result<(), MutationError> {
+        let Some(expected) = transition.owned_candidate_descriptor_bytes()? else {
+            return Ok(());
+        };
+        let Some(witness) = transition.owned_candidate_vault_descriptor_witness else {
+            return Ok(());
+        };
+        let witness_identity = crate::services::twin_events::RegularFileIdentity {
+            device: witness.device,
+            inode: witness.inode,
+        };
+        let candidate = Path::new(&transition.after.canonical_vault_path);
+        match std::fs::symlink_metadata(candidate) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                return Err(MutationError::RecoveryConflict(
+                    "owned candidate vault path is no longer a real directory".into(),
+                ));
+            }
+            Ok(_) => {}
+        }
+        let root = AnchoredRoot::open(candidate)?;
+        let witness_key = transition.candidate_descriptor_rollback_key();
+        if witness.live_installed {
+            let _ = root.quarantine_regular_file_if_identity(
+                crate::services::sync::identity::VAULT_DESCRIPTOR_KEY,
+                witness_identity,
+            )?;
+        }
+        if let Some(durable_witness) = root.read_bounded(
+            &witness_key,
+            crate::services::sync::identity::VAULT_DESCRIPTOR_LIMIT,
+        )? {
+            if durable_witness != expected
+                || !root.quarantine_regular_file_if_identity(&witness_key, witness_identity)?
+            {
+                return Err(MutationError::RecoveryConflict(
+                    "owned candidate vault descriptor witness changed during rollback".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn finalize_committed_candidate_vault_descriptor(
+        &self,
+        transition: &RootTransitionV1,
+    ) -> Result<(), MutationError> {
+        if transition.decision != RootTransitionDecision::Committed
+            || self.read_transition()?.as_ref() != Some(transition)
+        {
+            return Err(MutationError::RecoveryConflict(
+                "root-transition-committed-cas-failed".into(),
+            ));
+        }
+        let Some(expected) = transition.owned_candidate_descriptor_bytes()? else {
+            return Ok(());
+        };
+        let witness = transition
+            .owned_candidate_vault_descriptor_witness
+            .ok_or_else(|| {
+                MutationError::Invalid(
+                    "committed owned candidate vault descriptor has no durable witness identity"
+                        .into(),
+                )
+            })?;
+        let witness_identity = crate::services::twin_events::RegularFileIdentity {
+            device: witness.device,
+            inode: witness.inode,
+        };
+        let root = AnchoredRoot::open(&transition.after.canonical_vault_path)?;
+        let witness_key = transition.candidate_descriptor_rollback_key();
+        let Some(durable_witness) = root.read_bounded(
+            &witness_key,
+            crate::services::sync::identity::VAULT_DESCRIPTOR_LIMIT,
+        )?
+        else {
+            return Ok(());
+        };
+        if durable_witness != expected {
+            return Err(MutationError::RecoveryConflict(
+                "committed owned candidate vault descriptor witness is invalid".into(),
+            ));
+        }
+        root.quarantine_regular_file_if_identity(&witness_key, witness_identity)?
+            .then_some(())
+            .ok_or_else(|| {
+                MutationError::RecoveryConflict(
+                    "committed owned candidate vault descriptor witness changed during cleanup"
+                        .into(),
+                )
+            })
     }
 
     fn require_matching_process_lock(
@@ -831,7 +1711,9 @@ impl RootTransitionStore {
                                     "legacy-openrouter-migration-version-conflict".into(),
                                 ));
                             }
-                            None => self.stage_secret(LEGACY_MIGRATION_KEY_VERSION, &legacy_secret)?,
+                            None => {
+                                self.stage_secret(LEGACY_MIGRATION_KEY_VERSION, &legacy_secret)?
+                            }
                         }
                         self.write_key_authority(
                             OpenRouterKeySource::Versioned,
@@ -896,8 +1778,10 @@ impl RootTransitionStore {
         &self,
         lease: &ActiveMarkdownRootLeaseV1,
     ) -> Result<(), MutationError> {
-        if lease.schema_version != LEASE_SCHEMA_VERSION
-            || Uuid::parse_str(&lease.epoch_uuid).is_err()
+        if !matches!(
+            lease.schema_version,
+            LEASE_SCHEMA_VERSION | STABLE_LEASE_SCHEMA_VERSION
+        ) || !is_canonical_non_nil_uuid(&lease.epoch_uuid)
         {
             return Err(MutationError::Invalid("invalid active root lease".into()));
         }
@@ -989,6 +1873,8 @@ impl RootTransitionStore {
                 self.secrets.delete(version)?;
             }
         }
+        self.remove_owned_candidate_vault_descriptor(transition)?;
+        self.checkpoint(RootTransitionFaultPoint::AfterRollbackCandidateDescriptor)?;
         self.remove_transition()
     }
 
@@ -996,7 +1882,8 @@ impl RootTransitionStore {
         &self,
         transition: &RootTransitionV1,
     ) -> Result<(), MutationError> {
-        if transition.decision != RootTransitionDecision::Prepared
+        if transition.is_forward_only_reattach()
+            || transition.decision != RootTransitionDecision::Prepared
             || self.read_transition()?.as_ref() != Some(transition)
         {
             return Err(MutationError::RecoveryConflict(
@@ -1050,6 +1937,21 @@ impl RootTransitionStore {
             "OpenRouter key reference",
         )?;
 
+        if transition.is_forward_only_reattach() {
+            self.write_lease(&transition.after.lease)?;
+            self.checkpoint(RootTransitionFaultPoint::AfterLease)?;
+            self.write_settings(&transition.after.nonsecret_settings)?;
+            self.checkpoint(RootTransitionFaultPoint::AfterSettings)?;
+            self.write_key_authority(
+                transition.after.openrouter_key_source,
+                transition.after.openrouter_key_version.as_deref(),
+            )?;
+            self.checkpoint(RootTransitionFaultPoint::AfterKeyRef)?;
+            self.remove_transition()?;
+            self.checkpoint(RootTransitionFaultPoint::AfterRecoveryWalDelete)?;
+            return Ok(RecoveryWork::RolledForward);
+        }
+
         match transition.decision {
             RootTransitionDecision::Prepared => {
                 self.write_lease(&transition.rollback_lease)?;
@@ -1069,6 +1971,8 @@ impl RootTransitionStore {
                     }
                 }
                 self.checkpoint(RootTransitionFaultPoint::AfterRollbackSecretDelete)?;
+                self.remove_owned_candidate_vault_descriptor(&transition)?;
+                self.checkpoint(RootTransitionFaultPoint::AfterRollbackCandidateDescriptor)?;
                 self.remove_transition()?;
                 self.checkpoint(RootTransitionFaultPoint::AfterRecoveryWalDelete)?;
                 Ok(RecoveryWork::RolledBack)
@@ -1098,6 +2002,8 @@ impl RootTransitionStore {
                     }
                 }
                 self.checkpoint(RootTransitionFaultPoint::AfterOldKeyDelete)?;
+                self.finalize_committed_candidate_vault_descriptor(&transition)?;
+                self.checkpoint(RootTransitionFaultPoint::AfterCommittedCandidateDescriptor)?;
                 self.remove_transition()?;
                 self.checkpoint(RootTransitionFaultPoint::AfterRecoveryWalDelete)?;
                 Ok(RecoveryWork::RolledForward)
@@ -1196,18 +2102,18 @@ impl RootTransitionStore {
     }
 
     fn read_lease(&self) -> Result<ActiveMarkdownRootLeaseV1, MutationError> {
-        let bytes = self
+        self.read_optional_lease()?
+            .ok_or_else(|| MutationError::Invalid("active root lease is missing".into()))
+    }
+
+    fn read_optional_lease(&self) -> Result<Option<ActiveMarkdownRootLeaseV1>, MutationError> {
+        let Some(bytes) = self
             .data_root
             .read_bounded(ACTIVE_ROOT_LEASE_KEY, KEY_REF_LIMIT)?
-            .ok_or_else(|| MutationError::Invalid("active root lease is missing".into()))?;
-        let lease: ActiveMarkdownRootLeaseV1 = serde_json::from_slice(&bytes)
-            .map_err(|error| MutationError::Invalid(format!("invalid root lease: {error}")))?;
-        if lease.schema_version != LEASE_SCHEMA_VERSION
-            || Uuid::parse_str(&lease.epoch_uuid).is_err()
-        {
-            return Err(MutationError::Invalid("invalid active root lease".into()));
-        }
-        Ok(lease)
+        else {
+            return Ok(None);
+        };
+        parse_active_root_lease(&bytes).map(Some)
     }
 
     fn read_key_ref(&self) -> Result<OpenRouterKeyRefV1, MutationError> {
@@ -1369,7 +2275,7 @@ fn root_authority_binding(
         data_scope.as_str(),
         config_scope.as_str(),
         settings_key,
-        KEYRING_SERVICE,
+        SECRET_STORE_SERVICE,
         VERSIONED_KEY_PREFIX,
     ] {
         domain.extend_from_slice(&(value.len() as u64).to_be_bytes());
@@ -1378,388 +2284,56 @@ fn root_authority_binding(
     Ok(crate::services::twin_events::digest_bytes(&domain))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::models::settings::UserSettings;
-    use crate::services::twin_events::{root_identity_for_path, ActiveMarkdownRootLeaseV1};
-    use std::sync::Arc;
-
-    fn fixture() -> (tempfile::TempDir, RootTransitionStore, RootTransitionV1) {
-        let temp = tempfile::tempdir().unwrap();
-        let data = temp.path().join("data");
-        let config = temp.path().join("config");
-        let old = temp.path().join("vault-a");
-        let new = temp.path().join("vault-b");
-        std::fs::create_dir(&data).unwrap();
-        std::fs::create_dir(&config).unwrap();
-        std::fs::create_dir(&old).unwrap();
-        std::fs::create_dir(&new).unwrap();
-        let secrets = Arc::new(MemoryVersionedSecretStore::default());
-        let store = RootTransitionStore::new(&data, config.join("settings.json"), secrets).unwrap();
-        let before_settings = UserSettings {
-            vault_path: Some(old.to_string_lossy().into_owned()),
-            ..UserSettings::default()
-        };
-        let after_settings = UserSettings {
-            vault_path: Some(new.to_string_lossy().into_owned()),
-            theme: "dark".into(),
-            ..UserSettings::default()
-        };
-        let old_key = Uuid::new_v4().to_string();
-        let new_key = Uuid::new_v4().to_string();
-        let before = RootAuthorityV1::new(
-            &old,
-            before_settings,
-            ActiveMarkdownRootLeaseV1::new(root_identity_for_path(&old).unwrap()),
-            Some(old_key),
-        )
-        .unwrap();
-        let after = RootAuthorityV1::new(
-            &new,
-            after_settings,
-            ActiveMarkdownRootLeaseV1::new(root_identity_for_path(&new).unwrap()),
-            Some(new_key),
-        )
-        .unwrap();
-        let transition =
-            RootTransitionV1::prepared(before, after, store.authority_binding()).unwrap();
-        (temp, store, transition)
-    }
-
-    #[test]
-    fn guarded_settings_patch_uses_fresh_durable_state_instead_of_stale_process_state() {
-        let temp = tempfile::tempdir().unwrap();
-        let data = temp.path().join("data");
-        let config = temp.path().join("config");
-        let vault = temp.path().join("vault");
-        std::fs::create_dir(&data).unwrap();
-        std::fs::create_dir(&config).unwrap();
-        std::fs::create_dir(&vault).unwrap();
-        let secrets = Arc::new(MemoryVersionedSecretStore::default());
-        let first = RootTransitionStore::new(
-            &data,
-            config.join("settings.json"),
-            secrets.clone(),
-        )
-        .unwrap();
-        let stale = RootTransitionStore::new(&data, config.join("settings.json"), secrets).unwrap();
-        let initial = UserSettings {
-            vault_path: Some(vault.to_string_lossy().into_owned()),
-            theme: "light".into(),
-            mcp_enabled: false,
-            ..UserSettings::default()
-        };
-        first
-            .write_settings_guarded(&NonsecretSettingsV1::from_settings(initial))
-            .unwrap();
-
-        first
-            .patch_settings_guarded(|fresh| {
-                fresh.mcp_enabled = true;
-                Ok(())
-            })
-            .unwrap();
-        let patched = stale
-            .patch_settings_guarded(|fresh| {
-                fresh.theme = "dark".into();
-                Ok(())
-            })
-            .unwrap();
-
-        assert_eq!(patched.settings.theme, "dark");
-        assert!(patched.settings.mcp_enabled);
-        assert_eq!(patched.settings.effective_vault_path(), vault);
-    }
-
-    #[test]
-    fn copied_transition_wal_cannot_act_for_another_data_config_or_key_authority() {
-        let (_fixture, source, transition) = fixture();
-        let other = tempfile::tempdir().unwrap();
-        let data = other.path().join("data");
-        let config = other.path().join("config");
-        std::fs::create_dir(&data).unwrap();
-        std::fs::create_dir(&config).unwrap();
-        let destination = RootTransitionStore::new(
-            &data,
-            config.join("settings.json"),
-            Arc::new(MemoryVersionedSecretStore::default()),
-        )
-        .unwrap();
-
-        assert_ne!(source.authority_binding(), destination.authority_binding());
-        let error = destination.prepare_transition(&transition).unwrap_err();
-        assert!(error.to_string().contains("authority-binding"));
-        assert!(!destination.transition_exists_for_test().unwrap());
-    }
-
-    #[test]
-    fn prepared_recovery_rolls_back_mixed_authorities_and_second_restart_is_zero_work() {
-        let (_temp, store, transition) = fixture();
-        let old_key = transition.before.openrouter_key_version.as_deref().unwrap();
-        let new_key = transition.after.openrouter_key_version.as_deref().unwrap();
-        store.seed_secret_for_test(old_key, "old-secret").unwrap();
-        store.seed_secret_for_test(new_key, "new-secret").unwrap();
-        store.write_authority_for_test(&transition.before).unwrap();
-        store.write_transition(&transition).unwrap();
-        store.write_lease(&transition.after.lease).unwrap();
-        store
-            .write_key_ref(transition.after.openrouter_key_version.as_deref())
-            .unwrap();
-
-        assert_eq!(store.recover().unwrap(), RecoveryWork::RolledBack);
-        let recovered = store.read_authority_for_test().unwrap();
-        assert_eq!(
-            recovered.nonsecret_settings,
-            transition.before.nonsecret_settings
-        );
-        assert_eq!(recovered.root_scope, transition.before.root_scope);
-        assert_eq!(
-            recovered.openrouter_key_version,
-            transition.before.openrouter_key_version
-        );
-        assert_eq!(recovered.lease, transition.rollback_lease);
-        assert!(store.read_secret_for_test(new_key).unwrap().is_none());
-        assert_eq!(store.recover().unwrap(), RecoveryWork::None);
-    }
-
-    #[test]
-    fn committed_recovery_rolls_forward_and_second_restart_is_zero_work() {
-        let (_temp, store, mut transition) = fixture();
-        let old_key = transition.before.openrouter_key_version.clone().unwrap();
-        let new_key = transition.after.openrouter_key_version.clone().unwrap();
-        store.seed_secret_for_test(&old_key, "old-secret").unwrap();
-        store.seed_secret_for_test(&new_key, "new-secret").unwrap();
-        store.write_authority_for_test(&transition.before).unwrap();
-        transition.decision = RootTransitionDecision::Committed;
-        store.write_transition(&transition).unwrap();
-        store
-            .write_settings(&transition.after.nonsecret_settings)
-            .unwrap();
-
-        assert_eq!(store.recover().unwrap(), RecoveryWork::RolledForward);
-        assert_eq!(store.read_authority_for_test().unwrap(), transition.after);
-        assert!(store.read_secret_for_test(&old_key).unwrap().is_none());
-        assert_eq!(store.recover().unwrap(), RecoveryWork::None);
-    }
-
-    #[test]
-    fn unexpected_third_settings_state_preserves_every_byte_and_wal() {
-        let (_temp, store, transition) = fixture();
-        let old_key = transition.before.openrouter_key_version.as_deref().unwrap();
-        let new_key = transition.after.openrouter_key_version.as_deref().unwrap();
-        store.seed_secret_for_test(old_key, "old-secret").unwrap();
-        store.seed_secret_for_test(new_key, "new-secret").unwrap();
-        store.write_authority_for_test(&transition.before).unwrap();
-        store.write_transition(&transition).unwrap();
-        let third = UserSettings {
-            theme: "third".into(),
-            ..UserSettings::default()
-        };
-        store
-            .write_settings(&NonsecretSettingsV1::from_settings(third))
-            .unwrap();
-        let before = store.read_settings_bytes_for_test().unwrap();
-        assert!(store.recover().is_err());
-        assert_eq!(store.read_settings_bytes_for_test().unwrap(), before);
-        assert!(store.transition_exists_for_test().unwrap());
-    }
-
-    #[test]
-    fn strict_and_bounded_transition_read_fails_closed() {
-        let (_temp, store, transition) = fixture();
-        let mut value = serde_json::to_value(&transition).unwrap();
-        value
-            .as_object_mut()
-            .unwrap()
-            .insert("unknown".into(), true.into());
-        store
-            .write_raw_transition_for_test(&serde_json::to_vec(&value).unwrap())
-            .unwrap();
-        assert!(store.recover().is_err());
-        store
-            .write_raw_transition_for_test(&vec![b'x'; ROOT_TRANSITION_LIMIT + 1])
-            .unwrap();
-        assert!(store.recover().is_err());
-    }
-
-    #[test]
-    fn prepared_recovery_restarts_after_every_rollback_durable_phase() {
-        for point in [
-            RootTransitionFaultPoint::AfterRollbackLease,
-            RootTransitionFaultPoint::AfterRollbackSettings,
-            RootTransitionFaultPoint::AfterRollbackKeyRef,
-            RootTransitionFaultPoint::AfterRollbackSecretDelete,
-            RootTransitionFaultPoint::AfterRecoveryWalDelete,
-        ] {
-            let (_temp, store, transition) = fixture();
-            let old_key = transition.before.openrouter_key_version.as_deref().unwrap();
-            let new_key = transition.after.openrouter_key_version.as_deref().unwrap();
-            store.seed_secret_for_test(old_key, "old-secret").unwrap();
-            store.seed_secret_for_test(new_key, "new-secret").unwrap();
-            store.write_authority_for_test(&transition.before).unwrap();
-            store.write_transition(&transition).unwrap();
-            store.write_lease(&transition.after.lease).unwrap();
-            store
-                .write_settings(&transition.after.nonsecret_settings)
-                .unwrap();
-            store
-                .write_key_ref(transition.after.openrouter_key_version.as_deref())
-                .unwrap();
-            store.fail_once_at(point);
-            assert!(
-                store.recover().is_err(),
-                "fault {point:?} must interrupt recovery"
-            );
-            let resumed = store.recover().unwrap();
-            if point == RootTransitionFaultPoint::AfterRecoveryWalDelete {
-                assert_eq!(resumed, RecoveryWork::None);
-            } else {
-                assert_eq!(resumed, RecoveryWork::RolledBack);
-            }
-            assert_eq!(store.recover().unwrap(), RecoveryWork::None);
-        }
-    }
-
-    #[test]
-    fn committed_recovery_restarts_after_every_rollforward_durable_phase() {
-        for point in [
-            RootTransitionFaultPoint::AfterLease,
-            RootTransitionFaultPoint::AfterSettings,
-            RootTransitionFaultPoint::AfterKeyRef,
-            RootTransitionFaultPoint::AfterOldKeyDelete,
-            RootTransitionFaultPoint::AfterRecoveryWalDelete,
-        ] {
-            let (_temp, store, mut transition) = fixture();
-            let old_key = transition.before.openrouter_key_version.as_deref().unwrap();
-            let new_key = transition.after.openrouter_key_version.as_deref().unwrap();
-            store.seed_secret_for_test(old_key, "old-secret").unwrap();
-            store.seed_secret_for_test(new_key, "new-secret").unwrap();
-            store.write_authority_for_test(&transition.before).unwrap();
-            transition.decision = RootTransitionDecision::Committed;
-            store.write_transition(&transition).unwrap();
-            store.fail_once_at(point);
-            assert!(
-                store.recover().is_err(),
-                "fault {point:?} must interrupt recovery"
-            );
-            let resumed = store.recover().unwrap();
-            if point == RootTransitionFaultPoint::AfterRecoveryWalDelete {
-                assert_eq!(resumed, RecoveryWork::None);
-            } else {
-                assert_eq!(resumed, RecoveryWork::RolledForward);
-            }
-            assert_eq!(store.recover().unwrap(), RecoveryWork::None);
-        }
-    }
-
-    #[test]
-    fn prepared_wal_is_no_clobber_and_commit_is_same_transaction_cas() {
-        let (_temp, store, first) = fixture();
-        let (_second_temp, _second_store, second) = fixture();
-        store.prepare_transition(&first).unwrap();
-        let first_bytes = store.read_transition_bytes_for_test().unwrap();
-        assert!(store.prepare_transition(&second).is_err());
-        assert_eq!(store.read_transition_bytes_for_test().unwrap(), first_bytes);
-
-        let wrong = second;
-        assert!(matches!(
-            store.mark_committed(&wrong),
-            MarkCommittedResult::Uncertain(_)
-        ));
-        assert_eq!(store.read_transition_bytes_for_test().unwrap(), first_bytes);
-        let exact = first;
-        let committed = match store.mark_committed(&exact) {
-            MarkCommittedResult::Committed(committed) => committed,
-            other => panic!("expected committed WAL, got {other:?}"),
-        };
-        assert_eq!(committed.decision, RootTransitionDecision::Committed);
-        let committed_bytes = store.read_transition_bytes_for_test().unwrap();
-        assert!(matches!(
-            store.mark_committed(&committed),
-            MarkCommittedResult::Uncertain(_)
-        ));
-        assert_eq!(
-            store.read_transition_bytes_for_test().unwrap(),
-            committed_bytes
-        );
-    }
-
-    #[test]
-    fn commit_result_distinguishes_prepared_committed_and_uncertain_durability() {
-        let (_temp, store, transition) = fixture();
-        store.prepare_transition(&transition).unwrap();
-        store.fail_once_at(RootTransitionFaultPoint::BeforeCommitWalWrite);
-        assert!(matches!(
-            store.mark_committed(&transition),
-            MarkCommittedResult::DefinitelyPrepared(_)
-        ));
-        assert_eq!(store.read_transition().unwrap(), Some(transition.clone()));
-
-        store.fail_once_at(RootTransitionFaultPoint::AfterCommitWalWrite);
-        let committed = match store.mark_committed(&transition) {
-            MarkCommittedResult::Committed(committed) => committed,
-            other => panic!("durable committed WAL must win after an uncertain write: {other:?}"),
-        };
-        assert_eq!(committed.decision, RootTransitionDecision::Committed);
-
-        let (_other_temp, other_store, other) = fixture();
-        other_store.prepare_transition(&other).unwrap();
-        let mut wrong = other.clone();
-        wrong.transaction_id = Uuid::new_v4().to_string();
-        assert!(matches!(
-            other_store.mark_committed(&wrong),
-            MarkCommittedResult::Uncertain(_)
-        ));
-        assert_eq!(other_store.read_transition().unwrap(), Some(other));
-    }
-
-    #[test]
-    fn prepared_rollback_helpers_require_the_exact_durable_transaction() {
-        let (_temp, store, transition) = fixture();
-        let old_key = transition.before.openrouter_key_version.as_deref().unwrap();
-        let new_key = transition.after.openrouter_key_version.as_deref().unwrap();
-        store.seed_secret_for_test(old_key, "old-secret").unwrap();
-        store.seed_secret_for_test(new_key, "new-secret").unwrap();
-        store.write_authority_for_test(&transition.before).unwrap();
-        store.prepare_transition(&transition).unwrap();
-        let authority_before = store.read_authority_for_test().unwrap();
-
-        let mut wrong = transition.clone();
-        wrong.transaction_id = Uuid::new_v4().to_string();
-        assert!(store.restore_prepared_authorities(&wrong).is_err());
-        assert!(store.finalize_prepared_rollback(&wrong).is_err());
-        assert_eq!(store.read_authority_for_test().unwrap(), authority_before);
-        assert!(store.transition_exists_for_test().unwrap());
-        assert!(store.read_secret_for_test(new_key).unwrap().is_some());
-    }
-
-    #[test]
-    fn legacy_migration_uses_one_discoverable_version_and_sanitized_settings() {
-        let (_temp, store, _transition) = fixture();
-
-        let (version, secret) = store
-            .migrate_legacy_secret_authority("new-keychain")
-            .unwrap();
-        assert_eq!(version, LEGACY_MIGRATION_KEY_VERSION);
-        assert_eq!(secret, "new-keychain");
-        assert_eq!(
-            store.active_key_version().unwrap().as_deref(),
-            Some(version.as_str())
-        );
-        assert_eq!(
-            store.resolve_secret(Some(&version)).unwrap().as_deref(),
-            Some("new-keychain")
-        );
-        assert!(
-            !String::from_utf8(store.read_settings_bytes_for_test().unwrap())
-                .unwrap()
-                .contains("stale-plaintext")
-        );
-
-        let repeated = store
-            .migrate_legacy_secret_authority("new-keychain")
-            .unwrap();
-        assert_eq!(repeated, (version, "new-keychain".into()));
+fn authority_scope_for(
+    canonical_vault_path: &Path,
+    lease: &ActiveMarkdownRootLeaseV1,
+) -> Result<ContentDigest, MutationError> {
+    if lease.is_stable() {
+        Ok(crate::services::sync::identity::load_vault_identity(canonical_vault_path)?.root_scope)
+    } else {
+        root_identity_for_path(canonical_vault_path)
     }
 }
+
+fn same_nonsecret_settings_except_vault(
+    before: &NonsecretSettingsV1,
+    after: &NonsecretSettingsV1,
+) -> bool {
+    let mut before = before.clone();
+    let mut after = after.clone();
+    before.vault_path = None;
+    after.vault_path = None;
+    before == after
+}
+
+fn is_normal_absolute_path(path: &Path) -> bool {
+    path.is_absolute()
+        && path.components().all(|component| {
+            !matches!(
+                component,
+                std::path::Component::CurDir | std::path::Component::ParentDir
+            )
+        })
+}
+
+fn is_canonical_non_nil_uuid(value: &str) -> bool {
+    Uuid::parse_str(value)
+        .is_ok_and(|uuid| !uuid.is_nil() && uuid.hyphenated().to_string() == value)
+}
+
+fn parse_active_root_lease(bytes: &[u8]) -> Result<ActiveMarkdownRootLeaseV1, MutationError> {
+    let lease: ActiveMarkdownRootLeaseV1 = serde_json::from_slice(bytes)
+        .map_err(|error| MutationError::Invalid(format!("invalid root lease: {error}")))?;
+    if !matches!(
+        lease.schema_version,
+        LEASE_SCHEMA_VERSION | STABLE_LEASE_SCHEMA_VERSION
+    ) || !is_canonical_non_nil_uuid(&lease.epoch_uuid)
+    {
+        return Err(MutationError::Invalid("invalid active root lease".into()));
+    }
+    Ok(lease)
+}
+
+#[cfg(test)]
+#[path = "root_transition_tests.rs"]
+mod tests;

@@ -88,6 +88,7 @@ pub(crate) fn build_test_state() -> (AppState, TempDir, TempDir) {
         vault_transition: Arc::new(tokio::sync::RwLock::new(())),
         memory_service: Arc::new(MemoryService::new()),
         boot_state: Arc::new(RwLock::new(BootStatus::default())),
+        _recovery_runtime: None,
     };
 
     (state, vault_dir, data_dir)

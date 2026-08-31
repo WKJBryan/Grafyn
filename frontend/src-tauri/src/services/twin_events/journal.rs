@@ -145,7 +145,7 @@ pub struct MutationIntentV1 {
 
 impl MutationIntentV1 {
     pub fn validate(&self) -> Result<(), MutationError> {
-        if !matches!(self.schema_version, 1 | 2 | 3) {
+        if !matches!(self.schema_version, 1..=3) {
             return Err(MutationError::Invalid(
                 "unsupported local mutation journal schema".into(),
             ));
@@ -605,6 +605,24 @@ impl LocalMutationJournal {
             .len()
             .checked_add(self.preauthority_paths()?.len())
             .ok_or_else(|| MutationError::Invalid("mutation journal count overflow".into()))
+    }
+
+    pub(crate) fn retained_owner_count(
+        &self,
+        lock: &crate::services::twin_events::CoordinatorProcessLock,
+    ) -> Result<usize, MutationError> {
+        if !lock.covers_data_path(self.root.canonical_path())? {
+            return Err(MutationError::Invalid(
+                "mutation journal owner query lock belongs to another data root".into(),
+            ));
+        }
+        let pending = self.pending_paths()?.len();
+        let preauthority = self.preauthority_paths()?.len();
+        let receipts = self.json_names(RECEIPTS_DIRECTORY)?.len();
+        pending
+            .checked_add(preauthority)
+            .and_then(|count| count.checked_add(receipts))
+            .ok_or_else(|| MutationError::Invalid("mutation journal owner count overflow".into()))
     }
 
     pub(crate) fn quarantine_count(

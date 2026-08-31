@@ -46,6 +46,59 @@ struct Args {
     data: Option<PathBuf>,
 }
 
+fn prepare_mcp_root_directories(
+    vault_path: &std::path::Path,
+    data_path: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    std::fs::create_dir_all(data_path)?;
+    crate::services::twin_events::validate_real_directory(data_path, "MCP data root")?;
+    crate::services::twin_events::AnchoredRoot::open(data_path)?
+        .open_directory("twin/events", true)?;
+    let process_lock =
+        crate::services::twin_events::acquire_shared_coordinator_process_lock(data_path)?;
+    let result = (|| -> Result<(), crate::services::twin_events::MutationError> {
+        crate::services::root_transition::reject_transition_wal_locked(data_path, &process_lock)?;
+        let prepared_scope = crate::services::twin_events::prepared_stable_migration_scope_locked(
+            data_path,
+            &process_lock,
+        )?;
+        let durable_scope =
+            crate::services::root_transition::stable_root_scope_locked(data_path, &process_lock)?;
+        if durable_scope
+            .as_ref()
+            .zip(prepared_scope.as_ref())
+            .is_some_and(|(durable, prepared)| durable != prepared)
+        {
+            return Err(
+                crate::services::twin_events::MutationError::RecoveryConflict(
+                    "prepared stable migration conflicts with the durable stable lease".into(),
+                ),
+            );
+        }
+        if let Some(stable_scope) = durable_scope.or(prepared_scope) {
+            crate::services::twin_events::validate_real_directory(
+                vault_path,
+                "stable MCP vault root",
+            )?;
+            let identity = crate::services::sync::identity::load_vault_identity(vault_path)?;
+            if identity.root_scope != stable_scope {
+                return Err(
+                    crate::services::twin_events::MutationError::RecoveryConflict(
+                        "configured MCP vault does not match the durable stable lease".into(),
+                    ),
+                );
+            }
+        } else {
+            std::fs::create_dir_all(vault_path)?;
+            crate::services::twin_events::validate_real_directory(vault_path, "MCP vault root")?;
+        }
+        Ok(())
+    })();
+    process_lock.unlock()?;
+    result?;
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize logging to stderr (stdout is reserved for MCP protocol)
@@ -56,20 +109,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
     // Resolve paths: CLI args > settings.json > defaults
-    let paths = resolve_paths(args.vault, args.data)?;
-    let vault_path = paths.vault_path;
-    let data_path = paths.data_path;
+    let ResolvedMcpPaths {
+        vault_path,
+        data_path,
+        custom_data,
+        secret_store,
+    } = resolve_paths(args.vault, args.data)?;
 
     log::info!("Vault path: {}", vault_path.display());
     log::info!("Data path: {}", data_path.display());
 
-    // Ensure directories exist
-    std::fs::create_dir_all(&vault_path)?;
-    std::fs::create_dir_all(&data_path)?;
+    // A stable lease owns its vault identity. Never manufacture a replacement
+    // root or descriptor when the configured vault was moved or is unavailable.
+    prepare_mcp_root_directories(&vault_path, &data_path)?;
     // Recover the same canonical mutation journal as desktop before stdio is served.
     let twin_event_store = Arc::new(TwinEventStore::new(&data_path));
-    twin_event_store.initialize()?;
-    let mutation_coordinator = Arc::new(if paths.custom_data {
+    let mutation_coordinator = Arc::new(if custom_data {
         MutationCoordinator::new_custom_mcp(
             &data_path,
             &vault_path,
@@ -77,7 +132,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Arc::new(NoopMutationLifecycle),
         )?
     } else {
-        MutationCoordinator::new(
+        MutationCoordinator::new_stable(
             &data_path,
             &vault_path,
             twin_event_store,
@@ -85,6 +140,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )?
     });
     mutation_coordinator.recover_pending()?;
+    if let Some(secret_store) = secret_store {
+        mutation_coordinator.load_or_create_device_signing_identity(secret_store)?;
+    }
     let startup_token = mutation_coordinator.current_authority_token()?;
     let derived_data_path = mutation_coordinator.current_namespace_path()?;
     let derived_token = mutation_coordinator
@@ -194,11 +252,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Resolve vault and data paths from CLI args, settings file, or defaults.
-#[derive(Debug)]
 struct ResolvedMcpPaths {
     vault_path: PathBuf,
     data_path: PathBuf,
     custom_data: bool,
+    secret_store: Option<Arc<dyn crate::services::sync::secrets::SecretStore>>,
 }
 
 fn resolve_paths(
@@ -214,17 +272,21 @@ fn resolve_paths(
             vault_path,
             data_path,
             custom_data: true,
+            secret_store: None,
         });
     }
     // The default authority performs global settings/key/WAL recovery exactly once.
     let settings = SettingsService::load()?;
 
     let vault_path = settings.vault_path();
+    let data_path = settings.data_path();
+    let secret_store = settings.secret_store();
 
     Ok(ResolvedMcpPaths {
         vault_path,
-        data_path: settings.data_path(),
+        data_path,
         custom_data: false,
+        secret_store: Some(secret_store),
     })
 }
 
@@ -243,6 +305,24 @@ fn validate_cli_override_pair<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::services::twin_events::{CustomMcpRootBindingV1, CUSTOM_MCP_ROOT_BINDING_KEY};
+
+    fn tree_snapshot(
+        root: &std::path::Path,
+    ) -> std::collections::BTreeMap<PathBuf, Option<Vec<u8>>> {
+        walkdir::WalkDir::new(root)
+            .into_iter()
+            .map(Result::unwrap)
+            .map(|entry| {
+                let relative = entry.path().strip_prefix(root).unwrap().to_path_buf();
+                let contents = entry
+                    .file_type()
+                    .is_file()
+                    .then(|| std::fs::read(entry.path()).unwrap());
+                (relative, contents)
+            })
+            .collect()
+    }
 
     #[test]
     fn custom_data_requires_an_explicit_vault_and_custom_start_rejects_transition_wal() {
@@ -251,7 +331,9 @@ mod tests {
         let vault = temp.path().join("custom-vault");
         std::fs::create_dir(&data).unwrap();
         std::fs::create_dir(&vault).unwrap();
-        let missing = resolve_paths(None, Some(data.clone())).unwrap_err();
+        let missing = resolve_paths(None, Some(data.clone()))
+            .err()
+            .expect("missing vault override must fail");
         assert!(missing.to_string().contains("requires --vault"));
 
         std::fs::create_dir_all(data.join("twin/events")).unwrap();
@@ -260,9 +342,42 @@ mod tests {
             b"foreign authority",
         )
         .unwrap();
+        std::fs::write(data.join("twin/events/mutation-v1.lock"), b"").unwrap();
+        let data_before = walkdir::WalkDir::new(&data)
+            .into_iter()
+            .map(Result::unwrap)
+            .map(|entry| {
+                let relative = entry.path().strip_prefix(&data).unwrap().to_path_buf();
+                let contents = entry
+                    .file_type()
+                    .is_file()
+                    .then(|| std::fs::read(entry.path()).unwrap());
+                (relative, contents)
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
         let paths = resolve_paths(Some(vault), Some(data.clone())).unwrap();
+        let prepare_error = prepare_mcp_root_directories(&paths.vault_path, &data)
+            .expect_err("MCP root preparation must reject a transition WAL before identity writes");
+        assert!(prepare_error.to_string().contains("root-transition"));
+        assert!(!paths
+            .vault_path
+            .join(crate::services::sync::identity::VAULT_DESCRIPTOR_KEY)
+            .exists());
+        assert!(!data.join(CUSTOM_MCP_ROOT_BINDING_KEY).exists());
+        let data_after = walkdir::WalkDir::new(&data)
+            .into_iter()
+            .map(Result::unwrap)
+            .map(|entry| {
+                let relative = entry.path().strip_prefix(&data).unwrap().to_path_buf();
+                let contents = entry
+                    .file_type()
+                    .is_file()
+                    .then(|| std::fs::read(entry.path()).unwrap());
+                (relative, contents)
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(data_after, data_before);
         let events = Arc::new(TwinEventStore::new(&data));
-        events.initialize().unwrap();
         let error = match MutationCoordinator::new_custom_mcp(
             &data,
             &paths.vault_path,
@@ -287,6 +402,475 @@ mod tests {
             validate_cli_override_pair(Some(&vault), Some(&data)).unwrap(),
             Some((vault.as_path(), data.as_path()))
         );
+    }
+
+    #[test]
+    fn custom_data_mode_has_no_access_to_the_global_secret_store() {
+        let temp = tempfile::tempdir().unwrap();
+        let vault = temp.path().join("vault");
+        let data = temp.path().join("data");
+        std::fs::create_dir(&vault).unwrap();
+        std::fs::create_dir(&data).unwrap();
+
+        let paths = resolve_paths(Some(vault), Some(data)).unwrap();
+
+        assert!(paths.secret_store.is_none());
+    }
+
+    #[test]
+    fn custom_root_preflight_creates_a_fresh_pair_only_without_a_stable_lease() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let vault = temp.path().join("vault");
+
+        prepare_mcp_root_directories(&vault, &data).unwrap();
+
+        let coordinator = MutationCoordinator::new_custom_mcp(
+            &data,
+            &vault,
+            Arc::new(TwinEventStore::new(&data)),
+            Arc::new(NoopMutationLifecycle),
+        )
+        .unwrap();
+        let identity = crate::services::sync::identity::load_vault_identity(&vault).unwrap();
+        let binding: CustomMcpRootBindingV1 =
+            serde_json::from_slice(&std::fs::read(data.join(CUSTOM_MCP_ROOT_BINDING_KEY)).unwrap())
+                .unwrap();
+
+        assert!(data.is_dir());
+        assert!(vault.is_dir());
+        assert_eq!(binding.schema_version, 1);
+        assert_eq!(binding.root_scope, identity.root_scope);
+        assert_eq!(
+            binding.canonical_vault_path,
+            std::fs::canonicalize(&vault).unwrap().to_str().unwrap()
+        );
+        assert_eq!(
+            coordinator.current_root_epoch().unwrap().root_scope,
+            identity.root_scope
+        );
+        let descriptor_before =
+            std::fs::read(vault.join(crate::services::sync::identity::VAULT_DESCRIPTOR_KEY))
+                .unwrap();
+        let binding_before = std::fs::read(data.join(CUSTOM_MCP_ROOT_BINDING_KEY)).unwrap();
+        let lease_before =
+            std::fs::read(data.join("twin/events/active-markdown-root-v1.json")).unwrap();
+        drop(coordinator);
+
+        let reopened = MutationCoordinator::new_custom_mcp(
+            &data,
+            &vault,
+            Arc::new(TwinEventStore::new(&data)),
+            Arc::new(NoopMutationLifecycle),
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read(vault.join(crate::services::sync::identity::VAULT_DESCRIPTOR_KEY))
+                .unwrap(),
+            descriptor_before
+        );
+        assert_eq!(
+            std::fs::read(data.join(CUSTOM_MCP_ROOT_BINDING_KEY)).unwrap(),
+            binding_before
+        );
+        assert_eq!(
+            std::fs::read(data.join("twin/events/active-markdown-root-v1.json")).unwrap(),
+            lease_before
+        );
+        assert_eq!(
+            reopened.current_root_epoch().unwrap().root_scope,
+            identity.root_scope
+        );
+    }
+
+    #[test]
+    fn desktop_and_custom_mcp_reopen_one_scope_writer_device_and_event_namespace() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let vault = temp.path().join("vault");
+        prepare_mcp_root_directories(&vault, &data).unwrap();
+
+        let custom_events = Arc::new(TwinEventStore::new(&data));
+        let custom = MutationCoordinator::new_custom_mcp(
+            &data,
+            &vault,
+            custom_events.clone(),
+            Arc::new(NoopMutationLifecycle),
+        )
+        .unwrap();
+        let scope = custom.current_root_epoch().unwrap().root_scope;
+        let writer = custom.writer_device_id();
+        let expected_events = data
+            .join("twin/events/vaults/v1")
+            .join(scope.as_str())
+            .join("records/v1");
+        assert_eq!(
+            std::fs::canonicalize(custom_events.events_dir()).unwrap(),
+            std::fs::canonicalize(&expected_events).unwrap()
+        );
+        assert!(resolve_paths(Some(vault.clone()), Some(data.clone()))
+            .unwrap()
+            .secret_store
+            .is_none());
+        drop(custom);
+
+        let desktop_events = Arc::new(TwinEventStore::new(&data));
+        let desktop = MutationCoordinator::new_stable(
+            &data,
+            &vault,
+            desktop_events.clone(),
+            Arc::new(NoopMutationLifecycle),
+        )
+        .unwrap();
+        assert_eq!(desktop.current_root_epoch().unwrap().root_scope, scope);
+        assert_eq!(desktop.writer_device_id(), writer);
+        assert_eq!(
+            std::fs::canonicalize(desktop_events.events_dir()).unwrap(),
+            std::fs::canonicalize(&expected_events).unwrap()
+        );
+        let signing = desktop
+            .load_or_create_device_signing_identity(Arc::new(
+                crate::services::sync::secrets::MemorySecretStore::default(),
+            ))
+            .unwrap();
+        assert_eq!(signing.device_id().to_string(), writer.as_str());
+        drop(desktop);
+
+        let reopened_events = Arc::new(TwinEventStore::new(&data));
+        let reopened = MutationCoordinator::new_custom_mcp(
+            &data,
+            &vault,
+            reopened_events.clone(),
+            Arc::new(NoopMutationLifecycle),
+        )
+        .unwrap();
+        assert_eq!(reopened.current_root_epoch().unwrap().root_scope, scope);
+        assert_eq!(reopened.writer_device_id(), writer);
+        assert_eq!(
+            std::fs::canonicalize(reopened_events.events_dir()).unwrap(),
+            std::fs::canonicalize(expected_events).unwrap()
+        );
+        assert!(resolve_paths(Some(vault), Some(data))
+            .unwrap()
+            .secret_store
+            .is_none());
+    }
+
+    #[test]
+    fn custom_start_rejects_b_before_binding_no_lease_legacy_data_owned_by_a() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let vault_a = temp.path().join("vault-a");
+        let vault_b = temp.path().join("vault-b");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::create_dir(&vault_a).unwrap();
+        std::fs::create_dir(&vault_b).unwrap();
+        std::fs::create_dir_all(data.join("twin/events")).unwrap();
+        let legacy_scope_a =
+            crate::services::sync::identity::legacy_path_scope_for_migration(&vault_a).unwrap();
+        let legacy_twin = data.join("twin").join(legacy_scope_a.as_str());
+        std::fs::create_dir(&legacy_twin).unwrap();
+        std::fs::write(legacy_twin.join("owned-by-a.json"), b"vault-a").unwrap();
+        std::fs::create_dir(data.join("search_index")).unwrap();
+        std::fs::write(data.join("search_index/sentinel"), b"vault-a").unwrap();
+        crate::services::twin_events::acquire_shared_coordinator_process_lock(&data)
+            .unwrap()
+            .unlock()
+            .unwrap();
+        let data_before = tree_snapshot(&data);
+        let vault_a_before = tree_snapshot(&vault_a);
+        let vault_b_before = tree_snapshot(&vault_b);
+
+        prepare_mcp_root_directories(&vault_b, &data).unwrap();
+        let error = match MutationCoordinator::new_custom_mcp(
+            &data,
+            &vault_b,
+            Arc::new(TwinEventStore::new(&data)),
+            Arc::new(NoopMutationLifecycle),
+        ) {
+            Ok(_) => panic!("vault B must not adopt vault A's no-lease legacy data"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("legacy"));
+        assert_eq!(tree_snapshot(&data), data_before);
+        assert_eq!(tree_snapshot(&vault_a), vault_a_before);
+        assert_eq!(tree_snapshot(&vault_b), vault_b_before);
+        assert!(!vault_b
+            .join(crate::services::sync::identity::VAULT_DESCRIPTOR_KEY)
+            .exists());
+        assert!(!data.join(CUSTOM_MCP_ROOT_BINDING_KEY).exists());
+        assert!(!data
+            .join("twin/events/active-markdown-root-v1.json")
+            .exists());
+
+        prepare_mcp_root_directories(&vault_a, &data).unwrap();
+        let coordinator_a = MutationCoordinator::new_custom_mcp(
+            &data,
+            &vault_a,
+            Arc::new(TwinEventStore::new(&data)),
+            Arc::new(NoopMutationLifecycle),
+        )
+        .unwrap();
+        let identity_a = crate::services::sync::identity::load_vault_identity(&vault_a).unwrap();
+        let binding: CustomMcpRootBindingV1 =
+            serde_json::from_slice(&std::fs::read(data.join(CUSTOM_MCP_ROOT_BINDING_KEY)).unwrap())
+                .unwrap();
+        assert_eq!(binding.root_scope, identity_a.root_scope);
+        assert_eq!(
+            coordinator_a.current_root_epoch().unwrap().root_scope,
+            identity_a.root_scope
+        );
+    }
+
+    #[test]
+    fn blocked_legacy_custom_start_publishes_no_binding_or_other_bytes() {
+        for blocker in ["retained-receipt", "pending-optimizer-publication"] {
+            let temp = tempfile::tempdir().unwrap();
+            let data = temp.path().join("data");
+            let vault = temp.path().join("vault");
+            std::fs::create_dir(&data).unwrap();
+            std::fs::create_dir(&vault).unwrap();
+            std::fs::create_dir_all(data.join("twin/events")).unwrap();
+            let legacy = MutationCoordinator::new(
+                &data,
+                &vault,
+                Arc::new(TwinEventStore::new(&data)),
+                Arc::new(NoopMutationLifecycle),
+            )
+            .unwrap();
+            let guard = legacy.begin_root_transition().unwrap();
+            let lease = guard.current_lease().unwrap();
+            let twin_path = guard.prepare_twin_data_path(&vault, &lease).unwrap();
+            std::fs::create_dir_all(&twin_path).unwrap();
+            std::fs::write(twin_path.join("legacy-source.json"), b"legacy-source").unwrap();
+            guard.initialize_namespace(&lease).unwrap();
+            drop(guard);
+            drop(legacy);
+            let identity =
+                crate::services::sync::identity::load_or_create_vault_identity(&vault).unwrap();
+
+            let blocker_path = match blocker {
+                "retained-receipt" => data
+                    .join("twin/mutations/receipts/v1")
+                    .join("retained.json"),
+                "pending-optimizer-publication" => {
+                    crate::services::vault_namespace::scoped_data_path(&data, &lease.root_scope)
+                        .join("vault_migration/optimizer/pending-publications-v1/pending.json")
+                }
+                _ => unreachable!(),
+            };
+            std::fs::create_dir_all(blocker_path.parent().unwrap()).unwrap();
+            std::fs::write(&blocker_path, blocker.as_bytes()).unwrap();
+            prepare_mcp_root_directories(&vault, &data).unwrap();
+            let descriptor_path = vault.join(crate::services::sync::identity::VAULT_DESCRIPTOR_KEY);
+            let descriptor_before = std::fs::read(&descriptor_path).unwrap();
+            let lease_path = data.join("twin/events/active-markdown-root-v1.json");
+            let lease_before = std::fs::read(&lease_path).unwrap();
+            let blocker_before = std::fs::read(&blocker_path).unwrap();
+            let source_before = std::fs::read(twin_path.join("legacy-source.json")).unwrap();
+            let data_before = tree_snapshot(&data);
+            let vault_before = tree_snapshot(&vault);
+
+            let error = match MutationCoordinator::new_custom_mcp(
+                &data,
+                &vault,
+                Arc::new(TwinEventStore::new(&data)),
+                Arc::new(NoopMutationLifecycle),
+            ) {
+                Ok(_) => panic!("{blocker} must block stable custom migration"),
+                Err(error) => error,
+            };
+
+            assert!(
+                error.to_string().contains("stable migration"),
+                "unexpected {blocker} error: {error}"
+            );
+            assert_eq!(std::fs::read(&descriptor_path).unwrap(), descriptor_before);
+            assert_eq!(std::fs::read(&lease_path).unwrap(), lease_before);
+            assert_eq!(std::fs::read(&blocker_path).unwrap(), blocker_before);
+            assert_eq!(
+                std::fs::read(twin_path.join("legacy-source.json")).unwrap(),
+                source_before
+            );
+            assert!(!data.join(CUSTOM_MCP_ROOT_BINDING_KEY).exists());
+            assert_eq!(tree_snapshot(&data), data_before);
+            assert_eq!(tree_snapshot(&vault), vault_before);
+            assert_eq!(
+                identity.root_scope,
+                crate::services::sync::identity::load_vault_identity(&vault)
+                    .unwrap()
+                    .root_scope
+            );
+        }
+    }
+
+    #[test]
+    fn stable_root_preflight_never_manufactures_a_missing_vault_or_descriptor() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let original = temp.path().join("original-vault");
+        let empty_replacement = temp.path().join("empty-replacement");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::create_dir(&original).unwrap();
+        std::fs::create_dir(&empty_replacement).unwrap();
+        let identity =
+            crate::services::sync::identity::load_or_create_vault_identity(&original).unwrap();
+        let store = crate::services::root_transition::RootTransitionStore::new(
+            &data,
+            temp.path().join("settings.json"),
+            Arc::new(crate::services::root_transition::MemoryVersionedSecretStore::default()),
+        )
+        .unwrap();
+        store
+            .write_lease(
+                &crate::services::twin_events::ActiveMarkdownRootLeaseV1::new_stable(
+                    identity.root_scope,
+                ),
+            )
+            .unwrap();
+        std::fs::remove_dir_all(&original).unwrap();
+
+        assert!(prepare_mcp_root_directories(&original, &data).is_err());
+        assert!(!original.exists());
+        assert!(prepare_mcp_root_directories(&empty_replacement, &data).is_err());
+        assert!(!empty_replacement
+            .join(crate::services::sync::identity::VAULT_DESCRIPTOR_KEY)
+            .exists());
+    }
+
+    #[test]
+    fn stable_custom_data_without_a_binding_fails_closed() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let vault = temp.path().join("vault");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::create_dir(&vault).unwrap();
+        std::fs::create_dir_all(data.join("twin/events")).unwrap();
+        let legacy = MutationCoordinator::new(
+            &data,
+            &vault,
+            Arc::new(TwinEventStore::new(&data)),
+            Arc::new(NoopMutationLifecycle),
+        )
+        .unwrap();
+        drop(legacy);
+        let identity =
+            crate::services::sync::identity::load_or_create_vault_identity(&vault).unwrap();
+        let store = crate::services::root_transition::RootTransitionStore::new(
+            &data,
+            temp.path().join("settings.json"),
+            Arc::new(crate::services::root_transition::MemoryVersionedSecretStore::default()),
+        )
+        .unwrap();
+        store
+            .write_lease(
+                &crate::services::twin_events::ActiveMarkdownRootLeaseV1::new_stable(
+                    identity.root_scope,
+                ),
+            )
+            .unwrap();
+        prepare_mcp_root_directories(&vault, &data).unwrap();
+        let data_before = tree_snapshot(&data);
+        let vault_before = tree_snapshot(&vault);
+
+        let error = match MutationCoordinator::new_custom_mcp(
+            &data,
+            &vault,
+            Arc::new(TwinEventStore::new(&data)),
+            Arc::new(NoopMutationLifecycle),
+        ) {
+            Ok(_) => panic!("stable custom data without its path binding must fail closed"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("no durable vault-path binding"));
+        assert_eq!(tree_snapshot(&data), data_before);
+        assert_eq!(tree_snapshot(&vault), vault_before);
+        assert!(!data.join(CUSTOM_MCP_ROOT_BINDING_KEY).exists());
+    }
+
+    #[test]
+    fn custom_root_binding_rejects_a_same_uuid_copy_at_another_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let first = temp.path().join("first-vault");
+        let copied = temp.path().join("copied-vault");
+        prepare_mcp_root_directories(&first, &data).unwrap();
+        let first_coordinator = MutationCoordinator::new_custom_mcp(
+            &data,
+            &first,
+            Arc::new(TwinEventStore::new(&data)),
+            Arc::new(NoopMutationLifecycle),
+        )
+        .unwrap();
+        let identity = crate::services::sync::identity::load_vault_identity(&first).unwrap();
+        std::fs::create_dir(&copied).unwrap();
+        std::fs::create_dir(copied.join("_grafyn")).unwrap();
+        std::fs::copy(
+            first.join(crate::services::sync::identity::VAULT_DESCRIPTOR_KEY),
+            copied.join(crate::services::sync::identity::VAULT_DESCRIPTOR_KEY),
+        )
+        .unwrap();
+        assert_eq!(
+            first_coordinator.current_root_epoch().unwrap().root_scope,
+            identity.root_scope
+        );
+        drop(first_coordinator);
+        let binding_path = data.join(CUSTOM_MCP_ROOT_BINDING_KEY);
+        let binding_before = std::fs::read(&binding_path).unwrap();
+        let data_before = tree_snapshot(&data);
+
+        prepare_mcp_root_directories(&first, &data).unwrap();
+        prepare_mcp_root_directories(&copied, &data).unwrap();
+        let error = match MutationCoordinator::new_custom_mcp(
+            &data,
+            &copied,
+            Arc::new(TwinEventStore::new(&data)),
+            Arc::new(NoopMutationLifecycle),
+        ) {
+            Ok(_) => panic!("a same-UUID copy at another path must be rejected"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("binding"));
+        assert_eq!(std::fs::read(binding_path).unwrap(), binding_before);
+        assert_eq!(tree_snapshot(&data), data_before);
+    }
+
+    #[test]
+    fn established_custom_binding_never_recreates_a_missing_descriptor() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let vault = temp.path().join("vault");
+        prepare_mcp_root_directories(&vault, &data).unwrap();
+        let coordinator = MutationCoordinator::new_custom_mcp(
+            &data,
+            &vault,
+            Arc::new(TwinEventStore::new(&data)),
+            Arc::new(NoopMutationLifecycle),
+        )
+        .unwrap();
+        drop(coordinator);
+        let descriptor = vault.join(crate::services::sync::identity::VAULT_DESCRIPTOR_KEY);
+        std::fs::remove_file(&descriptor).unwrap();
+        let binding_path = data.join(CUSTOM_MCP_ROOT_BINDING_KEY);
+        let binding_before = std::fs::read(&binding_path).unwrap();
+
+        let error = match MutationCoordinator::new_custom_mcp(
+            &data,
+            &vault,
+            Arc::new(TwinEventStore::new(&data)),
+            Arc::new(NoopMutationLifecycle),
+        ) {
+            Ok(_) => panic!("an established binding requires its existing descriptor"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("vault-descriptor-missing"));
+        assert!(!descriptor.exists());
+        assert_eq!(std::fs::read(binding_path).unwrap(), binding_before);
     }
 
     #[test]
@@ -332,7 +916,9 @@ mod tests {
             .is_err());
         release_tx.send(()).unwrap();
         start.join().unwrap();
-        peer_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        peer_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
         peer.join().unwrap();
     }
 }

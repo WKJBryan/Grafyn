@@ -11,6 +11,7 @@ const AUTHORITY_SCHEMA_VERSION: u16 = 1;
 const MARKER_LIMIT: usize = 4096;
 const DERIVED_ROOT: &str = "vault_derived";
 const LEGACY_ASSIGNMENT_KEY: &str = "vault_derived/legacy-assignment-v1.json";
+const LEGACY_ASSIGNMENT_STAGING_KEY: &str = "twin/mutations/staging/v1";
 const AUTHORITY_GENERATION_KEY: &str = "twin/events/content-authority-v1.json";
 const AUTHORITY_STAGING_KEY: &str = "twin/events/staging/v1";
 const LEGACY_COMPONENTS: [&str; 4] = [
@@ -74,13 +75,60 @@ pub(crate) fn initialize_locked(
     lease: &ActiveMarkdownRootLeaseV1,
     process_lock: &CoordinatorProcessLock,
 ) -> Result<PathBuf, MutationError> {
+    initialize_locked_inner(data_path, lease, process_lock, &mut || {}, &mut || {})
+}
+
+#[cfg(test)]
+fn initialize_locked_with_assignment_hook(
+    data_path: &Path,
+    lease: &ActiveMarkdownRootLeaseV1,
+    process_lock: &CoordinatorProcessLock,
+    mut assignment_hook: impl FnMut(),
+) -> Result<PathBuf, MutationError> {
+    initialize_locked_inner(
+        data_path,
+        lease,
+        process_lock,
+        &mut || {},
+        &mut assignment_hook,
+    )
+}
+
+#[cfg(test)]
+fn initialize_locked_with_marker_install_hook(
+    data_path: &Path,
+    lease: &ActiveMarkdownRootLeaseV1,
+    process_lock: &CoordinatorProcessLock,
+    mut marker_install_hook: impl FnMut(),
+) -> Result<PathBuf, MutationError> {
+    initialize_locked_inner(
+        data_path,
+        lease,
+        process_lock,
+        &mut marker_install_hook,
+        &mut || {},
+    )
+}
+
+fn initialize_locked_inner(
+    data_path: &Path,
+    lease: &ActiveMarkdownRootLeaseV1,
+    process_lock: &CoordinatorProcessLock,
+    marker_install_hook: &mut impl FnMut(),
+    assignment_hook: &mut impl FnMut(),
+) -> Result<PathBuf, MutationError> {
     require_lock(data_path, process_lock)?;
     let root = AnchoredRoot::open(data_path)?;
     root.open_directory(DERIVED_ROOT, true)?;
     root.open_directory("vault_derived/v1", true)?;
     let scope_key = scope_key(&lease.root_scope);
     root.open_directory(&scope_key, true)?;
-    assign_legacy_once(&root, &lease.root_scope)?;
+    assign_legacy_once(
+        &root,
+        &lease.root_scope,
+        marker_install_hook,
+        assignment_hook,
+    )?;
     Ok(scoped_data_path(data_path, &lease.root_scope))
 }
 
@@ -267,6 +315,8 @@ fn require_lock(
 fn assign_legacy_once(
     root: &AnchoredRoot,
     root_scope: &ContentDigest,
+    marker_install_hook: &mut impl FnMut(),
+    assignment_hook: &mut impl FnMut(),
 ) -> Result<(), MutationError> {
     let assignment = read_assignment(root)?;
     let legacy_exists = LEGACY_COMPONENTS
@@ -291,7 +341,7 @@ fn assign_legacy_once(
             }
             return Ok(());
         }
-        return resume_legacy_assignment(root, existing, &legacy_exists);
+        return resume_legacy_assignment(root, existing, &legacy_exists, assignment_hook);
     }
 
     let initial_components = LEGACY_COMPONENTS
@@ -315,14 +365,15 @@ fn assign_legacy_once(
         initial_components,
         moved_components: Vec::new(),
     };
-    write_assignment(root, &prepared)?;
-    resume_legacy_assignment(root, &prepared, &legacy_exists)
+    install_initial_assignment(root, &prepared, marker_install_hook)?;
+    resume_legacy_assignment(root, &prepared, &legacy_exists, assignment_hook)
 }
 
 fn resume_legacy_assignment(
     root: &AnchoredRoot,
     existing: &LegacyAssignmentV1,
     legacy_exists: &[bool],
+    assignment_hook: &mut impl FnMut(),
 ) -> Result<(), MutationError> {
     let scope_key = scope_key(&existing.root_scope);
     let mut progress = existing.clone();
@@ -350,7 +401,7 @@ fn resume_legacy_assignment(
                 ));
             }
             (true, false, true, false) => {
-                root.rename(component, &destination, false)?;
+                rename_legacy_component_no_replace(root, component, &destination, assignment_hook)?;
                 progress.moved_components.push((*component).to_string());
                 write_assignment(root, &progress)?;
             }
@@ -368,6 +419,23 @@ fn resume_legacy_assignment(
     }
     progress.state = LegacyAssignmentState::Committed;
     write_assignment(root, &progress)
+}
+
+fn rename_legacy_component_no_replace(
+    root: &AnchoredRoot,
+    component: &str,
+    destination: &str,
+    assignment_hook: &mut impl FnMut(),
+) -> Result<(), MutationError> {
+    #[cfg(test)]
+    {
+        root.rename_no_replace_with_hook(component, destination, false, || assignment_hook())
+    }
+    #[cfg(not(test))]
+    {
+        let _ = assignment_hook;
+        root.rename_no_replace(component, destination, false)
+    }
 }
 
 fn validate_assignment(assignment: &LegacyAssignmentV1) -> Result<(), MutationError> {
@@ -419,6 +487,25 @@ fn write_assignment(
 ) -> Result<(), MutationError> {
     let bytes = encoded_json(assignment)?;
     root.put_atomic(LEGACY_ASSIGNMENT_KEY, &bytes)
+}
+
+fn install_initial_assignment(
+    root: &AnchoredRoot,
+    assignment: &LegacyAssignmentV1,
+    marker_install_hook: &mut impl FnMut(),
+) -> Result<(), MutationError> {
+    let bytes = encoded_json(assignment)?;
+    marker_install_hook();
+    root.install_no_clobber(LEGACY_ASSIGNMENT_KEY, LEGACY_ASSIGNMENT_STAGING_KEY, &bytes)?;
+    let durable = read_assignment(root)?.ok_or_else(|| {
+        MutationError::RecoveryConflict("legacy assignment disappeared after install".into())
+    })?;
+    if &durable != assignment {
+        return Err(MutationError::RecoveryConflict(
+            "legacy assignment was concurrently installed by another authority".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn write_ready_marker(
@@ -576,6 +663,61 @@ mod tests {
             std::fs::read(scoped.join("chunk_index/sentinel")).unwrap(),
             b"scoped"
         );
+        lock.unlock().unwrap();
+    }
+
+    #[test]
+    fn legacy_assignment_preserves_a_raced_destination() {
+        let (_temp, data, lease) = fixture();
+        std::fs::create_dir(data.join("search_index")).unwrap();
+        std::fs::write(data.join("search_index/sentinel"), b"legacy").unwrap();
+        let scoped = scoped_data_path(&data, &lease.root_scope);
+        let lock = acquire_shared_coordinator_process_lock(&data).unwrap();
+
+        let error = initialize_locked_with_assignment_hook(&data, &lease, &lock, || {
+            std::fs::create_dir(scoped.join("search_index")).unwrap();
+            std::fs::write(scoped.join("search_index/sentinel"), b"foreign").unwrap();
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("no-replace rename failed"));
+        assert_eq!(
+            std::fs::read(data.join("search_index/sentinel")).unwrap(),
+            b"legacy"
+        );
+        assert_eq!(
+            std::fs::read(scoped.join("search_index/sentinel")).unwrap(),
+            b"foreign"
+        );
+        let assignment = read_assignment(&AnchoredRoot::open(&data).unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(assignment.state, LegacyAssignmentState::Prepared);
+        assert!(assignment.moved_components.is_empty());
+        lock.unlock().unwrap();
+    }
+
+    #[test]
+    fn legacy_assignment_preserves_a_raced_marker() {
+        let (_temp, data, lease) = fixture();
+        std::fs::create_dir(data.join("search_index")).unwrap();
+        std::fs::write(data.join("search_index/sentinel"), b"legacy").unwrap();
+        let marker = data.join(LEGACY_ASSIGNMENT_KEY.replace('/', "\\"));
+        let scoped = scoped_data_path(&data, &lease.root_scope);
+        let lock = acquire_shared_coordinator_process_lock(&data).unwrap();
+
+        let error = initialize_locked_with_marker_install_hook(&data, &lease, &lock, || {
+            std::fs::write(&marker, b"foreign-marker").unwrap();
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("invalid legacy assignment"));
+        assert_eq!(std::fs::read(&marker).unwrap(), b"foreign-marker");
+        assert_eq!(
+            std::fs::read(data.join("search_index/sentinel")).unwrap(),
+            b"legacy"
+        );
+        assert!(!scoped.join("search_index").exists());
         lock.unlock().unwrap();
     }
 

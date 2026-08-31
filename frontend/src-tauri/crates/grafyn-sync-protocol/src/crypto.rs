@@ -29,6 +29,11 @@ impl VaultRootKey {
         Ok(Self::from_bytes(bytes))
     }
 
+    /// Returns a zeroizing copy for persistence in an external secret store.
+    pub fn export_bytes(&self) -> Zeroizing<[u8; 32]> {
+        Zeroizing::new(*self.0)
+    }
+
     fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
@@ -51,6 +56,11 @@ impl DeviceSigningKey {
         let mut seed = [0u8; 32];
         getrandom::fill(&mut seed).map_err(|_| ProtocolError::RandomnessUnavailable)?;
         Ok(Self::from_seed(seed))
+    }
+
+    /// Returns a zeroizing seed copy for persistence in an external secret store.
+    pub fn export_seed(&self) -> Zeroizing<[u8; 32]> {
+        Zeroizing::new(*self.0)
     }
 
     pub fn public_key(&self) -> DevicePublicKey {
@@ -396,5 +406,19 @@ mod tests {
             open_operation(&root_key, &vault_id, &trusted, &envelope),
             Err(ProtocolError::OperationIdMismatch)
         ));
+    }
+
+    #[test]
+    fn persistence_exports_are_exact_zeroizing_copies() {
+        let root = VaultRootKey::from_bytes([0x71; 32]);
+        let signing = DeviceSigningKey::from_seed([0x92; 32]);
+
+        let root_bytes = root.export_bytes();
+        let signing_seed = signing.export_seed();
+
+        assert_eq!(root_bytes.as_ref(), &[0x71; 32]);
+        assert_eq!(signing_seed.as_ref(), &[0x92; 32]);
+        assert_eq!(format!("{root:?}"), "VaultRootKey([REDACTED])");
+        assert_eq!(format!("{signing:?}"), "DeviceSigningKey([REDACTED])");
     }
 }
