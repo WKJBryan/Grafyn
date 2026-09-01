@@ -217,7 +217,7 @@ async fn companion_capture_commits_note_and_contextual_observation_as_one_group(
 async fn companion_capture_recovers_one_plan_without_duplicate_note_or_event() {
     let (state, _vault, _data) = companion_test_state();
     let at = Utc.with_ymd_and_hms(2026, 9, 1, 4, 5, 0).unwrap();
-    state
+    let _ = state
         .mutation_coordinator
         .as_ref()
         .unwrap()
@@ -828,11 +828,288 @@ fn relationship_filter(object_id: &str) -> TwinRelationshipFilter {
 }
 
 fn state_filter(relationship: Option<&str>, goals: &[&str], tags: &[&str]) -> TwinStateFilter {
+    state_filter_relationships(&relationship.into_iter().collect::<Vec<_>>(), goals, tags)
+}
+
+fn state_filter_relationships(
+    relationships: &[&str],
+    goals: &[&str],
+    tags: &[&str],
+) -> TwinStateFilter {
     TwinStateFilter {
-        relationships: relationship.map(relationship_filter).into_iter().collect(),
+        relationships: relationships
+            .iter()
+            .map(|relationship| relationship_filter(relationship))
+            .collect(),
         goals: goals.iter().map(|value| (*value).to_string()).collect(),
         tags: tags.iter().map(|value| (*value).to_string()).collect(),
     }
+}
+
+#[tokio::test]
+async fn timeline_filters_keep_global_alex_and_bob_context_identity() {
+    let (state, _vault, _data) = crate::commands::commit_note_write_tests::build_test_state();
+    let observed_at = Utc::now() - Duration::minutes(2);
+    let mut alex_bob = observation_draft(
+        "timeline-alex-bob",
+        "alex and bob context",
+        Some("alex"),
+        &[],
+        &[],
+        false,
+        observed_at + Duration::seconds(3),
+    );
+    alex_bob.context.relationships.push(RelationshipAssertion {
+        subject_id: EntityId::parse("owner").unwrap(),
+        predicate: RelationshipPredicate::parse("works_with").unwrap(),
+        object_id: EntityId::parse("bob").unwrap(),
+        direction: RelationshipDirection::Directed,
+        valid_from: None,
+        valid_to: None,
+        evidence: Vec::new(),
+        governance: Governance::direct_observation(),
+    });
+    let drafts = vec![
+        observation_draft(
+            "timeline-global",
+            "global context",
+            None,
+            &[],
+            &[],
+            false,
+            observed_at,
+        ),
+        observation_draft(
+            "timeline-alex",
+            "alex context",
+            Some("alex"),
+            &[],
+            &[],
+            false,
+            observed_at + Duration::seconds(1),
+        ),
+        observation_draft(
+            "timeline-bob",
+            "bob context",
+            Some("bob"),
+            &[],
+            &[],
+            false,
+            observed_at + Duration::seconds(2),
+        ),
+        alex_bob,
+    ];
+    let _ = state
+        .mutation_coordinator
+        .as_ref()
+        .unwrap()
+        .commit_local(
+            CausalStream::SyncEligible,
+            SourceChannel::parse("timeline_context_test").unwrap(),
+            Vec::new(),
+            drafts,
+        )
+        .unwrap();
+    let reference_time = Utc::now();
+
+    let all = get_twin_event_timeline_inner(
+        &state,
+        TwinStatePageRequest {
+            reference_time,
+            filter: state_filter(None, &[], &[]),
+            cursor: None,
+            limit: 100,
+        },
+    )
+    .await
+    .unwrap();
+    let all_contexts = all
+        .items
+        .iter()
+        .map(|entry| {
+            serde_json::to_value(entry).unwrap()["relationship_variant"]["relationships"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|relationship| relationship["object_id"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        all_contexts,
+        BTreeSet::from([
+            Vec::new(),
+            vec!["alex".into()],
+            vec!["alex".into(), "bob".into()],
+            vec!["bob".into()],
+        ])
+    );
+
+    for (relationships, expected) in [
+        (vec!["alex"], vec!["alex"]),
+        (vec!["bob"], vec!["bob"]),
+        (vec!["alex", "bob"], vec!["alex", "bob"]),
+    ] {
+        let page = get_twin_event_timeline_inner(
+            &state,
+            TwinStatePageRequest {
+                reference_time,
+                filter: state_filter_relationships(&relationships, &[], &[]),
+                cursor: None,
+                limit: 100,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!page.items.is_empty());
+        assert!(page.items.iter().all(|entry| {
+            let serialized = serde_json::to_value(entry).unwrap();
+            let actual = serialized["relationship_variant"]["relationships"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|relationship| relationship["object_id"].as_str().unwrap())
+                .collect::<Vec<_>>();
+            actual == expected
+        }));
+
+        let observations = list_twin_observations_inner(
+            &state,
+            TwinStatePageRequest {
+                reference_time,
+                filter: state_filter_relationships(&relationships, &[], &[]),
+                cursor: None,
+                limit: 100,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!observations.items.is_empty());
+        assert!(observations.items.iter().all(|item| {
+            item.relationship_variant
+                .relationships
+                .iter()
+                .map(|relationship| relationship.object_id.as_str())
+                .collect::<Vec<_>>()
+                == expected
+        }));
+    }
+}
+
+#[tokio::test]
+async fn relationship_filtered_timeline_keeps_supersession_with_another_context_source() {
+    let (state, _vault, _data) = crate::commands::commit_note_write_tests::build_test_state();
+    let relationship = |object_id: &str| RelationshipAssertion {
+        subject_id: EntityId::parse("owner").unwrap(),
+        predicate: RelationshipPredicate::parse("works_with").unwrap(),
+        object_id: EntityId::parse(object_id).unwrap(),
+        direction: RelationshipDirection::Directed,
+        valid_from: None,
+        valid_to: None,
+        evidence: Vec::new(),
+        governance: Governance::direct_observation(),
+    };
+    let memory_id = Identifier::parse("timeline-superseded-alex-memory").unwrap();
+    let mut proposed = crate::services::twin_events::test_support::valid_event_for_device(
+        "timeline-proposal-alex",
+        1,
+        Vec::new(),
+    );
+    let proposed_claim = match &proposed.payload {
+        TwinEventPayload::ObservationRecorded(observation) => observation.claims[0].clone(),
+        _ => unreachable!(),
+    };
+    proposed.event_type = crate::models::twin_event::TwinEventType::MemoryProposed;
+    proposed.payload = TwinEventPayload::MemoryProposed(MemoryProposed {
+        memory_id: memory_id.clone(),
+        claim: proposed_claim,
+        summary: None,
+        proposal_source: ProvenanceLabel::parse("timeline-filter-test").unwrap(),
+    });
+    proposed.context.relationships = vec![relationship("alex")];
+    proposed.context.tags = vec!["proposal-tag".into()];
+    proposed.governance.review = ReviewState::Pending;
+    proposed.event_id = crate::services::twin_events::derive_event_id(&proposed);
+
+    let mut accepted = crate::services::twin_events::test_support::valid_event_for_device(
+        "timeline-review-alex",
+        1,
+        vec![proposed.event_id.clone()],
+    );
+    accepted.event_type = crate::models::twin_event::TwinEventType::MemoryReviewed;
+    accepted.payload = TwinEventPayload::MemoryReviewed(MemoryReviewed {
+        memory_id: memory_id.clone(),
+        decision: MemoryReviewDecision::Accept,
+        reviewed_claim: None,
+        rationale: None,
+    });
+    accepted.context.relationships = vec![relationship("alex")];
+    accepted.governance.review = ReviewState::Accepted;
+    accepted.governance.authority = AuthorityClass::ReviewedMemory;
+    accepted.event_id = crate::services::twin_events::derive_event_id(&accepted);
+
+    let mut superseder = crate::services::twin_events::test_support::valid_event_for_device(
+        "timeline-superseder-bob",
+        1,
+        Vec::new(),
+    );
+    superseder.supersedes = vec![proposed.event_id.clone()];
+    superseder.context.relationships = vec![relationship("bob")];
+    superseder.context.tags = vec!["transition-tag".into()];
+    superseder.event_id = crate::services::twin_events::derive_event_id(&superseder);
+
+    for event in [proposed, accepted, superseder] {
+        state.twin_event_store.append(event).unwrap();
+    }
+    let reference_time = Utc::now();
+
+    let alex = get_twin_event_timeline_inner(
+        &state,
+        TwinStatePageRequest {
+            reference_time,
+            filter: state_filter(Some("alex"), &[], &[]),
+            cursor: None,
+            limit: 100,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(alex
+        .items
+        .iter()
+        .any(|entry| { entry.item_id == memory_id && entry.state == TimelineState::Superseded }));
+
+    let tagged = get_twin_event_timeline_inner(
+        &state,
+        TwinStatePageRequest {
+            reference_time,
+            filter: state_filter(Some("alex"), &[], &["transition-tag"]),
+            cursor: None,
+            limit: 100,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(tagged
+        .items
+        .iter()
+        .any(|entry| { entry.item_id == memory_id && entry.state == TimelineState::Superseded }));
+
+    let missing_tag = get_twin_event_timeline_inner(
+        &state,
+        TwinStatePageRequest {
+            reference_time,
+            filter: state_filter(Some("alex"), &[], &["missing-tag"]),
+            cursor: None,
+            limit: 100,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(!missing_tag
+        .items
+        .iter()
+        .any(|entry| { entry.item_id == memory_id && entry.state == TimelineState::Superseded }));
 }
 
 #[tokio::test]

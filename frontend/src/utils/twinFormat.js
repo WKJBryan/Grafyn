@@ -182,3 +182,38 @@ export function formatDate(value) {
 export function eventLabel(value) {
   return statusLabel(value)
 }
+
+export function normalizeRelationshipVariant(value) {
+  const variant = value?.relationship_variant || value || {}
+  const relationships = (variant.relationships || []).map(relationship => ({
+    subject_id: relationship.subject_id ?? relationship.subjectId,
+    predicate: relationship.predicate,
+    object_id: relationship.object_id ?? relationship.objectId,
+    direction: relationship.direction,
+  }))
+  relationships.sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right)))
+  return { relationships }
+}
+
+export function relationshipVariantKey(value) {
+  return JSON.stringify(normalizeRelationshipVariant(value))
+}
+
+export function relationshipVariantRequest(value) {
+  return normalizeRelationshipVariant(value).relationships.map(relationship => ({
+    subjectId: relationship.subject_id,
+    predicate: relationship.predicate,
+    objectId: relationship.object_id,
+    direction: relationship.direction,
+  }))
+}
+
+export function relationshipVariantLabel(value, globalLabel = '') {
+  const relationships = normalizeRelationshipVariant(value).relationships
+  if (relationships.length === 0) return globalLabel
+  return relationships
+    .map(relationship => (
+      `${relationship.subject_id} ${relationship.predicate} ${relationship.object_id} [${relationship.direction || 'unspecified'}]`
+    ))
+    .join(' · ')
+}

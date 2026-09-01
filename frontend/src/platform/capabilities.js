@@ -32,6 +32,7 @@ const CAPABILITIES_BY_PROFILE = Object.freeze({
     recall: true,
     twinReview: true,
     twinChat: true,
+    linearCanvas: true,
     spatialCanvas: true,
     nativeVaultPicker: true,
     importByPath: true,

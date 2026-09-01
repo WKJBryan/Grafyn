@@ -9,7 +9,7 @@ pub const BASIS_POINTS_MAX: u16 = 10_000;
 pub const MAX_PROJECTED_ITEMS: usize = 16_384;
 pub const MAX_STATE_LINKS: usize = 64;
 pub const EXPECTED_PROJECTION_SCHEMA_VERSION: u16 = 1;
-pub const EXPECTED_PROJECTION_VERSION: u16 = 2;
+pub const EXPECTED_PROJECTION_VERSION: u16 = 3;
 pub const EXPECTED_ATTENTION_PROFILE_VERSION: u16 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -371,6 +371,8 @@ pub struct TemporalStateEntry {
     pub state: TimelineState,
     pub effective_at: DateTime<Utc>,
     #[serde(default)]
+    pub relationship_variant: RelationshipVariant,
+    #[serde(default)]
     pub valid_from: Option<DateTime<Utc>>,
     #[serde(default)]
     pub valid_to: Option<DateTime<Utc>>,
@@ -511,6 +513,7 @@ impl ProjectionSnapshot {
                         entry.state,
                         entry.item_id.clone(),
                         entry.effective_at,
+                        entry.relationship_variant.clone(),
                         entry.valid_from,
                         entry.valid_to,
                     )
@@ -545,6 +548,9 @@ impl ProjectionSnapshot {
             validate_sorted_unique(&cluster.memory_ids, "cluster.memory_ids")?;
             validate_sorted_unique(&cluster.claims, "cluster.claims")?;
             validate_sorted_unique(&cluster.evidence_event_ids, "cluster.evidence_event_ids")?;
+        }
+        for entry in &self.timeline {
+            entry.relationship_variant.validate()?;
         }
         for item in self
             .reviewed_memories
@@ -663,6 +669,46 @@ mod tests {
                 .relationships
                 .len(),
             1
+        );
+    }
+
+    #[test]
+    fn temporal_state_relationship_context_is_typed_and_legacy_global() {
+        let legacy: TemporalStateEntry = serde_json::from_value(serde_json::json!({
+            "item_id": "memory-global",
+            "source_event_id": "a".repeat(64),
+            "state": "accepted",
+            "effective_at": "2026-09-01T00:00:00Z",
+            "valid_from": null,
+            "valid_to": null
+        }))
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&legacy).unwrap()["relationship_variant"],
+            serde_json::json!({ "relationships": [] })
+        );
+
+        let contextual: TemporalStateEntry = serde_json::from_value(serde_json::json!({
+            "item_id": "memory-alex",
+            "source_event_id": "b".repeat(64),
+            "state": "accepted",
+            "effective_at": "2026-09-01T00:00:00Z",
+            "valid_from": null,
+            "valid_to": null,
+            "relationship_variant": {
+                "relationships": [{
+                    "subject_id": "owner",
+                    "predicate": "works_with",
+                    "object_id": "alex",
+                    "direction": "directed"
+                }]
+            }
+        }))
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(contextual).unwrap()["relationship_variant"]["relationships"][0]
+                ["object_id"],
+            "alex"
         );
     }
 }

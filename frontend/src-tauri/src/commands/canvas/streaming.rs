@@ -156,6 +156,7 @@ pub async fn send_prompt(
         approved_twin_records: resolved_context.approved_twin_records.clone(),
         candidate_twin_records: resolved_context.candidate_twin_records.clone(),
         twin_evidence_snapshot: resolved_context.twin_evidence_snapshot.clone(),
+        twin_relationship_variant: request.twin_relationship_variant.clone(),
         twin_answer_mode: request.twin_answer_mode.clone(),
         twin_context_policy: request.twin_context_policy.clone(),
         twin_llm_provider: persisted_twin_provider,
@@ -1667,6 +1668,7 @@ fn prompt_request_from_tile(
         position: None,
         context_mode: tile.context_mode.clone(),
         twin_answer_mode: tile.twin_answer_mode.clone(),
+        twin_relationship_variant: tile.twin_relationship_variant.clone(),
         twin_context_policy: tile.twin_context_policy.clone(),
         twin_llm_provider: tile.twin_llm_provider.clone(),
         decision_metadata: tile.decision_metadata.clone(),
@@ -1851,6 +1853,8 @@ mod tests {
     use super::*;
     use crate::commands::canvas::test_support::build_tile;
     use crate::models::canvas::{ContextMode, TwinAnswerMode};
+    use crate::models::twin_event::{EntityId, RelationshipDirection, RelationshipPredicate};
+    use crate::models::twin_state::{RelationshipKey, RelationshipVariant};
 
     #[test]
     fn test_prompt_request_from_tile_preserves_web_search_settings() {
@@ -1872,9 +1876,16 @@ mod tests {
 
     #[test]
     fn test_prompt_request_from_tile_preserves_twin_settings() {
+        let relationship_variant = RelationshipVariant::new(vec![RelationshipKey {
+            subject_id: EntityId::parse("owner").unwrap(),
+            predicate: RelationshipPredicate::parse("works_with").unwrap(),
+            object_id: EntityId::parse("alex").unwrap(),
+            direction: RelationshipDirection::Directed,
+        }]);
         let tile = PromptTile {
-            context_mode: ContextMode::Twin,
+            context_mode: ContextMode::TwinHistory,
             twin_answer_mode: TwinAnswerMode::Simulation,
+            twin_relationship_variant: relationship_variant.clone(),
             twin_context_policy: Some("approved_plus_relevant_candidates".to_string()),
             twin_llm_provider: Some("ollama".to_string()),
             ..build_tile("tile-1", "Prompt", "openai/gpt-4", "Response", None, None)
@@ -1882,8 +1893,9 @@ mod tests {
 
         let request = prompt_request_from_tile(&tile, vec!["openai/gpt-4".to_string()], 0.7);
 
-        assert_eq!(request.context_mode, ContextMode::Twin);
+        assert_eq!(request.context_mode, ContextMode::TwinHistory);
         assert_eq!(request.twin_answer_mode, TwinAnswerMode::Simulation);
+        assert_eq!(request.twin_relationship_variant, relationship_variant);
         assert_eq!(
             request.twin_context_policy.as_deref(),
             Some("approved_plus_relevant_candidates")

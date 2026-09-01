@@ -28,7 +28,7 @@ const destinations = [
   { label: 'Capture', to: '/', icon: 'plus', capability: 'notesWrite' },
   { label: 'Recall', to: '/recall', icon: 'search', capability: 'recall' },
   { label: 'Twin', to: '/twin', icon: 'orbit', capability: 'twinReview' },
-  { label: 'Canvas', to: '/canvas', icon: 'layout-grid', capability: 'spatialCanvas' },
+  { label: 'Canvas', to: '/canvas', icon: 'layout-grid', capability: 'linearCanvas' },
 ]
 
 const route = useRoute()

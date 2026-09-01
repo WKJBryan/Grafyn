@@ -74,12 +74,69 @@ describe('Canvas Store', () => {
       prompt: 'What should I do next?',
       models: ['openai/gpt-4'],
       context_mode: 'twin_history',
-      twin_answer_mode: 'advisor'
+      twin_answer_mode: 'advisor',
+      twin_relationship_variant: { relationships: [] }
     }))
     expect(tileId).toBe('tile-companion')
     expect(store.isStreaming).toBe(false)
     expect(store.error).toBeNull()
   })
+
+  it('sendCompanionPrompt forwards an explicit Simulation answer mode for Twin history', async () => {
+    const sendPromptSpy = mockCompletedSendPrompt('tile-simulation', 'openai/gpt-4')
+    const store = useCanvasStore()
+    store.currentSession = { id: 'session-1', prompt_tiles: [], debates: [] }
+
+    await store.sendCompanionPrompt({
+      prompt: 'How would I respond?',
+      modelId: 'openai/gpt-4',
+      mode: 'twin',
+      answerMode: 'simulation',
+      relationshipVariant: {
+        relationships: [{
+          subject_id: 'owner',
+          predicate: 'with',
+          object_id: 'person-alex',
+          direction: 'directed'
+        }]
+      }
+    })
+
+    expect(sendPromptSpy).toHaveBeenCalledWith('session-1', expect.objectContaining({
+      context_mode: 'twin_history',
+      twin_answer_mode: 'simulation',
+      twin_relationship_variant: {
+        relationships: [{
+          subject_id: 'owner',
+          predicate: 'with',
+          object_id: 'person-alex',
+          direction: 'directed'
+        }]
+      }
+    }))
+  })
+
+  it.each([
+    ['knowledge', 'simulation'],
+    ['twin', 'impersonation']
+  ])(
+    'sendCompanionPrompt rejects mode %s with answer mode %s before starting a stream',
+    async (mode, answerMode) => {
+      const sendPromptSpy = mockCompletedSendPrompt('tile-invalid-answer-mode', 'openai/gpt-4')
+      const store = useCanvasStore()
+      store.currentSession = { id: 'session-1', prompt_tiles: [], debates: [] }
+
+      await expect(store.sendCompanionPrompt({
+        prompt: 'Continue',
+        modelId: 'openai/gpt-4',
+        mode,
+        answerMode
+      })).rejects.toThrow(/answer mode|Simulation requires Twin/i)
+
+      expect(sendPromptSpy).not.toHaveBeenCalled()
+      expect(listenMock).not.toHaveBeenCalled()
+    }
+  )
 
   it.each([
     ['plain', 'none'],
@@ -745,6 +802,24 @@ describe('Canvas Store', () => {
     })
   })
 
+  it('does not publish a late session A send failure as session B store error', async () => {
+    let rejectSessionA
+    vi.spyOn(apiClient.canvas, 'sendPrompt').mockImplementation(() => new Promise((resolve, reject) => {
+      rejectSessionA = reject
+    }))
+    const store = useCanvasStore()
+    store.currentSession = { id: 'session-A', prompt_tiles: [], debates: [] }
+
+    const pendingSend = store.sendPrompt('Hello from A', ['openai/gpt-4'])
+    await flushPromises()
+    store.currentSession = { id: 'session-B', prompt_tiles: [], debates: [] }
+    rejectSessionA(new Error('Session A provider failed'))
+
+    await expect(pendingSend).rejects.toThrow('Session A provider failed')
+    expect(store.currentSession.id).toBe('session-B')
+    expect(store.error).toBeNull()
+  })
+
   it('scopes concurrent sendPrompt streams per tile so same-model interleaved chunks do not cross-contaminate', async () => {
     // Simulates the real Tauri behavior: every setupTauriStreamListener() call registers
     // its own listener, and ALL listeners receive every canvas-stream event for the session.
@@ -950,6 +1025,107 @@ describe('Canvas Store', () => {
     })
   })
 
+  it('does not let an invalidated session load overwrite a newer destination owner', async () => {
+    let finishLoad
+    vi.spyOn(apiClient.canvas, 'get').mockImplementation(() => new Promise(resolve => {
+      finishLoad = () => resolve({
+        id: 'stale-canvas',
+        prompt_tiles: [],
+        debates: [],
+      })
+    }))
+    const store = useCanvasStore()
+
+    const pending = store.loadSession('stale-canvas')
+    store.clearSession()
+    store.currentSession = {
+      id: 'twin-chat',
+      tags: ['companion-twin-chat'],
+      prompt_tiles: [],
+      debates: [],
+    }
+    finishLoad()
+    await pending
+
+    expect(store.currentSession.id).toBe('twin-chat')
+  })
+
+  it('does not let an invalidated session create install itself over a newer owner', async () => {
+    let finishCreate
+    vi.spyOn(apiClient.canvas, 'create').mockImplementation(() => new Promise(resolve => {
+      finishCreate = () => resolve({
+        id: 'stale-created',
+        tags: [],
+        prompt_tiles: [],
+        debates: [],
+      })
+    }))
+    const store = useCanvasStore()
+
+    const pending = store.createSession({ title: 'Stale create' })
+    store.clearSession()
+    store.currentSession = {
+      id: 'new-owner',
+      tags: ['companion-twin-chat'],
+      prompt_tiles: [],
+      debates: [],
+    }
+    finishCreate()
+
+    await expect(pending).resolves.toBeNull()
+    expect(store.currentSession.id).toBe('new-owner')
+    expect(store.sessions.some(session => session.id === 'stale-created')).toBe(false)
+    expect(store.loading).toBe(false)
+  })
+
+  it('does not let a stale create clear loading owned by a newer session load', async () => {
+    let finishCreate
+    let finishLoad
+    vi.spyOn(apiClient.canvas, 'create').mockImplementation(() => new Promise(resolve => {
+      finishCreate = () => resolve({ id: 'stale-created', prompt_tiles: [], debates: [] })
+    }))
+    vi.spyOn(apiClient.canvas, 'get').mockImplementation(() => new Promise(resolve => {
+      finishLoad = () => resolve({ id: 'new-owner', prompt_tiles: [], debates: [] })
+    }))
+    const store = useCanvasStore()
+
+    const pendingCreate = store.createSession({ title: 'Stale create' })
+    const pendingLoad = store.loadSession('new-owner')
+    finishCreate()
+    await pendingCreate
+
+    expect(store.loading).toBe(true)
+    expect(store.currentSession).toBeNull()
+
+    finishLoad()
+    await pendingLoad
+    expect(store.currentSession.id).toBe('new-owner')
+    expect(store.loading).toBe(false)
+  })
+
+  it('clears loading when deleting a session invalidates an in-flight session load', async () => {
+    let finishLoad
+    vi.spyOn(apiClient.canvas, 'get').mockImplementation(() => new Promise(resolve => {
+      finishLoad = () => resolve({
+        id: 'stale-canvas',
+        prompt_tiles: [],
+        debates: [],
+      })
+    }))
+    vi.spyOn(apiClient.canvas, 'delete').mockResolvedValue()
+    const store = useCanvasStore()
+    store.sessions = [{ id: 'deleted-session', prompt_tiles: [], debates: [] }]
+
+    const pending = store.loadSession('stale-canvas')
+    expect(store.loading).toBe(true)
+    await store.deleteSession('deleted-session')
+
+    expect(store.loading).toBe(false)
+    finishLoad()
+    await pending
+    expect(store.loading).toBe(false)
+  })
+
   it('deleteTile removes the full descendant tree from the current session', async () => {
     vi.spyOn(apiClient.canvas, 'deleteTile').mockResolvedValue()
 
@@ -1121,6 +1297,30 @@ describe('Canvas Store', () => {
       content: null
     })
     expect(result.created_record_ids).toEqual(['rec-1'])
+  })
+
+  it('deduplicates in-flight feedback by session, tile, and model', async () => {
+    let finishFeedback
+    const feedbackSpy = vi.spyOn(apiClient.twin, 'recordCanvasFeedback').mockImplementation(
+      () => new Promise(resolve => { finishFeedback = resolve })
+    )
+    const store = useCanvasStore()
+    store.currentSession = {
+      id: 'session-1',
+      prompt_tiles: [],
+      debates: [],
+    }
+
+    const first = store.recordPreferenceFeedback('tile-1', 'model-a', 'accept')
+    const duplicate = store.recordPreferenceFeedback('tile-1', 'model-a', 'reject')
+
+    expect(feedbackSpy).toHaveBeenCalledOnce()
+    expect(store.feedbackInFlight.has('session-1:tile-1:model-a')).toBe(true)
+    await expect(duplicate).resolves.toBeNull()
+
+    finishFeedback({ trace_event_id: 'evt-1', created_record_ids: [] })
+    await first
+    expect(store.feedbackInFlight.size).toBe(0)
   })
 
   it('session_saved reconciles silently mid-stream: no loading flash, no clobbered stream content, no reverted drag', async () => {

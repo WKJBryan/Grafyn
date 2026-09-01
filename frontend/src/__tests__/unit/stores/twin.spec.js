@@ -46,6 +46,16 @@ function pendingProposalFixture(overrides = {}) {
   }
 }
 
+function deferred() {
+  let resolve
+  let reject
+  const promise = new Promise((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise
+    reject = rejectPromise
+  })
+  return { promise, resolve, reject }
+}
+
 describe('Twin Store', () => {
   beforeEach(() => {
     setActivePinia(createPinia())
@@ -274,6 +284,183 @@ describe('Twin Store', () => {
     await store.rankAttention(attentionRequest)
     expect(store.attention.trace).toEqual({ selected: [], excluded: [] })
     expect(store.twinStateError.attention).toBeNull()
+  })
+
+  it('keeps every latest Twin resource coherent when A is invalidated before B', async () => {
+    const observations = [deferred(), deferred()]
+    const proposals = [deferred(), deferred()]
+    const projections = [deferred(), deferred()]
+    const timelines = [deferred(), deferred()]
+    const attentions = [deferred(), deferred()]
+    const workspaceReviews = [deferred(), deferred()]
+    vi.spyOn(apiClient.twin, 'listObservations')
+      .mockReturnValueOnce(observations[0].promise)
+      .mockReturnValueOnce(observations[1].promise)
+    vi.spyOn(apiClient.twin, 'listProposals')
+      .mockReturnValueOnce(proposals[0].promise)
+      .mockReturnValueOnce(proposals[1].promise)
+    vi.spyOn(apiClient.twin, 'getStateProjection')
+      .mockReturnValueOnce(projections[0].promise)
+      .mockReturnValueOnce(projections[1].promise)
+    vi.spyOn(apiClient.twin, 'getEventTimeline')
+      .mockReturnValueOnce(timelines[0].promise)
+      .mockReturnValueOnce(timelines[1].promise)
+    vi.spyOn(apiClient.twin, 'rankAttention')
+      .mockReturnValueOnce(attentions[0].promise)
+      .mockReturnValueOnce(attentions[1].promise)
+    vi.spyOn(apiClient.twin, 'getReview')
+      .mockReturnValueOnce(workspaceReviews[0].promise)
+      .mockReturnValueOnce(workspaceReviews[1].promise)
+    vi.spyOn(apiClient.twin, 'listMemoryDigest').mockResolvedValue([])
+    vi.spyOn(apiClient.twin, 'listConstitutionItems').mockResolvedValue([])
+    vi.spyOn(apiClient.twin, 'listActionGaps').mockResolvedValue([])
+    vi.spyOn(apiClient.twin, 'listDecisionEpisodes').mockResolvedValue([])
+    vi.spyOn(apiClient.twin, 'getConstitutionSetup').mockResolvedValue({})
+    vi.spyOn(apiClient.twin, 'getDecisionMirrorConfig').mockResolvedValue({})
+    const store = useTwinStore()
+    const pageRequest = suffix => ({
+      referenceTime: `2026-09-01T0${suffix}:00:00Z`,
+      filter: { relationships: [], goals: [], tags: [] },
+      cursor: null,
+      limit: 20,
+    })
+    const attentionRequest = suffix => ({
+      referenceTime: `2026-09-01T0${suffix}:00:00Z`,
+      profile: 'capture_review',
+      query: suffix,
+      relationshipVariant: { relationships: [] },
+      goals: [],
+      destination: 'local',
+      filter: { relationships: [], goals: [], tags: [] },
+      limit: 20,
+    })
+
+    const pendingA = Promise.all([
+      store.loadObservations(pageRequest('1')),
+      store.loadProposals(pageRequest('1')),
+      store.loadProjection({ referenceTime: '2026-09-01T01:00:00Z' }),
+      store.loadTimeline(pageRequest('1')),
+      store.rankAttention(attentionRequest('a')),
+      store.loadWorkspace(),
+    ])
+    store.invalidateTwinStateRequests()
+    const pendingB = Promise.all([
+      store.loadObservations(pageRequest('2')),
+      store.loadProposals(pageRequest('2')),
+      store.loadProjection({ referenceTime: '2026-09-01T02:00:00Z' }),
+      store.loadTimeline(pageRequest('2')),
+      store.rankAttention(attentionRequest('b')),
+      store.loadWorkspace(),
+    ])
+
+    observations[1].resolve({ items: [{ item_id: 'observation-b' }], nextCursor: null })
+    proposals[1].resolve({ items: [{ item_id: 'proposal-b' }], nextCursor: null })
+    projections[1].resolve({ snapshot_id: 'projection-b' })
+    timelines[1].resolve({ items: [{ item_id: 'timeline-b' }], nextCursor: null })
+    attentions[1].resolve({ trace: { selected: [{ item_id: 'attention-b' }] } })
+    workspaceReviews[1].resolve([{ record: { id: 'workspace-b' } }])
+    await pendingB
+
+    observations[0].resolve({ items: [{ item_id: 'observation-a' }], nextCursor: null })
+    proposals[0].resolve({ items: [{ item_id: 'proposal-a' }], nextCursor: null })
+    projections[0].resolve({ snapshot_id: 'projection-a' })
+    timelines[0].resolve({ items: [{ item_id: 'timeline-a' }], nextCursor: null })
+    attentions[0].resolve({ trace: { selected: [{ item_id: 'attention-a' }] } })
+    workspaceReviews[0].resolve([{ record: { id: 'workspace-a' } }])
+    await pendingA
+
+    expect(store.observations[0].item_id).toBe('observation-b')
+    expect(store.proposals[0].item_id).toBe('proposal-b')
+    expect(store.projection.snapshot_id).toBe('projection-b')
+    expect(store.timeline[0].item_id).toBe('timeline-b')
+    expect(store.attention.trace.selected[0].item_id).toBe('attention-b')
+    expect(store.reviewRecords[0].record.id).toBe('workspace-b')
+    expect(Object.values(store.twinStateLoading).every(value => value === false)).toBe(true)
+    expect(Object.values(store.twinStateError).every(value => value == null)).toBe(true)
+  })
+
+  it('ignores a stale Twin resource error after the newer generation succeeds', async () => {
+    const projectionA = deferred()
+    const projectionB = deferred()
+    vi.spyOn(apiClient.twin, 'getStateProjection')
+      .mockReturnValueOnce(projectionA.promise)
+      .mockReturnValueOnce(projectionB.promise)
+    const store = useTwinStore()
+
+    const pendingA = store.loadProjection({ referenceTime: '2026-09-01T01:00:00Z' })
+    store.invalidateTwinStateRequests()
+    const pendingB = store.loadProjection({ referenceTime: '2026-09-01T02:00:00Z' })
+    projectionB.resolve({ snapshot_id: 'projection-b' })
+    await pendingB
+    projectionA.reject(new Error('stale projection failure'))
+    await pendingA
+
+    expect(store.projection.snapshot_id).toBe('projection-b')
+    expect(store.twinStateError.projection).toBeNull()
+    expect(store.twinStateLoading.projection).toBe(false)
+  })
+
+  it('does not let a stale proposal review commit or launch refresh loaders after invalidation', async () => {
+    const reviewResult = deferred()
+    const proposal = pendingProposalFixture()
+    const initialReferenceTime = '2026-09-01T01:00:00Z'
+    const reviewedReferenceTime = '2026-09-01T02:00:00Z'
+    vi.spyOn(apiClient.twin, 'reviewProposal').mockReturnValue(reviewResult.promise)
+    const observations = vi.spyOn(apiClient.twin, 'listObservations').mockResolvedValue({ items: [] })
+    const proposals = vi.spyOn(apiClient.twin, 'listProposals').mockResolvedValue({ items: [] })
+    const projection = vi.spyOn(apiClient.twin, 'getStateProjection').mockResolvedValue({ snapshot_id: 'new' })
+    const timeline = vi.spyOn(apiClient.twin, 'getEventTimeline').mockResolvedValue({ items: [] })
+    const store = useTwinStore()
+    store.proposalPage = {
+      snapshotId: 'snapshot-a',
+      referenceTime: initialReferenceTime,
+      items: [structuredClone(proposal)],
+    }
+    store.projection = {
+      snapshot_id: 'snapshot-a',
+      reference_time: initialReferenceTime,
+      pending_proposals: [structuredClone(proposal)],
+    }
+
+    const pending = store.reviewProposal(proposal.item_id, 'accept')
+    store.invalidateTwinStateRequests()
+    reviewResult.resolve({
+      snapshot: {
+        snapshot_id: 'snapshot-after-review',
+        reference_time: reviewedReferenceTime,
+        pending_proposals: [],
+      },
+      referenceTime: reviewedReferenceTime,
+    })
+    await pending
+
+    expect(store.projection.snapshot_id).toBe('snapshot-a')
+    expect(observations).not.toHaveBeenCalled()
+    expect(proposals).not.toHaveBeenCalled()
+    expect(projection).not.toHaveBeenCalled()
+    expect(timeline).not.toHaveBeenCalled()
+    expect(store.twinStateLoading.review).toBe(false)
+  })
+
+  it('does not let a stale digest review launch a new workspace generation after invalidation', async () => {
+    const digestReview = deferred()
+    vi.spyOn(apiClient.twin, 'reviewMemoryDigestItem').mockReturnValue(digestReview.promise)
+    const workspace = vi.spyOn(apiClient.twin, 'getReview').mockResolvedValue([])
+    vi.spyOn(apiClient.twin, 'listMemoryDigest').mockResolvedValue([])
+    vi.spyOn(apiClient.twin, 'listConstitutionItems').mockResolvedValue([])
+    vi.spyOn(apiClient.twin, 'listActionGaps').mockResolvedValue([])
+    vi.spyOn(apiClient.twin, 'listDecisionEpisodes').mockResolvedValue([])
+    vi.spyOn(apiClient.twin, 'getConstitutionSetup').mockResolvedValue({})
+    vi.spyOn(apiClient.twin, 'getDecisionMirrorConfig').mockResolvedValue({})
+    const store = useTwinStore()
+
+    const pending = store.reviewMemoryDigestItem('digest-a', 'keep')
+    store.invalidateTwinStateRequests()
+    digestReview.resolve()
+    await pending
+
+    expect(workspace).not.toHaveBeenCalled()
+    expect(store.message).toBeNull()
   })
 
   it('reviews a proposal against the loaded snapshot and reloads state at server review time', async () => {

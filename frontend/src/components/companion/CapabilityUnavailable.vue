@@ -30,6 +30,7 @@ const labels = {
   notesWrite: 'Capture',
   recall: 'Recall',
   twinReview: 'Twin',
+  linearCanvas: 'Canvas',
   spatialCanvas: 'Canvas',
   importByPath: 'Path import',
 }

@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use crate::models::twin::TwinContextRecord;
 use crate::models::twin_event::{ContentDigest, EventId};
-use crate::models::twin_state::SnapshotId;
+use crate::models::twin_state::{RelationshipVariant, SnapshotId};
 
 /// Canvas session containing prompts and model responses
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -104,11 +104,20 @@ pub struct DecisionPromptMetadata {
 
 /// Immutable provenance needed to reproduce the governed Twin evidence used
 /// for one prompt. Both vectors are canonical sets: sorted and unique.
+pub const TWIN_HISTORY_LEGACY_GLOBAL_CONTEXT_VERSION: &str = "ctx-v3-reviewed-projection-history";
+pub const TWIN_HISTORY_GLOBAL_CONTEXT_VERSION: &str = "global-v4-reviewed-projection-history";
+pub const TWIN_HISTORY_RELATIONSHIP_CONTEXT_VERSION: &str =
+    "relationship-v4-reviewed-projection-history";
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TwinEvidenceSnapshot {
     pub projection_snapshot_id: SnapshotId,
     pub reference_time: DateTime<Utc>,
     pub prompt_context_digest: ContentDigest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_context_version: Option<String>,
+    #[serde(default)]
+    pub twin_relationship_variant: RelationshipVariant,
     #[serde(default)]
     pub evidence_event_ids: Vec<EventId>,
     #[serde(default)]
@@ -116,6 +125,26 @@ pub struct TwinEvidenceSnapshot {
 }
 
 impl TwinEvidenceSnapshot {
+    pub fn resolved_prompt_context_version(&self) -> Result<&'static str, String> {
+        let is_global = self.twin_relationship_variant.relationships.is_empty();
+        match self.prompt_context_version.as_deref() {
+            None if is_global => Ok(TWIN_HISTORY_LEGACY_GLOBAL_CONTEXT_VERSION),
+            None => {
+                Err("Legacy Twin History context version is valid only for global replay".into())
+            }
+            Some(TWIN_HISTORY_GLOBAL_CONTEXT_VERSION) if is_global => {
+                Ok(TWIN_HISTORY_GLOBAL_CONTEXT_VERSION)
+            }
+            Some(TWIN_HISTORY_RELATIONSHIP_CONTEXT_VERSION) if !is_global => {
+                Ok(TWIN_HISTORY_RELATIONSHIP_CONTEXT_VERSION)
+            }
+            Some(
+                TWIN_HISTORY_GLOBAL_CONTEXT_VERSION | TWIN_HISTORY_RELATIONSHIP_CONTEXT_VERSION,
+            ) => Err("Twin History context version does not match its relationship variant".into()),
+            Some(_) => Err("Twin History context version is not supported".into()),
+        }
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         const MAX_EVIDENCE_EVENT_IDS: usize = 24 * (1 + 64 + 64);
         const MAX_EVIDENCE_NOTE_IDS: usize = 64;
@@ -141,6 +170,17 @@ impl TwinEvidenceSnapshot {
         {
             return Err("Twin evidence note IDs must be bounded non-control text".into());
         }
+        if self.prompt_context_version.as_ref().is_some_and(|version| {
+            version.trim().is_empty()
+                || version.len() > 128
+                || version.chars().any(char::is_control)
+        }) {
+            return Err("Twin evidence prompt context version must be bounded text".into());
+        }
+        self.twin_relationship_variant
+            .validate()
+            .map_err(|error| error.to_string())?;
+        self.resolved_prompt_context_version()?;
         Ok(())
     }
 }
@@ -174,6 +214,8 @@ pub struct PromptTile {
     #[serde(default)]
     pub twin_evidence_snapshot: Option<TwinEvidenceSnapshot>,
     #[serde(default)]
+    pub twin_relationship_variant: RelationshipVariant,
+    #[serde(default)]
     pub twin_answer_mode: TwinAnswerMode,
     #[serde(default)]
     pub twin_context_policy: Option<String>,
@@ -189,6 +231,32 @@ pub struct PromptTile {
     pub web_search_max_results: u32,
     #[serde(default = "default_reasoning_effort")]
     pub reasoning_effort: String,
+}
+
+impl PromptTile {
+    pub fn validate_twin_relationship_context(
+        &self,
+        requested: Option<&RelationshipVariant>,
+    ) -> Result<(), String> {
+        self.twin_relationship_variant
+            .validate()
+            .map_err(|error| error.to_string())?;
+        if requested.is_some_and(|variant| variant != &self.twin_relationship_variant) {
+            return Err(
+                "Twin History relationship context does not match its persisted tile".into(),
+            );
+        }
+        if let Some(evidence) = &self.twin_evidence_snapshot {
+            evidence.validate()?;
+            if evidence.twin_relationship_variant != self.twin_relationship_variant {
+                return Err(
+                    "Twin History relationship context does not match its persisted evidence"
+                        .into(),
+                );
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Default for PromptTile {
@@ -209,6 +277,7 @@ impl Default for PromptTile {
             approved_twin_records: Vec::new(),
             candidate_twin_records: Vec::new(),
             twin_evidence_snapshot: None,
+            twin_relationship_variant: RelationshipVariant::global(),
             twin_answer_mode: TwinAnswerMode::default(),
             twin_context_policy: None,
             twin_llm_provider: None,
@@ -512,6 +581,8 @@ pub struct PromptRequest {
     #[serde(default = "default_prompt_twin_answer_mode")]
     pub twin_answer_mode: TwinAnswerMode,
     #[serde(default)]
+    pub twin_relationship_variant: RelationshipVariant,
+    #[serde(default)]
     pub twin_context_policy: Option<String>,
     #[serde(default)]
     pub twin_llm_provider: Option<String>,
@@ -663,6 +734,175 @@ mod tests {
     }
 
     #[test]
+    fn twin_relationship_context_is_typed_persisted_and_legacy_global() {
+        let relationship = json!({
+            "relationships": [{
+                "subject_id": "owner",
+                "predicate": "works_with",
+                "object_id": "alex",
+                "direction": "directed"
+            }]
+        });
+        let request: PromptRequest = serde_json::from_value(json!({
+            "prompt": "What matters with Alex?",
+            "models": ["openai/gpt-4"],
+            "context_mode": "twin_history",
+            "twin_relationship_variant": relationship.clone()
+        }))
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&request).unwrap()["twin_relationship_variant"],
+            relationship
+        );
+
+        let legacy_request: PromptRequest = serde_json::from_value(json!({
+            "prompt": "What matters generally?",
+            "models": ["openai/gpt-4"],
+            "context_mode": "twin_history"
+        }))
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&legacy_request).unwrap()["twin_relationship_variant"],
+            json!({ "relationships": [] })
+        );
+
+        let legacy_tile: PromptTile = serde_json::from_value(json!({
+            "id": "tile-legacy",
+            "prompt": "hello",
+            "models": [],
+            "responses": {},
+            "position": { "x": 0.0, "y": 0.0, "width": 400.0, "height": 300.0 },
+            "created_at": "2026-08-29T00:00:00Z"
+        }))
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&legacy_tile).unwrap()["twin_relationship_variant"],
+            json!({ "relationships": [] })
+        );
+
+        let legacy_snapshot: TwinEvidenceSnapshot = serde_json::from_value(json!({
+            "projection_snapshot_id": "a".repeat(64),
+            "reference_time": "2026-08-29T00:00:00Z",
+            "prompt_context_digest": "b".repeat(64),
+            "evidence_event_ids": [],
+            "note_ids": []
+        }))
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&legacy_snapshot).unwrap()["twin_relationship_variant"],
+            json!({ "relationships": [] })
+        );
+        assert!(legacy_snapshot.prompt_context_version.is_none());
+        assert!(serde_json::to_value(&legacy_snapshot)
+            .unwrap()
+            .get("prompt_context_version")
+            .is_none());
+    }
+
+    #[test]
+    fn replay_relationship_context_requires_request_tile_and_evidence_agreement() {
+        let alex: RelationshipVariant = serde_json::from_value(json!({
+            "relationships": [{
+                "subject_id": "owner",
+                "predicate": "works_with",
+                "object_id": "alex",
+                "direction": "directed"
+            }]
+        }))
+        .unwrap();
+        let bob: RelationshipVariant = serde_json::from_value(json!({
+            "relationships": [{
+                "subject_id": "owner",
+                "predicate": "works_with",
+                "object_id": "bob",
+                "direction": "directed"
+            }]
+        }))
+        .unwrap();
+        let mut tile = PromptTile {
+            twin_relationship_variant: alex.clone(),
+            twin_evidence_snapshot: Some(TwinEvidenceSnapshot {
+                projection_snapshot_id: SnapshotId::parse("a".repeat(64)).unwrap(),
+                reference_time: "2026-08-29T00:00:00Z".parse().unwrap(),
+                prompt_context_digest: ContentDigest::parse("b".repeat(64)).unwrap(),
+                prompt_context_version: Some("relationship-v4-reviewed-projection-history".into()),
+                twin_relationship_variant: alex.clone(),
+                evidence_event_ids: Vec::new(),
+                note_ids: Vec::new(),
+            }),
+            ..PromptTile::default()
+        };
+
+        tile.validate_twin_relationship_context(Some(&alex))
+            .unwrap();
+        assert!(tile
+            .validate_twin_relationship_context(Some(&bob))
+            .unwrap_err()
+            .contains("relationship context"));
+
+        tile.twin_evidence_snapshot
+            .as_mut()
+            .unwrap()
+            .twin_relationship_variant = bob;
+        assert!(tile
+            .validate_twin_relationship_context(None)
+            .unwrap_err()
+            .contains("relationship context"));
+    }
+
+    #[test]
+    fn twin_evidence_context_version_must_match_its_relationship_variant() {
+        let alex: RelationshipVariant = serde_json::from_value(json!({
+            "relationships": [{
+                "subject_id": "owner",
+                "predicate": "works_with",
+                "object_id": "alex",
+                "direction": "directed"
+            }]
+        }))
+        .unwrap();
+        let evidence = |variant: RelationshipVariant, version: Option<&str>| TwinEvidenceSnapshot {
+            projection_snapshot_id: SnapshotId::parse("a".repeat(64)).unwrap(),
+            reference_time: "2026-08-29T00:00:00Z".parse().unwrap(),
+            prompt_context_digest: ContentDigest::parse("b".repeat(64)).unwrap(),
+            prompt_context_version: version.map(str::to_string),
+            twin_relationship_variant: variant,
+            evidence_event_ids: Vec::new(),
+            note_ids: Vec::new(),
+        };
+
+        for invalid in [
+            evidence(
+                RelationshipVariant::global(),
+                Some("relationship-v4-reviewed-projection-history"),
+            ),
+            evidence(alex.clone(), Some("global-v4-reviewed-projection-history")),
+            evidence(alex.clone(), None),
+            evidence(
+                RelationshipVariant::global(),
+                Some("unknown-v5-reviewed-projection-history"),
+            ),
+        ] {
+            assert!(invalid.validate().unwrap_err().contains("context version"));
+        }
+
+        assert!(evidence(RelationshipVariant::global(), None)
+            .validate()
+            .is_ok());
+        assert!(evidence(
+            RelationshipVariant::global(),
+            Some("global-v4-reviewed-projection-history"),
+        )
+        .validate()
+        .is_ok());
+        assert!(
+            evidence(alex, Some("relationship-v4-reviewed-projection-history"),)
+                .validate()
+                .is_ok()
+        );
+    }
+
+    #[test]
     fn prompt_tile_evidence_snapshot_is_optional_and_canonical() {
         let legacy: PromptTile = serde_json::from_value(json!({
             "id": "tile-legacy",
@@ -680,6 +920,8 @@ mod tests {
                 .unwrap(),
             reference_time: "2026-08-29T00:00:00Z".parse().unwrap(),
             prompt_context_digest: ContentDigest::parse("d".repeat(64)).unwrap(),
+            prompt_context_version: Some("global-v4-reviewed-projection-history".into()),
+            twin_relationship_variant: RelationshipVariant::global(),
             evidence_event_ids: vec![
                 crate::models::twin_event::EventId::parse("b".repeat(64)).unwrap(),
                 crate::models::twin_event::EventId::parse("c".repeat(64)).unwrap(),

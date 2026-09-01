@@ -673,6 +673,18 @@ fn normalized_item_values(values: &[String]) -> BTreeSet<String> {
         .collect()
 }
 
+fn relationship_keys_match_filter(
+    relationships: &BTreeSet<RelationshipKey>,
+    filter: &NormalizedFilter,
+) -> bool {
+    filter.relationships.is_empty()
+        || (relationships.len() == filter.relationships.len()
+            && filter
+                .relationships
+                .iter()
+                .all(|relationship| relationships.contains(relationship)))
+}
+
 fn item_matches_filter(item: &ProjectedStateItem, filter: &NormalizedFilter) -> bool {
     let relationships = item
         .relationship_variant
@@ -680,13 +692,14 @@ fn item_matches_filter(item: &ProjectedStateItem, filter: &NormalizedFilter) -> 
         .iter()
         .cloned()
         .collect::<BTreeSet<_>>();
+    relationship_keys_match_filter(&relationships, filter)
+        && item_goals_tags_match_filter(item, filter)
+}
+
+fn item_goals_tags_match_filter(item: &ProjectedStateItem, filter: &NormalizedFilter) -> bool {
     let goals = normalized_item_values(&item.goals);
     let tags = normalized_item_values(&item.tags);
-    filter
-        .relationships
-        .iter()
-        .all(|relationship| relationships.contains(relationship))
-        && filter.goals.iter().all(|goal| goals.contains(goal))
+    filter.goals.iter().all(|goal| goals.contains(goal))
         && filter.tags.iter().all(|tag| tags.contains(tag))
 }
 
@@ -703,21 +716,24 @@ fn companion_note_id_from_item(item: &ProjectedStateItem) -> Option<Identifier> 
     Identifier::parse(item.claim.object.as_str()).ok()
 }
 
-fn event_matches_filter(event: &TwinEvent, filter: &NormalizedFilter) -> bool {
-    let relationships = event
-        .context
-        .relationships
-        .iter()
-        .map(RelationshipKey::from)
-        .collect::<BTreeSet<_>>();
+fn event_goals_tags_match_filter(event: &TwinEvent, filter: &NormalizedFilter) -> bool {
     let goals = normalized_item_values(&event.context.goals);
     let tags = normalized_item_values(&event.context.tags);
-    filter
+    filter.goals.iter().all(|goal| goals.contains(goal))
+        && filter.tags.iter().all(|tag| tags.contains(tag))
+}
+
+fn timeline_relationship_matches_filter(
+    entry: &TemporalStateEntry,
+    filter: &NormalizedFilter,
+) -> bool {
+    let relationships = entry
+        .relationship_variant
         .relationships
         .iter()
-        .all(|relationship| relationships.contains(relationship))
-        && filter.goals.iter().all(|goal| goals.contains(goal))
-        && filter.tags.iter().all(|tag| tags.contains(tag))
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    relationship_keys_match_filter(&relationships, filter)
 }
 
 fn build_snapshot(
@@ -954,12 +970,13 @@ async fn get_twin_event_timeline_inner(
             .timeline
             .iter()
             .filter(|entry| {
-                projected
-                    .get(&entry.item_id)
-                    .is_some_and(|item| item_matches_filter(item, &filter))
-                    || events
-                        .get(&entry.source_event_id)
-                        .is_some_and(|event| event_matches_filter(event, &filter))
+                timeline_relationship_matches_filter(entry, &filter)
+                    && (projected
+                        .get(&entry.item_id)
+                        .is_some_and(|item| item_goals_tags_match_filter(item, &filter))
+                        || events
+                            .get(&entry.source_event_id)
+                            .is_some_and(|event| event_goals_tags_match_filter(event, &filter)))
             })
             .cloned()
             .collect::<Vec<_>>();

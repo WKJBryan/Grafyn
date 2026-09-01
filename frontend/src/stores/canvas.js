@@ -2,7 +2,6 @@ import { defineStore } from 'pinia'
 import { ref, shallowRef, computed, triggerRef, toRaw } from 'vue'
 import { canvas as canvasApi, twin as twinApi } from '@/api/client'
 import { getTransport } from '@/api/transport'
-import { useAsyncOperation } from '@/composables/useAsyncOperation'
 
 export const DEFAULT_WEB_SEARCH_MAX_RESULTS = 5
 export const THINK_HARDER_WEB_SEARCH_MAX_RESULTS = 8
@@ -23,11 +22,13 @@ export const useCanvasStore = defineStore('canvas', () => {
   const availableModels = ref([])
   const loading = ref(false)
   const error = ref(null)
-  const { run } = useAsyncOperation(loading, error)
+  const errorSessionId = ref(null)
+  let sessionLoadGeneration = 0
   // shallowRef avoids deep reactivity tracking — these update on every streaming chunk,
   // so deep proxying wastes cycles. Use triggerRef() after mutations to notify watchers.
   const streamingModels = shallowRef(new Set())
   const streamingModelCounts = new Map()
+  const feedbackInFlight = shallowRef(new Set())
   // Debate streaming state: { [debateId]: { currentRound, models: { [modelId]: text }, completedRounds: [] } }
   // Kept as ref() (not shallowRef) because deeply nested mutations need automatic reactivity for streaming display
   const debateStreamingContent = ref({})
@@ -268,11 +269,11 @@ export const useCanvasStore = defineStore('canvas', () => {
   // Actions
   async function loadSessions() {
     loading.value = true
-    error.value = null
+    clearError()
     try {
       sessions.value = await canvasApi.list()
     } catch (err) {
-      error.value = err.message || 'Failed to load sessions'
+      setError(err.message || 'Failed to load sessions')
       console.error('Failed to load canvas sessions:', err)
     } finally {
       loading.value = false
@@ -280,25 +281,41 @@ export const useCanvasStore = defineStore('canvas', () => {
   }
 
   async function loadSession(sessionId) {
+    const generation = ++sessionLoadGeneration
     loading.value = true
-    error.value = null
+    clearError()
     try {
-      currentSession.value = normalizeSession(await canvasApi.get(sessionId))
+      const session = normalizeSession(await canvasApi.get(sessionId))
+      if (generation !== sessionLoadGeneration) return null
+      currentSession.value = session
+      return session
     } catch (err) {
-      error.value = err.message || 'Failed to load session'
+      if (generation !== sessionLoadGeneration) return null
+      setError(err.message || 'Failed to load session', sessionId)
       console.error('Failed to load canvas session:', err)
+      return null
     } finally {
-      loading.value = false
+      if (generation === sessionLoadGeneration) loading.value = false
     }
   }
 
   async function createSession(data = {}) {
-    return run(async () => {
+    const generation = ++sessionLoadGeneration
+    loading.value = true
+    clearError()
+    try {
       const session = normalizeSession(await canvasApi.create(data))
+      if (generation !== sessionLoadGeneration) return null
       sessions.value.unshift(session)
       currentSession.value = session
       return session
-    })
+    } catch (err) {
+      if (generation !== sessionLoadGeneration) return null
+      setError(err.message || 'Failed to create session')
+      throw err
+    } finally {
+      if (generation === sessionLoadGeneration) loading.value = false
+    }
   }
 
   async function updateSession(sessionId, data) {
@@ -318,7 +335,7 @@ export const useCanvasStore = defineStore('canvas', () => {
 
       return updated
     } catch (err) {
-      error.value = err.message || 'Failed to update session'
+      if (isCurrentSession(sessionId)) setError(err.message || 'Failed to update session', sessionId)
       console.error('Failed to update canvas session:', err)
       throw err
     }
@@ -327,24 +344,26 @@ export const useCanvasStore = defineStore('canvas', () => {
   async function deleteSession(sessionId) {
     try {
       await canvasApi.delete(sessionId)
+      sessionLoadGeneration += 1
+      loading.value = false
       sessions.value = sessions.value.filter(s => s.id !== sessionId)
 
       if (currentSession.value?.id === sessionId) {
         currentSession.value = null
       }
     } catch (err) {
-      error.value = err.message || 'Failed to delete session'
+      if (isCurrentSession(sessionId)) setError(err.message || 'Failed to delete session', sessionId)
       console.error('Failed to delete canvas session:', err)
       throw err
     }
   }
 
   async function loadModels() {
-    error.value = null
+    clearError()
     try {
       availableModels.value = await canvasApi.getModels()
     } catch (err) {
-      error.value = err.message || 'Failed to load models'
+      setError(err.message || 'Failed to load models')
       console.error('Failed to load models:', err)
     }
   }
@@ -378,14 +397,15 @@ export const useCanvasStore = defineStore('canvas', () => {
     promptType = 'standard',
     decisionMetadata = null,
     reasoningEffort = 'none',
-    twinLlmProvider = null
+    twinLlmProvider = null,
+    twinRelationshipVariant = null
   ) {
     if (!currentSession.value) {
       throw new Error('No active session')
     }
 
     const sessionId = currentSession.value.id
-    error.value = null
+    clearError()
 
     // Calculate position for new tile when branching from a parent response
     let position = undefined
@@ -435,6 +455,9 @@ export const useCanvasStore = defineStore('canvas', () => {
         twin_answer_mode: twinAnswerMode,
         twin_context_policy: contextMode === 'twin' ? 'approved_plus_relevant_candidates' : null,
         twin_llm_provider: twinLlmProvider,
+        ...(twinRelationshipVariant
+          ? { twin_relationship_variant: twinRelationshipVariant }
+          : {}),
         decision_metadata: decisionMetadata,
         reasoning_effort: normalizeReasoningEffort(reasoningEffort),
         position,
@@ -521,7 +544,7 @@ export const useCanvasStore = defineStore('canvas', () => {
         unlisten()
       }
     } catch (err) {
-      error.value = err.message || 'Failed to send prompt'
+      if (isCurrentSession(sessionId)) setError(err.message || 'Failed to send prompt', sessionId)
       console.error('Failed to send prompt:', err)
       throw err
     } finally {
@@ -784,7 +807,7 @@ export const useCanvasStore = defineStore('canvas', () => {
     }
 
     const sessionId = currentSession.value.id
-    error.value = null
+    clearError()
 
     // Mark models as streaming
     participatingModels.forEach(m => addStreaming(m))
@@ -867,7 +890,7 @@ export const useCanvasStore = defineStore('canvas', () => {
         unlisten()
       }
     } catch (err) {
-      error.value = err.message || 'Failed to start debate'
+      setError(err.message || 'Failed to start debate', sessionId)
       console.error('Failed to start debate:', err)
       throw err
     } finally {
@@ -881,7 +904,7 @@ export const useCanvasStore = defineStore('canvas', () => {
     }
 
     if (!prompt || !prompt.trim()) {
-      error.value = 'Enter a prompt to continue the debate.'
+      setError('Enter a prompt to continue the debate.', currentSession.value.id)
       throw new Error(error.value)
     }
 
@@ -947,7 +970,7 @@ export const useCanvasStore = defineStore('canvas', () => {
         unlisten()
       }
     } catch (err) {
-      error.value = err.message || 'Failed to continue debate'
+      setError(err.message || 'Failed to continue debate', sessionId)
       throw err
     } finally {
       participatingModels.forEach(m => removeStreaming(m))
@@ -960,7 +983,7 @@ export const useCanvasStore = defineStore('canvas', () => {
     }
 
     const sessionId = currentSession.value.id
-    error.value = null
+    clearError()
 
     try {
       const result = await canvasApi.exportToNote(sessionId)
@@ -972,7 +995,7 @@ export const useCanvasStore = defineStore('canvas', () => {
 
       return result
     } catch (err) {
-      error.value = err.message || 'Failed to export to note'
+      setError(err.message || 'Failed to export to note', sessionId)
       console.error('Failed to export canvas to note:', err)
       throw err
     }
@@ -990,7 +1013,7 @@ export const useCanvasStore = defineStore('canvas', () => {
     }
 
     const sessionId = currentSession.value.id
-    error.value = null
+    clearError()
 
     // tileId is known synchronously (an existing tile), so streaming keys can be
     // marked immediately — no need to learn ownership asynchronously like sendPrompt.
@@ -1044,7 +1067,7 @@ export const useCanvasStore = defineStore('canvas', () => {
         unlisten()
       }
     } catch (err) {
-      error.value = err.message || 'Failed to add models'
+      setError(err.message || 'Failed to add models', sessionId)
       console.error('Failed to add models to tile:', err)
       throw err
     } finally {
@@ -1064,7 +1087,7 @@ export const useCanvasStore = defineStore('canvas', () => {
     }
 
     const sessionId = currentSession.value.id
-    error.value = null
+    clearError()
     const previousResponse = {
       ...tile.responses[modelId],
       position: tile.responses[modelId].position
@@ -1126,7 +1149,7 @@ export const useCanvasStore = defineStore('canvas', () => {
         }
       }
       if (isCurrentSession(sessionId)) {
-        error.value = err.message || 'Failed to regenerate response'
+        setError(err.message || 'Failed to regenerate response', sessionId)
       }
       console.error('Failed to regenerate response:', err)
       throw err
@@ -1135,20 +1158,29 @@ export const useCanvasStore = defineStore('canvas', () => {
     }
   }
 
+  function setError(message, sessionId = null) {
+    error.value = message
+    errorSessionId.value = sessionId
+  }
+
   function clearError() {
     error.value = null
+    errorSessionId.value = null
   }
 
   function clearSession() {
+    sessionLoadGeneration += 1
     currentSession.value = null
+    loading.value = false
   }
 
   function reset() {
+    sessionLoadGeneration += 1
     sessions.value = []
     currentSession.value = null
     availableModels.value = []
     loading.value = false
-    error.value = null
+    clearError()
     clearStreaming()
     debateStreamingContent.value = {}
   }
@@ -1220,9 +1252,11 @@ export const useCanvasStore = defineStore('canvas', () => {
     prompt,
     modelId,
     mode = 'twin',
+    answerMode = 'advisor',
     parentTileId = null,
     parentModelId = null,
-    provider = null
+    provider = null,
+    relationshipVariant = { relationships: [] }
   }) {
     let contextMode
     switch (mode) {
@@ -1239,6 +1273,13 @@ export const useCanvasStore = defineStore('canvas', () => {
         throw new Error(`Unsupported companion mode: ${mode}`)
     }
 
+    if (!['advisor', 'simulation'].includes(answerMode)) {
+      throw new Error(`Unsupported companion answer mode: ${answerMode}`)
+    }
+    if (answerMode === 'simulation' && mode !== 'twin') {
+      throw new Error('Simulation requires Twin context')
+    }
+
     return sendPrompt(
       prompt,
       [modelId],
@@ -1248,13 +1289,14 @@ export const useCanvasStore = defineStore('canvas', () => {
       parentTileId,
       parentModelId,
       contextMode,
-      'advisor',
+      answerMode,
       false,
       DEFAULT_WEB_SEARCH_MAX_RESULTS,
       'standard',
       null,
       'none',
-      provider
+      provider,
+      relationshipVariant
     )
   }
 
@@ -1294,15 +1336,26 @@ export const useCanvasStore = defineStore('canvas', () => {
   }
 
   async function recordPreferenceFeedback(tileId, modelId, feedbackType, rationale = null, content = null) {
-    return recordCanvasFeedback({
-      feedback_type: feedbackType,
-      response: {
-        tile_id: tileId,
-        model_id: modelId
-      },
-      rationale,
-      content
-    })
+    if (!currentSession.value) throw new Error('No active session')
+    const sessionId = currentSession.value.id
+    const key = `${sessionId}:${tileId}:${modelId}`
+    if (feedbackInFlight.value.has(key)) return null
+    feedbackInFlight.value.add(key)
+    triggerRef(feedbackInFlight)
+    try {
+      return await twinApi.recordCanvasFeedback(sessionId, {
+        feedback_type: feedbackType,
+        response: {
+          tile_id: tileId,
+          model_id: modelId
+        },
+        rationale,
+        content
+      })
+    } finally {
+      feedbackInFlight.value.delete(key)
+      triggerRef(feedbackInFlight)
+    }
   }
 
   async function recordSelectionRanking(responseRefs, rationale = null, content = null) {
@@ -1389,7 +1442,9 @@ export const useCanvasStore = defineStore('canvas', () => {
     availableModels,
     loading,
     error,
+    errorSessionId,
     streamingModels,
+    feedbackInFlight,
     debateStreamingContent,
     // Getters
     promptTiles,

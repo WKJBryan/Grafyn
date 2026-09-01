@@ -53,4 +53,12 @@ describe('CompanionShell', () => {
     expect(links[1].attributes('aria-current')).toBe('page')
     expect(links.filter(link => link.attributes('aria-current') === 'page')).toHaveLength(1)
   })
+
+  it('maps the blocked Canvas destination to the linear capability', async () => {
+    const wrapper = await mountShell('/unavailable?capability=linearCanvas')
+    const links = wrapper.findAll('.companion-nav-link')
+
+    expect(links[3].attributes('aria-current')).toBe('page')
+    expect(links.filter(link => link.attributes('aria-current') === 'page')).toHaveLength(1)
+  })
 })

@@ -53,6 +53,7 @@ pub(super) fn build_tile(
         approved_twin_records: Vec::new(),
         candidate_twin_records: Vec::new(),
         twin_evidence_snapshot: None,
+        twin_relationship_variant: crate::models::twin_state::RelationshipVariant::global(),
         twin_answer_mode: TwinAnswerMode::default(),
         twin_context_policy: None,
         twin_llm_provider: None,

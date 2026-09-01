@@ -14,7 +14,7 @@ describe('runtime capability profiles', () => {
     recall: true,
     twinReview: true,
     twinChat: true,
-    linearCanvas: false,
+    linearCanvas: true,
     imageGeneration: false,
     sync: false,
     spatialCanvas: true,

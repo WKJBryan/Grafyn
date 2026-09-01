@@ -109,16 +109,38 @@ export const useTwinStore = defineStore('twin', () => {
   let observationRequest = null
   let proposalRequest = null
   let timelineRequest = null
+  const twinStateGeneration = {
+    observations: 0,
+    proposals: 0,
+    projection: 0,
+    timeline: 0,
+    attention: 0,
+    review: 0,
+    digestReview: 0,
+    workspace: 0,
+  }
 
   async function runTwinStateOperation(key, operation) {
+    const generation = ++twinStateGeneration[key]
+    const isCurrent = () => twinStateGeneration[key] === generation
     twinStateLoading[key] = true
     twinStateError[key] = null
     try {
-      return await operation()
+      const result = await operation(isCurrent)
+      return isCurrent() ? result : null
     } catch (err) {
-      twinStateError[key] = err?.message || String(err)
+      if (isCurrent()) twinStateError[key] = err?.message || String(err)
       return null
     } finally {
+      if (isCurrent()) twinStateLoading[key] = false
+    }
+  }
+
+  function invalidateTwinStateRequests() {
+    for (const key of Object.keys(twinStateGeneration)) {
+      twinStateGeneration[key] += 1
+    }
+    for (const key of Object.keys(twinStateLoading)) {
       twinStateLoading[key] = false
     }
   }
@@ -132,8 +154,9 @@ export const useTwinStore = defineStore('twin', () => {
   }
 
   async function loadObservations(request, append = false) {
-    return runTwinStateOperation('observations', async () => {
+    return runTwinStateOperation('observations', async isCurrent => {
       const page = await twinApi.listObservations(request)
+      if (!isCurrent()) return null
       observationPage.value = mergePage(observationPage.value, page, append)
       if (!append) observationRequest = { ...request, cursor: null }
       return observationPage.value
@@ -149,8 +172,9 @@ export const useTwinStore = defineStore('twin', () => {
   }
 
   async function loadProposals(request, append = false) {
-    return runTwinStateOperation('proposals', async () => {
+    return runTwinStateOperation('proposals', async isCurrent => {
       const page = await twinApi.listProposals(request)
+      if (!isCurrent()) return null
       proposalPage.value = mergePage(proposalPage.value, page, append)
       if (!append) proposalRequest = { ...request, cursor: null }
       return proposalPage.value
@@ -166,15 +190,18 @@ export const useTwinStore = defineStore('twin', () => {
   }
 
   async function loadProjection(request) {
-    return runTwinStateOperation('projection', async () => {
-      projection.value = await twinApi.getStateProjection(request)
+    return runTwinStateOperation('projection', async isCurrent => {
+      const nextProjection = await twinApi.getStateProjection(request)
+      if (!isCurrent()) return null
+      projection.value = nextProjection
       return projection.value
     })
   }
 
   async function loadTimeline(request, append = false) {
-    return runTwinStateOperation('timeline', async () => {
+    return runTwinStateOperation('timeline', async isCurrent => {
       const page = await twinApi.getEventTimeline(request)
+      if (!isCurrent()) return null
       timelinePage.value = mergePage(timelinePage.value, page, append)
       if (!append) timelineRequest = { ...request, cursor: null }
       return timelinePage.value
@@ -190,8 +217,10 @@ export const useTwinStore = defineStore('twin', () => {
   }
 
   async function rankAttention(request) {
-    return runTwinStateOperation('attention', async () => {
-      attention.value = await twinApi.rankAttention(request)
+    return runTwinStateOperation('attention', async isCurrent => {
+      const nextAttention = await twinApi.rankAttention(request)
+      if (!isCurrent()) return null
+      attention.value = nextAttention
       return attention.value
     })
   }
@@ -211,7 +240,7 @@ export const useTwinStore = defineStore('twin', () => {
     reviewedClaim = null,
     rationale = null
   ) {
-    return runTwinStateOperation('review', async () => {
+    return runTwinStateOperation('review', async isCurrent => {
       const displayedItem = proposalPage.value?.items?.find(item => item.item_id === memoryId)
       const expectedSnapshotId = proposalPage.value?.snapshotId
       const snapshotReferenceTime = proposalPage.value?.referenceTime
@@ -239,6 +268,7 @@ export const useTwinStore = defineStore('twin', () => {
         expectedSnapshotId,
         snapshotReferenceTime
       })
+      if (!isCurrent()) return null
       projection.value = response.snapshot
       attention.value = null
       await Promise.all([
@@ -247,11 +277,13 @@ export const useTwinStore = defineStore('twin', () => {
         loadProjection({ referenceTime: response.referenceTime }),
         loadTimeline(refreshedPageRequest(timelineRequest, response.referenceTime))
       ])
-      return response
+      return isCurrent() ? response : null
     })
   }
 
   async function loadWorkspace() {
+    const generation = ++twinStateGeneration.workspace
+    const isCurrent = () => twinStateGeneration.workspace === generation
     try {
       const [
         review,
@@ -270,6 +302,7 @@ export const useTwinStore = defineStore('twin', () => {
         twinApi.getConstitutionSetup(),
         twinApi.getDecisionMirrorConfig()
       ])
+      if (!isCurrent()) return null
       reviewRecords.value = review
       memoryDigestItems.value = digest
       constitutionItems.value = constitution
@@ -277,8 +310,18 @@ export const useTwinStore = defineStore('twin', () => {
       decisions.value = decisionRows
       loadSetupDraft(setup)
       loadConfigDraft(mirrorConfig)
+      return {
+        review,
+        digest,
+        constitution,
+        gaps,
+        decisionRows,
+        setup,
+        mirrorConfig,
+      }
     } catch (err) {
-      showMessage('error', err.message || 'Failed to load twin workspace')
+      if (isCurrent()) showMessage('error', err.message || 'Failed to load twin workspace')
+      return null
     }
   }
 
@@ -329,12 +372,18 @@ export const useTwinStore = defineStore('twin', () => {
   }
 
   async function reviewMemoryDigestItem(id, action) {
+    const generation = ++twinStateGeneration.digestReview
+    const isCurrent = () => twinStateGeneration.digestReview === generation
     try {
       await twinApi.reviewMemoryDigestItem(id, { action })
+      if (!isCurrent()) return null
       await loadWorkspace()
+      if (!isCurrent()) return null
       showMessage('success', 'Updated digest item', 1800)
+      return true
     } catch (err) {
-      showMessage('error', err.message || 'Failed to update digest item')
+      if (isCurrent()) showMessage('error', err.message || 'Failed to update digest item')
+      return null
     }
   }
 
@@ -529,6 +578,7 @@ export const useTwinStore = defineStore('twin', () => {
     loadTimeline,
     loadMoreTimeline,
     rankAttention,
+    invalidateTwinStateRequests,
     reviewProposal,
     loadWorkspace,
     runTwinInference,

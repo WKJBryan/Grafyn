@@ -2,21 +2,44 @@ import { describe, it, expect, beforeEach, vi } from 'vitest'
 import { mount, flushPromises } from '@vue/test-utils'
 import CanvasView from '@/views/CanvasView.vue'
 
-const { push, loadSessions, loadSession, loadModels, updateSettings, setTheme } = vi.hoisted(() => ({
-  push: vi.fn(),
-  loadSessions: vi.fn().mockResolvedValue(),
-  loadSession: vi.fn().mockResolvedValue(),
-  loadModels: vi.fn().mockResolvedValue(),
-  updateSettings: vi.fn().mockResolvedValue({}),
-  setTheme: vi.fn()
-}))
+const {
+  push,
+  replace,
+  routeState,
+  canvasState,
+  loadModels,
+  updateSettings,
+  setTheme,
+} = vi.hoisted(() => {
+  const loadSessions = vi.fn().mockResolvedValue()
+  const loadSession = vi.fn().mockResolvedValue()
+  const loadModels = vi.fn().mockResolvedValue()
+  return {
+    push: vi.fn(),
+    replace: vi.fn(),
+    routeState: { params: { id: 'session-1' } },
+    canvasState: {
+      sessions: [],
+      currentSession: null,
+      loading: false,
+      loadSessions,
+      loadSession,
+      loadModels,
+      createSession: vi.fn(),
+      deleteSession: vi.fn(),
+      clearSession: vi.fn(),
+    },
+    loadModels,
+    updateSettings: vi.fn().mockResolvedValue({}),
+    setTheme: vi.fn(),
+  }
+})
 
 vi.mock('vue-router', () => ({
-  useRoute: () => ({
-    params: { id: 'session-1' }
-  }),
+  useRoute: () => routeState,
   useRouter: () => ({
-    push
+    push,
+    replace,
   }),
   RouterLink: {
     props: ['to'],
@@ -25,15 +48,7 @@ vi.mock('vue-router', () => ({
 }))
 
 vi.mock('@/stores/canvas', () => ({
-  useCanvasStore: () => ({
-    sessions: [],
-    loading: false,
-    loadSessions,
-    loadSession,
-    loadModels,
-    createSession: vi.fn(),
-    deleteSession: vi.fn()
-  })
+  useCanvasStore: () => canvasState,
 }))
 
 vi.mock('@/stores/theme', () => ({
@@ -59,6 +74,10 @@ vi.mock('@/composables/useGuide', () => ({
 describe('CanvasView', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    routeState.params.id = 'session-1'
+    canvasState.sessions = []
+    canvasState.currentSession = null
+    canvasState.loading = false
   })
 
   it('shows a settings button in the canvas sidebar header', async () => {
@@ -161,5 +180,52 @@ describe('CanvasView', () => {
 
     expect(setTheme).toHaveBeenCalledWith('light')
     expect(updateSettings).toHaveBeenCalledWith({ theme: 'light' })
+  })
+
+  it('hides companion Twin chat sessions from the wide Canvas session list', async () => {
+    canvasState.sessions = [
+      { id: 'session-1', title: 'Ordinary Canvas', tile_count: 1, updated_at: '2026-09-01T00:00:00Z', tags: [] },
+      { id: 'twin-chat', title: 'Private Twin chat', tile_count: 2, updated_at: '2026-09-01T01:00:00Z', tags: ['companion-twin-chat'] },
+    ]
+    const wrapper = mount(CanvasView, {
+      global: {
+        stubs: {
+          RouterLink: { template: '<a><slot /></a>' },
+          CanvasContainer: { template: '<div class="canvas-container-stub" />' },
+          SettingsModal: { template: '<div />' },
+          ConfirmDialog: { template: '<div />' },
+        },
+      },
+    })
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('Ordinary Canvas')
+    expect(wrapper.text()).not.toContain('Private Twin chat')
+  })
+
+  it('clears and rejects a tagged Twin chat deep link in wide Canvas', async () => {
+    routeState.params.id = 'twin-chat'
+    canvasState.currentSession = {
+      id: 'twin-chat',
+      title: 'Private Twin chat',
+      tags: ['companion-twin-chat'],
+      prompt_tiles: [],
+      debates: [],
+    }
+    const wrapper = mount(CanvasView, {
+      global: {
+        stubs: {
+          RouterLink: { template: '<a><slot /></a>' },
+          CanvasContainer: { template: '<div class="canvas-container-stub" />' },
+          SettingsModal: { template: '<div />' },
+          ConfirmDialog: { template: '<div />' },
+        },
+      },
+    })
+    await flushPromises()
+
+    expect(canvasState.clearSession).toHaveBeenCalledOnce()
+    expect(replace).toHaveBeenCalledWith('/canvas')
+    expect(wrapper.find('.canvas-container-stub').exists()).toBe(false)
   })
 })

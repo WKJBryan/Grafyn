@@ -17,14 +17,14 @@ const routes = [
   {
     path: '/canvas',
     name: 'canvas',
-    component: () => import('../views/CanvasView.vue'),
-    meta: { capability: 'spatialCanvas' },
+    component: () => import('../views/ResponsiveCanvasView.vue'),
+    meta: { capability: 'linearCanvas' },
   },
   {
     path: '/canvas/:id',
     name: 'canvas-session',
-    component: () => import('../views/CanvasView.vue'),
-    meta: { capability: 'spatialCanvas' },
+    component: () => import('../views/ResponsiveCanvasView.vue'),
+    meta: { capability: 'linearCanvas' },
   },
   {
     path: '/import',
@@ -35,7 +35,7 @@ const routes = [
   {
     path: '/twin',
     name: 'twin-review',
-    component: () => import('../views/TwinReviewView.vue'),
+    component: () => import('../views/ResponsiveTwinView.vue'),
     meta: { capability: 'twinReview' },
   },
   {
