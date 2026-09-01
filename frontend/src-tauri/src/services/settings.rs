@@ -1,5 +1,6 @@
 //! Settings service for managing user preferences
 
+use crate::models::runtime::RuntimeKind;
 use crate::models::settings::{SettingsStatus, SettingsUpdate, UserSettings};
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
@@ -7,7 +8,9 @@ use std::sync::Arc;
 #[cfg(test)]
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 const KEYRING_SERVICE: &str = "com.grafyn.app";
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 const OPENROUTER_KEY_ACCOUNT: &str = "openrouter_api_key";
 
 const LEGACY_TWIN_ASSIGNMENT_KEY: &str = "twin/legacy-assignment-v1.json";
@@ -209,9 +212,12 @@ fn prepare_twin_data_path_locked_inner(
     }
     if has_legacy {
         #[cfg(not(windows))]
-        anyhow::bail!(
-            "legacy Twin namespace uses a case-folded root hash and is ambiguous on this platform"
-        );
+        {
+            let _ = (marker_install_hook, rename_hook);
+            anyhow::bail!(
+                "legacy Twin namespace uses a case-folded root hash and is ambiguous on this platform"
+            );
+        }
         #[cfg(windows)]
         {
             let prepared = LegacyTwinAssignmentV1 {
@@ -225,8 +231,8 @@ fn prepare_twin_data_path_locked_inner(
             if assignment.is_none() {
                 install_initial_legacy_twin_assignment(&root, &prepared, marker_install_hook)?;
             }
+            rename_twin_namespace_no_replace(&root, &legacy_key, &current_key, rename_hook)?;
         }
-        rename_twin_namespace_no_replace(&root, &legacy_key, &current_key, rename_hook)?;
     }
     if assignment
         .as_ref()
@@ -322,10 +328,11 @@ pub struct SettingsService {
     active_key_version: Option<String>,
     environment_runtime_secret: bool,
     secret_store: Arc<dyn crate::services::sync::secrets::SecretStore>,
+    runtime_kind: RuntimeKind,
 }
 
 impl SettingsService {
-    #[cfg(feature = "mcp")]
+    #[cfg(all(feature = "mcp", not(any(target_os = "android", target_os = "ios"))))]
     pub(crate) fn recover_root_transition_at(data_path: &Path) -> Result<()> {
         let config_dir = dirs::config_dir()
             .or_else(dirs::data_local_dir)
@@ -360,10 +367,12 @@ impl SettingsService {
             secret_store: Arc::new(
                 crate::services::root_transition::MemoryVersionedSecretStore::default(),
             ),
+            runtime_kind: RuntimeKind::Desktop,
         }
     }
 
     /// Create a SettingsService with default settings (used as fallback)
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     pub fn load_defaults() -> Self {
         let config_dir = dirs::config_dir()
             .or_else(|| dirs::data_local_dir())
@@ -386,10 +395,12 @@ impl SettingsService {
             active_key_version: None,
             environment_runtime_secret: false,
             secret_store: Arc::new(crate::services::sync::secrets::KeyringSecretStore),
+            runtime_kind: RuntimeKind::Desktop,
         }
     }
 
     /// Load settings from disk or create defaults
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     pub fn load() -> Result<Self> {
         let config_dir = dirs::config_dir()
             .or_else(|| dirs::data_local_dir())
@@ -416,6 +427,7 @@ impl SettingsService {
         .map_err(anyhow::Error::new)?;
         let startup = transition_store
             .load_startup_settings(
+                crate::services::root_transition::StartupSecretPolicy::AllowLegacy,
                 || {
                     load_openrouter_api_key().map_err(|error| {
                         crate::services::twin_events::MutationError::Io(error.to_string())
@@ -440,6 +452,79 @@ impl SettingsService {
             active_key_version,
             environment_runtime_secret: false,
             secret_store,
+            runtime_kind: RuntimeKind::Desktop,
+        })
+    }
+
+    #[cfg(feature = "tauri-app")]
+    pub(crate) fn load_for_runtime(
+        bootstrap: &crate::app_runtime::RuntimeBootstrap,
+    ) -> Result<Self> {
+        match bootstrap.kind {
+            RuntimeKind::Desktop => {
+                #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                {
+                    Self::load()
+                }
+                #[cfg(any(target_os = "android", target_os = "ios"))]
+                {
+                    anyhow::bail!("desktop runtime is unavailable on this target")
+                }
+            }
+            RuntimeKind::Android => Self::load_android(bootstrap),
+        }
+    }
+
+    #[cfg(feature = "tauri-app")]
+    fn load_android(bootstrap: &crate::app_runtime::RuntimeBootstrap) -> Result<Self> {
+        bootstrap.paths.prepare().map_err(anyhow::Error::msg)?;
+        let config_path = bootstrap.paths.config_dir.join("settings.json");
+        let data_path = bootstrap.paths.data_dir.clone();
+        let vault_path = std::fs::canonicalize(&bootstrap.paths.vault_dir)
+            .context("Failed to canonicalize the app-private vault")?;
+        let secret_store = bootstrap.secret_store.clone();
+        let transition_store = crate::services::root_transition::RootTransitionStore::new(
+            &data_path,
+            &config_path,
+            secret_store.clone(),
+        )
+        .map_err(anyhow::Error::new)?;
+        transition_store
+            .load_startup_settings(
+                crate::services::root_transition::StartupSecretPolicy::RejectPlaintext {
+                    resolve_versioned_secrets: bootstrap.secure_secrets.is_ready(),
+                },
+                || Ok(None),
+                || Ok(()),
+            )
+            .map_err(anyhow::Error::new)?;
+        let snapshot = transition_store
+            .patch_settings_guarded_with_secret_resolution(
+                |fresh| {
+                    fresh.vault_path = Some(vault_path.to_string_lossy().into_owned());
+                    fresh.setup_completed = true;
+                    fresh.mcp_enabled = false;
+                    fresh.twin_llm_provider = "openrouter".to_string();
+                    fresh.ollama_model.clear();
+                    fresh.background_link_discovery_enabled = false;
+                    fresh.background_link_discovery_llm_enabled = false;
+                    fresh.background_vault_optimizer_enabled = false;
+                    fresh.background_vault_optimizer_llm_enabled = false;
+                    Ok(())
+                },
+                bootstrap.secure_secrets.is_ready(),
+            )
+            .map_err(anyhow::Error::new)?;
+
+        Ok(Self {
+            config_path,
+            data_path,
+            settings: snapshot.settings,
+            key_source: snapshot.key_source,
+            active_key_version: snapshot.active_key_version,
+            environment_runtime_secret: false,
+            secret_store,
+            runtime_kind: RuntimeKind::Android,
         })
     }
 
@@ -510,7 +595,8 @@ impl SettingsService {
     }
 
     pub(crate) fn adopt_environment_runtime_secret(&mut self, secret: String) {
-        if self.key_source == crate::services::root_transition::OpenRouterKeySource::Unset
+        if self.runtime_kind == RuntimeKind::Desktop
+            && self.key_source == crate::services::root_transition::OpenRouterKeySource::Unset
             && self.active_key_version.is_none()
             && !secret.is_empty()
         {
@@ -526,7 +612,8 @@ impl SettingsService {
     }
 
     pub(crate) fn allows_environment_fallback(&self) -> bool {
-        self.key_source == crate::services::root_transition::OpenRouterKeySource::Unset
+        self.runtime_kind == RuntimeKind::Desktop
+            && self.key_source == crate::services::root_transition::OpenRouterKeySource::Unset
     }
 
     /// Get the effective vault path
@@ -546,12 +633,48 @@ impl SettingsService {
 
     /// Check if initial setup is needed
     pub fn needs_setup(&self) -> bool {
-        self.settings.needs_setup()
+        self.runtime_kind == RuntimeKind::Desktop && self.settings.needs_setup()
     }
 
     /// Check if MCP sidecar is enabled in settings
     pub fn mcp_enabled(&self) -> bool {
-        self.settings.mcp_enabled
+        self.runtime_kind == RuntimeKind::Desktop && self.settings.mcp_enabled
+    }
+
+    pub(crate) fn runtime_kind(&self) -> RuntimeKind {
+        self.runtime_kind
+    }
+
+    pub(crate) fn validate_update_for_runtime(&self, update: &SettingsUpdate) -> Result<()> {
+        if self.runtime_kind != RuntimeKind::Android {
+            return Ok(());
+        }
+        if update.vault_path.is_some() {
+            anyhow::bail!("Android uses an app-private vault that cannot be changed");
+        }
+        if update
+            .twin_llm_provider
+            .as_deref()
+            .is_some_and(|provider| !provider.trim().eq_ignore_ascii_case("openrouter"))
+        {
+            anyhow::bail!("Android Twin chat requires the OpenRouter provider");
+        }
+        if update.mcp_enabled.is_some()
+            || update.ollama_base_url.is_some()
+            || update.ollama_model.is_some()
+            || update.background_link_discovery_enabled.is_some()
+            || update.background_link_discovery_llm_enabled.is_some()
+            || update.background_vault_optimizer_enabled.is_some()
+            || update.background_vault_optimizer_llm_enabled.is_some()
+            || update.background_vault_optimizer_budget_monthly.is_some()
+            || update.background_vault_optimizer_max_daily_writes.is_some()
+            || update.background_vault_optimizer_edit_mode.is_some()
+            || update.background_vault_optimizer_program_enabled.is_some()
+            || update.vault_optimizer_program_path.is_some()
+        {
+            anyhow::bail!("Desktop-only settings are unavailable on Android");
+        }
+        Ok(())
     }
 }
 
@@ -722,11 +845,13 @@ fn quarantine_corrupt_file(path: &Path) {
     }
 }
 
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn keyring_entry() -> Result<keyring::Entry> {
     keyring::Entry::new(KEYRING_SERVICE, OPENROUTER_KEY_ACCOUNT)
         .context("Failed to initialize OS keychain entry")
 }
 
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn load_openrouter_api_key() -> Result<Option<String>> {
     let entry = keyring_entry()?;
     match entry.get_password() {
@@ -738,6 +863,7 @@ fn load_openrouter_api_key() -> Result<Option<String>> {
     }
 }
 
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn clear_openrouter_api_key() -> Result<()> {
     let entry = keyring_entry()?;
     match entry.delete_password() {

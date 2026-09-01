@@ -1,5 +1,6 @@
 import { createRouter, createWebHistory } from 'vue-router'
-import { getRuntimeProfile } from '@/api/transport'
+import { watch } from 'vue'
+import { getRuntimeProfile, getRuntimeStatus } from '@/api/transport'
 import { hasCapability } from '@/platform/capabilities'
 
 const routes = [
@@ -51,19 +52,25 @@ const routes = [
   },
 ]
 
+function capabilityRouteResult(route, getProfile) {
+  const capability = route.meta.capability
+  if (!capability || hasCapability(getProfile(), capability)) return true
+  return {
+    name: 'capability-unavailable',
+    query: { capability },
+  }
+}
+
 export function createGrafynRouter({
   history = createWebHistory(),
   getProfile = getRuntimeProfile,
 } = {}) {
   const router = createRouter({ history, routes })
 
-  router.beforeEach(to => {
-    const capability = to.meta.capability
-    if (!capability || hasCapability(getProfile(), capability)) return true
-    return {
-      name: 'capability-unavailable',
-      query: { capability },
-    }
+  router.beforeEach(to => capabilityRouteResult(to, getProfile))
+  watch(getRuntimeStatus, () => {
+    const result = capabilityRouteResult(router.currentRoute.value, getProfile)
+    if (result !== true) void router.replace(result)
   })
 
   return router

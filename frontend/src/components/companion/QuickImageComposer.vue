@@ -26,14 +26,6 @@
         role="status"
       >
         <p>Image generation is unavailable in this runtime.</p>
-        <button
-          v-if="isAndroid && !nativeImageShareAvailable"
-          type="button"
-          aria-label="Share generated image unavailable"
-          disabled
-        >
-          Share unavailable
-        </button>
       </div>
 
       <template v-else>
@@ -174,7 +166,7 @@
                 aria-label="Image annotation"
                 maxlength="2048"
                 placeholder="Why this image matters (optional)"
-                :disabled="saving || exporting"
+                :disabled="saving || exporting || sharing"
               >
             </label>
             <div class="option-grid save-options">
@@ -183,7 +175,7 @@
                 <select
                   v-model="retentionPolicy"
                   aria-label="Metadata retention"
-                  :disabled="saving || exporting"
+                  :disabled="saving || exporting || sharing"
                 >
                   <option value="strip_metadata">Strip metadata</option>
                   <option value="retain_original">Retain original</option>
@@ -194,7 +186,7 @@
                 <select
                   v-model="syncPolicy"
                   aria-label="Image sync policy"
-                  :disabled="saving || exporting"
+                  :disabled="saving || exporting || sharing"
                 >
                   <option value="local_only">Local only</option>
                   <option value="inherit">Use vault sync policy</option>
@@ -209,7 +201,7 @@
               class="primary-action"
               type="button"
               aria-label="Save image to Grafyn"
-              :disabled="saving || exporting"
+              :disabled="saving || exporting || sharing"
               @click="saveToGrafyn"
             >
               {{ saving ? 'Saving…' : 'Save to Grafyn' }}
@@ -219,25 +211,26 @@
               class="secondary-action"
               type="button"
               aria-label="Save generated image as a desktop file"
-              :disabled="saving || exporting"
+              :disabled="saving || exporting || sharing"
               @click="saveAsDesktopFile"
             >
               {{ exporting ? 'Opening…' : 'Save As…' }}
             </button>
             <button
-              v-else-if="isAndroid && !nativeImageShareAvailable"
+              v-if="isAndroid && nativeImageShareAvailable && !receiptConsumed"
               class="secondary-action"
               type="button"
-              aria-label="Share generated image unavailable"
-              disabled
+              aria-label="Share generated image"
+              :disabled="saving || exporting || sharing"
+              @click="shareAndroidImage"
             >
-              Share unavailable
+              {{ sharing ? 'Sharing…' : 'Share' }}
             </button>
             <button
               class="quiet-action"
               type="button"
               aria-label="Discard generated preview"
-              :disabled="saving || exporting"
+              :disabled="saving || exporting || sharing"
               @click="showDiscardConfirm = true"
             >
               Discard preview
@@ -259,6 +252,14 @@
             role="status"
           >
             {{ exportStatus }}
+          </p>
+          <p
+            v-if="shareStatus"
+            class="receipt-status"
+            data-test="image-share-status"
+            role="status"
+          >
+            {{ shareStatus }}
           </p>
         </div>
       </template>
@@ -295,12 +296,12 @@ const props = defineProps({
   collapsible: { type: Boolean, default: false },
 })
 
-const emit = defineEmits(['dirty-change'])
+const emit = defineEmits(['dirty-change', 'saved'])
 const runtimeProfile = getRuntimeProfile()
 const isDesktop = runtimeProfile.name === RUNTIME_PROFILES.DESKTOP_WIDE
 const isAndroid = runtimeProfile.name === RUNTIME_PROFILES.ANDROID_COMPACT
-const imageGenerationAvailable = hasCapability(runtimeProfile, 'imageGeneration')
-const nativeImageShareAvailable = hasCapability(runtimeProfile, 'nativeImageShare')
+const imageGenerationAvailable = computed(() => hasCapability(runtimeProfile, 'imageGeneration'))
+const nativeImageShareAvailable = computed(() => hasCapability(runtimeProfile, 'nativeImageShare'))
 const expanded = ref(!props.collapsible)
 const models = ref([])
 const modelCapability = ref(null)
@@ -319,9 +320,11 @@ const capabilityLoading = ref(false)
 const generating = ref(false)
 const saving = ref(false)
 const exporting = ref(false)
+const sharing = ref(false)
 const receiptConsumed = ref(false)
 const saveStatus = ref('')
 const exportStatus = ref('')
+const shareStatus = ref('')
 const showDiscardConfirm = ref(false)
 let active = true
 let capabilityGeneration = 0
@@ -383,7 +386,7 @@ onMounted(() => {
 })
 
 async function loadModelsOnce() {
-  if (!imageGenerationAvailable || discoveryStarted || !active) return
+  if (!imageGenerationAvailable.value || discoveryStarted || !active) return
   discoveryStarted = true
   discoveryLoading.value = true
   try {
@@ -415,10 +418,11 @@ function uniqueValues(values) {
 }
 
 async function generateImage() {
-  if (!canGenerate.value) return
+  if (!imageGenerationAvailable.value || !canGenerate.value) return
   generating.value = true
   error.value = null
   exportStatus.value = ''
+  shareStatus.value = ''
   let generated = null
   try {
     generated = await images.generate({
@@ -442,7 +446,7 @@ async function generateImage() {
 }
 
 async function saveToGrafyn() {
-  if (!preview.value || receiptConsumed.value || saving.value || exporting.value) return
+  if (!preview.value || receiptConsumed.value || saving.value || exporting.value || sharing.value) return
   const submittedSyncPolicy = syncPolicy.value
   saving.value = true
   error.value = null
@@ -456,6 +460,7 @@ async function saveToGrafyn() {
     if (!active) return
     receiptConsumed.value = true
     saveStatus.value = formatAttachmentSyncDisposition(saved?.syncDisposition)
+    emit('saved', saved)
   } catch (caught) {
     if (!active) return
     error.value = toGeneratedImageError(caught)
@@ -466,7 +471,7 @@ async function saveToGrafyn() {
 }
 
 async function saveAsDesktopFile() {
-  if (!isDesktop || !preview.value || receiptConsumed.value || saving.value || exporting.value) return
+  if (!isDesktop || !preview.value || receiptConsumed.value || saving.value || exporting.value || sharing.value) return
   exporting.value = true
   error.value = null
   exportStatus.value = ''
@@ -483,6 +488,45 @@ async function saveAsDesktopFile() {
   } finally {
     if (active) exporting.value = false
   }
+}
+
+async function shareAndroidImage() {
+  if (!isAndroid
+    || !nativeImageShareAvailable.value
+    || !preview.value
+    || receiptConsumed.value
+    || saving.value
+    || exporting.value
+    || sharing.value) return
+
+  const submittedReceiptId = preview.value.receiptId
+  const submittedRetentionPolicy = retentionPolicy.value
+  sharing.value = true
+  error.value = null
+  shareStatus.value = ''
+  try {
+    const result = await images.shareGeneratedImage(
+      submittedReceiptId,
+      submittedRetentionPolicy,
+    )
+    if (result?.shareSheetOpened !== true) {
+      throw new Error('Android share sheet did not open.')
+    }
+    if (active) shareStatus.value = 'Share sheet opened.'
+  } catch (caught) {
+    if (active) error.value = {
+      code: 'SHARE_FAILED',
+      message: shareErrorMessage(caught),
+    }
+  } finally {
+    if (active) sharing.value = false
+  }
+}
+
+function shareErrorMessage(caught) {
+  if (typeof caught === 'string' && caught.trim()) return caught
+  if (typeof caught?.message === 'string' && caught.message.trim()) return caught.message
+  return 'Android image sharing failed.'
 }
 
 function formatAttachmentSyncDisposition(disposition) {
@@ -508,6 +552,7 @@ function lockTerminalReceipt(generatedError) {
 }
 
 function discardPreview() {
+  if (saving.value || exporting.value || sharing.value) return
   const receiptId = preview.value?.receiptId
   showDiscardConfirm.value = false
   revokeGeneratedImageUrl(previewUrl.value)
@@ -516,6 +561,7 @@ function discardPreview() {
   receiptConsumed.value = false
   saveStatus.value = ''
   exportStatus.value = ''
+  shareStatus.value = ''
   annotation.value = ''
   discardBackendReceipt(receiptId)
 }

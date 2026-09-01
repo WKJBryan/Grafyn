@@ -51,7 +51,7 @@
         type="button"
         :aria-current="activeSection === 'chat' ? 'page' : undefined"
         aria-label="Open Twin chat"
-        @click="activeSection = 'chat'"
+        @click="openTwinChat"
       >
         Chat
       </button>
@@ -85,7 +85,7 @@
       :proposals="twinStore.proposals"
       :digest-items="twinStore.memoryDigestItems"
       :attention-trace="refreshing ? null : twinStore.attention?.trace || null"
-      :loading="refreshing || twinStore.twinStateLoading.proposals || twinStore.twinStateLoading.review || twinStore.twinStateLoading.attention || digestReviewing"
+      :loading="!twinReviewAvailable || refreshing || twinStore.twinStateLoading.proposals || twinStore.twinStateLoading.review || twinStore.twinStateLoading.attention || digestReviewing"
       @review-proposal="reviewProposal"
       @review-digest="reviewDigest"
     />
@@ -154,7 +154,7 @@
 </template>
 
 <script setup>
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { getRuntimeProfile } from '@/api/transport'
 import { hasCapability } from '@/platform/capabilities'
 import { useTwinStore } from '@/stores/twin'
@@ -173,11 +173,18 @@ const selectedRelationshipKey = ref('')
 const refreshing = ref(false)
 const digestReviewing = ref(false)
 const localError = ref('')
-const twinChatAvailable = hasCapability(getRuntimeProfile(), 'twinChat')
-const controlsLocked = computed(() => refreshing.value
+const runtimeProfile = getRuntimeProfile()
+const twinReviewAvailable = computed(() => hasCapability(runtimeProfile, 'twinReview'))
+const twinChatAvailable = computed(() => hasCapability(runtimeProfile, 'twinChat'))
+const controlsLocked = computed(() => !twinReviewAvailable.value
+  || refreshing.value
   || digestReviewing.value
   || twinStore.twinStateLoading.review
   || twinStore.twinStateLoading.attention)
+
+watch(twinChatAvailable, available => {
+  if (!available && activeSection.value === 'chat') activeSection.value = 'review'
+})
 
 const relationshipOptions = computed(() => {
   const options = new Map()
@@ -233,8 +240,12 @@ onBeforeUnmount(() => {
   twinStore.invalidateTwinStateRequests()
 })
 
+function openTwinChat() {
+  if (twinChatAvailable.value) activeSection.value = 'chat'
+}
+
 async function refresh() {
-  if (controlsLocked.value) return
+  if (!twinReviewAvailable.value || controlsLocked.value) return
   refreshing.value = true
   localError.value = ''
   twinStore.attention = null
@@ -266,6 +277,7 @@ async function refresh() {
 }
 
 async function reviewProposal({ itemId, decision, reviewedClaim }) {
+  if (!twinReviewAvailable.value) return
   const response = await twinStore.reviewProposal(itemId, decision, reviewedClaim)
   if (!response?.referenceTime) return
   const filter = currentFilter.value
@@ -283,7 +295,7 @@ async function reviewProposal({ itemId, decision, reviewedClaim }) {
 }
 
 async function reviewDigest({ id, action }) {
-  if (digestReviewing.value) return
+  if (!twinReviewAvailable.value || digestReviewing.value) return
   digestReviewing.value = true
   try {
     await twinStore.reviewMemoryDigestItem(id, action)

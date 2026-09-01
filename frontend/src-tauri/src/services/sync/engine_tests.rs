@@ -389,6 +389,59 @@ fn image_observation_drafts(
     vec![note_changed, observation]
 }
 
+fn attachment_artifact_path(harness: &Harness, directory: &str, digest: &Digest32) -> PathBuf {
+    harness
+        ._data
+        .path()
+        .join("sync/vaults/v1")
+        .join(harness.identity.root_scope.as_str())
+        .join("attachments/v1")
+        .join(directory)
+        .join(format!(
+            "{digest}.{}",
+            if directory == "blobs" { "blob" } else { "json" }
+        ))
+}
+
+fn commit_generated_image(
+    harness: &Harness,
+    note_id: &str,
+    local_only: bool,
+) -> (Vec<u8>, Digest32, ImageAttachmentCatalogRecordV1) {
+    let bytes = generated_png();
+    let catalog = harness
+        .engine
+        .store_cataloged_image_expecting_scope(
+            &harness.identity.root_scope,
+            &bytes,
+            Some("image/png"),
+        )
+        .unwrap();
+    let digest = catalog.attachment_digest().unwrap();
+    let content_digest = ContentDigest::parse(digest.to_string()).unwrap();
+    let _ = harness
+        .coordinator
+        .commit_local(
+            if local_only {
+                CausalStream::LocalOnly
+            } else {
+                CausalStream::SyncEligible
+            },
+            SourceChannel::parse("image_generation").unwrap(),
+            vec![TargetMutation::put(
+                TargetKind::Markdown,
+                format!("{note_id}.md"),
+                format!(
+                    "---\nnote_id: {note_id}\ngrafyn_sync: {}\n---\nimage",
+                    if local_only { "local_only" } else { "inherit" }
+                ),
+            )],
+            image_observation_drafts(note_id, &content_digest, local_only),
+        )
+        .unwrap();
+    (bytes, digest, catalog)
+}
+
 #[test]
 fn governed_image_attachment_joins_the_note_event_mutation_batch() {
     let harness = Harness::new(None);
@@ -740,7 +793,7 @@ fn generated_image_observation_requires_its_matching_note_changed_event() {
 }
 
 #[test]
-fn generated_image_event_before_chunks_reconstructs_catalog_after_reopen() {
+fn generated_image_event_before_chunks_fails_closed_then_reconstructs_after_reopen() {
     let first = Harness::new(None);
     let descriptor = first.descriptor_bytes();
     let second = Harness::new(Some(&descriptor));
@@ -773,10 +826,11 @@ fn generated_image_event_before_chunks_reconstructs_catalog_after_reopen() {
     assert_eq!(canonical.len(), 3);
     assert_eq!(attachments.len(), 2);
 
-    second
+    let error = second
         .engine
         .receive_envelopes(&second.coordinator, &canonical)
-        .unwrap();
+        .unwrap_err();
+    assert!(matches!(error, MutationError::RecoveryConflict(_)));
     assert_eq!(
         second.engine.materialized_attachment(&digest).unwrap(),
         None
@@ -874,6 +928,122 @@ fn generated_image_chunks_before_event_stay_generic_across_reopen_then_catalog()
             .unwrap(),
         Some(catalog)
     );
+}
+
+#[test]
+fn generated_image_catalog_repairs_only_from_complete_applied_manifest_and_blob() {
+    let harness = Harness::new(None);
+    let (bytes, digest, catalog) =
+        commit_generated_image(&harness, "repair-generated-image", false);
+    let catalog_path = attachment_artifact_path(&harness, "catalog", &digest);
+    std::fs::remove_file(&catalog_path).unwrap();
+
+    harness
+        .engine
+        .recover_pending_inbox(&harness.coordinator)
+        .unwrap();
+
+    assert!(catalog_path.is_file());
+    assert_eq!(
+        harness
+            .engine
+            .cataloged_image_expecting_scope(&harness.identity.root_scope, &digest)
+            .unwrap(),
+        Some(catalog)
+    );
+    assert_eq!(
+        harness.engine.materialized_attachment(&digest).unwrap(),
+        Some(bytes)
+    );
+}
+
+#[test]
+fn local_only_generated_image_missing_catalog_fails_recovery_closed() {
+    let harness = Harness::new(None);
+    let (_, digest, _) = commit_generated_image(&harness, "local-missing-catalog", true);
+    std::fs::remove_file(attachment_artifact_path(&harness, "catalog", &digest)).unwrap();
+
+    let error = harness
+        .engine
+        .recover_pending_inbox(&harness.coordinator)
+        .unwrap_err();
+
+    assert!(matches!(error, MutationError::RecoveryConflict(_)));
+}
+
+#[test]
+fn generated_image_missing_or_corrupt_blob_fails_recovery_closed() {
+    for corrupt in [false, true] {
+        let harness = Harness::new(None);
+        let (_, digest, _) = commit_generated_image(
+            &harness,
+            if corrupt {
+                "corrupt-generated-image-blob"
+            } else {
+                "missing-generated-image-blob"
+            },
+            false,
+        );
+        let blob_path = attachment_artifact_path(&harness, "blobs", &digest);
+        if corrupt {
+            std::fs::write(blob_path, b"corrupt blob bytes").unwrap();
+        } else {
+            std::fs::remove_file(blob_path).unwrap();
+        }
+
+        let error = harness
+            .engine
+            .recover_pending_inbox(&harness.coordinator)
+            .unwrap_err();
+        assert!(matches!(error, MutationError::RecoveryConflict(_)));
+    }
+}
+
+#[test]
+fn unreferenced_incomplete_remote_attachment_remains_nonfatal() {
+    let first = Harness::new(None);
+    let descriptor = first.descriptor_bytes();
+    let second = Harness::new(Some(&descriptor));
+    trust_each_other(&first, &second);
+    let (_, digest, _) = commit_generated_image(&first, "unreferenced-incomplete", false);
+    let (_, attachments) = split_generated_image_batch(&first);
+    let manifest = {
+        let state = first.engine.state.lock().unwrap();
+        attachments
+            .into_iter()
+            .find(|bytes| {
+                let envelope = EnvelopeV1::from_json_bytes(bytes).unwrap();
+                matches!(
+                    verify_envelope(&state, state.root_key.as_ref().unwrap(), &envelope)
+                        .unwrap()
+                        .operation()
+                        .payload(),
+                    OperationPayloadV1::AttachmentManifest(_)
+                )
+            })
+            .unwrap()
+    };
+
+    second
+        .engine
+        .receive_envelopes(&second.coordinator, &[manifest])
+        .unwrap();
+    assert_eq!(
+        second.engine.materialized_attachment(&digest).unwrap(),
+        None
+    );
+    assert_eq!(
+        second
+            .engine
+            .cataloged_image_expecting_scope(&second.identity.root_scope, &digest)
+            .unwrap(),
+        None
+    );
+    let (reopened, reopened_coordinator) = second.open_peer();
+    reopened
+        .recover_pending_inbox(&reopened_coordinator)
+        .unwrap();
+    assert_eq!(reopened.materialized_attachment(&digest).unwrap(), None);
 }
 
 #[test]
@@ -1997,13 +2167,23 @@ fn provenance_qualified_non_raster_is_rejected_without_catalog_or_recovery_wedge
         &events[1],
         vec![*note_event.operation_id()],
     );
-    assert_eq!(harness.receive(&[note_event, observation_event]).applied, 2);
+    let error = harness
+        .engine
+        .receive_envelopes(
+            &harness.coordinator,
+            &[
+                note_event.to_json().unwrap().into_bytes(),
+                observation_event.to_json().unwrap().into_bytes(),
+            ],
+        )
+        .unwrap_err();
+    assert!(matches!(error, MutationError::RecoveryConflict(_)));
 
     let manifest = AttachmentManifestV1::new(digest, "image/png", bytes.len()).unwrap();
     let manifest_operation = OperationV1::new(
         1_800_000_000_014,
         vec![],
-        OperationPayloadV1::AttachmentManifest(manifest),
+        OperationPayloadV1::AttachmentManifest(manifest.clone()),
     )
     .unwrap();
     let signing_key = DeviceSigningKey::from_seed(seed);
@@ -2060,14 +2240,50 @@ fn provenance_qualified_non_raster_is_rejected_without_catalog_or_recovery_wedge
         .clone();
     assert!(rejected.contains(&manifest_id.to_string()));
     assert!(rejected.contains(&chunk_id.to_string()));
+    {
+        let mut state = harness.engine.state.lock().unwrap();
+        assert!(applied_manifest_has_complete_chunks(
+            &state,
+            manifest_id,
+            &manifest,
+            true,
+        ));
+        state.applied.remove(&chunk_id);
+        assert!(!applied_manifest_has_complete_chunks(
+            &state,
+            manifest_id,
+            &manifest,
+            true,
+        ));
+        state.applied.insert(chunk_id);
+    }
 
-    let (reopened, _) = harness.open_peer();
+    let (reopened, reopened_coordinator) = harness.open_peer();
+    reopened
+        .recover_pending_inbox(&reopened_coordinator)
+        .unwrap();
     assert_eq!(
         reopened
             .cataloged_image_expecting_scope(&harness.identity.root_scope, &digest)
             .unwrap(),
         None
     );
+    let blob_path = attachment_artifact_path(&harness, "blobs", &digest);
+    let valid_blob = fs::read(&blob_path).unwrap();
+    fs::remove_file(&blob_path).unwrap();
+    assert!(matches!(
+        reopened.recover_pending_inbox(&reopened_coordinator),
+        Err(MutationError::RecoveryConflict(_))
+    ));
+    fs::write(&blob_path, b"corrupt quarantined blob").unwrap();
+    assert!(matches!(
+        reopened.recover_pending_inbox(&reopened_coordinator),
+        Err(MutationError::RecoveryConflict(_))
+    ));
+    fs::write(blob_path, valid_blob).unwrap();
+    reopened
+        .recover_pending_inbox(&reopened_coordinator)
+        .unwrap();
 }
 
 #[test]

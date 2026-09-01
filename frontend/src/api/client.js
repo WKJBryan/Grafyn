@@ -2,6 +2,11 @@ import { getRuntimeProfile, getTransport } from './transport'
 
 const invoke = (...args) => getTransport().invoke(...args)
 
+// Typed runtime health is installed before router mount and never includes secrets or paths.
+export const runtime = {
+  getStatus: () => invoke('get_runtime_status', {}),
+}
+
 // App boot API
 export const boot = {
   status: () => invoke('get_boot_status', {}),
@@ -106,6 +111,9 @@ export const images = {
 
   saveAs: (receiptId, retentionPolicy) =>
     invoke('export_generated_image', { request: { receiptId, retentionPolicy } }),
+
+  shareGeneratedImage: (receiptId, retentionPolicy) =>
+    invoke('share_generated_image', { request: { receiptId, retentionPolicy } }),
 
   load: (attachmentDigest) =>
     invoke('load_generated_image', { request: { attachmentDigest } }),

@@ -494,6 +494,12 @@ pub enum MutationFaultPoint {
 }
 
 pub trait MutationLifecycle: Send + Sync {
+    fn applied_twin_event_ids(
+        &self,
+    ) -> Result<Option<std::collections::BTreeSet<EventId>>, MutationError> {
+        Ok(None)
+    }
+
     fn stage_before_local(
         &self,
         _intent: &crate::services::twin_events::MutationIntentV1,
@@ -1071,6 +1077,11 @@ impl MutationCoordinator {
                 MutationError::Invalid("Markdown root lease lock poisoned".into())
             })? = stable_lease;
         }
+        let applied_event_ids = coordinator.lifecycle.applied_twin_event_ids()?;
+        coordinator
+            .store
+            .adopt_or_validate_integrity(applied_event_ids.as_ref())
+            .map_err(MutationError::Store)?;
         #[cfg(test)]
         crate::services::vault_namespace::publish_ready_locked(
             &coordinator.data_path,
@@ -1187,6 +1198,10 @@ impl MutationCoordinator {
                 process_lock.unlock()?;
                 return Err(error);
             }
+        }
+        if let Err(error) = self.validate_event_integrity() {
+            process_lock.unlock()?;
+            return Err(error);
         }
         let Some(plan) = (match planner() {
             Ok(plan) => plan,
@@ -1694,8 +1709,19 @@ impl MutationCoordinator {
             }
             recovered += 1;
         }
+        if let Err(error) = self.validate_event_integrity() {
+            process_lock.unlock()?;
+            return Err(error);
+        }
         process_lock.unlock()?;
         Ok(recovered)
+    }
+
+    fn validate_event_integrity(&self) -> Result<(), MutationError> {
+        let applied_event_ids = self.lifecycle.applied_twin_event_ids()?;
+        self.store
+            .validate_integrity(applied_event_ids.as_ref())
+            .map_err(MutationError::Store)
     }
 
     pub fn pending_count(&self) -> Result<usize, MutationError> {
@@ -2074,11 +2100,17 @@ impl MutationRootTransitionGuard<'_> {
         &self,
         lease: &ActiveMarkdownRootLeaseV1,
     ) -> Result<PathBuf, MutationError> {
-        crate::services::vault_namespace::initialize_locked(
+        let namespace = crate::services::vault_namespace::initialize_locked(
             &self.coordinator.data_path,
             lease,
             &self._process_lock,
-        )
+        )?;
+        let applied_event_ids = self.coordinator.lifecycle.applied_twin_event_ids()?;
+        self.coordinator
+            .store
+            .adopt_or_validate_integrity(applied_event_ids.as_ref())
+            .map_err(MutationError::Store)?;
+        Ok(namespace)
     }
 
     pub(crate) fn prepare_twin_data_path(

@@ -653,6 +653,7 @@ impl MutationCoordinator {
                 self.inject(MutationFaultPoint::AfterEvent(index))?;
             }
         }
+        self.store.advance_integrity_heads(&intent.events)?;
         if intent.retain_commit_receipt {
             let lease = self
                 .root_lease

@@ -1,23 +1,29 @@
 use super::engine::SyncEngine;
-use super::identity::{
-    load_or_create_vault_identity, load_vault_identity, VaultIdentity, VAULT_DESCRIPTOR_KEY,
-};
+#[cfg(feature = "tauri-app")]
+use super::identity::load_vault_identity;
+use super::identity::{load_or_create_vault_identity, VaultIdentity, VAULT_DESCRIPTOR_KEY};
 use super::secrets::MemorySecretStore;
 use super::vault_keys::provision_vault_root_key;
+#[cfg(feature = "tauri-app")]
 use crate::models::image_generation::{GeneratedImageSyncPolicy, ImageMetadataRetentionPolicy};
+#[cfg(feature = "tauri-app")]
+use crate::models::twin_event::ContentDigest;
 use crate::models::twin_event::{
-    CausalStream, ContentDigest, EvidenceRef, EvidenceType, Governance, NoteChangeKind,
-    NoteChanged, SourceChannel, TwinEventPayload,
+    CausalStream, EvidenceRef, EvidenceType, Governance, NoteChangeKind, NoteChanged,
+    SourceChannel, TwinEventPayload,
 };
 use crate::services::knowledge_store::KnowledgeStore;
 use crate::services::twin_events::{
     test_support, MutationCoordinator, TargetKind, TargetMutation, TwinEventDraft, TwinEventStore,
 };
 use chrono::{TimeZone, Utc};
+#[cfg(feature = "tauri-app")]
+use grafyn_sync_protocol::Digest32;
 use grafyn_sync_protocol::{
-    open_operation, seal_operation, DeviceId, DeviceSigningKey, Digest32, NoteRevisionV1,
-    OperationPayloadV1, OperationV1, TrustedDevice, VaultRootKey,
+    open_operation, seal_operation, DeviceId, DeviceSigningKey, NoteRevisionV1, OperationPayloadV1,
+    OperationV1, TrustedDevice, VaultRootKey,
 };
+#[cfg(feature = "tauri-app")]
 use std::io::Cursor;
 use std::path::Path;
 use std::sync::Arc;
@@ -271,6 +277,7 @@ impl ExistingVault {
     }
 }
 
+#[cfg(feature = "tauri-app")]
 struct UnprovisionedImageVault {
     _data_root: tempfile::TempDir,
     _vault_root: tempfile::TempDir,
@@ -283,6 +290,7 @@ struct UnprovisionedImageVault {
     knowledge: KnowledgeStore,
 }
 
+#[cfg(feature = "tauri-app")]
 impl UnprovisionedImageVault {
     fn new() -> Self {
         let data_root = tempfile::tempdir().unwrap();
@@ -421,6 +429,7 @@ impl UnprovisionedImageVault {
     }
 }
 
+#[cfg(feature = "tauri-app")]
 #[test]
 fn unprovisioned_inherited_generated_image_bootstrap_reconstructs_catalog_on_peer() {
     let mut source = UnprovisionedImageVault::new();
@@ -500,6 +509,7 @@ fn unprovisioned_inherited_generated_image_bootstrap_reconstructs_catalog_on_pee
     assert_eq!(peer_engine.status().unwrap().outbox_operations, 0);
 }
 
+#[cfg(feature = "tauri-app")]
 #[test]
 fn mixed_generated_image_bootstrap_includes_only_inherited_attachment() {
     let mut source = UnprovisionedImageVault::new();
@@ -541,6 +551,7 @@ fn mixed_generated_image_bootstrap_includes_only_inherited_attachment() {
         .is_some());
 }
 
+#[cfg(feature = "tauri-app")]
 #[test]
 fn bootstrap_rejects_missing_generated_image_catalog_before_witness_install() {
     let mut source = UnprovisionedImageVault::new();
@@ -558,6 +569,7 @@ fn bootstrap_rejects_missing_generated_image_catalog_before_witness_install() {
     assert!(!source.prepared_path().exists());
 }
 
+#[cfg(feature = "tauri-app")]
 #[test]
 fn bootstrap_rejects_corrupt_generated_image_catalog_before_witness_install() {
     let mut source = UnprovisionedImageVault::new();
@@ -575,6 +587,7 @@ fn bootstrap_rejects_corrupt_generated_image_catalog_before_witness_install() {
     assert!(!source.prepared_path().exists());
 }
 
+#[cfg(feature = "tauri-app")]
 #[test]
 fn finish_rejects_incomplete_generated_image_attachment_witness() {
     let mut source = UnprovisionedImageVault::new();

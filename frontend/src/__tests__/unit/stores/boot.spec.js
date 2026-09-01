@@ -2,6 +2,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createPinia, setActivePinia } from 'pinia'
 import { useBootStore } from '@/stores/boot'
 import * as apiClient from '@/api/client'
+import { getRuntimeStatus, resetTransport, setRuntimeStatus } from '@/api/transport'
+import { CAPABILITY_NAMES, normalizeRuntimeStatus } from '@/platform/capabilities'
 
 const { listenMock, unlistenMock } = vi.hoisted(() => ({
   listenMock: vi.fn(),
@@ -15,10 +17,54 @@ vi.mock('@tauri-apps/api/event', () => ({
 describe('Boot Store', () => {
   beforeEach(() => {
     setActivePinia(createPinia())
+    resetTransport()
     vi.clearAllMocks()
     vi.useFakeTimers()
     vi.setSystemTime(new Date('2026-03-31T00:00:00Z'))
     listenMock.mockResolvedValue(unlistenMock)
+  })
+
+  it('refreshes authoritative runtime health before exposing a terminal boot failure', async () => {
+    const healthyStatus = desktopRuntimeStatus(true)
+    const revokedStatus = desktopRuntimeStatus(false)
+    let resolveRuntimeStatus
+    setRuntimeStatus(healthyStatus)
+    vi.spyOn(apiClient.boot, 'status').mockResolvedValue({
+      phase: 'building_graph',
+      message: 'Building graph',
+      ready: false,
+      error: null,
+    })
+    const runtimeStatusSpy = vi.spyOn(apiClient.runtime, 'getStatus').mockImplementation(() => (
+      new Promise(resolve => {
+        resolveRuntimeStatus = resolve
+      })
+    ))
+
+    const store = useBootStore()
+    await store.initialize()
+    const handler = listenMock.mock.calls[0][1]
+    handler({
+      payload: {
+        phase: 'failed',
+        message: 'Startup failed',
+        ready: false,
+        error: 'canonical runtime unavailable',
+      },
+    })
+    await Promise.resolve()
+
+    expect(runtimeStatusSpy).toHaveBeenCalledOnce()
+    expect(getRuntimeStatus()).toBeNull()
+    expect(store.failed).toBe(false)
+
+    resolveRuntimeStatus(revokedStatus)
+    await vi.waitFor(() => expect(store.failed).toBe(true))
+
+    expect(getRuntimeStatus()).toEqual(revokedStatus)
+    store.dismissSplash()
+    expect(store.isVisible).toBe(false)
+    store.cleanup()
   })
 
   afterEach(() => {
@@ -166,3 +212,28 @@ describe('Boot Store', () => {
     expect(unlistenMock).toHaveBeenCalledTimes(1)
   })
 })
+
+function desktopRuntimeStatus(available) {
+  const health = available
+    ? { status: 'ready', code: null, message: null }
+    : {
+        status: 'unavailable',
+        code: 'canonical_runtime_unavailable',
+        message: 'The canonical local runtime is unavailable.',
+      }
+  return normalizeRuntimeStatus({
+    schemaVersion: 1,
+    runtime: 'desktop',
+    capabilities: Object.fromEntries(CAPABILITY_NAMES.map(name => [name, available])),
+    vault: { kind: 'user_selected', available },
+    secureSecrets: health,
+    nativeImageShare: available
+      ? {
+          status: 'unavailable',
+          code: 'desktop_save_as',
+          message: 'Desktop exports use the governed Save As boundary.',
+        }
+      : health,
+    diagnostics: [],
+  })
+}

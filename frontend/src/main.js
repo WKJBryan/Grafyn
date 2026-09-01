@@ -2,8 +2,9 @@ import { createApp } from 'vue'
 import { createPinia } from 'pinia'
 import App from './App.vue'
 import router from './router'
-import { settings } from './api/client'
-import { getRuntimeProfile, getTransport } from './api/transport'
+import { runtime, settings } from './api/client'
+import { getRuntimeProfile, getTransport, setRuntimeStatus } from './api/transport'
+import { normalizeRuntimeStatus } from './platform/capabilities'
 import { resolveThemePreference, useThemeStore } from './stores/theme'
 import './style.css'
 
@@ -42,7 +43,18 @@ async function syncThemeFromSettings() {
   }
 }
 
+async function syncRuntimeStatus() {
+  if (!getRuntimeProfile().isTauri) return
+
+  try {
+    setRuntimeStatus(normalizeRuntimeStatus(await runtime.getStatus()))
+  } catch (error) {
+    console.error('Failed to load runtime capability status:', error)
+  }
+}
+
 async function bootstrap() {
+  await syncRuntimeStatus()
   await syncThemeFromSettings()
 
   const app = createApp(App)

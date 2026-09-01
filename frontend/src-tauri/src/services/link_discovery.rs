@@ -483,11 +483,7 @@ impl LinkDiscoveryService {
         links: Vec<ZettelLinkCandidate>,
         exploratory_links: Vec<ZettelLinkCandidate>,
     ) -> Option<DiscoverLinksResponse> {
-        match self.store_discovery_result_checked(
-            note_id,
-            links,
-            exploratory_links,
-        ) {
+        match self.store_discovery_result_checked(note_id, links, exploratory_links) {
             Ok(response) => response,
             Err(error) => {
                 log::error!("Failed to persist discovery result for '{note_id}': {error}");
@@ -880,7 +876,9 @@ impl LinkDiscoveryService {
                     let contents = std::fs::read_to_string(&path)
                         .with_context(|| format!("Failed to read {}", path.display()))?;
                     let record = serde_json::from_str::<StoredDiscoveryNote>(&contents)
-                        .with_context(|| format!("Invalid link discovery record {}", path.display()))?;
+                        .with_context(|| {
+                            format!("Invalid link discovery record {}", path.display())
+                        })?;
                     let note_id = record.profile.note_id.clone();
                     self.profiles
                         .insert(note_id.clone(), record.profile.clone());
@@ -893,9 +891,10 @@ impl LinkDiscoveryService {
 
         match std::fs::read_to_string(&self.queue_path) {
             Ok(contents) => {
-                let state = serde_json::from_str::<PersistedQueueState>(&contents).with_context(
-                    || format!("Invalid link discovery queue {}", self.queue_path.display()),
-                )?;
+                let state =
+                    serde_json::from_str::<PersistedQueueState>(&contents).with_context(|| {
+                        format!("Invalid link discovery queue {}", self.queue_path.display())
+                    })?;
                 if state.schema_version > LINK_STATE_SCHEMA_VERSION {
                     anyhow::bail!(
                         "unsupported link discovery state schema {}",
@@ -1411,7 +1410,8 @@ pub(crate) async fn discover_for_note_at_epoch(
         .as_ref()
         .ok_or_else(|| "mutation coordinator is unavailable".to_string())?;
     let (cached, snapshot, all_profiles, initial_link_revision) = {
-        let mut discovery = state.link_discovery.write().await;
+        let service = state.link_discovery_service()?;
+        let mut discovery = service.write().await;
         coordinator
             .with_locked_derived_state(&root_epoch, true, || {
                 discovery.reload_from_disk_checked().map_err(|error| {
@@ -1582,16 +1582,19 @@ pub(crate) async fn discover_for_note_at_epoch(
     let publish_ticket =
         crate::commands::acquire_expected_derived_root_epoch(state, &root_epoch).await?;
     let stored = {
-        let mut discovery = state.link_discovery.write().await;
+        let service = state.link_discovery_service()?;
+        let mut discovery = service.write().await;
         coordinator
             .with_locked_derived_state(&root_epoch, true, || {
                 discovery.reload_from_disk_checked().map_err(|error| {
                     crate::services::twin_events::MutationError::Invalid(error.to_string())
                 })?;
                 if discovery.state_revision() != initial_link_revision {
-                    return Err(crate::services::twin_events::MutationError::RecoveryConflict(
-                        "link discovery state changed while ranking was in flight".into(),
-                    ));
+                    return Err(
+                        crate::services::twin_events::MutationError::RecoveryConflict(
+                            "link discovery state changed while ranking was in flight".into(),
+                        ),
+                    );
                 }
                 discovery
                     .store_discovery_result_checked(
@@ -2047,9 +2050,8 @@ mod tests {
         let vault = temp.path().join("vault");
         std::fs::create_dir(&data).unwrap();
         std::fs::create_dir(&vault).unwrap();
-        let event_store = std::sync::Arc::new(
-            crate::services::twin_events::TwinEventStore::new(&data),
-        );
+        let event_store =
+            std::sync::Arc::new(crate::services::twin_events::TwinEventStore::new(&data));
         event_store.initialize().unwrap();
         let coordinator = crate::services::twin_events::MutationCoordinator::new(
             &data,
@@ -2059,10 +2061,7 @@ mod tests {
         )
         .unwrap();
         let token = coordinator.current_authority_token().unwrap();
-        let scoped = crate::services::vault_namespace::scoped_data_path(
-            &data,
-            &token.root_scope,
-        );
+        let scoped = crate::services::vault_namespace::scoped_data_path(&data, &token.root_scope);
         let mut first = LinkDiscoveryService::new(scoped.clone());
         let mut peer = LinkDiscoveryService::new(scoped);
         let notes = [

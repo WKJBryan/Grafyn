@@ -1378,24 +1378,31 @@ impl SyncEngine {
             Err(crate::services::twin_events::StoreError::NotInitialized) => return Ok(()),
             Err(error) => return Err(error.into()),
         };
-        let digests = generated_image_attachment_digests_defer_incomplete(&events, true)?;
+        let digests = generated_image_attachment_digests(&events, false).map_err(|error| {
+            MutationError::RecoveryConflict(format!(
+                "canonical generated-image attachment binding is invalid: {error}"
+            ))
+        })?;
         if digests.is_empty() {
             return Ok(());
         }
         let (mut state, _engine_lock) = self.lock_fresh_state()?;
         for digest in digests {
-            if state.attachment_store.cataloged_image(&digest)?.is_some() {
-                continue;
+            match state.attachment_store.cataloged_image(&digest) {
+                Ok(Some(_)) => continue,
+                Ok(None) => {}
+                Err(error) => {
+                    return Err(MutationError::RecoveryConflict(format!(
+                        "canonical generated-image attachment is corrupt: {error}"
+                    )))
+                }
             }
-            let mut matching_manifest = None::<AttachmentManifestV1>;
+            let mut matching_manifests = Vec::<(OperationId, AttachmentManifestV1, bool)>::new();
             for operation_id in &state.applied {
-                if state
+                let rejected = state
                     .ledger
                     .rejected_operations
-                    .contains(&operation_id.to_string())
-                {
-                    continue;
-                }
+                    .contains(&operation_id.to_string());
                 let Some(verified) = state.operations.get(operation_id) else {
                     return Err(MutationError::RecoveryConflict(
                         "applied attachment operation disappeared".into(),
@@ -1409,7 +1416,7 @@ impl SyncEngine {
                 if manifest.attachment_digest() != &digest {
                     continue;
                 }
-                if let Some(existing) = matching_manifest.as_ref() {
+                if let Some((_, existing, _)) = matching_manifests.first() {
                     if existing.media_type() != manifest.media_type()
                         || existing.decoded_size() != manifest.decoded_size()
                         || existing.chunk_count() != manifest.chunk_count()
@@ -1418,15 +1425,38 @@ impl SyncEngine {
                             "generated image attachment has conflicting manifests".into(),
                         ));
                     }
-                } else {
-                    matching_manifest = Some(manifest.clone());
                 }
+                matching_manifests.push((*operation_id, manifest.clone(), rejected));
             }
-            let Some(manifest) = matching_manifest else {
-                continue;
+            let Some((manifest_operation_id, manifest, _)) = matching_manifests.into_iter().find(
+                |(manifest_operation_id, manifest, rejected)| {
+                    applied_manifest_has_complete_chunks(
+                        &state,
+                        *manifest_operation_id,
+                        manifest,
+                        *rejected,
+                    )
+                },
+            ) else {
+                return Err(MutationError::RecoveryConflict(format!(
+                    "canonical generated-image attachment {} has no complete applied manifest",
+                    digest
+                )));
             };
-            let Some(bytes) = state.attachment_store.materialized_bytes(&digest)? else {
-                continue;
+            let Some(bytes) =
+                state
+                    .attachment_store
+                    .materialized_bytes(&digest)
+                    .map_err(|error| {
+                        MutationError::RecoveryConflict(format!(
+                            "canonical generated-image attachment blob is invalid: {error}"
+                        ))
+                    })?
+            else {
+                return Err(MutationError::RecoveryConflict(format!(
+                    "canonical generated-image attachment {} is missing its materialized blob",
+                    digest
+                )));
             };
             match state
                 .attachment_store
@@ -1439,8 +1469,28 @@ impl SyncEngine {
                         &mut state,
                         &digest,
                     )?;
+                    continue;
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    return Err(MutationError::RecoveryConflict(format!(
+                        "canonical generated-image attachment {} could not be cataloged from manifest {}: {error}",
+                        digest, manifest_operation_id
+                    )))
+                }
+            }
+            if state
+                .attachment_store
+                .cataloged_image(&digest)
+                .map_err(|error| {
+                    MutationError::RecoveryConflict(format!(
+                        "repaired generated-image catalog is invalid: {error}"
+                    ))
+                })?
+                .is_none()
+            {
+                return Err(MutationError::RecoveryConflict(
+                    "repaired generated-image catalog did not become durable".into(),
+                ));
             }
         }
         Ok(())
@@ -1560,7 +1610,62 @@ impl SyncEngine {
     }
 }
 
+fn applied_manifest_has_complete_chunks(
+    state: &EngineState,
+    manifest_operation_id: OperationId,
+    manifest: &AttachmentManifestV1,
+    rejected: bool,
+) -> bool {
+    if state
+        .ledger
+        .rejected_operations
+        .contains(&manifest_operation_id.to_string())
+        != rejected
+    {
+        return false;
+    }
+    let mut indices = BTreeSet::new();
+    for operation_id in &state.applied {
+        let Some(verified) = state.operations.get(operation_id) else {
+            return false;
+        };
+        let OperationPayloadV1::AttachmentChunk(chunk) = verified.operation().payload() else {
+            continue;
+        };
+        if chunk.manifest_operation_id() != &manifest_operation_id {
+            continue;
+        }
+        if state
+            .ledger
+            .rejected_operations
+            .contains(&operation_id.to_string())
+            != rejected
+            || verified.operation().causal_parents() != [manifest_operation_id]
+            || chunk.attachment_digest() != manifest.attachment_digest()
+            || chunk.chunk_count() != manifest.chunk_count()
+            || !indices.insert(chunk.chunk_index())
+        {
+            return false;
+        }
+    }
+    indices.len() == manifest.chunk_count() as usize
+        && indices.iter().copied().eq(0..manifest.chunk_count())
+}
+
 impl MutationLifecycle for SyncEngine {
+    fn applied_twin_event_ids(&self) -> Result<Option<BTreeSet<EventId>>, MutationError> {
+        let (state, _engine_lock) = self.lock_fresh_state()?;
+        if state.root_key.is_none() {
+            return Ok(None);
+        }
+        state
+            .event_operations
+            .keys()
+            .map(|event_id| EventId::parse(event_id.clone()).map_err(MutationError::Invalid))
+            .collect::<Result<BTreeSet<_>, _>>()
+            .map(Some)
+    }
+
     fn stage_before_local(&self, intent: &MutationIntentV1) -> Result<(), MutationError> {
         self.stage_local_intent(intent)
     }

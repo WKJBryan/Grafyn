@@ -1,8 +1,14 @@
 <template>
   <main class="companion-view capture-view">
     <QuickCaptureCard
-      @captured="loadRecentCaptures"
+      :attachment-digests="pendingAttachmentDigests"
+      @captured="handleCaptured"
       @capture-uncertain="loadRecentCaptures"
+    />
+
+    <QuickImageComposer
+      collapsible
+      @saved="handleImageSaved"
     />
 
     <section
@@ -44,14 +50,38 @@
 </template>
 
 <script setup>
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { notes } from '@/api/client'
 import QuickCaptureCard from '@/components/companion/QuickCaptureCard.vue'
+import QuickImageComposer from '@/components/companion/QuickImageComposer.vue'
+
+const CONTENT_DIGEST_PATTERN = /^[0-9a-f]{64}$/
 
 const recentCaptures = ref([])
+const pendingAttachmentDigest = ref('')
+const pendingAttachmentDigests = computed(() => (
+  pendingAttachmentDigest.value ? [pendingAttachmentDigest.value] : []
+))
 const loading = ref(false)
 const error = ref('')
 let loadGeneration = 0
+
+function handleImageSaved(response) {
+  const digest = response?.attachmentDigest
+  if (typeof digest === 'string' && CONTENT_DIGEST_PATTERN.test(digest)) {
+    pendingAttachmentDigest.value = digest
+  }
+}
+
+function handleCaptured(response) {
+  const capturedDigests = response?.note?.properties?.attachment_digests
+  if (pendingAttachmentDigest.value
+    && Array.isArray(capturedDigests)
+    && capturedDigests.includes(pendingAttachmentDigest.value)) {
+    pendingAttachmentDigest.value = ''
+  }
+  void loadRecentCaptures()
+}
 
 function formatDate(value) {
   if (!value) return ''

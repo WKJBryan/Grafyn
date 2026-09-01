@@ -83,7 +83,9 @@ pub async fn list_user_records(state: State<'_, AppState>) -> Result<Vec<UserRec
         store
             .rebuild_mutation_caches()
             .map_err(|error| error.to_string())?;
-        store.list_user_records().map_err(|error| error.to_string())?
+        store
+            .list_user_records()
+            .map_err(|error| error.to_string())?
     };
     root_ticket.finish(state.inner()).await?;
     Ok(result)
@@ -395,7 +397,9 @@ pub async fn list_action_gaps(state: State<'_, AppState>) -> Result<Vec<ActionGa
     let root_ticket = crate::commands::acquire_derived_root_epoch(state.inner()).await?;
     let result = {
         let store = state.twin_store.read().await;
-        store.list_action_gaps().map_err(|error| error.to_string())?
+        store
+            .list_action_gaps()
+            .map_err(|error| error.to_string())?
     };
     root_ticket.finish(state.inner()).await?;
     Ok(result)

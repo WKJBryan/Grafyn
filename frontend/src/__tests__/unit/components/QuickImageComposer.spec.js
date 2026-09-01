@@ -2,8 +2,9 @@ import { flushPromises, mount } from '@vue/test-utils'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import QuickImageComposer from '@/components/companion/QuickImageComposer.vue'
 import ConfirmDialog from '@/components/ConfirmDialog.vue'
-import { resetTransport, setRuntimeProfile } from '@/api/transport'
+import { resetTransport, setRuntimeProfile, setRuntimeStatus } from '@/api/transport'
 import { createRuntimeProfile } from '@/platform/runtime'
+import { CAPABILITY_NAMES, normalizeRuntimeStatus } from '@/platform/capabilities'
 
 const api = vi.hoisted(() => ({
   discoverModels: vi.fn(),
@@ -11,6 +12,7 @@ const api = vi.hoisted(() => ({
   generate: vi.fn(),
   save: vi.fn(),
   saveAs: vi.fn(),
+  shareGeneratedImage: vi.fn(),
   discard: vi.fn(),
   getSyncStatus: vi.fn(),
 }))
@@ -22,6 +24,7 @@ vi.mock('@/api/client', () => ({
     generate: api.generate,
     save: api.save,
     saveAs: api.saveAs,
+    shareGeneratedImage: api.shareGeneratedImage,
     discard: api.discard,
   },
   sync: { getStatus: api.getSyncStatus },
@@ -64,6 +67,89 @@ const PREVIEW = {
   promptLeavesDevice: true,
 }
 
+const GOVERNED_SAVE = {
+  note: { id: 'note-image-1' },
+  observationEventId: 'event-1',
+  attachmentDigest: 'a'.repeat(64),
+  mediaType: 'image/png',
+  byteSize: 3,
+  width: 1024,
+  height: 1024,
+  syncDisposition: {
+    status: 'queued',
+    manifestCount: 1,
+    chunkCount: 2,
+    operationCount: 3,
+  },
+}
+
+function useDesktopRuntime() {
+  setRuntimeProfile(createRuntimeProfile({ isTauri: true, platform: 'windows' }))
+  setRuntimeStatus(normalizeRuntimeStatus({
+    schemaVersion: 1,
+    runtime: 'desktop',
+    capabilities: Object.fromEntries(CAPABILITY_NAMES.map(name => [name, true])),
+    vault: { kind: 'user_selected', available: true },
+    secureSecrets: { status: 'ready', code: null, message: null },
+    nativeImageShare: {
+      status: 'unavailable',
+      code: 'desktop_save_as',
+      message: 'Desktop uses Save As.',
+    },
+    diagnostics: [],
+  }))
+}
+
+function revokeDesktopRuntime() {
+  setRuntimeStatus(normalizeRuntimeStatus({
+    schemaVersion: 1,
+    runtime: 'desktop',
+    capabilities: Object.fromEntries(CAPABILITY_NAMES.map(name => [name, false])),
+    vault: { kind: 'user_selected', available: false },
+    secureSecrets: {
+      status: 'unavailable',
+      code: 'boot_failed',
+      message: 'Runtime startup failed.',
+    },
+    nativeImageShare: {
+      status: 'unavailable',
+      code: 'boot_failed',
+      message: 'Runtime startup failed.',
+    },
+    diagnostics: [],
+  }))
+}
+
+function useAndroidRuntime({ nativeShare = true } = {}) {
+  setRuntimeProfile(createRuntimeProfile({ isTauri: true, platform: 'android' }))
+  const capabilities = Object.fromEntries(CAPABILITY_NAMES.map(name => [name, false]))
+  Object.assign(capabilities, {
+    notesRead: true,
+    notesWrite: true,
+    recall: true,
+    twinReview: true,
+    twinChat: true,
+    linearCanvas: true,
+    imageGeneration: true,
+    nativeImageShare: nativeShare,
+  })
+  setRuntimeStatus(normalizeRuntimeStatus({
+    schemaVersion: 1,
+    runtime: 'android',
+    capabilities,
+    vault: { kind: 'app_private', available: true },
+    secureSecrets: { status: 'ready', code: null, message: null },
+    nativeImageShare: nativeShare
+      ? { status: 'ready', code: null, message: null }
+      : {
+        status: 'unavailable',
+        code: 'share_unavailable',
+        message: 'Native image sharing is unavailable.',
+      },
+    diagnostics: [],
+  }))
+}
+
 function deferred() {
   let resolve
   let reject
@@ -98,7 +184,7 @@ async function generatePreview(wrapper, preview = PREVIEW) {
 describe('QuickImageComposer', () => {
   beforeEach(() => {
     vi.resetAllMocks()
-    setRuntimeProfile(createRuntimeProfile({ isTauri: true, platform: 'windows' }))
+    useDesktopRuntime()
     api.discoverModels.mockResolvedValue(MODELS)
     api.getModelCapability.mockResolvedValue(CAPABILITY)
     api.discard.mockResolvedValue()
@@ -138,6 +224,20 @@ describe('QuickImageComposer', () => {
     expect(wrapper.get('[aria-label="Image resolution"]').element.value).toBe('')
     expect(wrapper.get('[aria-label="Image aspect ratio"]').element.value).toBe('')
     expect(wrapper.text()).toContain('Prompt is sent to OpenRouter')
+  })
+
+  it('removes mounted generation and blocks a submit as runtime capability is revoked', async () => {
+    const wrapper = await mountComposer()
+    await chooseRequest(wrapper)
+    const form = wrapper.get('.quick-image-form')
+
+    revokeDesktopRuntime()
+    await form.trigger('submit')
+    await flushPromises()
+
+    expect(api.generate).not.toHaveBeenCalled()
+    expect(wrapper.find('.quick-image-form').exists()).toBe(false)
+    expect(wrapper.get('[role="status"]').text()).toContain('unavailable')
   })
 
   it('offers only resolution and square-aspect pairs supported by the same endpoint', async () => {
@@ -364,21 +464,7 @@ describe('QuickImageComposer', () => {
   })
 
   it('performs an explicit governed save and reports the resulting sync receipt status', async () => {
-    api.save.mockResolvedValueOnce({
-      note: { id: 'note-image-1' },
-      observationEventId: 'event-1',
-      attachmentDigest: 'a'.repeat(64),
-      mediaType: 'image/png',
-      byteSize: 3,
-      width: 1024,
-      height: 1024,
-      syncDisposition: {
-        status: 'queued',
-        manifestCount: 1,
-        chunkCount: 2,
-        operationCount: 3,
-      },
-    })
+    api.save.mockResolvedValueOnce(GOVERNED_SAVE)
     const wrapper = await mountComposer()
     await generatePreview(wrapper)
     await wrapper.get('[aria-label="Image annotation"]').setValue('Systems sketch')
@@ -399,6 +485,23 @@ describe('QuickImageComposer', () => {
     expect(wrapper.get('[data-test="image-save-status"]').text())
       .toContain('3 attachment operations')
     expect(wrapper.find('[aria-label="Save image to Grafyn"]').exists()).toBe(false)
+    expect(wrapper.emitted('saved')).toEqual([[GOVERNED_SAVE]])
+  })
+
+  it('does not emit a governed save for failed or discarded image actions', async () => {
+    api.save.mockRejectedValueOnce(new Error('Provider save failed'))
+    const wrapper = await mountComposer()
+    await generatePreview(wrapper)
+    await wrapper.get('[aria-label="Save image to Grafyn"]').trigger('click')
+    await flushPromises()
+
+    expect(wrapper.emitted('saved')).toBeUndefined()
+
+    await wrapper.get('[aria-label="Discard generated preview"]').trigger('click')
+    wrapper.getComponent(ConfirmDialog).vm.$emit('confirm')
+    await flushPromises()
+
+    expect(wrapper.emitted('saved')).toBeUndefined()
   })
 
   it('reports a local-only save without borrowing the vault global sync status', async () => {
@@ -495,15 +598,25 @@ describe('QuickImageComposer', () => {
     expect(wrapper.find('[aria-label="Save image to Grafyn"]').exists()).toBe(retryable)
   })
 
-  it('keeps Android generation gated and shows Share as unavailable without calling export', async () => {
-    setRuntimeProfile(createRuntimeProfile({ isTauri: true, platform: 'android' }))
+  it('does not render native Share when Android capability health is unavailable', async () => {
+    useAndroidRuntime({ nativeShare: false })
     const wrapper = await mountComposer()
+    await generatePreview(wrapper)
 
-    expect(api.discoverModels).not.toHaveBeenCalled()
-    expect(wrapper.get('[role="status"]').text()).toContain('unavailable')
-    const share = wrapper.get('[aria-label="Share generated image unavailable"]')
-    expect(share.attributes('disabled')).toBeDefined()
-    await share.trigger('click')
+    expect(wrapper.find('[aria-label="Share generated image"]').exists()).toBe(false)
+    expect(wrapper.find('[aria-label="Share generated image unavailable"]').exists()).toBe(false)
+    expect(wrapper.find('[aria-label="Save image to Grafyn"]').exists()).toBe(true)
     expect(api.saveAs).not.toHaveBeenCalled()
+    expect(api.shareGeneratedImage).not.toHaveBeenCalled()
+  })
+
+  it('does not advertise native Share without an Android receipt producer', async () => {
+    useAndroidRuntime()
+    const wrapper = await mountComposer()
+    await generatePreview(wrapper)
+
+    expect(wrapper.find('[aria-label="Share generated image"]').exists()).toBe(false)
+    expect(wrapper.find('[data-test="image-share-status"]').exists()).toBe(false)
+    expect(api.shareGeneratedImage).not.toHaveBeenCalled()
   })
 })

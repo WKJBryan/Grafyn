@@ -16,7 +16,8 @@ pub async fn preview_markdown_migration(
     let root_ticket = crate::commands::acquire_derived_root_epoch(state.inner()).await?;
     let authority = root_ticket.authority().clone();
     let result = {
-        let service = state.markdown_migration.read().await;
+        let service_handle = state.markdown_migration_service()?;
+        let service = service_handle.read().await;
         let mut store = state.knowledge_store.write().await;
         let requested = std::fs::canonicalize(&vault_path).map_err(|error| error.to_string())?;
         let current =
@@ -41,7 +42,8 @@ pub async fn apply_markdown_migration(
     let root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
     let authority = root_epoch.authority().clone();
     let outcome = {
-        let service = state.markdown_migration.read().await;
+        let service_handle = state.markdown_migration_service()?;
+        let service = service_handle.read().await;
         let mut store = state.knowledge_store.write().await;
         service
             .apply_transaction(&preview_id, request.clone(), &mut store, authority)
@@ -128,7 +130,8 @@ pub async fn apply_markdown_migration(
     }
 
     if repair_ready && result.status == "applied" {
-        let mut optimizer = state.vault_optimizer.write().await;
+        let optimizer_handle = state.vault_optimizer_service()?;
+        let mut optimizer = optimizer_handle.write().await;
         for note_id in result
             .touched_note_ids
             .iter()
@@ -150,7 +153,8 @@ pub async fn get_markdown_migration_status(
     let root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
     let authority = root_epoch.authority().clone();
     let result = {
-        let service = state.markdown_migration.read().await;
+        let service_handle = state.markdown_migration_service()?;
+        let service = service_handle.read().await;
         service
             .status_scoped(run_id.as_deref(), &authority)
             .map_err(|error| error.to_string())?
@@ -167,7 +171,8 @@ pub async fn rollback_markdown_migration(
     let root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
     let authority = root_epoch.authority().clone();
     let outcome = {
-        let service = state.markdown_migration.read().await;
+        let service_handle = state.markdown_migration_service()?;
+        let service = service_handle.read().await;
         let mut store = state.knowledge_store.write().await;
         service
             .rollback_transaction(&run_id, &mut store, authority)
@@ -204,7 +209,8 @@ pub async fn get_vault_optimizer_status(
             let settings = state.settings_service.read().await;
             settings.get().clone()
         };
-        let mut optimizer = state.vault_optimizer.write().await;
+        let optimizer_handle = state.vault_optimizer_service()?;
+        let mut optimizer = optimizer_handle.write().await;
         optimizer
             .with_locked_fresh_state(|optimizer| Ok(optimizer.status(&settings)))
             .map_err(|error| error.to_string())?
@@ -257,7 +263,8 @@ pub async fn list_vault_optimizer_decisions(
 ) -> Result<Vec<VaultOptimizerDecision>, String> {
     let root_ticket = crate::commands::acquire_derived_root_epoch(state.inner()).await?;
     let result = {
-        let mut optimizer = state.vault_optimizer.write().await;
+        let optimizer_handle = state.vault_optimizer_service()?;
+        let mut optimizer = optimizer_handle.write().await;
         optimizer
             .with_locked_fresh_state(|optimizer| optimizer.list_decisions(limit.unwrap_or(20)))
             .map_err(|error| error.to_string())?
@@ -274,7 +281,8 @@ pub async fn get_vault_optimizer_inbox(
 ) -> Result<Vec<VaultOptimizerInboxEntry>, String> {
     let root_ticket = crate::commands::acquire_derived_root_epoch(state.inner()).await?;
     let result = {
-        let mut optimizer = state.vault_optimizer.write().await;
+        let optimizer_handle = state.vault_optimizer_service()?;
+        let mut optimizer = optimizer_handle.write().await;
         optimizer
             .with_locked_fresh_state(|optimizer| {
                 optimizer.inbox(status.as_deref(), limit.unwrap_or(20))
@@ -323,7 +331,8 @@ pub async fn rollback_vault_optimizer_change(
         // doc comment) — must match the background worker in main.rs to avoid
         // an ABBA deadlock.
         let mut store = state.knowledge_store.write().await;
-        let mut optimizer = state.vault_optimizer.write().await;
+        let optimizer_handle = state.vault_optimizer_service()?;
+        let mut optimizer = optimizer_handle.write().await;
         optimizer
             .rollback_change_expecting_authority(&change_id, &mut store, expected)
             .map_err(|error| error.to_string())?

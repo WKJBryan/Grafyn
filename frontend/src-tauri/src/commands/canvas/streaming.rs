@@ -76,6 +76,9 @@ pub async fn send_prompt(
             settings.get(),
         )?
     };
+    if model_route.provider == ModelProviderRoute::Ollama {
+        state.ollama_service()?;
+    }
     request.models = effective_model_ids(&model_route, &request.models);
     let response_provider = model_route.provider.provider_label().to_string();
     let response_provenance = if matches!(
@@ -423,7 +426,11 @@ pub async fn send_prompt(
             join_set.spawn(async move {
                 let stream_result = match provider_route {
                     ModelProviderRoute::Ollama => {
-                        let ollama = ollama_arc.read().await;
+                        let ollama = ollama_arc
+                            .as_ref()
+                            .expect("validated Ollama route")
+                            .read()
+                            .await;
                         let result = ollama
                             .chat_stream(
                                 &model_id,
@@ -971,6 +978,9 @@ pub async fn add_models_to_tile(
             settings.get(),
         )?
     };
+    if model_route.provider == ModelProviderRoute::Ollama {
+        state.ollama_service()?;
+    }
     let model_ids = effective_model_ids(&model_route, &request.model_ids);
     let response_provider = model_route.provider.provider_label().to_string();
     let response_provenance = if matches!(
@@ -1083,7 +1093,11 @@ pub async fn add_models_to_tile(
             join_set.spawn(async move {
                 let stream_result = match provider_route {
                     ModelProviderRoute::Ollama => {
-                        let ollama = ollama_arc.read().await;
+                        let ollama = ollama_arc
+                            .as_ref()
+                            .expect("validated Ollama route")
+                            .read()
+                            .await;
                         let result = ollama
                             .chat_stream(&model_id, messages, system_prompt.as_deref(), Some(0.7))
                             .await;
@@ -1393,6 +1407,9 @@ pub async fn regenerate_response(
             settings.get(),
         )?
     };
+    if model_route.provider == ModelProviderRoute::Ollama {
+        state.ollama_service()?;
+    }
     let effective_model_id = effective_model_ids(&model_route, std::slice::from_ref(&model_id))
         .into_iter()
         .next()
@@ -1443,7 +1460,11 @@ pub async fn regenerate_response(
         let model_id = effective_model_id;
         let stream_result = match provider_route {
             ModelProviderRoute::Ollama => {
-                let ollama = ollama_arc.read().await;
+                let ollama = ollama_arc
+                    .as_ref()
+                    .expect("validated Ollama route")
+                    .read()
+                    .await;
                 let result = ollama
                     .chat_stream(&model_id, messages, system_prompt.as_deref(), Some(0.7))
                     .await;

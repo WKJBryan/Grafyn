@@ -1,6 +1,21 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "app": {
+    "windows": [
+      {
+        "label": "main",
+        "fullscreen": false,
+        "height": 800,
+        "resizable": true,
+        "title": "Grafyn v0.3.0",
+        "width": 1200,
+        "minWidth": 800,
+        "minHeight": 600,
+        "center": true,
+        "visible": false,
+        "useHttpsScheme": true
+      }
+    ],
     "security": {
       "capabilities": ["desktop"]
     }

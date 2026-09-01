@@ -11,21 +11,6 @@
     "frontendDist": "../dist"
   },
   "app": {
-    "windows": [
-      {
-        "label": "main",
-        "fullscreen": false,
-        "height": 800,
-        "resizable": true,
-        "title": "Grafyn v0.3.0",
-        "width": 1200,
-        "minWidth": 800,
-        "minHeight": 600,
-        "center": true,
-        "visible": false,
-        "useHttpsScheme": true
-      }
-    ],
     "security": {
       "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' https: data: blob:; connect-src 'self' https://openrouter.ai https://grafyn-updater.grafyn-updater.workers.dev"
     }

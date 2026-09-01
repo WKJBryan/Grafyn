@@ -371,6 +371,12 @@ pub(crate) enum OpenRouterKeySource {
     Cleared,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StartupSecretPolicy {
+    AllowLegacy,
+    RejectPlaintext { resolve_versioned_secrets: bool },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum RootTransitionDecision {
@@ -832,6 +838,24 @@ impl std::fmt::Debug for DurableSettingsSnapshot {
             .field("resolved_secret_present", &self.resolved_secret.is_some())
             .finish_non_exhaustive()
     }
+}
+
+fn reject_plaintext_openrouter_key(bytes: Option<&[u8]>) -> Result<(), MutationError> {
+    let Some(bytes) = bytes else {
+        return Ok(());
+    };
+    let settings: UserSettings = serde_json::from_slice(bytes)
+        .map_err(|error| MutationError::Invalid(format!("invalid settings: {error}")))?;
+    if settings
+        .openrouter_api_key
+        .as_deref()
+        .is_some_and(|secret| !secret.is_empty())
+    {
+        return Err(MutationError::RecoveryConflict(
+            "android-plaintext-openrouter-key-rejected".into(),
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -1623,10 +1647,20 @@ impl RootTransitionStore {
         result
     }
 
-    #[cfg(test)]
     pub(crate) fn patch_settings_guarded<F>(
         &self,
         patch: F,
+    ) -> Result<DurableSettingsSnapshot, MutationError>
+    where
+        F: FnOnce(&mut UserSettings) -> Result<(), MutationError>,
+    {
+        self.patch_settings_guarded_with_secret_resolution(patch, true)
+    }
+
+    pub(crate) fn patch_settings_guarded_with_secret_resolution<F>(
+        &self,
+        patch: F,
+        resolve_versioned_secrets: bool,
     ) -> Result<DurableSettingsSnapshot, MutationError>
     where
         F: FnOnce(&mut UserSettings) -> Result<(), MutationError>,
@@ -1639,7 +1673,8 @@ impl RootTransitionStore {
                     "root-transition-already-pending".into(),
                 ));
             }
-            let mut snapshot = self.read_settings_snapshot()?;
+            let mut snapshot =
+                self.read_settings_snapshot_with_secret_resolution(resolve_versioned_secrets)?;
             patch(&mut snapshot.settings)?;
             let before_generation = snapshot.settings_generation.clone();
             if self.read_settings_generation()? != before_generation {
@@ -1650,7 +1685,8 @@ impl RootTransitionStore {
             self.write_settings(&NonsecretSettingsV1::from_settings(
                 snapshot.settings.clone(),
             ))?;
-            let published = self.read_settings_snapshot()?;
+            let published =
+                self.read_settings_snapshot_with_secret_resolution(resolve_versioned_secrets)?;
             if NonsecretSettingsV1::from_settings(published.settings.clone())
                 != NonsecretSettingsV1::from_settings(snapshot.settings.clone())
             {
@@ -1666,6 +1702,7 @@ impl RootTransitionStore {
 
     pub(crate) fn load_startup_settings<L, C>(
         &self,
+        policy: StartupSecretPolicy,
         load_legacy_key: L,
         clear_legacy_key: C,
     ) -> Result<DurableSettingsSnapshot, MutationError>
@@ -1676,6 +1713,10 @@ impl RootTransitionStore {
         let process_lock =
             crate::services::twin_events::acquire_shared_coordinator_process_lock(&self.data_path)?;
         let result = (|| {
+            let pre_recovery_bytes = self.read_settings_bytes()?;
+            if matches!(policy, StartupSecretPolicy::RejectPlaintext { .. }) {
+                reject_plaintext_openrouter_key(pre_recovery_bytes.as_deref())?;
+            }
             self.recover_locked()?;
             let raw_bytes = self.read_settings_bytes()?;
             let raw_settings = match raw_bytes.as_deref() {
@@ -1688,7 +1729,17 @@ impl RootTransitionStore {
                 .openrouter_api_key
                 .clone()
                 .filter(|secret| !secret.is_empty());
-            let legacy_keyring = load_legacy_key()?;
+            if matches!(policy, StartupSecretPolicy::RejectPlaintext { .. })
+                && legacy_plaintext.is_some()
+            {
+                return Err(MutationError::RecoveryConflict(
+                    "android-plaintext-openrouter-key-rejected".into(),
+                ));
+            }
+            let legacy_keyring = match policy {
+                StartupSecretPolicy::AllowLegacy => load_legacy_key()?,
+                StartupSecretPolicy::RejectPlaintext { .. } => None,
+            };
             let key_ref = self.read_key_ref()?;
             let legacy_present = legacy_plaintext.is_some() || legacy_keyring.is_some();
 
@@ -1697,7 +1748,13 @@ impl RootTransitionStore {
                     let version = key_ref.active_version.as_deref().ok_or_else(|| {
                         MutationError::Invalid("versioned key authority has no version".into())
                     })?;
-                    if self.secrets.get(version)?.is_none() {
+                    let should_resolve = match policy {
+                        StartupSecretPolicy::AllowLegacy => true,
+                        StartupSecretPolicy::RejectPlaintext {
+                            resolve_versioned_secrets,
+                        } => resolve_versioned_secrets,
+                    };
+                    if should_resolve && self.secrets.get(version)?.is_none() {
                         return Err(MutationError::RecoveryConflict(
                             "active-openrouter-key-version-missing".into(),
                         ));
@@ -1725,11 +1782,16 @@ impl RootTransitionStore {
                 OpenRouterKeySource::Cleared => {}
             }
 
-            if legacy_present {
+            if legacy_present && matches!(policy, StartupSecretPolicy::AllowLegacy) {
                 self.write_settings(&NonsecretSettingsV1::from_settings(raw_settings))?;
                 clear_legacy_key()?;
             }
-            self.read_settings_snapshot()
+            match policy {
+                StartupSecretPolicy::AllowLegacy => self.read_settings_snapshot(),
+                StartupSecretPolicy::RejectPlaintext {
+                    resolve_versioned_secrets,
+                } => self.read_settings_snapshot_with_secret_resolution(resolve_versioned_secrets),
+            }
         })();
         process_lock.unlock()?;
         result
@@ -2065,12 +2127,18 @@ impl RootTransitionStore {
             .read_bounded(&self.settings_key, SETTINGS_LIMIT)
     }
 
-    #[cfg(test)]
     fn read_settings_generation(&self) -> Result<ContentDigest, MutationError> {
         Ok(settings_generation(self.read_settings_bytes()?.as_deref()))
     }
 
     fn read_settings_snapshot(&self) -> Result<DurableSettingsSnapshot, MutationError> {
+        self.read_settings_snapshot_with_secret_resolution(true)
+    }
+
+    fn read_settings_snapshot_with_secret_resolution(
+        &self,
+        resolve_versioned_secrets: bool,
+    ) -> Result<DurableSettingsSnapshot, MutationError> {
         let bytes = self.read_settings_bytes()?;
         let nonsecret_settings = match bytes.as_deref() {
             Some(bytes) => {
@@ -2085,8 +2153,12 @@ impl RootTransitionStore {
         };
         let key_ref = self.read_key_ref()?;
         let active_key_version = key_ref.active_version.clone();
-        let resolved_secret = self.resolve_secret(active_key_version.as_deref())?;
-        if active_key_version.is_some() && resolved_secret.is_none() {
+        let resolved_secret = if resolve_versioned_secrets {
+            self.resolve_secret(active_key_version.as_deref())?
+        } else {
+            None
+        };
+        if resolve_versioned_secrets && active_key_version.is_some() && resolved_secret.is_none() {
             return Err(MutationError::RecoveryConflict(
                 "active-openrouter-key-version-missing".into(),
             ));

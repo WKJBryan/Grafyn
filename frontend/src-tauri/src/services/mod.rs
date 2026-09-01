@@ -1,9 +1,12 @@
+#[cfg(any(target_os = "android", test))]
+pub mod android_bridge;
 pub mod atomic_io;
 pub mod attachment_store;
 pub mod canvas_store;
 pub mod chunk_index;
 pub mod feedback;
 pub mod graph_index;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub mod import;
 pub mod index_commit;
 pub mod knowledge_store;

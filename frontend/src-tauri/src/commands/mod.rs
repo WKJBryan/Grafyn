@@ -24,14 +24,17 @@ pub mod distill;
 pub mod feedback;
 pub mod graph;
 pub mod image_generation;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub mod import;
 #[cfg(desktop)]
 pub mod mcp;
 pub mod memory;
+#[cfg(desktop)]
 pub mod migration;
 pub mod notes;
 pub mod priority;
 pub mod retrieval;
+pub mod runtime;
 pub mod search;
 pub mod settings;
 pub mod sync;
@@ -729,11 +732,14 @@ async fn rebuild_link_discovery_at(
     notes: &[Note],
     token: &crate::services::vault_namespace::VaultAuthorityTokenV1,
 ) -> Result<(), String> {
+    let Some(service) = state.link_discovery.as_ref() else {
+        return Ok(());
+    };
     let coordinator = state
         .mutation_coordinator
         .as_ref()
         .ok_or_else(|| "mutation coordinator is unavailable".to_string())?;
-    let mut discovery = state.link_discovery.write().await;
+    let mut discovery = service.write().await;
     coordinator
         .with_locked_derived_state(token, false, || {
             discovery.reload_from_disk_checked().map_err(|error| {
@@ -750,7 +756,10 @@ pub(crate) async fn bootstrap_vault_optimizer(
     state: &AppState,
     notes: &[Note],
 ) -> Result<(), String> {
-    let mut optimizer = state.vault_optimizer.write().await;
+    let Some(service) = state.vault_optimizer.as_ref() else {
+        return Ok(());
+    };
+    let mut optimizer = service.write().await;
     optimizer
         .with_locked_fresh_state(|optimizer| optimizer.bootstrap_checked(notes))
         .map_err(|error| error.to_string())
@@ -761,7 +770,10 @@ pub(crate) async fn enqueue_vault_optimizer_note(
     note_id: &str,
     reason: &str,
 ) -> Result<(), String> {
-    let mut optimizer = state.vault_optimizer.write().await;
+    let Some(service) = state.vault_optimizer.as_ref() else {
+        return Ok(());
+    };
+    let mut optimizer = service.write().await;
     optimizer
         .with_locked_fresh_state(|optimizer| {
             optimizer.enqueue_note_checked(note_id, reason).map(|_| ())
@@ -775,12 +787,15 @@ pub(crate) async fn enqueue_vault_optimizer_note_at_authority(
     note_id: &str,
     reason: &str,
 ) -> Result<(), String> {
+    let Some(service) = state.vault_optimizer.as_ref() else {
+        return Ok(());
+    };
     let root_ticket = acquire_expected_root_epoch(state, expected).await?;
     let coordinator = state
         .mutation_coordinator
         .as_ref()
         .ok_or_else(|| "mutation coordinator is unavailable".to_string())?;
-    let mut optimizer = state.vault_optimizer.write().await;
+    let mut optimizer = service.write().await;
     let result = coordinator.with_locked_derived_state(expected, false, || {
         optimizer
             .with_locked_fresh_state(|optimizer| {
@@ -799,6 +814,9 @@ pub(crate) async fn remove_link_discovery_note(
     state: &AppState,
     note_id: &str,
 ) -> Result<(), String> {
+    let Some(service) = state.link_discovery.as_ref() else {
+        return Ok(());
+    };
     let coordinator = state
         .mutation_coordinator
         .as_ref()
@@ -806,7 +824,7 @@ pub(crate) async fn remove_link_discovery_note(
     let token = coordinator
         .current_authority_token()
         .map_err(|error| error.to_string())?;
-    let mut discovery = state.link_discovery.write().await;
+    let mut discovery = service.write().await;
     coordinator
         .with_locked_derived_state(&token, false, || {
             discovery.reload_from_disk_checked().map_err(|error| {
@@ -1037,11 +1055,13 @@ pub(crate) struct AuthorityRepairGuards<'a> {
     search: tokio::sync::RwLockWriteGuard<'a, crate::services::search::SearchService>,
     chunks: tokio::sync::RwLockWriteGuard<'a, crate::services::chunk_index::ChunkIndex>,
     graph: tokio::sync::RwLockWriteGuard<'a, crate::services::graph_index::GraphIndex>,
-    discovery:
+    discovery: Option<
         tokio::sync::RwLockWriteGuard<'a, crate::services::link_discovery::LinkDiscoveryService>,
-    optimizer:
+    >,
+    optimizer: Option<
         tokio::sync::RwLockWriteGuard<'a, crate::services::vault_optimizer::VaultOptimizerService>,
-    _optimizer_state_lock: crate::services::twin_events::AnchoredExclusiveLock,
+    >,
+    _optimizer_state_lock: Option<crate::services::twin_events::AnchoredExclusiveLock>,
     loaded: tokio::sync::RwLockWriteGuard<
         'a,
         Option<crate::services::vault_namespace::VaultAuthorityTokenV1>,
@@ -1057,11 +1077,22 @@ pub(crate) async fn acquire_authority_repair_guards(
     let search = state.search_service.write().await;
     let chunks = state.chunk_index.write().await;
     let graph = state.graph_index.write().await;
-    let discovery = state.link_discovery.write().await;
-    let optimizer = state.vault_optimizer.write().await;
-    let optimizer_state_lock = optimizer
-        .acquire_state_lock()
-        .map_err(|error| error.to_string())?;
+    let discovery = match state.link_discovery.as_ref() {
+        Some(service) => Some(service.write().await),
+        None => None,
+    };
+    let optimizer = match state.vault_optimizer.as_ref() {
+        Some(service) => Some(service.write().await),
+        None => None,
+    };
+    let optimizer_state_lock = match optimizer.as_ref() {
+        Some(optimizer) => Some(
+            optimizer
+                .acquire_state_lock()
+                .map_err(|error| error.to_string())?,
+        ),
+        None => None,
+    };
     let loaded = state.loaded_authority.write().await;
     Ok(AuthorityRepairGuards {
         knowledge,
@@ -1134,30 +1165,29 @@ pub(crate) fn rebuild_authority_with_retained_guard(
     checkpoint(AuthorityRepairStep::Chunk)?;
     guards.graph.build_from_notes(&notes);
     checkpoint(AuthorityRepairStep::Graph)?;
-    guards
-        .discovery
-        .reload_from_disk_checked()
-        .map_err(|error| error.to_string())?;
-    guards
-        .discovery
-        .bootstrap_checked(&notes)
-        .map_err(|error| error.to_string())?;
-    checkpoint(AuthorityRepairStep::LinkDiscovery)?;
-    guards
-        .optimizer
-        .reload_from_disk_checked()
-        .map_err(|error| error.to_string())?;
-    guards
-        .optimizer
-        .recover_pending_publications_locked(&guards.knowledge, guard)
-        .map_err(|error| error.to_string())?;
-    if mode != AuthorityRepairMode::RemoteSync {
-        guards
-            .optimizer
+    if let Some(discovery) = guards.discovery.as_mut() {
+        discovery
+            .reload_from_disk_checked()
+            .map_err(|error| error.to_string())?;
+        discovery
             .bootstrap_checked(&notes)
             .map_err(|error| error.to_string())?;
+        checkpoint(AuthorityRepairStep::LinkDiscovery)?;
     }
-    checkpoint(AuthorityRepairStep::Optimizer)?;
+    if let Some(optimizer) = guards.optimizer.as_mut() {
+        optimizer
+            .reload_from_disk_checked()
+            .map_err(|error| error.to_string())?;
+        optimizer
+            .recover_pending_publications_locked(&guards.knowledge, guard)
+            .map_err(|error| error.to_string())?;
+        if mode != AuthorityRepairMode::RemoteSync {
+            optimizer
+                .bootstrap_checked(&notes)
+                .map_err(|error| error.to_string())?;
+        }
+        checkpoint(AuthorityRepairStep::Optimizer)?;
+    }
 
     guard
         .validate_authority_token(&token, false)

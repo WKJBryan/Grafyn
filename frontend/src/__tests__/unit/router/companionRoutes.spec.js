@@ -1,16 +1,58 @@
 import { createMemoryHistory } from 'vue-router'
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it } from 'vitest'
 import { createGrafynRouter } from '@/router'
+import { setRuntimeStatus } from '@/api/transport'
+import { CAPABILITY_NAMES, normalizeRuntimeStatus } from '@/platform/capabilities'
 import { RUNTIME_PROFILES } from '@/platform/runtime'
 
 function routerFor(name) {
+  setRuntimeStatus(name === RUNTIME_PROFILES.DESKTOP_WIDE
+    ? normalizeRuntimeStatus({
+        schemaVersion: 1,
+        runtime: 'desktop',
+        capabilities: Object.fromEntries(CAPABILITY_NAMES.map(capability => [capability, true])),
+        vault: { kind: 'user_selected', available: true },
+        secureSecrets: { status: 'ready', code: null, message: null },
+        nativeImageShare: {
+          status: 'unavailable',
+          code: 'desktop_save_as',
+          message: 'Desktop uses Save As.',
+        },
+        diagnostics: [],
+      })
+    : null)
   return createGrafynRouter({
     history: createMemoryHistory(),
     getProfile: () => ({ name }),
   })
 }
 
+function revokeDesktopRuntime() {
+  setRuntimeStatus(normalizeRuntimeStatus({
+    schemaVersion: 1,
+    runtime: 'desktop',
+    capabilities: Object.fromEntries(CAPABILITY_NAMES.map(capability => [capability, false])),
+    vault: { kind: 'user_selected', available: false },
+    secureSecrets: {
+      status: 'unavailable',
+      code: 'canonical_runtime_unavailable',
+      message: 'The canonical local runtime is unavailable.',
+    },
+    nativeImageShare: {
+      status: 'unavailable',
+      code: 'canonical_runtime_unavailable',
+      message: 'The canonical local runtime is unavailable.',
+    },
+    diagnostics: [{
+      code: 'canonical_runtime_unavailable',
+      message: 'The canonical local runtime is unavailable.',
+    }],
+  }))
+}
+
 describe('companion routes', () => {
+  afterEach(() => setRuntimeStatus(null))
+
   it('registers responsive Capture and Recall destinations', () => {
     const router = routerFor(RUNTIME_PROFILES.DESKTOP_WIDE)
     expect(router.resolve('/').name).toBe('home')
@@ -45,6 +87,25 @@ describe('companion routes', () => {
 
       expect(router.currentRoute.value.path).toBe(path)
       expect(router.currentRoute.value.meta.capability).toBe('linearCanvas')
+    },
+  )
+
+  it.each([
+    ['/recall', 'recall'],
+    ['/canvas', 'linearCanvas'],
+    ['/canvas/session-a', 'linearCanvas'],
+    ['/twin', 'twinReview'],
+  ])(
+    're-evaluates the active %s route when %s authority is revoked',
+    async (path, capability) => {
+      const router = routerFor(RUNTIME_PROFILES.DESKTOP_WIDE)
+      await router.push(path)
+
+      revokeDesktopRuntime()
+
+      await expect.poll(() => router.currentRoute.value.name)
+        .toBe('capability-unavailable')
+      expect(router.currentRoute.value.query.capability).toBe(capability)
     },
   )
 

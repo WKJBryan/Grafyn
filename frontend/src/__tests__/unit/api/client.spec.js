@@ -35,6 +35,7 @@ vi.mock('@tauri-apps/plugin-os', () => ({
 
 import {
   boot,
+  runtime as runtimeApi,
   notes,
   search,
   graph,
@@ -607,8 +608,18 @@ describe('API Client (Tauri)', () => {
     })
   })
 
+  describe('Runtime API', () => {
+    it('gets the typed backend runtime status', async () => {
+      mockInvoke.mockResolvedValue({ schemaVersion: 1, runtime: 'android' })
+
+      await runtimeApi.getStatus()
+
+      expect(mockInvoke).toHaveBeenCalledWith('get_runtime_status', {})
+    })
+  })
+
   describe('Generated image API', () => {
-    it('maps discovery, capability, generation, save, export, and load to strict request DTOs', async () => {
+    it('maps discovery, capability, generation, save, export, share, and load to strict request DTOs', async () => {
       mockInvoke.mockResolvedValue({})
 
       await images.discoverModels()
@@ -654,6 +665,17 @@ describe('API Client (Tauri)', () => {
         request: {
           receiptId: '018f0ca8-2e42-7c1e-ae13-7b35f09b4501',
           retentionPolicy: 'strip_metadata',
+        },
+      })
+
+      await images.shareGeneratedImage(
+        '018f0ca8-2e42-7c1e-ae13-7b35f09b4501',
+        'retain_original',
+      )
+      expect(mockInvoke).toHaveBeenLastCalledWith('share_generated_image', {
+        request: {
+          receiptId: '018f0ca8-2e42-7c1e-ae13-7b35f09b4501',
+          retentionPolicy: 'retain_original',
         },
       })
 

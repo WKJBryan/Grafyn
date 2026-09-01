@@ -6,6 +6,7 @@ use crate::models::settings::{SettingsStatus, SettingsUpdate, UserSettings};
 use crate::services::ollama::OllamaStatus;
 use crate::AppState;
 use tauri::{AppHandle, State};
+#[cfg(desktop)]
 use tauri_plugin_dialog::DialogExt;
 
 /// Get current settings
@@ -14,11 +15,17 @@ pub async fn get_settings(state: State<'_, AppState>) -> Result<UserSettings, St
     if state.mutation_coordinator.is_none() {
         let _transition_gate = state.vault_transition.read().await;
         let settings = state.settings_service.read().await;
-        return Ok(redact_sensitive_settings(settings.get()));
+        return Ok(redact_settings_for_runtime(
+            settings.get(),
+            settings.runtime_kind(),
+        ));
     }
     let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
     let settings = state.settings_service.read().await;
-    Ok(redact_sensitive_settings(settings.get()))
+    Ok(redact_settings_for_runtime(
+        settings.get(),
+        settings.runtime_kind(),
+    ))
 }
 
 /// Get settings status (for checking if setup is needed)
@@ -27,11 +34,17 @@ pub async fn get_settings_status(state: State<'_, AppState>) -> Result<SettingsS
     if state.mutation_coordinator.is_none() {
         let _transition_gate = state.vault_transition.read().await;
         let settings = state.settings_service.read().await;
-        return Ok(settings.status());
+        return Ok(redact_status_for_runtime(
+            settings.status(),
+            settings.runtime_kind(),
+        ));
     }
     let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
     let settings = state.settings_service.read().await;
-    Ok(settings.status())
+    Ok(redact_status_for_runtime(
+        settings.status(),
+        settings.runtime_kind(),
+    ))
 }
 
 /// Update settings
@@ -41,7 +54,8 @@ pub async fn update_settings(
     update: SettingsUpdate,
 ) -> Result<UserSettings, String> {
     let updated = apply_settings_update(state.inner(), update).await?;
-    Ok(redact_sensitive_settings(&updated))
+    let runtime_kind = state.settings_service.read().await.runtime_kind();
+    Ok(redact_settings_for_runtime(&updated, runtime_kind))
 }
 
 pub(crate) async fn apply_settings_update(
@@ -58,6 +72,12 @@ async fn apply_settings_update_inner(
 ) -> Result<UserSettings, String> {
     let _transition_gate = state.vault_transition.write().await;
     let _authority_repair = state.authority_repair.lock().await;
+    {
+        let settings = state.settings_service.read().await;
+        settings
+            .validate_update_for_runtime(&update)
+            .map_err(|error| error.to_string())?;
+    }
     if let Some(reattached) = try_forward_reattach(state, &update).await? {
         return Ok(reattached);
     }
@@ -312,11 +332,12 @@ async fn apply_settings_update_inner(
             .write()
             .await
             .set_api_key(resolved_secret.clone().unwrap_or_default());
-        state
-            .ollama
-            .write()
-            .await
-            .set_base_url(candidate.ollama_base_url.clone());
+        if let Some(ollama) = state.ollama.as_ref() {
+            ollama
+                .write()
+                .await
+                .set_base_url(candidate.ollama_base_url.clone());
+        }
 
         match transition_store.mark_committed(&transition) {
             crate::services::root_transition::MarkCommittedResult::Committed(committed) => {
@@ -450,11 +471,12 @@ async fn apply_settings_update_inner(
                             .write()
                             .await
                             .set_api_key(old_secret.unwrap_or_default());
-                        state
-                            .ollama
-                            .write()
-                            .await
-                            .set_base_url(before.ollama_base_url.clone());
+                        if let Some(ollama) = state.ollama.as_ref() {
+                            ollama
+                                .write()
+                                .await
+                                .set_base_url(before.ollama_base_url.clone());
+                        }
                         Ok::<(), String>(())
                     }
                     .await
@@ -537,11 +559,12 @@ async fn apply_settings_update_inner(
                             .write()
                             .await
                             .set_api_key(new_secret.unwrap_or_default());
-                        state
-                            .ollama
-                            .write()
-                            .await
-                            .set_base_url(candidate.ollama_base_url.clone());
+                        if let Some(ollama) = state.ollama.as_ref() {
+                            ollama
+                                .write()
+                                .await
+                                .set_base_url(candidate.ollama_base_url.clone());
+                        }
                         Ok::<(), String>(())
                     }
                     .await
@@ -634,11 +657,12 @@ async fn apply_settings_update_inner(
                     .write()
                     .await
                     .set_api_key(old_secret.unwrap_or_default());
-                state
-                    .ollama
-                    .write()
-                    .await
-                    .set_base_url(before.ollama_base_url.clone());
+                if let Some(ollama) = state.ollama.as_ref() {
+                    ollama
+                        .write()
+                        .await
+                        .set_base_url(before.ollama_base_url.clone());
+                }
                 Ok::<(), String>(())
             }
             .await;
@@ -813,21 +837,18 @@ async fn rebuild_indexes_from_notes(
         .read()
         .await
         .uses_data_path(derived_data_path);
-    let links_match = state
-        .link_discovery
-        .read()
-        .await
-        .uses_data_path(derived_data_path);
-    let optimizer_matches = state
-        .vault_optimizer
-        .read()
-        .await
-        .uses_data_path(derived_data_path);
-    let migration_matches = state
-        .markdown_migration
-        .read()
-        .await
-        .uses_data_path(derived_data_path);
+    let links_match = match state.link_discovery.as_ref() {
+        Some(service) => service.read().await.uses_data_path(derived_data_path),
+        None => true,
+    };
+    let optimizer_matches = match state.vault_optimizer.as_ref() {
+        Some(service) => service.read().await.uses_data_path(derived_data_path),
+        None => true,
+    };
+    let migration_matches = match state.markdown_migration.as_ref() {
+        Some(service) => service.read().await.uses_data_path(derived_data_path),
+        None => true,
+    };
     let reuse_current =
         search_matches && chunks_match && links_match && optimizer_matches && migration_matches;
     if reuse_current {
@@ -844,18 +865,20 @@ async fn rebuild_indexes_from_notes(
             .reindex_all(notes)
             .map_err(|error| error.to_string())?;
         state.graph_index.write().await.build_from_notes(notes);
-        state
-            .link_discovery
-            .write()
-            .await
-            .bootstrap_checked(notes)
-            .map_err(|error| error.to_string())?;
-        state
-            .vault_optimizer
-            .write()
-            .await
-            .reset_for_vault_checked(notes)
-            .map_err(|error| error.to_string())?;
+        if let Some(service) = state.link_discovery.as_ref() {
+            service
+                .write()
+                .await
+                .bootstrap_checked(notes)
+                .map_err(|error| error.to_string())?;
+        }
+        if let Some(service) = state.vault_optimizer.as_ref() {
+            service
+                .write()
+                .await
+                .reset_for_vault_checked(notes)
+                .map_err(|error| error.to_string())?;
+        }
         return Ok(());
     }
     let mut search = crate::services::search::SearchService::new(derived_data_path.to_path_buf())
@@ -870,31 +893,56 @@ async fn rebuild_indexes_from_notes(
         .map_err(|error| error.to_string())?;
     let mut graph = crate::services::graph_index::GraphIndex::new();
     graph.build_from_notes(notes);
-    let mut links = crate::services::link_discovery::LinkDiscoveryService::try_new(
-        derived_data_path.to_path_buf(),
-    )
-    .map_err(|error| error.to_string())?;
-    links
-        .bootstrap_checked(notes)
-        .map_err(|error| error.to_string())?;
-    let mut optimizer = crate::services::vault_optimizer::VaultOptimizerService::try_new(
-        derived_data_path.to_path_buf(),
-    )
-    .map_err(|error| error.to_string())?;
-    optimizer
-        .reset_for_vault_checked(notes)
-        .map_err(|error| error.to_string())?;
-    let migration = crate::services::markdown_migration::MarkdownMigrationService::try_new(
-        derived_data_path.to_path_buf(),
-    )
-    .map_err(|error| error.to_string())?;
+    let mut links = match state.link_discovery.as_ref() {
+        Some(_) => Some(
+            crate::services::link_discovery::LinkDiscoveryService::try_new(
+                derived_data_path.to_path_buf(),
+            )
+            .map_err(|error| error.to_string())?,
+        ),
+        None => None,
+    };
+    if let Some(links) = links.as_mut() {
+        links
+            .bootstrap_checked(notes)
+            .map_err(|error| error.to_string())?;
+    }
+    let mut optimizer = match state.vault_optimizer.as_ref() {
+        Some(_) => Some(
+            crate::services::vault_optimizer::VaultOptimizerService::try_new(
+                derived_data_path.to_path_buf(),
+            )
+            .map_err(|error| error.to_string())?,
+        ),
+        None => None,
+    };
+    if let Some(optimizer) = optimizer.as_mut() {
+        optimizer
+            .reset_for_vault_checked(notes)
+            .map_err(|error| error.to_string())?;
+    }
+    let migration = match state.markdown_migration.as_ref() {
+        Some(_) => Some(
+            crate::services::markdown_migration::MarkdownMigrationService::try_new(
+                derived_data_path.to_path_buf(),
+            )
+            .map_err(|error| error.to_string())?,
+        ),
+        None => None,
+    };
 
     *state.search_service.write().await = search;
     *state.chunk_index.write().await = chunks;
     *state.graph_index.write().await = graph;
-    *state.link_discovery.write().await = links;
-    *state.vault_optimizer.write().await = optimizer;
-    *state.markdown_migration.write().await = migration;
+    if let (Some(service), Some(links)) = (state.link_discovery.as_ref(), links) {
+        *service.write().await = links;
+    }
+    if let (Some(service), Some(optimizer)) = (state.vault_optimizer.as_ref(), optimizer) {
+        *service.write().await = optimizer;
+    }
+    if let (Some(service), Some(migration)) = (state.markdown_migration.as_ref(), migration) {
+        *service.write().await = migration;
+    }
     Ok(())
 }
 
@@ -1062,7 +1110,8 @@ async fn capture_ollama_request_authority(
             settings.get().ollama_model.clone(),
         )
     };
-    let runtime_base_url = state.ollama.read().await.base_url().to_string();
+    let ollama = state.ollama_service()?;
+    let runtime_base_url = ollama.read().await.base_url().to_string();
     let authority = OllamaRequestAuthority {
         root: ticket.authority().clone(),
         settings_base_url,
@@ -1080,7 +1129,8 @@ async fn finish_ollama_request_authority(
     let ticket = crate::commands::acquire_expected_root_epoch(state, &expected.root)
         .await
         .map_err(|_| "Grafyn authority changed while the Ollama request was running".to_string())?;
-    let current = capture_ollama_request_authority_without_gate(state, expected.root.clone()).await;
+    let current =
+        capture_ollama_request_authority_without_gate(state, expected.root.clone()).await?;
     if &current != expected {
         return Err("Grafyn authority changed while the Ollama request was running".into());
     }
@@ -1093,7 +1143,7 @@ async fn finish_ollama_request_authority(
 async fn capture_ollama_request_authority_without_gate(
     state: &AppState,
     root: crate::services::vault_namespace::VaultAuthorityTokenV1,
-) -> OllamaRequestAuthority {
+) -> Result<OllamaRequestAuthority, String> {
     let (settings_base_url, settings_model) = {
         let settings = state.settings_service.read().await;
         (
@@ -1101,20 +1151,21 @@ async fn capture_ollama_request_authority_without_gate(
             settings.get().ollama_model.clone(),
         )
     };
-    let runtime_base_url = state.ollama.read().await.base_url().to_string();
-    OllamaRequestAuthority {
+    let ollama = state.ollama_service()?;
+    let runtime_base_url = ollama.read().await.base_url().to_string();
+    Ok(OllamaRequestAuthority {
         root,
         settings_base_url,
         settings_model,
         runtime_base_url,
-    }
+    })
 }
 
 #[tauri::command]
 pub async fn get_ollama_status(state: State<'_, AppState>) -> Result<OllamaStatus, String> {
     let authority = capture_ollama_request_authority(state.inner()).await?;
     let selected_model = authority.settings_model.clone();
-    let ollama = state.ollama.read().await.clone();
+    let ollama = state.ollama_service()?.read().await.clone();
     let result = ollama
         .status(Some(&selected_model))
         .await
@@ -1126,7 +1177,7 @@ pub async fn get_ollama_status(state: State<'_, AppState>) -> Result<OllamaStatu
 #[tauri::command]
 pub async fn list_ollama_models(state: State<'_, AppState>) -> Result<Vec<AvailableModel>, String> {
     let authority = capture_ollama_request_authority(state.inner()).await?;
-    let ollama = state.ollama.read().await.clone();
+    let ollama = state.ollama_service()?.read().await.clone();
     let result = ollama
         .list_models()
         .await
@@ -1141,10 +1192,26 @@ pub struct OpenRouterStatus {
     pub is_configured: bool,
 }
 
-fn redact_sensitive_settings(settings: &UserSettings) -> UserSettings {
+pub(crate) fn redact_settings_for_runtime(
+    settings: &UserSettings,
+    runtime_kind: crate::models::runtime::RuntimeKind,
+) -> UserSettings {
     let mut redacted = settings.clone();
     redacted.openrouter_api_key = None;
+    if runtime_kind == crate::models::runtime::RuntimeKind::Android {
+        redacted.vault_path = None;
+    }
     redacted
+}
+
+pub(crate) fn redact_status_for_runtime(
+    mut status: SettingsStatus,
+    runtime_kind: crate::models::runtime::RuntimeKind,
+) -> SettingsStatus {
+    if runtime_kind == crate::models::runtime::RuntimeKind::Android {
+        status.vault_path = None;
+    }
+    status
 }
 
 #[cfg(test)]
@@ -1348,8 +1415,8 @@ mod tests {
             openrouter: Arc::new(RwLock::new(
                 crate::services::openrouter::OpenRouterService::new(String::new()),
             )),
-            ollama: Arc::new(RwLock::new(crate::services::ollama::OllamaService::new(
-                "http://localhost:11434".into(),
+            ollama: Some(Arc::new(RwLock::new(
+                crate::services::ollama::OllamaService::new("http://localhost:11434".into()),
             ))),
             feedback_service: Arc::new(RwLock::new(
                 crate::services::feedback::FeedbackService::new(data.join("feedback")),
@@ -1364,17 +1431,17 @@ mod tests {
             chunk_index: Arc::new(RwLock::new(
                 crate::services::chunk_index::ChunkIndex::new(derived_data.clone()).unwrap(),
             )),
-            link_discovery: Arc::new(RwLock::new(
+            link_discovery: Some(Arc::new(RwLock::new(
                 crate::services::link_discovery::LinkDiscoveryService::new(derived_data.clone()),
-            )),
-            markdown_migration: Arc::new(RwLock::new(
+            ))),
+            markdown_migration: Some(Arc::new(RwLock::new(
                 crate::services::markdown_migration::MarkdownMigrationService::new(
                     derived_data.clone(),
                 ),
-            )),
-            vault_optimizer: Arc::new(RwLock::new(
+            ))),
+            vault_optimizer: Some(Arc::new(RwLock::new(
                 crate::services::vault_optimizer::VaultOptimizerService::new(derived_data),
-            )),
+            ))),
             twin_store: Arc::new(RwLock::new(if stable {
                 crate::services::twin::TwinStore::with_event_recorder_scoped(
                     twin_root,
@@ -1476,8 +1543,8 @@ mod tests {
             openrouter: Arc::new(RwLock::new(
                 crate::services::openrouter::OpenRouterService::new(String::new()),
             )),
-            ollama: Arc::new(RwLock::new(crate::services::ollama::OllamaService::new(
-                "http://localhost:11434".into(),
+            ollama: Some(Arc::new(RwLock::new(
+                crate::services::ollama::OllamaService::new("http://localhost:11434".into()),
             ))),
             feedback_service: Arc::new(RwLock::new(
                 crate::services::feedback::FeedbackService::new(data.join("feedback")),
@@ -1492,17 +1559,17 @@ mod tests {
             chunk_index: Arc::new(RwLock::new(
                 crate::services::chunk_index::ChunkIndex::new(derived_data.clone()).unwrap(),
             )),
-            link_discovery: Arc::new(RwLock::new(
+            link_discovery: Some(Arc::new(RwLock::new(
                 crate::services::link_discovery::LinkDiscoveryService::new(derived_data.clone()),
-            )),
-            markdown_migration: Arc::new(RwLock::new(
+            ))),
+            markdown_migration: Some(Arc::new(RwLock::new(
                 crate::services::markdown_migration::MarkdownMigrationService::new(
                     derived_data.clone(),
                 ),
-            )),
-            vault_optimizer: Arc::new(RwLock::new(
+            ))),
+            vault_optimizer: Some(Arc::new(RwLock::new(
                 crate::services::vault_optimizer::VaultOptimizerService::new(derived_data),
-            )),
+            ))),
             twin_store: Arc::new(RwLock::new(
                 crate::services::twin::TwinStore::with_event_recorder_scoped(
                     twin_root,
@@ -1584,16 +1651,22 @@ mod tests {
             .uses_data_path(&expected_derived));
         assert!(state
             .link_discovery
+            .as_ref()
+            .unwrap()
             .read()
             .await
             .uses_data_path(&expected_derived));
         assert!(state
             .vault_optimizer
+            .as_ref()
+            .unwrap()
             .read()
             .await
             .uses_data_path(&expected_derived));
         assert!(state
             .markdown_migration
+            .as_ref()
+            .unwrap()
             .read()
             .await
             .uses_data_path(&expected_derived));
@@ -1716,14 +1789,24 @@ mod tests {
             .unwrap();
         assert!(state.search_service.read().await.uses_data_path(&namespace));
         assert!(state.chunk_index.read().await.uses_data_path(&namespace));
-        assert!(state.link_discovery.read().await.uses_data_path(&namespace));
+        assert!(state
+            .link_discovery
+            .as_ref()
+            .unwrap()
+            .read()
+            .await
+            .uses_data_path(&namespace));
         assert!(state
             .vault_optimizer
+            .as_ref()
+            .unwrap()
             .read()
             .await
             .uses_data_path(&namespace));
         assert!(state
             .markdown_migration
+            .as_ref()
+            .unwrap()
             .read()
             .await
             .uses_data_path(&namespace));
@@ -2366,6 +2449,8 @@ mod tests {
         let before = capture_ollama_request_authority(&state).await.unwrap();
         state
             .ollama
+            .as_ref()
+            .unwrap()
             .write()
             .await
             .set_base_url("http://127.0.0.1:22445".into());

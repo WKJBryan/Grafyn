@@ -257,14 +257,14 @@ async fn companion_capture_recovers_one_plan_without_duplicate_note_or_event() {
 
 async fn companion_optimizer_queue_size(state: &crate::AppState) -> usize {
     let settings = crate::models::settings::UserSettings::default();
-    let mut optimizer = state.vault_optimizer.write().await;
+    let mut optimizer = state.vault_optimizer.as_ref().unwrap().write().await;
     optimizer
         .with_locked_fresh_state(|optimizer| Ok(optimizer.status(&settings).queue_size))
         .unwrap()
 }
 
 async fn companion_optimizer_queue_ids(state: &crate::AppState) -> Vec<String> {
-    let mut optimizer = state.vault_optimizer.write().await;
+    let mut optimizer = state.vault_optimizer.as_ref().unwrap().write().await;
     optimizer
         .with_locked_fresh_state(|optimizer| Ok(optimizer.queued_note_ids()))
         .unwrap()
@@ -363,7 +363,7 @@ async fn companion_capture_root_retarget_keeps_commit_identity_and_skips_stale_o
         companion_capture_request("Do not enqueue across roots", CompanionSyncPolicy::Inherit),
         at,
         async {
-            *state.vault_optimizer.write().await =
+            *state.vault_optimizer.as_ref().unwrap().write().await =
                 crate::services::vault_optimizer::VaultOptimizerService::new(
                     empty_optimizer_root.path().to_path_buf(),
                 );

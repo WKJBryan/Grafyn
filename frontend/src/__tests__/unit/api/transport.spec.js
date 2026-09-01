@@ -1,6 +1,13 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { createPinia, setActivePinia } from 'pinia'
-import { createTransport, resetTransport, setRuntimeProfile, setTransport } from '@/api/transport'
+import {
+  createTransport,
+  getRuntimeStatus,
+  resetTransport,
+  setRuntimeProfile,
+  setRuntimeStatus,
+  setTransport,
+} from '@/api/transport'
 import { notes } from '@/api/client'
 import { twinEval } from '@/lab/api'
 import { CapabilityUnavailableError, assertCapability } from '@/platform/capabilities'
@@ -64,6 +71,16 @@ describe('frontend transport seam', () => {
     setRuntimeProfile({ name: 'android-compact' })
 
     expect(() => assertCapability('mcp')).toThrow(CapabilityUnavailableError)
+  })
+
+  it('holds injected runtime health only for the active bootstrap lifetime', () => {
+    const status = Object.freeze({ schemaVersion: 1, runtime: 'android' })
+    setRuntimeStatus(status)
+
+    expect(getRuntimeStatus()).toBe(status)
+
+    resetTransport()
+    expect(getRuntimeStatus()).toBeNull()
   })
 
   it('routes boot event listening through an injected transport', async () => {

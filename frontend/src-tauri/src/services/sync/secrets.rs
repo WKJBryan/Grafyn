@@ -1,4 +1,5 @@
 use std::fmt;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::{collections::BTreeMap, sync::Mutex};
@@ -11,7 +12,9 @@ const OPENROUTER_KEY_PREFIX: &str = "openrouter_api_key/";
 const SYNC_DEVICE_ED25519_ACCOUNT: &str = "sync.device.ed25519.v1";
 const SYNC_VAULT_PREFIX: &str = "sync.vault.";
 const SYNC_VAULT_SUFFIX: &str = ".root.v1";
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 const KEYRING_VALUE_PREFIX: &str = "grafyn-secret-v1:";
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 const SECRET_CLAIM_DIRECTORY: &str = "secret-account-claims-v1";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -105,6 +108,7 @@ impl SecretAccount {
         &self.value
     }
 
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     fn allows_legacy_utf8(&self) -> bool {
         self.kind == SecretAccountKind::OpenRouter
     }
@@ -171,6 +175,7 @@ fn validate_secret_len(len: usize) -> Result<(), SecretStoreError> {
     }
 }
 
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn encode_keyring_value(secret: &SecretBytes) -> Zeroizing<String> {
     const HEX: &[u8; 16] = b"0123456789abcdef";
 
@@ -186,6 +191,7 @@ fn encode_keyring_value(secret: &SecretBytes) -> Zeroizing<String> {
     encoded
 }
 
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn decode_keyring_value(
     account: &SecretAccount,
     value: &str,
@@ -215,6 +221,7 @@ fn decode_keyring_value(
     Ok(SecretBytes { bytes })
 }
 
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn decode_lower_hex(value: u8) -> Option<u8> {
     match value {
         b'0'..=b'9' => Some(value - b'0'),
@@ -230,8 +237,10 @@ pub(crate) trait SecretStore: Send + Sync {
 }
 
 #[derive(Debug, Default)]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub(crate) struct KeyringSecretStore;
 
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 impl KeyringSecretStore {
     fn entry(account: &SecretAccount) -> Result<keyring::Entry, SecretStoreError> {
         keyring::Entry::new(SECRET_STORE_SERVICE, account.as_str())
@@ -246,6 +255,7 @@ impl KeyringSecretStore {
     }
 }
 
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 impl SecretStore for KeyringSecretStore {
     fn put(&self, account: &SecretAccount, secret: &SecretBytes) -> Result<(), SecretStoreError> {
         let entry = Self::entry(account)?;
@@ -282,6 +292,7 @@ impl SecretStore for KeyringSecretStore {
     }
 }
 
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn load_raw_keyring_value(
     entry: &keyring::Entry,
 ) -> Result<Option<Zeroizing<String>>, SecretStoreError> {
@@ -292,6 +303,7 @@ fn load_raw_keyring_value(
     }
 }
 
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn put_keyring_with_claim<Load, Store>(
     claim_root: &Path,
     account: &SecretAccount,
@@ -317,6 +329,7 @@ where
     })
 }
 
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn with_account_claim<T>(
     claim_root: &Path,
     account: &SecretAccount,
@@ -339,6 +352,7 @@ fn with_account_claim<T>(
     }
 }
 
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn account_claim_filename(account: &SecretAccount) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut name = String::with_capacity(account.as_str().len() * 2 + ".lock".len());

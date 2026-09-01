@@ -5,20 +5,9 @@ import TwinCompanionView from '@/views/companion/TwinCompanionView.vue'
 import TwinReviewQueue from '@/components/companion/TwinReviewQueue.vue'
 import TwinChat from '@/components/companion/TwinChat.vue'
 import { useTwinStore } from '@/stores/twin'
-
-const { capabilityState } = vi.hoisted(() => ({
-  capabilityState: { twinChat: true },
-}))
-
-vi.mock('@/platform/capabilities', async importOriginal => {
-  const actual = await importOriginal()
-  return {
-    ...actual,
-    hasCapability: (profile, capability) => (
-      capability === 'twinChat' ? capabilityState.twinChat : actual.hasCapability(profile, capability)
-    ),
-  }
-})
+import { resetTransport, setRuntimeProfile, setRuntimeStatus } from '@/api/transport'
+import { createRuntimeProfile } from '@/platform/runtime'
+import { CAPABILITY_NAMES, normalizeRuntimeStatus } from '@/platform/capabilities'
 
 const relationship = {
   subject_id: 'owner',
@@ -39,10 +28,36 @@ const bidirectionalRelationship = {
   direction: 'bidirectional',
 }
 
+function useTwinRuntime({ twinReview = true, twinChat = true } = {}) {
+  setRuntimeProfile(createRuntimeProfile({ isTauri: true, platform: 'android' }))
+  const capabilities = Object.fromEntries(CAPABILITY_NAMES.map(name => [name, false]))
+  Object.assign(capabilities, {
+    notesRead: true,
+    notesWrite: true,
+    recall: true,
+    twinReview,
+    twinChat,
+    linearCanvas: true,
+  })
+  setRuntimeStatus(normalizeRuntimeStatus({
+    schemaVersion: 1,
+    runtime: 'android',
+    capabilities,
+    vault: { kind: 'app_private', available: true },
+    secureSecrets: { status: 'ready', code: null, message: null },
+    nativeImageShare: {
+      status: 'unavailable',
+      code: 'share_unavailable',
+      message: 'Native image sharing is unavailable.',
+    },
+    diagnostics: [],
+  }))
+}
+
 describe('TwinCompanionView', () => {
   beforeEach(() => {
     setActivePinia(createPinia())
-    capabilityState.twinChat = true
+    useTwinRuntime()
     vi.useFakeTimers()
     vi.setSystemTime(new Date('2026-09-01T02:03:04Z'))
   })
@@ -50,6 +65,7 @@ describe('TwinCompanionView', () => {
   afterEach(() => {
     vi.useRealTimers()
     vi.restoreAllMocks()
+    resetTransport()
   })
 
   function mountView(store, {
@@ -332,7 +348,7 @@ describe('TwinCompanionView', () => {
   })
 
   it('keeps review available while independently hiding unavailable Twin chat', async () => {
-    capabilityState.twinChat = false
+    useTwinRuntime({ twinChat: false })
     const store = useTwinStore()
     const wrapper = mountView(store)
     await flushPromises()
@@ -340,6 +356,69 @@ describe('TwinCompanionView', () => {
     expect(wrapper.find('[aria-label="Open Twin chat"]').exists()).toBe(false)
     expect(wrapper.getComponent(TwinReviewQueue).exists()).toBe(true)
     expect(wrapper.get('[aria-label="Open Twin review"]').attributes('aria-current')).toBe('page')
+  })
+
+  it('closes an open Twin chat when its mounted runtime capability is revoked', async () => {
+    const store = useTwinStore()
+    const wrapper = mountView(store)
+    await flushPromises()
+    await wrapper.get('[aria-label="Open Twin chat"]').trigger('click')
+
+    expect(wrapper.getComponent(TwinChat).exists()).toBe(true)
+
+    useTwinRuntime({ twinChat: false })
+    await wrapper.vm.$nextTick()
+
+    expect(wrapper.find('[aria-label="Open Twin chat"]').exists()).toBe(false)
+    expect(wrapper.findComponent(TwinChat).exists()).toBe(false)
+    expect(wrapper.getComponent(TwinReviewQueue).exists()).toBe(true)
+    expect(wrapper.get('[aria-label="Open Twin review"]').attributes('aria-current')).toBe('page')
+  })
+
+  it('blocks a Twin chat tab action as its mounted capability is revoked', async () => {
+    const store = useTwinStore()
+    const wrapper = mountView(store)
+    await flushPromises()
+    const chatTab = wrapper.get('[aria-label="Open Twin chat"]')
+
+    useTwinRuntime({ twinChat: false })
+    await chatTab.trigger('click')
+
+    expect(wrapper.find('[aria-label="Open Twin chat"]').exists()).toBe(false)
+    expect(wrapper.findComponent(TwinChat).exists()).toBe(false)
+    expect(wrapper.getComponent(TwinReviewQueue).exists()).toBe(true)
+  })
+
+  it('blocks mounted Twin review actions as runtime authority is revoked', async () => {
+    const store = useTwinStore()
+    store.proposalPage = {
+      items: [{
+        item_id: 'proposal-a',
+        claim: { subject_id: 'owner', predicate: 'prefers', object: 'evidence' },
+      }],
+    }
+    store.memoryDigestItems = [{ id: 'digest-a', pattern: 'Evidence pattern' }]
+    const wrapper = mountView(store, { stubQueue: false })
+    await flushPromises()
+    const refreshCalls = store.loadWorkspace.mock.calls.length
+    const reviewProposal = vi.spyOn(store, 'reviewProposal').mockResolvedValue(null)
+    const reviewDigest = vi.spyOn(store, 'reviewMemoryDigestItem').mockResolvedValue()
+    const refreshButton = wrapper.get('[aria-label="Refresh Twin companion"]')
+    const acceptProposal = wrapper.get('[aria-label="Accept proposal proposal-a"]')
+    const keepDigest = wrapper.get('[aria-label="Keep digest digest-a"]')
+
+    useTwinRuntime({ twinReview: false, twinChat: false })
+    await wrapper.vm.$nextTick()
+    await refreshButton.trigger('click')
+    await acceptProposal.trigger('click')
+    await keepDigest.trigger('click')
+
+    expect(refreshButton.attributes('disabled')).toBeDefined()
+    expect(acceptProposal.attributes('disabled')).toBeDefined()
+    expect(keepDigest.attributes('disabled')).toBeDefined()
+    expect(store.loadWorkspace).toHaveBeenCalledTimes(refreshCalls)
+    expect(reviewProposal).not.toHaveBeenCalled()
+    expect(reviewDigest).not.toHaveBeenCalled()
   })
 
   it('hides stale attention and locks proposal review until the matching refresh finishes', async () => {

@@ -708,7 +708,8 @@ pub async fn list_link_suggestion_queue(
 ) -> Result<Vec<LinkSuggestionQueueEntry>, String> {
     let root_ticket = crate::commands::acquire_derived_root_epoch(state.inner()).await?;
     let result = {
-        let mut discovery = state.link_discovery.write().await;
+        let service = state.link_discovery_service()?;
+        let mut discovery = service.write().await;
         state
             .mutation_coordinator
             .as_ref()
@@ -734,7 +735,8 @@ pub async fn dismiss_link_suggestion(
 ) -> Result<DismissLinkSuggestionResponse, String> {
     let root_ticket = crate::commands::acquire_derived_root_epoch(state.inner()).await?;
     let response = {
-        let mut discovery = state.link_discovery.write().await;
+        let service = state.link_discovery_service()?;
+        let mut discovery = service.write().await;
         state
             .mutation_coordinator
             .as_ref()
@@ -767,7 +769,8 @@ pub async fn get_link_discovery_status(
             let settings_service = state.settings_service.read().await;
             settings_service.get().clone()
         };
-        let mut discovery = state.link_discovery.write().await;
+        let service = state.link_discovery_service()?;
+        let mut discovery = service.write().await;
         state
             .mutation_coordinator
             .as_ref()

@@ -11,7 +11,14 @@ use uuid::Uuid;
 #[cfg(test)]
 use walkdir::WalkDir;
 
+#[path = "store/integrity.rs"]
+mod integrity;
+
 pub const MAX_TWIN_EVENT_BYTES: usize = 256 * 1024;
+const EVENT_INTEGRITY_MARKER_LIMIT: usize = 1024 * 1024;
+const EVENT_LANE_HEAD_LIMIT: usize = 1024;
+const MAX_EVENT_INTEGRITY_LANES: usize = 4096;
+const CANONICAL_QUARANTINE_PREFIX: &str = "canonical-";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppendOutcome {
@@ -88,10 +95,61 @@ impl EventNamespace {
             }
         }
     }
+
+    fn integrity_dir(&self) -> String {
+        match self {
+            Self::Legacy => "twin/events/integrity/v1".into(),
+            Self::Vault(scope) => {
+                format!("twin/events/vaults/v1/{}/integrity/v1", scope.as_str())
+            }
+        }
+    }
+
+    fn integrity_heads_dir(&self) -> String {
+        format!("{}/heads", self.integrity_dir())
+    }
+
+    fn integrity_marker_key(&self) -> String {
+        format!("{}/adoption.json", self.integrity_dir())
+    }
+}
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+enum EventIntegrityPhaseV1 {
+    Adopting,
+    Enabled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EventLaneIdentityV1 {
+    device_id: DeviceId,
+    causal_stream: CausalStream,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EventLaneHeadV1 {
+    schema_version: u16,
+    lane: EventLaneIdentityV1,
+    device_sequence: u64,
+    event_id: EventId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EventIntegrityMarkerV1 {
+    schema_version: u16,
+    phase: EventIntegrityPhaseV1,
+    heads: Vec<EventLaneHeadV1>,
 }
 
 struct StoreState {
     initialized: bool,
+    integrity_ready: bool,
     events: BTreeMap<EventId, TwinEvent>,
     namespace: EventNamespace,
 }
@@ -100,6 +158,7 @@ impl Default for StoreState {
     fn default() -> Self {
         Self {
             initialized: false,
+            integrity_ready: false,
             events: BTreeMap::new(),
             namespace: EventNamespace::Legacy,
         }
@@ -202,6 +261,7 @@ impl TwinEventStore {
             Some(root);
         state.events = events;
         state.initialized = true;
+        state.integrity_ready = false;
         Ok(())
     }
 
@@ -347,6 +407,7 @@ impl TwinEventStore {
         let events = events?;
         state.namespace = namespace;
         state.events = events;
+        state.integrity_ready = false;
         Ok(())
     }
 
@@ -396,6 +457,10 @@ impl TwinEventStore {
             })?;
         root.open_directory(&namespace.staging_dir(), true)
             .map_err(store_capability_error)?;
+        root.open_directory(&namespace.integrity_dir(), true)
+            .map_err(store_capability_error)?;
+        root.open_directory(&namespace.integrity_heads_dir(), true)
+            .map_err(store_capability_error)?;
         Ok(())
     }
 
@@ -410,6 +475,8 @@ impl TwinEventStore {
             namespace.records_dir(),
             namespace.quarantine_dir(),
             namespace.staging_dir(),
+            namespace.integrity_dir(),
+            namespace.integrity_heads_dir(),
         ] {
             root.open_directory(&directory, false)
                 .map_err(store_capability_error)?;
@@ -433,13 +500,16 @@ impl TwinEventStore {
         namespace: &EventNamespace,
     ) -> Result<BTreeMap<EventId, TwinEvent>, StoreError> {
         self.validate_store_layout(root, namespace)?;
+        self.reject_persistent_canonical_quarantine(root, namespace)?;
         let mut parsed = Vec::new();
+        let mut canonical_incident = None;
         let keys = self.event_record_keys(root, namespace)?;
         #[cfg(test)]
         if let Some(hook) = self.after_enumeration_hook.lock().unwrap().take() {
             hook();
         }
         for key in keys {
+            let canonical_shaped = canonical_shaped_event_key(namespace, &key);
             let bytes = match root.read_bounded(&key, MAX_TWIN_EVENT_BYTES) {
                 Ok(Some(bytes)) => bytes,
                 Ok(None) => {
@@ -448,7 +518,12 @@ impl TwinEventStore {
                     )))
                 }
                 Err(super::MutationError::Invalid(message)) if message.contains("exceeds its") => {
-                    self.quarantine(root, namespace, &key)?;
+                    self.quarantine(root, namespace, &key, canonical_shaped)?;
+                    if canonical_shaped {
+                        canonical_incident.get_or_insert_with(|| {
+                            format!("canonical Twin event record exceeded its size limit: {key}")
+                        });
+                    }
                     continue;
                 }
                 Err(error) => return Err(store_capability_error(error)),
@@ -456,18 +531,33 @@ impl TwinEventStore {
             let event = match serde_json::from_slice::<TwinEvent>(&bytes) {
                 Ok(mut event) => {
                     if event.validate().is_err() || derive_event_id(&event) != event.event_id {
-                        self.quarantine(root, namespace, &key)?;
+                        self.quarantine(root, namespace, &key, canonical_shaped)?;
+                        if canonical_shaped {
+                            canonical_incident.get_or_insert_with(|| {
+                                format!("canonical Twin event record failed validation: {key}")
+                            });
+                        }
                         continue;
                     }
                     if key != canonical_event_key(namespace, &event.event_id) {
-                        self.quarantine(root, namespace, &key)?;
+                        self.quarantine(root, namespace, &key, canonical_shaped)?;
+                        if canonical_shaped {
+                            canonical_incident.get_or_insert_with(|| {
+                                format!("canonical Twin event key does not match its record: {key}")
+                            });
+                        }
                         continue;
                     }
                     event.normalize();
                     event
                 }
                 Err(_) => {
-                    self.quarantine(root, namespace, &key)?;
+                    self.quarantine(root, namespace, &key, canonical_shaped)?;
+                    if canonical_shaped {
+                        canonical_incident.get_or_insert_with(|| {
+                            format!("canonical Twin event record is malformed: {key}")
+                        });
+                    }
                     continue;
                 }
             };
@@ -489,7 +579,10 @@ impl TwinEventStore {
             let mut retained = Vec::with_capacity(parsed.len() - invalid.len());
             for (path, event) in parsed {
                 if invalid.contains(&event.event_id) {
-                    self.quarantine(root, namespace, &path)?;
+                    self.quarantine(root, namespace, &path, true)?;
+                    canonical_incident.get_or_insert_with(|| {
+                        format!("canonical Twin event record has an unavailable dependency: {path}")
+                    });
                 } else {
                     retained.push((path, event));
                 }
@@ -505,10 +598,13 @@ impl TwinEventStore {
                 if semantic_bytes(existing) != semantic_bytes(&event) {
                     return Err(StoreError::Collision(event.event_id));
                 }
-                self.quarantine(root, namespace, &path)?;
+                self.quarantine(root, namespace, &path, false)?;
                 continue;
             }
             events.insert(event.event_id.clone(), event);
+        }
+        if let Some(message) = canonical_incident {
+            return Err(StoreError::Invalid(message));
         }
         validate_all_sequences(&events)?;
         topological_order(&events.values().cloned().collect::<Vec<_>>())?;
@@ -561,12 +657,43 @@ impl TwinEventStore {
         root: &super::AnchoredRoot,
         namespace: &EventNamespace,
         source: &str,
+        canonical_incident: bool,
     ) -> Result<(), StoreError> {
         self.validate_store_layout(root, namespace)?;
         let name = source.rsplit('/').next().unwrap_or("event.json");
-        let target = format!("{}/{}-{name}", namespace.quarantine_dir(), Uuid::new_v4());
+        let kind = if canonical_incident {
+            CANONICAL_QUARANTINE_PREFIX
+        } else {
+            "untrusted-"
+        };
+        let target = format!(
+            "{}/{kind}{}-{name}",
+            namespace.quarantine_dir(),
+            Uuid::new_v4()
+        );
         root.rename(source, &target, false)
             .map_err(store_capability_error)
+    }
+
+    fn reject_persistent_canonical_quarantine(
+        &self,
+        root: &super::AnchoredRoot,
+        namespace: &EventNamespace,
+    ) -> Result<(), StoreError> {
+        let persistent = root
+            .directory_entries(&namespace.quarantine_dir())
+            .map_err(store_capability_error)?
+            .into_iter()
+            .any(|(name, kind)| {
+                kind == super::AnchoredEntryKind::File
+                    && name.starts_with(CANONICAL_QUARANTINE_PREFIX)
+            });
+        if persistent {
+            return Err(StoreError::Invalid(
+                "canonical Twin event quarantine requires explicit recovery".into(),
+            ));
+        }
+        Ok(())
     }
 
     fn install_no_clobber(
@@ -623,6 +750,25 @@ fn canonical_event_key(namespace: &EventNamespace, event_id: &EventId) -> String
         &event_id.as_str()[..2],
         event_id
     )
+}
+
+fn canonical_shaped_event_key(namespace: &EventNamespace, key: &str) -> bool {
+    let Some(relative) = key
+        .strip_prefix(&namespace.records_dir())
+        .and_then(|relative| relative.strip_prefix('/'))
+    else {
+        return false;
+    };
+    let mut components = relative.split('/');
+    let (Some(prefix), Some(filename), None) =
+        (components.next(), components.next(), components.next())
+    else {
+        return false;
+    };
+    let Some(raw_id) = filename.strip_suffix(".json") else {
+        return false;
+    };
+    EventId::parse(raw_id.to_owned()).is_ok() && prefix.len() == 2 && prefix == &raw_id[..2]
 }
 
 fn store_capability_error(error: super::MutationError) -> StoreError {
@@ -1594,13 +1740,14 @@ mod tests {
         write_event(&canonical_path(&store, &local), &local);
         write_event(&canonical_path(&store, &shared), &shared);
 
-        store.initialize().unwrap();
+        assert!(store.initialize().is_err());
 
-        assert_eq!(store.ordered_events().unwrap(), vec![local]);
+        assert!(canonical_path(&store, &local).is_file());
         assert_eq!(
             std::fs::read_dir(store.quarantine_dir()).unwrap().count(),
             1
         );
+        assert!(TwinEventStore::new(temp.path()).initialize().is_err());
     }
 
     #[test]
@@ -1849,12 +1996,13 @@ mod tests {
             .join(format!("{}.json", "a".repeat(64)));
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, vec![b' '; MAX_TWIN_EVENT_BYTES + 1]).unwrap();
-        store.initialize().unwrap();
+        assert!(store.initialize().is_err());
         assert!(!path.exists());
         assert_eq!(
             std::fs::read_dir(store.quarantine_dir()).unwrap().count(),
             1
         );
+        assert!(TwinEventStore::new(temp.path()).initialize().is_err());
     }
 
     #[test]
@@ -1904,14 +2052,14 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, serde_json::to_vec_pretty(&json).unwrap()).unwrap();
 
-        store.initialize().unwrap();
+        assert!(store.initialize().is_err());
 
-        assert!(store.ordered_events().unwrap().is_empty());
         assert!(!path.exists());
         assert_eq!(
             std::fs::read_dir(store.quarantine_dir()).unwrap().count(),
             1
         );
+        assert!(TwinEventStore::new(temp.path()).initialize().is_err());
     }
 
     #[test]
@@ -1928,9 +2076,9 @@ mod tests {
             write_event(&canonical_path(&store, event), event);
         }
 
-        store.initialize().unwrap();
+        assert!(store.initialize().is_err());
 
-        assert_eq!(store.ordered_events().unwrap(), vec![clean]);
+        assert!(canonical_path(&store, &clean).is_file());
         assert_eq!(
             std::fs::read_dir(store.quarantine_dir()).unwrap().count(),
             2
@@ -2012,11 +2160,11 @@ mod tests {
             std::fs::write(&hook_target, replacement_bytes).unwrap();
         });
 
-        assert!(store.ordered_events().unwrap().is_empty());
-        assert!(store.ordered_events().unwrap().is_empty());
+        assert!(store.ordered_events().is_err());
+        assert!(store.ordered_events().is_err());
         assert_eq!(
             std::fs::read_dir(store.quarantine_dir()).unwrap().count(),
-            2
+            1
         );
         assert!(!target.exists());
     }

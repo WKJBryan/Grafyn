@@ -195,13 +195,19 @@ fn event_evidence(event: &TwinEvent) -> EventEvidenceRef {
     }
 }
 
-fn append_all(store: &TwinEventStore, events: &[TwinEvent]) {
+fn append_all(
+    store: &TwinEventStore,
+    coordinator: &crate::services::twin_events::MutationCoordinator,
+    events: &[TwinEvent],
+) {
+    let _root_guard = coordinator.begin_root_transition().unwrap();
     for event in events {
         assert_eq!(
             store.append(event.clone()).unwrap(),
             AppendOutcome::Appended
         );
     }
+    store.advance_integrity_heads(events).unwrap();
 }
 
 fn exported_events(bundle: &ExportBundle) -> Vec<TwinEvent> {
@@ -215,7 +221,7 @@ fn exported_events(bundle: &ExportBundle) -> Vec<TwinEvent> {
 #[test]
 fn eligible_reviewed_chain_exports_unchanged_and_projects_only_accepted_state() {
     let root = tempdir().unwrap();
-    let (mut store, events, _) = coordinated_store(root.path());
+    let (mut store, events, coordinator) = coordinated_store(root.path());
     let observation = observation("chain", 1, Vec::new(), "quiet mornings");
     let mut proposal = memory_proposal(
         "chain",
@@ -228,6 +234,7 @@ fn eligible_reviewed_chain_exports_unchanged_and_projects_only_accepted_state() 
     let review = accepted_review("chain", 3, vec![proposal.event_id.clone()], "memory-chain");
     append_all(
         &events,
+        &coordinator,
         &[observation.clone(), proposal.clone(), review.clone()],
     );
 
@@ -265,7 +272,7 @@ fn eligible_reviewed_chain_exports_unchanged_and_projects_only_accepted_state() 
 fn export_excludes_every_governance_and_review_denial_before_serialization() {
     let outer = tempdir().unwrap();
     let root = outer.path().join("ABSOLUTE_PATH_SENTINEL");
-    let (mut store, events, _) = coordinated_store(&root);
+    let (mut store, events, coordinator) = coordinated_store(&root);
 
     let mut sensitive = observation("sensitive", 1, Vec::new(), "explicit sensitive export");
     sensitive.governance.sensitivity = Sensitivity::Sensitive;
@@ -349,6 +356,7 @@ fn export_excludes_every_governance_and_review_denial_before_serialization() {
     future = rehash(future);
     append_all(
         &events,
+        &coordinator,
         &[
             sensitive.clone(),
             no_export,
@@ -379,7 +387,7 @@ fn export_excludes_every_governance_and_review_denial_before_serialization() {
 #[test]
 fn later_review_revocation_removes_every_previously_accepted_memory_event() {
     let root = tempdir().unwrap();
-    let (mut store, events, _) = coordinated_store(root.path());
+    let (mut store, events, coordinator) = coordinated_store(root.path());
 
     let rejected_proposal = memory_proposal("accepted-rejected", 1, Vec::new(), "revoked-memory");
     let accepted_before_reject = accepted_review(
@@ -412,6 +420,7 @@ fn later_review_revocation_removes_every_previously_accepted_memory_event() {
     let survivor = observation("revocation-survivor", 1, Vec::new(), "retained survivor");
     append_all(
         &events,
+        &coordinator,
         &[
             rejected_proposal,
             accepted_before_reject,
@@ -439,7 +448,7 @@ fn later_review_revocation_removes_every_previously_accepted_memory_event() {
 #[test]
 fn private_superseder_revokes_an_older_exportable_event() {
     let root = tempdir().unwrap();
-    let (mut store, events, _) = coordinated_store(root.path());
+    let (mut store, events, coordinator) = coordinated_store(root.path());
     let original = observation("exportable-original", 1, Vec::new(), "revoked observation");
     let mut private_revoker = observation("private-revoker", 1, Vec::new(), "private correction");
     private_revoker.causal_stream = CausalStream::LocalOnly;
@@ -449,7 +458,7 @@ fn private_superseder_revokes_an_older_exportable_event() {
     private_revoker.governance.allowed_uses.sync = false;
     private_revoker.supersedes = vec![original.event_id.clone()];
     private_revoker = rehash(private_revoker);
-    append_all(&events, &[original, private_revoker]);
+    append_all(&events, &coordinator, &[original, private_revoker]);
 
     let bundle = store
         .export_bundle(export_request("private-revocation"))
@@ -461,7 +470,7 @@ fn private_superseder_revokes_an_older_exportable_event() {
 #[test]
 fn dependency_closure_prunes_every_explicit_and_typed_semantic_dangling_reference() {
     let root = tempdir().unwrap();
-    let (mut store, events, _) = coordinated_store(root.path());
+    let (mut store, events, coordinator) = coordinated_store(root.path());
     let mut denied = observation("denied", 1, Vec::new(), "denied dependency");
     denied.governance.allowed_uses.export = false;
     denied = rehash(denied);
@@ -510,6 +519,7 @@ fn dependency_closure_prunes_every_explicit_and_typed_semantic_dangling_referenc
     let survivor = observation("survivor", 1, Vec::new(), "retained survivor");
     append_all(
         &events,
+        &coordinator,
         &[
             denied,
             causal,
@@ -537,6 +547,7 @@ fn artifact_manifest_uses_relative_names_and_atomic_export_adds_one_generation()
     let (mut store, events, coordinator) = coordinated_store(root.path());
     append_all(
         &events,
+        &coordinator,
         &[observation("atomic", 1, Vec::new(), "atomic export")],
     );
     let before = coordinator.current_authority_token().unwrap();

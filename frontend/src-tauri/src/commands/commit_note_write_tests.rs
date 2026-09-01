@@ -65,7 +65,7 @@ pub(crate) fn build_test_state() -> (AppState, TempDir, TempDir) {
         search_service: Arc::new(RwLock::new(search_service)),
         canvas_store: Arc::new(RwLock::new(CanvasStore::new(data_path.join("canvas")))),
         openrouter: Arc::new(RwLock::new(OpenRouterService::new(String::new()))),
-        ollama: Arc::new(RwLock::new(OllamaService::new(String::new()))),
+        ollama: Some(Arc::new(RwLock::new(OllamaService::new(String::new())))),
         feedback_service: Arc::new(RwLock::new(FeedbackService::new(
             data_path.join("feedback"),
         ))),
@@ -73,11 +73,13 @@ pub(crate) fn build_test_state() -> (AppState, TempDir, TempDir) {
         priority_service: Arc::new(RwLock::new(PriorityScoringService::new(data_path.clone()))),
         retrieval_service: Arc::new(RwLock::new(RetrievalService::new(data_path.clone()))),
         chunk_index: Arc::new(RwLock::new(chunk_index)),
-        link_discovery: Arc::new(RwLock::new(LinkDiscoveryService::new(namespace.clone()))),
-        markdown_migration: Arc::new(RwLock::new(MarkdownMigrationService::new(
+        link_discovery: Some(Arc::new(RwLock::new(LinkDiscoveryService::new(
             namespace.clone(),
-        ))),
-        vault_optimizer: Arc::new(RwLock::new(VaultOptimizerService::new(namespace))),
+        )))),
+        markdown_migration: Some(Arc::new(RwLock::new(MarkdownMigrationService::new(
+            namespace.clone(),
+        )))),
+        vault_optimizer: Some(Arc::new(RwLock::new(VaultOptimizerService::new(namespace)))),
         twin_store: Arc::new(RwLock::new(TwinStore::new(data_path.join("twin")))),
         twin_event_store,
         mutation_coordinator: Some(mutation_coordinator),
@@ -226,6 +228,8 @@ async fn remote_sync_repair_rebuilds_and_publishes_without_hub_or_optimizer_echo
     assert_eq!(
         state
             .vault_optimizer
+            .as_ref()
+            .unwrap()
             .read()
             .await
             .status(&UserSettings::default())
@@ -248,6 +252,8 @@ async fn remote_sync_repair_rebuilds_and_publishes_without_hub_or_optimizer_echo
     assert_eq!(
         state
             .vault_optimizer
+            .as_ref()
+            .unwrap()
             .read()
             .await
             .status(&UserSettings::default())
@@ -381,7 +387,7 @@ async fn live_rebuild_replays_optimizer_wal_before_witness_recovery() {
     let settings = UserSettings::default();
     let pending = {
         let store = state.knowledge_store.read().await;
-        let mut optimizer = state.vault_optimizer.write().await;
+        let mut optimizer = state.vault_optimizer.as_ref().unwrap().write().await;
         match optimizer
             .prepare_next_expecting_authority(&store, &settings, expected)
             .unwrap()
@@ -401,7 +407,7 @@ async fn live_rebuild_replays_optimizer_wal_before_witness_recovery() {
     coordinator.fail_next_replays_before_targets(2);
     let apply = {
         let mut store = state.knowledge_store.write().await;
-        let mut optimizer = state.vault_optimizer.write().await;
+        let mut optimizer = state.vault_optimizer.as_ref().unwrap().write().await;
         optimizer.apply_pending(&mut store, pending)
     };
     assert!(apply.is_err());
@@ -425,7 +431,7 @@ async fn live_rebuild_replays_optimizer_wal_before_witness_recovery() {
         .await
         .overlay_path(&created.id)
         .exists());
-    let optimizer = state.vault_optimizer.read().await;
+    let optimizer = state.vault_optimizer.as_ref().unwrap().read().await;
     let status = optimizer.status(&settings);
     assert_eq!(status.accepted_count, 1);
     assert_eq!(optimizer.list_decisions(10).unwrap().len(), 1);
@@ -480,7 +486,7 @@ async fn post_cas_guard_abort_retires_optimizer_owner_before_ready_repair() {
     let settings = UserSettings::default();
     let pending = {
         let store = state.knowledge_store.read().await;
-        let mut optimizer = state.vault_optimizer.write().await;
+        let mut optimizer = state.vault_optimizer.as_ref().unwrap().write().await;
         match optimizer
             .prepare_next_expecting_authority(&store, &settings, before.clone())
             .unwrap()
@@ -500,7 +506,7 @@ async fn post_cas_guard_abort_retires_optimizer_owner_before_ready_repair() {
     let resume = Arc::new(std::sync::Barrier::new(2));
     coordinator.pause_after_authority_advance_once(entered.clone(), resume.clone());
     let knowledge = state.knowledge_store.clone();
-    let optimizer = state.vault_optimizer.clone();
+    let optimizer = state.vault_optimizer.as_ref().unwrap().clone();
     let owner = std::thread::spawn(move || {
         let mut store = knowledge.blocking_write();
         let mut optimizer = optimizer.blocking_write();
@@ -547,7 +553,7 @@ async fn post_cas_guard_abort_retires_optimizer_owner_before_ready_repair() {
         .exists());
     assert_eq!(std::fs::read(&markdown_path).unwrap(), edited);
     {
-        let optimizer = state.vault_optimizer.read().await;
+        let optimizer = state.vault_optimizer.as_ref().unwrap().read().await;
         assert!(optimizer.list_decisions(10).unwrap().is_empty());
         assert!(optimizer.inbox(None, 10).unwrap().is_empty());
         let queue: serde_json::Value = serde_json::from_slice(
@@ -876,7 +882,7 @@ async fn optimizer_sidecar_write_is_reindexed_into_search() {
     // application runs under the knowledge-store write lock.
     let tick = {
         let store = state.knowledge_store.read().await;
-        let mut optimizer = state.vault_optimizer.write().await;
+        let mut optimizer = state.vault_optimizer.as_ref().unwrap().write().await;
         optimizer
             .prepare_next(&store, &settings)
             .expect("prepare_next should not error")
@@ -887,7 +893,7 @@ async fn optimizer_sidecar_write_is_reindexed_into_search() {
     };
     let applied_note_id = {
         let mut store = state.knowledge_store.write().await;
-        let mut optimizer = state.vault_optimizer.write().await;
+        let mut optimizer = state.vault_optimizer.as_ref().unwrap().write().await;
         match optimizer
             .apply_pending(&mut store, *pending)
             .expect("apply_pending should not error")
@@ -964,7 +970,7 @@ async fn optimizer_full_rewrite_write_is_reindexed_into_search() {
 
     let tick = {
         let store = state.knowledge_store.read().await;
-        let mut optimizer = state.vault_optimizer.write().await;
+        let mut optimizer = state.vault_optimizer.as_ref().unwrap().write().await;
         optimizer
             .prepare_next(&store, &settings)
             .expect("prepare_next should not error")
@@ -979,7 +985,7 @@ async fn optimizer_full_rewrite_write_is_reindexed_into_search() {
 
     let applied_note_id = {
         let mut store = state.knowledge_store.write().await;
-        let mut optimizer = state.vault_optimizer.write().await;
+        let mut optimizer = state.vault_optimizer.as_ref().unwrap().write().await;
         match optimizer
             .apply_pending(&mut store, *pending)
             .expect("apply_pending should not error")

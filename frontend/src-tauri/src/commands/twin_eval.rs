@@ -164,7 +164,8 @@ pub async fn run_twin_eval_lab(
         }
     }
 
-    let _root_guard = crate::commands::acquire_expected_root_epoch(state.inner(), &root_epoch).await?;
+    let _root_guard =
+        crate::commands::acquire_expected_root_epoch(state.inner(), &root_epoch).await?;
     Ok(TwinEvalRunReport {
         question,
         context_packet,
@@ -258,7 +259,7 @@ pub async fn run_twin_eval_lab_stream(
         },
     );
 
-    let ollama_arc = Arc::clone(&state.ollama);
+    let ollama_arc = state.ollama_service()?;
     let question = Arc::new(question);
     let context_packet = Arc::new(context_packet);
     let settings = Arc::new(settings);
@@ -330,23 +331,23 @@ pub async fn run_twin_eval_lab_stream(
                         error: Some(error),
                     },
                 };
-                let _root_guard = match crate::commands::acquire_expected_root_epoch(
-                    &root_state,
-                    &root_epoch,
-                )
-                .await
-                {
-                    Ok(guard) => guard,
-                    Err(error) => {
-                        let _ = window.emit(
-                            "lab-stream",
-                            LabStreamEvent::Error {
-                                message: format!("Twin Eval result discarded after vault switch: {error}"),
-                            },
-                        );
-                        return;
-                    }
-                };
+                let _root_guard =
+                    match crate::commands::acquire_expected_root_epoch(&root_state, &root_epoch)
+                        .await
+                    {
+                        Ok(guard) => guard,
+                        Err(error) => {
+                            let _ = window.emit(
+                                "lab-stream",
+                                LabStreamEvent::Error {
+                                    message: format!(
+                                        "Twin Eval result discarded after vault switch: {error}"
+                                    ),
+                                },
+                            );
+                            return;
+                        }
+                    };
                 let _ = window.emit(
                     "lab-stream",
                     LabStreamEvent::ModelComplete { result: scored },
@@ -566,7 +567,10 @@ fn action_gap_source(gap: ActionGap) -> TwinEvalContextSource {
 }
 
 async fn installed_ollama_model_ids(state: &State<'_, AppState>) -> Vec<String> {
-    let ollama = state.ollama.read().await;
+    let Ok(service) = state.ollama_service() else {
+        return Vec::new();
+    };
+    let ollama = service.read().await;
     ollama
         .list_models()
         .await
@@ -582,7 +586,8 @@ async fn run_ollama_lab_case(
     settings: &TwinEvalRunSettings,
     is_base: bool,
 ) -> Result<String, String> {
-    let ollama = state.ollama.read().await;
+    let service = state.ollama_service()?;
+    let ollama = service.read().await;
     let mut raw = String::new();
 
     if is_base {

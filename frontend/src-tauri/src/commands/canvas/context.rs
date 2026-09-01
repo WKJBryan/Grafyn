@@ -941,7 +941,7 @@ pub(super) async fn run_sealed_twin_prediction(
     root_epoch: crate::services::vault_namespace::VaultAuthorityTokenV1,
     twin_store: Arc<RwLock<TwinStore>>,
     openrouter: Arc<RwLock<OpenRouterService>>,
-    ollama: Arc<RwLock<OllamaService>>,
+    ollama: Option<Arc<RwLock<OllamaService>>>,
     provider_route: ModelProviderRoute,
     prediction_model: String,
     episode_id: String,
@@ -1068,10 +1068,16 @@ pub(super) async fn run_sealed_twin_prediction(
     }];
     let result = match provider_route {
         ModelProviderRoute::Ollama => {
-            let ollama = ollama.read().await;
-            ollama
-                .chat(&prediction_model, messages, Some(&system_prompt), Some(0.2))
-                .await
+            if let Some(ollama) = ollama {
+                let ollama = ollama.read().await;
+                ollama
+                    .chat(&prediction_model, messages, Some(&system_prompt), Some(0.2))
+                    .await
+            } else {
+                Err(anyhow::anyhow!(
+                    "Local Ollama is unavailable on this runtime"
+                ))
+            }
         }
         ModelProviderRoute::OpenRouter => {
             let openrouter = openrouter.read().await;

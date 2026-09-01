@@ -1,4 +1,5 @@
 import { flushPromises, mount } from '@vue/test-utils'
+import { createPinia } from 'pinia'
 import { createMemoryHistory, createRouter } from 'vue-router'
 import { describe, expect, it } from 'vitest'
 import CompanionShell from '@/components/companion/CompanionShell.vue'
@@ -18,7 +19,7 @@ async function mountShell(path = '/') {
   await router.isReady()
   const wrapper = mount(CompanionShell, {
     slots: { default: '<main data-test="shell-content">Content</main>' },
-    global: { plugins: [router] },
+    global: { plugins: [router, createPinia()] },
   })
   await flushPromises()
   return wrapper
@@ -60,5 +61,19 @@ describe('CompanionShell', () => {
 
     expect(links[3].attributes('aria-current')).toBe('page')
     expect(links.filter(link => link.attributes('aria-current') === 'page')).toHaveLength(1)
+  })
+
+  it('opens the compact settings sheet from an accessible utility action', async () => {
+    const wrapper = await mountShell()
+
+    const opener = wrapper.get('[aria-label="Open companion settings"]')
+    expect(wrapper.findComponent({ name: 'CompanionSettingsSheet' }).exists()).toBe(false)
+
+    await opener.trigger('click')
+    expect(wrapper.findComponent({ name: 'CompanionSettingsSheet' }).exists()).toBe(true)
+
+    wrapper.findComponent({ name: 'CompanionSettingsSheet' }).vm.$emit('close')
+    await flushPromises()
+    expect(wrapper.findComponent({ name: 'CompanionSettingsSheet' }).exists()).toBe(false)
   })
 })

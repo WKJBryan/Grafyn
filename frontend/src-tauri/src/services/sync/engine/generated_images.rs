@@ -7,13 +7,6 @@ pub(super) fn generated_image_attachment_digests(
     generated_image_attachment_digests_with_policy(events, sync_only, false)
 }
 
-pub(super) fn generated_image_attachment_digests_defer_incomplete(
-    events: &[TwinEvent],
-    sync_only: bool,
-) -> Result<BTreeSet<Digest32>, MutationError> {
-    generated_image_attachment_digests_with_policy(events, sync_only, true)
-}
-
 pub(super) fn quarantine_invalid_generated_image_attachment(
     data_root: &AnchoredRoot,
     state: &mut EngineState,

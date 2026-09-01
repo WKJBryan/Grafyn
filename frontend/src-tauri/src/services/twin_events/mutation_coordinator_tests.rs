@@ -777,7 +777,11 @@ fn stable_coordinator_rechecks_transition_wal_under_its_retained_process_lock() 
     let events = Arc::new(TwinEventStore::new(&data));
 
     transition_store
-        .load_startup_settings(|| Ok(None), || Ok(()))
+        .load_startup_settings(
+            crate::services::root_transition::StartupSecretPolicy::AllowLegacy,
+            || Ok(None),
+            || Ok(()),
+        )
         .unwrap();
     let transition = crate::services::root_transition::RootTransitionV1::prepared(
         before,
@@ -3255,6 +3259,84 @@ fn finalized_event_group(labels: &[&str]) -> Vec<crate::models::twin_event::Twin
         )
         .unwrap()
         .events
+}
+
+#[test]
+fn retained_wal_replay_heals_append_before_integrity_head_update() {
+    let temp = tempdir().unwrap();
+    let vault = temp.path().join("vault");
+    std::fs::create_dir(&vault).unwrap();
+    let store = Arc::new(TwinEventStore::new(temp.path()));
+    store.initialize().unwrap();
+    let coordinator = MutationCoordinator::new_stable(
+        temp.path(),
+        &vault,
+        store.clone(),
+        Arc::new(NoopMutationLifecycle),
+    )
+    .unwrap();
+    let marker = store
+        .events_dir()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("integrity/v1/adoption.json");
+    let marker_before = std::fs::read(&marker).unwrap();
+    let process_lock = coordinator.finalizer.acquire_coordinator_lock().unwrap();
+    let intent = coordinator
+        .prepare_intent(
+            &process_lock,
+            MutationOrigin::Local,
+            CausalStream::SyncEligible,
+            crate::models::twin_event::SourceChannel::parse("note_editor").unwrap(),
+            Vec::new(),
+            vec![draft("append-before-integrity-head")],
+            false,
+        )
+        .unwrap()
+        .unwrap();
+    let lease = coordinator.root_lease.lock().unwrap().clone();
+    let advanced = crate::services::vault_namespace::advance_authority_locked(
+        temp.path(),
+        &lease,
+        &process_lock,
+    )
+    .unwrap();
+    assert_eq!(
+        Some(advanced.authority_generation),
+        intent.content_authority_generation
+    );
+    coordinator.journal.stage(&process_lock, &intent).unwrap();
+    coordinator.fail_once_at(MutationFaultPoint::AfterEvent(0));
+
+    let error = coordinator
+        .replay_intent_locked(&process_lock, &intent, true, true)
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        MutationError::Io(message)
+            if message == "injected mutation crash at AfterEvent(0)"
+    ));
+    process_lock.unlock().unwrap();
+    assert_eq!(store.ordered_events().unwrap(), intent.events);
+    assert_eq!(std::fs::read(&marker).unwrap(), marker_before);
+    drop(coordinator);
+    drop(store);
+
+    let reopened_store = Arc::new(TwinEventStore::new(temp.path()));
+    let reopened = MutationCoordinator::new_stable(
+        temp.path(),
+        &vault,
+        reopened_store.clone(),
+        Arc::new(NoopMutationLifecycle),
+    )
+    .unwrap();
+
+    assert_eq!(reopened.pending_count().unwrap(), 0);
+    assert_eq!(reopened_store.ordered_events().unwrap(), intent.events);
+    reopened_store.validate_integrity(None).unwrap();
+    assert_ne!(std::fs::read(marker).unwrap(), marker_before);
 }
 
 #[derive(Default)]

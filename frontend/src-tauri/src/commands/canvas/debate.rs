@@ -267,7 +267,10 @@ pub async fn start_debate(
                     let response_provenance = provider_route.provenance_label(true).to_string();
                     let stream_result = match provider_route {
                         ModelProviderRoute::Ollama => {
-                            let ollama = ollama_arc.read().await;
+                            let ollama_handle = ollama_arc
+                                .as_ref()
+                                .expect("Ollama debate route was validated before spawning");
+                            let ollama = ollama_handle.read().await;
                             let result = ollama
                                 .chat_stream(&model_id, messages, None, Some(0.7))
                                 .await;
@@ -709,7 +712,10 @@ pub async fn continue_debate(
                 let response_provenance = provider_route.provenance_label(true).to_string();
                 let stream_result = match provider_route {
                     ModelProviderRoute::Ollama => {
-                        let ollama = ollama_arc.read().await;
+                        let ollama_handle = ollama_arc
+                            .as_ref()
+                            .expect("Ollama debate route was validated before spawning");
+                        let ollama = ollama_handle.read().await;
                         let result = ollama
                             .chat_stream(&model_id, messages, None, Some(0.7))
                             .await;

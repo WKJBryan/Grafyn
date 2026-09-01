@@ -252,24 +252,40 @@ impl UserSettings {
     /// Get the effective vault path (with default fallback)
     pub fn effective_vault_path(&self) -> std::path::PathBuf {
         if let Some(ref path) = self.vault_path {
-            std::path::PathBuf::from(path)
-        } else {
-            // Default to ~/Documents/Grafyn/vault
-            dirs::document_dir()
+            return std::path::PathBuf::from(path);
+        }
+
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        {
+            // Default to ~/Documents/Grafyn/vault on desktop hosts.
+            return dirs::document_dir()
                 .unwrap_or_else(|| std::path::PathBuf::from("."))
                 .join("Grafyn")
-                .join("vault")
+                .join("vault");
+        }
+
+        #[cfg(any(target_os = "android", target_os = "ios"))]
+        {
+            panic!("mobile runtime must inject its app-private vault path")
         }
     }
 
     /// Get the effective data path (always in app data directory)
     pub fn effective_data_path(&self) -> std::path::PathBuf {
-        dirs::data_local_dir()
-            .unwrap_or_else(|| {
-                dirs::document_dir().unwrap_or_else(|| std::path::PathBuf::from("."))
-            })
-            .join("Grafyn")
-            .join("data")
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        {
+            return dirs::data_local_dir()
+                .unwrap_or_else(|| {
+                    dirs::document_dir().unwrap_or_else(|| std::path::PathBuf::from("."))
+                })
+                .join("Grafyn")
+                .join("data");
+        }
+
+        #[cfg(any(target_os = "android", target_os = "ios"))]
+        {
+            panic!("mobile runtime data paths must come from RuntimeBootstrap")
+        }
     }
 
     pub fn effective_twin_data_path(

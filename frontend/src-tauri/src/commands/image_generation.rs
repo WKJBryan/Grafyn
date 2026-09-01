@@ -6,6 +6,8 @@ use crate::models::image_generation::{
     LoadedGeneratedImage, SaveGeneratedImageRequest, SavedGeneratedImage,
 };
 use crate::models::twin_event::{ContentDigest, TwinEventPayload};
+#[cfg(any(target_os = "android", test))]
+use crate::services::android_bridge::ShareDescriptor;
 use crate::services::attachment_store::{
     prepare_generated_image_for_storage, validate_generated_image_bytes,
 };
@@ -13,6 +15,8 @@ use crate::AppState;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use chrono::{DateTime, Utc};
 use std::path::Path;
+#[cfg(target_os = "android")]
+use tauri::Manager;
 use tauri::State;
 #[cfg(desktop)]
 use tauri_plugin_dialog::DialogExt;
@@ -20,6 +24,13 @@ use tauri_plugin_dialog::DialogExt;
 #[cfg(any(mobile, test))]
 const MOBILE_IMAGE_SHARE_UNAVAILABLE: &str =
     "Generated image file sharing is unavailable on mobile until secure native sharing is enabled";
+
+#[cfg(any(target_os = "android", test))]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GeneratedImageShareResult {
+    pub share_sheet_opened: bool,
+}
 
 #[cfg(test)]
 static SAVE_ENTRY_PAUSE: std::sync::OnceLock<
@@ -516,6 +527,63 @@ fn export_generated_image_to_path_for_test(
     result
 }
 
+#[cfg(any(target_os = "android", test))]
+fn prepare_generated_image_share(
+    receipt: &crate::services::openrouter::GeneratedImageReceipt,
+    retention_policy: crate::models::image_generation::ImageMetadataRetentionPolicy,
+) -> Result<
+    (
+        ShareDescriptor,
+        crate::services::attachment_store::PreparedGeneratedImage,
+    ),
+    String,
+> {
+    let prepared = prepare_generated_image_for_storage(
+        &receipt.bytes,
+        Some(&receipt.media_type),
+        retention_policy,
+    )
+    .map_err(|error| error.to_string())?;
+    let validated = validate_generated_image_bytes(prepared.bytes(), Some(prepared.media_type()))
+        .map_err(|error| error.to_string())?;
+    if validated.dimensions() != (receipt.width, receipt.height) {
+        return Err("Generated image receipt dimensions do not match its raster".into());
+    }
+    let extension = match prepared.media_type() {
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        "image/webp" => "webp",
+        _ => return Err("Generated image receipt MIME is unsupported".into()),
+    };
+    let file_name = format!("grafyn-{}.{}", uuid::Uuid::new_v4(), extension);
+    let descriptor = ShareDescriptor::parse(&file_name, prepared.media_type())
+        .map_err(|error| error.to_string())?;
+    Ok((descriptor, prepared))
+}
+
+#[cfg(any(target_os = "android", test))]
+async fn share_generated_image_inner(
+    state: &AppState,
+    request: ExportGeneratedImageRequest,
+    share: impl FnOnce(&ShareDescriptor, &[u8]) -> Result<(), String>,
+) -> Result<GeneratedImageShareResult, String> {
+    request.validate()?;
+    let service = state.openrouter.read().await.clone();
+    let receipt = service
+        .lease_generated_image(&request.receipt_id)
+        .map_err(|error| error.to_string())?;
+    let result = prepare_generated_image_share(&receipt, request.retention_policy).and_then(
+        |(descriptor, prepared)| {
+            share(&descriptor, prepared.bytes())?;
+            Ok(GeneratedImageShareResult {
+                share_sheet_opened: true,
+            })
+        },
+    );
+    service.release_generated_image(&request.receipt_id);
+    result
+}
+
 #[tauri::command]
 pub async fn discover_image_models(
     state: State<'_, AppState>,
@@ -607,6 +675,21 @@ pub async fn export_generated_image(
         let _ = state;
         Err(MOBILE_IMAGE_SHARE_UNAVAILABLE.into())
     }
+}
+
+#[cfg(target_os = "android")]
+#[tauri::command]
+pub async fn share_generated_image(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    request: ExportGeneratedImageRequest,
+) -> Result<GeneratedImageShareResult, String> {
+    share_generated_image_inner(state.inner(), request, move |descriptor, bytes| {
+        app.state::<crate::services::android_bridge::AndroidBridge<tauri::Wry>>()
+            .stage_and_share_generated_image(descriptor.file_name(), descriptor.mime(), bytes)
+            .map_err(|error| error.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
@@ -1345,6 +1428,103 @@ mod tests {
         assert_eq!(sync.generated_image_stage_file_count().unwrap(), 0);
         coordinator.recover_pending().unwrap();
         assert_eq!(state.twin_event_store.ordered_events().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn android_share_strips_metadata_revalidates_and_never_mutates_or_consumes() {
+        let (mut state, _vault, _data) = image_test_state();
+        let original = png_with_text_metadata();
+        let receipt_id =
+            install_receipt_with_bytes(&mut state, "Share-only receipt prompt", original);
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        for _ in 0..2 {
+            let captured = captured.clone();
+            let result = share_generated_image_inner(
+                &state,
+                ExportGeneratedImageRequest {
+                    receipt_id: receipt_id.clone(),
+                    retention_policy: ImageMetadataRetentionPolicy::StripMetadata,
+                },
+                move |descriptor, bytes| {
+                    captured.lock().unwrap().push((
+                        descriptor.file_name().to_owned(),
+                        descriptor.mime().to_owned(),
+                        bytes.to_vec(),
+                    ));
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
+            assert!(result.share_sheet_opened);
+            assert_eq!(
+                serde_json::to_value(&result).unwrap(),
+                serde_json::json!({ "shareSheetOpened": true })
+            );
+        }
+
+        let captured = captured.lock().unwrap();
+        assert_eq!(captured.len(), 2);
+        assert_ne!(captured[0].0, captured[1].0);
+        for (file_name, mime, bytes) in captured.iter() {
+            assert!(file_name.starts_with("grafyn-"));
+            assert!(file_name.ends_with(".png"));
+            assert_eq!(mime, "image/png");
+            validate_generated_image_bytes(bytes, Some(mime)).unwrap();
+            assert!(!bytes
+                .windows(b"private-export-metadata".len())
+                .any(|window| window == b"private-export-metadata"));
+        }
+        drop(captured);
+
+        assert!(state.twin_event_store.ordered_events().unwrap().is_empty());
+        assert!(state
+            .knowledge_store
+            .read()
+            .await
+            .list_notes()
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            state
+                .sync_engine
+                .as_ref()
+                .unwrap()
+                .status()
+                .unwrap()
+                .outbox_operations,
+            0
+        );
+        let service = state.openrouter.read().await.clone();
+        assert!(service.lease_generated_image(&receipt_id).is_ok());
+        service.release_generated_image(&receipt_id);
+    }
+
+    #[tokio::test]
+    async fn android_share_failure_is_retryable_and_keeps_the_exact_receipt_usable() {
+        let (mut state, _vault, _data) = image_test_state();
+        let receipt_id = install_receipt(&mut state, "Retryable share prompt");
+        let request = ExportGeneratedImageRequest {
+            receipt_id: receipt_id.clone(),
+            retention_policy: ImageMetadataRetentionPolicy::RetainOriginal,
+        };
+
+        let error = share_generated_image_inner(&state, request.clone(), |_descriptor, _bytes| {
+            Err("android_share_backend_unavailable".to_owned())
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(error, "android_share_backend_unavailable");
+
+        let retry = share_generated_image_inner(&state, request, |_descriptor, _bytes| Ok(()))
+            .await
+            .unwrap();
+        assert!(retry.share_sheet_opened);
+        let service = state.openrouter.read().await.clone();
+        assert!(service.lease_generated_image(&receipt_id).is_ok());
+        service.release_generated_image(&receipt_id);
+        assert!(state.twin_event_store.ordered_events().unwrap().is_empty());
     }
 
     #[tokio::test]

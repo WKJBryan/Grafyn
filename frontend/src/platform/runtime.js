@@ -1,10 +1,9 @@
 export const RUNTIME_PROFILES = Object.freeze({
   DESKTOP_WIDE: 'desktop-wide',
   ANDROID_COMPACT: 'android-compact',
+  IOS_COMPACT: 'ios-compact',
   PLAIN_WEB: 'plain-web',
 })
-
-const MOBILE_PLATFORMS = new Set(['android', 'ios'])
 
 export function createRuntimeProfile({ isTauri = false, platform = null } = {}) {
   if (!isTauri) {
@@ -15,10 +14,12 @@ export function createRuntimeProfile({ isTauri = false, platform = null } = {}) 
     })
   }
 
+  let name = RUNTIME_PROFILES.DESKTOP_WIDE
+  if (platform === 'android') name = RUNTIME_PROFILES.ANDROID_COMPACT
+  if (platform === 'ios') name = RUNTIME_PROFILES.IOS_COMPACT
+
   return Object.freeze({
-    name: MOBILE_PLATFORMS.has(platform)
-      ? RUNTIME_PROFILES.ANDROID_COMPACT
-      : RUNTIME_PROFILES.DESKTOP_WIDE,
+    name,
     isTauri: true,
     platform,
   })

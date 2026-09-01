@@ -16,12 +16,41 @@ function deferred() {
 vi.mock('@/components/companion/QuickCaptureCard.vue', () => ({
   default: {
     name: 'QuickCaptureCard',
+    props: {
+      attachmentDigests: {
+        type: Array,
+        default: () => [],
+      },
+    },
+    emits: ['captured', 'capture-uncertain'],
     template: `
       <button data-test="capture" @click="$emit('captured', { note: { id: 'new' } })">Capture</button>
       <button data-test="uncertain" @click="$emit('capture-uncertain')">Uncertain</button>
     `,
   },
 }))
+
+vi.mock('@/components/companion/QuickImageComposer.vue', () => ({
+  default: {
+    name: 'QuickImageComposer',
+    props: {
+      collapsible: Boolean,
+    },
+    emits: ['saved'],
+    template: '<div data-test="image-composer" />',
+  },
+}))
+
+const DIGEST_A = 'a'.repeat(64)
+const DIGEST_B = 'b'.repeat(64)
+
+function quickCapture(wrapper) {
+  return wrapper.getComponent({ name: 'QuickCaptureCard' })
+}
+
+function imageComposer(wrapper) {
+  return wrapper.getComponent({ name: 'QuickImageComposer' })
+}
 
 describe('CaptureView', () => {
   beforeEach(() => {
@@ -64,6 +93,93 @@ describe('CaptureView', () => {
     await flushPromises()
 
     expect(list).toHaveBeenCalledTimes(2)
+  })
+
+  it('passes only a validated governed image digest into the next capture', async () => {
+    vi.spyOn(notes, 'list').mockResolvedValue([])
+    const wrapper = mount(CaptureView)
+    await flushPromises()
+
+    imageComposer(wrapper).vm.$emit('saved', {
+      attachmentDigest: DIGEST_A,
+      localPath: 'C:\\private\\vault\\image.png',
+      providerResponse: { requestId: 'provider-secret' },
+    })
+    await wrapper.vm.$nextTick()
+
+    expect(quickCapture(wrapper).props('attachmentDigests')).toEqual([DIGEST_A])
+
+    imageComposer(wrapper).vm.$emit('saved', {
+      attachmentDigest: '../private/image.png',
+      localPath: 'C:\\private\\vault\\image.png',
+    })
+    await wrapper.vm.$nextTick()
+
+    expect(quickCapture(wrapper).props('attachmentDigests')).toEqual([DIGEST_A])
+    expect(wrapper.text()).not.toContain('provider-secret')
+    expect(wrapper.text()).not.toContain('private')
+  })
+
+  it('replaces the pending attachment when a later governed image save succeeds', async () => {
+    vi.spyOn(notes, 'list').mockResolvedValue([])
+    const wrapper = mount(CaptureView)
+    await flushPromises()
+
+    imageComposer(wrapper).vm.$emit('saved', { attachmentDigest: DIGEST_A })
+    await wrapper.vm.$nextTick()
+    imageComposer(wrapper).vm.$emit('saved', { attachmentDigest: DIGEST_B })
+    await wrapper.vm.$nextTick()
+
+    expect(quickCapture(wrapper).props('attachmentDigests')).toEqual([DIGEST_B])
+  })
+
+  it('clears only the digest confirmed in the successful capture evidence', async () => {
+    vi.spyOn(notes, 'list').mockResolvedValue([])
+    const wrapper = mount(CaptureView)
+    await flushPromises()
+
+    imageComposer(wrapper).vm.$emit('saved', { attachmentDigest: DIGEST_A })
+    await wrapper.vm.$nextTick()
+    imageComposer(wrapper).vm.$emit('saved', { attachmentDigest: DIGEST_B })
+    await wrapper.vm.$nextTick()
+
+    quickCapture(wrapper).vm.$emit('captured', {
+      note: {
+        id: 'capture-a',
+        properties: { attachment_digests: [DIGEST_A] },
+      },
+    })
+    await flushPromises()
+
+    expect(quickCapture(wrapper).props('attachmentDigests')).toEqual([DIGEST_B])
+
+    quickCapture(wrapper).vm.$emit('captured', {
+      note: {
+        id: 'capture-b',
+        properties: { attachment_digests: [DIGEST_B] },
+      },
+    })
+    await flushPromises()
+
+    expect(quickCapture(wrapper).props('attachmentDigests')).toEqual([])
+  })
+
+  it('retains the pending digest when capture success cannot confirm it or is uncertain', async () => {
+    vi.spyOn(notes, 'list').mockResolvedValue([])
+    const wrapper = mount(CaptureView)
+    await flushPromises()
+
+    imageComposer(wrapper).vm.$emit('saved', { attachmentDigest: DIGEST_A })
+    await wrapper.vm.$nextTick()
+    quickCapture(wrapper).vm.$emit('captured', { note: { id: 'capture-without-evidence' } })
+    await flushPromises()
+
+    expect(quickCapture(wrapper).props('attachmentDigests')).toEqual([DIGEST_A])
+
+    quickCapture(wrapper).vm.$emit('capture-uncertain')
+    await flushPromises()
+
+    expect(quickCapture(wrapper).props('attachmentDigests')).toEqual([DIGEST_A])
   })
 
   it('refreshes recent captures after an uncertain capture outcome', async () => {
