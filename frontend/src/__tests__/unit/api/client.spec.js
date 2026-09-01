@@ -39,6 +39,7 @@ import {
   search,
   graph,
   canvas,
+  images,
   twin,
   feedback,
   settings,
@@ -603,6 +604,68 @@ describe('API Client (Tauri)', () => {
       mockInvoke.mockResolvedValue([])
       await settings.listOllamaModels()
       expect(mockInvoke).toHaveBeenCalledWith('list_ollama_models', {})
+    })
+  })
+
+  describe('Generated image API', () => {
+    it('maps discovery, capability, generation, save, export, and load to strict request DTOs', async () => {
+      mockInvoke.mockResolvedValue({})
+
+      await images.discoverModels()
+      expect(mockInvoke).toHaveBeenLastCalledWith('discover_image_models', { request: {} })
+
+      await images.getModelCapability('author/image-model')
+      expect(mockInvoke).toHaveBeenLastCalledWith('get_image_model_capability', {
+        request: { modelId: 'author/image-model' },
+      })
+
+      await images.generate({
+        prompt: 'A quiet workspace',
+        modelId: 'author/image-model',
+        resolution: '1024x1024',
+        aspectRatio: '1:1',
+      })
+      expect(mockInvoke).toHaveBeenLastCalledWith('generate_image', {
+        request: {
+          prompt: 'A quiet workspace',
+          modelId: 'author/image-model',
+          resolution: '1024x1024',
+          aspectRatio: '1:1',
+        },
+      })
+
+      await images.save({
+        receiptId: '018f0ca8-2e42-7c1e-ae13-7b35f09b4501',
+        annotation: 'Concept sketch',
+        retentionPolicy: 'strip_metadata',
+        grafynSync: 'local_only',
+      })
+      expect(mockInvoke).toHaveBeenLastCalledWith('save_generated_image', {
+        request: {
+          receiptId: '018f0ca8-2e42-7c1e-ae13-7b35f09b4501',
+          annotation: 'Concept sketch',
+          retentionPolicy: 'strip_metadata',
+          grafynSync: 'local_only',
+        },
+      })
+
+      await images.saveAs('018f0ca8-2e42-7c1e-ae13-7b35f09b4501', 'strip_metadata')
+      expect(mockInvoke).toHaveBeenLastCalledWith('export_generated_image', {
+        request: {
+          receiptId: '018f0ca8-2e42-7c1e-ae13-7b35f09b4501',
+          retentionPolicy: 'strip_metadata',
+        },
+      })
+
+      await images.load('a'.repeat(64))
+      expect(mockInvoke).toHaveBeenLastCalledWith('load_generated_image', {
+        request: { attachmentDigest: 'a'.repeat(64) },
+      })
+
+      await images.discard('018f0ca8-2e42-7c1e-ae13-7b35f09b4501')
+      expect(mockInvoke).toHaveBeenLastCalledWith('discard_generated_image_receipt', {
+        request: { receiptId: '018f0ca8-2e42-7c1e-ae13-7b35f09b4501' },
+      })
     })
   })
 

@@ -16,6 +16,9 @@ use std::sync::Arc;
 use walkdir::WalkDir;
 
 mod exact_targets;
+mod note_helpers;
+
+use note_helpers::*;
 
 lazy_static! {
     /// Regex for extracting wikilinks: [[Target]] or [[Target|Display]]
@@ -129,6 +132,84 @@ pub(crate) struct KnowledgeAuthorityAdvancedOutcome {
     pub note_ids: Vec<String>,
 }
 
+pub(crate) enum KnowledgeNotePersistenceAttempt {
+    Committed((Note, crate::services::twin_events::MutationCommit)),
+    ProvenPrecommit(anyhow::Error),
+    AuthorityAdvanced(anyhow::Error),
+    Uncertain(anyhow::Error),
+}
+
+impl KnowledgeNotePersistenceAttempt {
+    pub(crate) fn is_proven_precommit(&self) -> bool {
+        matches!(self, Self::ProvenPrecommit(_))
+    }
+
+    pub(crate) fn into_result(
+        self,
+    ) -> Result<(Note, crate::services::twin_events::MutationCommit)> {
+        match self {
+            Self::Committed(value) => Ok(value),
+            Self::ProvenPrecommit(error)
+            | Self::AuthorityAdvanced(error)
+            | Self::Uncertain(error) => Err(error),
+        }
+    }
+}
+
+fn classify_generated_image_persistence(
+    result: anyhow::Result<(Note, crate::services::twin_events::MutationCommit)>,
+) -> KnowledgeNotePersistenceAttempt {
+    match result {
+        Ok(value) => KnowledgeNotePersistenceAttempt::Committed(value),
+        Err(error) if knowledge_authority_advanced_outcome(&error).is_some() => {
+            KnowledgeNotePersistenceAttempt::AuthorityAdvanced(error)
+        }
+        Err(error) if is_proven_precommit_knowledge_error(&error) => {
+            KnowledgeNotePersistenceAttempt::ProvenPrecommit(error)
+        }
+        Err(error) => KnowledgeNotePersistenceAttempt::Uncertain(error),
+    }
+}
+
+fn is_proven_precommit_knowledge_error(error: &anyhow::Error) -> bool {
+    matches!(
+        error.downcast_ref::<crate::services::twin_events::MutationError>(),
+        Some(crate::services::twin_events::MutationError::Invalid(_))
+            | Some(
+                crate::services::twin_events::MutationError::AbortedPrecondition {
+                    authority_advanced: false,
+                    ..
+                }
+            )
+    )
+}
+
+#[cfg(test)]
+mod generated_image_persistence_attempt_tests {
+    use super::*;
+
+    #[test]
+    fn unknown_persistence_error_is_not_classified_as_proven_precommit() {
+        let attempt = classify_generated_image_persistence(Err(anyhow::anyhow!(
+            "plain unknown persistence failure"
+        )));
+
+        assert!(!attempt.is_proven_precommit());
+        assert!(attempt.into_result().is_err());
+    }
+
+    #[test]
+    fn typed_invalid_persistence_error_is_classified_as_proven_precommit() {
+        let attempt = classify_generated_image_persistence(Err(anyhow::Error::new(
+            crate::services::twin_events::MutationError::Invalid(
+                "planner rejected before authority".into(),
+            ),
+        )));
+
+        assert!(attempt.is_proven_precommit());
+    }
+}
+
 #[derive(Debug)]
 struct KnowledgeAuthorityAdvancedError {
     outcome: KnowledgeAuthorityAdvancedOutcome,
@@ -170,6 +251,23 @@ fn preserve_knowledge_authority_error_with_events(
             note_ids,
         },
         source: error,
+    })
+}
+
+fn preserve_committed_knowledge_result_error(
+    commit: crate::services::twin_events::MutationCommit,
+    note_ids: Vec<String>,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    anyhow::Error::new(KnowledgeAuthorityAdvancedError {
+        outcome: KnowledgeAuthorityAdvancedOutcome {
+            commit,
+            target_aborted: false,
+            note_ids,
+        },
+        source: crate::services::twin_events::MutationError::RecoveryConflict(format!(
+            "committed knowledge result could not be loaded: {error}"
+        )),
     })
 }
 
@@ -984,15 +1082,45 @@ impl KnowledgeStore {
         observation: crate::services::twin_events::CompanionObservationInput,
         expected: crate::services::vault_namespace::VaultAuthorityTokenV1,
     ) -> Result<(Note, crate::services::twin_events::MutationCommit)> {
+        self.create_companion_evidence_expecting_authority(
+            create,
+            observation,
+            "companion_capture",
+            expected,
+        )
+    }
+
+    pub(crate) fn create_companion_evidence_expecting_authority(
+        &mut self,
+        create: NoteCreate,
+        observation: crate::services::twin_events::CompanionObservationInput,
+        source: &str,
+        expected: crate::services::vault_namespace::VaultAuthorityTokenV1,
+    ) -> Result<(Note, crate::services::twin_events::MutationCommit)> {
         if self.event_recorder.is_noop() {
             anyhow::bail!("companion capture requires the mutation coordinator");
         }
         self.create_note_with_locked_plan(
             create,
-            NoteMutationContext::local("companion_capture")?,
+            NoteMutationContext::local(source)?,
             Some(expected),
             Some(observation),
         )
+    }
+
+    pub(crate) fn create_generated_image_capture_expecting_authority(
+        &mut self,
+        create: NoteCreate,
+        observation: crate::services::twin_events::CompanionObservationInput,
+        expected: crate::services::vault_namespace::VaultAuthorityTokenV1,
+    ) -> KnowledgeNotePersistenceAttempt {
+        let result = self.create_companion_evidence_expecting_authority(
+            create,
+            observation,
+            "image_generation",
+            expected,
+        );
+        classify_generated_image_persistence(result)
     }
 
     pub fn import_note_container(
@@ -1325,10 +1453,15 @@ impl KnowledgeStore {
                 prepared_events,
             )
         })?;
-        Ok((
-            self.get_note(planned_id.as_deref().expect("planner returned a note ID"))?,
-            commit,
-        ))
+        let planned_id = planned_id.expect("planner returned a note ID");
+        let note = self.get_note(&planned_id).map_err(|error| {
+            preserve_committed_knowledge_result_error(
+                commit.clone(),
+                vec![planned_id.clone()],
+                error,
+            )
+        })?;
+        Ok((note, commit))
     }
 
     pub fn update_note(&mut self, id: &str, update: NoteUpdate) -> Result<Note> {
@@ -2206,295 +2339,6 @@ impl KnowledgeStore {
         };
         normalize_relative_path_for_output(relative).eq_ignore_ascii_case("_grafyn/program.md")
     }
-}
-
-fn note_update_changes(note: &Note, update: &NoteUpdate) -> Result<bool> {
-    if update
-        .title
-        .as_ref()
-        .is_some_and(|value| value != &note.title)
-        || update
-            .content
-            .as_ref()
-            .is_some_and(|value| value != &note.content)
-        || update
-            .aliases
-            .as_ref()
-            .is_some_and(|value| dedupe_strings(value.clone()) != note.aliases)
-        || update
-            .status
-            .as_ref()
-            .is_some_and(|value| value != &note.status)
-        || update
-            .tags
-            .as_ref()
-            .is_some_and(|value| dedupe_strings(value.clone()) != note.tags)
-        || update
-            .schema_version
-            .is_some_and(|value| value.max(CURRENT_NOTE_SCHEMA_VERSION) != note.schema_version)
-        || update
-            .migration_source
-            .as_ref()
-            .is_some_and(|value| Some(value) != note.migration_source.as_ref())
-        || update
-            .optimizer_managed
-            .is_some_and(|value| value != note.optimizer_managed)
-        || update
-            .properties
-            .as_ref()
-            .is_some_and(|value| value != &note.properties)
-    {
-        return Ok(true);
-    }
-    if let Some(relative_path) = &update.relative_path {
-        return Ok(normalize_note_relative_path(relative_path)? != note.relative_path);
-    }
-    Ok(false)
-}
-
-fn note_capture_governance(
-    note: &Note,
-    source_channel: &str,
-) -> crate::models::twin_event::Governance {
-    let mut governance = if source_channel == "import" {
-        crate::services::twin_events::imported_capture_governance()
-    } else {
-        crate::services::twin_events::standard_capture_governance()
-    };
-    let local_only = note
-        .properties
-        .get("grafyn_sync")
-        .and_then(Value::as_str)
-        .is_some_and(|value| value == "local_only")
-        || note
-            .properties
-            .get("private")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-    let sensitivity = note
-        .properties
-        .get("sensitivity")
-        .and_then(Value::as_str)
-        .map(|value| match value {
-            "restricted" | "private" => crate::models::twin_event::Sensitivity::Restricted,
-            "sensitive" => crate::models::twin_event::Sensitivity::Sensitive,
-            _ => crate::models::twin_event::Sensitivity::Standard,
-        })
-        .unwrap_or(governance.sensitivity.clone());
-    if local_only || sensitivity == crate::models::twin_event::Sensitivity::Restricted {
-        governance = crate::services::twin_events::local_capture_governance(sensitivity);
-    } else {
-        governance.sensitivity = sensitivity;
-    }
-    governance
-}
-
-fn normalize_lookup_key(value: &str) -> String {
-    value.trim().replace('\\', "/").to_lowercase()
-}
-
-fn migration_paths_equal(left: &str, right: &str) -> bool {
-    #[cfg(windows)]
-    {
-        left.eq_ignore_ascii_case(right)
-    }
-    #[cfg(not(windows))]
-    {
-        left == right
-    }
-}
-
-fn migration_physical_path_key(value: &str) -> String {
-    #[cfg(windows)]
-    {
-        value.to_ascii_lowercase()
-    }
-    #[cfg(not(windows))]
-    {
-        value.to_string()
-    }
-}
-
-fn normalize_relative_path_for_output(value: &str) -> String {
-    value
-        .replace('\\', "/")
-        .trim_start_matches("./")
-        .to_string()
-}
-
-/// Windows reserved device names — invalid as a file/directory stem
-/// regardless of extension (e.g. `con`, `CON.md`, `con.backup.md`).
-/// Checked platform-independently: a vault synced across OSes must not
-/// contain files that are unopenable on Windows.
-const RESERVED_WINDOWS_STEMS: &[&str] = &[
-    "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8",
-    "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
-];
-
-/// Returns true if `component` (an id or a single path segment, with or
-/// without an extension) is a Windows-reserved device name. The reserved
-/// stem is the text before the *first* dot, matched case-insensitively, so
-/// `con.backup.md` is still reserved. Windows additionally strips trailing
-/// spaces and dots before device-name resolution (`con .md` still reaches
-/// the CON device), so the stem is trimmed of those before comparison.
-fn is_reserved_windows_component(component: &str) -> bool {
-    let stem = component.split('.').next().unwrap_or(component);
-    let stem = stem.trim_end_matches([' ', '.']);
-    RESERVED_WINDOWS_STEMS
-        .iter()
-        .any(|reserved| stem.eq_ignore_ascii_case(reserved))
-}
-
-/// Belt-and-braces check run after joining a (validated) relative path onto
-/// the vault root: confirms the resolved path is still lexically nested
-/// under `vault_path`. This is a pure component walk — no filesystem
-/// canonicalize, since the target may not exist yet (e.g. a note being
-/// created). Catches anything the string-level validators might miss,
-/// including Windows drive-relative joins (`PathBuf::join` replaces the
-/// base entirely when the argument carries its own drive prefix).
-fn ensure_path_within_vault(vault_path: &Path, resolved: &Path) -> Result<()> {
-    let remainder = resolved.strip_prefix(vault_path).map_err(|_| {
-        anyhow::anyhow!(
-            "Resolved note path escapes the vault: {}",
-            resolved.display()
-        )
-    })?;
-    for component in remainder.components() {
-        match component {
-            std::path::Component::Prefix(_)
-            | std::path::Component::RootDir
-            | std::path::Component::ParentDir => {
-                anyhow::bail!(
-                    "Resolved note path escapes the vault: {}",
-                    resolved.display()
-                );
-            }
-            _ => {}
-        }
-    }
-    Ok(())
-}
-
-fn normalize_note_relative_path(value: &str) -> Result<String> {
-    let normalized = normalize_relative_path_for_output(value)
-        .trim_matches('/')
-        .to_string();
-    if normalized.is_empty() {
-        anyhow::bail!("Relative note path cannot be empty");
-    }
-    if Path::new(&normalized).is_absolute() {
-        anyhow::bail!("Absolute note paths are not allowed");
-    }
-    if normalized.contains(':') {
-        anyhow::bail!(
-            "Note paths must not contain ':' (drive-relative or alternate-data-stream syntax is not allowed): {}",
-            normalized
-        );
-    }
-    for segment in normalized.split('/') {
-        if segment.is_empty() || segment == ".." {
-            anyhow::bail!("Path traversal is not allowed in note paths");
-        }
-        if is_reserved_windows_component(segment) {
-            anyhow::bail!(
-                "Note paths must not use a reserved device name: {}",
-                segment
-            );
-        }
-    }
-    if normalized.to_lowercase().ends_with(".md") {
-        Ok(normalized)
-    } else {
-        Ok(format!("{}.md", normalized))
-    }
-}
-
-#[allow(dead_code)] // Used by bounded legacy migration recovery helpers.
-fn before_image_for_path(path: &Path) -> Result<crate::services::twin_events::BeforeImage> {
-    match std::fs::read(path) {
-        Ok(bytes) => Ok(crate::services::twin_events::BeforeImage::Sha256(
-            crate::services::twin_events::digest_bytes(&bytes),
-        )),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            Ok(crate::services::twin_events::BeforeImage::Absent)
-        }
-        Err(error) => Err(error.into()),
-    }
-}
-
-fn slugify(value: &str) -> String {
-    value
-        .to_lowercase()
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() {
-                character
-            } else if character.is_whitespace()
-                || character == '-'
-                || character == '_'
-                || character == '/'
-            {
-                '-'
-            } else {
-                ' '
-            }
-        })
-        .collect::<String>()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join("-")
-}
-
-fn humanize_filename(value: &str) -> String {
-    value
-        .replace(['-', '_'], " ")
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn alias_candidates(title: &str, file_stem: &str) -> Vec<String> {
-    let mut candidates = Vec::new();
-    let humanized = humanize_filename(file_stem);
-    if !humanized.trim().is_empty() && !humanized.eq_ignore_ascii_case(title.trim()) {
-        candidates.push(humanized);
-    }
-    let compact = file_stem.replace(['-', '_'], "");
-    if !compact.is_empty()
-        && !compact.eq_ignore_ascii_case(file_stem)
-        && !compact.eq_ignore_ascii_case(title)
-    {
-        candidates.push(compact);
-    }
-    candidates
-}
-
-fn extract_inline_hashtags(content: &str) -> Vec<String> {
-    HASHTAG_REGEX
-        .captures_iter(content)
-        .filter_map(|caps| caps.get(1).map(|value| value.as_str().trim().to_string()))
-        .filter(|value| !value.is_empty())
-        .collect()
-}
-
-fn dedupe_strings<I>(values: I) -> Vec<String>
-where
-    I: IntoIterator<Item = String>,
-{
-    let mut seen = HashSet::new();
-    let mut result = Vec::new();
-    for value in values {
-        let trimmed = value.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let owned = trimmed.to_string();
-        let key = owned.to_lowercase();
-        if seen.insert(key) {
-            result.push(owned);
-        }
-    }
-    result
 }
 
 #[cfg(test)]

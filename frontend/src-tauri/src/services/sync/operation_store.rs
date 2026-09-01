@@ -572,6 +572,29 @@ impl OperationStore {
         })
     }
 
+    pub(crate) fn promoted_outbox_records(
+        &self,
+        mutation_id: &ContentDigest,
+    ) -> Result<Option<Vec<StoredEnvelope>>, OperationStoreError> {
+        self.with_lock(|| {
+            self.validate_layout()?;
+            let Some(batch) = self.read_batch(BatchState::Promoted, mutation_id)? else {
+                return Ok(None);
+            };
+            self.validate_promoted_batch(&batch)?;
+            let mut records = Vec::with_capacity(batch.operation_ids().len());
+            for operation_id in batch.operation_ids() {
+                let record = self
+                    .read_record(OperationArea::Outbox, operation_id)?
+                    .ok_or(OperationStoreError::IncompleteBatch(*operation_id))?;
+                let exact_outbox = Some(record.clone());
+                ensure_batch_operation_matches(&batch, operation_id, [&exact_outbox])?;
+                records.push(record);
+            }
+            Ok(Some(records))
+        })
+    }
+
     pub(crate) fn cancel_batch(
         &self,
         mutation_id: &ContentDigest,
@@ -1849,6 +1872,45 @@ mod tests {
         assert_eq!(
             store.promote_batch(&mutation_id).unwrap(),
             PromotionOutcome::AlreadyPromoted
+        );
+        let records = store
+            .promoted_outbox_records(&mutation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].envelope(), &envelope);
+        assert!(store
+            .promoted_outbox_records(&super::tests::mutation_id(99))
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn promoted_outbox_records_reject_a_promoted_batch_record_left_only_in_inbox() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = store(&temp);
+        let envelope = envelope(1, "inbox-only");
+        let mutation_id = mutation_id(4);
+        store
+            .stage_batch(&mutation_id, std::slice::from_ref(&envelope))
+            .unwrap();
+        store
+            .root
+            .hard_link_no_clobber(
+                &store
+                    .namespace
+                    .operation_key(OperationArea::Staged, envelope.operation_id()),
+                &store
+                    .namespace
+                    .operation_key(OperationArea::Inbox, envelope.operation_id()),
+                true,
+            )
+            .unwrap();
+        store.promote_batch(&mutation_id).unwrap();
+
+        assert_eq!(
+            store.promoted_outbox_records(&mutation_id).unwrap_err(),
+            OperationStoreError::IncompleteBatch(*envelope.operation_id())
         );
     }
 

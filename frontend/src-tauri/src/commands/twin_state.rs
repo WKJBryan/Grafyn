@@ -327,8 +327,32 @@ fn plan_companion_capture(
         CompanionSyncPolicy::Inherit => "inherit",
         CompanionSyncPolicy::LocalOnly => "local_only",
     };
-    let mut properties = HashMap::new();
-    properties.insert("capture_kind".into(), serde_json::json!("text"));
+    let title = derive_companion_capture_title(&request.content, captured_at);
+    build_companion_evidence_plan(
+        title,
+        request.content,
+        "text",
+        HashMap::new(),
+        attachment_digests,
+        grafyn_sync,
+        captured_at,
+        context,
+        governance,
+    )
+}
+
+fn build_companion_evidence_plan(
+    title: String,
+    content: String,
+    capture_kind: &str,
+    mut properties: HashMap<String, serde_json::Value>,
+    attachment_digests: Vec<ContentDigest>,
+    grafyn_sync: &str,
+    observed_at: DateTime<Utc>,
+    context: EventContext,
+    governance: Governance,
+) -> Result<(NoteCreate, CompanionObservationInput), String> {
+    properties.insert("capture_kind".into(), serde_json::json!(capture_kind));
     properties.insert(
         "attachment_digests".into(),
         serde_json::json!(attachment_digests
@@ -337,25 +361,131 @@ fn plan_companion_capture(
             .collect::<Vec<_>>()),
     );
     properties.insert("grafyn_sync".into(), serde_json::json!(grafyn_sync));
-    let note = NoteCreate {
-        title: derive_companion_capture_title(&request.content, captured_at),
-        content: request.content,
-        relative_path: None,
-        aliases: Vec::new(),
-        status: NoteStatus::Draft,
+    Ok((
+        NoteCreate {
+            title,
+            content,
+            relative_path: None,
+            aliases: Vec::new(),
+            status: NoteStatus::Draft,
+            tags: vec!["inbox".into()],
+            schema_version: CURRENT_NOTE_SCHEMA_VERSION,
+            migration_source: None,
+            optimizer_managed: false,
+            properties,
+        },
+        CompanionObservationInput {
+            observed_at,
+            context,
+            attachment_digests,
+            governance,
+        },
+    ))
+}
+
+pub(crate) struct GeneratedImageCapturePlanInput {
+    pub prompt: String,
+    pub annotation: Option<String>,
+    pub model_id: String,
+    pub gateway: String,
+    pub provider_tag: String,
+    pub resolution: String,
+    pub aspect_ratio: String,
+    pub attachment_digest: ContentDigest,
+    pub media_type: String,
+    pub byte_size: u64,
+    pub width: u32,
+    pub height: u32,
+    pub retention_policy: crate::models::image_generation::ImageMetadataRetentionPolicy,
+    pub grafyn_sync: crate::models::image_generation::GeneratedImageSyncPolicy,
+}
+
+pub(crate) fn plan_generated_image_capture(
+    input: GeneratedImageCapturePlanInput,
+    captured_at: DateTime<Utc>,
+) -> Result<(NoteCreate, CompanionObservationInput), String> {
+    if input.prompt.trim().is_empty() {
+        return Err("Generated image receipt prompt cannot be blank".into());
+    }
+    let governance = match input.grafyn_sync {
+        crate::models::image_generation::GeneratedImageSyncPolicy::Inherit => {
+            standard_capture_governance()
+        }
+        crate::models::image_generation::GeneratedImageSyncPolicy::LocalOnly => {
+            local_capture_governance(Sensitivity::Standard)
+        }
+    };
+    let grafyn_sync = match input.grafyn_sync {
+        crate::models::image_generation::GeneratedImageSyncPolicy::Inherit => "inherit",
+        crate::models::image_generation::GeneratedImageSyncPolicy::LocalOnly => "local_only",
+    };
+    let retention_policy = match input.retention_policy {
+        crate::models::image_generation::ImageMetadataRetentionPolicy::StripMetadata => {
+            "strip_metadata"
+        }
+        crate::models::image_generation::ImageMetadataRetentionPolicy::RetainOriginal => {
+            "retain_original"
+        }
+    };
+    let annotation = input.annotation.filter(|value| !value.trim().is_empty());
+    let title = derive_companion_capture_title(&input.prompt, captured_at);
+    let mut content = format!("## Prompt\n\n{}", input.prompt);
+    if let Some(annotation) = annotation.as_deref() {
+        content.push_str("\n\n## Annotation\n\n");
+        content.push_str(annotation);
+    }
+    let mut properties = HashMap::new();
+    properties.insert("generation_prompt".into(), serde_json::json!(input.prompt));
+    properties.insert("generation_model".into(), serde_json::json!(input.model_id));
+    properties.insert(
+        "generation_gateway".into(),
+        serde_json::json!(input.gateway),
+    );
+    properties.insert(
+        "generation_provider".into(),
+        serde_json::json!(input.provider_tag),
+    );
+    properties.insert(
+        "generation_resolution".into(),
+        serde_json::json!(input.resolution),
+    );
+    properties.insert(
+        "generation_aspect_ratio".into(),
+        serde_json::json!(input.aspect_ratio),
+    );
+    properties.insert(
+        "image_media_type".into(),
+        serde_json::json!(input.media_type),
+    );
+    properties.insert("image_byte_size".into(), serde_json::json!(input.byte_size));
+    properties.insert("image_width".into(), serde_json::json!(input.width));
+    properties.insert("image_height".into(), serde_json::json!(input.height));
+    properties.insert(
+        "image_metadata_retention".into(),
+        serde_json::json!(retention_policy),
+    );
+    if let Some(annotation) = annotation {
+        properties.insert(
+            "generation_annotation".into(),
+            serde_json::json!(annotation),
+        );
+    }
+    let context = EventContext {
+        source_channel: SourceChannel::parse("image_generation")?,
         tags: vec!["inbox".into()],
-        schema_version: CURRENT_NOTE_SCHEMA_VERSION,
-        migration_source: None,
-        optimizer_managed: false,
+        ..EventContext::default()
+    };
+    build_companion_evidence_plan(
+        title,
+        content,
+        "image",
         properties,
-    };
-    let observation = CompanionObservationInput {
-        observed_at: captured_at,
+        vec![input.attachment_digest],
+        grafyn_sync,
+        captured_at,
         context,
-        attachment_digests,
         governance,
-    };
-    Ok((note, observation))
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

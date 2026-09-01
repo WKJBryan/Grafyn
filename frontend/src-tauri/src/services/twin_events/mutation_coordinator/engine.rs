@@ -1125,6 +1125,28 @@ impl MutationCoordinator {
     }
 
     pub(super) fn inject(&self, point: MutationFaultPoint) -> Result<(), MutationError> {
+        #[cfg(test)]
+        {
+            let mut rejected = self
+                .reject_once
+                .lock()
+                .map_err(|_| MutationError::Invalid("rejection injector lock poisoned".into()))?;
+            if rejected.as_ref() == Some(&point) {
+                *rejected = None;
+                return Err(MutationError::Invalid(format!(
+                    "injected precommit rejection at {point:?}"
+                )));
+            }
+            let mut sequence = self.fault_sequence.lock().map_err(|_| {
+                MutationError::Invalid("fault sequence injector lock poisoned".into())
+            })?;
+            if sequence.front() == Some(&point) {
+                sequence.pop_front();
+                return Err(MutationError::Io(format!(
+                    "injected mutation crash at {point:?}"
+                )));
+            }
+        }
         let mut configured = self
             .fault_once
             .lock()

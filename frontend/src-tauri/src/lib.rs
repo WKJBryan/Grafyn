@@ -670,6 +670,14 @@ pub fn run() {
             commands::twin_state::get_twin_state_projection,
             commands::twin_state::rank_twin_attention,
             commands::twin_state::get_twin_event_timeline,
+            // Governed one-shot image generation commands
+            commands::image_generation::discover_image_models,
+            commands::image_generation::get_image_model_capability,
+            commands::image_generation::generate_image,
+            commands::image_generation::discard_generated_image_receipt,
+            commands::image_generation::export_generated_image,
+            commands::image_generation::save_generated_image,
+            commands::image_generation::load_generated_image,
             #[cfg(feature = "twin-eval-lab")]
             // Twin evaluation commands
             commands::twin_eval::get_twin_eval_model_matrix,
@@ -1484,6 +1492,121 @@ mod tests {
                 .iter()
                 .all(|event| event.causal_stream == expected_stream));
         }
+    }
+
+    #[tokio::test]
+    async fn provisioned_generated_image_save_seals_one_inherited_attachment_group() {
+        use crate::commands::image_generation::{
+            load_generated_image_inner, save_generated_image_inner,
+        };
+        use crate::models::image_generation::{
+            GeneratedImageSyncPolicy, ImageMetadataRetentionPolicy, LoadGeneratedImageRequest,
+            SaveGeneratedImageRequest,
+        };
+        use crate::models::twin_event::{CausalStream, EvidenceType};
+        use crate::services::openrouter::{GeneratedImageReceipt, OpenRouterService};
+        use chrono::TimeZone;
+
+        let temp = tempfile::tempdir().unwrap();
+        let vault_path = temp.path().join("vault");
+        let (settings, _) = stable_boot_settings(&temp, &vault_path);
+        crate::services::twin_events::PersistedMutationIdentityProvider::load_or_create(
+            temp.path().join("data"),
+        )
+        .unwrap();
+        let identity =
+            crate::services::sync::identity::load_or_create_vault_identity(&vault_path).unwrap();
+        crate::services::sync::vault_keys::provision_vault_root_key(
+            settings.secret_store().as_ref(),
+            &identity.descriptor.vault_id().to_string(),
+            &grafyn_sync_protocol::VaultRootKey::from_bytes([0x62; 32]),
+        )
+        .unwrap();
+        let state = build_app_state(settings, None).unwrap();
+        let sync_engine = state.sync_engine.as_ref().unwrap();
+        assert_eq!(sync_engine.status().unwrap().outbox_operations, 0);
+        let image = image::DynamicImage::new_rgba8(2, 2);
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        image
+            .write_to(&mut encoded, image::ImageFormat::Png)
+            .unwrap();
+        let bytes = encoded.into_inner();
+        let service = OpenRouterService::new(String::new());
+        let receipt_id = service
+            .insert_generated_image_for_tests(GeneratedImageReceipt {
+                bytes: bytes.clone(),
+                media_type: "image/png".into(),
+                width: 2,
+                height: 2,
+                prompt: "Inherited companion image".into(),
+                model_id: "author/model".into(),
+                resolution: "1024x1024".into(),
+                aspect_ratio: "1:1".into(),
+                vault_scope: state
+                    .mutation_coordinator
+                    .as_ref()
+                    .unwrap()
+                    .current_authority_token()
+                    .unwrap()
+                    .root_scope,
+                gateway: "openrouter".into(),
+                provider_tag: "test-provider".into(),
+            })
+            .unwrap();
+        *state.openrouter.write().await = service;
+
+        let saved = save_generated_image_inner(
+            &state,
+            SaveGeneratedImageRequest {
+                receipt_id,
+                annotation: Some("Inherited image evidence".into()),
+                retention_policy: ImageMetadataRetentionPolicy::RetainOriginal,
+                grafyn_sync: GeneratedImageSyncPolicy::Inherit,
+            },
+            chrono::Utc.with_ymd_and_hms(2026, 9, 1, 9, 0, 0).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(sync_engine.status().unwrap().outbox_operations, 5);
+        assert_eq!(
+            serde_json::to_value(saved.sync_disposition).unwrap(),
+            serde_json::json!({
+                "status": "queued",
+                "manifestCount": 1,
+                "chunkCount": 1,
+                "operationCount": 2
+            })
+        );
+        let events = state.twin_event_store.ordered_events().unwrap();
+        assert_eq!(events.len(), 2);
+        assert!(events
+            .iter()
+            .all(|event| event.causal_stream == CausalStream::SyncEligible));
+        assert_eq!(
+            events
+                .iter()
+                .flat_map(|event| &event.evidence)
+                .filter(|evidence| evidence.evidence_type == EvidenceType::Attachment)
+                .count(),
+            1
+        );
+        let loaded = load_generated_image_inner(
+            &state,
+            LoadGeneratedImageRequest {
+                attachment_digest: saved.attachment_digest,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            base64::Engine::decode(
+                &base64::engine::general_purpose::STANDARD,
+                loaded.base64_data
+            )
+            .unwrap(),
+            bytes
+        );
     }
 
     fn assert_recoverable_detached_validation_state(

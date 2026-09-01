@@ -4,7 +4,12 @@ use anyhow::{Context, Result};
 use futures::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+mod image_generation;
+pub(crate) use image_generation::GeneratedImageReceipt;
+use image_generation::ImageReceiptStore;
 
 const OPENROUTER_API_URL: &str = "https://openrouter.ai/api/v1";
 
@@ -13,6 +18,8 @@ const OPENROUTER_API_URL: &str = "https://openrouter.ai/api/v1";
 pub struct OpenRouterService {
     client: Client,
     api_key: String,
+    image_api_url: String,
+    image_receipts: Arc<Mutex<ImageReceiptStore>>,
 }
 
 impl std::fmt::Debug for OpenRouterService {
@@ -21,6 +28,7 @@ impl std::fmt::Debug for OpenRouterService {
             .debug_struct("OpenRouterService")
             .field("client", &self.client)
             .field("api_key", &"[REDACTED]")
+            .field("image_api_url", &self.image_api_url)
             .finish()
     }
 }
@@ -39,6 +47,21 @@ impl OpenRouterService {
                 .build()
                 .unwrap_or_else(|_| Client::new()),
             api_key,
+            image_api_url: OPENROUTER_API_URL.to_string(),
+            image_receipts: Arc::new(Mutex::new(ImageReceiptStore::default())),
+        }
+    }
+
+    #[cfg(test)]
+    fn new_for_image_tests(api_key: String, image_api_url: String) -> Self {
+        Self {
+            client: Client::builder()
+                .connect_timeout(Duration::from_secs(2))
+                .build()
+                .unwrap_or_else(|_| Client::new()),
+            api_key,
+            image_api_url,
+            image_receipts: Arc::new(Mutex::new(ImageReceiptStore::default())),
         }
     }
 
@@ -276,7 +299,10 @@ impl OpenRouterService {
                             if !buffer.trim().is_empty() {
                                 let remaining = std::mem::take(&mut buffer);
                                 match parse_sse_chunk(&remaining) {
-                                    Ok(update) if !update.content.is_empty() || update.cost_usd.is_some() => {
+                                    Ok(update)
+                                        if !update.content.is_empty()
+                                            || update.cost_usd.is_some() =>
+                                    {
                                         return Some((Ok(update), (inner, buffer, utf8_buffer)));
                                     }
                                     Err(error) => {
@@ -328,7 +354,10 @@ fn build_reasoning(reasoning_effort: Option<&str>) -> Option<ReasoningRequest> {
 /// went wrong. Such payloads are now detected and surfaced as an `Err` so
 /// the caller can mark the response as errored instead.
 fn parse_sse_chunk(chunk: &str) -> Result<StreamUpdate> {
-    let mut update = StreamUpdate { content: String::new(), cost_usd: None };
+    let mut update = StreamUpdate {
+        content: String::new(),
+        cost_usd: None,
+    };
 
     for line in chunk.lines() {
         if let Some(data) = line.strip_prefix("data: ") {
@@ -541,7 +570,6 @@ struct PricingInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
     fn chat_request_serializes_reasoning_effort_without_max_tokens() {
         let request = ChatRequest {

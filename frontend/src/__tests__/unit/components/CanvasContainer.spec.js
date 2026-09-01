@@ -159,6 +159,7 @@ function mountContainer() {
         },
         DebateNode: { template: '<div />' },
         AddModelDialog: { template: '<div />' },
+        ImageGenerationDialog: { template: '<div class="image-generation-dialog-stub" />' },
         PinnedNotesPanel: { template: '<div />' },
         PromptDialog: {
           props: ['models', 'presets', 'branchContext', 'smartWebSearch', 'openRouterConfigured', 'twinLlmProvider', 'ollamaModel', 'twinIdentity'],
@@ -304,6 +305,18 @@ describe('CanvasContainer', () => {
     saveConstitutionSetup.mockResolvedValue({})
     toastSuccess.mockReset()
     toastError.mockReset()
+  })
+
+  it('opens image generation without mutating the Canvas text-model catalog', async () => {
+    const textModels = store.availableModels
+    const wrapper = mountContainer()
+    await flushPromises()
+
+    await wrapper.get('[aria-label="Open image generation"]').trigger('click')
+
+    expect(wrapper.find('.image-generation-dialog-stub').exists()).toBe(true)
+    expect(store.availableModels).toBe(textModels)
+    expect(store.loadModels).toHaveBeenCalledOnce()
   })
 
   it('surfaces a toast when loadModels fails on mount, instead of leaving PromptDialog with no models and no explanation', async () => {

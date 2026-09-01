@@ -3,6 +3,85 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 pub(crate) const ATTACHMENT_MANIFEST_RECORD_SCHEMA_VERSION: u16 = 1;
+pub(crate) const IMAGE_ATTACHMENT_CATALOG_SCHEMA_VERSION: u16 = 1;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ImageAttachmentCatalogRecordV1 {
+    schema_version: u16,
+    attachment_digest: String,
+    media_type: String,
+    decoded_size: u64,
+    width: u32,
+    height: u32,
+}
+
+impl ImageAttachmentCatalogRecordV1 {
+    pub(crate) fn new(
+        attachment_digest: Digest32,
+        media_type: String,
+        decoded_size: u64,
+        width: u32,
+        height: u32,
+    ) -> Result<Self, String> {
+        let record = Self {
+            schema_version: IMAGE_ATTACHMENT_CATALOG_SCHEMA_VERSION,
+            attachment_digest: attachment_digest.to_string(),
+            media_type,
+            decoded_size,
+            width,
+            height,
+        };
+        record.validate()?;
+        Ok(record)
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        if self.schema_version != IMAGE_ATTACHMENT_CATALOG_SCHEMA_VERSION {
+            return Err("unsupported image attachment catalog schema".into());
+        }
+        Digest32::parse_hex(&self.attachment_digest)
+            .map_err(|_| "invalid image attachment digest".to_string())?;
+        if !matches!(
+            self.media_type.as_str(),
+            "image/png" | "image/jpeg" | "image/webp"
+        ) {
+            return Err("image attachment MIME must be PNG, JPEG, or WebP".into());
+        }
+        if self.decoded_size == 0
+            || self.decoded_size > crate::models::image_generation::MAX_GENERATED_IMAGE_BYTES as u64
+        {
+            return Err("image attachment must be between 1 byte and 24 MiB".into());
+        }
+        if self.width == 0
+            || self.height == 0
+            || self.width > crate::models::image_generation::MAX_GENERATED_IMAGE_DIMENSION
+            || self.height > crate::models::image_generation::MAX_GENERATED_IMAGE_DIMENSION
+            || u64::from(self.width) * u64::from(self.height)
+                > crate::models::image_generation::MAX_GENERATED_IMAGE_PIXELS
+        {
+            return Err("image attachment dimensions exceed Grafyn bounds".into());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn attachment_digest(&self) -> Result<Digest32, String> {
+        Digest32::parse_hex(&self.attachment_digest)
+            .map_err(|_| "invalid image attachment digest".to_string())
+    }
+
+    pub(crate) fn media_type(&self) -> &str {
+        &self.media_type
+    }
+
+    pub(crate) const fn decoded_size(&self) -> u64 {
+        self.decoded_size
+    }
+
+    pub(crate) const fn dimensions(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -147,6 +226,54 @@ mod tests {
         assert_eq!(
             sha256_attachment_digest(b"abc").to_string(),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn image_catalog_record_round_trips_only_intrinsic_cas_metadata() {
+        let digest = sha256_attachment_digest(b"stored raster bytes");
+        let record =
+            ImageAttachmentCatalogRecordV1::new(digest, "image/png".into(), 19, 1024, 1024)
+                .unwrap();
+
+        let encoded = serde_json::to_value(&record).unwrap();
+        assert!(encoded.get("source").is_none());
+        assert!(encoded.get("annotation").is_none());
+        assert!(encoded.get("createdAt").is_none());
+        assert!(encoded.get("retentionPolicy").is_none());
+        let decoded: ImageAttachmentCatalogRecordV1 = serde_json::from_value(encoded).unwrap();
+
+        assert_eq!(decoded, record);
+        assert_eq!(decoded.attachment_digest().unwrap(), digest);
+        assert_eq!(decoded.media_type(), "image/png");
+        assert_eq!(decoded.decoded_size(), 19);
+        assert_eq!(decoded.dimensions(), (1024, 1024));
+    }
+
+    #[test]
+    fn image_catalog_record_is_strict_and_bounded() {
+        let unknown = br#"{"schemaVersion":1,"attachmentDigest":"0808080808080808080808080808080808080808080808080808080808080808","mediaType":"image/png","decodedSize":1,"width":1,"height":1,"extra":true}"#;
+        assert!(serde_json::from_slice::<ImageAttachmentCatalogRecordV1>(unknown).is_err());
+
+        let digest = sha256_attachment_digest(b"x");
+        for (media_type, decoded_size, width, height) in [
+            ("image/svg+xml", 1, 1, 1),
+            ("image/png", 0, 1, 1),
+            ("image/png", 1, 0, 1),
+            ("image/png", 1, 4097, 1),
+            ("image/png", 1, 4096, 4097),
+        ] {
+            assert!(ImageAttachmentCatalogRecordV1::new(
+                digest,
+                media_type.into(),
+                decoded_size,
+                width,
+                height,
+            )
+            .is_err());
+        }
+        assert!(
+            ImageAttachmentCatalogRecordV1::new(digest, "image/png".into(), 1, 4096, 4096,).is_ok()
         );
     }
 }

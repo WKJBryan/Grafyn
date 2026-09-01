@@ -42,6 +42,8 @@
       @feedback="recordFeedback"
     />
 
+    <QuickImageComposer collapsible />
+
     <CanvasComposer
       :models="canvasStore.availableModels"
       :parent="replyTarget"
@@ -72,6 +74,7 @@ import { useCanvasStore } from '@/stores/canvas'
 import CanvasComposer from '@/components/companion/CanvasComposer.vue'
 import CanvasSessionSheet from '@/components/companion/CanvasSessionSheet.vue'
 import LinearCanvasThread from '@/components/companion/LinearCanvasThread.vue'
+import QuickImageComposer from '@/components/companion/QuickImageComposer.vue'
 import ConfirmDialog from '@/components/ConfirmDialog.vue'
 
 const TWIN_CHAT_TAG = 'companion-twin-chat'

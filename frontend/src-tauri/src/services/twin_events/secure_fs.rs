@@ -89,6 +89,64 @@ impl AnchoredRoot {
         })
     }
 
+    pub(crate) fn open_external_directory(path: &Path) -> Result<Self, MutationError> {
+        let absolute = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir()?.join(path)
+        };
+        #[cfg(windows)]
+        {
+            let dir = open_external_windows_directory(&absolute)?;
+            return Ok(Self {
+                canonical_path: absolute,
+                dir,
+            });
+        }
+        #[cfg(not(windows))]
+        {
+            let mut anchor = PathBuf::new();
+            let mut descendants = Vec::new();
+            for component in absolute.components() {
+                match component {
+                    std::path::Component::Prefix(prefix) => anchor.push(prefix.as_os_str()),
+                    std::path::Component::RootDir => anchor.push(component.as_os_str()),
+                    std::path::Component::CurDir => {}
+                    std::path::Component::ParentDir => {
+                        return Err(MutationError::Invalid(
+                            "external atomic directory cannot contain parent traversal".into(),
+                        ))
+                    }
+                    std::path::Component::Normal(name) => descendants.push(name.to_os_string()),
+                }
+            }
+            if anchor.as_os_str().is_empty() {
+                return Err(MutationError::Invalid(
+                    "external atomic directory must resolve from a filesystem root".into(),
+                ));
+            }
+            let mut dir = Dir::open_ambient_dir(&anchor, ambient_authority())?;
+            for descendant in descendants {
+                dir = dir.open_dir_nofollow(&descendant).map_err(|error| {
+                    MutationError::RecoveryConflict(format!(
+                        "external atomic parent traversal failed at {}: {error}",
+                        descendant.to_string_lossy()
+                    ))
+                })?;
+            }
+            if !dir.dir_metadata()?.is_dir() {
+                return Err(MutationError::Invalid(
+                    "external atomic parent is not a directory".into(),
+                ));
+            }
+            let dir = reopen_external_dir_with_identity(&absolute, &dir)?;
+            Ok(Self {
+                canonical_path: absolute,
+                dir,
+            })
+        }
+    }
+
     pub(crate) fn canonical_path(&self) -> &Path {
         &self.canonical_path
     }
@@ -204,6 +262,38 @@ impl AnchoredRoot {
 
     pub(crate) fn put_atomic(&self, relative_key: &str, bytes: &[u8]) -> Result<(), MutationError> {
         self.resolve_target(relative_key, true)?.put_atomic(bytes)
+    }
+
+    pub(crate) fn put_atomic_leaf(&self, leaf: &OsStr, bytes: &[u8]) -> Result<(), MutationError> {
+        if !leaf_name_is_relative(leaf) {
+            return Err(MutationError::Invalid(
+                "capability atomic target must be one filename".into(),
+            ));
+        }
+        AnchoredTarget {
+            parent: self.dir.try_clone()?,
+            leaf: leaf.to_os_string(),
+        }
+        .put_atomic(bytes)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn put_atomic_leaf_with_temporary_for_test(
+        &self,
+        leaf: &OsStr,
+        temporary: &OsStr,
+        bytes: &[u8],
+    ) -> Result<(), MutationError> {
+        if !leaf_name_is_relative(leaf) || !leaf_name_is_relative(temporary) {
+            return Err(MutationError::Invalid(
+                "capability atomic test target must be one filename".into(),
+            ));
+        }
+        AnchoredTarget {
+            parent: self.dir.try_clone()?,
+            leaf: leaf.to_os_string(),
+        }
+        .put_atomic_with_temporary(temporary.to_os_string(), bytes)
     }
 
     pub(crate) fn delete(&self, relative_key: &str) -> Result<(), MutationError> {
@@ -548,6 +638,18 @@ pub(crate) struct AnchoredTarget {
 }
 
 #[cfg(unix)]
+fn rename_target_replace(from: AnchoredTarget, to: AnchoredTarget) -> Result<(), MutationError> {
+    rename_replace_with_retry(&from.parent, &from.leaf, &to.parent, &to.leaf)?;
+    sync_dir(&from.parent)?;
+    sync_dir(&to.parent)
+}
+
+#[cfg(windows)]
+fn rename_target_replace(from: AnchoredTarget, to: AnchoredTarget) -> Result<(), MutationError> {
+    rename_target_windows(from, to, true, || {})
+}
+
+#[cfg(unix)]
 fn rename_target_no_replace(
     from: AnchoredTarget,
     to: AnchoredTarget,
@@ -572,6 +674,16 @@ fn rename_target_no_replace(
 fn rename_target_no_replace(
     from: AnchoredTarget,
     to: AnchoredTarget,
+    hook: impl FnOnce(),
+) -> Result<(), MutationError> {
+    rename_target_windows(from, to, false, hook)
+}
+
+#[cfg(windows)]
+fn rename_target_windows(
+    from: AnchoredTarget,
+    to: AnchoredTarget,
+    replace_if_exists: bool,
     hook: impl FnOnce(),
 ) -> Result<(), MutationError> {
     use cap_std::fs::OpenOptionsExt;
@@ -602,21 +714,36 @@ fn rename_target_no_replace(
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
         .follow(FollowSymlinks::No);
-    let source = from.parent.open_with(&from.leaf, &options)?;
+    let source = from
+        .parent
+        .open_with(&from.leaf, &options)
+        .map_err(|error| MutationError::Io(format!("atomic rename source open failed: {error}")))?;
     let mut destination_options = OpenOptions::new();
     destination_options
         .access_mode(FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
         .follow(FollowSymlinks::No);
-    let destination_parent = to.parent.open_with(".", &destination_options)?;
-    let mut destination_sync_options = OpenOptions::new();
-    destination_sync_options
-        .access_mode(FILE_WRITE_DATA | SYNCHRONIZE)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-        .follow(FollowSymlinks::No);
-    let destination_sync = to.parent.open_with(".", &destination_sync_options)?;
+    let destination_parent = to
+        .parent
+        .open_with(".", &destination_options)
+        .map_err(|error| {
+            MutationError::Io(format!("atomic rename destination open failed: {error}"))
+        })?;
+    let from_metadata = from.parent.dir_metadata()?;
+    let to_metadata = to.parent.dir_metadata()?;
+    let destination_sync =
+        if from_metadata.dev() == to_metadata.dev() && from_metadata.ino() == to_metadata.ino() {
+            None
+        } else {
+            let mut destination_sync_options = OpenOptions::new();
+            destination_sync_options
+                .access_mode(FILE_WRITE_DATA | SYNCHRONIZE)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+                .follow(FollowSymlinks::No);
+            Some(to.parent.open_with(".", &destination_sync_options)?)
+        };
     let destination_name = to.leaf.encode_wide().collect::<Vec<_>>();
     let name_bytes = destination_name
         .len()
@@ -629,7 +756,7 @@ fn rename_target_no_replace(
     let mut buffer = vec![0_u64; buffer_bytes.div_ceil(size_of::<u64>())];
     let information = buffer.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
     unsafe {
-        (*information).Anonymous.ReplaceIfExists = false;
+        (*information).Anonymous.ReplaceIfExists = replace_if_exists;
         (*information).RootDirectory = destination_parent.as_raw_handle();
         (*information).FileNameLength = name_bytes;
         std::ptr::copy_nonoverlapping(
@@ -641,33 +768,71 @@ fn rename_target_no_replace(
 
     drop(to.parent);
     hook();
-    let mut io_status = IO_STATUS_BLOCK::default();
-    let status = unsafe {
-        NtSetInformationFile(
-            source.as_raw_handle(),
-            &mut io_status,
-            information.cast_const().cast(),
-            u32::try_from(buffer_bytes).map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidInput, "rename buffer is too large")
-            })?,
-            FileRenameInformation,
-        )
-    };
-    if status < 0 {
-        let error = io::Error::from_raw_os_error(unsafe { RtlNtStatusToDosError(status) } as i32);
-        return Err(io::Error::new(
-            error.kind(),
-            format!("handle-relative rename failed: {error}"),
-        )
-        .into());
-    }
+    retry_windows_replace(
+        replace_if_exists,
+        std::time::Duration::from_millis(10),
+        || {
+            let mut io_status = IO_STATUS_BLOCK::default();
+            let status = unsafe {
+                NtSetInformationFile(
+                    source.as_raw_handle(),
+                    &mut io_status,
+                    information.cast_const().cast(),
+                    u32::try_from(buffer_bytes).map_err(|_| {
+                        io::Error::new(io::ErrorKind::InvalidInput, "rename buffer is too large")
+                    })?,
+                    FileRenameInformation,
+                )
+            };
+            if status >= 0 {
+                return Ok(());
+            }
+            let error =
+                io::Error::from_raw_os_error(unsafe { RtlNtStatusToDosError(status) } as i32);
+            Err(io::Error::new(
+                error.kind(),
+                format!("handle-relative rename failed: {error}"),
+            ))
+        },
+    )?;
     sync_dir(&from.parent)?;
-    destination_sync.sync_all().map_err(|error| {
-        MutationError::Io(format!(
-            "destination directory durability flush failed: {error}"
-        ))
-    })?;
+    if let Some(destination_sync) = destination_sync {
+        destination_sync.sync_all().map_err(|error| {
+            MutationError::Io(format!(
+                "destination directory durability flush failed: {error}"
+            ))
+        })?;
+    }
     Ok(())
+}
+
+#[cfg(windows)]
+fn retry_windows_replace(
+    replace_if_exists: bool,
+    mut backoff: std::time::Duration,
+    mut operation: impl FnMut() -> io::Result<()>,
+) -> io::Result<()> {
+    const ATTEMPTS: u32 = 8;
+    const SHARING_VIOLATION: i32 = 32;
+    let mut last_error = None;
+    for attempt in 0..ATTEMPTS {
+        match operation() {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if replace_if_exists
+                    && (error.kind() == io::ErrorKind::PermissionDenied
+                        || error.raw_os_error() == Some(SHARING_VIOLATION)) =>
+            {
+                last_error = Some(error);
+                if attempt + 1 < ATTEMPTS {
+                    std::thread::sleep(backoff);
+                    backoff *= 2;
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_error.expect("bounded Windows rename retry records every transient error"))
 }
 
 impl AnchoredTarget {
@@ -758,15 +923,30 @@ impl AnchoredTarget {
 
     pub(crate) fn put_atomic(&self, bytes: &[u8]) -> Result<(), MutationError> {
         let temporary = OsString::from(format!(".{}.tmp", Uuid::new_v4()));
+        self.put_atomic_with_temporary(temporary, bytes)
+    }
+
+    fn put_atomic_with_temporary(
+        &self,
+        temporary: OsString,
+        bytes: &[u8],
+    ) -> Result<(), MutationError> {
         let temporary_target = Self {
             parent: self.parent.try_clone()?,
             leaf: temporary.clone(),
         };
-        temporary_target.put_new(bytes)?;
-        let result = self
-            .parent
-            .rename(&temporary, &self.parent, &self.leaf)
-            .map_err(MutationError::from);
+        temporary_target.put_new(bytes).map_err(|error| {
+            MutationError::RecoveryConflict(format!(
+                "capability atomic temporary publication failed: {error}"
+            ))
+        })?;
+        let result = rename_target_replace(
+            temporary_target,
+            Self {
+                parent: self.parent.try_clone()?,
+                leaf: self.leaf.clone(),
+            },
+        );
         if result.is_err() {
             let _ = self.parent.remove_file_or_symlink(&temporary);
         }
@@ -852,7 +1032,15 @@ fn sync_dir(directory: &Dir) -> Result<(), MutationError> {
             .write(true)
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
             .follow(FollowSymlinks::No);
-        directory.open_with(".", &options)?.sync_all()?;
+        directory
+            .open_with(".", &options)
+            .map_err(|error| {
+                MutationError::Io(format!("directory durability open failed: {error}"))
+            })?
+            .sync_all()
+            .map_err(|error| {
+                MutationError::Io(format!("directory durability flush failed: {error}"))
+            })?;
         Ok(())
     }
     #[cfg(not(windows))]
@@ -862,7 +1050,218 @@ fn sync_dir(directory: &Dir) -> Result<(), MutationError> {
     }
 }
 
-#[allow(dead_code)]
-fn _leaf_name_is_relative(leaf: &OsStr) -> bool {
-    Path::new(leaf).components().count() == 1
+#[cfg(unix)]
+fn rename_replace_with_retry(
+    from_dir: &Dir,
+    from: &OsStr,
+    to_dir: &Dir,
+    to: &OsStr,
+) -> io::Result<()> {
+    const ATTEMPTS: u32 = 5;
+    const SHARING_VIOLATION: i32 = 32;
+    let mut backoff = std::time::Duration::from_millis(10);
+    let mut last_error = None;
+    for attempt in 0..ATTEMPTS {
+        match from_dir.rename(from, to_dir, to) {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if error.kind() == io::ErrorKind::PermissionDenied
+                    || error.raw_os_error() == Some(SHARING_VIOLATION) =>
+            {
+                last_error = Some(error);
+                if attempt + 1 < ATTEMPTS {
+                    std::thread::sleep(backoff);
+                    backoff *= 2;
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_error.expect("bounded rename retry records every transient error"))
+}
+
+#[cfg(windows)]
+fn open_external_windows_directory(path: &Path) -> Result<Dir, MutationError> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt as _};
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFinalPathNameByHandleW, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, FILE_TRAVERSE, SYNCHRONIZE, VOLUME_NAME_DOS,
+    };
+
+    let mut anchor = PathBuf::new();
+    let mut descendants = Vec::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Prefix(prefix) => anchor.push(prefix.as_os_str()),
+            std::path::Component::RootDir => anchor.push(component.as_os_str()),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                return Err(MutationError::Invalid(
+                    "external atomic directory cannot contain parent traversal".into(),
+                ))
+            }
+            std::path::Component::Normal(name) => descendants.push(name.to_os_string()),
+        }
+    }
+    if anchor.as_os_str().is_empty() {
+        return Err(MutationError::Invalid(
+            "external atomic directory must resolve from a filesystem root".into(),
+        ));
+    }
+    let mut current = anchor;
+    let mut pinned_ancestors = Vec::new();
+    for descendant in descendants {
+        current.push(&descendant);
+        let metadata = std::fs::symlink_metadata(&current)?;
+        if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(MutationError::Invalid(format!(
+                "external atomic directory contains a reparse point at {}",
+                descendant.to_string_lossy()
+            )));
+        }
+        let opened = std::fs::OpenOptions::new()
+            .access_mode(FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&current);
+        match opened {
+            Ok(file) => pinned_ancestors.push(file),
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                // Some Windows profile ancestors deny opening the directory itself
+                // while permitting traversal. The final retained handle path check
+                // below still proves that no unchecked ancestor redirected it.
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let file = std::fs::OpenOptions::new()
+        .access_mode(FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(&current)
+        .map_err(|error| {
+            MutationError::Io(format!("external parent no-follow open failed: {error}"))
+        })?;
+    let metadata = file.metadata()?;
+    if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(MutationError::Invalid(
+            "external atomic parent must be a real directory".into(),
+        ));
+    }
+    let required = unsafe {
+        GetFinalPathNameByHandleW(
+            file.as_raw_handle(),
+            std::ptr::null_mut(),
+            0,
+            FILE_NAME_NORMALIZED | VOLUME_NAME_DOS,
+        )
+    };
+    if required == 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    let mut buffer = vec![0_u16; required as usize + 1];
+    let written = unsafe {
+        GetFinalPathNameByHandleW(
+            file.as_raw_handle(),
+            buffer.as_mut_ptr(),
+            buffer.len() as u32,
+            FILE_NAME_NORMALIZED | VOLUME_NAME_DOS,
+        )
+    };
+    if written == 0 || written as usize >= buffer.len() {
+        return Err(io::Error::last_os_error().into());
+    }
+    let retained = String::from_utf16(&buffer[..written as usize])
+        .map_err(|_| MutationError::Invalid("external retained path is invalid UTF-16".into()))?;
+    if normalize_windows_retained_path(&retained)
+        != normalize_windows_retained_path(&current.to_string_lossy())
+    {
+        return Err(MutationError::RecoveryConflict(
+            "external atomic parent was redirected during capability acquisition".into(),
+        ));
+    }
+    drop(pinned_ancestors);
+    Ok(Dir::from_std_file(file))
+}
+
+#[cfg(windows)]
+fn normalize_windows_retained_path(path: &str) -> String {
+    let path = path.replace('/', "\\");
+    let path = path
+        .strip_prefix(r"\\?\UNC\")
+        .map(|path| format!(r"\\{path}"))
+        .or_else(|| path.strip_prefix(r"\\?\").map(ToOwned::to_owned))
+        .unwrap_or(path);
+    path.trim_end_matches('\\').to_lowercase()
+}
+
+#[cfg(not(windows))]
+fn reopen_external_dir_with_identity(path: &Path, expected: &Dir) -> Result<Dir, MutationError> {
+    let reopened = Dir::open_ambient_dir(path, ambient_authority())
+        .map_err(|error| MutationError::Io(format!("external parent reopen failed: {error}")))?;
+    let expected_metadata = expected.dir_metadata().map_err(|error| {
+        MutationError::Io(format!(
+            "external traversed parent metadata failed: {error}"
+        ))
+    })?;
+    let reopened_metadata = reopened.dir_metadata().map_err(|error| {
+        MutationError::Io(format!("external reopened parent metadata failed: {error}"))
+    })?;
+    if expected_metadata.dev() != reopened_metadata.dev()
+        || expected_metadata.ino() != reopened_metadata.ino()
+    {
+        return Err(MutationError::RecoveryConflict(
+            "external atomic parent changed during capability acquisition".into(),
+        ));
+    }
+    Ok(reopened)
+}
+
+fn leaf_name_is_relative(leaf: &OsStr) -> bool {
+    let mut components = Path::new(leaf).components();
+    matches!(components.next(), Some(std::path::Component::Normal(_)))
+        && components.next().is_none()
+}
+
+#[cfg(all(test, windows))]
+mod external_windows_path_tests {
+    use super::{normalize_windows_retained_path, retry_windows_replace};
+
+    #[test]
+    fn retained_dos_and_unc_paths_normalize_to_their_lexical_forms() {
+        assert_eq!(
+            normalize_windows_retained_path(r"\\?\C:\Users\Bryan\Preview\\"),
+            r"c:\users\bryan\preview"
+        );
+        assert_eq!(
+            normalize_windows_retained_path(r"\\?\UNC\Server\Share\Preview"),
+            r"\\server\share\preview"
+        );
+    }
+
+    #[test]
+    fn transient_replace_retries_are_bounded_and_reach_the_eighth_attempt() {
+        let mut eventual_attempts = 0;
+        retry_windows_replace(true, std::time::Duration::ZERO, || {
+            eventual_attempts += 1;
+            if eventual_attempts < 8 {
+                Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap();
+        assert_eq!(eventual_attempts, 8);
+
+        let mut exhausted_attempts = 0;
+        let error = retry_windows_replace(true, std::time::Duration::ZERO, || {
+            exhausted_attempts += 1;
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        })
+        .unwrap_err();
+        assert_eq!(exhausted_attempts, 8);
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    }
 }

@@ -291,6 +291,14 @@
       </button>
       <button
         class="btn btn-secondary"
+        type="button"
+        aria-label="Open image generation"
+        @click="showImageGeneration = true"
+      >
+        Generate Image
+      </button>
+      <button
+        class="btn btn-secondary"
         :disabled="selectedLLMNodes.length < 2"
         @click="handleStartDebate"
       >
@@ -321,6 +329,11 @@
       @create-preset="handleCreatePreset"
       @update-preset="handleUpdatePreset"
       @delete-preset="handleDeletePreset"
+    />
+
+    <ImageGenerationDialog
+      v-if="showImageGeneration"
+      @close="showImageGeneration = false"
     />
 
     <!-- Add Model Dialog -->
@@ -420,6 +433,7 @@ import LLMNode from './LLMNode.vue'
 import DebateNode from './DebateNode.vue'
 import PromptDialog from './PromptDialog.vue'
 import AddModelDialog from './AddModelDialog.vue'
+import ImageGenerationDialog from './ImageGenerationDialog.vue'
 import PinnedNotesPanel from './PinnedNotesPanel.vue'
 import GIcon from '@/components/ui/GIcon.vue'
 
@@ -443,6 +457,7 @@ const surface = ref(null)
 const viewport = ref({ x: 0, y: 0, zoom: 1 })
 const selectedNodes = ref([])  // Format: "prompt:{id}", "llm:{tileId}:{modelId}", "debate:{id}"
 const showPromptDialog = ref(false)
+const showImageGeneration = ref(false)
 const saving = ref(false)
 const exportingTwin = ref(false)
 const saveMessage = ref(null)

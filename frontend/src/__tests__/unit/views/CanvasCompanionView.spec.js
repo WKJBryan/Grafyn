@@ -41,6 +41,10 @@ async function mountView(path = '/canvas/session-a') {
           CompanionShell: {
             template: '<div data-test="inner-companion-shell"><slot /></div>',
           },
+          QuickImageComposer: {
+            props: ['collapsible'],
+            template: '<section class="quick-image-stub" :data-collapsible="String(collapsible)" />',
+          },
         },
       },
     }),
@@ -62,6 +66,20 @@ describe('CanvasCompanionView', () => {
     await flushPromises()
 
     expect(wrapper.find('[data-test="inner-companion-shell"]').exists()).toBe(false)
+  })
+
+  it('mounts compact image creation beside the existing text composer without changing its models', async () => {
+    const store = useCanvasStore()
+    store.availableModels = [{ id: 'model-a', name: 'Model A', provider: 'openrouter' }]
+    const textModels = store.availableModels
+    vi.spyOn(store, 'loadSessions').mockResolvedValue()
+    vi.spyOn(store, 'loadModels').mockResolvedValue()
+    vi.spyOn(store, 'loadSession').mockResolvedValue()
+    const { wrapper } = await mountView('/canvas')
+    await flushPromises()
+
+    expect(wrapper.get('.quick-image-stub').attributes('data-collapsible')).toBeDefined()
+    expect(wrapper.getComponent(CanvasComposer).props('models')).toBe(textModels)
   })
 
   it('loads the routed session and model catalog through the existing Canvas store', async () => {

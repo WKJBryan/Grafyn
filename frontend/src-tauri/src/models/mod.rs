@@ -2,6 +2,7 @@ pub mod attachment;
 pub mod boot;
 pub mod canvas;
 pub mod feedback;
+pub mod image_generation;
 pub mod import;
 pub mod link_discovery;
 pub mod memory;

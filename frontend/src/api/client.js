@@ -93,6 +93,27 @@ export const canvas = {
     invoke('regenerate_response', { sessionId, tileId, modelId }),
 }
 
+// One-shot image generation stays separate from Canvas text persistence and streaming.
+export const images = {
+  discoverModels: () => invoke('discover_image_models', { request: {} }),
+
+  getModelCapability: (modelId) =>
+    invoke('get_image_model_capability', { request: { modelId } }),
+
+  generate: (request) => invoke('generate_image', { request }),
+
+  save: (request) => invoke('save_generated_image', { request }),
+
+  saveAs: (receiptId, retentionPolicy) =>
+    invoke('export_generated_image', { request: { receiptId, retentionPolicy } }),
+
+  load: (attachmentDigest) =>
+    invoke('load_generated_image', { request: { attachmentDigest } }),
+
+  discard: (receiptId) =>
+    invoke('discard_generated_image_receipt', { request: { receiptId } }),
+}
+
 // Twin collector API
 export const twin = {
   listRecords: () => invoke('list_user_records', {}),

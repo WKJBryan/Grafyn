@@ -1,10 +1,13 @@
 use super::engine::SyncEngine;
-use super::identity::{load_or_create_vault_identity, VaultIdentity, VAULT_DESCRIPTOR_KEY};
+use super::identity::{
+    load_or_create_vault_identity, load_vault_identity, VaultIdentity, VAULT_DESCRIPTOR_KEY,
+};
 use super::secrets::MemorySecretStore;
 use super::vault_keys::provision_vault_root_key;
+use crate::models::image_generation::{GeneratedImageSyncPolicy, ImageMetadataRetentionPolicy};
 use crate::models::twin_event::{
-    CausalStream, EvidenceRef, EvidenceType, Governance, NoteChangeKind, NoteChanged,
-    SourceChannel, TwinEventPayload,
+    CausalStream, ContentDigest, EvidenceRef, EvidenceType, Governance, NoteChangeKind,
+    NoteChanged, SourceChannel, TwinEventPayload,
 };
 use crate::services::knowledge_store::KnowledgeStore;
 use crate::services::twin_events::{
@@ -12,9 +15,10 @@ use crate::services::twin_events::{
 };
 use chrono::{TimeZone, Utc};
 use grafyn_sync_protocol::{
-    open_operation, seal_operation, DeviceId, DeviceSigningKey, NoteRevisionV1, OperationPayloadV1,
-    OperationV1, TrustedDevice, VaultRootKey,
+    open_operation, seal_operation, DeviceId, DeviceSigningKey, Digest32, NoteRevisionV1,
+    OperationPayloadV1, OperationV1, TrustedDevice, VaultRootKey,
 };
+use std::io::Cursor;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -265,6 +269,358 @@ impl ExistingVault {
         );
         (engine, coordinator, knowledge, event_store)
     }
+}
+
+struct UnprovisionedImageVault {
+    _data_root: tempfile::TempDir,
+    _vault_root: tempfile::TempDir,
+    data_path: std::path::PathBuf,
+    vault_path: std::path::PathBuf,
+    identity: VaultIdentity,
+    secrets: Arc<MemorySecretStore>,
+    engine: Arc<SyncEngine>,
+    coordinator: Arc<MutationCoordinator>,
+    knowledge: KnowledgeStore,
+}
+
+impl UnprovisionedImageVault {
+    fn new() -> Self {
+        let data_root = tempfile::tempdir().unwrap();
+        let vault_root = tempfile::tempdir().unwrap();
+        let data_path = data_root.path().to_path_buf();
+        let vault_path = vault_root.path().to_path_buf();
+        std::fs::create_dir_all(data_path.join("twin/events")).unwrap();
+        let identity = load_or_create_vault_identity(&vault_path).unwrap();
+        let secrets = Arc::new(MemorySecretStore::default());
+        let event_store = Arc::new(TwinEventStore::new(&data_path));
+        let engine = Arc::new(
+            SyncEngine::open_core(
+                &data_path,
+                &vault_path,
+                identity.clone(),
+                None,
+                secrets.clone(),
+                event_store.clone(),
+            )
+            .unwrap(),
+        );
+        let coordinator = Arc::new(
+            MutationCoordinator::new_stable(&data_path, &vault_path, event_store, engine.clone())
+                .unwrap(),
+        );
+        let device = coordinator
+            .load_or_create_device_signing_identity(secrets.clone())
+            .unwrap();
+        engine.attach_device_identity(device).unwrap();
+        let knowledge = KnowledgeStore::with_event_recorder(
+            vault_path.clone(),
+            data_path.join("image-bootstrap-derived"),
+            coordinator.clone(),
+        );
+        Self {
+            _data_root: data_root,
+            _vault_root: vault_root,
+            data_path,
+            vault_path,
+            identity,
+            secrets,
+            engine,
+            coordinator,
+            knowledge,
+        }
+    }
+
+    fn save_generated_image(
+        &mut self,
+        sync_policy: GeneratedImageSyncPolicy,
+        marker: u8,
+    ) -> (
+        Vec<u8>,
+        Digest32,
+        crate::models::attachment::ImageAttachmentCatalogRecordV1,
+    ) {
+        let image = image::RgbaImage::from_pixel(2, 2, image::Rgba([marker, 0, 0, 255]));
+        let mut output = Cursor::new(Vec::new());
+        image
+            .write_to(&mut output, image::ImageFormat::Png)
+            .unwrap();
+        let bytes = output.into_inner();
+        let (lease, digest) = self
+            .engine
+            .register_pending_generated_image(&self.identity.root_scope, &bytes, "image/png")
+            .unwrap();
+        let attachment_digest = ContentDigest::parse(digest.to_string()).unwrap();
+        let captured_at = Utc
+            .with_ymd_and_hms(2026, 9, 1, 6, 0, u32::from(marker))
+            .unwrap();
+        let (create, observation) = crate::commands::twin_state::plan_generated_image_capture(
+            crate::commands::twin_state::GeneratedImageCapturePlanInput {
+                prompt: format!("bootstrap generated image {marker}"),
+                annotation: None,
+                model_id: "test/image-model".into(),
+                gateway: "openrouter".into(),
+                provider_tag: "test-provider".into(),
+                resolution: "2x2".into(),
+                aspect_ratio: "1:1".into(),
+                attachment_digest,
+                media_type: "image/png".into(),
+                byte_size: bytes.len() as u64,
+                width: 2,
+                height: 2,
+                retention_policy: ImageMetadataRetentionPolicy::RetainOriginal,
+                grafyn_sync: sync_policy,
+            },
+            captured_at,
+        )
+        .unwrap();
+        let expected = self.coordinator.current_authority_token().unwrap();
+        let _ = self
+            .knowledge
+            .create_generated_image_capture_expecting_authority(create, observation, expected)
+            .into_result()
+            .unwrap();
+        drop(lease);
+        assert_eq!(self.engine.status().unwrap().outbox_operations, 0);
+        let catalog = self
+            .engine
+            .cataloged_image_expecting_scope(&self.identity.root_scope, &digest)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            self.engine.materialized_attachment(&digest).unwrap(),
+            Some(bytes.clone())
+        );
+        (bytes, digest, catalog)
+    }
+
+    fn provision(&self) {
+        provision_vault_root_key(
+            self.secrets.as_ref(),
+            &self.identity.descriptor.vault_id().to_string(),
+            &VaultRootKey::from_bytes(ROOT_KEY_BYTES),
+        )
+        .unwrap();
+        let prepared = self.engine.prepare_retarget(&self.vault_path).unwrap();
+        self.engine.activate_retarget(prepared).unwrap();
+        assert!(self.engine.status().unwrap().provisioned);
+    }
+
+    fn prepared_path(&self) -> std::path::PathBuf {
+        self.data_path
+            .join("sync/vaults/v1")
+            .join(self.identity.root_scope.as_str())
+            .join("bootstrap/v1/prepared.json")
+    }
+
+    fn catalog_path(&self, digest: &Digest32) -> std::path::PathBuf {
+        self.data_path
+            .join("sync/vaults/v1")
+            .join(self.identity.root_scope.as_str())
+            .join("attachments/v1/catalog")
+            .join(format!("{digest}.json"))
+    }
+}
+
+#[test]
+fn unprovisioned_inherited_generated_image_bootstrap_reconstructs_catalog_on_peer() {
+    let mut source = UnprovisionedImageVault::new();
+    let (bytes, digest, catalog) =
+        source.save_generated_image(GeneratedImageSyncPolicy::Inherit, 1);
+    source.provision();
+
+    source
+        .engine
+        .bootstrap_existing_vault(source.coordinator.as_ref(), &source.knowledge)
+        .unwrap();
+
+    let outbox = source.engine.export_outbox().unwrap();
+    assert_eq!(outbox.len(), 5, "note + two events + manifest + chunk");
+    let peer_data = tempfile::tempdir().unwrap();
+    let peer_vault = tempfile::tempdir().unwrap();
+    let descriptor_path = peer_vault.path().join(VAULT_DESCRIPTOR_KEY);
+    std::fs::create_dir_all(descriptor_path.parent().unwrap()).unwrap();
+    std::fs::copy(
+        source.vault_path.join(VAULT_DESCRIPTOR_KEY),
+        &descriptor_path,
+    )
+    .unwrap();
+    std::fs::create_dir_all(peer_data.path().join("twin/events")).unwrap();
+    let peer_identity = load_vault_identity(peer_vault.path()).unwrap();
+    let peer_secrets = Arc::new(MemorySecretStore::default());
+    provision_vault_root_key(
+        peer_secrets.as_ref(),
+        &peer_identity.descriptor.vault_id().to_string(),
+        &VaultRootKey::from_bytes(ROOT_KEY_BYTES),
+    )
+    .unwrap();
+    let peer_events = Arc::new(TwinEventStore::new(peer_data.path()));
+    let peer_engine = Arc::new(
+        SyncEngine::open_core(
+            peer_data.path(),
+            peer_vault.path(),
+            peer_identity.clone(),
+            Some(VaultRootKey::from_bytes(ROOT_KEY_BYTES)),
+            peer_secrets.clone(),
+            peer_events.clone(),
+        )
+        .unwrap(),
+    );
+    let peer_coordinator = Arc::new(
+        MutationCoordinator::new_stable(
+            peer_data.path(),
+            peer_vault.path(),
+            peer_events,
+            peer_engine.clone(),
+        )
+        .unwrap(),
+    );
+    let peer_device = peer_coordinator
+        .load_or_create_device_signing_identity(peer_secrets)
+        .unwrap();
+    peer_engine.attach_device_identity(peer_device).unwrap();
+    let (source_device, source_public_key) = source.engine.local_device().unwrap();
+    peer_engine
+        .trust_device(source_device, source_public_key)
+        .unwrap();
+
+    peer_engine
+        .receive_envelopes(peer_coordinator.as_ref(), &outbox)
+        .unwrap();
+
+    assert_eq!(
+        peer_engine
+            .cataloged_image_expecting_scope(&peer_identity.root_scope, &digest)
+            .unwrap(),
+        Some(catalog)
+    );
+    assert_eq!(
+        peer_engine.materialized_attachment(&digest).unwrap(),
+        Some(bytes)
+    );
+    assert_eq!(peer_engine.status().unwrap().outbox_operations, 0);
+}
+
+#[test]
+fn mixed_generated_image_bootstrap_includes_only_inherited_attachment() {
+    let mut source = UnprovisionedImageVault::new();
+    let (_, inherited_digest, _) =
+        source.save_generated_image(GeneratedImageSyncPolicy::Inherit, 2);
+    let (_, local_digest, _) = source.save_generated_image(GeneratedImageSyncPolicy::LocalOnly, 3);
+    source.provision();
+
+    source
+        .engine
+        .bootstrap_existing_vault(source.coordinator.as_ref(), &source.knowledge)
+        .unwrap();
+
+    let (device_id, public_key) = source.engine.local_device().unwrap();
+    let trusted = TrustedDevice::new(device_id, public_key).unwrap();
+    let mut manifests = std::collections::BTreeSet::new();
+    for bytes in source.engine.export_outbox().unwrap() {
+        let envelope = grafyn_sync_protocol::EnvelopeV1::from_json_bytes(&bytes).unwrap();
+        let verified = open_operation(
+            &VaultRootKey::from_bytes(ROOT_KEY_BYTES),
+            source.identity.descriptor.vault_id(),
+            &trusted,
+            &envelope,
+        )
+        .unwrap();
+        if let OperationPayloadV1::AttachmentManifest(manifest) = verified.operation().payload() {
+            manifests.insert(*manifest.attachment_digest());
+        }
+    }
+    assert_eq!(
+        manifests,
+        std::collections::BTreeSet::from([inherited_digest])
+    );
+    assert!(!manifests.contains(&local_digest));
+    assert!(source
+        .engine
+        .cataloged_image_expecting_scope(&source.identity.root_scope, &local_digest)
+        .unwrap()
+        .is_some());
+}
+
+#[test]
+fn bootstrap_rejects_missing_generated_image_catalog_before_witness_install() {
+    let mut source = UnprovisionedImageVault::new();
+    let (_, digest, _) = source.save_generated_image(GeneratedImageSyncPolicy::Inherit, 4);
+    source.provision();
+    std::fs::remove_file(source.catalog_path(&digest)).unwrap();
+
+    let error = source
+        .engine
+        .prepare_existing_vault_bootstrap(source.coordinator.as_ref(), &source.knowledge)
+        .unwrap_err();
+
+    assert!(error.to_string().contains("catalog"));
+    assert_eq!(source.engine.status().unwrap().outbox_operations, 0);
+    assert!(!source.prepared_path().exists());
+}
+
+#[test]
+fn bootstrap_rejects_corrupt_generated_image_catalog_before_witness_install() {
+    let mut source = UnprovisionedImageVault::new();
+    let (_, digest, _) = source.save_generated_image(GeneratedImageSyncPolicy::Inherit, 5);
+    source.provision();
+    std::fs::write(source.catalog_path(&digest), b"not a catalog").unwrap();
+
+    let error = source
+        .engine
+        .prepare_existing_vault_bootstrap(source.coordinator.as_ref(), &source.knowledge)
+        .unwrap_err();
+
+    assert!(error.to_string().contains("catalog"));
+    assert_eq!(source.engine.status().unwrap().outbox_operations, 0);
+    assert!(!source.prepared_path().exists());
+}
+
+#[test]
+fn finish_rejects_incomplete_generated_image_attachment_witness() {
+    let mut source = UnprovisionedImageVault::new();
+    let _ = source.save_generated_image(GeneratedImageSyncPolicy::Inherit, 6);
+    source.provision();
+    assert!(source
+        .engine
+        .prepare_existing_vault_bootstrap(source.coordinator.as_ref(), &source.knowledge)
+        .unwrap());
+    let witness_path = source.prepared_path();
+    let mut witness: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&witness_path).unwrap()).unwrap();
+    let (device_id, public_key) = source.engine.local_device().unwrap();
+    let trusted = TrustedDevice::new(device_id, public_key).unwrap();
+    let root_key = VaultRootKey::from_bytes(ROOT_KEY_BYTES);
+    let envelopes = witness["envelopes"].as_array_mut().unwrap();
+    let chunk_index = envelopes
+        .iter()
+        .position(|value| {
+            let bytes = serde_json::to_vec(value).unwrap();
+            let envelope = grafyn_sync_protocol::EnvelopeV1::from_json_bytes(&bytes).unwrap();
+            let verified = open_operation(
+                &root_key,
+                source.identity.descriptor.vault_id(),
+                &trusted,
+                &envelope,
+            )
+            .unwrap();
+            matches!(
+                verified.operation().payload(),
+                OperationPayloadV1::AttachmentChunk(_)
+            )
+        })
+        .expect("prepared generated image bootstrap must contain a chunk");
+    envelopes.remove(chunk_index);
+    std::fs::write(&witness_path, serde_json::to_vec_pretty(&witness).unwrap()).unwrap();
+
+    let error = source
+        .engine
+        .finish_existing_vault_bootstrap(source.coordinator.as_ref(), &source.knowledge)
+        .unwrap_err();
+
+    assert!(error
+        .to_string()
+        .contains("incomplete generated image attachment"));
+    assert_eq!(source.engine.status().unwrap().outbox_operations, 0);
 }
 
 #[test]

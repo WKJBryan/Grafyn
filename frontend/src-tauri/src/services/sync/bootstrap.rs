@@ -3,7 +3,7 @@ use crate::services::knowledge_store::KnowledgeStore;
 use crate::services::sync::operation_store::{
     MAX_OPERATIONS_PER_AREA, MAX_OPERATION_BYTES_PER_AREA,
 };
-use grafyn_sync_protocol::MAX_ENVELOPE_JSON_BYTES;
+use grafyn_sync_protocol::{reassemble_attachment, VerifiedOperation, MAX_ENVELOPE_JSON_BYTES};
 use serde_json::Value;
 
 const BOOTSTRAP_SCHEMA_VERSION: u16 = 1;
@@ -482,6 +482,7 @@ fn build_prepared(
         }
         event_candidates.push(event);
     }
+    let generated_image_digests = generated_image_attachment_digests(&event_candidates, true)?;
     let available_event_ids = event_operations.keys().cloned().collect::<BTreeSet<_>>();
     for event in dependency_order_bootstrap_events(event_candidates, &available_event_ids)? {
         let event_dependencies = event_dependency_ids(&event)?;
@@ -522,6 +523,70 @@ fn build_prepared(
         .map_err(|error| MutationError::Invalid(error.to_string()))?;
         event_operations.insert(event.event_id.as_str().to_owned(), *envelope.operation_id());
         envelopes.push(envelope);
+    }
+    for digest in generated_image_digests {
+        let catalog = state
+            .attachment_store
+            .cataloged_image(&digest)?
+            .ok_or_else(|| {
+                MutationError::RecoveryConflict(format!(
+                    "generated image catalog is missing for bootstrap attachment {digest}"
+                ))
+            })?;
+        let bytes = state
+            .attachment_store
+            .materialized_bytes(&digest)?
+            .ok_or_else(|| {
+                MutationError::RecoveryConflict(format!(
+                    "generated image blob is missing for bootstrap attachment {digest}"
+                ))
+            })?;
+        let manifest = AttachmentManifestV1::new(digest, catalog.media_type(), bytes.len())
+            .map_err(|error| MutationError::Invalid(error.to_string()))?;
+        let manifest_operation = OperationV1::new(
+            recorded_at_unix_ms,
+            Vec::new(),
+            OperationPayloadV1::AttachmentManifest(manifest.clone()),
+        )
+        .map_err(|error| MutationError::Invalid(error.to_string()))?;
+        let manifest_envelope = seal_operation(
+            root_key,
+            &state.vault_id,
+            &device.device_id,
+            &device.signing_key,
+            &manifest_operation,
+        )
+        .map_err(|error| MutationError::Invalid(error.to_string()))?;
+        let manifest_operation_id = *manifest_envelope.operation_id();
+        envelopes.push(manifest_envelope);
+        for (chunk_index, chunk_bytes) in bytes.chunks(ATTACHMENT_CHUNK_BYTES).enumerate() {
+            let chunk = AttachmentChunkV1::new(
+                manifest_operation_id,
+                digest,
+                u32::try_from(chunk_index).map_err(|_| {
+                    MutationError::Invalid("bootstrap attachment chunk index overflowed".into())
+                })?,
+                manifest.chunk_count(),
+                chunk_bytes.to_vec(),
+            )
+            .map_err(|error| MutationError::Invalid(error.to_string()))?;
+            let operation = OperationV1::new(
+                recorded_at_unix_ms,
+                vec![manifest_operation_id],
+                OperationPayloadV1::AttachmentChunk(chunk),
+            )
+            .map_err(|error| MutationError::Invalid(error.to_string()))?;
+            envelopes.push(
+                seal_operation(
+                    root_key,
+                    &state.vault_id,
+                    &device.device_id,
+                    &device.signing_key,
+                    &operation,
+                )
+                .map_err(|error| MutationError::Invalid(error.to_string()))?,
+            );
+        }
     }
     if envelopes.len() > MAX_OPERATIONS_PER_AREA {
         return Err(MutationError::Invalid(
@@ -692,6 +757,10 @@ fn validate_prepared(
     let mut known_operations = state.operations.keys().copied().collect::<BTreeSet<_>>();
     let mut event_operations = state.event_operations.clone();
     let mut represented_notes = BTreeSet::new();
+    let mut bootstrap_events = Vec::new();
+    let mut attachment_manifests = BTreeMap::<OperationId, (Digest32, VerifiedOperation)>::new();
+    let mut attachment_manifest_digests = BTreeSet::new();
+    let mut attachment_chunks = BTreeMap::<OperationId, Vec<VerifiedOperation>>::new();
     for value in &prepared.envelopes {
         let bytes = serde_json::to_vec(value).map_err(|error| {
             MutationError::Invalid(format!("invalid sync bootstrap envelope: {error}"))
@@ -770,15 +839,71 @@ fn validate_prepared(
                 }
                 event_operations
                     .insert(event.event_id.as_str().to_owned(), *verified.operation_id());
+                bootstrap_events.push(event);
             }
-            OperationPayloadV1::AttachmentManifest(_) | OperationPayloadV1::AttachmentChunk(_) => {
-                return Err(MutationError::Invalid(
-                    "sync bootstrap witness contains a non-bootstrap payload".into(),
-                ))
+            OperationPayloadV1::AttachmentManifest(manifest) => {
+                if !verified.operation().causal_parents().is_empty()
+                    || !attachment_manifest_digests.insert(*manifest.attachment_digest())
+                {
+                    return Err(MutationError::Invalid(
+                        "sync bootstrap witness contains a duplicate or dependent attachment manifest"
+                            .into(),
+                    ));
+                }
+                attachment_manifests.insert(
+                    *verified.operation_id(),
+                    (*manifest.attachment_digest(), verified.clone()),
+                );
+            }
+            OperationPayloadV1::AttachmentChunk(chunk) => {
+                if !attachment_manifests.contains_key(chunk.manifest_operation_id()) {
+                    return Err(MutationError::Invalid(
+                        "sync bootstrap attachment chunk precedes its manifest".into(),
+                    ));
+                }
+                attachment_chunks
+                    .entry(*chunk.manifest_operation_id())
+                    .or_default()
+                    .push(verified.clone());
             }
         }
         known_operations.insert(*verified.operation_id());
         envelopes.push(envelope);
+    }
+    let expected_attachment_digests = generated_image_attachment_digests(&bootstrap_events, true)?;
+    if attachment_manifest_digests != expected_attachment_digests {
+        return Err(MutationError::Invalid(
+            "sync bootstrap witness has incomplete generated image attachments".into(),
+        ));
+    }
+    for (manifest_operation_id, (_, manifest_operation)) in &attachment_manifests {
+        let chunks = attachment_chunks
+            .remove(manifest_operation_id)
+            .unwrap_or_default();
+        let bytes = reassemble_attachment(manifest_operation, &chunks).map_err(|error| {
+            MutationError::Invalid(format!(
+                "incomplete generated image attachment in sync bootstrap witness: {error}"
+            ))
+        })?;
+        let OperationPayloadV1::AttachmentManifest(manifest) =
+            manifest_operation.operation().payload()
+        else {
+            unreachable!("attachment manifest map contains only manifests")
+        };
+        crate::services::attachment_store::validate_generated_image_bytes(
+            &bytes,
+            Some(manifest.media_type()),
+        )
+        .map_err(|error| {
+            MutationError::Invalid(format!(
+                "invalid generated image attachment in sync bootstrap witness: {error}"
+            ))
+        })?;
+    }
+    if !attachment_chunks.is_empty() {
+        return Err(MutationError::Invalid(
+            "sync bootstrap witness has unbound attachment chunks".into(),
+        ));
     }
     Ok(envelopes)
 }
