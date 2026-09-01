@@ -906,11 +906,12 @@ impl TwinStore {
                     let record = if let Some(existing_id) =
                         existing_by_key.get(&draft.inference_key).cloned()
                     {
-                        let mut record = records_by_id.get(&existing_id).cloned().ok_or_else(|| {
-                            crate::services::twin_events::MutationError::Invalid(
-                                "inference record index is inconsistent".into(),
-                            )
-                        })?;
+                        let mut record =
+                            records_by_id.get(&existing_id).cloned().ok_or_else(|| {
+                                crate::services::twin_events::MutationError::Invalid(
+                                    "inference record index is inconsistent".into(),
+                                )
+                            })?;
                         let previous_state = record.promotion_state.clone();
                         record.kind = draft.kind.clone();
                         record.content = draft.content.clone();
@@ -1005,14 +1006,12 @@ impl TwinStore {
                         })?,
                     ));
                     event_drafts.push(
-                        self.record_observation_draft(
-                            record,
-                            true,
-                            Some("legacy_inference"),
-                        )
-                        .map_err(|error| {
-                            crate::services::twin_events::MutationError::Invalid(error.to_string())
-                        })?,
+                        self.record_observation_draft(record, true, Some("legacy_inference"))
+                            .map_err(|error| {
+                                crate::services::twin_events::MutationError::Invalid(
+                                    error.to_string(),
+                                )
+                            })?,
                     );
                 }
                 let targets = self.governed_json_targets(values).map_err(|error| {
@@ -1032,8 +1031,8 @@ impl TwinStore {
                 &mut planner,
             );
             let commit = self.finish_mutation_commit(result)?;
-            let (summary, _records) = committed
-                .ok_or_else(|| anyhow::anyhow!("Twin inference was not planned"))?;
+            let (summary, _records) =
+                committed.ok_or_else(|| anyhow::anyhow!("Twin inference was not planned"))?;
             self.invalidate_mutation_caches();
             return Ok((summary, commit));
         }
@@ -1353,9 +1352,8 @@ impl TwinStore {
     }
 
     fn read_record_file(&self, path: &Path) -> Result<UserRecord> {
-        self.read_twin_json_bounded(path)?.ok_or_else(|| {
-            anyhow::anyhow!("Failed to read record file: {}", path.display())
-        })
+        self.read_twin_json_bounded(path)?
+            .ok_or_else(|| anyhow::anyhow!("Failed to read record file: {}", path.display()))
     }
 
     pub(super) fn list_user_records_durable(&self) -> Result<Vec<UserRecord>> {

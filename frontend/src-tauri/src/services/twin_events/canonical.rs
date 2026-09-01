@@ -354,10 +354,7 @@ fn encode_primitive_assessment(
     );
     out.optional_text(
         "primitive_assessment.time_horizon",
-        assessment
-            .time_horizon
-            .as_ref()
-            .map(BoundedContent::as_str),
+        assessment.time_horizon.as_ref().map(BoundedContent::as_str),
     );
     out.optional_text(
         "primitive_assessment.uncertainty",
@@ -699,8 +696,8 @@ mod tests {
             "outcome_feedback",
         ];
         let variants = field_names.map(|field_name| {
-            let mut value = serde_json::to_value(PrimitiveDecisionAssessmentPayload::default())
-                .unwrap();
+            let mut value =
+                serde_json::to_value(PrimitiveDecisionAssessmentPayload::default()).unwrap();
             value[field_name] = serde_json::Value::String(format!("{field_name} value"));
             serde_json::from_value::<PrimitiveDecisionAssessmentPayload>(value).unwrap()
         });
@@ -716,9 +713,8 @@ mod tests {
                 primitive_assessment,
             }))
         };
-        let decision_baseline = super::derive_event_id(&decision(
-            PrimitiveDecisionAssessmentPayload::default(),
-        ));
+        let decision_baseline =
+            super::derive_event_id(&decision(PrimitiveDecisionAssessmentPayload::default()));
         for (field_name, variant) in field_names.into_iter().zip(variants.clone()) {
             assert_ne!(
                 decision_baseline,

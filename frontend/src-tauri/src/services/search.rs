@@ -26,8 +26,7 @@ impl SearchOpenError {
 impl std::fmt::Display for SearchOpenError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::WriterBusy(error)
-            | Self::CorruptOrIncompatible(error) => error.fmt(formatter),
+            Self::WriterBusy(error) | Self::CorruptOrIncompatible(error) => error.fmt(formatter),
             Self::Other(error) => error.fmt(formatter),
         }
     }
@@ -39,9 +38,7 @@ fn classify_tantivy_open(error: tantivy::TantivyError) -> SearchOpenError {
     match error {
         error @ (tantivy::TantivyError::DataCorruption(_)
         | tantivy::TantivyError::IncompatibleIndex(_)
-        | tantivy::TantivyError::SchemaError(_)) => {
-            SearchOpenError::CorruptOrIncompatible(error)
-        }
+        | tantivy::TantivyError::SchemaError(_)) => SearchOpenError::CorruptOrIncompatible(error),
         error => SearchOpenError::Other(anyhow::Error::new(error)),
     }
 }
@@ -81,8 +78,7 @@ impl SearchService {
         let index = if index_path.join("meta.json").exists() {
             Index::open_in_dir(&index_path).map_err(classify_tantivy_open)?
         } else {
-            Index::create_in_dir(&index_path, schema.clone())
-                .map_err(classify_tantivy_open)?
+            Index::create_in_dir(&index_path, schema.clone()).map_err(classify_tantivy_open)?
         };
 
         let reader = index
@@ -91,14 +87,10 @@ impl SearchService {
             .try_into()
             .map_err(classify_tantivy_open)?;
 
-        let writer = index
-            .writer(50_000_000)
-            .map_err(|error| match error {
-                error @ tantivy::TantivyError::LockFailure(_, _) => {
-                    SearchOpenError::WriterBusy(error)
-                }
-                error => classify_tantivy_open(error),
-            })?;
+        let writer = index.writer(50_000_000).map_err(|error| match error {
+            error @ tantivy::TantivyError::LockFailure(_, _) => SearchOpenError::WriterBusy(error),
+            error => classify_tantivy_open(error),
+        })?;
 
         Ok(Self {
             index_path,

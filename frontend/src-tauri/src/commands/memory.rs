@@ -12,9 +12,13 @@ pub async fn recall_relevant(
     state: State<'_, AppState>,
 ) -> Result<Vec<RecallResult>, String> {
     let root_ticket = crate::commands::acquire_derived_root_epoch(state.inner()).await?;
-    let results =
-        run_retrieval(state.inner(), &request.query, request.limit, &request.context_note_ids)
-            .await?;
+    let results = run_retrieval(
+        state.inner(),
+        &request.query,
+        request.limit,
+        &request.context_note_ids,
+    )
+    .await?;
 
     let result = results
         .into_iter()
@@ -41,11 +45,15 @@ pub async fn find_contradictions(
     let root_ticket = crate::commands::acquire_derived_root_epoch(state.inner()).await?;
     let note = {
         let store = state.knowledge_store.read().await;
-        store.get_note(&note_id).map_err(|error| error.to_string())?
+        store
+            .get_note(&note_id)
+            .map_err(|error| error.to_string())?
     };
     let result = {
         let search = state.search_service.read().await;
-        state.memory_service.find_contradictions_for_note(&search, &note)?
+        state
+            .memory_service
+            .find_contradictions_for_note(&search, &note)?
     };
     root_ticket.finish(state.inner()).await?;
     Ok(result)
