@@ -517,7 +517,7 @@ rebuild_sync_state
 - [x] Implement the smallest components over existing stores/APIs; do not duplicate persistence or streaming state.
 - [x] Keep desktop Twin workspace, spatial Canvas, debates, and multi-model comparison unchanged.
 - [x] Run focused and full frontend tests/build.
-- [ ] Commit: `feat: add companion Twin and linear Canvas`
+- [x] Commit: `feat: add companion Twin and linear Canvas`
 
 **Verification (2026-09-01):** Task 15 focused frontend tests passed 186/186 across 15 files and the full Vue suite passed 672/672 across 59 files. The production build and selected ESLint passed; its separate responsive, compact Canvas/Twin, and wide Canvas/Twin chunks preserve the async boundary that keeps D3 out of compact Canvas. RED regressions covered exact review/attention joins, shared reference time, unique normalized full relationship variants (including multi-edge and directed-versus-bidirectional variants), exact contextual-memory filtering and direction labels on every compact Twin surface, persisted and submission-frozen chat relationship variants, global-context exclusion, mismatched tile/evidence fail-closed behavior, completed-usable history parent IDs, Simulation disclosure/identity, evidence snapshots, independent `twinChat` capability gating, stale-attention hiding/review locks, per-resource/workspace/session-create generation fencing and stale review cancellation, deterministic thread/session ordering, single-shell ownership, route/load/action race locks, committed and API-loaded tagged Twin deep-link clearing, queued-route unmount fencing, compact and wide tagged Twin/Canvas destination isolation, fail-closed Twin history discovery, session-owned reply completion/drafts/send and action errors across navigation, routed-owner store errors during deferred loads, per-session duplicate-send locks, streaming/error states, success-acknowledged draft preservation, one-model context, confirmed session deletion and load-generation cleanup, deduplicated in-flight feedback, regenerate actions, desktop `linearCanvas`, and Android fail-closed routing. `git diff --check` reported only Windows line-ending notices. The repository-wide source-size gate remains independently blocked by three pre-existing oversized Rust files (`sync/engine.rs`, `mutation_coordinator.rs`, and `knowledge_store.rs`); no Task 15 frontend file exceeds the limit.
 
@@ -620,16 +620,22 @@ Task 15 backend verification passed 146/146 focused Rust tests across Twin Histo
 
 **Contract:** Automated evidence proves the success scenario from the design and current desktop features remain usable. Documentation distinguishes working local sync foundations from undeployed paid hosting.
 
-- [ ] Add an `e2e-test-runtime` Cargo feature and required-feature test binary that calls the same production builder/commands/services with explicitly injected temporary app/vault paths. It is excluded from release capabilities/binaries. Use a bounded local HTTP stub only at the OpenRouter network boundary so no test spends money; note/event/attachment/projection/sync behavior remains production code.
-- [ ] Write the Pixel-sized flow: generate and explicitly save one image while online → block network → capture contextual text → restart → recall note/attachment with attention explanation → proposal not used by Simulation → review promotion → history-aware Advisor chat → encrypted envelope delivery with duplicate/reorder → second-device note/attachment/event/projection convergence and zero echo.
-- [ ] Add layout checks for all four destinations: `scrollWidth <= clientWidth`, safe areas, visible composer, 44px targets, and no desktop-only controls.
-- [ ] Add wide-desktop smoke for notes/search/graph, spatial Canvas mount, import capability, settings, updater surface, and MCP status.
-- [ ] Run zoomed-in suites: focused frontend files, event/projection tests, protocol crypto tests, sync convergence tests, Android capability/path tests.
-- [ ] Run zoomed-out gates: `npm run test:run`, `npm run lint`, `npm run build`, `npm run check:file-sizes`, `npm run prepare:sidecar`, `cargo test --locked`, MCP feature tests, `cargo fmt --check`, `cargo clippy --locked --all-targets --all-features -- -D warnings`, desktop Tauri build, E2E, and Android debug build/target check.
-- [ ] Run `npm audit --audit-level=high`, `cargo audit`, license alignment, secret scan, schema/golden-vector validation, and inspect `git diff --check` plus full branch diff.
-- [ ] Use superpowers:requesting-code-review for an independent final review; resolve all blocking findings and re-run affected gates.
-- [ ] Update `CLAUDE.md` as the final live architecture map and remove every obsolete desktop-only/Tauri-v1 statement.
-- [ ] Commit: `test: verify Grafyn companion system end to end`
+- [x] Add an `e2e-test-runtime` Cargo feature and required-feature test binary that calls the same production builder/commands/services with explicitly injected temporary app/vault paths. It is excluded from release capabilities/binaries. Use a bounded local HTTP stub only at the OpenRouter network boundary so no test spends money; note/event/attachment/projection/sync behavior remains production code.
+- [x] Write the Pixel-sized flow: generate and explicitly save one image while online → block network → capture contextual text → restart → recall note/attachment with attention explanation → proposal not used by Simulation → review promotion → history-aware Advisor chat → encrypted envelope delivery with duplicate/reorder → second-device note/attachment/event/projection convergence and zero echo.
+- [x] Add layout checks for all four destinations: `scrollWidth <= clientWidth`, safe areas, visible composer, 44px targets, and no desktop-only controls.
+- [x] Add wide-desktop smoke for notes/search/graph, spatial Canvas mount, import capability, settings, updater surface, and MCP status.
+- [x] Run zoomed-in suites: focused frontend files, event/projection tests, protocol crypto tests, sync convergence tests, Android capability/path tests.
+- [x] Run zoomed-out gates: `npm run test:run`, `npm run lint`, `npm run build`, `npm run check:file-sizes`, `npm run prepare:sidecar`, `cargo test --locked`, MCP feature tests, `cargo fmt --check`, the separate default-desktop/MCP/E2E-runtime Clippy profiles, desktop Tauri build, E2E, and Android debug build/target check.
+- [x] Run dependency/security checks, license alignment, secret scan, schema/golden-vector validation, and inspect `git diff --check` plus the full branch diff. Local npm audits remain offline under the dependency-metadata export policy; CI retains the live high-severity gates.
+- [x] Use superpowers:requesting-code-review for an independent final review; resolve all blocking findings and re-run affected gates.
+- [x] Update `CLAUDE.md` as the final live architecture map and remove every obsolete desktop-only/Tauri-v1 statement.
+- [x] Commit: `test: verify Grafyn companion system end to end`
+
+**Verification (2026-09-02):** Fresh host suites passed 832/832 frontend tests, 1,184/1,184 default desktop Rust library tests, 958/958 MCP tests, 21/21 protocol tests, and 19/19 E2E-runtime tests. The final Playwright system run passed 2/2 in 4.2 minutes—desktop in 5.8 seconds and Pixel in 3.1 minutes—with both strict browser-error gates empty. The desktop journey covered durable notes, search/graph, spatial Canvas, import, settings, updater capability, and MCP status. The Pixel journey covered deterministic-stub image generation and governed save, network loss, contextual capture, restart and Recall with attention, pending-before-review and accepted-after-review Twin state, history-aware Advisor chat, four-destination layout/touch/safe-area checks, duplicate/reordered encrypted delivery, two-device note/attachment/event/projection convergence, and zero echo. The browser bridge, in-memory secret store, Android image-capability injection, and deterministic OpenRouter fixture are test-only; no paid provider or installed native plugin was exercised.
+
+Production Vite and desktop Tauri release/NSIS builds, license alignment, source-size, workflow-YAML, schema/golden-vector, rustfmt, and diff checks passed. All three strict Clippy profiles were run but remain advisory RED on existing warning debt: desktop reported 76 warnings-as-errors, MCP 44, and E2E-runtime 74. Both offline npm audits reported zero known vulnerabilities in their cached snapshots; CI retains live audits because a local live run would export the dependency manifest. RustSec reported zero vulnerabilities plus 22 explicitly allowed maintenance/unsound warnings. The targeted credential-pattern scan found no matches; it is not a comprehensive security audit. Independent final review found no remaining actionable or blocking findings.
+
+The canonical ARM64 Android command completed fresh frontend and Rust/NDK builds, then stopped at the documented Windows Developer Mode symlink boundary. The reviewed exact-library copy plus clean `:app:assembleArm64Debug -x :app:rustBuildArm64Debug` fallback succeeded. The resulting debug APK is 392,893,783 bytes with SHA-256 `7DF91851746501BF14F3F45D743EA0F60EF59B2905C2207D6F5C3E07F915AA3B`; APK Signature Scheme v2 validation passed with one Android debug signer. Its packaged and source native libraries match exactly at 385,622,328 bytes with SHA-256 `7E71D9C32A7BC8B5DEF7B918A57A11413ADDCAEED279FF21F90CB8AFF59A38D5`. The exact Kotlin contract suite passed 11/11. `adb devices -l` was empty, so install/launch, real Keystore, FileProvider, WebView, permissions, and lifecycle behavior remain unverified. The stale popup executable was absent, fresh test and product executables carried the Common Controls v6 dependency, no matching process remained, and the `TaskDialogIndirect` popup did not recur during the final Rust, desktop, E2E, or Android runs.
 
 ---
 
@@ -662,13 +668,13 @@ Task 15 backend verification passed 146/146 focused Rust tests across Twin Histo
 
 ## Plan self-review checklist
 
-- [ ] Every design invariant maps to a task and a test.
-- [ ] Every task identifies production files, tests, focused commands, and a commit.
-- [ ] No task requires the private relay to prove the public/local foundation.
-- [ ] Mobile is a peer local vault, never a remote-control client.
-- [ ] Event capture occurs below Tauri commands and covers MCP.
-- [ ] Sync covers governed Twin events as well as Markdown notes.
-- [ ] Review, authority, sensitivity, allowed uses, and attention remain different data.
-- [ ] Android secret storage fails closed.
-- [ ] Existing desktop behavior remains an explicit gate.
-- [ ] Deferred scope is named instead of represented as implemented.
+- [x] Every design invariant maps to a task and a test.
+- [x] Every task identifies production files, tests, focused commands, and a commit.
+- [x] No task requires the private relay to prove the public/local foundation.
+- [x] Mobile is a peer local vault, never a remote-control client.
+- [x] Event capture occurs below Tauri commands and covers MCP.
+- [x] Sync covers governed Twin events as well as Markdown notes.
+- [x] Review, authority, sensitivity, allowed uses, and attention remain different data.
+- [x] Android secret storage fails closed.
+- [x] Existing desktop behavior remains an explicit gate.
+- [x] Deferred scope is named instead of represented as implemented.

@@ -7,6 +7,7 @@ import CanvasCompanionView from '@/views/companion/CanvasCompanionView.vue'
 import CanvasComposer from '@/components/companion/CanvasComposer.vue'
 import CanvasSessionSheet from '@/components/companion/CanvasSessionSheet.vue'
 import LinearCanvasThread from '@/components/companion/LinearCanvasThread.vue'
+import TwinPreferenceCaptureDialog from '@/components/companion/TwinPreferenceCaptureDialog.vue'
 import ConfirmDialog from '@/components/ConfirmDialog.vue'
 import { useCanvasStore } from '@/stores/canvas'
 import * as apiClient from '@/api/client'
@@ -813,5 +814,269 @@ describe('CanvasCompanionView', () => {
 
     expect(wrapper.get('[aria-label="Accept tile-a model-a"]').attributes('disabled')).toBeDefined()
     expect(wrapper.get('[aria-label="Reject tile-a model-a"]').attributes('disabled')).toBeDefined()
+  })
+
+  it('opts Canvas into preference capture only for completed global responses', async () => {
+    const store = useCanvasStore()
+    store.currentSession = {
+      ...session('session-a'),
+      prompt_tiles: [
+        {
+          id: 'tile-global',
+          prompt: 'Global question',
+          models: ['model-a'],
+          created_at: '2026-09-01T00:00:00Z',
+          twin_relationship_variant: { relationships: [] },
+          responses: {
+            'model-a': {
+              id: 'response-global', model_id: 'model-a', content: 'Global answer', status: 'completed',
+            },
+          },
+        },
+        {
+          id: 'tile-contextual',
+          prompt: 'Contextual question',
+          models: ['model-a'],
+          created_at: '2026-09-01T01:00:00Z',
+          twin_relationship_variant: { relationships: [{
+            subject_id: 'owner', predicate: 'with', object_id: 'person-alex', direction: 'directed',
+          }] },
+          responses: {
+            'model-a': {
+              id: 'response-contextual', model_id: 'model-a', content: 'Contextual answer', status: 'completed',
+            },
+          },
+        },
+      ],
+    }
+    vi.spyOn(store, 'loadSessions').mockResolvedValue()
+    vi.spyOn(store, 'loadModels').mockResolvedValue()
+    const { wrapper } = await mountView('/canvas')
+    await flushPromises()
+
+    expect(wrapper.getComponent(LinearCanvasThread).props('allowPreferenceCapture')).toBe(true)
+    expect(wrapper.find('[aria-label="Capture Twin preference from tile-global model-a"]').exists())
+      .toBe(true)
+    expect(wrapper.find('[aria-label="Capture Twin preference from tile-contextual model-a"]').exists())
+      .toBe(false)
+  })
+
+  it('captures only blank-starting user-authored preference evidence from the exact response', async () => {
+    const store = useCanvasStore()
+    store.currentSession = {
+      ...session('session-a'),
+      prompt_tiles: [{
+        id: 'tile-a',
+        prompt: 'Question',
+        models: ['model-a'],
+        created_at: '2026-09-01T00:00:00Z',
+        twin_relationship_variant: { relationships: [] },
+        responses: {
+          'model-a': {
+            id: 'response-a', model_id: 'model-a', model_name: 'Model A',
+            content: 'MODEL TEXT MUST NOT PREFILL', status: 'completed',
+          },
+        },
+      }],
+    }
+    vi.spyOn(store, 'loadSessions').mockResolvedValue()
+    vi.spyOn(store, 'loadModels').mockResolvedValue()
+    const capture = vi.spyOn(store, 'captureInsight').mockResolvedValue({})
+    const { wrapper } = await mountView('/canvas')
+    await flushPromises()
+
+    await wrapper.get('[aria-label="Capture Twin preference from tile-a model-a"]').trigger('click')
+    await wrapper.vm.$nextTick()
+
+    const dialog = wrapper.getComponent(TwinPreferenceCaptureDialog)
+    expect(dialog.get('textarea').element.value).toBe('')
+    expect(dialog.get('textarea').element.value).not.toContain('MODEL TEXT')
+    store.currentSession.prompt_tiles[0].responses['model-a'].id = 'response-regenerated'
+    store.currentSession.prompt_tiles[0].responses['model-a'].content = 'REGENERATED MODEL TEXT'
+    dialog.vm.$emit('submit', '  I prefer concrete details.  ')
+    await flushPromises()
+
+    expect(capture).toHaveBeenCalledWith('preference', 'I prefer concrete details.', {
+      response: { tile_id: 'tile-a', model_id: 'model-a' },
+      responseWitness: {
+        response_id: 'response-a',
+        response_content: 'MODEL TEXT MUST NOT PREFILL',
+      },
+    })
+    expect(wrapper.text()).toContain('Evidence recorded. More matching evidence may be needed before Grafyn proposes a Twin memory for review.')
+    expect(wrapper.findComponent(TwinPreferenceCaptureDialog).exists()).toBe(false)
+  })
+
+  it('deduplicates an exact capture and preserves the dialog draft after failure', async () => {
+    const store = useCanvasStore()
+    store.currentSession = session('session-a')
+    vi.spyOn(store, 'loadSessions').mockResolvedValue()
+    vi.spyOn(store, 'loadModels').mockResolvedValue()
+    let failCapture
+    const capture = vi.spyOn(store, 'captureInsight').mockImplementation(() => new Promise((resolve, reject) => {
+      failCapture = () => reject(new Error('Evidence capture failed'))
+    }))
+    const { wrapper } = await mountView('/canvas')
+    await flushPromises()
+
+    wrapper.getComponent(LinearCanvasThread).vm.$emit('capture-preference', {
+      tileId: 'tile-a', modelId: 'model-a', responseId: 'response-a', responseContent: 'Answer A',
+    })
+    await wrapper.vm.$nextTick()
+    const dialog = wrapper.getComponent(TwinPreferenceCaptureDialog)
+    await dialog.get('textarea').setValue('Keep this preference draft')
+    dialog.vm.$emit('submit', 'Keep this preference draft')
+    dialog.vm.$emit('submit', 'Keep this preference draft')
+    await flushPromises()
+
+    expect(capture).toHaveBeenCalledTimes(1)
+    expect(wrapper.getComponent(LinearCanvasThread).props('captureInFlight'))
+      .toEqual(new Set(['tile-a:model-a']))
+
+    failCapture()
+    await flushPromises()
+
+    expect(wrapper.getComponent(TwinPreferenceCaptureDialog).get('textarea').element.value)
+      .toBe('Keep this preference draft')
+    expect(wrapper.getComponent(TwinPreferenceCaptureDialog).get('[role="alert"]').text())
+      .toContain('Evidence capture failed')
+    expect(wrapper.findAll('[role="alert"]')).toHaveLength(1)
+  })
+
+  it('locks regeneration from opening the preference dialog until its exact capture settles', async () => {
+    const store = useCanvasStore()
+    store.currentSession = {
+      ...session('session-a'),
+      prompt_tiles: [{
+        id: 'tile-a',
+        prompt: 'Question',
+        models: ['model-a'],
+        created_at: '2026-09-01T00:00:00Z',
+        twin_relationship_variant: { relationships: [] },
+        responses: {
+          'model-a': {
+            id: 'response-a', model_id: 'model-a', model_name: 'Model A',
+            content: 'Answer A', status: 'completed',
+          },
+        },
+      }],
+    }
+    vi.spyOn(store, 'loadSessions').mockResolvedValue()
+    vi.spyOn(store, 'loadModels').mockResolvedValue()
+    let finishCapture
+    vi.spyOn(store, 'captureInsight').mockImplementation(() => new Promise(resolve => {
+      finishCapture = () => resolve({})
+    }))
+    const { wrapper } = await mountView('/canvas')
+    await flushPromises()
+
+    const regenerate = wrapper.get('[aria-label="Regenerate tile-a model-a"]')
+    expect(regenerate.attributes('disabled')).toBeUndefined()
+    await wrapper.get('[aria-label="Capture Twin preference from tile-a model-a"]').trigger('click')
+    await wrapper.vm.$nextTick()
+    expect(regenerate.attributes('disabled')).toBeDefined()
+
+    wrapper.getComponent(TwinPreferenceCaptureDialog).vm.$emit('submit', 'Stable preference')
+    await flushPromises()
+    expect(regenerate.attributes('disabled')).toBeDefined()
+
+    finishCapture()
+    await flushPromises()
+    expect(regenerate.attributes('disabled')).toBeUndefined()
+  })
+
+  it('allows closing a pending capture without releasing its originating response lock', async () => {
+    const store = useCanvasStore()
+    store.currentSession = session('session-a')
+    vi.spyOn(store, 'loadSessions').mockResolvedValue()
+    vi.spyOn(store, 'loadModels').mockResolvedValue()
+    let finishCapture
+    const capture = vi.spyOn(store, 'captureInsight').mockImplementation(() => new Promise(resolve => {
+      finishCapture = () => resolve({})
+    }))
+    const { wrapper } = await mountView('/canvas')
+    await flushPromises()
+
+    const thread = wrapper.getComponent(LinearCanvasThread)
+    thread.vm.$emit('capture-preference', {
+      tileId: 'tile-a', modelId: 'model-a', responseId: 'response-a', responseContent: 'Answer A',
+    })
+    await wrapper.vm.$nextTick()
+    const dialog = wrapper.getComponent(TwinPreferenceCaptureDialog)
+    dialog.vm.$emit('submit', 'Keep this preference lock')
+    await flushPromises()
+
+    expect(dialog.props('submitting')).toBe(true)
+    await dialog.get('[data-test="cancel-twin-preference"]').trigger('click')
+    await wrapper.vm.$nextTick()
+
+    expect(wrapper.findComponent(TwinPreferenceCaptureDialog).exists()).toBe(false)
+    expect(thread.props('captureInFlight')).toEqual(new Set(['tile-a:model-a']))
+
+    thread.vm.$emit('capture-preference', {
+      tileId: 'tile-a', modelId: 'model-a', responseId: 'response-a', responseContent: 'Answer A',
+    })
+    await wrapper.vm.$nextTick()
+    expect(wrapper.findComponent(TwinPreferenceCaptureDialog).exists()).toBe(false)
+    expect(capture).toHaveBeenCalledOnce()
+
+    finishCapture()
+    await flushPromises()
+    expect(thread.props('captureInFlight')).toEqual(new Set())
+  })
+
+  it('closes capture on route change and scopes a late failure to its originating session', async () => {
+    const store = useCanvasStore()
+    store.currentSession = session('session-a')
+    vi.spyOn(store, 'loadSessions').mockResolvedValue()
+    vi.spyOn(store, 'loadModels').mockResolvedValue()
+    vi.spyOn(store, 'loadSession').mockImplementation(async id => {
+      store.currentSession = session(id)
+      return store.currentSession
+    })
+    let failCapture
+    vi.spyOn(store, 'captureInsight').mockImplementation(() => new Promise((resolve, reject) => {
+      failCapture = () => reject(new Error('Session A evidence failed'))
+    }))
+    const { router, wrapper } = await mountView('/canvas/session-a')
+    await flushPromises()
+
+    wrapper.getComponent(LinearCanvasThread).vm.$emit('capture-preference', {
+      tileId: 'tile-a', modelId: 'model-a', responseId: 'response-a', responseContent: 'Answer A',
+    })
+    await wrapper.vm.$nextTick()
+    wrapper.getComponent(TwinPreferenceCaptureDialog).vm.$emit('submit', 'Session A preference')
+    await router.push('/canvas/session-b')
+    await flushPromises()
+
+    expect(wrapper.findComponent(TwinPreferenceCaptureDialog).exists()).toBe(false)
+    failCapture()
+    await flushPromises()
+    expect(wrapper.find('[role="alert"]').exists()).toBe(false)
+
+    await router.push('/canvas/session-a')
+    await flushPromises()
+    expect(wrapper.get('[role="alert"]').text()).toContain('Session A evidence failed')
+  })
+
+  it('discards the capture draft when the active session changes without a route change', async () => {
+    const store = useCanvasStore()
+    store.currentSession = session('session-a')
+    vi.spyOn(store, 'loadSessions').mockResolvedValue()
+    vi.spyOn(store, 'loadModels').mockResolvedValue()
+    const { wrapper } = await mountView('/canvas')
+    await flushPromises()
+
+    wrapper.getComponent(LinearCanvasThread).vm.$emit('capture-preference', {
+      tileId: 'tile-a', modelId: 'model-a', responseId: 'response-a', responseContent: 'Answer A',
+    })
+    await wrapper.vm.$nextTick()
+    await wrapper.getComponent(TwinPreferenceCaptureDialog).get('textarea')
+      .setValue('Discard with session A')
+
+    store.currentSession = session('session-b')
+    await wrapper.vm.$nextTick()
+
+    expect(wrapper.findComponent(TwinPreferenceCaptureDialog).exists()).toBe(false)
   })
 })

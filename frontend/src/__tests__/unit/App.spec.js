@@ -14,6 +14,7 @@ const tauriPlugins = vi.hoisted(() => ({
   runtime: {
     isTauri: true,
     isDesktop: true,
+    nativePlugins: true,
     compact: false,
     platform: 'windows',
   },
@@ -25,7 +26,10 @@ vi.mock('@/api/client', () => ({
 }))
 
 vi.mock('@/api/transport', () => ({
-  getRuntimeProfile: () => ({ platform: tauriPlugins.runtime.platform }),
+  getRuntimeProfile: () => ({
+    platform: tauriPlugins.runtime.platform,
+    nativePlugins: tauriPlugins.runtime.nativePlugins,
+  }),
   getTransport: () => ({
     listen: tauriPlugins.listen,
     openExternal: tauriPlugins.openExternal,
@@ -97,6 +101,7 @@ describe('desktop Tauri shell', () => {
     vi.clearAllMocks()
     tauriPlugins.runtime.isTauri = true
     tauriPlugins.runtime.isDesktop = true
+    tauriPlugins.runtime.nativePlugins = true
     tauriPlugins.runtime.compact = false
     tauriPlugins.runtime.platform = 'windows'
     tauriPlugins.check.mockResolvedValue(null)
@@ -322,6 +327,24 @@ describe('desktop Tauri shell', () => {
 
     expect(tauriPlugins.check).not.toHaveBeenCalled()
     wrapper.unmount()
+  })
+
+  it('does not intercept links or import updater plugins without native plugin authority', async () => {
+    tauriPlugins.runtime.nativePlugins = false
+    const wrapper = mountApp()
+    const link = document.createElement('a')
+    link.href = 'https://grafyn.app/docs'
+    link.addEventListener('click', event => event.preventDefault())
+    document.body.appendChild(link)
+
+    link.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }))
+    await flushPromises()
+
+    expect(tauriPlugins.openExternal).not.toHaveBeenCalled()
+    expect(tauriPlugins.check).not.toHaveBeenCalled()
+    expect(tauriPlugins.listen).toHaveBeenCalledOnce()
+    wrapper.unmount()
+    link.remove()
   })
 
   it('wraps only compact routes in the companion shell and hides desktop guide chrome', () => {

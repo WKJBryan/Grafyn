@@ -28,6 +28,129 @@ use tokio::sync::RwLock;
 
 const EMPTY_MODEL_RESPONSE_ERROR: &str = "No response returned from model";
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CanvasEventSinkError;
+
+pub(crate) trait CanvasEventSink: Clone + Send + Sync + 'static {
+    fn emit_canvas(&self, event: CanvasStreamEvent) -> Result<(), CanvasEventSinkError>;
+}
+
+impl CanvasEventSink for tauri::WebviewWindow {
+    fn emit_canvas(&self, event: CanvasStreamEvent) -> Result<(), CanvasEventSinkError> {
+        tauri::Emitter::emit(self, "canvas-stream", event).map_err(|_| CanvasEventSinkError)
+    }
+}
+
+#[cfg(any(test, feature = "e2e-test-runtime"))]
+const BUFFERED_CANVAS_EVENT_LIMIT: usize = 256;
+#[cfg(any(test, feature = "e2e-test-runtime"))]
+const BUFFERED_CANVAS_BYTE_LIMIT: usize = 1024 * 1024;
+
+#[cfg(any(test, feature = "e2e-test-runtime"))]
+#[derive(Clone)]
+pub(crate) struct BufferedCanvasEventSink {
+    inner: Arc<std::sync::Mutex<BufferedCanvasEventState>>,
+    activity: Arc<tokio::sync::Notify>,
+    max_events: usize,
+    max_bytes: usize,
+}
+
+#[cfg(any(test, feature = "e2e-test-runtime"))]
+#[derive(Default)]
+struct BufferedCanvasEventState {
+    events: std::collections::VecDeque<(CanvasStreamEvent, usize)>,
+    total_bytes: usize,
+    dropped_events: usize,
+}
+
+#[cfg(any(test, feature = "e2e-test-runtime"))]
+pub(crate) struct BufferedCanvasEventBatch {
+    pub(crate) events: Vec<CanvasStreamEvent>,
+    pub(crate) total_bytes: usize,
+    pub(crate) dropped_events: usize,
+}
+
+#[cfg(any(test, feature = "e2e-test-runtime"))]
+impl BufferedCanvasEventSink {
+    pub(crate) fn new() -> Self {
+        Self::with_limits(BUFFERED_CANVAS_EVENT_LIMIT, BUFFERED_CANVAS_BYTE_LIMIT)
+    }
+
+    fn with_limits(max_events: usize, max_bytes: usize) -> Self {
+        Self {
+            inner: Arc::new(std::sync::Mutex::new(BufferedCanvasEventState::default())),
+            activity: Arc::new(tokio::sync::Notify::new()),
+            max_events,
+            max_bytes,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_limits_for_tests(max_events: usize, max_bytes: usize) -> Self {
+        Self::with_limits(max_events, max_bytes)
+    }
+
+    pub(crate) fn drain(&self) -> BufferedCanvasEventBatch {
+        let mut state = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        let events = std::mem::take(&mut state.events)
+            .into_iter()
+            .map(|(event, _)| event)
+            .collect();
+        let total_bytes = std::mem::take(&mut state.total_bytes);
+        let dropped_events = std::mem::take(&mut state.dropped_events);
+        BufferedCanvasEventBatch {
+            events,
+            total_bytes,
+            dropped_events,
+        }
+    }
+
+    pub(crate) async fn wait_for_activity(&self) {
+        loop {
+            let notified = self.activity.notified();
+            let has_activity = {
+                let state = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+                !state.events.is_empty() || state.dropped_events > 0
+            };
+            if has_activity {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+#[cfg(any(test, feature = "e2e-test-runtime"))]
+impl Default for BufferedCanvasEventSink {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(any(test, feature = "e2e-test-runtime"))]
+impl CanvasEventSink for BufferedCanvasEventSink {
+    fn emit_canvas(&self, event: CanvasStreamEvent) -> Result<(), CanvasEventSinkError> {
+        let event_bytes = serde_json::to_vec(&event)
+            .map_err(|_| CanvasEventSinkError)?
+            .len();
+        let mut state = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        let next_bytes = state.total_bytes.checked_add(event_bytes);
+        if state.events.len() >= self.max_events
+            || next_bytes.is_none_or(|bytes| bytes > self.max_bytes)
+        {
+            state.dropped_events = state.dropped_events.saturating_add(1);
+            drop(state);
+            self.activity.notify_one();
+            return Ok(());
+        }
+        state.events.push_back((event, event_bytes));
+        state.total_bytes = next_bytes.expect("bounded event bytes were checked");
+        drop(state);
+        self.activity.notify_one();
+        Ok(())
+    }
+}
+
 // LLM node layout constants
 const LLM_NODE_WIDTH: f64 = 280.0;
 const LLM_NODE_HEIGHT: f64 = 200.0;
@@ -56,13 +179,22 @@ where
 pub async fn send_prompt(
     window: tauri::WebviewWindow,
     session_id: String,
-    mut request: PromptRequest,
+    request: PromptRequest,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
+    send_prompt_with_sink(window, session_id, request, state.inner()).await
+}
+
+pub(crate) async fn send_prompt_with_sink<S: CanvasEventSink>(
+    window: S,
+    session_id: String,
+    mut request: PromptRequest,
+    state: &AppState,
+) -> Result<String, String> {
     let root_ticket = if is_vault_context_prompt(&request.prompt_type, &request.context_mode) {
-        crate::commands::acquire_derived_root_epoch(state.inner()).await?
+        crate::commands::acquire_derived_root_epoch(state).await?
     } else {
-        crate::commands::acquire_root_epoch(state.inner()).await?
+        crate::commands::acquire_root_epoch(state).await?
     };
     let input_root_epoch = root_ticket.authority().clone();
     let tile_id = uuid::Uuid::new_v4().to_string();
@@ -96,8 +228,8 @@ pub async fn send_prompt(
         store.get_session(&session_id).map_err(|e| e.to_string())?
     };
     let resolved_context =
-        resolve_prompt_context(state.inner(), &session, &request, None, &model_route).await?;
-    root_ticket.validate(state.inner()).await?;
+        resolve_prompt_context(state, &session, &request, None, &model_route).await?;
+    root_ticket.validate(state).await?;
     let persisted_twin_provider = persisted_twin_provider(
         &request.context_mode,
         request.twin_llm_provider.clone(),
@@ -225,7 +357,7 @@ pub async fn send_prompt(
             let error = preserve_canvas_mutation_error(error);
             drop(root_ticket);
             crate::commands::acknowledge_reported_repair(
-                repair_canvas_trace_error(state.inner(), &error, "Canvas prompt").await,
+                repair_canvas_trace_error(state, &error, "Canvas prompt").await,
             );
             return Err(error.to_string());
         }
@@ -269,11 +401,10 @@ pub async fn send_prompt(
             Err(error) => {
                 let error = error.with_fallback_commit(initial_commit.clone());
                 crate::commands::acknowledge_reported_repair(
-                    repair_canvas_trace_error(state.inner(), &error, "Canvas prompt").await,
+                    repair_canvas_trace_error(state, &error, "Canvas prompt").await,
                 );
                 drop(root_ticket);
-                let _ = window.emit(
-                    "canvas-stream",
+                let _ = window.emit_canvas(
                     CanvasStreamEvent::TileCreated {
                         session_id: session_id.clone(),
                         tile: tile.clone(),
@@ -297,7 +428,7 @@ pub async fn send_prompt(
         repair_commit = trace_commit;
     }
     root_epoch = match crate::commands::repair_after_authority_mutation(
-        state.inner(),
+        state,
         &repair_commit,
         "Canvas prompt",
     )
@@ -308,7 +439,7 @@ pub async fn send_prompt(
             drop(root_ticket);
             if let Some(episode_id) = decision_episode_id.as_deref() {
                 fail_requested_prediction_if_same_root(
-                    state.inner(),
+                    state,
                     &state.twin_store,
                     episode_id,
                     &root_epoch,
@@ -316,13 +447,10 @@ pub async fn send_prompt(
                 )
                 .await;
             }
-            let _ = window.emit(
-                "canvas-stream",
-                CanvasStreamEvent::TileCreated {
-                    session_id: session_id.clone(),
-                    tile: tile.clone(),
-                },
-            );
+            let _ = window.emit_canvas(CanvasStreamEvent::TileCreated {
+                session_id: session_id.clone(),
+                tile: tile.clone(),
+            });
             for model_id in &request.models {
                 emit_canvas_error(&window, &session_id, &tile_id, model_id, &warning.message);
             }
@@ -332,7 +460,7 @@ pub async fn send_prompt(
             drop(root_ticket);
             if let Some(episode_id) = decision_episode_id.as_deref() {
                 fail_requested_prediction_if_same_root(
-                    state.inner(),
+                    state,
                     &state.twin_store,
                     episode_id,
                     &root_epoch,
@@ -346,24 +474,18 @@ pub async fn send_prompt(
     drop(root_ticket);
 
     // Emit TileCreated event
-    let _ = window.emit(
-        "canvas-stream",
-        CanvasStreamEvent::TileCreated {
-            session_id: session_id.clone(),
-            tile: tile.clone(),
-        },
-    );
+    let _ = window.emit_canvas(CanvasStreamEvent::TileCreated {
+        session_id: session_id.clone(),
+        tile: tile.clone(),
+    });
 
     // Emit ContextNotes event (so frontend can display which notes were used)
     if !resolved_context.context_notes.is_empty() {
-        let _ = window.emit(
-            "canvas-stream",
-            CanvasStreamEvent::ContextNotes {
-                session_id: session_id.clone(),
-                tile_id: tile_id.clone(),
-                notes: resolved_context.context_notes.clone(),
-            },
-        );
+        let _ = window.emit_canvas(CanvasStreamEvent::ContextNotes {
+            session_id: session_id.clone(),
+            tile_id: tile_id.clone(),
+            notes: resolved_context.context_notes.clone(),
+        });
     }
 
     // Clone what we need for the spawned task
@@ -403,7 +525,7 @@ pub async fn send_prompt(
         .iter()
         .map(|gap| gap.id.clone())
         .collect::<Vec<_>>();
-    let stream_root_state = state.inner().clone();
+    let stream_root_state = state.clone();
     let stream_root_epoch = root_epoch.clone();
     let (sealed_epoch_sender, sealed_epoch_receiver) = tokio::sync::oneshot::channel();
 
@@ -486,15 +608,12 @@ pub async fn send_prompt(
                                     let chunk = update.content;
                                     if !chunk.is_empty() {
                                         full_content.push_str(&chunk);
-                                        let _ = window.emit(
-                                            "canvas-stream",
-                                            CanvasStreamEvent::Chunk {
-                                                session_id: session_id.clone(),
-                                                tile_id: tile_id.clone(),
-                                                model_id: model_id.clone(),
-                                                chunk,
-                                            },
-                                        );
+                                        let _ = window.emit_canvas(CanvasStreamEvent::Chunk {
+                                            session_id: session_id.clone(),
+                                            tile_id: tile_id.clone(),
+                                            model_id: model_id.clone(),
+                                            chunk,
+                                        });
                                     }
                                 }
                                 Ok(Some(Err(e))) => {
@@ -864,12 +983,9 @@ pub async fn send_prompt(
         // batch persist above actually succeeded. If it failed, per-model
         // Error events were already emitted and the frontend must not
         // believe the (in-memory only) responses were saved to disk.
-        let _ = window.emit(
-            "canvas-stream",
-            CanvasStreamEvent::SessionSaved {
-                session_id: session_id_clone,
-            },
-        );
+        let _ = window.emit_canvas(CanvasStreamEvent::SessionSaved {
+            session_id: session_id_clone,
+        });
     });
 
     // Sealed twin prediction: one hidden, non-streaming call per decision
@@ -895,7 +1011,7 @@ pub async fn send_prompt(
                 .context_version
                 .clone()
                 .unwrap_or_else(|| TWIN_CONTEXT_VERSION.to_string());
-            let prediction_state = state.inner().clone();
+            let prediction_state = state.clone();
             let prediction_store = state.twin_store.clone();
             let prediction_openrouter = state.openrouter.clone();
             let prediction_ollama = state.ollama.clone();
@@ -1384,7 +1500,17 @@ pub async fn regenerate_response(
     model_id: String,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let root_ticket = crate::commands::acquire_derived_root_epoch(state.inner()).await?;
+    regenerate_response_with_sink(window, session_id, tile_id, model_id, state.inner()).await
+}
+
+pub(crate) async fn regenerate_response_with_sink<S: CanvasEventSink>(
+    window: S,
+    session_id: String,
+    tile_id: String,
+    model_id: String,
+    state: &AppState,
+) -> Result<(), String> {
+    let root_ticket = crate::commands::acquire_derived_root_epoch(state).await?;
     let root_epoch = root_ticket.authority().clone();
     // Get the tile's prompt
     let mut store = state.canvas_store.write().await;
@@ -1421,8 +1547,8 @@ pub async fn regenerate_response(
 
     let request = prompt_request_from_tile(tile, vec![effective_model_id.clone()], 0.7);
     let resolved_context =
-        resolve_prompt_context(state.inner(), &session, &request, Some(tile), &model_route).await?;
-    root_ticket.validate(state.inner()).await?;
+        resolve_prompt_context(state, &session, &request, Some(tile), &model_route).await?;
+    root_ticket.validate(state).await?;
 
     // Reset response to streaming
     {
@@ -1454,7 +1580,7 @@ pub async fn regenerate_response(
     let web_search_max_results = request.web_search_max_results;
     let reasoning_effort = request.reasoning_effort.clone();
     let provider_route = model_route.provider.clone();
-    let stream_root_state = state.inner().clone();
+    let stream_root_state = state.clone();
 
     tauri::async_runtime::spawn(async move {
         let model_id = effective_model_id;
@@ -1512,15 +1638,12 @@ pub async fn regenerate_response(
                             let chunk = update.content;
                             if !chunk.is_empty() {
                                 full_content.push_str(&chunk);
-                                let _ = window.emit(
-                                    "canvas-stream",
-                                    CanvasStreamEvent::Chunk {
-                                        session_id: session_id.clone(),
-                                        tile_id: tile_id.clone(),
-                                        model_id: model_id.clone(),
-                                        chunk,
-                                    },
-                                );
+                                let _ = window.emit_canvas(CanvasStreamEvent::Chunk {
+                                    session_id: session_id.clone(),
+                                    tile_id: tile_id.clone(),
+                                    model_id: model_id.clone(),
+                                    chunk,
+                                });
                             }
                         }
                         Ok(Some(Err(e))) => {
@@ -1667,10 +1790,7 @@ pub async fn regenerate_response(
         ) {
             return;
         }
-        let _ = window.emit(
-            "canvas-stream",
-            CanvasStreamEvent::SessionSaved { session_id },
-        );
+        let _ = window.emit_canvas(CanvasStreamEvent::SessionSaved { session_id });
     });
 
     Ok(())
@@ -1764,22 +1884,19 @@ async fn append_model_result_traces(
     Ok(latest_commit)
 }
 
-fn emit_canvas_error(
-    window: &tauri::WebviewWindow,
+fn emit_canvas_error<S: CanvasEventSink>(
+    window: &S,
     session_id: &str,
     tile_id: &str,
     model_id: &str,
     error: &str,
 ) {
-    let _ = window.emit(
-        "canvas-stream",
-        CanvasStreamEvent::Error {
-            session_id: session_id.to_string(),
-            tile_id: tile_id.to_string(),
-            model_id: model_id.to_string(),
-            error: error.to_string(),
-        },
-    );
+    let _ = window.emit_canvas(CanvasStreamEvent::Error {
+        session_id: session_id.to_string(),
+        tile_id: tile_id.to_string(),
+        model_id: model_id.to_string(),
+        error: error.to_string(),
+    });
 }
 
 /// Emit an Error event for every model whose response was streamed
@@ -1788,8 +1905,8 @@ fn emit_canvas_error(
 /// complete response, `SessionSaved` would otherwise still fire, and the
 /// content silently reverts to an empty Pending stub the next time the
 /// session is reopened — with no error anywhere in the UI.
-fn emit_persistence_error(
-    window: &tauri::WebviewWindow,
+fn emit_persistence_error<S: CanvasEventSink>(
+    window: &S,
     session_id: &str,
     tile_id: &str,
     model_ids: &[String],
@@ -1808,27 +1925,24 @@ fn emit_persistence_error(
     }
 }
 
-fn emit_canvas_complete(
-    window: &tauri::WebviewWindow,
+fn emit_canvas_complete<S: CanvasEventSink>(
+    window: &S,
     session_id: &str,
     tile_id: &str,
     model_id: &str,
     cost_usd: Option<f64>,
 ) {
-    let _ = window.emit(
-        "canvas-stream",
-        CanvasStreamEvent::Complete {
-            session_id: session_id.to_string(),
-            tile_id: tile_id.to_string(),
-            model_id: model_id.to_string(),
-            tokens_used: None,
-            cost_usd,
-        },
-    );
+    let _ = window.emit_canvas(CanvasStreamEvent::Complete {
+        session_id: session_id.to_string(),
+        tile_id: tile_id.to_string(),
+        model_id: model_id.to_string(),
+        tokens_used: None,
+        cost_usd,
+    });
 }
 
-fn finalize_streamed_model_response(
-    window: &tauri::WebviewWindow,
+fn finalize_streamed_model_response<S: CanvasEventSink>(
+    window: &S,
     session_id: &str,
     tile_id: &str,
     model_id: String,
@@ -1962,5 +2076,128 @@ mod tests {
         assert_eq!(update.2, ResponseStatus::Completed);
         assert_eq!(update.3, None);
         assert_eq!(update.1, "Answer");
+    }
+
+    #[test]
+    fn buffered_sink_preserves_tile_chunk_and_complete_order() {
+        let sink = BufferedCanvasEventSink::new();
+        let tile = build_tile("tile-1", "Prompt", "openai/gpt-4", "", None, None);
+
+        CanvasEventSink::emit_canvas(
+            &sink,
+            CanvasStreamEvent::TileCreated {
+                session_id: "session-1".into(),
+                tile,
+            },
+        )
+        .unwrap();
+        for chunk in ["hello", " world"] {
+            CanvasEventSink::emit_canvas(
+                &sink,
+                CanvasStreamEvent::Chunk {
+                    session_id: "session-1".into(),
+                    tile_id: "tile-1".into(),
+                    model_id: "openai/gpt-4".into(),
+                    chunk: chunk.into(),
+                },
+            )
+            .unwrap();
+        }
+        CanvasEventSink::emit_canvas(
+            &sink,
+            CanvasStreamEvent::Complete {
+                session_id: "session-1".into(),
+                tile_id: "tile-1".into(),
+                model_id: "openai/gpt-4".into(),
+                tokens_used: None,
+                cost_usd: Some(0.001),
+            },
+        )
+        .unwrap();
+
+        let batch = sink.drain();
+        let kinds = batch
+            .events
+            .iter()
+            .map(|event| {
+                serde_json::to_value(event).unwrap()["type"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(kinds, ["tile_created", "chunk", "chunk", "complete"]);
+        assert_eq!(batch.dropped_events, 0);
+        assert!(batch.total_bytes > 0);
+    }
+
+    #[test]
+    fn buffered_sink_preserves_error_terminal_and_never_exceeds_limits() {
+        let count_limited = BufferedCanvasEventSink::with_limits_for_tests(2, 4096);
+        for error in ["first", "second", "third"] {
+            CanvasEventSink::emit_canvas(
+                &count_limited,
+                CanvasStreamEvent::Error {
+                    session_id: "session-1".into(),
+                    tile_id: "tile-1".into(),
+                    model_id: "openai/gpt-4".into(),
+                    error: error.into(),
+                },
+            )
+            .unwrap();
+        }
+
+        let count_batch = count_limited.drain();
+        assert_eq!(count_batch.events.len(), 2);
+        assert!(count_batch.total_bytes <= 4096);
+        assert_eq!(count_batch.dropped_events, 1);
+        assert!(count_batch
+            .events
+            .iter()
+            .all(|event| matches!(event, CanvasStreamEvent::Error { .. })));
+
+        let byte_limited = BufferedCanvasEventSink::with_limits_for_tests(8, 256);
+        CanvasEventSink::emit_canvas(
+            &byte_limited,
+            CanvasStreamEvent::Error {
+                session_id: "session-1".into(),
+                tile_id: "tile-1".into(),
+                model_id: "openai/gpt-4".into(),
+                error: "x".repeat(512),
+            },
+        )
+        .unwrap();
+        let byte_batch = byte_limited.drain();
+        assert!(byte_batch.events.is_empty());
+        assert_eq!(byte_batch.total_bytes, 0);
+        assert_eq!(byte_batch.dropped_events, 1);
+    }
+
+    #[tokio::test]
+    async fn buffered_sink_wait_for_activity_does_not_miss_events() {
+        let sink = BufferedCanvasEventSink::new();
+        let event = || CanvasStreamEvent::Error {
+            session_id: "session-1".into(),
+            tile_id: "tile-1".into(),
+            model_id: "openai/gpt-4".into(),
+            error: "failed".into(),
+        };
+
+        CanvasEventSink::emit_canvas(&sink, event()).unwrap();
+        tokio::time::timeout(Duration::from_millis(250), sink.wait_for_activity())
+            .await
+            .expect("an event emitted before waiting must remain observable");
+        sink.drain();
+
+        let waiting_sink = sink.clone();
+        let waiter = tokio::spawn(async move {
+            waiting_sink.wait_for_activity().await;
+        });
+        tokio::task::yield_now().await;
+        CanvasEventSink::emit_canvas(&sink, event()).unwrap();
+        tokio::time::timeout(Duration::from_millis(250), waiter)
+            .await
+            .expect("an event emitted while waiting must wake the waiter")
+            .expect("activity waiter must not panic");
     }
 }

@@ -295,11 +295,19 @@ pub struct CanvasResponseRef {
     pub model_id: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CanvasResponseVersionWitness {
+    pub response_id: String,
+    pub response_content: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CanvasFeedbackRequest {
     pub feedback_type: CanvasFeedbackType,
     #[serde(default)]
     pub response: Option<CanvasResponseRef>,
+    #[serde(default)]
+    pub response_witness: Option<CanvasResponseVersionWitness>,
     #[serde(default)]
     pub ranked_responses: Vec<CanvasResponseRef>,
     #[serde(default)]

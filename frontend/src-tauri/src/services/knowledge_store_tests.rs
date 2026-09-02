@@ -1140,6 +1140,98 @@ fn store_rejects_hostile_note_ids_and_paths_end_to_end() {
         .is_err());
 }
 
+#[test]
+fn reserved_synced_materialization_preserves_only_frontmatter_aliases() {
+    let vault_dir = tempdir().expect("vault tempdir");
+    let data_dir = tempdir().expect("data tempdir");
+    let synced_dir = vault_dir.path().join("synced");
+    std::fs::create_dir(&synced_dir).expect("synced directory should be created");
+    let remote_stem = "a".repeat(64);
+    let relative_path = format!("synced/{remote_stem}.md");
+    std::fs::write(
+        synced_dir.join(format!("{remote_stem}.md")),
+        "---\ntitle: Shared Note\naliases:\n  - Shared Alias\n  - Existing Alias\n---\n\nShared body.",
+    )
+    .expect("synced note should be written");
+
+    let store = KnowledgeStore::new(
+        vault_dir.path().to_path_buf(),
+        data_dir.path().to_path_buf(),
+    );
+    let note = store
+        .find_note_by_relative_path(&relative_path)
+        .expect("lookup should not error")
+        .expect("synced note should be readable");
+
+    assert_eq!(
+        note.aliases,
+        vec!["Shared Alias".to_string(), "Existing Alias".to_string()]
+    );
+}
+
+#[test]
+fn non_reserved_note_paths_still_derive_filename_aliases() {
+    let vault_dir = tempdir().expect("vault tempdir");
+    let data_dir = tempdir().expect("data tempdir");
+    let lowercase_hash = "b".repeat(64);
+    let uppercase_hash = "A".repeat(64);
+    let short_hash = "c".repeat(63);
+    let cases = [
+        (
+            "synced/not-a-remote-hash.md".to_string(),
+            "Ordinary Synced Note",
+            "not a remote hash".to_string(),
+        ),
+        (
+            format!("notes/{lowercase_hash}.md"),
+            "User Hash Note",
+            lowercase_hash.clone(),
+        ),
+        (
+            format!("synced/{uppercase_hash}.md"),
+            "Uppercase Hash Note",
+            uppercase_hash,
+        ),
+        (
+            format!("synced/{short_hash}.md"),
+            "Short Hash Note",
+            short_hash,
+        ),
+        (
+            format!("synced/nested/{lowercase_hash}.md"),
+            "Nested Synced Note",
+            lowercase_hash,
+        ),
+    ];
+
+    for (relative_path, title, _) in &cases {
+        let note_path = vault_dir.path().join(relative_path);
+        std::fs::create_dir_all(note_path.parent().expect("note path should have a parent"))
+            .expect("note parent should be created");
+        std::fs::write(
+            note_path,
+            format!("---\ntitle: {title}\naliases:\n  - Explicit Alias\n---\n\nBody."),
+        )
+        .expect("note should be written");
+    }
+
+    let store = KnowledgeStore::new(
+        vault_dir.path().to_path_buf(),
+        data_dir.path().to_path_buf(),
+    );
+    for (relative_path, _, expected_derived_alias) in cases {
+        let note = store
+            .find_note_by_relative_path(&relative_path)
+            .expect("lookup should not error")
+            .expect("note should be readable");
+        assert!(
+            note.aliases.contains(&expected_derived_alias),
+            "{relative_path} should retain its path-derived alias: {:?}",
+            note.aliases
+        );
+    }
+}
+
 /// Frontmatter block with a tab character used as block-sequence indentation,
 /// which yaml-rust2 rejects ("tab cannot be used as indentation"). This is not
 /// well-formed YAML, so `YamlLoader::load_from_str` errors and the gray_matter

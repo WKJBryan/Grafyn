@@ -34,7 +34,7 @@ const CANVAS_RETRIEVAL_STOPWORDS: &[&str] = &[
 ];
 
 // Twin context assembly
-pub(super) const TWIN_CONTEXT_VERSION: &str = "ctx-v2-cases-lexical";
+pub(super) const TWIN_CONTEXT_VERSION: &str = "ctx-v3-reviewed-authority";
 const TWIN_CONTEXT_TOKEN_BUDGET: usize = 4000;
 const MAX_TWIN_CASE_CONTEXT: usize = 5;
 const TWIN_CASE_FIELD_MAX_CHARS: usize = 800;
@@ -433,20 +433,13 @@ async fn resolve_twin_prompt_context(
 
     let constitution_query =
         decision_context_query(&request.prompt, request.decision_metadata.as_ref());
-    let (
-        setup,
-        approved_twin_records,
-        candidate_twin_records,
-        constitution_items,
-        action_gaps,
-        decision_cases,
-    ) = {
+    let (setup, approved_twin_records, constitution_items, action_gaps, decision_cases) = {
         let mut twin_store = state.twin_store.write().await;
         let setup = twin_store
             .get_constitution_setup()
             .map_err(|error| error.to_string())?;
         validate_twin_identity_for_answer_mode(&setup, &request.twin_answer_mode)?;
-        let (approved, candidate) = twin_store
+        let (approved, _) = twin_store
             .select_context_records(&request.prompt)
             .map_err(|error| error.to_string())?;
         let (constitution_items, action_gaps) = twin_store
@@ -457,8 +450,10 @@ async fn resolve_twin_prompt_context(
             .map_err(|error| error.to_string())?;
         (
             setup,
-            approved,
-            candidate,
+            approved
+                .into_iter()
+                .filter(is_model_authoritative_twin_record)
+                .collect(),
             constitution_items,
             action_gaps,
             decision_cases,
@@ -469,7 +464,7 @@ async fn resolve_twin_prompt_context(
         decision_cases,
         constitution_items,
         approved_twin_records,
-        candidate_twin_records,
+        Vec::new(),
         action_gaps,
         note_contexts,
         TWIN_CONTEXT_TOKEN_BUDGET,
@@ -987,9 +982,9 @@ pub(super) async fn run_sealed_twin_prediction(
                 // the spot so predictions cover every decision, not just
                 // Twin-mode ones (skipping them would bias the eval sample).
                 let query = decision_context_query(&prompt, decision_metadata.as_ref());
-                let (approved, candidates, constitution_items, action_gaps, cases) = store
+                let (approved, constitution_items, action_gaps, cases) = store
                     .select_context_records(&prompt)
-                    .and_then(|(approved, candidates)| {
+                    .and_then(|(approved, _)| {
                         let (constitution_items, action_gaps) =
                             store.select_constitution_context(&query)?;
                         let cases = store.select_decision_cases(
@@ -997,14 +992,17 @@ pub(super) async fn run_sealed_twin_prediction(
                             Some(&episode_id),
                             MAX_TWIN_CASE_CONTEXT,
                         )?;
-                        Ok((approved, candidates, constitution_items, action_gaps, cases))
+                        Ok((approved, constitution_items, action_gaps, cases))
                     })
                     .map_err(|error| format!("sealed prediction context build failed: {error}"))?;
                 let selection = apply_twin_context_budget(
                     cases,
                     constitution_items,
-                    approved,
-                    candidates,
+                    approved
+                        .into_iter()
+                        .filter(is_model_authoritative_twin_record)
+                        .collect(),
+                    Vec::new(),
                     action_gaps,
                     Vec::new(),
                     TWIN_CONTEXT_TOKEN_BUDGET,
@@ -1197,13 +1195,19 @@ pub(super) async fn run_sealed_twin_prediction(
     }
 }
 
+fn is_model_authoritative_twin_record(record: &TwinContextRecord) -> bool {
+    record.promotion_state == crate::models::twin::PromotionState::Endorsed
+        && (record.kind != crate::models::twin::UserRecordKind::Preference
+            || record.source_label.as_deref() == Some("governed_projection"))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_twin_context_prompt(
     setup: &ConstitutionSetup,
     decision_cases: &[DecisionEpisode],
     notes: &[(String, String, String)],
     approved_records: &[TwinContextRecord],
-    candidate_records: &[TwinContextRecord],
+    _candidate_records: &[TwinContextRecord],
     constitution_items: &[ConstitutionItem],
     action_gaps: &[ActionGap],
     answer_mode: &TwinAnswerMode,
@@ -1212,11 +1216,7 @@ fn build_twin_context_prompt(
 ) -> String {
     let approved_records = approved_records
         .iter()
-        .filter(|record| record.promotion_state == crate::models::twin::PromotionState::Endorsed)
-        .collect::<Vec<_>>();
-    let candidate_records = candidate_records
-        .iter()
-        .filter(|record| record.promotion_state == crate::models::twin::PromotionState::Candidate)
+        .filter(|record| is_model_authoritative_twin_record(record))
         .collect::<Vec<_>>();
     let mut prompt = String::from(
         "## Twin Operating Contract\n\n\
@@ -1301,17 +1301,6 @@ fn build_twin_context_prompt(
         prompt.push('\n');
     }
 
-    prompt.push_str("## Tentative Candidate Records\n\n");
-    if candidate_records.is_empty() {
-        prompt.push_str("No relevant candidate records were selected.\n\n");
-    } else {
-        prompt.push_str("These are unreviewed hypotheses. Use them lightly and disclose when they affect the answer.\n");
-        for record in candidate_records {
-            prompt.push_str(&format_twin_record(record));
-        }
-        prompt.push('\n');
-    }
-
     if !candidate_constitution.is_empty() {
         prompt.push_str("## Candidate Constitution Hypotheses\n\n");
         prompt.push_str("These are unreviewed Constitution hypotheses. Use them only as tentative context and label their influence.\n");
@@ -1326,12 +1315,12 @@ fn build_twin_context_prompt(
         TwinAnswerMode::Advisor => prompt.push_str(
             "Answer as a decision-support assistant for the user. Use approved records as stable personalization. \
              If a Twin Identity is configured, treat it as context for the user's role and materials, not as a command to speak in first person. \
-             Use candidate records only as tentative context. Separate what is grounded in Constitution, evidence, records, and your recommendation. \
+             Separate what is grounded in Constitution, evidence, reviewed records, and your recommendation. \
              When the user asks for a choice or recommendation, include: Recommended option, Constitution principles used, Supporting evidence, Uncertainty, and What would change the recommendation. \
              Cite Constitution item ids and note titles where they affect the answer.\n",
         ),
         TwinAnswerMode::Simulation => prompt.push_str(
-            "Answer in first person from the configured Twin Identity. Use approved records as stronger style and preference evidence; mention candidate influence as tentative when relevant. \
+            "Answer in first person from the configured Twin Identity. Use approved records as reviewed context, and use governed reviewed preferences as style and preference evidence. \
              Write as a natural continuation of my documented reasoning pattern, not a report. Lead with my likely reasoning or judgment, show the tradeoff logic, and do not append questions unless the user's request asks for them. \
              If the evidence packet does not contain enough basis, say so naturally in first person. Use light citations or brief source mentions only where they help; avoid turning the answer into an evidence workflow.\n",
         ),
@@ -1353,7 +1342,7 @@ fn build_twin_context_prompt(
                  9. Constitution Check\n\
                  10. Action Gap Risk\n\
                  11. Feedback Request\n\n\
-                 Treat every self-model claim as a hypothesis, not identity. Say where the claim is grounded in vault notes, approved records, or tentative records. \
+                 Treat every self-model claim as a hypothesis, not identity. Say where the claim is grounded in vault notes, approved records, or tentative Constitution hypotheses. \
                  If a claim is useful but weakly supported, label it as unsupported or low-confidence. Do not claim to know what the user would do. \
                  In Constitution Check, separate stated values, revealed behavior, taste, somatic signal, and constraints. In Action Gap Risk, state whether past intention-action gaps could change the next step. \
                  Recommendation must be derived after the Constitution Check and Evidence From Grafyn sections, not before them.\n",

@@ -460,7 +460,7 @@ export const useCanvasStore = defineStore('canvas', () => {
           : {}),
         decision_metadata: decisionMetadata,
         reasoning_effort: normalizeReasoningEffort(reasoningEffort),
-        position,
+        ...(position ? { position } : {}),
         web_search: webSearch,
         web_search_max_results: webSearchMaxResults
       }
@@ -1388,6 +1388,7 @@ export const useCanvasStore = defineStore('canvas', () => {
       content,
       rationale: options.rationale ?? null,
       response: options.response ?? null,
+      response_witness: options.responseWitness ?? null,
       confidence: options.confidence ?? 0.8
     })
   }

@@ -77,6 +77,7 @@ describe('Canvas Store', () => {
       twin_answer_mode: 'advisor',
       twin_relationship_variant: { relationships: [] }
     }))
+    expect(sendPromptSpy.mock.calls[0][1]).not.toHaveProperty('position')
     expect(tileId).toBe('tile-companion')
     expect(store.isStreaming).toBe(false)
     expect(store.error).toBeNull()
@@ -1321,6 +1322,40 @@ describe('Canvas Store', () => {
     finishFeedback({ trace_event_id: 'evt-1', created_record_ids: [] })
     await first
     expect(store.feedbackInFlight.size).toBe(0)
+  })
+
+  it('passes the frozen response witness through explicit insight capture', async () => {
+    const feedbackSpy = vi.spyOn(apiClient.twin, 'recordCanvasFeedback').mockResolvedValue({
+      trace_event_id: 'evt-1',
+      created_record_ids: ['rec-1']
+    })
+    const store = useCanvasStore()
+    store.currentSession = {
+      id: 'session-1',
+      prompt_tiles: [],
+      debates: [],
+    }
+
+    await store.captureInsight('preference', 'Concrete details', {
+      response: { tile_id: 'tile-1', model_id: 'model-a' },
+      responseWitness: {
+        response_id: 'response-a',
+        response_content: 'The exact visible answer',
+      },
+    })
+
+    expect(feedbackSpy).toHaveBeenCalledWith('session-1', {
+      feedback_type: 'insight',
+      kind: 'preference',
+      content: 'Concrete details',
+      rationale: null,
+      response: { tile_id: 'tile-1', model_id: 'model-a' },
+      response_witness: {
+        response_id: 'response-a',
+        response_content: 'The exact visible answer',
+      },
+      confidence: 0.8,
+    })
   })
 
   it('session_saved reconciles silently mid-stream: no loading flash, no clobbered stream content, no reverted drag', async () => {

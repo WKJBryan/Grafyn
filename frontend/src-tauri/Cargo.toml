@@ -15,7 +15,7 @@ resolver = "2"
 name = "grafyn_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
-# Two binaries: Tauri desktop app and standalone MCP server
+# Binary targets: desktop app, MCP server, and feature-gated system-test runtime
 [[bin]]
 name = "grafyn"
 path = "src/main.rs"
@@ -25,6 +25,11 @@ required-features = ["tauri-app"]
 name = "grafyn-mcp"
 path = "src/mcp.rs"
 required-features = ["mcp"]
+
+[[bin]]
+name = "grafyn-test-runtime"
+path = "src/bin/grafyn-test-runtime.rs"
+required-features = ["e2e-test-runtime"]
 
 [build-dependencies]
 tauri-build = { version = "=2.6.3", features = [], optional = true }
@@ -48,6 +53,9 @@ tempfile = "3"
 
 # Async runtime
 tokio = { version = "1.0", features = ["rt-multi-thread", "sync", "macros", "fs", "io-util", "time"] }
+hyper = { version = "1", features = ["server", "http1"], optional = true }
+hyper-util = { version = "0.1", features = ["tokio"], optional = true }
+http-body-util = { version = "0.1", optional = true }
 
 # File handling
 gray_matter = "0.2"
@@ -88,12 +96,12 @@ tauri-plugin-updater = { version = "=2.10.1", optional = true }
 dirs = "5.0"
 keyring = "2.3"
 zip = "0.6"
-quick-xml = "0.39"
-pdf-extract = "0.7"
-lopdf = "0.34"
+quick-xml = "0.41"
+pdf-extract = "0.12"
+lopdf = "0.42"
 
 # MCP server (optional — only needed for the non-mobile grafyn-mcp binary)
-rmcp = { version = "0.15", features = ["server", "transport-io"], optional = true }
+rmcp = { version = "1.4", features = ["server", "transport-io"], optional = true }
 schemars = { version = "1", optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
 
@@ -122,6 +130,14 @@ desktop-updater = ["tauri-app", "dep:tauri-plugin-updater"]
 custom-protocol = ["tauri-app", "tauri/custom-protocol"]
 mcp = ["dep:rmcp", "dep:schemars", "dep:clap"]
 twin-eval-lab = ["tauri-app"]
+e2e-test-runtime = [
+    "tauri-app",
+    "tauri/test",
+    "tokio/net",
+    "dep:hyper",
+    "dep:hyper-util",
+    "dep:http-body-util",
+]
 
 [profile.release]
 lto = true

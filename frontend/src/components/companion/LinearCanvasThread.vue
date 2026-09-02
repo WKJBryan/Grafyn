@@ -110,6 +110,16 @@
         >
           Not useful
         </button>
+        <button
+          v-if="canCapturePreference(entry)"
+          type="button"
+          class="capture-preference-action"
+          :aria-label="`Capture Twin preference from ${entry.tile.id} ${entry.modelId}`"
+          :disabled="feedbackIsPending(entry) || captureIsPending(entry)"
+          @click="$emit('capture-preference', preferenceResponseRef(entry))"
+        >
+          Capture Twin preference
+        </button>
       </div>
     </article>
   </section>
@@ -124,9 +134,11 @@ const props = defineProps({
   tiles: { type: Array, default: () => [] },
   streamingModels: { type: Object, default: () => new Set() },
   feedbackInFlight: { type: Object, default: () => new Set() },
+  captureInFlight: { type: Object, default: () => new Set() },
+  allowPreferenceCapture: { type: Boolean, default: false },
 })
 
-defineEmits(['follow-up', 'regenerate', 'feedback'])
+defineEmits(['follow-up', 'regenerate', 'feedback', 'capture-preference'])
 
 const entries = computed(() => [...props.tiles]
   .sort((left, right) => {
@@ -147,8 +159,20 @@ function responseRef(entry) {
   return { tileId: entry.tile.id, modelId: entry.modelId }
 }
 
+function preferenceResponseRef(entry) {
+  return {
+    ...responseRef(entry),
+    responseId: entry.response.id,
+    responseContent: entry.response.content,
+  }
+}
+
 function feedbackIsPending(entry) {
   return props.feedbackInFlight?.has?.(`${entry.tile.id}:${entry.modelId}`) || false
+}
+
+function captureIsPending(entry) {
+  return props.captureInFlight?.has?.(`${entry.tile.id}:${entry.modelId}`) || false
 }
 
 function responseIsStreaming(entry) {
@@ -160,8 +184,22 @@ function canUseResponse(entry) {
   return !responseIsStreaming(entry) && entry.response?.status === 'completed'
 }
 
+function canCapturePreference(entry) {
+  const relationships = entry.tile?.twin_relationship_variant?.relationships
+  return props.allowPreferenceCapture
+    && canUseResponse(entry)
+    && typeof entry.response?.id === 'string'
+    && entry.response.id.trim().length > 0
+    && typeof entry.response?.content === 'string'
+    && entry.response.content.trim().length > 0
+    && Array.isArray(relationships)
+    && relationships.length === 0
+}
+
 function canRegenerate(entry) {
-  return !responseIsStreaming(entry) && ['completed', 'error'].includes(entry.response?.status)
+  return !responseIsStreaming(entry)
+    && !captureIsPending(entry)
+    && ['completed', 'error'].includes(entry.response?.status)
 }
 
 function isSimulationTurn(tile) {
@@ -309,6 +347,12 @@ function formatTime(value) {
 .turn-actions button:disabled {
   cursor: not-allowed;
   opacity: 0.55;
+}
+
+.turn-actions .capture-preference-action {
+  grid-column: 1 / -1;
+  color: var(--accent-cyan);
+  border-color: color-mix(in srgb, var(--accent-cyan) 45%, var(--border-default));
 }
 
 @media (max-width: 420px) {

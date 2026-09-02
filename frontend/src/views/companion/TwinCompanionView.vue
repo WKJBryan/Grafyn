@@ -42,7 +42,7 @@
         type="button"
         :aria-current="activeSection === 'review' ? 'page' : undefined"
         aria-label="Open Twin review"
-        @click="activeSection = 'review'"
+        @click="openTwinReview"
       >
         Review <span>{{ twinStore.proposals.length + twinStore.memoryDigestItems.length }}</span>
       </button>
@@ -85,7 +85,7 @@
       :proposals="twinStore.proposals"
       :digest-items="twinStore.memoryDigestItems"
       :attention-trace="refreshing ? null : twinStore.attention?.trace || null"
-      :loading="!twinReviewAvailable || refreshing || twinStore.twinStateLoading.proposals || twinStore.twinStateLoading.review || twinStore.twinStateLoading.attention || digestReviewing"
+      :loading="!twinReviewAvailable || !reviewSnapshotReady || refreshing || twinStore.twinStateLoading.proposals || twinStore.twinStateLoading.review || twinStore.twinStateLoading.attention || digestReviewing"
       @review-proposal="reviewProposal"
       @review-digest="reviewDigest"
     />
@@ -171,6 +171,7 @@ const twinStore = useTwinStore()
 const activeSection = ref('review')
 const selectedRelationshipKey = ref('')
 const refreshing = ref(false)
+const reviewSnapshotReady = ref(false)
 const digestReviewing = ref(false)
 const localError = ref('')
 const runtimeProfile = getRuntimeProfile()
@@ -244,16 +245,22 @@ function openTwinChat() {
   if (twinChatAvailable.value) activeSection.value = 'chat'
 }
 
-async function refresh() {
+async function openTwinReview() {
   if (!twinReviewAvailable.value || controlsLocked.value) return
+  if (await refresh()) activeSection.value = 'review'
+}
+
+async function refresh() {
+  if (!twinReviewAvailable.value || controlsLocked.value) return false
   refreshing.value = true
+  reviewSnapshotReady.value = false
   localError.value = ''
   twinStore.attention = null
   const referenceTime = new Date().toISOString()
   const filter = currentFilter.value
   const pageRequest = { referenceTime, filter, cursor: null, limit: 50 }
   try {
-    await Promise.all([
+    const results = await Promise.all([
       twinStore.loadWorkspace(),
       twinStore.loadProjection({ referenceTime }),
       twinStore.loadProposals(pageRequest),
@@ -269,8 +276,11 @@ async function refresh() {
         limit: 50,
       }),
     ])
+    reviewSnapshotReady.value = results.every(result => result !== null)
+    return reviewSnapshotReady.value
   } catch (error) {
     localError.value = error?.message || String(error)
+    return false
   } finally {
     refreshing.value = false
   }

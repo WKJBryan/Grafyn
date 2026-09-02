@@ -33,13 +33,24 @@
       {{ displayError }}
     </p>
 
+    <p
+      v-if="currentCaptureNotice"
+      class="canvas-notice"
+      role="status"
+    >
+      {{ currentCaptureNotice }}
+    </p>
+
     <LinearCanvasThread
       :tiles="currentCanvasSession ? canvasStore.promptTiles : []"
       :streaming-models="canvasStore.streamingModels"
       :feedback-in-flight="currentFeedbackInFlight"
+      :capture-in-flight="currentCaptureInFlight"
+      allow-preference-capture
       @follow-up="replyTarget = $event"
       @regenerate="regenerate"
       @feedback="recordFeedback"
+      @capture-preference="openPreferenceCapture"
     />
 
     <QuickImageComposer collapsible />
@@ -64,6 +75,15 @@
       @confirm="confirmDeleteSession"
       @cancel="pendingDeleteSessionId = null"
     />
+
+    <TwinPreferenceCaptureDialog
+      v-if="preferenceCapture"
+      :visible="true"
+      :submitting="preferenceCaptureIsPending"
+      :error="preferenceCapture.error"
+      @submit="captureTwinPreference"
+      @cancel="closePreferenceCapture"
+    />
   </main>
 </template>
 
@@ -75,6 +95,7 @@ import CanvasComposer from '@/components/companion/CanvasComposer.vue'
 import CanvasSessionSheet from '@/components/companion/CanvasSessionSheet.vue'
 import LinearCanvasThread from '@/components/companion/LinearCanvasThread.vue'
 import QuickImageComposer from '@/components/companion/QuickImageComposer.vue'
+import TwinPreferenceCaptureDialog from '@/components/companion/TwinPreferenceCaptureDialog.vue'
 import ConfirmDialog from '@/components/ConfirmDialog.vue'
 
 const TWIN_CHAT_TAG = 'companion-twin-chat'
@@ -87,9 +108,12 @@ const replyTarget = ref(null)
 const loadingRouteSession = ref(false)
 const pendingDeleteSessionId = ref(null)
 const localError = ref('')
+const preferenceCapture = ref(null)
 const draftsBySession = reactive(new Map())
 const errorsBySession = reactive(new Map())
 const sendingBySession = reactive(new Set())
+const captureInFlight = reactive(new Set())
+const captureNoticesBySession = reactive(new Map())
 let routeSessionLoad = null
 let routeSessionTail = Promise.resolve()
 let componentActive = true
@@ -108,12 +132,16 @@ const currentStoreError = computed(() => (
     ? canvasStore.error
     : ''
 ))
-const displayError = computed(() => (
-  localError.value
-  || errorsBySession.get(draftOwnerKey.value)
-  || currentStoreError.value
-  || ''
+const activePreferenceCaptureError = computed(() => (
+  preferenceCapture.value?.sessionId === draftOwnerKey.value
+    ? preferenceCapture.value.error
+    : ''
 ))
+const displayError = computed(() => [
+  localError.value,
+  errorsBySession.get(draftOwnerKey.value),
+  currentStoreError.value,
+].find(error => error && error !== activePreferenceCaptureError.value) || '')
 const canvasSessions = computed(() => canvasStore.sessions.filter(session => !isTwinChatSession(session)))
 const currentFeedbackInFlight = computed(() => feedbackKeysForSession(currentCanvasSession.value?.id))
 const currentCanvasSession = computed(() => {
@@ -122,9 +150,31 @@ const currentCanvasSession = computed(() => {
   const routedSessionId = typeof route.params.id === 'string' ? route.params.id : null
   return !routedSessionId || session.id === routedSessionId ? session : null
 })
+const currentCaptureInFlight = computed(() => {
+  const sessionId = currentCanvasSession.value?.id
+  const keys = captureKeysForSession(sessionId)
+  const capture = preferenceCapture.value
+  if (capture && capture.sessionId === sessionId) {
+    keys.add(`${capture.tileId}:${capture.modelId}`)
+  }
+  return keys
+})
+const currentCaptureNotice = computed(() => (
+  captureNoticesBySession.get(currentCanvasSession.value?.id) || ''
+))
+const preferenceCaptureIsPending = computed(() => (
+  preferenceCapture.value
+    ? captureInFlight.has(captureKey(preferenceCapture.value))
+    : false
+))
+
+watch(() => currentCanvasSession.value?.id, (id, previousId) => {
+  if (previousId && id !== previousId) closePreferenceCapture()
+})
 
 watch(() => route.params.id, async (id, previousId) => {
   replyTarget.value = null
+  closePreferenceCapture()
   if (previousId !== undefined && id !== previousId) {
     localError.value = ''
     canvasStore.clearError()
@@ -145,6 +195,7 @@ onMounted(async () => {
 
 onBeforeUnmount(() => {
   componentActive = false
+  closePreferenceCapture()
   canvasStore.clearSession()
 })
 
@@ -284,6 +335,84 @@ function feedbackKeysForSession(sessionId) {
     .map(key => key.slice(prefix.length)))
 }
 
+function captureKeysForSession(sessionId) {
+  if (!sessionId) return new Set()
+  const prefix = `${sessionId}:`
+  return new Set([...captureInFlight]
+    .filter(key => key.startsWith(prefix))
+    .map(key => key.slice(prefix.length)))
+}
+
+function captureKey(capture) {
+  return `${capture.sessionId}:${capture.tileId}:${capture.modelId}`
+}
+
+function openPreferenceCapture({ tileId, modelId, responseId, responseContent }) {
+  const sessionId = currentCanvasSession.value?.id
+  if (
+    !sessionId
+    || typeof responseId !== 'string'
+    || !responseId.trim()
+    || typeof responseContent !== 'string'
+    || !responseContent.trim()
+  ) return
+  const key = `${sessionId}:${tileId}:${modelId}`
+  if (captureInFlight.has(key) || canvasStore.feedbackInFlight.has(key)) return
+  captureNoticesBySession.delete(sessionId)
+  preferenceCapture.value = {
+    sessionId,
+    tileId,
+    modelId,
+    responseWitness: {
+      response_id: responseId,
+      response_content: responseContent,
+    },
+    error: '',
+  }
+}
+
+function closePreferenceCapture() {
+  preferenceCapture.value = null
+}
+
+async function captureTwinPreference(content) {
+  const capture = preferenceCapture.value
+  const trimmedContent = content.trim()
+  if (!capture || !trimmedContent) return
+  const key = captureKey(capture)
+  if (captureInFlight.has(key)) return
+
+  captureInFlight.add(key)
+  capture.error = ''
+  errorsBySession.delete(capture.sessionId)
+  try {
+    await canvasStore.captureInsight('preference', trimmedContent, {
+      response: {
+        tile_id: capture.tileId,
+        model_id: capture.modelId,
+      },
+      responseWitness: capture.responseWitness,
+    })
+    captureNoticesBySession.set(
+      capture.sessionId,
+      'Evidence recorded. More matching evidence may be needed before Grafyn proposes a Twin memory for review.',
+    )
+    if (preferenceCapture.value === capture) closePreferenceCapture()
+  } catch (error) {
+    const message = error?.message || String(error)
+    errorsBySession.set(capture.sessionId, message)
+    if (
+      componentActive
+      && currentCanvasSession.value?.id === capture.sessionId
+      && preferenceCapture.value === capture
+    ) {
+      capture.error = message
+    }
+  } finally {
+    captureInFlight.delete(key)
+  }
+}
+
 async function sendPrompt(request) {
   const initialOwnerKey = draftOwnerKey.value
   if (sendingBySession.has(initialOwnerKey)) return
@@ -389,6 +518,15 @@ h1 {
   padding: var(--spacing-sm) var(--spacing-md);
   color: var(--accent-red);
   background: color-mix(in srgb, var(--accent-red) 10%, var(--bg-secondary));
+  border-radius: var(--radius-md);
+}
+
+.canvas-notice {
+  margin: 0;
+  padding: var(--spacing-sm) var(--spacing-md);
+  color: var(--accent-cyan);
+  background: color-mix(in srgb, var(--accent-cyan) 9%, var(--bg-secondary));
+  border: 1px solid color-mix(in srgb, var(--accent-cyan) 32%, var(--border-default));
   border-radius: var(--radius-md);
 }
 </style>

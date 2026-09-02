@@ -1573,17 +1573,19 @@ impl SyncEngine {
             &engine_ledger_key(&state.vault_scope),
             &state.ledger,
         )?;
-        let outbox_ids = state
+        let promoted_records = state
             .operation_store
-            .list(OperationArea::Outbox)
+            .promoted_outbox_records(&intent.mutation_id)
             .map_err(operation_store_error)?
-            .into_iter()
-            .map(|record| *record.envelope().operation_id())
-            .collect::<Vec<_>>();
-        for operation_id in outbox_ids {
+            .ok_or_else(|| {
+                MutationError::RecoveryConflict(
+                    "promoted local sync batch disappeared before it was applied".into(),
+                )
+            })?;
+        for record in promoted_records {
             state
                 .operation_store
-                .mark_applied(&operation_id)
+                .mark_applied(record.envelope().operation_id())
                 .map_err(operation_store_error)?;
         }
         rebuild_engine_state(&self.data_root, &mut state)

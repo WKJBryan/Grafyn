@@ -104,7 +104,7 @@
             </button>
             <button
               class="dropdown-item"
-              title="Capture a durable fact, preference, or reasoning record"
+              title="Capture a durable fact or reasoning record"
               @click="handleTwinMenuAction(handleCaptureInsight)"
             >
               Capture Insight
@@ -1167,14 +1167,21 @@ async function handleCaptureInsight() {
   if (!session.value) return
 
   const kind = globalThis.prompt?.(
-    'Record kind? Use fact, preference, or reasoning_pattern.',
+    'Record kind? Use fact or reasoning_pattern.',
     'fact'
   )
   if (typeof kind !== 'string') return
 
   const normalizedKind = kind.trim().toLowerCase()
-  if (!['fact', 'preference', 'reasoning_pattern'].includes(normalizedKind)) {
-    showCanvasMessage('error', 'Insight kind must be fact, preference, or reasoning_pattern')
+  if (normalizedKind === 'preference') {
+    showCanvasMessage(
+      'error',
+      'Use Capture Twin preference on a completed global response so it remains reviewed evidence.'
+    )
+    return
+  }
+  if (!['fact', 'reasoning_pattern'].includes(normalizedKind)) {
+    showCanvasMessage('error', 'Insight kind must be fact or reasoning_pattern')
     return
   }
 

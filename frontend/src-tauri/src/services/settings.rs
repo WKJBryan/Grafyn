@@ -327,6 +327,7 @@ pub struct SettingsService {
     key_source: crate::services::root_transition::OpenRouterKeySource,
     active_key_version: Option<String>,
     environment_runtime_secret: bool,
+    allow_environment_fallback: bool,
     secret_store: Arc<dyn crate::services::sync::secrets::SecretStore>,
     runtime_kind: RuntimeKind,
 }
@@ -364,6 +365,7 @@ impl SettingsService {
             key_source: crate::services::root_transition::OpenRouterKeySource::Unset,
             active_key_version: None,
             environment_runtime_secret: false,
+            allow_environment_fallback: true,
             secret_store: Arc::new(
                 crate::services::root_transition::MemoryVersionedSecretStore::default(),
             ),
@@ -394,6 +396,7 @@ impl SettingsService {
             key_source: crate::services::root_transition::OpenRouterKeySource::Unset,
             active_key_version: None,
             environment_runtime_secret: false,
+            allow_environment_fallback: true,
             secret_store: Arc::new(crate::services::sync::secrets::KeyringSecretStore),
             runtime_kind: RuntimeKind::Desktop,
         }
@@ -451,6 +454,7 @@ impl SettingsService {
             key_source,
             active_key_version,
             environment_runtime_secret: false,
+            allow_environment_fallback: true,
             secret_store,
             runtime_kind: RuntimeKind::Desktop,
         })
@@ -523,8 +527,66 @@ impl SettingsService {
             key_source: snapshot.key_source,
             active_key_version: snapshot.active_key_version,
             environment_runtime_secret: false,
+            allow_environment_fallback: false,
             secret_store,
             runtime_kind: RuntimeKind::Android,
+        })
+    }
+
+    #[cfg(feature = "e2e-test-runtime")]
+    pub(crate) fn load_for_e2e(
+        config_path: PathBuf,
+        data_path: PathBuf,
+        vault_path: PathBuf,
+        secret_store: Arc<dyn crate::services::sync::secrets::SecretStore>,
+    ) -> Result<Self> {
+        let config_dir = config_path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("E2E settings path has no parent"))?;
+        std::fs::create_dir_all(config_dir).context("Failed to create E2E config directory")?;
+        std::fs::create_dir_all(&data_path).context("Failed to create E2E data directory")?;
+        let data_path =
+            std::fs::canonicalize(data_path).context("Failed to canonicalize the E2E data root")?;
+        let vault_path =
+            std::fs::canonicalize(vault_path).context("Failed to canonicalize the E2E vault")?;
+        let transition_store = crate::services::root_transition::RootTransitionStore::new(
+            &data_path,
+            &config_path,
+            secret_store.clone(),
+        )
+        .map_err(anyhow::Error::new)?;
+        let startup = transition_store
+            .load_startup_settings(
+                crate::services::root_transition::StartupSecretPolicy::RejectPlaintext {
+                    resolve_versioned_secrets: true,
+                },
+                || Ok(None),
+                || Ok(()),
+            )
+            .map_err(anyhow::Error::new)?;
+        let snapshot = transition_store
+            .patch_settings_guarded(|fresh| {
+                fresh.vault_path = Some(vault_path.to_string_lossy().into_owned());
+                fresh.setup_completed = true;
+                fresh.mcp_enabled = false;
+                fresh.background_link_discovery_enabled = false;
+                fresh.background_link_discovery_llm_enabled = false;
+                fresh.background_vault_optimizer_enabled = false;
+                fresh.background_vault_optimizer_llm_enabled = false;
+                Ok(())
+            })
+            .map_err(anyhow::Error::new)?;
+
+        Ok(Self {
+            config_path,
+            data_path,
+            settings: snapshot.settings,
+            key_source: startup.key_source,
+            active_key_version: startup.active_key_version,
+            environment_runtime_secret: false,
+            allow_environment_fallback: false,
+            secret_store,
+            runtime_kind: RuntimeKind::Desktop,
         })
     }
 
@@ -612,7 +674,8 @@ impl SettingsService {
     }
 
     pub(crate) fn allows_environment_fallback(&self) -> bool {
-        self.runtime_kind == RuntimeKind::Desktop
+        self.allow_environment_fallback
+            && self.runtime_kind == RuntimeKind::Desktop
             && self.key_source == crate::services::root_transition::OpenRouterKeySource::Unset
     }
 

@@ -225,6 +225,26 @@ fn commit_note(harness: &Harness, note_key: &str, markdown: &str) {
         .unwrap();
 }
 
+fn outbox_operation_ids(harness: &Harness) -> BTreeSet<OperationId> {
+    harness
+        .engine
+        .export_outbox()
+        .unwrap()
+        .into_iter()
+        .map(|bytes| *EnvelopeV1::from_json_bytes(&bytes).unwrap().operation_id())
+        .collect()
+}
+
+fn applied_marker_path(harness: &Harness, operation_id: &OperationId) -> PathBuf {
+    let id = operation_id.to_string();
+    harness.engine.data_path.join(format!(
+        "sync/vaults/v1/{}/operations/v1/applied/v1/{}/{}.json",
+        harness.identity.root_scope.as_str(),
+        &id[..2],
+        id
+    ))
+}
+
 fn delete_note(harness: &Harness, note_key: &str) {
     let _ = harness
         .coordinator
@@ -1288,6 +1308,85 @@ fn local_rename_preserves_one_stable_note_history() {
     assert_eq!(
         fs::read_to_string(harness.vault.path().join("after.md")).unwrap(),
         renamed
+    );
+}
+
+#[test]
+fn new_local_commit_does_not_reapply_historical_outbox_operations() {
+    let harness = Harness::new(None);
+    commit_note(&harness, "historical.md", "historical");
+    let historical = outbox_operation_ids(&harness);
+    assert_eq!(historical.len(), 1);
+    let historical_id = historical.first().unwrap();
+    let historical_marker = applied_marker_path(&harness, historical_id);
+    fs::remove_file(&historical_marker).unwrap();
+
+    commit_note(&harness, "current.md", "current");
+
+    assert!(
+        !historical_marker.exists(),
+        "a new mutation must not recreate a historical applied marker"
+    );
+    let current = outbox_operation_ids(&harness)
+        .difference(&historical)
+        .copied()
+        .collect::<Vec<_>>();
+    assert_eq!(current.len(), 1);
+    assert!(applied_marker_path(&harness, &current[0]).exists());
+}
+
+#[test]
+fn already_promoted_retry_applies_only_its_current_batch() {
+    let harness = Harness::new(None);
+    commit_note(&harness, "historical.md", "historical");
+    let historical = outbox_operation_ids(&harness);
+
+    let mut plan = Some(crate::services::twin_events::MutationPlan::new(
+        CausalStream::SyncEligible,
+        SourceChannel::parse("note_editor").unwrap(),
+        vec![TargetMutation::put(
+            TargetKind::Markdown,
+            "current.md",
+            "current",
+        )],
+        vec![],
+    ));
+    let mut captured_intent = None;
+    {
+        let mut capture = |intent: &MutationIntentV1| {
+            captured_intent = Some(intent.clone());
+            Ok(())
+        };
+        let _ = harness
+            .coordinator
+            .commit_planned_with_hooks(
+                MutationOrigin::Local,
+                &mut || Ok(plan.take()),
+                &mut capture,
+                &mut |_| Ok(()),
+            )
+            .unwrap();
+    }
+    let intent = captured_intent.unwrap();
+    let current = outbox_operation_ids(&harness)
+        .difference(&historical)
+        .copied()
+        .collect::<Vec<_>>();
+    assert_eq!(current.len(), 1);
+    let historical_marker = applied_marker_path(&harness, historical.first().unwrap());
+    let current_marker = applied_marker_path(&harness, &current[0]);
+    fs::remove_file(&historical_marker).unwrap();
+    fs::remove_file(&current_marker).unwrap();
+
+    harness.engine.commit_local_intent(&intent).unwrap();
+
+    assert!(
+        !historical_marker.exists(),
+        "an already-promoted retry must not recreate a historical applied marker"
+    );
+    assert!(
+        current_marker.exists(),
+        "an already-promoted retry must restore its current applied marker"
     );
 }
 

@@ -5,13 +5,12 @@
   "type": "module",
   "scripts": {
     "test": "playwright test",
+    "test:fixtures": "node --test fixtures/*.test.js",
     "test:headed": "playwright test --headed",
     "test:ui": "playwright test --ui",
     "test:debug": "playwright test --debug",
-    "test:chromium": "playwright test --project=chromium",
-    "test:firefox": "playwright test --project=firefox",
-    "test:webkit": "playwright test --project=webkit",
-    "test:mobile": "playwright test --project='Mobile Chrome' --project='Mobile Safari'",
+    "test:desktop": "playwright test --project=desktop-chromium",
+    "test:companion": "playwright test --project=companion-pixel",
     "report": "playwright show-report",
     "install-browsers": "playwright install --with-deps"
   },

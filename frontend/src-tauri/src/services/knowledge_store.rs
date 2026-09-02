@@ -1929,11 +1929,12 @@ impl KnowledgeStore {
         };
 
         let frontmatter_aliases = dedupe_strings(frontmatter.aliases);
-        let aliases = dedupe_strings(
-            frontmatter_aliases
-                .into_iter()
-                .chain(alias_candidates(&title, file_stem)),
-        );
+        let derived_aliases = if is_reserved_synced_materialization_path(&relative_path) {
+            Vec::new()
+        } else {
+            alias_candidates(&title, file_stem)
+        };
+        let aliases = dedupe_strings(frontmatter_aliases.into_iter().chain(derived_aliases));
         let tags = dedupe_strings(
             frontmatter
                 .tags

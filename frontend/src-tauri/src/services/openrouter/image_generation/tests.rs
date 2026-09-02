@@ -221,6 +221,71 @@ async fn image_generation_rechecks_exact_endpoint_pins_provider_and_posts_once()
 }
 
 #[tokio::test]
+async fn e2e_api_url_drives_models_text_chat_and_image_routes() {
+    let generation = serde_json::json!({
+        "created": 1_800_000_001u64,
+        "data": [{"b64_json": preview_png_base64(), "media_type": "image/png"}]
+    })
+    .to_string();
+    let (base_url, observed, handle) = spawn_image_server(vec![
+        (200, image_catalog("1024x1024", &["png"])),
+        (
+            200,
+            serde_json::json!({
+                "choices": [{"message": {"role": "assistant", "content": "stub reply"}}]
+            })
+            .to_string(),
+        ),
+        (200, image_catalog("1024x1024", &["png"])),
+        (200, image_endpoints("1024x1024", &["png"])),
+        (200, generation),
+    ]);
+    let service = OpenRouterService::new_for_e2e("secret".into(), base_url).unwrap();
+
+    let models = service.get_available_models().await.unwrap();
+    let reply = service
+        .chat(
+            "author/model",
+            vec![crate::services::openrouter::ChatMessage {
+                role: "user".into(),
+                content: "hello".into(),
+            }],
+            None,
+            None,
+            None,
+            None,
+            false,
+            5,
+        )
+        .await
+        .unwrap();
+    let image = service
+        .generate_image(image_request(), test_vault_scope())
+        .await
+        .unwrap();
+    handle.join().unwrap();
+
+    assert_eq!(models[0].id, "author/model");
+    assert_eq!(reply, "stub reply");
+    assert_eq!(image.media_type, "image/png");
+    assert_eq!(
+        observed
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|request| request.path.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "/api/v1/models",
+            "/api/v1/chat/completions",
+            "/api/v1/images/models",
+            "/api/v1/images/models/author/model/endpoints",
+            "/api/v1/images",
+        ]
+    );
+}
+
+#[tokio::test]
 async fn image_generation_omits_output_format_when_endpoint_does_not_advertise_it() {
     let mut endpoints =
         serde_json::from_str::<serde_json::Value>(&image_endpoints("1024x1024", &["png"])).unwrap();

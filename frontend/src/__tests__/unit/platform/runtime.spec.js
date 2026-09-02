@@ -45,6 +45,7 @@ describe('runtime capability profiles', () => {
       setRuntimeStatus(normalizeRuntimeStatus(desktopRuntimeStatus()))
 
       expect(profile.name).toBe(RUNTIME_PROFILES.DESKTOP_WIDE)
+      expect(profile.nativePlugins).toBe(true)
       for (const [capability, enabled] of Object.entries(expectedDesktopCapabilities)) {
         expect(hasCapability(profile, capability)).toBe(enabled)
       }
@@ -183,9 +184,25 @@ describe('runtime capability profiles', () => {
     const profile = createRuntimeProfile({ isTauri: false, platform: 'windows' })
 
     expect(profile.name).toBe(RUNTIME_PROFILES.PLAIN_WEB)
+    expect(profile.nativePlugins).toBe(false)
     for (const capability of Object.keys(expectedDesktopCapabilities)) {
       expect(hasCapability(profile, capability)).toBe(false)
     }
+  })
+
+  it('can model the E2E desktop shell without granting native plugin authority', () => {
+    const profile = createRuntimeProfile({
+      isTauri: true,
+      platform: 'windows',
+      nativePlugins: false,
+    })
+
+    expect(profile).toEqual({
+      name: RUNTIME_PROFILES.DESKTOP_WIDE,
+      isTauri: true,
+      platform: 'windows',
+      nativePlugins: false,
+    })
   })
 })
 

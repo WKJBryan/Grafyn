@@ -37,7 +37,7 @@ vi.mock('@/api/client', () => ({
   settings: { get: shell.settingsGet },
 }))
 vi.mock('@/api/transport', () => ({
-  getRuntimeProfile: () => ({ name: 'desktop-wide', isTauri: true }),
+  getRuntimeProfile: () => ({ name: 'desktop-wide', isTauri: true, nativePlugins: true }),
   getTransport: () => ({ showMainWindow: shell.showMainWindow }),
   setRuntimeStatus: shell.setRuntimeStatus,
 }))

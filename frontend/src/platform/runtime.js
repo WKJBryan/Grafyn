@@ -5,12 +5,17 @@ export const RUNTIME_PROFILES = Object.freeze({
   PLAIN_WEB: 'plain-web',
 })
 
-export function createRuntimeProfile({ isTauri = false, platform = null } = {}) {
+export function createRuntimeProfile({
+  isTauri = false,
+  platform = null,
+  nativePlugins = isTauri,
+} = {}) {
   if (!isTauri) {
     return Object.freeze({
       name: RUNTIME_PROFILES.PLAIN_WEB,
       isTauri: false,
       platform: null,
+      nativePlugins: false,
     })
   }
 
@@ -22,5 +27,6 @@ export function createRuntimeProfile({ isTauri = false, platform = null } = {}) 
     name,
     isTauri: true,
     platform,
+    nativePlugins: nativePlugins === true,
   })
 }

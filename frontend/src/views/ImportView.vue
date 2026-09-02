@@ -16,7 +16,7 @@
         <button
           class="btn btn-primary file-btn"
           data-guide="import-file-btn"
-          :disabled="loading"
+          :disabled="loading || !nativeFilePickerAvailable"
           @click="handlePickFile"
         >
           {{ loading ? 'Reading file...' : 'Choose Export File' }}
@@ -335,10 +335,11 @@
 <script setup>
 import { ref, reactive, computed } from 'vue'
 import { importApi, zettelkasten, notes } from '@/api/client'
-import { getTransport } from '@/api/transport'
+import { getRuntimeProfile, getTransport } from '@/api/transport'
 import { useToast } from '@/composables/useToast'
 
 const toast = useToast()
+const nativeFilePickerAvailable = getRuntimeProfile().nativePlugins === true
 
 const loading = ref(false)
 const importing = ref(false)
@@ -403,6 +404,7 @@ function isSelected(noteId, targetId) {
 }
 
 async function handlePickFile() {
+  if (!nativeFilePickerAvailable) return
   error.value = null
 
   const selected = await getTransport().openExternal({

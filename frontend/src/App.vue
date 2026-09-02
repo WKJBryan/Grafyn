@@ -107,6 +107,8 @@ async function registerCommittedWarningListener() {
 }
 
 function handleExternalLinkClick(event) {
+  if (getRuntimeProfile().nativePlugins !== true) return
+
   let el = event.target
   while (el && el.tagName !== 'A') {
     el = el.parentElement
@@ -122,6 +124,8 @@ function handleExternalLinkClick(event) {
 }
 
 async function checkForDesktopUpdate() {
+  if (getRuntimeProfile().nativePlugins !== true) return
+
   try {
     const [{ check }, { confirm }] = await Promise.all([
       import('@tauri-apps/plugin-updater'),
@@ -159,10 +163,12 @@ onMounted(() => {
   guide.checkNewFeatures()
 
   if (isTauriApp()) {
-    document.addEventListener('click', handleExternalLinkClick)
     void registerCommittedWarningListener()
   }
-  if (isDesktopApp()) {
+  if (getRuntimeProfile().nativePlugins === true) {
+    document.addEventListener('click', handleExternalLinkClick)
+  }
+  if (isDesktopApp() && getRuntimeProfile().nativePlugins === true) {
     void checkForDesktopUpdate()
   }
 })

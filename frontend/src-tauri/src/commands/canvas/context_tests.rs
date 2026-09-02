@@ -270,11 +270,11 @@ fn test_build_chunk_context_prompt_empty() {
 }
 
 #[test]
-fn twin_context_prompt_separates_approved_candidates_and_advisor_instructions() {
+fn twin_context_prompt_uses_endorsed_non_preference_compatibility_without_candidates() {
     let approved = vec![TwinContextRecord {
         id: "record-approved".into(),
-        kind: crate::models::twin::UserRecordKind::Preference,
-        content: "User prefers evidence-backed implementation detail.".into(),
+        kind: crate::models::twin::UserRecordKind::Fact,
+        content: "The user has an evidence review deadline.".into(),
         confidence: 0.9,
         promotion_state: crate::models::twin::PromotionState::Endorsed,
         evidence_count: 4,
@@ -349,7 +349,10 @@ fn twin_context_prompt_separates_approved_candidates_and_advisor_instructions() 
     assert!(prompt.contains("## Relevant Evidence"));
     assert!(prompt.contains("Expert says accept grants when partnerships are strategic."));
     assert!(prompt.contains("## Approved User Records"));
-    assert!(prompt.contains("## Tentative Candidate Records"));
+    assert!(prompt.contains("The user has an evidence review deadline."));
+    assert!(!prompt.contains("## Tentative Candidate Records"));
+    assert!(!prompt.contains("User may prefer red-team critique before shipping."));
+    assert!(!prompt.contains("candidate records"));
     assert!(prompt.contains("Candidate Constitution Hypotheses"));
     assert!(prompt.contains("May prefer negotiation before rejection."));
     assert!(!prompt.contains("Rejected claims must not leak."));
@@ -359,6 +362,142 @@ fn twin_context_prompt_separates_approved_candidates_and_advisor_instructions() 
     assert!(prompt.contains("Do not use evidence to justify a preselected answer"));
     assert!(prompt.contains("Recommended option"));
     assert!(prompt.contains("decision-support assistant"));
+}
+
+#[test]
+fn twin_context_prompt_keeps_governed_projection_preferences_but_not_legacy_preferences() {
+    let legacy = TwinContextRecord {
+        id: "legacy-preference".into(),
+        kind: crate::models::twin::UserRecordKind::Preference,
+        content: "LEGACY_PREFERENCE_MUST_NOT_ENTER_PROMPT".into(),
+        confidence: 1.0,
+        promotion_state: crate::models::twin::PromotionState::Endorsed,
+        evidence_count: 4,
+        source_label: Some("approved".into()),
+    };
+    let reviewed = TwinContextRecord {
+        id: "reviewed-memory".into(),
+        kind: crate::models::twin::UserRecordKind::Preference,
+        content: "REVIEWED_PROJECTION_PREFERENCE_MUST_REMAIN".into(),
+        confidence: 1.0,
+        promotion_state: crate::models::twin::PromotionState::Endorsed,
+        evidence_count: 3,
+        source_label: Some("governed_projection".into()),
+    };
+
+    let prompt = build_twin_context_prompt(
+        &ConstitutionSetup::default(),
+        &[],
+        &[],
+        &[legacy, reviewed],
+        &[],
+        &[],
+        &[],
+        &TwinAnswerMode::Advisor,
+        &PromptType::Standard,
+        None,
+    );
+
+    assert!(!prompt.contains("LEGACY_PREFERENCE_MUST_NOT_ENTER_PROMPT"));
+    assert!(prompt.contains("REVIEWED_PROJECTION_PREFERENCE_MUST_REMAIN"));
+}
+
+fn create_legacy_context_record(
+    store: &mut crate::services::twin::TwinStore,
+    kind: crate::models::twin::UserRecordKind,
+    content: &str,
+    endorsed: bool,
+) {
+    let record = store
+        .create_user_record(crate::models::twin::UserRecordCreate {
+            kind,
+            content: content.to_string(),
+            origin: crate::models::twin::RecordOrigin::User,
+            evidence_refs: Vec::new(),
+            confidence: 0.9,
+            promotion_state: Some(crate::models::twin::PromotionState::Candidate),
+            valid_from: None,
+            valid_until: None,
+            links: Vec::new(),
+            metadata: std::collections::HashMap::new(),
+        })
+        .unwrap();
+    if endorsed {
+        store
+            .set_user_record_promotion(
+                &record.id,
+                crate::models::twin::PromotionState::Endorsed,
+                None,
+            )
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn twin_context_does_not_render_or_persist_candidate_records() {
+    let (state, _vault, _data) = crate::commands::commit_note_write_tests::build_test_state();
+    {
+        let mut store = state.twin_store.write().await;
+        create_legacy_context_record(
+            &mut store,
+            crate::models::twin::UserRecordKind::ReasoningPattern,
+            "UNREVIEWED red-team critique before shipping",
+            false,
+        );
+    }
+    let session = build_session(Vec::new());
+    let mut request =
+        build_root_request("Need red-team critique before shipping", ContextMode::Twin);
+    request.twin_answer_mode = TwinAnswerMode::Advisor;
+    let messages = build_canvas_messages(&session, &request).unwrap();
+
+    let resolved = resolve_twin_prompt_context(&state, messages, &session, &request)
+        .await
+        .unwrap();
+
+    assert!(resolved.candidate_twin_records.is_empty());
+    assert!(!resolved
+        .twin_context_prompt
+        .as_deref()
+        .unwrap()
+        .contains("UNREVIEWED red-team critique before shipping"));
+}
+
+#[tokio::test]
+async fn twin_context_persists_endorsed_facts_but_not_legacy_preferences() {
+    let (state, _vault, _data) = crate::commands::commit_note_write_tests::build_test_state();
+    {
+        let mut store = state.twin_store.write().await;
+        create_legacy_context_record(
+            &mut store,
+            crate::models::twin::UserRecordKind::Preference,
+            "LEGACY product launch preference",
+            true,
+        );
+        create_legacy_context_record(
+            &mut store,
+            crate::models::twin::UserRecordKind::Fact,
+            "COMPATIBILITY product launch deadline",
+            true,
+        );
+    }
+    let session = build_session(Vec::new());
+    let mut request = build_root_request("Review the product launch", ContextMode::Twin);
+    request.twin_answer_mode = TwinAnswerMode::Advisor;
+    let messages = build_canvas_messages(&session, &request).unwrap();
+
+    let resolved = resolve_twin_prompt_context(&state, messages, &session, &request)
+        .await
+        .unwrap();
+
+    assert_eq!(resolved.approved_twin_records.len(), 1);
+    assert_eq!(
+        resolved.approved_twin_records[0].kind,
+        crate::models::twin::UserRecordKind::Fact
+    );
+    let prompt = resolved.twin_context_prompt.as_deref().unwrap();
+    assert!(prompt.contains("COMPATIBILITY product launch deadline"));
+    assert!(!prompt.contains("LEGACY product launch preference"));
 }
 
 #[test]

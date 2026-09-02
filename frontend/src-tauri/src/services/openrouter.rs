@@ -13,12 +13,39 @@ use image_generation::ImageReceiptStore;
 
 const OPENROUTER_API_URL: &str = "https://openrouter.ai/api/v1";
 
+#[cfg(any(test, feature = "e2e-test-runtime"))]
+fn validate_e2e_api_url(candidate: &str) -> Result<String> {
+    let url = reqwest::Url::parse(candidate).context("Invalid OpenRouter E2E API URL")?;
+    let host = url.host_str().unwrap_or_default();
+    let host = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    let is_loopback = host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback());
+    if url.scheme() != "http"
+        || !is_loopback
+        || url.path() != "/api/v1"
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(anyhow::anyhow!(
+            "OpenRouter E2E API URL must be an exact loopback HTTP /api/v1 URL"
+        ));
+    }
+    Ok(url.to_string())
+}
+
 /// Service for interacting with OpenRouter API
 #[derive(Clone)]
 pub struct OpenRouterService {
     client: Client,
     api_key: String,
-    image_api_url: String,
+    api_url: String,
     image_receipts: Arc<Mutex<ImageReceiptStore>>,
 }
 
@@ -28,7 +55,7 @@ impl std::fmt::Debug for OpenRouterService {
             .debug_struct("OpenRouterService")
             .field("client", &self.client)
             .field("api_key", &"[REDACTED]")
-            .field("image_api_url", &self.image_api_url)
+            .field("api_url", &self.api_url)
             .finish()
     }
 }
@@ -47,22 +74,36 @@ impl OpenRouterService {
                 .build()
                 .unwrap_or_else(|_| Client::new()),
             api_key,
-            image_api_url: OPENROUTER_API_URL.to_string(),
+            api_url: OPENROUTER_API_URL.to_string(),
             image_receipts: Arc::new(Mutex::new(ImageReceiptStore::default())),
         }
     }
 
     #[cfg(test)]
-    fn new_for_image_tests(api_key: String, image_api_url: String) -> Self {
+    fn new_for_image_tests(api_key: String, api_url: String) -> Self {
         Self {
             client: Client::builder()
                 .connect_timeout(Duration::from_secs(2))
                 .build()
                 .unwrap_or_else(|_| Client::new()),
             api_key,
-            image_api_url,
+            api_url,
             image_receipts: Arc::new(Mutex::new(ImageReceiptStore::default())),
         }
+    }
+
+    #[cfg(any(test, feature = "e2e-test-runtime"))]
+    pub(crate) fn new_for_e2e(api_key: String, api_url: String) -> Result<Self> {
+        let api_url = validate_e2e_api_url(&api_url)?;
+        Ok(Self {
+            client: Client::builder()
+                .connect_timeout(Duration::from_secs(2))
+                .build()
+                .unwrap_or_else(|_| Client::new()),
+            api_key,
+            api_url,
+            image_receipts: Arc::new(Mutex::new(ImageReceiptStore::default())),
+        })
     }
 
     /// Update the API key (called when user updates settings)
@@ -98,7 +139,7 @@ impl OpenRouterService {
 
         let response = self
             .client
-            .get(format!("{}/models", OPENROUTER_API_URL))
+            .get(format!("{}/models", self.api_url))
             .header("Authorization", format!("Bearer {}", self.api_key))
             .timeout(Duration::from_secs(15))
             .send()
@@ -176,7 +217,7 @@ impl OpenRouterService {
 
         let response = self
             .client
-            .post(format!("{}/chat/completions", OPENROUTER_API_URL))
+            .post(format!("{}/chat/completions", self.api_url))
             .header("Authorization", format!("Bearer {}", self.api_key))
             .header("HTTP-Referer", "https://grafyn.app")
             .header("X-Title", "Grafyn")
@@ -247,7 +288,7 @@ impl OpenRouterService {
 
         let response = self
             .client
-            .post(format!("{}/chat/completions", OPENROUTER_API_URL))
+            .post(format!("{}/chat/completions", self.api_url))
             .header("Authorization", format!("Bearer {}", self.api_key))
             .header("HTTP-Referer", "https://grafyn.app")
             .header("X-Title", "Grafyn")
@@ -644,5 +685,33 @@ mod tests {
         let debug = format!("{service:?}");
         assert!(!debug.contains(secret));
         assert!(debug.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn e2e_api_url_accepts_only_exact_loopback_http_api_v1_origins() {
+        for url in [
+            "http://127.0.0.1:43123/api/v1",
+            "http://localhost:43123/api/v1",
+            "http://[::1]:43123/api/v1",
+        ] {
+            OpenRouterService::new_for_e2e("secret".into(), url.into())
+                .unwrap_or_else(|error| panic!("{url} should be accepted: {error}"));
+        }
+
+        for url in [
+            "https://127.0.0.1:43123/api/v1",
+            "http://example.com:43123/api/v1",
+            "http://localhost.evil:43123/api/v1",
+            "http://0.0.0.0:43123/api/v1",
+            "http://127.0.0.1:43123/api/v1/",
+            "http://127.0.0.1:43123/api/v1/models",
+            "http://127.0.0.1:43123/api/v1?token=secret",
+            "http://user@127.0.0.1:43123/api/v1",
+        ] {
+            assert!(
+                OpenRouterService::new_for_e2e("secret".into(), url.into()).is_err(),
+                "{url} must be rejected"
+            );
+        }
     }
 }

@@ -15,6 +15,7 @@ fn main() {
             // Prevent link.exe from generating a second MANIFEST #1 for binary targets while
             // retaining the activation manifest above for Rust test harness executables.
             println!("cargo:rustc-link-arg-bin=grafyn=/MANIFEST:NO");
+            println!("cargo:rustc-link-arg-bin=grafyn-test-runtime=/MANIFEST:NO");
         }
     }
 }

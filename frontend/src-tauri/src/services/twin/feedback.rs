@@ -2,10 +2,13 @@ use super::TwinStore;
 use crate::models::canvas::{CanvasSession, ModelResponse, PromptTile, ResponseStatus};
 use crate::models::twin::{
     CanvasFeedbackRequest, CanvasFeedbackResult, CanvasFeedbackType, CanvasResponseRef,
-    EvidenceRef as LegacyEvidenceRef, PromotionState, RecordOrigin, TraceEvent, TraceEventType,
-    UserRecordCreate, UserRecordKind,
+    CanvasResponseVersionWitness, EvidenceRef as LegacyEvidenceRef, PromotionState, RecordOrigin,
+    TraceEvent, TraceEventType, UserRecordCreate, UserRecordKind,
 };
-use crate::models::twin_event::{EvidenceRef, EvidenceType, Identifier, SourceChannel};
+use crate::models::twin_event::{
+    ClaimAssertion, ClaimObject, ClaimPolarity, ClaimPredicate, EntityId, EvidenceRef,
+    EvidenceType, Identifier, SourceChannel, TwinEvent, TwinEventPayload,
+};
 use anyhow::{bail, Result};
 use serde_json::json;
 use std::collections::HashSet;
@@ -100,7 +103,46 @@ impl TwinStore {
         for draft in &mut drafts {
             draft.evidence.push(canvas_evidence.clone());
         }
-        drafts.push(self.record_observation_draft(&record, false, None)?);
+        let preference_claim = explicit_preference_insight_claim(request)?;
+        let preference_source = if let Some(claim) = preference_claim.as_ref() {
+            let response_ref = required_response(request)?;
+            let (_, response) = completed_response(session, response_ref)?;
+            let response_witness = required_response_witness(request)?;
+            let events = self.event_recorder.recorded_events()?;
+            let source = source_canvas_response_event(
+                &events,
+                session,
+                response_ref,
+                response,
+                response_witness,
+            )?;
+            if preference_already_captured(&events, claim, source) {
+                bail!("Twin preference evidence for this response was already captured");
+            }
+            Some(source.clone())
+        } else {
+            None
+        };
+        let mut observation = self.record_observation_draft(&record, false, None)?;
+        if let Some(claim) = preference_claim {
+            let TwinEventPayload::ObservationRecorded(payload) = &mut observation.payload else {
+                unreachable!("legacy record capture is always an observation")
+            };
+            payload.claims.push(claim);
+            let source = preference_source.expect("preference source was resolved with its claim");
+            observation.causal_parents.push(source.event_id.clone());
+            observation.context = source.context.clone();
+            observation.governance = source.governance.clone();
+            observation.evidence.push(EvidenceRef {
+                evidence_type: EvidenceType::Event,
+                source_id: Identifier::parse(source.event_id.as_str())
+                    .map_err(anyhow::Error::msg)?,
+                digest: None,
+            });
+            observation.evidence.sort();
+            observation.evidence.dedup();
+        }
+        drafts.push(observation);
         let values = vec![
             self.serialized_trace_target(&trace)?,
             (
@@ -131,11 +173,25 @@ fn validate_feedback_request(
             }
         }
         CanvasFeedbackType::Insight => {
-            if request.content.as_deref().is_none_or(str::is_empty) {
+            if request
+                .content
+                .as_deref()
+                .is_none_or(|content| content.trim().is_empty())
+            {
                 bail!("Insight capture requires content");
             }
             if request.kind.is_none() {
                 bail!("Insight capture requires a record kind");
+            }
+            if is_explicit_preference_insight(request) {
+                let response_ref = required_response(request)?;
+                let (tile, response) = completed_response(session, response_ref)?;
+                validate_response_witness(response, required_response_witness(request)?)?;
+                tile.validate_twin_relationship_context(None)
+                    .map_err(anyhow::Error::msg)?;
+                if !tile.twin_relationship_variant.relationships.is_empty() {
+                    bail!("Twin preference capture currently requires a global Canvas response");
+                }
             }
             if let Some(response) = request.response.as_ref() {
                 completed_response(session, response)?;
@@ -155,6 +211,132 @@ fn validate_feedback_request(
         }
     }
     Ok(())
+}
+
+fn explicit_preference_insight_claim(
+    request: &CanvasFeedbackRequest,
+) -> Result<Option<ClaimAssertion>> {
+    if !is_explicit_preference_insight(request) {
+        return Ok(None);
+    }
+    let content = request
+        .content
+        .as_deref()
+        .expect("validated preference insight content")
+        .trim();
+    Ok(Some(ClaimAssertion {
+        subject_id: EntityId::parse("owner").map_err(anyhow::Error::msg)?,
+        predicate: ClaimPredicate::parse("prefers").map_err(anyhow::Error::msg)?,
+        object: ClaimObject::parse(content).map_err(anyhow::Error::msg)?,
+        polarity: ClaimPolarity::Affirmed,
+    }))
+}
+
+fn is_explicit_preference_insight(request: &CanvasFeedbackRequest) -> bool {
+    request.feedback_type == CanvasFeedbackType::Insight
+        && request.kind.as_ref() == Some(&UserRecordKind::Preference)
+}
+
+fn required_response_witness(
+    request: &CanvasFeedbackRequest,
+) -> Result<&CanvasResponseVersionWitness> {
+    request.response_witness.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("Twin preference capture requires an exact response version witness")
+    })
+}
+
+fn validate_response_witness(
+    response: &ModelResponse,
+    witness: &CanvasResponseVersionWitness,
+) -> Result<()> {
+    if witness.response_id != response.id || witness.response_content != response.content {
+        bail!("Canvas response changed before capture; reopen the preference capture and review the current response");
+    }
+    Ok(())
+}
+
+fn source_canvas_response_event<'a>(
+    events: &'a [TwinEvent],
+    session: &CanvasSession,
+    response_ref: &CanvasResponseRef,
+    response: &ModelResponse,
+    witness: &CanvasResponseVersionWitness,
+) -> Result<&'a TwinEvent> {
+    let response_digest =
+        crate::services::twin_events::digest_bytes(witness.response_content.as_bytes());
+    let superseded = events
+        .iter()
+        .flat_map(|event| event.supersedes.iter().map(|id| id.as_str()))
+        .collect::<HashSet<_>>();
+    let matches = events
+        .iter()
+        .filter(|event| {
+            !superseded.contains(event.event_id.as_str())
+                && match &event.payload {
+                    TwinEventPayload::CanvasResponseRecorded(recorded) => {
+                        recorded.session_id.as_str() == session.id
+                            && recorded.tile_id.as_str() == response_ref.tile_id
+                            && recorded.response_id.as_str() == witness.response_id
+                            && recorded.model_id.as_str() == response.model_id
+                            && recorded.response.as_str() == witness.response_content
+                            && recorded.response_digest.as_ref() == Some(&response_digest)
+                    }
+                    _ => false,
+                }
+        })
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [source] => Ok(*source),
+        [] => Err(anyhow::anyhow!(
+            "Persisted Canvas response evidence is unavailable for Twin preference capture"
+        )),
+        _ => Err(anyhow::anyhow!(
+            "Persisted Canvas response evidence is ambiguous for Twin preference capture"
+        )),
+    }
+}
+
+fn same_canvas_response_identity(
+    left: &crate::models::twin_event::CanvasResponseRecorded,
+    right: &crate::models::twin_event::CanvasResponseRecorded,
+) -> bool {
+    left.session_id == right.session_id
+        && left.tile_id == right.tile_id
+        && left.response_id == right.response_id
+}
+
+fn preference_already_captured(
+    events: &[TwinEvent],
+    claim: &ClaimAssertion,
+    source_event: &TwinEvent,
+) -> bool {
+    let TwinEventPayload::CanvasResponseRecorded(source_response) = &source_event.payload else {
+        return false;
+    };
+    let source_event_ids = events
+        .iter()
+        .filter_map(|event| match &event.payload {
+            TwinEventPayload::CanvasResponseRecorded(response)
+                if same_canvas_response_identity(response, source_response) =>
+            {
+                Some(event.event_id.as_str())
+            }
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
+    events.iter().any(|event| {
+        let TwinEventPayload::ObservationRecorded(observation) = &event.payload else {
+            return false;
+        };
+        observation.claims.contains(claim)
+            && (event.evidence.iter().any(|evidence| {
+                evidence.evidence_type == EvidenceType::Event
+                    && source_event_ids.contains(evidence.source_id.as_str())
+            }) || event
+                .causal_parents
+                .iter()
+                .any(|parent| source_event_ids.contains(parent.as_str())))
+    })
 }
 
 fn feedback_drafts(
@@ -501,7 +683,13 @@ mod tests {
     use crate::models::twin::{
         CanvasFeedbackRequest, CanvasFeedbackType, CanvasResponseRef, UserRecordKind,
     };
-    use crate::models::twin_event::TwinEventPayload;
+    use crate::models::twin_event::{
+        CausalStream, ClaimPolarity, EntityId, EvidenceType, RelationshipDirection,
+        RelationshipPredicate, SourceChannel, TwinEventPayload,
+    };
+    use crate::models::twin_state::{RelationshipKey, RelationshipVariant};
+    use crate::services::twin_events::{canvas_transition_drafts, digest_bytes, project};
+    use chrono::Utc;
     use tempfile::tempdir;
 
     fn session() -> CanvasSession {
@@ -517,6 +705,7 @@ mod tests {
         for (model, response_id, content) in [
             ("model-a", "response-a", "Answer A"),
             ("model-b", "response-b", "Answer B"),
+            ("model-c", "response-c", "Answer C"),
         ] {
             tile.responses.insert(
                 model.to_string(),
@@ -572,6 +761,25 @@ mod tests {
             serde_json::to_vec_pretty(session).unwrap(),
         )
         .unwrap();
+    }
+
+    fn persist_session_with_response_events(
+        root: &std::path::Path,
+        session: &CanvasSession,
+        coordinator: &crate::services::twin_events::MutationCoordinator,
+    ) {
+        persist_session(root, session);
+        let session_bytes = serde_json::to_vec_pretty(session).unwrap();
+        let drafts =
+            canvas_transition_drafts(None, session, &[], digest_bytes(&session_bytes)).unwrap();
+        let _commit = coordinator
+            .commit_local(
+                CausalStream::SyncEligible,
+                SourceChannel::parse("canvas").unwrap(),
+                Vec::new(),
+                drafts,
+            )
+            .unwrap();
     }
 
     #[test]
@@ -782,5 +990,435 @@ mod tests {
         assert!(result.is_err());
         assert!(events.ordered_events().unwrap().is_empty());
         assert_eq!(coordinator.pending_count().unwrap(), 0);
+    }
+
+    fn insight_request(
+        model_id: &str,
+        kind: UserRecordKind,
+        content: &str,
+    ) -> CanvasFeedbackRequest {
+        let (response_id, response_content) = match model_id {
+            "model-a" => ("response-a", "Answer A"),
+            "model-b" => ("response-b", "Answer B"),
+            "model-c" => ("response-c", "Answer C"),
+            _ => panic!("unknown fixture model: {model_id}"),
+        };
+        CanvasFeedbackRequest {
+            feedback_type: CanvasFeedbackType::Insight,
+            response: Some(CanvasResponseRef {
+                tile_id: "tile-feedback".to_string(),
+                model_id: model_id.to_string(),
+            }),
+            kind: Some(kind),
+            content: Some(content.to_string()),
+            ..serde_json::from_value(serde_json::json!({
+                "feedback_type": "insight",
+                "response_witness": {
+                    "response_id": response_id,
+                    "response_content": response_content
+                }
+            }))
+            .unwrap()
+        }
+    }
+
+    #[test]
+    fn preference_insight_requires_an_exact_response_version_witness() {
+        let root = tempdir().unwrap();
+        let (mut store, events, coordinator) = coordinated_store(root.path());
+        let session = session();
+        persist_session_with_response_events(root.path(), &session, &coordinator);
+        let event_count = events.ordered_events().unwrap().len();
+
+        let error = store
+            .record_canvas_feedback(
+                &session,
+                CanvasFeedbackRequest {
+                    feedback_type: CanvasFeedbackType::Insight,
+                    response: Some(CanvasResponseRef {
+                        tile_id: "tile-feedback".to_string(),
+                        model_id: "model-a".to_string(),
+                    }),
+                    kind: Some(UserRecordKind::Preference),
+                    content: Some("answers with concrete implementation details".to_string()),
+                    ..serde_json::from_value(serde_json::json!({
+                        "feedback_type": "insight"
+                    }))
+                    .unwrap()
+                },
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("response version witness"));
+        assert_eq!(events.ordered_events().unwrap().len(), event_count);
+    }
+
+    #[test]
+    fn preference_insight_rejects_a_stale_witness_after_regeneration() {
+        let root = tempdir().unwrap();
+        let (mut store, events, coordinator) = coordinated_store(root.path());
+        let stale_session = session();
+        persist_session_with_response_events(root.path(), &stale_session, &coordinator);
+        let request = insight_request(
+            "model-a",
+            UserRecordKind::Preference,
+            "answers with concrete implementation details",
+        );
+
+        let mut regenerated_session = stale_session.clone();
+        regenerated_session.prompt_tiles[0]
+            .responses
+            .get_mut("model-a")
+            .unwrap()
+            .content = "Regenerated answer A".to_string();
+        persist_session(root.path(), &regenerated_session);
+        let prior_events = events.ordered_events().unwrap();
+        let session_bytes = serde_json::to_vec_pretty(&regenerated_session).unwrap();
+        let drafts = canvas_transition_drafts(
+            Some(&stale_session),
+            &regenerated_session,
+            &prior_events,
+            digest_bytes(&session_bytes),
+        )
+        .unwrap();
+        let _ = coordinator
+            .commit_local(
+                CausalStream::SyncEligible,
+                SourceChannel::parse("canvas").unwrap(),
+                Vec::new(),
+                drafts,
+            )
+            .unwrap();
+        let event_count = events.ordered_events().unwrap().len();
+
+        let error = store
+            .record_canvas_feedback(&stale_session, request)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("changed before capture"));
+        assert_eq!(events.ordered_events().unwrap().len(), event_count);
+    }
+
+    #[test]
+    fn preference_insight_rejects_a_response_identity_mismatch() {
+        let root = tempdir().unwrap();
+        let (mut store, events, coordinator) = coordinated_store(root.path());
+        let session = session();
+        persist_session_with_response_events(root.path(), &session, &coordinator);
+        let event_count = events.ordered_events().unwrap().len();
+        let request = serde_json::from_value(serde_json::json!({
+            "feedback_type": "insight",
+            "response": {
+                "tile_id": "tile-feedback",
+                "model_id": "model-a"
+            },
+            "response_witness": {
+                "response_id": "response-from-another-version",
+                "response_content": "Answer A"
+            },
+            "kind": "preference",
+            "content": "answers with concrete implementation details"
+        }))
+        .unwrap();
+
+        let error = store.record_canvas_feedback(&session, request).unwrap_err();
+
+        assert!(error.to_string().contains("changed before capture"));
+        assert_eq!(events.ordered_events().unwrap().len(), event_count);
+    }
+
+    #[test]
+    fn only_explicit_preference_insight_adds_a_canonical_claim() {
+        let root = tempdir().unwrap();
+        let (mut store, events, coordinator) = coordinated_store(root.path());
+        let session = session();
+        persist_session_with_response_events(root.path(), &session, &coordinator);
+
+        store
+            .record_canvas_feedback(
+                &session,
+                CanvasFeedbackRequest {
+                    feedback_type: CanvasFeedbackType::Accept,
+                    response: Some(CanvasResponseRef {
+                        tile_id: "tile-feedback".to_string(),
+                        model_id: "model-a".to_string(),
+                    }),
+                    ..serde_json::from_value(serde_json::json!({
+                        "feedback_type": "accept"
+                    }))
+                    .unwrap()
+                },
+            )
+            .unwrap();
+        store
+            .record_canvas_feedback(
+                &session,
+                insight_request("model-a", UserRecordKind::Fact, "A user-authored fact"),
+            )
+            .unwrap();
+        store
+            .record_canvas_feedback(
+                &session,
+                insight_request(
+                    "model-b",
+                    UserRecordKind::ReasoningPattern,
+                    "A user-authored reasoning pattern",
+                ),
+            )
+            .unwrap();
+        store
+            .record_canvas_feedback(
+                &session,
+                insight_request(
+                    "model-c",
+                    UserRecordKind::Preference,
+                    "  answers with concrete implementation details  ",
+                ),
+            )
+            .unwrap();
+
+        let captured = events.ordered_events().unwrap();
+        let observations = captured
+            .iter()
+            .filter_map(|event| match &event.payload {
+                TwinEventPayload::ObservationRecorded(observation) => Some(observation),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(observations.len(), 4);
+        assert!(observations[..3]
+            .iter()
+            .all(|observation| observation.claims.is_empty()));
+        assert_eq!(observations[3].claims.len(), 1);
+        let claim = &observations[3].claims[0];
+        assert_eq!(claim.subject_id.as_str(), "owner");
+        assert_eq!(claim.predicate.as_str(), "prefers");
+        assert_eq!(
+            claim.object.as_str(),
+            "answers with concrete implementation details"
+        );
+        assert_eq!(claim.polarity, ClaimPolarity::Affirmed);
+        let source_response = captured
+            .iter()
+            .find(|event| {
+                matches!(
+                    &event.payload,
+                    TwinEventPayload::CanvasResponseRecorded(response)
+                        if response.response_id.as_str() == "response-c"
+                )
+            })
+            .unwrap();
+        let preference_observation = captured
+            .iter()
+            .find(|event| {
+                matches!(
+                    &event.payload,
+                    TwinEventPayload::ObservationRecorded(observation)
+                        if !observation.claims.is_empty()
+                )
+            })
+            .unwrap();
+        assert_eq!(
+            preference_observation.governance,
+            source_response.governance
+        );
+        assert!(preference_observation
+            .causal_parents
+            .contains(&source_response.event_id));
+        assert!(preference_observation.evidence.iter().any(|evidence| {
+            evidence.evidence_type == EvidenceType::Event
+                && evidence.source_id.as_str() == source_response.event_id.as_str()
+        }));
+    }
+
+    #[test]
+    fn three_distinct_preference_insights_cross_the_canonical_proposal_threshold() {
+        let root = tempdir().unwrap();
+        let (mut store, events, coordinator) = coordinated_store(root.path());
+        let session = session();
+        persist_session_with_response_events(root.path(), &session, &coordinator);
+        let content = "answers with concrete implementation details";
+
+        for (index, model_id) in ["model-a", "model-b", "model-c"].into_iter().enumerate() {
+            let result = store
+                .record_canvas_feedback(
+                    &session,
+                    insight_request(model_id, UserRecordKind::Preference, content),
+                )
+                .unwrap();
+            let record = store
+                .get_user_record(&result.created_record_ids[0])
+                .unwrap();
+            assert_eq!(record.evidence_refs.len(), 1);
+            assert_eq!(record.evidence_refs[0].model_id.as_deref(), Some(model_id));
+
+            let snapshot = project(&events.ordered_events().unwrap(), Utc::now()).unwrap();
+            if index < 2 {
+                assert!(snapshot.pending_proposals.is_empty());
+            } else {
+                assert_eq!(snapshot.pending_proposals.len(), 1);
+                assert!(snapshot.reviewed_memories.is_empty());
+                let proposal = &snapshot.pending_proposals[0];
+                assert_eq!(proposal.support_count, 3);
+                assert!(proposal.proposal_event_id.is_none());
+                assert_eq!(proposal.claim.subject_id.as_str(), "owner");
+                assert_eq!(proposal.claim.predicate.as_str(), "prefers");
+                assert_eq!(proposal.claim.object.as_str(), content);
+                assert_eq!(proposal.claim.polarity, ClaimPolarity::Affirmed);
+            }
+        }
+    }
+
+    #[test]
+    fn preference_insight_cannot_count_the_same_response_twice() {
+        let root = tempdir().unwrap();
+        let (mut store, events, coordinator) = coordinated_store(root.path());
+        let session = session();
+        persist_session_with_response_events(root.path(), &session, &coordinator);
+        let request = insight_request(
+            "model-a",
+            UserRecordKind::Preference,
+            "answers with concrete implementation details",
+        );
+
+        store
+            .record_canvas_feedback(&session, request.clone())
+            .unwrap();
+        let event_count = events.ordered_events().unwrap().len();
+        let error = store.record_canvas_feedback(&session, request).unwrap_err();
+
+        assert!(error.to_string().contains("already captured"));
+        assert_eq!(events.ordered_events().unwrap().len(), event_count);
+    }
+
+    #[test]
+    fn preference_insight_cannot_reuse_regenerations_of_the_same_response_identity() {
+        let root = tempdir().unwrap();
+        let (mut store, events, coordinator) = coordinated_store(root.path());
+        let mut current = session();
+        persist_session_with_response_events(root.path(), &current, &coordinator);
+        let request = insight_request(
+            "model-a",
+            UserRecordKind::Preference,
+            "answers with concrete implementation details",
+        );
+        store
+            .record_canvas_feedback(&current, request.clone())
+            .unwrap();
+
+        for regenerated_content in ["Regenerated answer A", "Regenerated answer B"] {
+            let before = current.clone();
+            current.prompt_tiles[0]
+                .responses
+                .get_mut("model-a")
+                .unwrap()
+                .content = regenerated_content.to_string();
+            persist_session(root.path(), &current);
+            let persisted_events = events.ordered_events().unwrap();
+            let session_bytes = serde_json::to_vec_pretty(&current).unwrap();
+            let drafts = canvas_transition_drafts(
+                Some(&before),
+                &current,
+                &persisted_events,
+                digest_bytes(&session_bytes),
+            )
+            .unwrap();
+            let _ = coordinator
+                .commit_local(
+                    CausalStream::SyncEligible,
+                    SourceChannel::parse("canvas").unwrap(),
+                    Vec::new(),
+                    drafts,
+                )
+                .unwrap();
+
+            let mut regenerated_request = request.clone();
+            regenerated_request
+                .response_witness
+                .as_mut()
+                .unwrap()
+                .response_content = regenerated_content.to_string();
+            let error = store
+                .record_canvas_feedback(&current, regenerated_request)
+                .unwrap_err();
+            assert!(error.to_string().contains("already captured"));
+        }
+
+        let snapshot = project(&events.ordered_events().unwrap(), Utc::now()).unwrap();
+        assert!(snapshot.pending_proposals.is_empty());
+        assert_eq!(
+            snapshot
+                .recent_observations
+                .iter()
+                .filter(|item| item.claim.object.as_str()
+                    == "answers with concrete implementation details")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn preference_insight_fails_closed_for_ambiguous_active_response_events() {
+        let root = tempdir().unwrap();
+        let (mut store, events, coordinator) = coordinated_store(root.path());
+        let session = session();
+        persist_session_with_response_events(root.path(), &session, &coordinator);
+
+        let session_bytes = serde_json::to_vec_pretty(&session).unwrap();
+        let duplicate_drafts =
+            canvas_transition_drafts(None, &session, &[], digest_bytes(&session_bytes)).unwrap();
+        let _ = coordinator
+            .commit_local(
+                CausalStream::SyncEligible,
+                SourceChannel::parse("canvas").unwrap(),
+                Vec::new(),
+                duplicate_drafts,
+            )
+            .unwrap();
+        let event_count = events.ordered_events().unwrap().len();
+
+        let error = store
+            .record_canvas_feedback(
+                &session,
+                insight_request(
+                    "model-a",
+                    UserRecordKind::Preference,
+                    "answers with concrete implementation details",
+                ),
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("ambiguous"));
+        assert_eq!(events.ordered_events().unwrap().len(), event_count);
+    }
+
+    #[test]
+    fn preference_insight_rejects_relationship_scoped_response_until_scope_is_proven() {
+        let root = tempdir().unwrap();
+        let (mut store, events, coordinator) = coordinated_store(root.path());
+        let mut session = session();
+        session.prompt_tiles[0].twin_relationship_variant =
+            RelationshipVariant::new(vec![RelationshipKey {
+                subject_id: EntityId::parse("owner").unwrap(),
+                predicate: RelationshipPredicate::parse("works_with").unwrap(),
+                object_id: EntityId::parse("alex").unwrap(),
+                direction: RelationshipDirection::Directed,
+            }]);
+        persist_session_with_response_events(root.path(), &session, &coordinator);
+        let event_count = events.ordered_events().unwrap().len();
+
+        let error = store
+            .record_canvas_feedback(
+                &session,
+                insight_request(
+                    "model-a",
+                    UserRecordKind::Preference,
+                    "answers with concrete implementation details",
+                ),
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("global Canvas response"));
+        assert_eq!(events.ordered_events().unwrap().len(), event_count);
     }
 }

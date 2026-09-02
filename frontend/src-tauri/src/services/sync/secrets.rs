@@ -1,7 +1,7 @@
 use std::fmt;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 use std::path::{Path, PathBuf};
-#[cfg(test)]
+#[cfg(any(test, feature = "e2e-test-runtime"))]
 use std::{collections::BTreeMap, sync::Mutex};
 use zeroize::Zeroizing;
 
@@ -364,20 +364,20 @@ fn account_claim_filename(account: &SecretAccount) -> String {
     name
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "e2e-test-runtime"))]
 #[derive(Default)]
 pub(crate) struct MemorySecretStore {
     values: Mutex<BTreeMap<String, SecretBytes>>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "e2e-test-runtime"))]
 impl fmt::Debug for MemorySecretStore {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("MemorySecretStore([REDACTED])")
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "e2e-test-runtime"))]
 impl SecretStore for MemorySecretStore {
     fn put(&self, account: &SecretAccount, secret: &SecretBytes) -> Result<(), SecretStoreError> {
         let mut values = self

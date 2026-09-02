@@ -263,6 +263,22 @@ pub(super) fn alias_candidates(title: &str, file_stem: &str) -> Vec<String> {
     candidates
 }
 
+pub(super) fn is_reserved_synced_materialization_path(relative_path: &str) -> bool {
+    let Some(filename) = relative_path.strip_prefix("synced/") else {
+        return false;
+    };
+    if filename.contains('/') {
+        return false;
+    }
+    let Some(stem) = filename.strip_suffix(".md") else {
+        return false;
+    };
+    stem.len() == 64
+        && stem
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 pub(super) fn extract_inline_hashtags(content: &str) -> Vec<String> {
     HASHTAG_REGEX
         .captures_iter(content)

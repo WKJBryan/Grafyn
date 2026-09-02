@@ -597,7 +597,7 @@ fn extract_docx_text(bytes: &[u8]) -> Result<String, String> {
             },
             Ok(Event::Text(event)) if in_text_run => {
                 let decoded = event
-                    .xml_content()
+                    .xml10_content()
                     .map_err(|e| format!("Failed to decode DOCX text: {}", e))?;
                 text.push_str(&decoded);
             }
@@ -627,9 +627,74 @@ fn extract_docx_text(bytes: &[u8]) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lopdf::content::{Content, Operation};
+    use lopdf::dictionary;
+    use lopdf::{Bookmark, Document, Object, Stream};
     use std::fs::File;
     use std::io::Write;
     use zip::write::FileOptions;
+
+    fn write_valid_pdf(path: &Path, text: &str, outline_title: Option<&str>) {
+        let mut document = Document::with_version("1.5");
+        let pages_id = document.new_object_id();
+        let font_id = document.add_object(lopdf::dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type1",
+            "BaseFont" => "Courier",
+        });
+        let resources_id = document.add_object(lopdf::dictionary! {
+            "Font" => lopdf::dictionary! { "F1" => font_id },
+        });
+        let content = Content {
+            operations: vec![
+                Operation::new("BT", vec![]),
+                Operation::new("Tf", vec!["F1".into(), 12.into()]),
+                Operation::new("Td", vec![72.into(), 720.into()]),
+                Operation::new("Tj", vec![Object::string_literal(text)]),
+                Operation::new("ET", vec![]),
+            ],
+        };
+        let content_id = document.add_object(Stream::new(
+            lopdf::dictionary! {},
+            content.encode().expect("encode PDF content"),
+        ));
+        let page_id = document.add_object(lopdf::dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "Contents" => content_id,
+        });
+        document.objects.insert(
+            pages_id,
+            Object::Dictionary(lopdf::dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![page_id.into()],
+                "Count" => 1,
+                "Resources" => resources_id,
+                "MediaBox" => vec![0.into(), 0.into(), 595.into(), 842.into()],
+            }),
+        );
+        let catalog_id = document.add_object(lopdf::dictionary! {
+            "Type" => "Catalog",
+            "Pages" => pages_id,
+        });
+        document.trailer.set("Root", catalog_id);
+
+        if let Some(title) = outline_title {
+            document.add_bookmark(
+                Bookmark::new(title.to_string(), [0.0, 0.0, 0.0], 0, page_id),
+                None,
+            );
+            if let Some(outline_id) = document.build_outline() {
+                let catalog = document
+                    .get_object_mut(catalog_id)
+                    .and_then(Object::as_dict_mut)
+                    .expect("PDF catalog");
+                catalog.set("Outlines", Object::Reference(outline_id));
+            }
+        }
+
+        document.save(path).expect("save PDF fixture");
+    }
 
     #[tokio::test]
     async fn read_import_content_extracts_docx_transcript_text() {
@@ -652,6 +717,30 @@ mod tests {
         assert!(content.contains("Interviewer: How do you decide what to trust?"));
         assert!(content.contains("Expert: I need a real demo first."));
         assert_eq!(import::detect_platform(&content), Some("interview"));
+    }
+
+    #[tokio::test]
+    async fn read_import_content_extracts_valid_pdf_text() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("evidence.pdf");
+        write_valid_pdf(&path, "Evidence before conclusions.", None);
+
+        let content = read_import_content(path.to_string_lossy().as_ref())
+            .await
+            .expect("PDF content");
+
+        assert_eq!(content, "Evidence before conclusions.");
+    }
+
+    #[tokio::test]
+    async fn extract_pdf_outline_titles_reads_valid_pdf_bookmark() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("outlined.pdf");
+        write_valid_pdf(&path, "Outlined evidence.", Some("Import Overview"));
+
+        let titles = extract_pdf_outline_titles(path.to_string_lossy().as_ref()).await;
+
+        assert_eq!(titles, vec!["Import Overview"]);
     }
 
     #[tokio::test]

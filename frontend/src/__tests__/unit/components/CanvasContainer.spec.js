@@ -896,6 +896,23 @@ describe('CanvasContainer', () => {
     promptSpy.mockRestore()
   })
 
+  it('fails the legacy generic insight path closed for preference claims', async () => {
+    getOpenRouterStatus.mockResolvedValue({ has_key: true, is_configured: true })
+    const promptSpy = vi.spyOn(globalThis, 'prompt').mockReturnValue('preference')
+
+    const wrapper = mountContainer()
+    await flushPromises()
+    await openTwinActions(wrapper)
+    await wrapper.findAll('button').find(button => button.text() === 'Capture Insight').trigger('click')
+    await flushPromises()
+
+    expect(store.captureInsight).not.toHaveBeenCalled()
+    expect(wrapper.text()).toContain('Capture Twin preference')
+    expect(promptSpy).toHaveBeenCalledOnce()
+
+    promptSpy.mockRestore()
+  })
+
   it('records rank feedback for completed selected responses', async () => {
     getOpenRouterStatus.mockResolvedValue({ has_key: true, is_configured: true })
     store.promptTiles = [

@@ -80,7 +80,7 @@ Canonical event/root corruption or startup failure returns a recoverable failed 
 
 Android uses one native Keystore-backed secret-store adapter for both OpenRouter/settings transitions and sync identity material. Every durable record contains a non-secret canonical account mapping plus nonce, ciphertext, and authentication tag; its filename prefix is bound to the account hash, and native health AEAD-authenticates every record with the exact account as associated data before reporting ready. Same-length ciphertext or tag tampering therefore fails closed instead of passing a shape-only health check. Grafyn never reads `OPENROUTER_API_KEY` on Android, never falls back to memory or plaintext secrets, and rejects a plaintext OpenRouter key in Android settings before accessing the native secret store.
 
-If Keystore is unavailable, Grafyn keeps the app-private canonical vault and local mutation coordinator active. Notes, Capture, Recall, and governed Twin review remain local-only; secret-backed Twin chat and sync fail closed, and no `SyncEngine` is constructed. Native image share is gated independently by share-bridge health; a missing bridge or invalid share root disables sharing without disabling the local vault. No hosted fallback is implied.
+If Keystore is unavailable, Grafyn keeps the app-private canonical vault and local mutation coordinator active. Notes, Capture, Recall, and governed Twin review remain available locally while sync is unavailable; governed mutations may retain sync eligibility for delivery after secret health returns. Secret-backed Twin chat and sync fail closed, and no `SyncEngine` is constructed. Native image share is gated independently by share-bridge health; a missing bridge or invalid share root disables sharing without disabling the local vault. No hosted fallback is implied.
 
 ## Storage Boundaries
 
@@ -109,10 +109,18 @@ These commands verify Vue/Vite behavior only. They do not exercise Rust IPC, nat
 cd frontend
 npm run prepare:sidecar
 cd src-tauri
-cargo test
+cargo test --locked
+cargo test --locked --no-default-features --features mcp
+cargo test --locked --lib --features e2e-test-runtime test_runtime::tests -- --test-threads=1
+cargo test --locked --manifest-path crates/grafyn-sync-protocol/Cargo.toml
+cargo fmt --all -- --check
+cargo clippy --locked --lib --bin grafyn -- -D warnings
+cargo clippy --locked --no-default-features --features mcp --bin grafyn-mcp -- -D warnings
+cargo clippy --locked --features e2e-test-runtime --bin grafyn-test-runtime -- -D warnings
+cargo audit --file Cargo.lock
 ```
 
-Focused tests may be run with `cargo test test_name`. On Windows, `cargo test -- --test-threads=4` reduces transient scanner/ACL pressure from filesystem-heavy tests.
+Focused tests may be run with `cargo test --locked test_name`. The three Clippy commands deliberately lint supported products separately: the default desktop product, the standalone MCP binary, and the E2E runtime. Combining every feature with every binary makes the MCP binary inherit Tauri-only cfg branches, which is not a build Grafyn ships. On Windows, `cargo test --locked -- --test-threads=4` reduces transient scanner/ACL pressure from filesystem-heavy tests.
 
 Host Rust tests can verify target-independent contracts and cfg-selected compilation, but they do not prove Android JNI command registration, Keystore behavior, FileProvider URI grants, chooser behavior, WebView rendering, runtime permissions, process death, or lifecycle recovery.
 
@@ -122,7 +130,7 @@ After building, install and launch the APK on an arm64 emulator or device. The n
 
 1. Cold start and recovery UI behavior with healthy and unavailable native bridge health.
 2. App-private note capture, Recall, Twin review, and linear Canvas without storage permissions or a Documents path.
-3. Keystore-backed OpenRouter/settings and sync-secret access, plus local-only behavior when Keystore is unavailable.
+3. Keystore-backed OpenRouter/settings and sync-secret access, plus locally available operation with sync disabled when Keystore is unavailable.
 4. FileProvider staging from only the dedicated cache subtree and read-only URI permission behavior. A future invocation may report only that the share sheet opened; recipient delivery and chooser cancellation are not observable or claimed.
 5. WebView safe areas, back navigation, rotation/recreation, background/foreground, and process-death recovery.
 
@@ -130,20 +138,43 @@ Host tests and a successful APK build are prerequisites for this boundary, not s
 
 ## Windows Common Controls Safeguard
 
-`frontend/src-tauri/build.rs` supplies the Microsoft Common Controls v6 manifest dependency to MSVC test harnesses so Windows can resolve `TaskDialogIndirect`. Tauri's generated resource already owns the desktop application manifest, so the `grafyn` binary is linked with `/MANIFEST:NO` to prevent a duplicate while test executables retain the activation dependency.
+`frontend/src-tauri/build.rs` supplies the Microsoft Common Controls v6 manifest dependency to MSVC test harnesses so Windows can resolve `TaskDialogIndirect`. Tauri's generated resource already owns the application manifest for the binaries that link it, so both `grafyn` and the feature-gated `grafyn-test-runtime` are linked with `/MANIFEST:NO` to prevent duplicate MANIFEST resources while Rust test executables retain the activation dependency.
 
 If Windows shows an “Entry Point Not Found” dialog for a stale `target/debug/deps/grafyn_lib-*.exe`, rebuild and run the harness through Cargo; do not launch the stale executable directly.
 
 ## Playwright UI Tests
 
 ```bash
-cd e2e
-npm install
-npm run install-browsers
+cd frontend
+npm ci
+npm run prepare:sidecar
+npm run build
+
+cd ../e2e
+npm ci
+npx playwright install chromium
+npm run test:fixtures
 npm test
 ```
 
-These tests cover the Vite UI surface. They do not provide Android native-plugin or installed-APK evidence.
+Or, after both dependency trees and Chromium are installed:
+
+```bash
+cd frontend
+npm run e2e
+```
+
+The suite starts a feature-gated Grafyn runtime on `127.0.0.1:18890`, Vite on `127.0.0.1:5173`, and a deterministic OpenRouter-compatible fixture on `127.0.0.1:18891`. The local bridge uses a random bearer token, exact Origin/profile/device headers, bounded JSON, and a fixed production-command allowlist. Notes, attachments, Twin events, projections, restart behavior, and two-device encrypted sync remain real Rust services over per-run temporary roots. Harness-only boundaries are the browser transport bridge, in-memory secret store, Android capability/image-receipt injection, and deterministic model-network fixture; installed native plugins and a paid provider are not exercised.
+
+The Pixel browser profile exercises the compact UI. After constructing the production runtime over temporary roots with an injected in-memory test secret store, the harness alone enables image generation so the portable core and UI journey can be exercised. Production `RuntimeBootstrap` is unchanged: installed Android continues to advertise image generation unavailable until a secret-backed receipt-producer path is separately verified. These tests do not replace APK install/launch, Keystore, FileProvider, WebView, lifecycle, or physical-device evidence.
+
+To run just one journey:
+
+```bash
+cd e2e
+npm run test:desktop
+npm run test:companion
+```
 
 ## Quick Start
 

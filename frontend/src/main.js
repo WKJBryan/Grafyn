@@ -23,7 +23,8 @@ window.addEventListener('grafyn-app-mounted', () => {
   appShellShown = true
 
   requestAnimationFrame(() => {
-    if (getRuntimeProfile().name === 'desktop-wide') {
+    const runtimeProfile = getRuntimeProfile()
+    if (runtimeProfile.name === 'desktop-wide' && runtimeProfile.nativePlugins === true) {
       getTransport().showMainWindow()
         .catch((error) => console.error('Failed to show Grafyn window:', error))
     }

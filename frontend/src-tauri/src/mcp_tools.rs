@@ -307,7 +307,7 @@ fn extract_mcp_docx_text(bytes: &[u8]) -> Result<String, String> {
             },
             Ok(quick_xml::events::Event::Text(event)) if in_text_run => {
                 let decoded = event
-                    .xml_content()
+                    .xml10_content()
                     .map_err(|e| format!("Failed to decode DOCX text: {}", e))?;
                 text.push_str(&decoded);
             }
@@ -1097,17 +1097,12 @@ impl GrafynMcpServer {
 #[tool_handler]
 impl ServerHandler for GrafynMcpServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            instructions: Some(
-                "Grafyn knowledge base server. Use tools to search, browse, and manage \
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
+            "Grafyn knowledge base server. Use tools to search, browse, and manage \
                  markdown notes with [[wikilinks]], tags, and a graph of connections. \
                  Notes have statuses: draft, evidence, canonical. \
-                 Use search_chunks for token-budgeted paragraph-level retrieval."
-                    .into(),
-            ),
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
-            ..Default::default()
-        }
+                 Use search_chunks for token-budgeted paragraph-level retrieval.",
+        )
     }
 }
 
@@ -1118,7 +1113,92 @@ mod tests {
     use crate::services::twin_events::{
         MutationCoordinator, NoopMutationLifecycle, TwinEventStore,
     };
+    use lopdf::content::{Content, Operation};
+    use lopdf::dictionary;
+    use lopdf::{Document, Object, Stream};
+    use std::fs::File;
+    use std::io::Write;
     use tempfile::tempdir;
+    use zip::write::FileOptions;
+
+    fn write_valid_pdf(path: &Path, text: &str) {
+        let mut document = Document::with_version("1.5");
+        let pages_id = document.new_object_id();
+        let font_id = document.add_object(lopdf::dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type1",
+            "BaseFont" => "Courier",
+        });
+        let resources_id = document.add_object(lopdf::dictionary! {
+            "Font" => lopdf::dictionary! { "F1" => font_id },
+        });
+        let content = Content {
+            operations: vec![
+                Operation::new("BT", vec![]),
+                Operation::new("Tf", vec!["F1".into(), 12.into()]),
+                Operation::new("Td", vec![72.into(), 720.into()]),
+                Operation::new("Tj", vec![Object::string_literal(text)]),
+                Operation::new("ET", vec![]),
+            ],
+        };
+        let content_id = document.add_object(Stream::new(
+            lopdf::dictionary! {},
+            content.encode().expect("encode PDF content"),
+        ));
+        let page_id = document.add_object(lopdf::dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "Contents" => content_id,
+        });
+        document.objects.insert(
+            pages_id,
+            Object::Dictionary(lopdf::dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![page_id.into()],
+                "Count" => 1,
+                "Resources" => resources_id,
+                "MediaBox" => vec![0.into(), 0.into(), 595.into(), 842.into()],
+            }),
+        );
+        let catalog_id = document.add_object(lopdf::dictionary! {
+            "Type" => "Catalog",
+            "Pages" => pages_id,
+        });
+        document.trailer.set("Root", catalog_id);
+        document.save(path).expect("save PDF fixture");
+    }
+
+    #[test]
+    fn read_mcp_import_content_extracts_docx_xml10_text() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("evidence.docx");
+        let file = File::create(&path).expect("DOCX fixture");
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file("word/document.xml", FileOptions::default())
+            .expect("document.xml");
+        zip.write_all(
+            br#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>Owner prefers evidence and concrete details.</w:t></w:r></w:p></w:body></w:document>"#,
+        )
+        .expect("write DOCX XML");
+        zip.finish().expect("finish DOCX");
+
+        let content =
+            read_mcp_import_content(path.to_string_lossy().as_ref()).expect("DOCX content");
+
+        assert_eq!(content, "Owner prefers evidence and concrete details.");
+    }
+
+    #[test]
+    fn read_mcp_import_content_extracts_valid_pdf_text() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("evidence.pdf");
+        write_valid_pdf(&path, "Evidence before conclusions.");
+
+        let content =
+            read_mcp_import_content(path.to_string_lossy().as_ref()).expect("PDF content");
+
+        assert_eq!(content, "Evidence before conclusions.");
+    }
 
     fn test_server(
         root: &Path,

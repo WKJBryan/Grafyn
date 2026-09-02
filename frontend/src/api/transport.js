@@ -1,5 +1,10 @@
 import { createRuntimeProfile } from '@/platform/runtime'
 import { shallowRef } from 'vue'
+import {
+  createE2eTransport,
+  resolveE2eRuntimePlatform,
+  resolveE2eTransportConfiguration,
+} from './e2eTransport'
 import { getTauriRuntimeProfile, tauriTransport } from './tauriTransport'
 
 function unavailable(operation) {
@@ -15,8 +20,37 @@ export function createTransport(operations = {}) {
   }
 }
 
-let activeTransport = tauriTransport
-let activeRuntimeProfile = getTauriRuntimeProfile
+const e2eConfiguration = import.meta.env.DEV
+  ? resolveE2eTransportConfiguration({
+      enabled: true,
+      runtimeUrl: import.meta.env.VITE_GRAFYN_E2E_RUNTIME_URL,
+      token: import.meta.env.VITE_GRAFYN_E2E_RUNTIME_TOKEN,
+    })
+  : null
+const e2eRuntimePlatform = e2eConfiguration
+  ? resolveE2eRuntimePlatform(globalThis.location?.search ?? '')
+  : null
+
+function getE2eRuntimeProfile() {
+  return createRuntimeProfile({
+    isTauri: true,
+    platform: e2eRuntimePlatform === 'android' ? 'android' : 'windows',
+    nativePlugins: false,
+  })
+}
+
+const defaultTransport = e2eConfiguration
+  ? createTransport(createE2eTransport({
+      ...e2eConfiguration,
+      profileResolver: () => e2eRuntimePlatform,
+    }))
+  : tauriTransport
+const defaultRuntimeProfile = e2eConfiguration
+  ? getE2eRuntimeProfile
+  : getTauriRuntimeProfile
+
+let activeTransport = defaultTransport
+let activeRuntimeProfile = defaultRuntimeProfile
 const activeRuntimeStatus = shallowRef(null)
 
 export function getTransport() {
@@ -44,7 +78,7 @@ export function setRuntimeStatus(status) {
 }
 
 export function resetTransport() {
-  activeTransport = tauriTransport
-  activeRuntimeProfile = getTauriRuntimeProfile
+  activeTransport = defaultTransport
+  activeRuntimeProfile = defaultRuntimeProfile
   activeRuntimeStatus.value = null
 }

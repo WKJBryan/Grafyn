@@ -235,6 +235,125 @@ describe('TwinCompanionView', () => {
     })
   })
 
+  it('refreshes one common governed snapshot before mounting review after chat', async () => {
+    const store = useTwinStore()
+    store.proposalPage = {
+      items: [{
+        item_id: 'proposal-a',
+        claim: { subject_id: 'owner', predicate: 'prefers', object: 'fresh evidence' },
+      }],
+    }
+    const wrapper = mountView(store, { stubQueue: false })
+    await flushPromises()
+    await wrapper.get('[aria-label="Open Twin chat"]').trigger('click')
+
+    vi.setSystemTime(new Date('2026-09-01T02:04:05Z'))
+    let finishProjection
+    store.loadProjection.mockImplementationOnce(() => new Promise(resolve => {
+      finishProjection = () => resolve(store.projection)
+    }))
+    const priorWorkspaceLoads = store.loadWorkspace.mock.calls.length
+
+    await wrapper.get('[aria-label="Open Twin review"]').trigger('click')
+    await wrapper.vm.$nextTick()
+
+    const referenceTime = '2026-09-01T02:04:05.000Z'
+    const emptyFilter = { relationships: [], goals: [], tags: [] }
+    expect(store.loadWorkspace).toHaveBeenCalledTimes(priorWorkspaceLoads + 1)
+    expect(store.loadProjection).toHaveBeenLastCalledWith({ referenceTime })
+    expect(store.loadProposals).toHaveBeenLastCalledWith({
+      referenceTime,
+      filter: emptyFilter,
+      cursor: null,
+      limit: 50,
+    })
+    expect(store.loadTimeline).toHaveBeenLastCalledWith({
+      referenceTime,
+      filter: emptyFilter,
+      cursor: null,
+      limit: 50,
+    })
+    expect(store.rankAttention).toHaveBeenLastCalledWith(expect.objectContaining({
+      referenceTime,
+      relationshipVariant: { relationships: [] },
+      filter: emptyFilter,
+    }))
+    expect(wrapper.getComponent(TwinChat).exists()).toBe(true)
+    expect(wrapper.findComponent(TwinReviewQueue).exists()).toBe(false)
+    expect(wrapper.find('[aria-label="Accept proposal proposal-a"]').exists()).toBe(false)
+
+    await wrapper.get('[aria-label="Open Twin review"]').trigger('click')
+    expect(store.loadWorkspace).toHaveBeenCalledTimes(priorWorkspaceLoads + 1)
+    expect(wrapper.getComponent(TwinChat).exists()).toBe(true)
+    expect(wrapper.findComponent(TwinReviewQueue).exists()).toBe(false)
+
+    finishProjection()
+    await flushPromises()
+
+    const queue = wrapper.getComponent(TwinReviewQueue)
+    expect(queue.props('loading')).toBe(false)
+    expect(wrapper.get('[aria-label="Accept proposal proposal-a"]').attributes('disabled')).toBeUndefined()
+  })
+
+  it('keeps stale review actions unavailable when a production-style refresh resolves null', async () => {
+    const store = useTwinStore()
+    store.proposalPage = {
+      items: [{
+        item_id: 'proposal-stale',
+        claim: { subject_id: 'owner', predicate: 'prefers', object: 'stale evidence' },
+      }],
+    }
+    const wrapper = mountView(store, { stubQueue: false })
+    await flushPromises()
+    await wrapper.get('[aria-label="Open Twin chat"]').trigger('click')
+
+    let finishProjection
+    store.loadProjection.mockImplementationOnce(() => new Promise(resolve => {
+      finishProjection = () => {
+        store.twinStateError.projection = 'Fresh Twin snapshot failed'
+        resolve(null)
+      }
+    }))
+
+    await wrapper.get('[aria-label="Open Twin review"]').trigger('click')
+    await wrapper.vm.$nextTick()
+    expect(wrapper.getComponent(TwinChat).exists()).toBe(true)
+    expect(wrapper.findComponent(TwinReviewQueue).exists()).toBe(false)
+
+    finishProjection()
+    await flushPromises()
+
+    expect(wrapper.getComponent(TwinChat).exists()).toBe(true)
+    expect(wrapper.findComponent(TwinReviewQueue).exists()).toBe(false)
+    expect(wrapper.find('[aria-label="Accept proposal proposal-stale"]').exists()).toBe(false)
+    expect(wrapper.get('[role="alert"]').text()).toContain('Fresh Twin snapshot failed')
+  })
+
+  it('keeps an already-mounted review queue locked after a null refresh result', async () => {
+    const store = useTwinStore()
+    store.proposalPage = {
+      items: [{
+        item_id: 'proposal-stale',
+        claim: { subject_id: 'owner', predicate: 'prefers', object: 'stale evidence' },
+      }],
+    }
+    const wrapper = mountView(store, { stubQueue: false })
+    await flushPromises()
+    expect(wrapper.get('[aria-label="Accept proposal proposal-stale"]').attributes('disabled')).toBeUndefined()
+
+    store.loadProjection.mockImplementationOnce(async () => {
+      store.twinStateError.projection = 'Fresh Twin snapshot failed'
+      return null
+    })
+    await wrapper.get('[aria-label="Refresh Twin companion"]').trigger('click')
+    await flushPromises()
+
+    const queue = wrapper.getComponent(TwinReviewQueue)
+    expect(queue.props('loading')).toBe(true)
+    expect(wrapper.get('[aria-label="Accept proposal proposal-stale"]').attributes('disabled')).toBeDefined()
+    expect(wrapper.get('[role="alert"]').text()).toContain('Fresh Twin snapshot failed')
+  })
+
   it('keeps unique full relationship variants distinct and passes the exact multi-edge variant', async () => {
     const store = useTwinStore()
     const multiVariant = { relationships: [bobRelationship, relationship] }

@@ -4,6 +4,8 @@ mod app_runtime;
 mod commands;
 pub mod models;
 pub mod services;
+#[cfg(feature = "e2e-test-runtime")]
+pub mod test_runtime;
 
 use models::boot::BootStatus;
 use services::twin_events::NoopMutationLifecycle;
@@ -1127,6 +1129,8 @@ async fn maybe_publish_boot_phase(
 ) {
     if let Some(app_handle) = app_handle {
         publish_boot_phase(app_handle, state, boot_started, status).await;
+    } else {
+        update_boot_state(&state.boot_state, &status).await;
     }
 }
 

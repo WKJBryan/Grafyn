@@ -165,10 +165,7 @@ impl OpenRouterService {
         };
         let response = self
             .client
-            .post(format!(
-                "{}/images",
-                self.image_api_url.trim_end_matches('/')
-            ))
+            .post(format!("{}/images", self.api_url.trim_end_matches('/')))
             .header("Authorization", format!("Bearer {}", self.api_key))
             .header("HTTP-Referer", "https://grafyn.app")
             .header("X-Title", "Grafyn")
@@ -330,10 +327,7 @@ impl OpenRouterService {
     async fn send_image_get(&self, path: &str, limit: usize) -> Result<Vec<u8>> {
         let response = self
             .client
-            .get(format!(
-                "{}{path}",
-                self.image_api_url.trim_end_matches('/')
-            ))
+            .get(format!("{}{path}", self.api_url.trim_end_matches('/')))
             .header("Authorization", format!("Bearer {}", self.api_key))
             .timeout(Duration::from_secs(15))
             .send()
