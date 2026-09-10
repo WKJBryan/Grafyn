@@ -18,6 +18,8 @@
 
 mod shared;
 
+mod working_memory;
+
 mod context;
 
 mod streaming;

@@ -228,7 +228,7 @@
           v-if="branchContext"
           value="compact"
         >
-          Compact (summary + recent)
+          Compact (compiled memory + recent)
         </option>
       </select>
       <span class="context-mode-hint">
@@ -501,10 +501,10 @@ const twinRuntimeHint = computed(() => {
 // Context mode descriptions
 const contextModeHints = {
   none: 'No additional context - just your prompt',
-  knowledge_search: 'Retrieves relevant notes (+ pinned notes) from your vault using the selected Context Runtime.',
-  twin: 'Retrieves relevant notes plus approved user records and relevant candidate records from Twin Review.',
-  full_history: 'Include all conversation turns from the parent chain using the selected Context Runtime.',
-  compact: 'Include recent turns + summary of older context to save tokens using the selected Context Runtime.'
+  knowledge_search: 'Vault notes, pinned notes, and compiled session memory when you are branching.',
+  twin: 'Retrieves relevant notes plus approved user records and relevant candidate records from Twin Review, plus session memory when branching.',
+  full_history: 'Include all conversation turns from the parent chain, prefixed with compiled session memory when available.',
+  compact: 'Compiled session state plus the last two turns. Older transcript is summarized, not cut mid-sentence.'
 }
 
 const twinModeHints = {

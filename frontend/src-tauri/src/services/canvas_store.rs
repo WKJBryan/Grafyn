@@ -1,6 +1,6 @@
 use crate::models::canvas::{
-    CanvasSession, CanvasViewport, Debate, LLMNodePositionUpdate, PromptTile, SessionCreate,
-    SessionMeta, SessionUpdate, TilePosition, TilePositionUpdate,
+    CanvasSession, CanvasViewport, CanvasWorkingMemory, Debate, LLMNodePositionUpdate, PromptTile,
+    SessionCreate, SessionMeta, SessionUpdate, TilePosition, TilePositionUpdate,
 };
 use crate::services::atomic_io::write_atomic;
 use anyhow::{Context, Result};
@@ -164,6 +164,8 @@ impl CanvasStore {
             tags: create.tags,
             status: "draft".to_string(),
             pinned_note_ids: Vec::new(),
+            working_memory: CanvasWorkingMemory::default(),
+            branch_memories: HashMap::new(),
         };
 
         self.write_session_file(&session)?;
@@ -264,6 +266,34 @@ impl CanvasStore {
                 && !Self::debate_uses_deleted_response(debate, tile_id, model_id)
         });
 
+        session.updated_at = Utc::now();
+        let session = session.clone();
+        self.write_session_file(&session)?;
+        Ok(())
+    }
+
+    pub fn update_branch_memory(
+        &mut self,
+        session_id: &str,
+        branch_key: &str,
+        memory: CanvasWorkingMemory,
+    ) -> Result<()> {
+        let session = self.get_session_mut(session_id)?;
+        session.branch_memories.insert(branch_key.to_string(), memory);
+        session.updated_at = Utc::now();
+        let session = session.clone();
+        self.write_session_file(&session)?;
+        Ok(())
+    }
+
+    /// Replace the compiled session working memory and persist.
+    pub fn update_working_memory(
+        &mut self,
+        session_id: &str,
+        memory: CanvasWorkingMemory,
+    ) -> Result<()> {
+        let session = self.get_session_mut(session_id)?;
+        session.working_memory = memory;
         session.updated_at = Utc::now();
         let session = session.clone();
         self.write_session_file(&session)?;
@@ -518,7 +548,10 @@ impl CanvasStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::canvas::{Debate, ModelResponse, PromptTile, ResponseStatus, SessionCreate};
+    use crate::models::canvas::{
+        CanvasWorkingMemory, Debate, ModelPosition, ModelResponse, PromptTile, ResponseStatus,
+        SessionCreate,
+    };
     use crate::services::atomic_io::assert_no_tmp_siblings;
     use tempfile::tempdir;
 
@@ -798,5 +831,47 @@ mod tests {
         assert_eq!(root.models, vec!["model-b".to_string()]);
         assert!(!root.responses.contains_key("model-a"));
         assert_eq!(remaining_debate_ids, vec!["debate-b".to_string()]);
+    }
+
+    #[test]
+    fn update_working_memory_persists_compiled_session_state() {
+        let temp_dir = tempdir().expect("temp dir should be created");
+        let mut store = CanvasStore::new(temp_dir.path().to_path_buf());
+        let session = store
+            .create_session(SessionCreate {
+                title: "Memory session".to_string(),
+                description: None,
+                tags: Vec::new(),
+            })
+            .expect("session should be created");
+
+        let memory = CanvasWorkingMemory {
+            version: 1,
+            compiled_from_tile_id: Some("tile-1".to_string()),
+            question: "Should we compact instead of truncate?".to_string(),
+            summary: "The thread is about replacing 240-character chops with compiled state."
+                .to_string(),
+            model_positions: vec![ModelPosition {
+                model_id: "openai/gpt-4".to_string(),
+                stance: "Prefer compiled summaries.".to_string(),
+            }],
+            ..CanvasWorkingMemory::default()
+        };
+
+        store
+            .update_working_memory(&session.id, memory.clone())
+            .expect("working memory should persist");
+
+        let reloaded = store
+            .get_session(&session.id)
+            .expect("session should reload");
+        assert_eq!(reloaded.working_memory.version, 1);
+        assert_eq!(
+            reloaded.working_memory.question,
+            "Should we compact instead of truncate?"
+        );
+        assert_eq!(reloaded.working_memory.summary, memory.summary);
+        assert_eq!(reloaded.working_memory.model_positions.len(), 1);
+        assert!(!reloaded.working_memory.is_empty());
     }
 }

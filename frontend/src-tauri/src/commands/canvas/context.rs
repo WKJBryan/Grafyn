@@ -1,4 +1,8 @@
 use super::shared::ModelProviderRoute;
+use super::working_memory::{
+    build_canvas_messages, compose_system_prompt, format_working_memory_for_prompt,
+    memory_for_follow_up, rewrite_retrieval_query,
+};
 use crate::commands::run_retrieval;
 use crate::models::canvas::{
     CanvasSession, ContextMode, DecisionPromptMetadata, PromptRequest, PromptType, TileContextNote,
@@ -17,8 +21,6 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-const COMPACT_HISTORY_RECENT_TURNS: usize = 2;
-const COMPACT_HISTORY_EXCERPT_CHARS: usize = 240;
 const MIN_RETRIEVAL_SCORE_FOR_NOTES: f32 = 5.0;
 const MIN_CANVAS_QUERY_TOKEN_LEN: usize = 3;
 const CANVAS_RETRIEVAL_STOPWORDS: &[&str] = &[
@@ -35,13 +37,6 @@ const TWIN_CONTEXT_TOKEN_BUDGET: usize = 4000;
 const MAX_TWIN_CASE_CONTEXT: usize = 5;
 const TWIN_CASE_FIELD_MAX_CHARS: usize = 800;
 const TWIN_CASE_CORRECTION_MAX_CHARS: usize = 500;
-
-#[derive(Debug, Clone)]
-struct ConversationTurn {
-    prompt: String,
-    response: String,
-    model_id: String,
-}
 
 #[derive(Debug, Clone)]
 pub(super) struct ResolvedPromptContext {
@@ -184,31 +179,24 @@ pub(super) async fn resolve_prompt_context(
         ContextMode::KnowledgeSearch | ContextMode::Semantic
     ) {
         let pinned_ids = session.pinned_note_ids.clone();
+        let retrieval_query = rewrite_retrieval_query(
+            &request.prompt,
+            &memory_for_follow_up(session, request),
+        );
 
         // Quality gate: note-level retrieval to check if vault has relevant content
-        let retrieval_results = run_retrieval(state, &request.prompt, 5, &pinned_ids)
+        let retrieval_results = run_retrieval(state, &retrieval_query, 5, &pinned_ids)
             .await
             .unwrap_or_default();
 
-        let retrieval_decision = should_use_retrieved_notes(&request.prompt, &retrieval_results);
+        let retrieval_decision = should_use_retrieved_notes(&retrieval_query, &retrieval_results);
         if retrieval_decision != RetrievalDecisionReason::UseRetrievedNotes {
             log::info!(
                 "Canvas knowledge search fallback for prompt {:?}: {:?}",
                 request.prompt,
                 retrieval_decision
             );
-            return Ok(ResolvedPromptContext {
-                messages,
-                context_notes: Vec::new(),
-                approved_twin_records: Vec::new(),
-                candidate_twin_records: Vec::new(),
-                constitution_items: Vec::new(),
-                action_gaps: Vec::new(),
-                system_prompt: request.system_prompt.clone(),
-                twin_context_prompt: None,
-                context_version: None,
-                decision_case_ids: Vec::new(),
-            });
+            return resolve_pinned_only_context(state, session, request, messages).await;
         }
 
         // Check if chunk-level retrieval is enabled
@@ -230,7 +218,7 @@ pub(super) async fn resolve_prompt_context(
                         &chunk_index,
                         &graph,
                         &priority,
-                        &request.prompt,
+                        &retrieval_query,
                         token_budget,
                         &pinned_ids,
                     )
@@ -241,10 +229,11 @@ pub(super) async fn resolve_prompt_context(
                 log::info!("Chunk retrieval returned no results, falling back to note-level");
                 return resolve_note_level_context(
                     state,
+                    session,
+                    request,
                     messages,
                     &retrieval_results,
                     &pinned_ids,
-                    &request.system_prompt,
                 )
                 .await;
             }
@@ -282,10 +271,8 @@ pub(super) async fn resolve_prompt_context(
                 .collect();
 
             let note_prompt = build_chunk_context_prompt(&chunks);
-            let system_prompt = match &request.system_prompt {
-                Some(user_sp) if !user_sp.is_empty() => format!("{}\n\n{}", note_prompt, user_sp),
-                _ => note_prompt,
-            };
+            let context_notes =
+                merge_pinned_context_notes(state, context_notes, &pinned_ids).await;
 
             Ok(ResolvedPromptContext {
                 messages,
@@ -294,7 +281,7 @@ pub(super) async fn resolve_prompt_context(
                 candidate_twin_records: Vec::new(),
                 constitution_items: Vec::new(),
                 action_gaps: Vec::new(),
-                system_prompt: Some(system_prompt),
+                system_prompt: compose_system_prompt(session, request, Some(note_prompt)),
                 twin_context_prompt: None,
                 context_version: None,
                 decision_case_ids: Vec::new(),
@@ -303,10 +290,11 @@ pub(super) async fn resolve_prompt_context(
             log::info!("Canvas using note-level context (chunk retrieval disabled)");
             resolve_note_level_context(
                 state,
+                session,
+                request,
                 messages,
                 &retrieval_results,
                 &pinned_ids,
-                &request.system_prompt,
             )
             .await
         }
@@ -318,7 +306,7 @@ pub(super) async fn resolve_prompt_context(
             candidate_twin_records: Vec::new(),
             constitution_items: Vec::new(),
             action_gaps: Vec::new(),
-            system_prompt: request.system_prompt.clone(),
+            system_prompt: compose_system_prompt(session, request, None),
             twin_context_prompt: None,
             context_version: None,
             decision_case_ids: Vec::new(),
@@ -333,11 +321,15 @@ async fn resolve_twin_prompt_context(
     request: &PromptRequest,
 ) -> Result<ResolvedPromptContext, String> {
     let pinned_ids = session.pinned_note_ids.clone();
-    let retrieval_results = run_retrieval(state, &request.prompt, 5, &pinned_ids)
+    let retrieval_query = rewrite_retrieval_query(
+        &request.prompt,
+        &memory_for_follow_up(session, request),
+    );
+    let retrieval_results = run_retrieval(state, &retrieval_query, 5, &pinned_ids)
         .await
         .unwrap_or_default();
 
-    let should_use_notes = should_use_retrieved_notes(&request.prompt, &retrieval_results)
+    let should_use_notes = should_use_retrieved_notes(&retrieval_query, &retrieval_results)
         == RetrievalDecisionReason::UseRetrievedNotes;
     let mut context_notes = Vec::new();
     let mut note_contexts = Vec::new();
@@ -360,7 +352,7 @@ async fn resolve_twin_prompt_context(
                         &chunk_index,
                         &graph,
                         &priority,
-                        &request.prompt,
+                        &retrieval_query,
                         token_budget,
                         &pinned_ids,
                     )
@@ -406,8 +398,22 @@ async fn resolve_twin_prompt_context(
         }
     }
 
+    let pinned_notes = fetch_notes_by_ids(state, &pinned_ids).await;
+    for (id, title, content) in pinned_notes {
+        if !note_contexts.iter().any(|(existing, _, _)| existing == &id) {
+            note_contexts.push((id.clone(), title.clone(), content.clone()));
+            context_notes.push(TileContextNote {
+                id,
+                title,
+                snippet: truncate_note_context_content(&content, 200),
+                score: 0.0,
+                pinned: true,
+            });
+        }
+    }
+
     let constitution_query =
-        decision_context_query(&request.prompt, request.decision_metadata.as_ref());
+        decision_context_query(&retrieval_query, request.decision_metadata.as_ref());
     let (
         setup,
         approved_twin_records,
@@ -422,7 +428,7 @@ async fn resolve_twin_prompt_context(
             .map_err(|error| error.to_string())?;
         validate_twin_identity_for_answer_mode(&setup, &request.twin_answer_mode)?;
         let (approved, candidate) = twin_store
-            .select_context_records(&request.prompt)
+            .select_context_records(&retrieval_query)
             .map_err(|error| error.to_string())?;
         let (constitution_items, action_gaps) = twin_store
             .select_constitution_context(&constitution_query)
@@ -467,8 +473,12 @@ async fn resolve_twin_prompt_context(
         &request.prompt_type,
         request.decision_metadata.as_ref(),
     );
+    let twin_prompt = match format_working_memory_for_prompt(&session.working_memory) {
+        Some(memory) => format!("{memory}\n\n{twin_prompt}"),
+        None => twin_prompt,
+    };
     let system_prompt = match &request.system_prompt {
-        Some(user_sp) if !user_sp.is_empty() => format!("{}\n\n{}", twin_prompt, user_sp),
+        Some(user_sp) if !user_sp.trim().is_empty() => format!("{twin_prompt}\n\n{user_sp}"),
         _ => twin_prompt.clone(),
     };
 
@@ -507,14 +517,15 @@ async fn fetch_note_contexts(
 /// Fall back to note-level context when chunk retrieval is disabled or returns nothing.
 async fn resolve_note_level_context(
     state: &AppState,
+    session: &CanvasSession,
+    request: &PromptRequest,
     messages: Vec<ChatMessage>,
     retrieval_results: &[RetrievalResult],
     pinned_ids: &[String],
-    user_system_prompt: &Option<String>,
 ) -> Result<ResolvedPromptContext, String> {
     let note_contexts = fetch_note_contexts(state, retrieval_results).await;
 
-    let context_notes: Vec<TileContextNote> = retrieval_results
+    let mut context_notes: Vec<TileContextNote> = retrieval_results
         .iter()
         .map(|r| TileContextNote {
             id: r.note.id.clone(),
@@ -524,11 +535,52 @@ async fn resolve_note_level_context(
             pinned: pinned_ids.contains(&r.note.id),
         })
         .collect();
+    context_notes = merge_pinned_context_notes(state, context_notes, pinned_ids).await;
 
-    let note_prompt = build_note_context_prompt(&note_contexts);
-    let system_prompt = match user_system_prompt {
-        Some(user_sp) if !user_sp.is_empty() => format!("{}\n\n{}", note_prompt, user_sp),
-        _ => note_prompt,
+    let mut prompt_notes = note_contexts;
+    for note in &context_notes {
+        if note.pinned && !prompt_notes.iter().any(|(id, _, _)| id == &note.id) {
+            prompt_notes.push((note.id.clone(), note.title.clone(), note.snippet.clone()));
+        }
+    }
+
+    let note_prompt = build_note_context_prompt(&prompt_notes);
+
+    Ok(ResolvedPromptContext {
+        messages,
+        context_notes,
+        approved_twin_records: Vec::new(),
+        candidate_twin_records: Vec::new(),
+        constitution_items: Vec::new(),
+        action_gaps: Vec::new(),
+        system_prompt: compose_system_prompt(session, request, Some(note_prompt)),
+        twin_context_prompt: None,
+        context_version: None,
+        decision_case_ids: Vec::new(),
+    })
+}
+
+async fn resolve_pinned_only_context(
+    state: &AppState,
+    session: &CanvasSession,
+    request: &PromptRequest,
+    messages: Vec<ChatMessage>,
+) -> Result<ResolvedPromptContext, String> {
+    let pinned = fetch_notes_by_ids(state, &session.pinned_note_ids).await;
+    let context_notes: Vec<TileContextNote> = pinned
+        .iter()
+        .map(|(id, title, content)| TileContextNote {
+            id: id.clone(),
+            title: title.clone(),
+            snippet: truncate_note_context_content(content, 200),
+            score: 0.0,
+            pinned: true,
+        })
+        .collect();
+    let inner = if pinned.is_empty() {
+        None
+    } else {
+        Some(build_note_context_prompt(&pinned))
     };
 
     Ok(ResolvedPromptContext {
@@ -538,184 +590,56 @@ async fn resolve_note_level_context(
         candidate_twin_records: Vec::new(),
         constitution_items: Vec::new(),
         action_gaps: Vec::new(),
-        system_prompt: Some(system_prompt),
+        system_prompt: compose_system_prompt(session, request, inner),
         twin_context_prompt: None,
         context_version: None,
         decision_case_ids: Vec::new(),
     })
 }
 
-fn build_canvas_messages(
-    session: &CanvasSession,
-    request: &PromptRequest,
-) -> Result<Vec<ChatMessage>, String> {
-    match request.context_mode {
-        ContextMode::FullHistory => build_full_history_messages(session, request),
-        ContextMode::Compact => build_compact_history_messages(session, request),
-        _ => Ok(vec![ChatMessage {
-            role: "user".to_string(),
-            content: request.prompt.clone(),
-        }]),
+async fn fetch_notes_by_ids(
+    state: &AppState,
+    ids: &[String],
+) -> Vec<(String, String, String)> {
+    if ids.is_empty() {
+        return Vec::new();
     }
+    let store = state.knowledge_store.read().await;
+    ids.iter()
+        .filter_map(|id| {
+            store.get_note(id).ok().map(|note| {
+                let truncated = truncate_note_context_content(&note.content, 1500);
+                (note.id.clone(), note.title.clone(), truncated)
+            })
+        })
+        .collect()
 }
 
-fn build_full_history_messages(
-    session: &CanvasSession,
-    request: &PromptRequest,
-) -> Result<Vec<ChatMessage>, String> {
-    let turns = build_selected_parent_chain(session, request)?;
-    let mut messages = Vec::with_capacity((turns.len() * 2) + 1);
-
-    for turn in turns {
-        messages.push(ChatMessage {
-            role: "user".to_string(),
-            content: turn.prompt,
-        });
-        messages.push(ChatMessage {
-            role: "assistant".to_string(),
-            content: turn.response,
+async fn merge_pinned_context_notes(
+    state: &AppState,
+    mut context_notes: Vec<TileContextNote>,
+    pinned_ids: &[String],
+) -> Vec<TileContextNote> {
+    let missing: Vec<String> = pinned_ids
+        .iter()
+        .filter(|id| !context_notes.iter().any(|note| &note.id == *id))
+        .cloned()
+        .collect();
+    for (id, title, content) in fetch_notes_by_ids(state, &missing).await {
+        context_notes.push(TileContextNote {
+            id,
+            title,
+            snippet: truncate_note_context_content(&content, 200),
+            score: 0.0,
+            pinned: true,
         });
     }
-
-    messages.push(ChatMessage {
-        role: "user".to_string(),
-        content: request.prompt.clone(),
-    });
-
-    Ok(messages)
-}
-
-fn build_compact_history_messages(
-    session: &CanvasSession,
-    request: &PromptRequest,
-) -> Result<Vec<ChatMessage>, String> {
-    let turns = build_selected_parent_chain(session, request)?;
-    let mut messages = Vec::new();
-
-    if turns.len() > COMPACT_HISTORY_RECENT_TURNS {
-        let split_at = turns.len() - COMPACT_HISTORY_RECENT_TURNS;
-        let summary = build_compact_history_summary(&turns[..split_at]);
-        messages.push(ChatMessage {
-            role: "user".to_string(),
-            content: summary,
-        });
-
-        for turn in &turns[split_at..] {
-            messages.push(ChatMessage {
-                role: "user".to_string(),
-                content: turn.prompt.clone(),
-            });
-            messages.push(ChatMessage {
-                role: "assistant".to_string(),
-                content: turn.response.clone(),
-            });
-        }
-    } else {
-        for turn in turns {
-            messages.push(ChatMessage {
-                role: "user".to_string(),
-                content: turn.prompt,
-            });
-            messages.push(ChatMessage {
-                role: "assistant".to_string(),
-                content: turn.response,
-            });
+    for note in &mut context_notes {
+        if pinned_ids.contains(&note.id) {
+            note.pinned = true;
         }
     }
-
-    messages.push(ChatMessage {
-        role: "user".to_string(),
-        content: request.prompt.clone(),
-    });
-
-    Ok(messages)
-}
-
-fn build_selected_parent_chain(
-    session: &CanvasSession,
-    request: &PromptRequest,
-) -> Result<Vec<ConversationTurn>, String> {
-    let mut tile_id = request
-        .parent_tile_id
-        .clone()
-        .ok_or_else(|| "Context mode requires a parent tile".to_string())?;
-    let mut model_id = request
-        .parent_model_id
-        .clone()
-        .ok_or_else(|| "Context mode requires a parent model".to_string())?;
-    let mut visited = HashSet::new();
-    let mut turns = Vec::new();
-
-    loop {
-        let visit_key = format!("{}::{}", tile_id, model_id);
-        if !visited.insert(visit_key) {
-            return Err("Detected a cycle while reconstructing canvas history".to_string());
-        }
-
-        let tile = session
-            .prompt_tiles
-            .iter()
-            .find(|t| t.id == tile_id)
-            .ok_or_else(|| format!("Parent tile not found in session: {}", tile_id))?;
-        let response = tile.responses.get(&model_id).ok_or_else(|| {
-            format!(
-                "Parent response not found for tile {} and model {}",
-                tile_id, model_id
-            )
-        })?;
-
-        turns.push(ConversationTurn {
-            prompt: tile.prompt.clone(),
-            response: response.content.clone(),
-            model_id: model_id.clone(),
-        });
-
-        match (&tile.parent_tile_id, &tile.parent_model_id) {
-            (Some(next_tile_id), Some(next_model_id)) => {
-                tile_id = next_tile_id.clone();
-                model_id = next_model_id.clone();
-            }
-            (None, None) => break,
-            _ => {
-                return Err(format!(
-                    "Incomplete parent linkage for tile {} while reconstructing history",
-                    tile.id
-                ))
-            }
-        }
-    }
-
-    turns.reverse();
-    Ok(turns)
-}
-
-fn build_compact_history_summary(turns: &[ConversationTurn]) -> String {
-    let mut summary = String::from("Conversation summary before the most recent turns:\n");
-
-    for (index, turn) in turns.iter().enumerate() {
-        summary.push_str(&format!(
-            "\nTurn {}:\nUser: {}\nAssistant ({}): {}\n",
-            index + 1,
-            truncate_for_compact_history(&turn.prompt),
-            turn.model_id,
-            truncate_for_compact_history(&turn.response),
-        ));
-    }
-
-    summary
-}
-
-fn truncate_for_compact_history(content: &str) -> String {
-    if content.chars().count() <= COMPACT_HISTORY_EXCERPT_CHARS {
-        return content.to_string();
-    }
-
-    let mut truncated = content
-        .chars()
-        .take(COMPACT_HISTORY_EXCERPT_CHARS)
-        .collect::<String>();
-    truncated.push_str("...");
-    truncated
+    context_notes
 }
 
 /// Build a system prompt that includes retrieved note context.
@@ -1462,9 +1386,12 @@ mod tests {
             tags: Vec::new(),
             status: "draft".to_string(),
             pinned_note_ids: Vec::new(),
+            working_memory: crate::models::canvas::CanvasWorkingMemory::default(),
+            branch_memories: std::collections::HashMap::new(),
         }
     }
 
+    #[allow(dead_code)]
     fn build_request(
         prompt: &str,
         parent_tile_id: &str,
@@ -1484,6 +1411,7 @@ mod tests {
             decision_metadata: None,
             parent_tile_id: Some(parent_tile_id.to_string()),
             parent_model_id: Some(parent_model_id.to_string()),
+            parent_debate_id: None,
             temperature: 0.7,
             max_tokens: None,
             web_search: false,
@@ -1506,6 +1434,7 @@ mod tests {
             decision_metadata: None,
             parent_tile_id: None,
             parent_model_id: None,
+            parent_debate_id: None,
             temperature: 0.7,
             max_tokens: None,
             web_search: false,
@@ -2031,88 +1960,6 @@ mod tests {
     }
 
     #[test]
-    fn test_build_selected_parent_chain_returns_root_to_leaf_order() {
-        let session = build_session(vec![
-            build_tile(
-                "tile-1",
-                "Root prompt",
-                "openai/gpt-4",
-                "Root response",
-                None,
-                None,
-            ),
-            build_tile(
-                "tile-2",
-                "Follow-up prompt",
-                "openai/gpt-4",
-                "Follow-up response",
-                Some("tile-1"),
-                Some("openai/gpt-4"),
-            ),
-            build_tile(
-                "tile-3",
-                "Deep prompt",
-                "openai/gpt-4",
-                "Deep response",
-                Some("tile-2"),
-                Some("openai/gpt-4"),
-            ),
-        ]);
-        let request = build_request(
-            "Newest prompt",
-            "tile-3",
-            "openai/gpt-4",
-            ContextMode::FullHistory,
-        );
-
-        let turns = build_selected_parent_chain(&session, &request).unwrap();
-
-        assert_eq!(turns.len(), 3);
-        assert_eq!(turns[0].prompt, "Root prompt");
-        assert_eq!(turns[1].prompt, "Follow-up prompt");
-        assert_eq!(turns[2].prompt, "Deep prompt");
-    }
-
-    #[test]
-    fn test_build_full_history_messages_interleaves_user_and_assistant_turns() {
-        let session = build_session(vec![
-            build_tile(
-                "tile-1",
-                "Root prompt",
-                "openai/gpt-4",
-                "Root response",
-                None,
-                None,
-            ),
-            build_tile(
-                "tile-2",
-                "Branch prompt",
-                "openai/gpt-4",
-                "Branch response",
-                Some("tile-1"),
-                Some("openai/gpt-4"),
-            ),
-        ]);
-        let request = build_request(
-            "Final prompt",
-            "tile-2",
-            "openai/gpt-4",
-            ContextMode::FullHistory,
-        );
-
-        let messages = build_full_history_messages(&session, &request).unwrap();
-
-        assert_eq!(messages.len(), 5);
-        assert_eq!(messages[0].role, "user");
-        assert_eq!(messages[0].content, "Root prompt");
-        assert_eq!(messages[1].role, "assistant");
-        assert_eq!(messages[1].content, "Root response");
-        assert_eq!(messages[2].content, "Branch prompt");
-        assert_eq!(messages[3].content, "Branch response");
-        assert_eq!(messages[4].content, "Final prompt");
-    }
-
-    #[test]
     fn test_root_prompt_without_parent_ids_ignores_unrelated_canvas_tiles() {
         let session = build_session(vec![
             build_tile(
@@ -2139,88 +1986,6 @@ mod tests {
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].role, "user");
         assert_eq!(messages[0].content, "Fresh root prompt");
-    }
-
-    #[test]
-    fn test_build_compact_history_messages_summarizes_older_turns() {
-        let session = build_session(vec![
-            build_tile(
-                "tile-1",
-                "Prompt 1",
-                "openai/gpt-4",
-                "Response 1",
-                None,
-                None,
-            ),
-            build_tile(
-                "tile-2",
-                "Prompt 2",
-                "openai/gpt-4",
-                "Response 2",
-                Some("tile-1"),
-                Some("openai/gpt-4"),
-            ),
-            build_tile(
-                "tile-3",
-                "Prompt 3",
-                "openai/gpt-4",
-                "Response 3",
-                Some("tile-2"),
-                Some("openai/gpt-4"),
-            ),
-            build_tile(
-                "tile-4",
-                "Prompt 4",
-                "openai/gpt-4",
-                "Response 4",
-                Some("tile-3"),
-                Some("openai/gpt-4"),
-            ),
-        ]);
-        let request = build_request("Prompt 5", "tile-4", "openai/gpt-4", ContextMode::Compact);
-
-        let messages = build_compact_history_messages(&session, &request).unwrap();
-
-        assert_eq!(messages.len(), 6);
-        assert!(messages[0]
-            .content
-            .contains("Conversation summary before the most recent turns"));
-        assert!(messages[0].content.contains("Prompt 1"));
-        assert!(messages[1].content.contains("Prompt 3"));
-        assert!(messages[2].content.contains("Response 3"));
-        assert_eq!(messages[5].content, "Prompt 5");
-    }
-
-    #[test]
-    fn test_build_selected_parent_chain_errors_when_parent_response_is_missing() {
-        let session = build_session(vec![
-            build_tile(
-                "tile-1",
-                "Root prompt",
-                "openai/gpt-4",
-                "Root response",
-                None,
-                None,
-            ),
-            build_tile(
-                "tile-2",
-                "Branch prompt",
-                "anthropic/claude",
-                "Branch response",
-                Some("tile-1"),
-                Some("openai/gpt-4"),
-            ),
-        ]);
-        let request = build_request(
-            "Next prompt",
-            "tile-2",
-            "openai/gpt-4",
-            ContextMode::FullHistory,
-        );
-
-        let err = build_selected_parent_chain(&session, &request).unwrap_err();
-
-        assert!(err.contains("Parent response not found"));
     }
 
     #[test]

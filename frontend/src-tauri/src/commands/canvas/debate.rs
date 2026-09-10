@@ -2,6 +2,13 @@ use super::shared::{
     append_canvas_trace, effective_model_ids, resolve_model_route, source_tile_context_provider,
     ModelProviderRoute,
 };
+use crate::services::canvas_store::CanvasStore;
+use crate::services::ollama::OllamaService;
+use crate::services::openrouter::OpenRouterService;
+use crate::services::settings::SettingsService;
+use crate::services::twin::TwinStore;
+use std::sync::Arc;
+use tokio::sync::RwLock;
 use crate::models::canvas::{
     CanvasStreamEvent, ContextMode, Debate, DebateContinueRequest, DebateResponse, DebateRound,
     DebateStartRequest, PromptType, TilePosition,
@@ -20,6 +27,71 @@ where
     S: futures::Stream<Item = anyhow::Result<String>> + Send + 'static,
 {
     Box::pin(stream.map(|result| result.map(|content| StreamUpdate { content, cost_usd: None })))
+}
+
+fn format_previous_rounds(rounds: &[DebateRound]) -> String {
+    let mut body = String::new();
+    for round in rounds {
+        body.push_str(&format!("\nAfter round {}:\n", round.round_number));
+        for resp in &round.responses {
+            body.push_str(&format!("\n{} said:\n{}\n", resp.model_name, resp.content));
+        }
+    }
+    body
+}
+
+pub(super) fn build_debate_round_user_message(
+    round_num: u32,
+    source_content: &str,
+    previous_rounds: &[DebateRound],
+    steer: Option<&str>,
+) -> String {
+    let mut message = String::from(
+        "You are in a room with other models. Talk like a person. \
+Do not use headings, numbered sections, or labels like Understand, Think, or Position.\n\n",
+    );
+    message.push_str("Here is what started this:\n");
+    message.push_str(source_content);
+    message.push('\n');
+
+    if previous_rounds.is_empty() {
+        message.push_str(
+            "\nThis is the first round. You have everyone's original answer, including your own. \
+Hear them. Then say what you think. Take a stand if you have one.\n",
+        );
+    } else {
+        message.push_str("\nYou've now heard the others talk:\n");
+        message.push_str(&format_previous_rounds(previous_rounds));
+        message.push_str(
+            "\nThis is a later round. Answer them — agree, push back, or change your mind. \
+Do not restart from the original prompt as if you hadn't heard anyone.\n",
+        );
+    }
+
+    if let Some(steer) = steer.map(str::trim).filter(|value| !value.is_empty()) {
+        message.push_str("\nThe human steering this round:\n");
+        message.push_str(steer);
+        message.push('\n');
+    }
+
+    let _ = round_num;
+    message
+}
+
+pub(super) fn build_chair_synthesis_prompt(
+    source_content: &str,
+    rounds: &[DebateRound],
+) -> String {
+    let mut message = String::from(
+        "You were listening, not in the fight. Talk like a person who heard the room. \
+Do not use headings or bins like Agreed, Split, or Moved. Do not declare a winner. \
+Do not invent a position nobody took.\n\n",
+    );
+    message.push_str("What started this:\n");
+    message.push_str(source_content);
+    message.push_str(&format_previous_rounds(rounds));
+    message.push_str("\nWhere did the room land?\n");
+    message
 }
 
 /// Start a debate between models with streaming via Tauri events
@@ -99,6 +171,8 @@ pub async fn start_debate(
         },
         debate_mode: request.debate_mode.clone(),
         reasoning_effort: request.reasoning_effort.clone(),
+        recap: None,
+        recap_updated_at: None,
         created_at: now,
     };
 
@@ -137,6 +211,8 @@ pub async fn start_debate(
     let openrouter_arc = state.openrouter.clone();
     let ollama_arc = state.ollama.clone();
     let canvas_store_arc = state.canvas_store.clone();
+    let twin_store_arc = state.twin_store.clone();
+    let settings_arc = state.settings_service.clone();
     let models = request.participating_models.clone();
     let max_rounds = request.max_rounds;
     let reasoning_effort = request.reasoning_effort.clone();
@@ -157,25 +233,12 @@ pub async fn start_debate(
                 },
             );
 
-            // Build debate context
-            let mut context = format!(
-                "You are participating in a structured debate.\n\nOriginal context:\n{}\n\n",
-                source_content
+            let context = build_debate_round_user_message(
+                round_num,
+                &source_content,
+                &debate_state.rounds,
+                None,
             );
-
-            // Add previous rounds for context
-            for prev_round in &debate_state.rounds {
-                context.push_str(&format!("Round {}:\n", prev_round.round_number));
-                for resp in &prev_round.responses {
-                    context.push_str(&format!("{}: {}\n", resp.model_name, resp.content));
-                }
-                context.push('\n');
-            }
-
-            context.push_str(&format!(
-                "Round {} - Present your analysis. Be concise and insightful. If other models have responded before you, engage with their points.",
-                round_num
-            ));
 
             // Stream all models concurrently within this round using JoinSet
             let mut join_set = tokio::task::JoinSet::new();
@@ -416,6 +479,17 @@ pub async fn start_debate(
         };
 
         if completion_persisted {
+            spawn_debate_chair_synthesis(
+                window.clone(),
+                session_id_clone.clone(),
+                debate_id_clone.clone(),
+                source_content.clone(),
+                canvas_store_arc,
+                twin_store_arc,
+                openrouter_arc,
+                ollama_arc,
+                settings_arc,
+            );
             let _ = window.emit(
                 "canvas-stream",
                 CanvasStreamEvent::DebateComplete {
@@ -448,6 +522,20 @@ pub async fn continue_debate(
         .find(|d| d.id == debate_id)
         .ok_or_else(|| "Debate not found".to_string())?
         .clone();
+    let mut source_content = String::new();
+    for tile_id in &debate.source_tile_ids {
+        if let Some(tile) = session.prompt_tiles.iter().find(|t| &t.id == tile_id) {
+            source_content.push_str(&format!("Prompt: {}\n", tile.prompt));
+            for model_id in &debate.participating_models {
+                if let Some(resp) = tile.responses.get(model_id) {
+                    source_content.push_str(&format!(
+                        "{} responded: {}\n",
+                        resp.model_name, resp.content
+                    ));
+                }
+            }
+        }
+    }
     let (source_has_vault_context, source_twin_provider) =
         source_tile_context_provider(&session, &debate.source_tile_ids);
     let model_route = {
@@ -468,7 +556,6 @@ pub async fn continue_debate(
             )?
         }
     };
-
     append_canvas_trace(
         state.twin_store.clone(),
         &session_id,
@@ -484,6 +571,8 @@ pub async fn continue_debate(
     let openrouter_arc = state.openrouter.clone();
     let ollama_arc = state.ollama.clone();
     let canvas_store_arc = state.canvas_store.clone();
+    let twin_store_arc = state.twin_store.clone();
+    let settings_arc = state.settings_service.clone();
     let models = effective_model_ids(&model_route, &debate.participating_models);
     let reasoning_effort = request.reasoning_effort.clone();
     let provider_route = model_route.provider.clone();
@@ -501,19 +590,12 @@ pub async fn continue_debate(
             },
         );
 
-        // Build context from previous rounds + new prompt
-        let mut context = String::from("Previous debate rounds:\n\n");
-        for round in &debate_state.rounds {
-            context.push_str(&format!("Round {}:\n", round.round_number));
-            for resp in &round.responses {
-                context.push_str(&format!("{}: {}\n", resp.model_name, resp.content));
-            }
-            context.push('\n');
-        }
-        context.push_str(&format!(
-            "New prompt: {}\n\nRespond to this new direction.",
-            request.prompt
-        ));
+        let context = build_debate_round_user_message(
+            round_num,
+            "",
+            &debate_state.rounds,
+            Some(&request.prompt),
+        );
 
         // Stream all models concurrently using JoinSet
         let mut join_set = tokio::task::JoinSet::new();
@@ -720,6 +802,17 @@ pub async fn continue_debate(
         };
 
         if persisted {
+            spawn_debate_chair_synthesis(
+                window.clone(),
+                session_id.clone(),
+                debate_id.clone(),
+                source_content.clone(),
+                canvas_store_arc,
+                twin_store_arc,
+                openrouter_arc,
+                ollama_arc,
+                settings_arc,
+            );
             let _ = window.emit(
                 "canvas-stream",
                 CanvasStreamEvent::DebateComplete {
@@ -787,4 +880,200 @@ fn emit_debate_persist_error(
             },
         );
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::canvas::DebateResponse;
+
+    fn sample_round(number: u32, speaker: &str, content: &str) -> DebateRound {
+        DebateRound {
+            round_number: number,
+            topic: format!("Round {number}"),
+            responses: vec![DebateResponse {
+                model_id: speaker.to_string(),
+                model_name: speaker.to_string(),
+                content: content.to_string(),
+                stance: None,
+                cost_usd: None,
+            }],
+            created_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn round_one_is_loose_talk_about_original_answers() {
+        let message = build_debate_round_user_message(
+            1,
+            "Prompt: move?\nGPT responded: take the job\n",
+            &[],
+            None,
+        );
+        assert!(message.contains("first round"));
+        assert!(message.contains("take the job"));
+        assert!(message.contains("Talk like a person"));
+        assert!(!message.to_lowercase().contains("understand:"));
+        assert!(!message.contains("Present your analysis"));
+        assert!(!message.contains("structured debate"));
+    }
+
+    #[test]
+    fn later_round_answers_previous_posts_not_the_original() {
+        let rounds = vec![sample_round(1, "GPT", "I'd still take it.")];
+        let message = build_debate_round_user_message(2, "Prompt: move?\n", &rounds, None);
+        assert!(message.contains("later round"));
+        assert!(message.contains("I'd still take it."));
+        assert!(message.contains("Do not restart"));
+        assert!(!message.contains("UNDERSTAND"));
+        assert!(!message.contains("POSITION"));
+    }
+
+    #[test]
+    fn chair_prompt_is_free_talk_not_a_checklist() {
+        let rounds = vec![sample_round(1, "GPT", "Go if rent works.")];
+        let message = build_chair_synthesis_prompt("Prompt: move?\n", &rounds);
+        assert!(message.contains("listening, not in the fight"));
+        assert!(message.contains("Where did the room land"));
+        assert!(!message.contains("Agreed:"));
+        assert!(!message.contains("JSON"));
+        assert!(!message.contains("name who moved"));
+    }
+}
+
+fn spawn_debate_chair_synthesis(
+    window: tauri::Window,
+    session_id: String,
+    debate_id: String,
+    source_content: String,
+    canvas_store: Arc<RwLock<CanvasStore>>,
+    twin_store: Arc<RwLock<TwinStore>>,
+    openrouter: Arc<RwLock<OpenRouterService>>,
+    ollama: Arc<RwLock<OllamaService>>,
+    settings: Arc<RwLock<SettingsService>>,
+) {
+    tauri::async_runtime::spawn(async move {
+        if let Err(error) = run_debate_chair_synthesis(
+            window,
+            session_id,
+            debate_id,
+            source_content,
+            canvas_store,
+            twin_store,
+            openrouter,
+            ollama,
+            settings,
+        )
+        .await
+        {
+            log::warn!("Debate chair synthesis failed: {error}");
+        }
+    });
+}
+
+async fn run_debate_chair_synthesis(
+    window: tauri::Window,
+    session_id: String,
+    debate_id: String,
+    source_content: String,
+    canvas_store: Arc<RwLock<CanvasStore>>,
+    twin_store: Arc<RwLock<TwinStore>>,
+    openrouter: Arc<RwLock<OpenRouterService>>,
+    ollama: Arc<RwLock<OllamaService>>,
+    settings: Arc<RwLock<SettingsService>>,
+) -> Result<(), String> {
+    let debate = {
+        let mut store = canvas_store.write().await;
+        let session = store.get_session(&session_id).map_err(|e| e.to_string())?;
+        session
+            .debates
+            .iter()
+            .find(|debate| debate.id == debate_id)
+            .cloned()
+            .ok_or_else(|| "Debate not found for chair synthesis".to_string())?
+    };
+
+    let prompt = build_chair_synthesis_prompt(&source_content, &debate.rounds);
+    let settings_snapshot = settings.read().await.get().clone();
+    let use_ollama = settings_snapshot.twin_llm_provider.eq_ignore_ascii_case("ollama");
+    let messages = vec![ChatMessage {
+        role: "user".to_string(),
+        content: prompt,
+    }];
+
+    let raw = if use_ollama {
+        let model = settings_snapshot.ollama_model.trim();
+        if model.is_empty() {
+            return Err("Select an Ollama model before synthesizing a debate".to_string());
+        }
+        let ollama = ollama.read().await;
+        ollama
+            .chat(model, messages, None, Some(0.4))
+            .await
+            .map_err(|e| e.to_string())?
+    } else {
+        let model = settings_snapshot.llm_model.trim();
+        if model.is_empty() {
+            return Err("No synthesis model configured".to_string());
+        }
+        let openrouter = openrouter.read().await;
+        openrouter
+            .chat(
+                model,
+                messages,
+                None,
+                Some(0.4),
+                Some(700),
+                Some("none"),
+                false,
+                0,
+            )
+            .await
+            .map_err(|e| e.to_string())?
+    };
+
+    let recap = raw.trim().to_string();
+    if recap.is_empty() {
+        return Ok(());
+    }
+
+    {
+        let mut store = canvas_store.write().await;
+        let session = store.get_session(&session_id).map_err(|e| e.to_string())?;
+        let Some(mut debate) = session
+            .debates
+            .iter()
+            .find(|debate| debate.id == debate_id)
+            .cloned()
+        else {
+            return Err("Debate not found for chair synthesis".to_string());
+        };
+        debate.recap = Some(recap.clone());
+        debate.recap_updated_at = Some(Utc::now());
+        store
+            .update_debate(&session_id, &debate)
+            .map_err(|e| e.to_string())?;
+    }
+
+    let _ = window.emit(
+        "canvas-stream",
+        CanvasStreamEvent::DebateRecapUpdated {
+            session_id: session_id.clone(),
+            debate_id: debate_id.clone(),
+            recap: recap.clone(),
+        },
+    );
+
+    let mut twin = twin_store.write().await;
+    let _ = twin.append_trace_event(
+        &session_id,
+        TraceEventType::WorkingMemoryCompiled,
+        json!({
+            "debate_id": debate_id,
+            "kind": "debate_chair",
+            "recap": recap.chars().take(240).collect::<String>(),
+        }),
+    );
+
+    Ok(())
 }
