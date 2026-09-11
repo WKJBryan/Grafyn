@@ -21,6 +21,8 @@
 pub mod boot;
 pub mod canvas;
 pub mod distill;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub mod evidence;
 pub mod feedback;
 pub mod graph;
 pub mod image_generation;

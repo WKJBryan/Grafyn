@@ -1,6 +1,39 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+/// Explicit identity attribution, independent of chat role or importing user.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "mcp", derive(schemars::JsonSchema))]
+pub struct ImportTargetMapping {
+    pub target_person_id: String,
+    pub target_speaker: String,
+}
+
+/// Headerless/custom tables map semantic fields to Excel column letters.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "mcp", derive(schemars::JsonSchema))]
+pub struct ImportTableMapping {
+    pub columns: std::collections::BTreeMap<String, String>,
+    pub first_data_row: usize,
+    #[serde(default)]
+    pub sheet: Option<String>,
+}
+
+impl ImportTargetMapping {
+    pub fn apply(&self, properties: &mut std::collections::HashMap<String, serde_json::Value>) {
+        if !self.target_person_id.trim().is_empty() && !self.target_speaker.trim().is_empty() {
+            properties.insert(
+                "target_person_id".into(),
+                serde_json::json!(self.target_person_id.trim()),
+            );
+            properties.insert(
+                "target_speaker".into(),
+                serde_json::json!(self.target_speaker.trim()),
+            );
+        }
+    }
+}
+
 /// A single message in a parsed conversation
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ParsedMessage {

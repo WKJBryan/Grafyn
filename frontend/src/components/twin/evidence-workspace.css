@@ -1,0 +1,133 @@
+.evidence-workspace {
+  display: grid;
+  gap: 20px;
+}
+.evidence-section {
+  padding: 20px;
+  border: 1px solid var(--bg-tertiary);
+  border-radius: var(--radius-md);
+  background: var(--bg-secondary);
+}
+.evidence-section h2,
+.evidence-section h3 {
+  margin: 0 0 12px;
+}
+.evidence-section p,
+.evidence-section small,
+.evidence-section figcaption {
+  color: var(--text-secondary);
+  line-height: 1.55;
+}
+.evidence-section form,
+.evidence-section fieldset {
+  display: grid;
+  gap: 14px;
+}
+.evidence-section fieldset {
+  padding: 0;
+  border: 0;
+  margin: 12px 0;
+}
+.evidence-section label {
+  display: grid;
+  gap: 6px;
+  font-size: 0.875rem;
+}
+.evidence-section input,
+.evidence-section textarea,
+.evidence-section select {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 9px 11px;
+  color: var(--text-primary);
+  background: var(--bg-primary);
+  border: 1px solid var(--bg-tertiary);
+  border-radius: var(--radius-sm);
+  font: inherit;
+}
+.evidence-section textarea {
+  resize: vertical;
+}
+.evidence-section .inline-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.evidence-section input[type='checkbox'] {
+  width: auto;
+}
+.evidence-actions,
+.evidence-filters {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin: 12px 0;
+}
+.evidence-filters label {
+  flex: 1 1 160px;
+}
+.evidence-list {
+  display: grid;
+  gap: 10px;
+  padding: 0;
+  list-style: none;
+}
+.evidence-list button {
+  text-align: left;
+  white-space: normal;
+}
+.evidence-graph {
+  height: 440px;
+  min-height: 260px;
+  margin: 16px 0;
+}
+.evidence-section figure {
+  margin: 16px 0;
+  padding: 14px;
+  background: var(--bg-primary);
+  border: 1px solid var(--bg-tertiary);
+}
+.evidence-section blockquote {
+  white-space: pre-wrap;
+  margin: 12px 0;
+}
+.evidence-section .criterion {
+  padding: 16px;
+  border: 1px solid var(--bg-tertiary);
+  display: grid;
+  gap: 12px;
+}
+.evidence-section details {
+  margin: 16px 0;
+}
+.evidence-section summary {
+  cursor: pointer;
+}
+.evidence-section [role='alert'] {
+  color: var(--error, #ef6666);
+}
+.evidence-section dd {
+  margin-bottom: 12px;
+  white-space: pre-wrap;
+}
+.evidence-table-scroll {
+  overflow-x: auto;
+}
+.evidence-table-scroll table {
+  border-collapse: collapse;
+  font-size: 0.8rem;
+}
+.evidence-table-scroll th,
+.evidence-table-scroll td {
+  padding: 8px;
+  border-bottom: 1px solid var(--bg-tertiary);
+  text-align: left;
+}
+.evidence-section button:focus-visible,
+.evidence-section input:focus-visible,
+.evidence-section textarea:focus-visible,
+.evidence-section select:focus-visible {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: 3px;
+}

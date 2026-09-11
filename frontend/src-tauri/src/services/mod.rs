@@ -4,6 +4,14 @@ pub mod atomic_io;
 pub mod attachment_store;
 pub mod canvas_store;
 pub mod chunk_index;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub mod evidence;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub mod evidence_bridge;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub mod evidence_prediction;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub mod evidence_repair;
 pub mod feedback;
 pub mod graph_index;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -19,6 +27,8 @@ pub mod priority;
 pub mod retrieval;
 pub mod root_transition;
 pub mod search;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub mod source_content;
 pub mod settings;
 pub mod similarity;
 pub mod sync;

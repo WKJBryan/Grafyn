@@ -27,6 +27,11 @@ path = "src/mcp.rs"
 required-features = ["mcp"]
 
 [[bin]]
+name = "grafyn-evidence-maintenance"
+path = "src/evidence_maintenance.rs"
+required-features = ["mcp"]
+
+[[bin]]
 name = "grafyn-test-runtime"
 path = "src/bin/grafyn-test-runtime.rs"
 required-features = ["e2e-test-runtime"]

@@ -521,6 +521,14 @@ impl KnowledgeStore {
         &self.vault_path
     }
 
+    pub fn data_path(&self) -> PathBuf {
+        self.overlay_notes_dir
+            .parent()
+            .and_then(|path| path.parent())
+            .map(|path| path.to_path_buf())
+            .unwrap_or_else(|| self.overlay_notes_dir.clone())
+    }
+
     /// Builds the exact physical inputs used by Markdown migration previews.
     /// This deliberately bypasses the metadata cache for file discovery and
     /// bytes, then binds the freshly rebuilt note identity map and the complete
@@ -924,7 +932,7 @@ impl KnowledgeStore {
     }
 
     /// Rebuild the metadata cache and lookups from disk.
-    fn refresh_cache(&mut self) {
+    pub(crate) fn refresh_cache(&mut self) {
         let mut notes = Vec::new();
         self.path_index.clear();
         self.title_index.clear();

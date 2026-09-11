@@ -989,6 +989,18 @@ fn register_desktop_commands(builder: tauri::Builder<tauri::Wry>) -> tauri::Buil
         commands::import::preview_import,
         commands::import::apply_import,
         commands::import::get_supported_formats,
+        // Evidence workspace (desktop-only)
+        commands::evidence::evidence_snapshot,
+        commands::evidence::create_evidence_pilot,
+        commands::evidence::save_evidence_interview,
+        commands::evidence::save_evidence_goal,
+        commands::evidence::review_evidence_relationship,
+        commands::evidence::review_evidence_statement,
+        commands::evidence::process_evidence_jobs,
+        commands::evidence::predict_evidence_decision,
+        commands::evidence::install_evidence_embeddings,
+        commands::evidence::record_evidence_choice,
+        commands::evidence::list_evidence_predictions,
         // Retrieval commands
         commands::retrieval::retrieve_relevant,
         commands::retrieval::get_retrieval_config,
@@ -1049,6 +1061,7 @@ fn configure_runtime(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<taur
                     {
                         start_link_discovery_worker(state.clone());
                         start_vault_optimizer_worker(state.clone());
+                        commands::evidence::start_worker(state.clone());
                     }
                 }
                 Err(error) => {
