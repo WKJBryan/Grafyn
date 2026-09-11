@@ -633,4 +633,3 @@ fn unassigned_speaker_similarity_is_browseable_but_not_personal_context() {
     assert!(packet.relationships.is_empty());
     assert!(packet.source_revisions.is_empty());
 }
-

@@ -258,7 +258,9 @@ impl CanvasStore {
         memory: CanvasWorkingMemory,
     ) -> Result<()> {
         let session = self.get_session_mut(session_id)?;
-        session.branch_memories.insert(branch_key.to_string(), memory);
+        session
+            .branch_memories
+            .insert(branch_key.to_string(), memory);
         session.updated_at = Utc::now();
         let session = session.clone();
         self.write_session_file(&session)?;

@@ -2,12 +2,12 @@ use super::context::{
     fail_requested_prediction_if_same_root, resolve_prompt_context, run_sealed_twin_prediction,
     TWIN_CONTEXT_VERSION,
 };
-use super::working_memory::spawn_working_memory_compile;
 use super::shared::{
     append_canvas_trace_expecting_authority, effective_model_ids, is_vault_context_prompt,
     preserve_canvas_mutation_error, repair_canvas_trace_error, resolve_model_route,
     CanvasTraceMutationError, ModelProviderRoute,
 };
+use super::working_memory::spawn_working_memory_compile;
 use crate::models::canvas::{
     AddModelsRequest, CanvasStreamEvent, ContextMode, ModelResponse, PromptRequest, PromptTile,
     PromptType, ResponseStatus, TilePosition, TwinAnswerMode,

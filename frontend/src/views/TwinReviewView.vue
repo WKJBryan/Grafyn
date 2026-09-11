@@ -55,7 +55,10 @@
       </nav>
 
       <main class="workspace-main">
-        <EvidenceWorkspace v-if="isEvidenceTab" :tab="twinStore.activeTab" />
+        <EvidenceWorkspace
+          v-if="isEvidenceTab"
+          :tab="twinStore.activeTab"
+        />
 
         <TwinOverviewTab v-else-if="twinStore.activeTab === 'overview'" />
 

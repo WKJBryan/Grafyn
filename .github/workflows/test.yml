@@ -251,12 +251,6 @@ jobs:
       - name: Build frontend
         run: cd frontend && npm run build
 
-      - name: Build Twin Eval lab explicitly
-        working-directory: frontend
-        env:
-          GRAFYN_TWIN_EVAL_LAB: 1
-        run: npm run build
-
   android-build:
     name: Android Debug APK
     runs-on: ubuntu-22.04

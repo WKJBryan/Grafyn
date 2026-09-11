@@ -69,7 +69,14 @@ check(frontendLock.packages?.['']?.license === 'MPL-2.0', 'frontend/package-lock
 check(e2ePackage.license === 'MPL-2.0', 'e2e/package.json must declare MPL-2.0')
 check(e2eLock.packages?.['']?.license === 'MPL-2.0', 'e2e/package-lock.json root package must declare MPL-2.0')
 check(/^license = "MPL-2\.0"$/m.test(cargoToml), 'frontend/src-tauri/Cargo.toml must declare MPL-2.0')
-check(/\[\[package\]\]\r?\nname = "grafyn"\r?\nversion = "0\.3\.0"/m.test(cargoLock), 'frontend/src-tauri/Cargo.lock must contain the locked Grafyn package')
+const cargoVersion = cargoToml.match(/^version\s*=\s*"([^"]+)"/m)?.[1]
+check(
+  cargoVersion &&
+    new RegExp(
+      `\\[\\[package\\]\\]\\r?\\nname = "grafyn"\\r?\\nversion = "${cargoVersion.replaceAll('.', '\\.')}"`,
+    ).test(cargoLock),
+  'frontend/src-tauri/Cargo.lock must contain the locked Grafyn package',
+)
 
 check(
   dcoBlock && sha256(dcoBlock) === dcoSha256,

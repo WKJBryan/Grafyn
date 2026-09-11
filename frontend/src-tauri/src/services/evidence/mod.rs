@@ -4,13 +4,13 @@ mod jobs;
 mod models;
 mod paths;
 pub use context::{context_from_snapshot, without_goal_paths};
-mod discovery;
-mod embedding;
 mod assessment;
 pub mod benchmark;
-pub use assessment::{assess_pair, assess_next, relationship_for_context, PairAssessment};
+mod discovery;
+mod embedding;
 use crate::services::atomic_io::write_atomic;
 use anyhow::{ensure, Context, Result};
+pub use assessment::{assess_next, assess_pair, relationship_for_context, PairAssessment};
 use chrono::Utc;
 pub use discovery::{discover_relationships, DiscoveryOutput};
 pub use models::*;
@@ -224,14 +224,20 @@ impl EvidenceStore {
         );
         if let Some(kind) = relation {
             updated.relation = kind;
-            if matches!(updated.relation, RelationshipKind::Related | RelationshipKind::Equivalent | RelationshipKind::Conflicts | RelationshipKind::Contradicts) {
+            if matches!(
+                updated.relation,
+                RelationshipKind::Related
+                    | RelationshipKind::Equivalent
+                    | RelationshipKind::Conflicts
+                    | RelationshipKind::Contradicts
+            ) {
                 updated.directed = false;
                 updated.causal_basis = None;
             }
         }
         jobs::validate_relationship(&next, &updated)?;
         if status == ReviewStatus::Confirmed && updated.assessment.is_some() {
-            updated.reviewed_context_hash = Some(assessment::review_fingerprint(&next,&updated)?);
+            updated.reviewed_context_hash = Some(assessment::review_fingerprint(&next, &updated)?);
         }
         updated.review_status = status;
         next.relationships[index] = updated.clone();

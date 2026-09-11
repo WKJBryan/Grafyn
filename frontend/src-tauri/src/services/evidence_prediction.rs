@@ -147,20 +147,28 @@ fn public_record(record: &PredictionRecord) -> Value {
     value
 }
 
-fn neutral_questions(topics:&[String])->Vec<String>{
-    let mut questions=Vec::new();
+fn neutral_questions(topics: &[String]) -> Vec<String> {
+    let mut questions = Vec::new();
     for topic in topics {
-        let question=match topic.as_str(){
-            "timeframe"=>"What deadline or timeframe applies to this decision?",
-            "budget"=>"What budget or resource limit applies?",
-            "success_metric"=>"What concrete result would count as success, and how would you measure it?",
-            "competing_goals"=>"Which other goals need to be considered here?",
-            "constraints"=>"What costs or constraints would make an option unacceptable?",
-            "alternatives"=>"Are combined choices or alternatives beyond the listed options available?",
-            _=>continue,
+        let question = match topic.as_str() {
+            "timeframe" => "What deadline or timeframe applies to this decision?",
+            "budget" => "What budget or resource limit applies?",
+            "success_metric" => {
+                "What concrete result would count as success, and how would you measure it?"
+            }
+            "competing_goals" => "Which other goals need to be considered here?",
+            "constraints" => "What costs or constraints would make an option unacceptable?",
+            "alternatives" => {
+                "Are combined choices or alternatives beyond the listed options available?"
+            }
+            _ => continue,
         };
-        if !questions.iter().any(|q|q==question){questions.push(question.to_string());}
-        if questions.len()==2{break;}
+        if !questions.iter().any(|q| q == question) {
+            questions.push(question.to_string());
+        }
+        if questions.len() == 2 {
+            break;
+        }
     }
     questions
 }
@@ -227,7 +235,12 @@ fn parse_forecast(raw: &str) -> Result<Forecast> {
         "No action, conditional branch, or abstention"
     );
     f.questions.truncate(2);
-    ensure!(f.conditional_branches.iter().all(|b|!b.condition.trim().is_empty() && !b.action.trim().is_empty()),"Empty conditional branch");
+    ensure!(
+        f.conditional_branches
+            .iter()
+            .all(|b| !b.condition.trim().is_empty() && !b.action.trim().is_empty()),
+        "Empty conditional branch"
+    );
     Ok(f)
 }
 

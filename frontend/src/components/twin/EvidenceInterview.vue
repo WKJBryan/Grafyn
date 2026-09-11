@@ -5,63 +5,81 @@
       Start with 10–15 minutes. Save at any step and return later. Product and project choices and
       everyday choices both count. Leave anything you do not know blank.
     </p>
-    <p aria-live="polite">Step {{ draft.step + 1 }} of 4 — {{ steps[draft.step] }}</p>
+    <p aria-live="polite">
+      Step {{ draft.step + 1 }} of 4 — {{ steps[draft.step] }}
+    </p>
     <form @submit.prevent="advance">
       <fieldset :disabled="store.busy">
         <template v-if="draft.step === 0">
-          <label
-            >Domain<select v-model="draft.domain">
-              <option value="product_project">Product / project</option>
-              <option value="everyday">Everyday life</option>
-            </select></label
-          >
-          <label>What was the situation?<textarea v-model="draft.situation" rows="4" /></label>
-          <label
-            >What options did you consider? One per line.<textarea v-model="options" rows="3" />
+          <label>Domain<select v-model="draft.domain">
+            <option value="product_project">Product / project</option>
+            <option value="everyday">Everyday life</option>
+          </select></label>
+          <label>What was the situation?<textarea
+            v-model="draft.situation"
+            rows="4"
+          /></label>
+          <label>What options did you consider? One per line.<textarea
+            v-model="options"
+            rows="3"
+          />
           </label>
         </template>
         <template v-if="draft.step === 1">
-          <label>What did you want to happen?<textarea v-model="draft.wanted" rows="3" /></label>
-          <label
-            >What did you expect would actually happen?<textarea
-              v-model="draft.expected"
-              rows="3"
-            />
+          <label>What did you want to happen?<textarea
+            v-model="draft.wanted"
+            rows="3"
+          /></label>
+          <label>What did you expect would actually happen?<textarea
+            v-model="draft.expected"
+            rows="3"
+          />
+          </label>
+          <label>How did that expected result affect what you wanted? Optional<select
+            v-model="draft.expected_goal_relation"
+          >
+            <option :value="null">Unsure / not supplied</option>
+            <option value="contributes_to">Helped</option>
+            <option value="inhibits">Hindered</option>
+          </select></label>
+          <label>What constraints mattered? One per line.<textarea
+            v-model="constraints"
+            rows="3"
+          />
           </label>
           <label
-            >How did that expected result affect what you wanted? Optional<select
-              v-model="draft.expected_goal_relation"
-            >
-              <option :value="null">Unsure / not supplied</option>
-              <option value="contributes_to">Helped</option>
-              <option value="inhibits">Hindered</option>
-            </select></label
-          >
-          <label
-            >What constraints mattered? One per line.<textarea v-model="constraints" rows="3" />
-          </label>
-          <label v-for="goal in currentGoals" :key="goal.id" class="inline-label"
-            ><input v-model="draft.goal_ids" type="checkbox" :value="goal.id" />
-            {{ goal.label }}</label
-          >
+            v-for="goal in currentGoals"
+            :key="goal.id"
+            class="inline-label"
+          ><input
+             v-model="draft.goal_ids"
+             type="checkbox"
+             :value="goal.id"
+           >
+            {{ goal.label }}</label>
         </template>
         <template v-if="draft.step === 2">
-          <label
-            >What did you choose? Leave blank if you have not chosen.<textarea
-              v-model="draft.chosen"
-              rows="3"
-            />
+          <label>What did you choose? Leave blank if you have not chosen.<textarea
+            v-model="draft.chosen"
+            rows="3"
+          />
           </label>
-          <label
-            >Which options did you reject? One per line.<textarea v-model="rejected" rows="3" />
+          <label>Which options did you reject? One per line.<textarea
+            v-model="rejected"
+            rows="3"
+          />
           </label>
-          <label
-            >Why did you make that choice?<textarea v-model="draft.rationale" rows="3" />
+          <label>Why did you make that choice?<textarea
+            v-model="draft.rationale"
+            rows="3"
+          />
           </label>
         </template>
         <template v-if="draft.step === 3">
-          <label
-            >What actually happened? Optional follow-up.<textarea v-model="draft.actual" rows="4" />
+          <label>What actually happened? Optional follow-up.<textarea
+            v-model="draft.actual"
+            rows="4"
+          />
           </label>
           <p>
             Wanted, expected, chosen, and actual outcomes stay separate. Saving an unanswered
@@ -73,9 +91,10 @@
               <template
                 v-for="key in ['situation', 'wanted', 'expected', 'chosen', 'rationale', 'actual']"
                 :key="key"
-                ><dt>{{ key }}</dt>
-                <dd>{{ draft[key] || 'Unknown / not supplied' }}</dd></template
               >
+                <dt>{{ key }}</dt>
+                <dd>{{ draft[key] || 'Unknown / not supplied' }}</dd>
+              </template>
             </dl>
           </details>
         </template>
@@ -90,7 +109,12 @@
         >
           Back
         </button>
-        <button class="btn btn-secondary" type="button" :disabled="store.busy" @click="save(false)">
+        <button
+          class="btn btn-secondary"
+          type="button"
+          :disabled="store.busy"
+          @click="save(false)"
+        >
           Save and pause
         </button>
         <button
@@ -101,7 +125,12 @@
         </button>
       </div>
     </form>
-    <button v-if="completed" class="btn btn-secondary" :disabled="store.busy" @click="startAnother">
+    <button
+      v-if="completed"
+      class="btn btn-secondary"
+      :disabled="store.busy"
+      @click="startAnother"
+    >
       Start another decision
     </button>
   </section>

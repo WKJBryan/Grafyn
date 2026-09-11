@@ -65,10 +65,7 @@ Do not restart from the original prompt as if you hadn't heard anyone.\n",
     message
 }
 
-pub(super) fn build_chair_synthesis_prompt(
-    source_content: &str,
-    rounds: &[DebateRound],
-) -> String {
+pub(super) fn build_chair_synthesis_prompt(source_content: &str, rounds: &[DebateRound]) -> String {
     let mut message = String::from(
         "You were listening, not in the fight. Talk like a person who heard the room. \
 Do not use headings or bins like Agreed, Split, or Moved. Do not declare a winner. \
@@ -1168,9 +1165,8 @@ async fn run_debate_chair_synthesis(
         if model.is_empty() {
             return Err("Select an Ollama model before synthesizing a debate".to_string());
         }
-        let ollama = ollama.ok_or_else(|| {
-            "Local Ollama is unavailable on this runtime".to_string()
-        })?;
+        let ollama =
+            ollama.ok_or_else(|| "Local Ollama is unavailable on this runtime".to_string())?;
         let ollama = ollama.read().await;
         ollama
             .chat(model, messages, None, Some(0.4))

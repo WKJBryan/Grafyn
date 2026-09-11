@@ -114,9 +114,9 @@ fn read_xlsx(bytes: &[u8]) -> Result<Vec<(String, Vec<(usize, Row)>)>> {
             match reader.read_event()? {
                 Event::Start(e) if e.local_name().as_ref() == b"si" => value.clear(),
                 Event::Start(e) if e.local_name().as_ref() == b"t" => in_text = true,
-                Event::Text(e) if in_text => {
-                    value.push_str(&quick_xml::escape::unescape(std::str::from_utf8(e.as_ref())?)?)
-                }
+                Event::Text(e) if in_text => value.push_str(&quick_xml::escape::unescape(
+                    std::str::from_utf8(e.as_ref())?,
+                )?),
                 Event::GeneralRef(e) if in_text => value.push_str(&decode_reference(e.as_ref())?),
                 Event::End(e) if e.local_name().as_ref() == b"t" => in_text = false,
                 Event::End(e) if e.local_name().as_ref() == b"si" => shared.push(value.clone()),
@@ -191,9 +191,9 @@ fn worksheet_rows(xml: &str, shared: &[String]) -> Result<Vec<(usize, Row)>> {
             }
             Event::Start(e) if e.local_name().as_ref() == b"f" => formula = true,
             Event::Start(e) if matches!(e.local_name().as_ref(), b"v" | b"t") => in_value = true,
-            Event::Text(e) if in_value => {
-                value.push_str(&quick_xml::escape::unescape(std::str::from_utf8(e.as_ref())?)?)
-            }
+            Event::Text(e) if in_value => value.push_str(&quick_xml::escape::unescape(
+                std::str::from_utf8(e.as_ref())?,
+            )?),
             Event::GeneralRef(e) if in_value => value.push_str(&decode_reference(e.as_ref())?),
             Event::End(e) if matches!(e.local_name().as_ref(), b"v" | b"t") => in_value = false,
             Event::End(e) if e.local_name().as_ref() == b"c" => {

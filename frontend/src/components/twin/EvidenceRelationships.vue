@@ -6,56 +6,67 @@
       or causally stronger. Node size shows visible connectivity.
     </p>
     <div class="evidence-filters">
-      <label
-        >View<select v-model="layer">
-          <option value="meaning">Meaning</option>
-          <option value="goal_path" :disabled="store.snapshot.subject_id === 'unconfigured'">Goal paths</option>
-        </select></label
-      >
-      <label
-        >Review<select v-model="review">
-          <option value="">All usable evidence</option>
-          <option value="tentative">Tentative</option>
-          <option value="confirmed">Confirmed</option>
-        </select></label
-      >
-      <label
-        >Relation<select v-model="relation">
-          <option value="">All relations</option>
-          <option v-for="kind in relationKinds" :key="kind">{{ kind }}</option>
-        </select></label
-      >
-      <label
-        >Source<select v-model="source">
-          <option value="">All sources</option>
-          <option v-for="item in store.snapshot.sources" :key="item.id" :value="item.id">
-            {{ item.title || item.id }}
-          </option>
-        </select></label
-      >
-      <label>Known by date<input v-model="asOf" type="date" /></label>
-      <label
-        >Focus<select v-model="focus">
-          <option value="">All visible content</option>
-          <option v-for="node in availableNodes" :key="node.id" :value="node.id">
-            {{ node.label }}
-          </option>
-        </select></label
-      >
+      <label>View<select v-model="layer">
+        <option value="meaning">Meaning</option>
+        <option
+          value="goal_path"
+          :disabled="store.snapshot.subject_id === 'unconfigured'"
+        >Goal paths</option>
+      </select></label>
+      <label>Review<select v-model="review">
+        <option value="">All usable evidence</option>
+        <option value="tentative">Tentative</option>
+        <option value="confirmed">Confirmed</option>
+      </select></label>
+      <label>Relation<select v-model="relation">
+        <option value="">All relations</option>
+        <option
+          v-for="kind in relationKinds"
+          :key="kind"
+        >{{ kind }}</option>
+      </select></label>
+      <label>Source<select v-model="source">
+        <option value="">All sources</option>
+        <option
+          v-for="item in store.snapshot.sources"
+          :key="item.id"
+          :value="item.id"
+        >
+          {{ item.title || item.id }}
+        </option>
+      </select></label>
+      <label>Known by date<input
+        v-model="asOf"
+        type="date"
+      ></label>
+      <label>Focus<select v-model="focus">
+        <option value="">All visible content</option>
+        <option
+          v-for="node in availableNodes"
+          :key="node.id"
+          :value="node.id"
+        >
+          {{ node.label }}
+        </option>
+      </select></label>
     </div>
     <fieldset v-if="layer === 'goal_path'">
       <legend>Concurrent goals</legend>
-      <label v-for="goal in goals" :key="goal.id" class="inline-label"
-        ><input v-model="selectedGoals" type="checkbox" :value="goal.id" /> {{ goal.label }} ·
-        {{ goal.status }} · r{{ goal.revision }}</label
-      ><label
-        >Path depth<select v-model.number="depth">
-          <option :value="1">One step</option>
-          <option :value="2">Two steps</option>
-          <option :value="3">Three steps</option>
-          <option :value="4">Four steps</option>
-        </select></label
-      >
+      <label
+        v-for="goal in goals"
+        :key="goal.id"
+        class="inline-label"
+      ><input
+        v-model="selectedGoals"
+        type="checkbox"
+        :value="goal.id"
+      > {{ goal.label }} ·
+        {{ goal.status }} · r{{ goal.revision }}</label><label>Path depth<select v-model.number="depth">
+        <option :value="1">One step</option>
+        <option :value="2">Two steps</option>
+        <option :value="3">Three steps</option>
+        <option :value="4">Four steps</option>
+      </select></label>
       <p>
         Steps are relative to the selected node. Hop count does not describe elapsed time or effect
         size. Missing connecting evidence stays missing.
@@ -71,7 +82,10 @@
     </p>
     <p>Embedding discovery: {{ store.snapshot.embedding_status || 'Unknown' }}</p>
     <p>Contextual assessment: {{ store.snapshot.assessment_status || 'Unknown' }}</p>
-    <details v-if="groups.length" open>
+    <details
+      v-if="groups.length"
+      open
+    >
       <summary>Passage groups ({{ groups.length }})</summary>
       <p>
         Each group contains an anchor and its strongest scored semantic neighbors. Passages may
@@ -79,7 +93,10 @@
         equivalent.
       </p>
       <ul class="evidence-list">
-        <li v-for="group in groups" :key="group.id">
+        <li
+          v-for="group in groups"
+          :key="group.id"
+        >
           <button
             class="btn btn-secondary"
             :aria-expanded="expandedGroupId === group.id"
@@ -92,11 +109,12 @@
             :aria-label="`Members related to ${nodeLabel(group.anchor)}`"
           >
             <ul>
-              <li v-for="id in group.members" :key="id">
+              <li
+                v-for="id in group.members"
+                :key="id"
+              >
                 {{ nodeLabel(id) }}
-                <small v-if="membershipCount(id) > 1"
-                  >· appears in {{ membershipCount(id) }} groups</small
-                >
+                <small v-if="membershipCount(id) > 1">· appears in {{ membershipCount(id) }} groups</small>
               </li>
             </ul>
             <p v-if="group.hiddenNeighbors">
@@ -113,7 +131,11 @@
         These are source-backed statements, preferences, or procedures. They are not recorded
         choices.
       </p>
-      <article v-for="statement in statements" :key="statement.id" class="criterion">
+      <article
+        v-for="statement in statements"
+        :key="statement.id"
+        class="criterion"
+      >
         <strong>{{ statement.kind.replaceAll('_', ' ') }} · {{ statement.review_status }}</strong>
         <p>{{ statement.statement }}</p>
         <div class="evidence-actions">
@@ -122,8 +144,8 @@
             :disabled="store.busy"
             @click="store.reviewStatement({ id: statement.id, status: 'confirmed' })"
           >
-            Confirm statement</button
-          ><button
+            Confirm statement
+          </button><button
             class="btn btn-secondary"
             :disabled="store.busy"
             @click="store.reviewStatement({ id: statement.id, status: 'rejected' })"
@@ -135,7 +157,10 @@
           To correct this interpretation, edit its source and re-import. Original quotes and
           revisions are retained.
         </p>
-        <figure v-for="(receipt, index) in statement.receipts" :key="index">
+        <figure
+          v-for="(receipt, index) in statement.receipts"
+          :key="index"
+        >
           <figcaption>
             {{ receipt.locator || receipt.source_id }} · source revision
             {{ receipt.source_revision }}
@@ -146,7 +171,12 @@
     </details>
     <p v-if="focused.hidden">
       {{ focused.hidden }} weaker or unscored connections hidden.
-      <button class="btn btn-secondary" @click="expanded = true">Expand weaker connections</button>
+      <button
+        class="btn btn-secondary"
+        @click="expanded = true"
+      >
+        Expand weaker connections
+      </button>
     </p>
     <div class="evidence-graph">
       <GraphView
@@ -163,8 +193,14 @@
     <details open>
       <summary>Accessible relationship list ({{ focused.visible.length }})</summary>
       <ul class="evidence-list">
-        <li v-for="edge in focused.visible" :key="edge.id">
-          <button class="btn btn-secondary" @click="selectedId = edge.id">
+        <li
+          v-for="edge in focused.visible"
+          :key="edge.id"
+        >
+          <button
+            class="btn btn-secondary"
+            @click="selectedId = edge.id"
+          >
             {{ nodeLabel(edge.source) }} — {{ edge.relation.replaceAll('_', ' ') }}
             {{ edge.directed ? '→' : '—' }} {{ nodeLabel(edge.target) }} ·
             {{ edge.review_status }} · {{ edge.score == null ? 'unscored' : 'scored' }}
@@ -179,8 +215,14 @@
         Machine withholding records no human rejection.
       </p>
       <ul class="evidence-list">
-        <li v-for="edge in withheld" :key="edge.id">
-          <button class="btn btn-secondary" @click="selectedId = edge.id">
+        <li
+          v-for="edge in withheld"
+          :key="edge.id"
+        >
+          <button
+            class="btn btn-secondary"
+            @click="selectedId = edge.id"
+          >
             {{ nodeLabel(edge.from_id) }} — {{ candidateStateLabel(edge) }} —
             {{ nodeLabel(edge.to_id) }} ·
             {{ candidateExplanation(edge) }}
@@ -188,7 +230,11 @@
         </li>
       </ul>
     </details>
-    <RelationshipEvidencePanel v-if="selected" :relationship="selected" @close="selectedId = ''" />
+    <RelationshipEvidencePanel
+      v-if="selected"
+      :relationship="selected"
+      @close="selectedId = ''"
+    />
   </section>
 </template>
 

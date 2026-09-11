@@ -6,27 +6,28 @@
       its development evidence; start a new batch after changing that evidence.
     </p>
     <div class="evidence-filters">
-      <label
-        >Batch for new decisions<select v-model="store.batchId" :disabled="store.busy">
-          <option value="">Create on first prediction</option>
-          <option
-            v-for="batch in store.predictionHistory.batches"
-            :key="batch.id"
-            :value="batch.id"
-          >
-            {{ batch.created_at }} · {{ batch.model }} · {{ batch.id.slice(0, 8) }}
-          </option>
-          <option
-            v-if="
-              store.batchId &&
-              !store.predictionHistory.batches.some((batch) => batch.id === store.batchId)
-            "
-            :value="store.batchId"
-          >
-            New batch · {{ store.batchId.slice(0, 8) }}
-          </option>
-        </select></label
+      <label>Batch for new decisions<select
+        v-model="store.batchId"
+        :disabled="store.busy"
       >
+        <option value="">Create on first prediction</option>
+        <option
+          v-for="batch in store.predictionHistory.batches"
+          :key="batch.id"
+          :value="batch.id"
+        >
+          {{ batch.created_at }} · {{ batch.model }} · {{ batch.id.slice(0, 8) }}
+        </option>
+        <option
+          v-if="
+            store.batchId &&
+              !store.predictionHistory.batches.some((batch) => batch.id === store.batchId)
+          "
+          :value="store.batchId"
+        >
+          New batch · {{ store.batchId.slice(0, 8) }}
+        </option>
+      </select></label>
       <button
         class="btn btn-secondary"
         :disabled="store.busy"
@@ -34,7 +35,11 @@
       >
         New batch
       </button>
-      <button class="btn btn-secondary" :disabled="store.busy" @click="store.loadPredictions">
+      <button
+        class="btn btn-secondary"
+        :disabled="store.busy"
+        @click="store.loadPredictions"
+      >
         Refresh saved predictions
       </button>
       <button
@@ -45,24 +50,22 @@
         Export prediction ledger JSON
       </button>
     </div>
-    <label
-      >Resume a saved decision<select
-        :value="store.prediction?.id || ''"
-        :disabled="store.busy"
-        @change="resume($event.target.value)"
-      >
-        <option value="">Select a saved decision</option>
-        <option
-          v-for="record in store.predictionHistory.records"
-          :key="record.id"
-          :value="record.id"
-        >
-          {{ record.request?.domain === 'everyday' ? 'Everyday' : 'Product / project' }} ·
-          {{ record.request?.situation || record.id }} ·
-          {{ record.sealed ? 'sealed' : record.status }}
-        </option>
-      </select></label
+    <label>Resume a saved decision<select
+      :value="store.prediction?.id || ''"
+      :disabled="store.busy"
+      @change="resume($event.target.value)"
     >
+      <option value="">Select a saved decision</option>
+      <option
+        v-for="record in store.predictionHistory.records"
+        :key="record.id"
+        :value="record.id"
+      >
+        {{ record.request?.domain === 'everyday' ? 'Everyday' : 'Product / project' }} ·
+        {{ record.request?.situation || record.id }} ·
+        {{ record.sealed ? 'sealed' : record.status }}
+      </option>
+    </select></label>
     <button
       v-if="store.prediction?.status === 'pending' && !store.prediction.human_choice"
       class="btn btn-primary"
@@ -71,7 +74,9 @@
     >
       Resume pending comparisons
     </button>
-    <p v-if="!store.predictionHistory.records.length">No predictions saved yet.</p>
+    <p v-if="!store.predictionHistory.records.length">
+      No predictions saved yet.
+    </p>
     <details v-if="store.predictionHistory.records.length">
       <summary>Capture and review counts by domain</summary>
       <p>
@@ -97,7 +102,10 @@
             </tr>
           </thead>
           <tbody>
-            <tr v-for="row in summary" :key="row.domain">
+            <tr
+              v-for="row in summary"
+              :key="row.domain"
+            >
               <th>{{ row.domain === 'everyday' ? 'Everyday' : 'Product / project' }}</th>
               <td>{{ row.records }}</td>
               <td>{{ row.choices }}</td>

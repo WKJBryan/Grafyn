@@ -5,7 +5,11 @@
       Recorded choice: {{ record.human_choice }}. Judge whether each prediction is equivalent to
       your choice; combined and outside options are allowed.
     </p>
-    <article v-for="comparison in record.comparisons" :key="keyOf(comparison)" class="criterion">
+    <article
+      v-for="comparison in record.comparisons"
+      :key="keyOf(comparison)"
+      class="criterion"
+    >
       <h4>
         {{ conditionLabels[comparison.condition] || comparison.condition }} ·
         {{
@@ -15,39 +19,58 @@
         }}
       </h4>
       <p>Status: {{ comparison.status }}</p>
-      <p v-if="comparison.error" role="alert">{{ comparison.error }}</p>
-      <p v-if="comparison.forecast?.insufficient_evidence">Insufficient evidence — abstained.</p>
+      <p
+        v-if="comparison.error"
+        role="alert"
+      >
+        {{ comparison.error }}
+      </p>
+      <p v-if="comparison.forecast?.insufficient_evidence">
+        Insufficient evidence — abstained.
+      </p>
       <p>{{ comparison.forecast?.proposed_action }}</p>
       <ul v-if="comparison.forecast?.conditional_branches?.length">
-        <li v-for="(branch, index) in comparison.forecast.conditional_branches" :key="index">
+        <li
+          v-for="(branch, index) in comparison.forecast.conditional_branches"
+          :key="index"
+        >
           If {{ branch.condition }}: {{ branch.action }}
         </li>
       </ul>
       <details v-if="comparison.forecast">
         <summary>Assumptions and evidence</summary>
         <ul>
-          <li v-for="assumption in comparison.forecast.assumptions" :key="assumption">
+          <li
+            v-for="assumption in comparison.forecast.assumptions"
+            :key="assumption"
+          >
             {{ assumption }}
           </li>
         </ul>
         <p>Evidence IDs: {{ comparison.forecast.evidence_ids?.join(', ') || 'None supplied' }}</p>
-        <p v-for="goal in comparison.context?.goals || []" :key="`${goal.id}-${goal.revision}`">
+        <p
+          v-for="goal in comparison.context?.goals || []"
+          :key="`${goal.id}-${goal.revision}`"
+        >
           Goal {{ goal.label }} · revision {{ goal.revision }}
         </p>
       </details>
-      <label v-if="record.human_choice"
-        >Your equivalence judgement<select
-          v-model="judgements[keyOf(comparison)]"
-          :disabled="store.busy || comparison.status !== 'completed'"
-        >
-          <option value="">Not reviewed</option>
-          <option value="agree">Agree — equivalent choice</option>
-          <option value="disagree">Disagree — different choice</option>
-          <option value="ambiguous">Ambiguous — cannot determine</option>
-        </select></label
+      <label v-if="record.human_choice">Your equivalence judgement<select
+        v-model="judgements[keyOf(comparison)]"
+        :disabled="store.busy || comparison.status !== 'completed'"
       >
+        <option value="">Not reviewed</option>
+        <option value="agree">Agree — equivalent choice</option>
+        <option value="disagree">Disagree — different choice</option>
+        <option value="ambiguous">Ambiguous — cannot determine</option>
+      </select></label>
     </article>
-    <button v-if="record.human_choice" class="btn btn-primary" :disabled="store.busy" @click="save">
+    <button
+      v-if="record.human_choice"
+      class="btn btn-primary"
+      :disabled="store.busy"
+      @click="save"
+    >
       Save my judgements
     </button>
   </section>

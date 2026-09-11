@@ -27,10 +27,10 @@ pub mod priority;
 pub mod retrieval;
 pub mod root_transition;
 pub mod search;
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
-pub mod source_content;
 pub mod settings;
 pub mod similarity;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub mod source_content;
 pub mod sync;
 pub mod texttiling;
 pub mod topic_hub;

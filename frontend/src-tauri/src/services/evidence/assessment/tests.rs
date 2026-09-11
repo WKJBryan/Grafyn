@@ -410,4 +410,3 @@ fn frozen_context_uses_its_cutoff_for_assessment_goal_revisions() {
         1
     );
 }
-

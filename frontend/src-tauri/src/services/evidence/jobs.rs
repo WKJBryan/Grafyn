@@ -528,7 +528,10 @@ pub(super) fn validate_relationship(
     }
     if matches!(
         relation.relation,
-        RelationshipKind::Supports | RelationshipKind::Contradicts | RelationshipKind::Equivalent | RelationshipKind::Conflicts
+        RelationshipKind::Supports
+            | RelationshipKind::Contradicts
+            | RelationshipKind::Equivalent
+            | RelationshipKind::Conflicts
     ) {
         ensure!(
             !relation.conditions.is_empty(),

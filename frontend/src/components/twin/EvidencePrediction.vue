@@ -8,20 +8,26 @@
     <EvidencePredictionLedger />
     <form @submit.prevent="predict">
       <fieldset :disabled="store.busy">
-        <label
-          >Domain<select v-model="domain">
-            <option value="product_project">Product / project</option>
-            <option value="everyday">Everyday life</option>
-          </select></label
-        >
-        <label>Decision situation<textarea v-model="situation" rows="3" required /></label>
-        <label
-          >Available options — one per line<textarea v-model="options" rows="3" required />
+        <label>Domain<select v-model="domain">
+          <option value="product_project">Product / project</option>
+          <option value="everyday">Everyday life</option>
+        </select></label>
+        <label>Decision situation<textarea
+          v-model="situation"
+          rows="3"
+          required
+        /></label>
+        <label>Available options — one per line<textarea
+          v-model="options"
+          rows="3"
+          required
+        />
         </label>
-        <label class="inline-label"
-          ><input v-model="validation" type="checkbox" /> Validation: keep the prediction hidden
-          until I record my choice</label
-        >
+        <label class="inline-label"><input
+          v-model="validation"
+          type="checkbox"
+        > Validation: keep the prediction hidden
+          until I record my choice</label>
       </fieldset>
       <button
         class="btn btn-primary"
@@ -30,31 +36,59 @@
         {{ store.predicting ? 'Running comparisons…' : 'Run all three comparisons' }}
       </button>
     </form>
-    <p v-if="store.predicting" role="status">
+    <p
+      v-if="store.predicting"
+      role="status"
+    >
       The same decision is running without personal evidence, with personal evidence, and with goal
       paths. Local inference can take several minutes.
     </p>
-    <section v-if="result" aria-live="polite">
-      <p v-if="result.error" role="alert">{{ result.error }}</p>
-      <p v-if="result.sealed">Prediction sealed. Record your choice below before seeing it.</p>
+    <section
+      v-if="result"
+      aria-live="polite"
+    >
+      <p
+        v-if="result.error"
+        role="alert"
+      >
+        {{ result.error }}
+      </p>
+      <p v-if="result.sealed">
+        Prediction sealed. Record your choice below before seeing it.
+      </p>
       <template v-else>
-        <h3 v-if="result.proposed_action">Likely choice</h3>
+        <h3 v-if="result.proposed_action">
+          Likely choice
+        </h3>
         <p>{{ result.proposed_action }}</p>
         <ul v-if="result.conditional_branches?.length">
-          <li v-for="(branch, index) in result.conditional_branches" :key="index">
+          <li
+            v-for="(branch, index) in result.conditional_branches"
+            :key="index"
+          >
             If {{ branch.condition }}: {{ branch.action }}
           </li>
         </ul>
         <details v-if="result.assumptions?.length">
           <summary>Assumptions</summary>
           <ul>
-            <li v-for="assumption in result.assumptions" :key="assumption">{{ assumption }}</li>
+            <li
+              v-for="assumption in result.assumptions"
+              :key="assumption"
+            >
+              {{ assumption }}
+            </li>
           </ul>
         </details>
         <details v-if="result.evidence_ids?.length">
           <summary>Evidence used</summary>
           <ul>
-            <li v-for="id in result.evidence_ids" :key="id">{{ id }}</li>
+            <li
+              v-for="id in result.evidence_ids"
+              :key="id"
+            >
+              {{ id }}
+            </li>
           </ul>
         </details>
       </template>
@@ -62,15 +96,33 @@
         v-if="questions.length && !result.human_choice && !hasClarified"
         @submit.prevent="clarify"
       >
-        <label v-for="(question, index) in questions" :key="question"
-          >{{ question }}<input v-model="answers[index]"
-        /></label>
-        <button class="btn btn-secondary" :disabled="store.busy">Use these clarifications</button>
+        <label
+          v-for="(question, index) in questions"
+          :key="question"
+        >{{ question }}<input v-model="answers[index]"></label>
+        <button
+          class="btn btn-secondary"
+          :disabled="store.busy"
+        >
+          Use these clarifications
+        </button>
       </form>
-      <form v-if="!result.human_choice" @submit.prevent="recordChoice">
-        <label>Your actual choice<input v-model="choice" required /></label>
-        <label>Why? Optional<textarea v-model="rationale" rows="2" /></label>
-        <button class="btn btn-primary" :disabled="store.busy || !choice.trim()">
+      <form
+        v-if="!result.human_choice"
+        @submit.prevent="recordChoice"
+      >
+        <label>Your actual choice<input
+          v-model="choice"
+          required
+        ></label>
+        <label>Why? Optional<textarea
+          v-model="rationale"
+          rows="2"
+        /></label>
+        <button
+          class="btn btn-primary"
+          :disabled="store.busy || !choice.trim()"
+        >
           {{ result.sealed ? 'Record choice and reveal prediction' : 'Record my choice' }}
         </button>
       </form>

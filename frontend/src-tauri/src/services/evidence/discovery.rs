@@ -368,7 +368,8 @@ mod model_lifecycle_tests {
     #[test]
     fn changed_model_and_same_model_refresh_scores_preserving_confirmed_correction() {
         let (_dir, mut store, mut candidate) = fixture();
-        store.state.relationships[0].conditions = vec!["Same release-quality and customer-trust context".into()];
+        store.state.relationships[0].conditions =
+            vec!["Same release-quality and customer-trust context".into()];
         store.state.relationships[0].assessment = Some(assessment::PairAssessment {
             model_version: "scorer-a".into(),
             raw_response: Some("Preserved audit payload".into()),

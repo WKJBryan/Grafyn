@@ -1,10 +1,20 @@
 <template>
-  <section class="evidence-section relationship-panel" aria-label="Relationship evidence">
+  <section
+    class="evidence-section relationship-panel"
+    aria-label="Relationship evidence"
+  >
     <div class="evidence-actions">
       <h3>{{ relationship.relation.replaceAll('_', ' ') }}</h3>
-      <button class="btn btn-secondary" @click="$emit('close')">Close evidence</button>
+      <button
+        class="btn btn-secondary"
+        @click="$emit('close')"
+      >
+        Close evidence
+      </button>
     </div>
-    <p v-if="relationship.explanation">{{ relationship.explanation }}</p>
+    <p v-if="relationship.explanation">
+      {{ relationship.explanation }}
+    </p>
     <p>
       {{ relationship.review_status }} · {{ relationship.provenance }} ·
       {{
@@ -13,7 +23,10 @@
           : `Candidate relatedness ${relationship.similarity.toFixed(2)}`
       }}
     </p>
-    <section v-if="relationship.assessment?.result" aria-label="Contextual assessment">
+    <section
+      v-if="relationship.assessment?.result"
+      aria-label="Contextual assessment"
+    >
       <p>
         Contextual verdict: {{ relationship.assessment.result.verdict.replaceAll('_', ' ') }} ·
         {{ directionLabel(relationship.assessment.result.direction) }}
@@ -54,10 +67,8 @@
         revision {{ receipt.source_revision }}
       </figcaption>
       <blockquote>{{ receipt.quote }}</blockquote>
-      <small
-        >Source {{ receipt.source_id }} · bytes {{ receipt.start }}–{{ receipt.end }} · recorded
-        {{ sourceTime(receipt.source_id) }}</small
-      >
+      <small>Source {{ receipt.source_id }} · bytes {{ receipt.start }}–{{ receipt.end }} · recorded
+        {{ sourceTime(receipt.source_id) }}</small>
     </figure>
     <p v-if="relationship.conditions?.length">
       Conditions: {{ relationship.conditions.join('; ') }}
@@ -68,24 +79,35 @@
       {{ relationship.goal_criterion_id || 'unresolved' }}
     </p>
     <div class="evidence-actions">
-      <button class="btn btn-primary" :disabled="store.busy" @click="review('confirmed')">
-        Accept</button
-      ><button class="btn btn-secondary" :disabled="store.busy" @click="review('rejected')">
+      <button
+        class="btn btn-primary"
+        :disabled="store.busy"
+        @click="review('confirmed')"
+      >
+        Accept
+      </button><button
+        class="btn btn-secondary"
+        :disabled="store.busy"
+        @click="review('rejected')"
+      >
         Reject
       </button>
     </div>
     <form @submit.prevent="review('confirmed', correction)">
-      <label
-        >Correct relation<select v-model="correction">
-          <option
-            v-for="relation in relations"
-            :key="relation"
-            :disabled="correctionDisabled(relation)"
-          >
-            {{ relation }}
-          </option>
-        </select></label
-      ><button class="btn btn-secondary" :disabled="store.busy">Save correction</button>
+      <label>Correct relation<select v-model="correction">
+        <option
+          v-for="relation in relations"
+          :key="relation"
+          :disabled="correctionDisabled(relation)"
+        >
+          {{ relation }}
+        </option>
+      </select></label><button
+        class="btn btn-secondary"
+        :disabled="store.busy"
+      >
+        Save correction
+      </button>
     </form>
     <p v-if="!hasScopeConditions">
       Equivalent and conflicts corrections require scope conditions in the supporting evidence.

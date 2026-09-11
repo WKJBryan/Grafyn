@@ -3,6 +3,10 @@ mod twin_history;
 use super::shared::{
     preserve_canvas_mutation_error, repair_canvas_trace_error, ModelProviderRoute, ModelRoute,
 };
+use super::working_memory::{
+    build_canvas_messages as build_memory_canvas_messages, compose_system_prompt,
+    memory_for_follow_up, rewrite_retrieval_query,
+};
 use crate::commands::run_retrieval;
 use crate::models::canvas::{
     CanvasSession, ContextMode, DecisionPromptMetadata, PromptRequest, PromptTile, PromptType,
@@ -21,10 +25,6 @@ use crate::AppState;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use super::working_memory::{
-    build_canvas_messages as build_memory_canvas_messages, compose_system_prompt,
-    memory_for_follow_up, rewrite_retrieval_query,
-};
 use twin_history::build_compact_history_messages;
 
 const MIN_RETRIEVAL_SCORE_FOR_NOTES: f32 = 5.0;
