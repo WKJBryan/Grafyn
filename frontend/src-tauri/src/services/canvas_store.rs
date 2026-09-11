@@ -1,6 +1,6 @@
 use crate::models::canvas::{
-    CanvasSession, CanvasViewport, Debate, LLMNodePositionUpdate, PromptTile, SessionCreate,
-    SessionMeta, SessionUpdate, TilePosition, TilePositionUpdate,
+    CanvasSession, CanvasViewport, CanvasWorkingMemory, Debate, LLMNodePositionUpdate, PromptTile,
+    SessionCreate, SessionMeta, SessionUpdate, TilePosition, TilePositionUpdate,
 };
 use crate::services::atomic_io::write_atomic;
 use anyhow::{Context, Result};
@@ -242,11 +242,40 @@ impl CanvasStore {
             tags: create.tags,
             status: "draft".to_string(),
             pinned_note_ids: Vec::new(),
+            working_memory: CanvasWorkingMemory::default(),
+            branch_memories: HashMap::new(),
         };
 
         self.write_session_file(&session)?;
         self.session_cache.insert(id, session.clone());
         Ok(session)
+    }
+
+    pub fn update_branch_memory(
+        &mut self,
+        session_id: &str,
+        branch_key: &str,
+        memory: CanvasWorkingMemory,
+    ) -> Result<()> {
+        let session = self.get_session_mut(session_id)?;
+        session.branch_memories.insert(branch_key.to_string(), memory);
+        session.updated_at = Utc::now();
+        let session = session.clone();
+        self.write_session_file(&session)?;
+        Ok(())
+    }
+
+    pub fn update_working_memory(
+        &mut self,
+        session_id: &str,
+        memory: CanvasWorkingMemory,
+    ) -> Result<()> {
+        let session = self.get_session_mut(session_id)?;
+        session.working_memory = memory;
+        session.updated_at = Utc::now();
+        let session = session.clone();
+        self.write_session_file(&session)?;
+        Ok(())
     }
 
     /// Update an existing session

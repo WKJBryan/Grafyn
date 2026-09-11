@@ -631,6 +631,7 @@ mod tests {
             decision_metadata: None,
             parent_tile_id: parent.map(str::to_string),
             parent_model_id: parent.map(|_| "openai/gpt-4".to_string()),
+            parent_debate_id: None,
             temperature: 0.7,
             max_tokens: None,
             web_search: false,
@@ -669,6 +670,8 @@ mod tests {
             tags: Vec::new(),
             status: "draft".into(),
             pinned_note_ids: Vec::new(),
+            working_memory: crate::models::canvas::CanvasWorkingMemory::default(),
+            branch_memories: std::collections::HashMap::new(),
         }
     }
 

@@ -49,6 +49,7 @@ pub(super) fn build_tile(
         context_mode: ContextMode::default(),
         parent_tile_id: parent_tile_id.map(str::to_string),
         parent_model_id: parent_model_id.map(str::to_string),
+        parent_debate_id: None,
         context_notes: Vec::new(),
         approved_twin_records: Vec::new(),
         candidate_twin_records: Vec::new(),

@@ -58,16 +58,12 @@
     
     <!-- Summary preview in compact view -->
     <div
-      v-if="lastRoundSummary && !isExpanded"
+      v-if="recapPreview && !isExpanded"
       class="conclusion-preview"
     >
-      <div class="conclusion-label">
-        Summary:
+      <div class="conclusion-text recap-text">
+        {{ recapPreview }}
       </div>
-      <div
-        class="conclusion-text"
-        v-html="lastRoundSummary"
-      />
     </div>
     
     <div class="node-footer">
@@ -94,6 +90,13 @@
         @click.stop="toggleContinuePrompt"
       >
         Continue
+      </button>
+      <button
+        v-if="debate.recap"
+        class="continue-btn reply-btn"
+        @click.stop="$emit('reply', debate.id)"
+      >
+        Reply
       </button>
     </div>
 
@@ -241,7 +244,7 @@ const props = defineProps({
   }
 })
 
-const emit = defineEmits(['drag', 'delete', 'expand', 'collapse', 'continue'])
+const emit = defineEmits(['drag', 'delete', 'expand', 'collapse', 'continue', 'reply'])
 
 // Dragging state
 const isDragging = ref(false)
@@ -289,6 +292,13 @@ const displayRounds = computed(() => {
 })
 
 const hasRounds = computed(() => displayRounds.value.length > 0)
+
+const recapPreview = computed(() => {
+  const recap = props.debate.recap?.trim()
+  if (!recap) return null
+  const sentences = recap.split(/(?<=[.!?])\s+/)
+  return sentences.slice(0, 2).join(' ')
+})
 
 const nodeStyle = computed(() => ({
   left: `${props.debate.position.x}px`,

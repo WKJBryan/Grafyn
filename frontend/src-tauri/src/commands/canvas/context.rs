@@ -21,6 +21,10 @@ use crate::AppState;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use super::working_memory::{
+    build_canvas_messages as build_memory_canvas_messages, compose_system_prompt,
+    memory_for_follow_up, rewrite_retrieval_query,
+};
 use twin_history::build_compact_history_messages;
 
 const MIN_RETRIEVAL_SCORE_FOR_NOTES: f32 = 5.0;
@@ -208,11 +212,13 @@ pub(super) async fn resolve_prompt_context(
         let pinned_ids = session.pinned_note_ids.clone();
 
         // Quality gate: note-level retrieval to check if vault has relevant content
-        let retrieval_results = run_retrieval(state, &request.prompt, 5, &pinned_ids)
+        let retrieval_query =
+            rewrite_retrieval_query(&request.prompt, &memory_for_follow_up(session, request));
+        let retrieval_results = run_retrieval(state, &retrieval_query, 5, &pinned_ids)
             .await
             .unwrap_or_default();
 
-        let retrieval_decision = should_use_retrieved_notes(&request.prompt, &retrieval_results);
+        let retrieval_decision = should_use_retrieved_notes(&retrieval_query, &retrieval_results);
         if retrieval_decision != RetrievalDecisionReason::UseRetrievedNotes {
             log::info!(
                 "Canvas knowledge search fallback for prompt {:?}: {:?}",
@@ -226,7 +232,7 @@ pub(super) async fn resolve_prompt_context(
                 candidate_twin_records: Vec::new(),
                 constitution_items: Vec::new(),
                 action_gaps: Vec::new(),
-                system_prompt: request.system_prompt.clone(),
+                system_prompt: compose_system_prompt(session, request, None),
                 twin_context_prompt: None,
                 context_version: None,
                 decision_case_ids: Vec::new(),
@@ -264,10 +270,11 @@ pub(super) async fn resolve_prompt_context(
                 log::info!("Chunk retrieval returned no results, falling back to note-level");
                 return resolve_note_level_context(
                     state,
+                    session,
+                    request,
                     messages,
                     &retrieval_results,
                     &pinned_ids,
-                    &request.system_prompt,
                 )
                 .await;
             }
@@ -305,10 +312,6 @@ pub(super) async fn resolve_prompt_context(
                 .collect();
 
             let note_prompt = build_chunk_context_prompt(&chunks);
-            let system_prompt = match &request.system_prompt {
-                Some(user_sp) if !user_sp.is_empty() => format!("{}\n\n{}", note_prompt, user_sp),
-                _ => note_prompt,
-            };
 
             Ok(ResolvedPromptContext {
                 messages,
@@ -317,7 +320,7 @@ pub(super) async fn resolve_prompt_context(
                 candidate_twin_records: Vec::new(),
                 constitution_items: Vec::new(),
                 action_gaps: Vec::new(),
-                system_prompt: Some(system_prompt),
+                system_prompt: compose_system_prompt(session, request, Some(note_prompt)),
                 twin_context_prompt: None,
                 context_version: None,
                 decision_case_ids: Vec::new(),
@@ -327,10 +330,11 @@ pub(super) async fn resolve_prompt_context(
             log::info!("Canvas using note-level context (chunk retrieval disabled)");
             resolve_note_level_context(
                 state,
+                session,
+                request,
                 messages,
                 &retrieval_results,
                 &pinned_ids,
-                &request.system_prompt,
             )
             .await
         }
@@ -342,7 +346,7 @@ pub(super) async fn resolve_prompt_context(
             candidate_twin_records: Vec::new(),
             constitution_items: Vec::new(),
             action_gaps: Vec::new(),
-            system_prompt: request.system_prompt.clone(),
+            system_prompt: compose_system_prompt(session, request, None),
             twin_context_prompt: None,
             context_version: None,
             decision_case_ids: Vec::new(),
@@ -487,11 +491,6 @@ async fn resolve_twin_prompt_context(
         &request.prompt_type,
         request.decision_metadata.as_ref(),
     );
-    let system_prompt = match &request.system_prompt {
-        Some(user_sp) if !user_sp.is_empty() => format!("{}\n\n{}", twin_prompt, user_sp),
-        _ => twin_prompt.clone(),
-    };
-
     Ok(ResolvedPromptContext {
         messages,
         context_notes,
@@ -499,7 +498,7 @@ async fn resolve_twin_prompt_context(
         candidate_twin_records: selection.candidates,
         constitution_items: selection.constitution_items,
         action_gaps: selection.action_gaps,
-        system_prompt: Some(system_prompt),
+        system_prompt: compose_system_prompt(session, request, Some(twin_prompt.clone())),
         twin_context_prompt: Some(twin_prompt),
         context_version: Some(TWIN_CONTEXT_VERSION.to_string()),
         decision_case_ids,
@@ -528,10 +527,11 @@ async fn fetch_note_contexts(
 /// Fall back to note-level context when chunk retrieval is disabled or returns nothing.
 async fn resolve_note_level_context(
     state: &AppState,
+    session: &CanvasSession,
+    request: &PromptRequest,
     messages: Vec<ChatMessage>,
     retrieval_results: &[RetrievalResult],
     pinned_ids: &[String],
-    user_system_prompt: &Option<String>,
 ) -> Result<ResolvedPromptContext, String> {
     let note_contexts = fetch_note_contexts(state, retrieval_results).await;
 
@@ -547,10 +547,6 @@ async fn resolve_note_level_context(
         .collect();
 
     let note_prompt = build_note_context_prompt(&note_contexts);
-    let system_prompt = match user_system_prompt {
-        Some(user_sp) if !user_sp.is_empty() => format!("{}\n\n{}", note_prompt, user_sp),
-        _ => note_prompt,
-    };
 
     Ok(ResolvedPromptContext {
         messages,
@@ -559,7 +555,7 @@ async fn resolve_note_level_context(
         candidate_twin_records: Vec::new(),
         constitution_items: Vec::new(),
         action_gaps: Vec::new(),
-        system_prompt: Some(system_prompt),
+        system_prompt: compose_system_prompt(session, request, Some(note_prompt)),
         twin_context_prompt: None,
         context_version: None,
         decision_case_ids: Vec::new(),
@@ -571,9 +567,10 @@ fn build_canvas_messages(
     session: &CanvasSession,
     request: &PromptRequest,
 ) -> Result<Vec<ChatMessage>, String> {
+    if request.parent_debate_id.is_some() {
+        return build_memory_canvas_messages(session, request);
+    }
     match request.context_mode {
-        ContextMode::FullHistory => build_full_history_messages(session, request),
-        ContextMode::Compact => build_compact_history_messages(session, request),
         ContextMode::TwinHistory => {
             if request.parent_tile_id.is_none() && request.parent_model_id.is_none() {
                 Ok(vec![ChatMessage {
@@ -584,10 +581,7 @@ fn build_canvas_messages(
                 build_compact_history_messages(session, request)
             }
         }
-        _ => Ok(vec![ChatMessage {
-            role: "user".to_string(),
-            content: request.prompt.clone(),
-        }]),
+        _ => build_memory_canvas_messages(session, request),
     }
 }
 

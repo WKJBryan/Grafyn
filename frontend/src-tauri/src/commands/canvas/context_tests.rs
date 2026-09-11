@@ -18,6 +18,8 @@ fn build_session(tiles: Vec<PromptTile>) -> CanvasSession {
         tags: Vec::new(),
         status: "draft".to_string(),
         pinned_note_ids: Vec::new(),
+        working_memory: crate::models::canvas::CanvasWorkingMemory::default(),
+        branch_memories: std::collections::HashMap::new(),
     }
 }
 
@@ -41,6 +43,7 @@ fn build_request(
         decision_metadata: None,
         parent_tile_id: Some(parent_tile_id.to_string()),
         parent_model_id: Some(parent_model_id.to_string()),
+        parent_debate_id: None,
         temperature: 0.7,
         max_tokens: None,
         web_search: false,
@@ -64,6 +67,7 @@ fn build_root_request(prompt: &str, context_mode: ContextMode) -> PromptRequest 
         decision_metadata: None,
         parent_tile_id: None,
         parent_model_id: None,
+        parent_debate_id: None,
         temperature: 0.7,
         max_tokens: None,
         web_search: false,

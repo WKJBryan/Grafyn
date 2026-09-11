@@ -246,6 +246,7 @@
           @expand="expandDebate"
           @collapse="collapseDebate"
           @continue="handleDebateContinue"
+          @reply="handleDebateReply"
         />
       </div>
     </div>
@@ -1453,7 +1454,27 @@ async function handlePromptSubmit({
   const activeBranchContext = branchContext.value
 
   try {
-    if (activeBranchContext) {
+    if (activeBranchContext?.parentDebateId) {
+      await canvasStore.sendPrompt(
+        prompt,
+        models,
+        systemPrompt,
+        temperature,
+        maxTokens,
+        null,
+        null,
+        contextMode || 'none',
+        twinAnswerMode || 'simulation',
+        webSearch || false,
+        undefined,
+        promptType,
+        decisionMetadata,
+        reasoningEffort,
+        selectedTwinLlmProvider,
+        null,
+        activeBranchContext.parentDebateId
+      )
+    } else if (activeBranchContext) {
       // Branching from a tile
       await canvasStore.branchFromResponse(
         activeBranchContext.parentTileId,
@@ -1554,7 +1575,7 @@ async function handleStartDebate() {
   }
 
   try {
-    await canvasStore.startDebate(Array.from(tileIds), Array.from(models), 'auto', 3)
+    await canvasStore.startDebate(Array.from(tileIds), Array.from(models), 'auto', 2)
     clearSelection()
   } catch (err) {
     console.error('Failed to start debate:', err)
@@ -1564,6 +1585,15 @@ async function handleStartDebate() {
     }
     setTimeout(() => { saveMessage.value = null }, 5000)
   }
+}
+
+function handleDebateReply(debateId) {
+  const debate = canvasStore.debates.find(item => item.id === debateId)
+  branchContext.value = {
+    parentDebateId: debateId,
+    parentContent: debate?.recap || ''
+  }
+  showPromptDialog.value = true
 }
 
 async function handleDebateContinue(debateId, prompt) {
