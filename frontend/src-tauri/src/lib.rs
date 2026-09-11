@@ -916,19 +916,6 @@ fn register_desktop_commands(builder: tauri::Builder<tauri::Wry>) -> tauri::Buil
         commands::image_generation::export_generated_image,
         commands::image_generation::save_generated_image,
         commands::image_generation::load_generated_image,
-        #[cfg(feature = "twin-eval-lab")]
-        // Twin evaluation commands
-        commands::twin_eval::get_twin_eval_model_matrix,
-        #[cfg(feature = "twin-eval-lab")]
-        commands::twin_eval::preview_twin_eval_input,
-        #[cfg(feature = "twin-eval-lab")]
-        commands::twin_eval::preview_twin_eval_context,
-        #[cfg(feature = "twin-eval-lab")]
-        commands::twin_eval::run_twin_eval_lab,
-        #[cfg(feature = "twin-eval-lab")]
-        commands::twin_eval::run_twin_eval_lab_stream,
-        #[cfg(feature = "twin-eval-lab")]
-        commands::twin_eval::export_twin_eval_results,
         // Feedback commands
         commands::feedback::submit_feedback,
         commands::feedback::get_system_info,

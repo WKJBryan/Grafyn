@@ -9,7 +9,6 @@ import {
   setTransport,
 } from '@/api/transport'
 import { notes } from '@/api/client'
-import { twinEval } from '@/lab/api'
 import { CapabilityUnavailableError, assertCapability } from '@/platform/capabilities'
 import { useBootStore } from '@/stores/boot'
 import { useCanvasStore } from '@/stores/canvas'
@@ -55,15 +54,6 @@ describe('frontend transport seam', () => {
       options: { multiple: false },
     })
     expect(showMainWindow).toHaveBeenCalledOnce()
-  })
-
-  it('routes the desktop-only lab API through the injected invoke operation', async () => {
-    const invoke = vi.fn().mockResolvedValue([])
-    setTransport(createTransport({ invoke }))
-
-    await twinEval.getModelMatrix()
-
-    expect(invoke).toHaveBeenCalledWith('get_twin_eval_model_matrix', {})
   })
 
   it('uses the active runtime when asserting a capability', () => {

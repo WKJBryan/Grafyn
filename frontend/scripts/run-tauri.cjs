@@ -78,13 +78,6 @@ function isMobileTarget(target) {
   return target.includes('android') || target.includes('ios')
 }
 
-function featureList(args) {
-  return findOption(args, '--features')
-    .split(',')
-    .map((feature) => feature.trim())
-    .filter(Boolean)
-}
-
 function main() {
   const [subcommand, ...tauriArgs] = process.argv.slice(2)
   if (!subcommand || !['build', 'dev'].includes(subcommand)) {
@@ -93,19 +86,6 @@ function main() {
 
   const target = findOption(tauriArgs, '--target')
   const config = findOption(tauriArgs, '--config')
-  const features = featureList(tauriArgs)
-  const labConfig = config.endsWith('tauri.lab.conf.json')
-  const labFeature = features.includes('twin-eval-lab')
-
-  if (labConfig !== labFeature) {
-    fail('Twin Eval lab builds require both tauri.lab.conf.json and the twin-eval-lab feature')
-  }
-  if (labFeature && isMobileTarget(target)) {
-    fail('Twin Eval lab builds are desktop-only')
-  }
-  if (labFeature) {
-    process.env.GRAFYN_TWIN_EVAL_LAB = '1'
-  }
 
   const prepareArgs = []
   if (subcommand === 'build') {
@@ -140,7 +120,7 @@ function main() {
     tauriArgs.push('--config', 'src-tauri/tauri.desktop.conf.json')
   }
 
-  if (!labFeature && !isMobileTarget(target)) {
+  if (!isMobileTarget(target)) {
     run(process.execPath, [path.join(__dirname, 'prepare-sidecar.cjs'), ...prepareArgs])
   }
   const tauriEntrypoint = path.join(

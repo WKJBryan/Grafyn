@@ -2,32 +2,16 @@ import { defineConfig } from 'vite'
 import vue from '@vitejs/plugin-vue'
 import { createRequire } from 'node:module'
 import { fileURLToPath, URL } from 'node:url'
-import {
-  assertTwinEvalIsolation,
-  resolveViteInputs,
-} from './scripts/twin-eval-isolation.mjs'
+import { resolve } from 'node:path'
 
-const twinEvalLabEnabled = process.env.GRAFYN_TWIN_EVAL_LAB === '1'
 const require = createRequire(import.meta.url)
 const pkg = require('./package.json')
 
-function twinEvalIsolationPlugin() {
-  return {
-    name: 'grafyn-twin-eval-isolation',
-    generateBundle(_options, bundle) {
-      if (!twinEvalLabEnabled) {
-        assertTwinEvalIsolation(bundle)
-      }
-    },
-  }
-}
-
 // https://vitejs.dev/config/
 export default defineConfig({
-  plugins: [vue(), twinEvalIsolationPlugin()],
+  plugins: [vue()],
   define: {
     __APP_VERSION__: JSON.stringify(pkg.version),
-    __TWIN_EVAL_LAB__: JSON.stringify(twinEvalLabEnabled),
   },
   resolve: {
     alias: {
@@ -53,7 +37,9 @@ export default defineConfig({
     // Produce sourcemaps for debug builds
     sourcemap: !!process.env.TAURI_ENV_DEBUG,
     rollupOptions: {
-      input: resolveViteInputs(__dirname, twinEvalLabEnabled),
+      input: {
+        main: resolve(__dirname, 'index.html'),
+      },
       output: {
         // vite 8 bundles with Rolldown, which only accepts the function form of
         // manualChunks (the object map form is Rollup-only and throws).

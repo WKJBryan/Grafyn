@@ -1,5 +1,7 @@
 # Grafyn Companion-First Implementation Plan
 
+> Historical plan. Twin Eval lab (`twin-eval-lab`, `lab.html`, `twin_eval` commands) was later removed from the product and is not part of Grafyn.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Use superpowers:test-driven-development for every behavior change, superpowers:systematic-debugging for unexpected failures, and superpowers:verification-before-completion before any completion claim.
 
 **Goal:** Turn Grafyn into a verified local-first desktop/Android companion and data-collection layer for digital twins, with a bio-inspired governed event spine, contextual temporal state, explainable per-use-case attention, an open E2EE sync foundation, and no regression to the wide desktop app.

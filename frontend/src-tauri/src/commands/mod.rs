@@ -41,8 +41,6 @@ pub mod search;
 pub mod settings;
 pub mod sync;
 pub mod twin;
-#[cfg(feature = "twin-eval-lab")]
-pub mod twin_eval;
 pub mod twin_state;
 pub mod zettelkasten;
 
@@ -419,7 +417,6 @@ mod root_epoch_source_guards {
             (include_str!("canvas/streaming.rs"), "Canvas streaming", 3),
             (include_str!("canvas/debate.rs"), "Canvas debate", 2),
             (include_str!("zettelkasten.rs"), "link application", 1),
-            (include_str!("twin_eval.rs"), "Twin evaluation", 2),
         ] {
             let captures = source.matches("capture_root_epoch").count()
                 + source.matches("authority().clone()").count();
@@ -490,16 +487,6 @@ mod root_epoch_source_guards {
                 "Canvas debate must carry its exact post-mutation authority via {required}"
             );
         }
-
-        let twin_eval = include_str!("twin_eval.rs");
-        assert!(
-            twin_eval.matches("acquire_derived_root_epoch").count() >= 2,
-            "Twin evaluation must validate ready derived input before network work"
-        );
-        assert!(
-            twin_eval.matches(".finish(state.inner()).await?").count() >= 2,
-            "Twin evaluation must discard stale derived input before network work"
-        );
 
         let distill = include_str!("distill.rs");
         for required in [

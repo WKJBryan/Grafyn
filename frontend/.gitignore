@@ -32,6 +32,3 @@ dist-ssr
 build
 .cache
 src-tauri/gen/schemas/
-
-# Local Twin Eval model cache and generated manifests
-twin-eval-models/

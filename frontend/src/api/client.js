@@ -206,7 +206,6 @@ export const twin = {
   runConstitutionInference: () => invoke('run_constitution_inference', {}),
 }
 
-// Twin Evaluation API
 // Feedback API
 export const feedback = {
   submit: (data) => invoke('submit_feedback', { feedback: data }),

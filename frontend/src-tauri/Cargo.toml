@@ -134,7 +134,6 @@ desktop-process = ["tauri-app", "dep:tauri-plugin-process"]
 desktop-updater = ["tauri-app", "dep:tauri-plugin-updater"]
 custom-protocol = ["tauri-app", "tauri/custom-protocol"]
 mcp = ["dep:rmcp", "dep:schemars", "dep:clap"]
-twin-eval-lab = ["tauri-app"]
 e2e-test-runtime = [
     "tauri-app",
     "tauri/test",
