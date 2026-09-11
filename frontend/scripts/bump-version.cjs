@@ -57,15 +57,6 @@ const files = [
     },
   },
   {
-    rel: 'src-tauri/tauri.lab.conf.json',
-    update(content) {
-      const json = JSON.parse(content);
-      const old = json.version;
-      json.version = version;
-      return { old, content: JSON.stringify(json, null, 2) + '\n' };
-    },
-  },
-  {
     rel: 'src-tauri/Cargo.toml',
     update(content) {
       const match = content.match(/^version\s*=\s*"([^"]+)"/m);

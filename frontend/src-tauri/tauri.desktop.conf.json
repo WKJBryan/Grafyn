@@ -7,7 +7,7 @@
         "fullscreen": false,
         "height": 800,
         "resizable": true,
-        "title": "Grafyn v0.3.0",
+        "title": "Grafyn v0.4.0",
         "width": 1200,
         "minWidth": 800,
         "minHeight": 600,
@@ -17,13 +17,22 @@
       }
     ],
     "security": {
-      "capabilities": ["desktop"]
+      "capabilities": [
+        "desktop"
+      ]
     }
   },
   "bundle": {
     "createUpdaterArtifacts": "v1Compatible",
-    "externalBin": ["binaries/grafyn-mcp"],
-    "targets": ["nsis", "dmg", "deb", "appimage"]
+    "externalBin": [
+      "binaries/grafyn-mcp"
+    ],
+    "targets": [
+      "nsis",
+      "dmg",
+      "deb",
+      "appimage"
+    ]
   },
   "plugins": {
     "updater": {

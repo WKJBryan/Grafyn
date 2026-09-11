@@ -19,7 +19,6 @@ const releaseManifestFiles = [
   'frontend/src-tauri/Cargo.lock',
   'frontend/src-tauri/tauri.conf.json',
   'frontend/src-tauri/tauri.desktop.conf.json',
-  'frontend/src-tauri/tauri.lab.conf.json',
 ]
 
 function fail(message, details = '') {

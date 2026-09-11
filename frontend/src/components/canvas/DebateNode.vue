@@ -56,7 +56,6 @@
       </div>
     </div>
     
-    <!-- Summary preview in compact view -->
     <div
       v-if="recapPreview && !isExpanded"
       class="conclusion-preview"
@@ -149,7 +148,7 @@
       @wheel.stop
     >
       <div class="expanded-header">
-        <h4>Debate Rounds ({{ displayRounds.length }})</h4>
+        <h4>The fight ({{ displayRounds.length }})</h4>
         <button
           class="close-btn"
           @click.stop="toggleExpand"
@@ -159,6 +158,12 @@
             :size="14"
           />
         </button>
+      </div>
+      <div
+        v-if="debate.recap"
+        class="recap-block"
+      >
+        {{ debate.recap }}
       </div>
       <div class="rounds-container">
         <div
@@ -306,27 +311,6 @@ const nodeStyle = computed(() => ({
   width: `${props.debate.position.width || 280}px`,
   minHeight: `${props.debate.position.height || 200}px`
 }))
-
-// Get a summary from the last round for the compact view
-const lastRoundSummary = computed(() => {
-  if (!hasRounds.value) return null
-
-  const rounds = displayRounds.value
-  const lastRound = rounds[rounds.length - 1]
-  if (!lastRound) return null
-
-  // Handle both object format and other formats
-  const responses = getRoundResponses(lastRound)
-  const modelIds = Object.keys(responses)
-  if (modelIds.length === 0) return null
-
-  // Get the first model's response as summary
-  const firstResponse = responses[modelIds[0]]
-  if (!firstResponse) return null
-
-  // Show full content (scrollable in UI)
-  return renderMarkdown(firstResponse.content || firstResponse)
-})
 
 // Methods
 function toggleExpand() {
@@ -723,6 +707,19 @@ onBeforeUnmount(() => {
   border-color: var(--accent-green);
   color: var(--accent-green);
   background: color-mix(in srgb, var(--accent-green) 10%, transparent);
+}
+
+.recap-block {
+  margin: 0 var(--spacing-md) var(--spacing-md);
+  padding: var(--spacing-md);
+  font-size: 0.875rem;
+  line-height: 1.45;
+  color: var(--text-primary);
+  white-space: pre-wrap;
+}
+
+.recap-text {
+  white-space: pre-wrap;
 }
 
 /* Continue-debate prompt overlay */
