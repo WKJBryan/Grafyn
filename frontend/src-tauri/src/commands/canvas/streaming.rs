@@ -1,17 +1,22 @@
-use super::context::{resolve_prompt_context, run_sealed_twin_prediction, TWIN_CONTEXT_VERSION};
-use super::working_memory::spawn_working_memory_compile;
-use super::shared::{
-    append_canvas_trace, effective_model_ids, resolve_model_route, ModelProviderRoute,
+use super::context::{
+    fail_requested_prediction_if_same_root, resolve_prompt_context, run_sealed_twin_prediction,
+    TWIN_CONTEXT_VERSION,
 };
+use super::shared::{
+    append_canvas_trace_expecting_authority, effective_model_ids, is_vault_context_prompt,
+    preserve_canvas_mutation_error, repair_canvas_trace_error, resolve_model_route,
+    CanvasTraceMutationError, ModelProviderRoute,
+};
+use super::working_memory::spawn_working_memory_compile;
 use crate::models::canvas::{
-    AddModelsRequest, CanvasStreamEvent, ModelResponse, PromptRequest, PromptTile, PromptType,
-    ResponseStatus, TilePosition,
+    AddModelsRequest, CanvasStreamEvent, ContextMode, ModelResponse, PromptRequest, PromptTile,
+    PromptType, ResponseStatus, TilePosition, TwinAnswerMode,
 };
 use crate::models::twin::{
     DecisionEpisodeCreate, PrimitiveDecisionAssessment, ReflectionCardCreate, TraceEventType,
 };
-use crate::services::twin::TwinStore;
 use crate::services::openrouter::StreamUpdate;
+use crate::services::twin::TwinStore;
 use crate::AppState;
 use chrono::Utc;
 use futures::StreamExt;
@@ -19,10 +24,133 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tauri::State;
+use tauri::{Emitter, State};
 use tokio::sync::RwLock;
 
 const EMPTY_MODEL_RESPONSE_ERROR: &str = "No response returned from model";
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CanvasEventSinkError;
+
+pub(crate) trait CanvasEventSink: Clone + Send + Sync + 'static {
+    fn emit_canvas(&self, event: CanvasStreamEvent) -> Result<(), CanvasEventSinkError>;
+}
+
+impl CanvasEventSink for tauri::WebviewWindow {
+    fn emit_canvas(&self, event: CanvasStreamEvent) -> Result<(), CanvasEventSinkError> {
+        tauri::Emitter::emit(self, "canvas-stream", event).map_err(|_| CanvasEventSinkError)
+    }
+}
+
+#[cfg(any(test, feature = "e2e-test-runtime"))]
+const BUFFERED_CANVAS_EVENT_LIMIT: usize = 256;
+#[cfg(any(test, feature = "e2e-test-runtime"))]
+const BUFFERED_CANVAS_BYTE_LIMIT: usize = 1024 * 1024;
+
+#[cfg(any(test, feature = "e2e-test-runtime"))]
+#[derive(Clone)]
+pub(crate) struct BufferedCanvasEventSink {
+    inner: Arc<std::sync::Mutex<BufferedCanvasEventState>>,
+    activity: Arc<tokio::sync::Notify>,
+    max_events: usize,
+    max_bytes: usize,
+}
+
+#[cfg(any(test, feature = "e2e-test-runtime"))]
+#[derive(Default)]
+struct BufferedCanvasEventState {
+    events: std::collections::VecDeque<(CanvasStreamEvent, usize)>,
+    total_bytes: usize,
+    dropped_events: usize,
+}
+
+#[cfg(any(test, feature = "e2e-test-runtime"))]
+pub(crate) struct BufferedCanvasEventBatch {
+    pub(crate) events: Vec<CanvasStreamEvent>,
+    pub(crate) total_bytes: usize,
+    pub(crate) dropped_events: usize,
+}
+
+#[cfg(any(test, feature = "e2e-test-runtime"))]
+impl BufferedCanvasEventSink {
+    pub(crate) fn new() -> Self {
+        Self::with_limits(BUFFERED_CANVAS_EVENT_LIMIT, BUFFERED_CANVAS_BYTE_LIMIT)
+    }
+
+    fn with_limits(max_events: usize, max_bytes: usize) -> Self {
+        Self {
+            inner: Arc::new(std::sync::Mutex::new(BufferedCanvasEventState::default())),
+            activity: Arc::new(tokio::sync::Notify::new()),
+            max_events,
+            max_bytes,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_limits_for_tests(max_events: usize, max_bytes: usize) -> Self {
+        Self::with_limits(max_events, max_bytes)
+    }
+
+    pub(crate) fn drain(&self) -> BufferedCanvasEventBatch {
+        let mut state = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        let events = std::mem::take(&mut state.events)
+            .into_iter()
+            .map(|(event, _)| event)
+            .collect();
+        let total_bytes = std::mem::take(&mut state.total_bytes);
+        let dropped_events = std::mem::take(&mut state.dropped_events);
+        BufferedCanvasEventBatch {
+            events,
+            total_bytes,
+            dropped_events,
+        }
+    }
+
+    pub(crate) async fn wait_for_activity(&self) {
+        loop {
+            let notified = self.activity.notified();
+            let has_activity = {
+                let state = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+                !state.events.is_empty() || state.dropped_events > 0
+            };
+            if has_activity {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+#[cfg(any(test, feature = "e2e-test-runtime"))]
+impl Default for BufferedCanvasEventSink {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(any(test, feature = "e2e-test-runtime"))]
+impl CanvasEventSink for BufferedCanvasEventSink {
+    fn emit_canvas(&self, event: CanvasStreamEvent) -> Result<(), CanvasEventSinkError> {
+        let event_bytes = serde_json::to_vec(&event)
+            .map_err(|_| CanvasEventSinkError)?
+            .len();
+        let mut state = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        let next_bytes = state.total_bytes.checked_add(event_bytes);
+        if state.events.len() >= self.max_events
+            || next_bytes.is_none_or(|bytes| bytes > self.max_bytes)
+        {
+            state.dropped_events = state.dropped_events.saturating_add(1);
+            drop(state);
+            self.activity.notify_one();
+            return Ok(());
+        }
+        state.events.push_back((event, event_bytes));
+        state.total_bytes = next_bytes.expect("bounded event bytes were checked");
+        drop(state);
+        self.activity.notify_one();
+        Ok(())
+    }
+}
 
 // LLM node layout constants
 const LLM_NODE_WIDTH: f64 = 280.0;
@@ -32,22 +160,44 @@ const LLM_NODE_X_GAP: f64 = 80.0;
 
 type StreamedResponseUpdate = (String, String, ResponseStatus, Option<String>, Option<f64>);
 
-fn no_cost_stream<S>(stream: S) -> std::pin::Pin<Box<dyn futures::Stream<Item = anyhow::Result<StreamUpdate>> + Send>>
+fn no_cost_stream<S>(
+    stream: S,
+) -> std::pin::Pin<Box<dyn futures::Stream<Item = anyhow::Result<StreamUpdate>> + Send>>
 where
     S: futures::Stream<Item = anyhow::Result<String>> + Send + 'static,
 {
-    Box::pin(stream.map(|result| result.map(|content| StreamUpdate { content, cost_usd: None })))
+    Box::pin(stream.map(|result| {
+        result.map(|content| StreamUpdate {
+            content,
+            cost_usd: None,
+        })
+    }))
 }
 
 /// Send a prompt to multiple models with streaming responses via Tauri events.
 /// Returns the tile_id immediately; actual responses stream via "canvas-stream" events.
 #[tauri::command]
 pub async fn send_prompt(
-    window: tauri::Window,
+    window: tauri::WebviewWindow,
     session_id: String,
-    mut request: PromptRequest,
+    request: PromptRequest,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
+    send_prompt_with_sink(window, session_id, request, state.inner()).await
+}
+
+pub(crate) async fn send_prompt_with_sink<S: CanvasEventSink>(
+    window: S,
+    session_id: String,
+    mut request: PromptRequest,
+    state: &AppState,
+) -> Result<String, String> {
+    let root_ticket = if is_vault_context_prompt(&request.prompt_type, &request.context_mode) {
+        crate::commands::acquire_derived_root_epoch(state).await?
+    } else {
+        crate::commands::acquire_root_epoch(state).await?
+    };
+    let input_root_epoch = root_ticket.authority().clone();
     let tile_id = uuid::Uuid::new_v4().to_string();
     let now = Utc::now();
     let model_route = {
@@ -59,12 +209,33 @@ pub async fn send_prompt(
             settings.get(),
         )?
     };
+    if model_route.provider == ModelProviderRoute::Ollama {
+        state.ollama_service()?;
+    }
     request.models = effective_model_ids(&model_route, &request.models);
+    let response_provider = model_route.provider.provider_label().to_string();
+    let response_provenance = if matches!(
+        request.context_mode,
+        ContextMode::Twin | ContextMode::TwinHistory
+    ) && request.twin_answer_mode == TwinAnswerMode::Simulation
+    {
+        "twin_simulation".to_string()
+    } else {
+        model_route.provider.provenance_label(false).to_string()
+    };
     let session = {
         let mut store = state.canvas_store.write().await;
+        store.reload_authoritative_state();
         store.get_session(&session_id).map_err(|e| e.to_string())?
     };
-    let resolved_context = resolve_prompt_context(state.inner(), &session, &request).await?;
+    let resolved_context =
+        resolve_prompt_context(state, &session, &request, None, &model_route).await?;
+    root_ticket.validate(state).await?;
+    let persisted_twin_provider = persisted_twin_provider(
+        &request.context_mode,
+        request.twin_llm_provider.clone(),
+        &model_route.provider,
+    );
     let decision_episode_id = if request.prompt_type == PromptType::Decision {
         Some(uuid::Uuid::new_v4().to_string())
     } else {
@@ -91,6 +262,8 @@ pub async fn send_prompt(
                 error: None,
                 tokens_used: None,
                 cost_usd: None,
+                provider: Some(response_provider.clone()),
+                provenance: Some(response_provenance.clone()),
                 created_at: now,
                 position: TilePosition {
                     x: llm_start_x,
@@ -119,9 +292,11 @@ pub async fn send_prompt(
         context_notes: resolved_context.context_notes.clone(),
         approved_twin_records: resolved_context.approved_twin_records.clone(),
         candidate_twin_records: resolved_context.candidate_twin_records.clone(),
+        twin_evidence_snapshot: resolved_context.twin_evidence_snapshot.clone(),
+        twin_relationship_variant: request.twin_relationship_variant.clone(),
         twin_answer_mode: request.twin_answer_mode.clone(),
         twin_context_policy: request.twin_context_policy.clone(),
-        twin_llm_provider: request.twin_llm_provider.clone(),
+        twin_llm_provider: persisted_twin_provider,
         decision_metadata: request.decision_metadata.clone(),
         decision_episode_id: decision_episode_id.clone(),
         web_search: request.web_search,
@@ -129,93 +304,190 @@ pub async fn send_prompt(
         reasoning_effort: request.reasoning_effort.clone(),
     };
 
-    // Save tile to session
-    {
-        let mut store = state.canvas_store.write().await;
-        store
-            .add_tile(&session_id, tile.clone())
-            .map_err(|e| e.to_string())?;
-    }
-
-    if let Some(decision_episode_id) = decision_episode_id.clone() {
+    let decision_create = decision_episode_id.clone().map(|decision_episode_id| {
         let decision_metadata = request.decision_metadata.clone().unwrap_or_default();
         let decision = if decision_metadata.decision.trim().is_empty() {
             request.prompt.clone()
         } else {
             decision_metadata.decision
         };
-        let mut twin_store = state.twin_store.write().await;
-        twin_store
-            .record_decision_episode(DecisionEpisodeCreate {
-                id: decision_episode_id,
-                session_id: session_id.clone(),
-                tile_id: tile_id.clone(),
-                decision,
-                options: decision_metadata.options,
-                stakes: decision_metadata.stakes,
-                initial_leaning: decision_metadata.initial_leaning,
-                review_date: decision_metadata.review_date,
-                primitive_assessment: PrimitiveDecisionAssessment::default(),
-                // Stamped on every decision episode — including non-Twin
-                // context tiles — so attribution survives a failed or absent
-                // hidden prediction call.
-                context_version: Some(
-                    resolved_context
-                        .context_version
-                        .clone()
-                        .unwrap_or_else(|| TWIN_CONTEXT_VERSION.to_string()),
-                ),
-            })
-            .map_err(|error| error.to_string())?;
-    }
+        DecisionEpisodeCreate {
+            id: decision_episode_id,
+            session_id: session_id.clone(),
+            tile_id: tile_id.clone(),
+            decision,
+            options: decision_metadata.options,
+            stakes: decision_metadata.stakes,
+            initial_leaning: decision_metadata.initial_leaning,
+            review_date: decision_metadata.review_date,
+            primitive_assessment: PrimitiveDecisionAssessment::default(),
+            // Stamped on every decision episode — including non-Twin
+            // context tiles — so attribution survives a failed or absent
+            // hidden prediction call.
+            context_version: Some(
+                resolved_context
+                    .context_version
+                    .clone()
+                    .unwrap_or_else(|| TWIN_CONTEXT_VERSION.to_string()),
+            ),
+        }
+    });
 
-    append_canvas_trace(
-        state.twin_store.clone(),
-        &session_id,
-        TraceEventType::PromptSubmitted,
-        json!({
-            "tile_id": tile.id.clone(),
-            "prompt_type": tile.prompt_type.clone(),
-            "decision_episode_id": tile.decision_episode_id.clone(),
-            "decision_metadata": tile.decision_metadata.clone(),
-            "prompt": tile.prompt.clone(),
-            "models": tile.models.clone(),
-            "context_mode": tile.context_mode.clone(),
-            "parent_tile_id": tile.parent_tile_id.clone(),
-            "parent_model_id": tile.parent_model_id.clone(),
-            "context_note_ids": tile.context_notes.iter().map(|note| note.id.clone()).collect::<Vec<_>>(),
-            "twin_answer_mode": tile.twin_answer_mode.clone(),
-            "approved_twin_record_ids": tile.approved_twin_records.iter().map(|record| record.id.clone()).collect::<Vec<_>>(),
-            "candidate_twin_record_ids": tile.candidate_twin_records.iter().map(|record| record.id.clone()).collect::<Vec<_>>(),
-            "constitution_item_ids": resolved_context.constitution_items.iter().map(|item| item.id.clone()).collect::<Vec<_>>(),
-            "action_gap_ids": resolved_context.action_gaps.iter().map(|gap| gap.id.clone()).collect::<Vec<_>>(),
-            "context_version": resolved_context.context_version.clone(),
-            "decision_case_ids": resolved_context.decision_case_ids.clone(),
-            "web_search": tile.web_search,
-            "web_search_max_results": tile.web_search_max_results,
-        }),
+    // A decision tile, its decision episode, and the decision trace are one
+    // coordinated mutation. Ordinary prompts use the same Canvas boundary.
+    let initial_commit = match {
+        let mut store = state.canvas_store.write().await;
+        if let Some(create) = decision_create {
+            let mut twin_store = state.twin_store.write().await;
+            store
+                .add_decision_tile_expecting_authority(
+                    &session_id,
+                    tile.clone(),
+                    &mut twin_store,
+                    create,
+                    input_root_epoch.clone(),
+                )
+                .map(|(_, commit)| commit)
+        } else {
+            store
+                .add_tile_expecting_authority(&session_id, tile.clone(), input_root_epoch.clone())
+                .map(|(_, commit)| commit)
+        }
+    } {
+        Ok(commit) => commit,
+        Err(error) => {
+            let error = preserve_canvas_mutation_error(error);
+            drop(root_ticket);
+            crate::commands::acknowledge_reported_repair(
+                repair_canvas_trace_error(state, &error, "Canvas prompt").await,
+            );
+            return Err(error.to_string());
+        }
+    };
+    let mut root_epoch = initial_commit.authority_token.clone().ok_or_else(|| {
+        "Canvas prompt mutation did not advance the content authority generation".to_string()
+    })?;
+    let mut repair_commit = initial_commit.clone();
+
+    if decision_episode_id.is_none() {
+        let trace_commit = match append_canvas_trace_expecting_authority(
+            state.twin_store.clone(),
+            &session_id,
+            TraceEventType::PromptSubmitted,
+            json!({
+                "tile_id": tile.id.clone(),
+                "prompt_type": tile.prompt_type.clone(),
+                "decision_episode_id": tile.decision_episode_id.clone(),
+                "decision_metadata": tile.decision_metadata.clone(),
+                "prompt": tile.prompt.clone(),
+                "models": tile.models.clone(),
+                "context_mode": tile.context_mode.clone(),
+                "parent_tile_id": tile.parent_tile_id.clone(),
+                "parent_model_id": tile.parent_model_id.clone(),
+                "context_note_ids": tile.context_notes.iter().map(|note| note.id.clone()).collect::<Vec<_>>(),
+                "twin_answer_mode": tile.twin_answer_mode.clone(),
+                "approved_twin_record_ids": tile.approved_twin_records.iter().map(|record| record.id.clone()).collect::<Vec<_>>(),
+                "candidate_twin_record_ids": tile.candidate_twin_records.iter().map(|record| record.id.clone()).collect::<Vec<_>>(),
+                "constitution_item_ids": resolved_context.constitution_items.iter().map(|item| item.id.clone()).collect::<Vec<_>>(),
+                "action_gap_ids": resolved_context.action_gaps.iter().map(|gap| gap.id.clone()).collect::<Vec<_>>(),
+                "context_version": resolved_context.context_version.clone(),
+                "decision_case_ids": resolved_context.decision_case_ids.clone(),
+                "web_search": tile.web_search,
+                "web_search_max_results": tile.web_search_max_results,
+            }),
+            root_epoch,
+        )
+        .await
+        {
+            Ok(commit) => commit,
+            Err(error) => {
+                let error = error.with_fallback_commit(initial_commit.clone());
+                crate::commands::acknowledge_reported_repair(
+                    repair_canvas_trace_error(state, &error, "Canvas prompt").await,
+                );
+                drop(root_ticket);
+                let _ = window.emit_canvas(
+                    CanvasStreamEvent::TileCreated {
+                        session_id: session_id.clone(),
+                        tile: tile.clone(),
+                    },
+                );
+                for model_id in &request.models {
+                    emit_canvas_error(
+                        &window,
+                        &session_id,
+                        &tile_id,
+                        model_id,
+                        &format!("Prompt saved, but its audit trace failed: {error}"),
+                    );
+                }
+                return Ok(tile_id);
+            }
+        };
+        root_epoch = trace_commit.authority_token.clone().ok_or_else(|| {
+            "Canvas prompt trace did not advance the content authority generation".to_string()
+        })?;
+        repair_commit = trace_commit;
+    }
+    root_epoch = match crate::commands::repair_after_authority_mutation(
+        state,
+        &repair_commit,
+        "Canvas prompt",
     )
-    .await;
+    .await
+    {
+        crate::commands::PostAuthorityRepair::Ready(epoch) => epoch,
+        crate::commands::PostAuthorityRepair::Unavailable(warning) => {
+            drop(root_ticket);
+            if let Some(episode_id) = decision_episode_id.as_deref() {
+                fail_requested_prediction_if_same_root(
+                    state,
+                    &state.twin_store,
+                    episode_id,
+                    &root_epoch,
+                    "initial Canvas repair",
+                )
+                .await;
+            }
+            let _ = window.emit_canvas(CanvasStreamEvent::TileCreated {
+                session_id: session_id.clone(),
+                tile: tile.clone(),
+            });
+            for model_id in &request.models {
+                emit_canvas_error(&window, &session_id, &tile_id, model_id, &warning.message);
+            }
+            return Ok(tile_id);
+        }
+        crate::commands::PostAuthorityRepair::NotRequired => {
+            drop(root_ticket);
+            if let Some(episode_id) = decision_episode_id.as_deref() {
+                fail_requested_prediction_if_same_root(
+                    state,
+                    &state.twin_store,
+                    episode_id,
+                    &root_epoch,
+                    "missing initial Canvas authority",
+                )
+                .await;
+            }
+            return Ok(tile_id);
+        }
+    };
+    drop(root_ticket);
 
     // Emit TileCreated event
-    let _ = window.emit(
-        "canvas-stream",
-        CanvasStreamEvent::TileCreated {
-            session_id: session_id.clone(),
-            tile: tile.clone(),
-        },
-    );
+    let _ = window.emit_canvas(CanvasStreamEvent::TileCreated {
+        session_id: session_id.clone(),
+        tile: tile.clone(),
+    });
 
     // Emit ContextNotes event (so frontend can display which notes were used)
     if !resolved_context.context_notes.is_empty() {
-        let _ = window.emit(
-            "canvas-stream",
-            CanvasStreamEvent::ContextNotes {
-                session_id: session_id.clone(),
-                tile_id: tile_id.clone(),
-                notes: resolved_context.context_notes.clone(),
-            },
-        );
+        let _ = window.emit_canvas(CanvasStreamEvent::ContextNotes {
+            session_id: session_id.clone(),
+            tile_id: tile_id.clone(),
+            notes: resolved_context.context_notes.clone(),
+        });
     }
 
     // Clone what we need for the spawned task
@@ -256,6 +528,9 @@ pub async fn send_prompt(
         .iter()
         .map(|gap| gap.id.clone())
         .collect::<Vec<_>>();
+    let stream_root_state = state.clone();
+    let stream_root_epoch = root_epoch.clone();
+    let (sealed_epoch_sender, sealed_epoch_receiver) = tokio::sync::oneshot::channel();
 
     // Spawn async task for streaming (doesn't block the IPC response)
     tauri::async_runtime::spawn(async move {
@@ -276,7 +551,11 @@ pub async fn send_prompt(
             join_set.spawn(async move {
                 let stream_result = match provider_route {
                     ModelProviderRoute::Ollama => {
-                        let ollama = ollama_arc.read().await;
+                        let ollama = ollama_arc
+                            .as_ref()
+                            .expect("validated Ollama route")
+                            .read()
+                            .await;
                         let result = ollama
                             .chat_stream(
                                 &model_id,
@@ -304,7 +583,15 @@ pub async fn send_prompt(
                             )
                             .await;
                         drop(openrouter);
-                        result.map(|stream| Box::pin(stream) as std::pin::Pin<Box<dyn futures::Stream<Item = anyhow::Result<StreamUpdate>> + Send>>)
+                        result.map(|stream| {
+                            Box::pin(stream)
+                                as std::pin::Pin<
+                                    Box<
+                                        dyn futures::Stream<Item = anyhow::Result<StreamUpdate>>
+                                            + Send,
+                                    >,
+                                >
+                        })
                     }
                 };
 
@@ -324,15 +611,12 @@ pub async fn send_prompt(
                                     let chunk = update.content;
                                     if !chunk.is_empty() {
                                         full_content.push_str(&chunk);
-                                        let _ = window.emit(
-                                            "canvas-stream",
-                                            CanvasStreamEvent::Chunk {
-                                                session_id: session_id.clone(),
-                                                tile_id: tile_id.clone(),
-                                                model_id: model_id.clone(),
-                                                chunk,
-                                            },
-                                        );
+                                        let _ = window.emit_canvas(CanvasStreamEvent::Chunk {
+                                            session_id: session_id.clone(),
+                                            tile_id: tile_id.clone(),
+                                            model_id: model_id.clone(),
+                                            chunk,
+                                        });
                                     }
                                 }
                                 Ok(Some(Err(e))) => {
@@ -385,7 +669,13 @@ pub async fn send_prompt(
                     Err(e) => {
                         let error = e.to_string();
                         emit_canvas_error(&window, &session_id, &tile_id, &model_id, &error);
-                        (model_id, String::new(), ResponseStatus::Error, Some(error), None)
+                        (
+                            model_id,
+                            String::new(),
+                            ResponseStatus::Error,
+                            Some(error),
+                            None,
+                        )
                     }
                 }
             });
@@ -399,16 +689,71 @@ pub async fn send_prompt(
             }
         }
 
+        let root_guard = match crate::commands::acquire_expected_root_epoch(
+            &stream_root_state,
+            &stream_root_epoch,
+        )
+        .await
+        {
+            Ok(guard) => guard,
+            Err(error) => {
+                let model_ids = results
+                    .iter()
+                    .map(|(model_id, _, _, _, _)| model_id.clone())
+                    .collect::<Vec<_>>();
+                emit_persistence_error(
+                    &window,
+                    &session_id_clone,
+                    &tile_id_clone,
+                    &model_ids,
+                    &anyhow::anyhow!(error),
+                );
+                if let Some(episode_id) = decision_episode_id_for_reflection.as_deref() {
+                    fail_requested_prediction_if_same_root(
+                        &stream_root_state,
+                        &twin_store_arc,
+                        episode_id,
+                        &stream_root_epoch,
+                        "visible response authority validation",
+                    )
+                    .await;
+                }
+                return;
+            }
+        };
+
         // Batch update store with all results in a single write
-        let persistence_ok = {
+        let response_commit = {
             let mut store = canvas_store_arc.write().await;
-            match store.batch_update_tile_responses(&session_id_clone, &tile_id_clone, &results) {
-                Ok(()) => true,
+            match store.batch_update_tile_responses_expecting_authority(
+                &session_id_clone,
+                &tile_id_clone,
+                &results,
+                stream_root_epoch.clone(),
+            ) {
+                Ok(commit) => commit,
                 Err(error) => {
+                    let error = preserve_canvas_mutation_error(error);
                     let model_ids: Vec<String> = results
                         .iter()
                         .map(|(model_id, _, _, _, _)| model_id.clone())
                         .collect();
+                    drop(store);
+                    drop(root_guard);
+                    let repair = repair_canvas_trace_error(
+                        &stream_root_state,
+                        &error,
+                        "Canvas response persistence",
+                    )
+                    .await;
+                    let failed_epoch = match &repair {
+                        crate::commands::PostAuthorityRepair::Ready(epoch) => epoch.clone(),
+                        _ => error
+                            .repair_commit()
+                            .and_then(|commit| commit.authority_token.clone())
+                            .unwrap_or_else(|| stream_root_epoch.clone()),
+                    };
+                    crate::commands::acknowledge_reported_repair(repair);
                     emit_persistence_error(
                         &window,
                         &session_id_clone,
@@ -416,39 +761,224 @@ pub async fn send_prompt(
                         &model_ids,
                         &error,
                     );
-                    false
+                    if let Some(episode_id) = decision_episode_id_for_reflection.as_deref() {
+                        fail_requested_prediction_if_same_root(
+                            &stream_root_state,
+                            &twin_store_arc,
+                            episode_id,
+                            &failed_epoch,
+                            "visible response persistence",
+                        )
+                        .await;
+                    }
+                    return;
                 }
             }
         };
+        let mut publication_epoch = response_commit
+            .authority_token
+            .clone()
+            .unwrap_or_else(|| stream_root_epoch.clone());
+        let mut publication_commit = response_commit;
+        drop(root_guard);
 
-        append_model_result_traces(
+        publication_commit = match append_model_result_traces(
             twin_store_arc.clone(),
             &session_id_clone,
             &tile_id_clone,
             "send_prompt",
             &results,
+            publication_commit,
         )
-        .await;
+        .await
+        {
+            Ok(commit) => commit,
+            Err(error) => {
+                log::error!("Failed to append governed Canvas result trace: {error}");
+                let model_ids = results
+                    .iter()
+                    .map(|(model_id, _, _, _, _)| model_id.clone())
+                    .collect::<Vec<_>>();
+                let repair =
+                    repair_canvas_trace_error(&stream_root_state, &error, "Canvas response trace")
+                        .await;
+                let failed_epoch = match &repair {
+                    crate::commands::PostAuthorityRepair::Ready(epoch) => epoch.clone(),
+                    _ => error
+                        .repair_commit()
+                        .and_then(|commit| commit.authority_token.clone())
+                        .unwrap_or_else(|| publication_epoch.clone()),
+                };
+                crate::commands::acknowledge_reported_repair(repair);
+                emit_persistence_error(
+                    &window,
+                    &session_id_clone,
+                    &tile_id_clone,
+                    &model_ids,
+                    &error,
+                );
+                if let Some(episode_id) = decision_episode_id_for_reflection.as_deref() {
+                    fail_requested_prediction_if_same_root(
+                        &stream_root_state,
+                        &twin_store_arc,
+                        episode_id,
+                        &failed_epoch,
+                        "visible response trace",
+                    )
+                    .await;
+                }
+                return;
+            }
+        };
+        publication_epoch = publication_commit
+            .authority_token
+            .clone()
+            .expect("governed result traces must carry authority");
 
-        if let Some(decision_episode_id) = decision_episode_id_for_reflection {
+        if let Some(decision_episode_id) = decision_episode_id_for_reflection.as_deref() {
             let mut twin_store = twin_store_arc.write().await;
             for (model_id, content, status, _, _) in &results {
                 if *status != ResponseStatus::Completed || content.trim().is_empty() {
                     continue;
                 }
 
-                let _ = twin_store.record_reflection_card(ReflectionCardCreate {
-                    decision_episode_id: decision_episode_id.clone(),
-                    session_id: session_id_clone.clone(),
-                    tile_id: tile_id_clone.clone(),
-                    model_id: model_id.clone(),
-                    content: content.clone(),
-                    cited_note_ids: reflection_note_ids.clone(),
-                    cited_user_record_ids: reflection_user_record_ids.clone(),
-                    cited_constitution_item_ids: reflection_constitution_item_ids.clone(),
-                    cited_action_gap_ids: reflection_action_gap_ids.clone(),
-                    evidence_packet: None,
-                });
+                let (_, commit) = match twin_store.record_reflection_card_expecting_authority(
+                    ReflectionCardCreate {
+                        decision_episode_id: decision_episode_id.to_string(),
+                        session_id: session_id_clone.clone(),
+                        tile_id: tile_id_clone.clone(),
+                        model_id: model_id.clone(),
+                        content: content.clone(),
+                        cited_note_ids: reflection_note_ids.clone(),
+                        cited_user_record_ids: reflection_user_record_ids.clone(),
+                        cited_constitution_item_ids: reflection_constitution_item_ids.clone(),
+                        cited_action_gap_ids: reflection_action_gap_ids.clone(),
+                        evidence_packet: None,
+                    },
+                    publication_epoch.clone(),
+                ) {
+                    Ok(committed) => committed,
+                    Err(error) => {
+                        let error = preserve_canvas_mutation_error(error)
+                            .with_fallback_commit(publication_commit.clone());
+                        log::error!("Failed to persist governed reflection card: {error}");
+                        drop(twin_store);
+                        let repair = repair_canvas_trace_error(
+                            &stream_root_state,
+                            &error,
+                            "Canvas reflection card",
+                        )
+                        .await;
+                        let failed_epoch = match &repair {
+                            crate::commands::PostAuthorityRepair::Ready(epoch) => epoch.clone(),
+                            _ => error
+                                .repair_commit()
+                                .and_then(|commit| commit.authority_token.clone())
+                                .unwrap_or_else(|| publication_epoch.clone()),
+                        };
+                        crate::commands::acknowledge_reported_repair(repair);
+                        emit_persistence_error(
+                            &window,
+                            &session_id_clone,
+                            &tile_id_clone,
+                            std::slice::from_ref(model_id),
+                            &error,
+                        );
+                        fail_requested_prediction_if_same_root(
+                            &stream_root_state,
+                            &twin_store_arc,
+                            decision_episode_id,
+                            &failed_epoch,
+                            "visible response reflection",
+                        )
+                        .await;
+                        return;
+                    }
+                };
+                publication_epoch = match commit.authority_token.clone() {
+                    Some(epoch) => epoch,
+                    None => {
+                        let error = CanvasTraceMutationError::precommit(
+                            "Reflection-card mutation did not advance authority",
+                        )
+                        .with_fallback_commit(publication_commit.clone());
+                        log::error!("{error}");
+                        drop(twin_store);
+                        crate::commands::acknowledge_reported_repair(
+                            repair_canvas_trace_error(
+                                &stream_root_state,
+                                &error,
+                                "Canvas reflection card",
+                            )
+                            .await,
+                        );
+                        emit_persistence_error(
+                            &window,
+                            &session_id_clone,
+                            &tile_id_clone,
+                            std::slice::from_ref(model_id),
+                            &error,
+                        );
+                        fail_requested_prediction_if_same_root(
+                            &stream_root_state,
+                            &twin_store_arc,
+                            decision_episode_id,
+                            &publication_epoch,
+                            "visible response reflection authority",
+                        )
+                        .await;
+                        return;
+                    }
+                };
+                publication_commit = commit;
+            }
+        }
+
+        let published_epoch = match crate::commands::repair_after_authority_mutation(
+            &stream_root_state,
+            &publication_commit,
+            "Canvas response",
+        )
+        .await
+        {
+            crate::commands::PostAuthorityRepair::Ready(epoch) => epoch,
+            crate::commands::PostAuthorityRepair::Unavailable(_) => {
+                if let Some(episode_id) = decision_episode_id_for_reflection.as_deref() {
+                    fail_requested_prediction_if_same_root(
+                        &stream_root_state,
+                        &twin_store_arc,
+                        episode_id,
+                        &publication_epoch,
+                        "visible response authority repair",
+                    )
+                    .await;
+                }
+                return;
+            }
+            crate::commands::PostAuthorityRepair::NotRequired => {
+                if let Some(episode_id) = decision_episode_id_for_reflection.as_deref() {
+                    fail_requested_prediction_if_same_root(
+                        &stream_root_state,
+                        &twin_store_arc,
+                        episode_id,
+                        &publication_epoch,
+                        "visible response missing authority",
+                    )
+                    .await;
+                }
+                return;
+            }
+        };
+        if let Err(returned_epoch) = sealed_epoch_sender.send(published_epoch) {
+            if let Some(episode_id) = decision_episode_id_for_reflection.as_deref() {
+                fail_requested_prediction_if_same_root(
+                    &stream_root_state,
+                    &twin_store_arc,
+                    episode_id,
+                    &returned_epoch,
+                    "sealed prediction channel loss",
+                )
+                .await;
             }
         }
 
@@ -456,27 +986,22 @@ pub async fn send_prompt(
         // batch persist above actually succeeded. If it failed, per-model
         // Error events were already emitted and the frontend must not
         // believe the (in-memory only) responses were saved to disk.
-        if persistence_ok {
-            let _ = window.emit(
-                "canvas-stream",
-                CanvasStreamEvent::SessionSaved {
-                    session_id: session_id_clone.clone(),
-                },
-            );
-            for (model_id, _, status, _, _) in &results {
-                if *status == ResponseStatus::Completed {
-                    spawn_working_memory_compile(
-                        window.clone(),
-                        session_id_clone.clone(),
-                        tile_id_clone.clone(),
-                        model_id.clone(),
-                        canvas_store_arc.clone(),
-                        twin_store_arc.clone(),
-                        openrouter_arc.clone(),
-                        ollama_arc.clone(),
-                        settings_arc.clone(),
-                    );
-                }
+        let _ = window.emit_canvas(CanvasStreamEvent::SessionSaved {
+            session_id: session_id_clone.clone(),
+        });
+        for (model_id, _, status, _, _) in &results {
+            if *status == ResponseStatus::Completed {
+                spawn_working_memory_compile(
+                    window.clone(),
+                    session_id_clone.clone(),
+                    tile_id_clone.clone(),
+                    model_id.clone(),
+                    canvas_store_arc.clone(),
+                    twin_store_arc.clone(),
+                    openrouter_arc.clone(),
+                    ollama_arc.clone(),
+                    settings_arc.clone(),
+                );
             }
         }
     });
@@ -504,21 +1029,51 @@ pub async fn send_prompt(
                 .context_version
                 .clone()
                 .unwrap_or_else(|| TWIN_CONTEXT_VERSION.to_string());
-            tauri::async_runtime::spawn(run_sealed_twin_prediction(
-                state.twin_store.clone(),
-                state.openrouter.clone(),
-                state.ollama.clone(),
-                model_route.provider.clone(),
-                prediction_model,
-                episode_id,
-                tile.prompt.clone(),
-                decision,
-                metadata.options.clone(),
-                metadata.stakes.clone(),
-                resolved_context.twin_context_prompt.clone(),
-                context_version,
-                tile.decision_metadata.clone(),
-            ));
+            let prediction_state = state.clone();
+            let prediction_store = state.twin_store.clone();
+            let prediction_openrouter = state.openrouter.clone();
+            let prediction_ollama = state.ollama.clone();
+            let prediction_provider = model_route.provider.clone();
+            let prediction_prompt = tile.prompt.clone();
+            let prediction_options = metadata.options.clone();
+            let prediction_stakes = metadata.stakes.clone();
+            let prediction_context = resolved_context.twin_context_prompt.clone();
+            let prediction_metadata = tile.decision_metadata.clone();
+            let prediction_request_root = root_epoch.clone();
+            tauri::async_runtime::spawn(async move {
+                let root_epoch = match sealed_epoch_receiver.await {
+                    Ok(root_epoch) => root_epoch,
+                    Err(_) => {
+                        fail_requested_prediction_if_same_root(
+                            &prediction_state,
+                            &prediction_store,
+                            &episode_id,
+                            &prediction_request_root,
+                            "visible response channel closed",
+                        )
+                        .await;
+                        return;
+                    }
+                };
+                run_sealed_twin_prediction(
+                    prediction_state,
+                    root_epoch,
+                    prediction_store,
+                    prediction_openrouter,
+                    prediction_ollama,
+                    prediction_provider,
+                    prediction_model,
+                    episode_id,
+                    prediction_prompt,
+                    decision,
+                    prediction_options,
+                    prediction_stakes,
+                    prediction_context,
+                    context_version,
+                    prediction_metadata,
+                )
+                .await;
+            });
         }
     }
 
@@ -528,14 +1083,17 @@ pub async fn send_prompt(
 /// Add new models to an existing tile (same prompt, new model responses)
 #[tauri::command]
 pub async fn add_models_to_tile(
-    window: tauri::Window,
+    window: tauri::WebviewWindow,
     session_id: String,
     tile_id: String,
     request: AddModelsRequest,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
+    let root_ticket = crate::commands::acquire_derived_root_epoch(state.inner()).await?;
+    let root_epoch = root_ticket.authority().clone();
     // Get the tile's prompt
     let mut store = state.canvas_store.write().await;
+    store.reload_authoritative_state();
     let session = store.get_session(&session_id).map_err(|e| e.to_string())?;
     drop(store);
 
@@ -554,9 +1112,30 @@ pub async fn add_models_to_tile(
             settings.get(),
         )?
     };
+    if model_route.provider == ModelProviderRoute::Ollama {
+        state.ollama_service()?;
+    }
     let model_ids = effective_model_ids(&model_route, &request.model_ids);
+    let response_provider = model_route.provider.provider_label().to_string();
+    let response_provenance = if matches!(
+        tile.context_mode,
+        ContextMode::Twin | ContextMode::TwinHistory
+    ) && tile.twin_answer_mode == TwinAnswerMode::Simulation
+    {
+        "twin_simulation".to_string()
+    } else {
+        model_route.provider.provenance_label(false).to_string()
+    };
     let prompt_request = prompt_request_from_tile(&tile, model_ids.clone(), 0.7);
-    let resolved_context = resolve_prompt_context(state.inner(), &session, &prompt_request).await?;
+    let resolved_context = resolve_prompt_context(
+        state.inner(),
+        &session,
+        &prompt_request,
+        Some(&tile),
+        &model_route,
+    )
+    .await?;
+    root_ticket.validate(state.inner()).await?;
 
     let now = Utc::now();
 
@@ -583,6 +1162,8 @@ pub async fn add_models_to_tile(
                     error: None,
                     tokens_used: None,
                     cost_usd: None,
+                    provider: Some(response_provider.clone()),
+                    provenance: Some(response_provenance.clone()),
                     created_at: now,
                     position: TilePosition {
                         x: llm_start_x,
@@ -596,9 +1177,14 @@ pub async fn add_models_to_tile(
                 t.responses.insert(model_id.clone(), response);
             }
             session.updated_at = Utc::now();
-            store.save_session(&session).map_err(|e| e.to_string())?;
+            let commit = store
+                .save_session_expecting_authority(&session, root_epoch.clone())
+                .map_err(|e| e.to_string())?;
+            crate::services::canvas_store::require_canvas_only_commit(&commit)
+                .map_err(|error| error.to_string())?;
         }
     }
+    drop(root_ticket);
 
     // Notify frontend about new responses before streaming starts
     let _ = window.emit(
@@ -622,6 +1208,7 @@ pub async fn add_models_to_tile(
     let web_search_max_results = prompt_request.web_search_max_results;
     let reasoning_effort = prompt_request.reasoning_effort.clone();
     let provider_route = model_route.provider.clone();
+    let stream_root_state = state.inner().clone();
 
     tauri::async_runtime::spawn(async move {
         // Stream all new models concurrently using JoinSet
@@ -641,7 +1228,11 @@ pub async fn add_models_to_tile(
             join_set.spawn(async move {
                 let stream_result = match provider_route {
                     ModelProviderRoute::Ollama => {
-                        let ollama = ollama_arc.read().await;
+                        let ollama = ollama_arc
+                            .as_ref()
+                            .expect("validated Ollama route")
+                            .read()
+                            .await;
                         let result = ollama
                             .chat_stream(&model_id, messages, system_prompt.as_deref(), Some(0.7))
                             .await;
@@ -664,7 +1255,15 @@ pub async fn add_models_to_tile(
                             )
                             .await;
                         drop(openrouter);
-                        result.map(|stream| Box::pin(stream) as std::pin::Pin<Box<dyn futures::Stream<Item = anyhow::Result<StreamUpdate>> + Send>>)
+                        result.map(|stream| {
+                            Box::pin(stream)
+                                as std::pin::Pin<
+                                    Box<
+                                        dyn futures::Stream<Item = anyhow::Result<StreamUpdate>>
+                                            + Send,
+                                    >,
+                                >
+                        })
                     }
                 };
 
@@ -745,7 +1344,13 @@ pub async fn add_models_to_tile(
                     Err(e) => {
                         let error = e.to_string();
                         emit_canvas_error(&window, &session_id, &tile_id, &model_id, &error);
-                        (model_id, String::new(), ResponseStatus::Error, Some(error), None)
+                        (
+                            model_id,
+                            String::new(),
+                            ResponseStatus::Error,
+                            Some(error),
+                            None,
+                        )
                     }
                 }
             });
@@ -759,23 +1364,65 @@ pub async fn add_models_to_tile(
             }
         }
 
-        // Batch update store
-        let persistence_ok = {
-            let mut store = canvas_store_arc.write().await;
-            match store.batch_update_tile_responses(&session_id, &tile_id, &results) {
-                Ok(()) => true,
+        let root_guard =
+            match crate::commands::acquire_expected_root_epoch(&stream_root_state, &root_epoch)
+                .await
+            {
+                Ok(guard) => guard,
                 Err(error) => {
+                    let model_ids = results
+                        .iter()
+                        .map(|(model_id, _, _, _, _)| model_id.clone())
+                        .collect::<Vec<_>>();
+                    emit_persistence_error(
+                        &window,
+                        &session_id,
+                        &tile_id,
+                        &model_ids,
+                        &anyhow::anyhow!(error),
+                    );
+                    return;
+                }
+            };
+
+        // Batch update store
+        let response_commit = {
+            let mut store = canvas_store_arc.write().await;
+            match store.batch_update_tile_responses_expecting_authority(
+                &session_id,
+                &tile_id,
+                &results,
+                root_epoch.clone(),
+            ) {
+                Ok(commit) => commit,
+                Err(error) => {
+                    let error = preserve_canvas_mutation_error(error);
                     let model_ids: Vec<String> = results
                         .iter()
                         .map(|(model_id, _, _, _, _)| model_id.clone())
                         .collect();
+                    drop(store);
+                    drop(root_guard);
+                    crate::commands::acknowledge_reported_repair(
+                        repair_canvas_trace_error(
+                            &stream_root_state,
+                            &error,
+                            "Canvas added-model response persistence",
+                        )
+                        .await,
+                    );
                     emit_persistence_error(&window, &session_id, &tile_id, &model_ids, &error);
-                    false
+                    return;
                 }
             }
         };
+        let publication_epoch = response_commit
+            .authority_token
+            .clone()
+            .unwrap_or_else(|| root_epoch.clone());
+        drop(root_guard);
 
-        append_canvas_trace(
+        let mut publication_commit = match append_canvas_trace_expecting_authority(
             twin_store_arc.clone(),
             &session_id,
             TraceEventType::ModelsAdded,
@@ -783,38 +1430,93 @@ pub async fn add_models_to_tile(
                 "tile_id": tile_id.clone(),
                 "model_ids": results.iter().map(|(model_id, _, _, _, _)| model_id.clone()).collect::<Vec<_>>(),
             }),
+            publication_epoch,
         )
-        .await;
-        append_model_result_traces(
+        .await
+        {
+            Ok(commit) => commit,
+            Err(error) => {
+                let error = error.with_fallback_commit(response_commit.clone());
+                log::error!("Failed to persist governed models-added trace: {error}");
+                crate::commands::acknowledge_reported_repair(
+                    repair_canvas_trace_error(
+                        &stream_root_state,
+                        &error,
+                        "Canvas models-added trace",
+                    )
+                    .await,
+                );
+                let model_ids = results
+                    .iter()
+                    .map(|(model_id, _, _, _, _)| model_id.clone())
+                    .collect::<Vec<_>>();
+                emit_persistence_error(
+                    &window,
+                    &session_id,
+                    &tile_id,
+                    &model_ids,
+                    &error,
+                );
+                return;
+            }
+        };
+        publication_commit = match append_model_result_traces(
             twin_store_arc.clone(),
             &session_id,
             &tile_id,
             "add_models_to_tile",
             &results,
+            publication_commit,
         )
-        .await;
+        .await
+        {
+            Ok(commit) => commit,
+            Err(error) => {
+                log::error!("Failed to persist governed added-model result trace: {error}");
+                crate::commands::acknowledge_reported_repair(
+                    repair_canvas_trace_error(
+                        &stream_root_state,
+                        &error,
+                        "Canvas added-model result trace",
+                    )
+                    .await,
+                );
+                let model_ids = results
+                    .iter()
+                    .map(|(model_id, _, _, _, _)| model_id.clone())
+                    .collect::<Vec<_>>();
+                emit_persistence_error(&window, &session_id, &tile_id, &model_ids, &error);
+                return;
+            }
+        };
 
-        if persistence_ok {
-            let _ = window.emit(
-                "canvas-stream",
-                CanvasStreamEvent::SessionSaved {
-                    session_id: session_id.clone(),
-                },
-            );
-            for (model_id, _, status, _, _) in &results {
-                if *status == ResponseStatus::Completed {
-                    spawn_working_memory_compile(
-                        window.clone(),
-                        session_id.clone(),
-                        tile_id.clone(),
-                        model_id.clone(),
-                        canvas_store_arc.clone(),
-                        twin_store_arc.clone(),
-                        openrouter_arc.clone(),
-                        ollama_arc.clone(),
-                        settings_arc.clone(),
-                    );
-                }
+        if !matches!(
+            crate::commands::repair_after_authority_mutation(
+                &stream_root_state,
+                &publication_commit,
+                "Canvas models added",
+            )
+            .await,
+            crate::commands::PostAuthorityRepair::Ready(_)
+        ) {
+            return;
+        }
+        let _ = window.emit_canvas(CanvasStreamEvent::SessionSaved {
+            session_id: session_id.clone(),
+        });
+        for (model_id, _, status, _, _) in &results {
+            if *status == ResponseStatus::Completed {
+                spawn_working_memory_compile(
+                    window.clone(),
+                    session_id.clone(),
+                    tile_id.clone(),
+                    model_id.clone(),
+                    canvas_store_arc.clone(),
+                    twin_store_arc.clone(),
+                    openrouter_arc.clone(),
+                    ollama_arc.clone(),
+                    settings_arc.clone(),
+                );
             }
         }
     });
@@ -825,14 +1527,27 @@ pub async fn add_models_to_tile(
 /// Regenerate a single model's response
 #[tauri::command]
 pub async fn regenerate_response(
-    window: tauri::Window,
+    window: tauri::WebviewWindow,
     session_id: String,
     tile_id: String,
     model_id: String,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
+    regenerate_response_with_sink(window, session_id, tile_id, model_id, state.inner()).await
+}
+
+pub(crate) async fn regenerate_response_with_sink<S: CanvasEventSink>(
+    window: S,
+    session_id: String,
+    tile_id: String,
+    model_id: String,
+    state: &AppState,
+) -> Result<(), String> {
+    let root_ticket = crate::commands::acquire_derived_root_epoch(state).await?;
+    let root_epoch = root_ticket.authority().clone();
     // Get the tile's prompt
     let mut store = state.canvas_store.write().await;
+    store.reload_authoritative_state();
     let session = store.get_session(&session_id).map_err(|e| e.to_string())?;
     drop(store);
 
@@ -851,6 +1566,9 @@ pub async fn regenerate_response(
             settings.get(),
         )?
     };
+    if model_route.provider == ModelProviderRoute::Ollama {
+        state.ollama_service()?;
+    }
     let effective_model_id = effective_model_ids(&model_route, std::slice::from_ref(&model_id))
         .into_iter()
         .next()
@@ -861,21 +1579,29 @@ pub async fn regenerate_response(
     }
 
     let request = prompt_request_from_tile(tile, vec![effective_model_id.clone()], 0.7);
-    let resolved_context = resolve_prompt_context(state.inner(), &session, &request).await?;
+    let resolved_context =
+        resolve_prompt_context(state, &session, &request, Some(tile), &model_route).await?;
+    root_ticket.validate(state).await?;
 
     // Reset response to streaming
     {
         let mut store = state.canvas_store.write().await;
-        let _ = store.update_tile_response(
-            &session_id,
-            &tile_id,
-            &effective_model_id,
-            "",
-            ResponseStatus::Streaming,
-            None,
-            None,
-        );
+        let commit = store
+            .update_tile_response_expecting_authority(
+                &session_id,
+                &tile_id,
+                &effective_model_id,
+                "",
+                ResponseStatus::Streaming,
+                None,
+                None,
+                root_epoch.clone(),
+            )
+            .map_err(|error| error.to_string())?;
+        crate::services::canvas_store::require_canvas_only_commit(&commit)
+            .map_err(|error| error.to_string())?;
     }
+    drop(root_ticket);
 
     let openrouter_arc = state.openrouter.clone();
     let ollama_arc = state.ollama.clone();
@@ -888,12 +1614,17 @@ pub async fn regenerate_response(
     let web_search_max_results = request.web_search_max_results;
     let reasoning_effort = request.reasoning_effort.clone();
     let provider_route = model_route.provider.clone();
+    let stream_root_state = state.clone();
 
     tauri::async_runtime::spawn(async move {
         let model_id = effective_model_id;
         let stream_result = match provider_route {
             ModelProviderRoute::Ollama => {
-                let ollama = ollama_arc.read().await;
+                let ollama = ollama_arc
+                    .as_ref()
+                    .expect("validated Ollama route")
+                    .read()
+                    .await;
                 let result = ollama
                     .chat_stream(&model_id, messages, system_prompt.as_deref(), Some(0.7))
                     .await;
@@ -916,13 +1647,16 @@ pub async fn regenerate_response(
                     )
                     .await;
                 drop(openrouter);
-                result.map(|stream| Box::pin(stream) as std::pin::Pin<Box<dyn futures::Stream<Item = anyhow::Result<StreamUpdate>> + Send>>)
+                result.map(|stream| {
+                    Box::pin(stream)
+                        as std::pin::Pin<
+                            Box<dyn futures::Stream<Item = anyhow::Result<StreamUpdate>> + Send>,
+                        >
+                })
             }
         };
 
-        let mut persistence_ok = true;
-
-        match stream_result {
+        let (final_content, final_status, final_error, cost_usd) = match stream_result {
             Ok(stream) => {
                 let mut stream = stream;
                 let mut full_content = String::new();
@@ -938,15 +1672,12 @@ pub async fn regenerate_response(
                             let chunk = update.content;
                             if !chunk.is_empty() {
                                 full_content.push_str(&chunk);
-                                let _ = window.emit(
-                                    "canvas-stream",
-                                    CanvasStreamEvent::Chunk {
-                                        session_id: session_id.clone(),
-                                        tile_id: tile_id.clone(),
-                                        model_id: model_id.clone(),
-                                        chunk,
-                                    },
-                                );
+                                let _ = window.emit_canvas(CanvasStreamEvent::Chunk {
+                                    session_id: session_id.clone(),
+                                    tile_id: tile_id.clone(),
+                                    model_id: model_id.clone(),
+                                    chunk,
+                                });
                             }
                         }
                         Ok(Some(Err(e))) => {
@@ -979,101 +1710,134 @@ pub async fn regenerate_response(
                     (update.1, update.2)
                 };
 
-                {
-                    let mut store = canvas_store_arc.write().await;
-                    if let Err(persist_error) = store.update_tile_response(
-                        &session_id,
-                        &tile_id,
-                        &model_id,
-                        &final_content,
-                        final_status.clone(),
-                        final_error.as_deref(),
-                        cost_usd,
-                    ) {
-                        emit_persistence_error(
-                            &window,
-                            &session_id,
-                            &tile_id,
-                            std::slice::from_ref(&model_id),
-                            &persist_error,
-                        );
-                        persistence_ok = false;
-                    }
-                }
-
-                append_canvas_trace(
-                    twin_store_arc.clone(),
-                    &session_id,
-                    TraceEventType::ResponseRegenerated,
-                    json!({
-                        "tile_id": tile_id.clone(),
-                        "model_id": model_id.clone(),
-                        "status": final_status,
-                        "error": final_error.clone(),
-                        "content": final_content.clone(),
-                    }),
-                )
-                .await;
+                (final_content, final_status, final_error, cost_usd)
             }
             Err(e) => {
                 let error = e.to_string();
-                {
-                    let mut store = canvas_store_arc.write().await;
-                    if let Err(persist_error) = store.update_tile_response(
+                emit_canvas_error(&window, &session_id, &tile_id, &model_id, &error);
+                (String::new(), ResponseStatus::Error, Some(error), None)
+            }
+        };
+
+        let root_guard =
+            match crate::commands::acquire_expected_root_epoch(&stream_root_state, &root_epoch)
+                .await
+            {
+                Ok(guard) => guard,
+                Err(error) => {
+                    emit_persistence_error(
+                        &window,
                         &session_id,
                         &tile_id,
-                        &model_id,
-                        "",
-                        ResponseStatus::Error,
-                        Some(error.as_str()),
-                        None,
-                    ) {
-                        emit_persistence_error(
-                            &window,
-                            &session_id,
-                            &tile_id,
-                            std::slice::from_ref(&model_id),
-                            &persist_error,
-                        );
-                        persistence_ok = false;
-                    }
+                        std::slice::from_ref(&model_id),
+                        &anyhow::anyhow!(error),
+                    );
+                    return;
                 }
-                emit_canvas_error(&window, &session_id, &tile_id, &model_id, &error);
-                append_canvas_trace(
-                    twin_store_arc.clone(),
-                    &session_id,
-                    TraceEventType::ResponseRegenerated,
-                    json!({
-                        "tile_id": tile_id.clone(),
-                        "model_id": model_id.clone(),
-                        "status": ResponseStatus::Error,
-                        "error": error,
-                        "content": "",
-                    }),
-                )
-                .await;
+            };
+        let response_commit = {
+            let mut store = canvas_store_arc.write().await;
+            match store.update_tile_response_expecting_authority(
+                &session_id,
+                &tile_id,
+                &model_id,
+                &final_content,
+                final_status.clone(),
+                final_error.as_deref(),
+                cost_usd,
+                root_epoch.clone(),
+            ) {
+                Ok(commit) => commit,
+                Err(error) => {
+                    let error = preserve_canvas_mutation_error(error);
+                    drop(store);
+                    drop(root_guard);
+                    crate::commands::acknowledge_reported_repair(
+                        repair_canvas_trace_error(
+                            &stream_root_state,
+                            &error,
+                            "Canvas regenerated-response persistence",
+                        )
+                        .await,
+                    );
+                    emit_persistence_error(
+                        &window,
+                        &session_id,
+                        &tile_id,
+                        std::slice::from_ref(&model_id),
+                        &error,
+                    );
+                    return;
+                }
             }
+        };
+        let publication_epoch = response_commit
+            .authority_token
+            .clone()
+            .unwrap_or_else(|| root_epoch.clone());
+        drop(root_guard);
+        let trace_commit = match append_canvas_trace_expecting_authority(
+            twin_store_arc.clone(),
+            &session_id,
+            TraceEventType::ResponseRegenerated,
+            json!({
+                "tile_id": tile_id.clone(),
+                "model_id": model_id.clone(),
+                "status": final_status,
+                "error": final_error,
+                "content": final_content,
+            }),
+            publication_epoch,
+        )
+        .await
+        {
+            Ok(commit) => commit,
+            Err(error) => {
+                let error = error.with_fallback_commit(response_commit.clone());
+                log::error!("Failed to persist governed regeneration trace: {error}");
+                crate::commands::acknowledge_reported_repair(
+                    repair_canvas_trace_error(
+                        &stream_root_state,
+                        &error,
+                        "Canvas response regeneration trace",
+                    )
+                    .await,
+                );
+                emit_persistence_error(
+                    &window,
+                    &session_id,
+                    &tile_id,
+                    std::slice::from_ref(&model_id),
+                    &error,
+                );
+                return;
+            }
+        };
+        if !matches!(
+            crate::commands::repair_after_authority_mutation(
+                &stream_root_state,
+                &trace_commit,
+                "Canvas response regeneration",
+            )
+            .await,
+            crate::commands::PostAuthorityRepair::Ready(_)
+        ) {
+            return;
         }
-
-        if persistence_ok {
-            let _ = window.emit(
-                "canvas-stream",
-                CanvasStreamEvent::SessionSaved {
-                    session_id: session_id.clone(),
-                },
-            );
-            spawn_working_memory_compile(
-                window,
-                session_id,
-                tile_id,
-                model_id,
-                canvas_store_arc,
-                twin_store_arc,
-                openrouter_arc,
-                ollama_arc,
-                settings_arc,
-            );
-        }
+        let _ = window.emit_canvas(CanvasStreamEvent::SessionSaved {
+            session_id: session_id.clone(),
+        });
+        spawn_working_memory_compile(
+            window,
+            session_id,
+            tile_id,
+            model_id,
+            canvas_store_arc,
+            twin_store_arc,
+            openrouter_arc,
+            ollama_arc,
+            settings_arc,
+        );
     });
 
     Ok(())
@@ -1092,6 +1856,7 @@ fn prompt_request_from_tile(
         position: None,
         context_mode: tile.context_mode.clone(),
         twin_answer_mode: tile.twin_answer_mode.clone(),
+        twin_relationship_variant: tile.twin_relationship_variant.clone(),
         twin_context_policy: tile.twin_context_policy.clone(),
         twin_llm_provider: tile.twin_llm_provider.clone(),
         decision_metadata: tile.decision_metadata.clone(),
@@ -1106,13 +1871,31 @@ fn prompt_request_from_tile(
     }
 }
 
+fn persisted_twin_provider(
+    context_mode: &ContextMode,
+    requested_provider: Option<String>,
+    resolved_provider: &ModelProviderRoute,
+) -> Option<String> {
+    if context_mode == &ContextMode::TwinHistory {
+        Some(resolved_provider.provider_label().to_string())
+    } else {
+        requested_provider
+    }
+}
+
 async fn append_model_result_traces(
     twin_store_arc: Arc<RwLock<TwinStore>>,
     session_id: &str,
     tile_id: &str,
     trigger: &str,
     results: &[StreamedResponseUpdate],
-) {
+    mut latest_commit: crate::services::twin_events::MutationCommit,
+) -> Result<crate::services::twin_events::MutationCommit, CanvasTraceMutationError> {
+    let mut expected = latest_commit.authority_token.clone().ok_or_else(|| {
+        CanvasTraceMutationError::precommit(
+            "Canvas response mutation did not advance the content authority generation",
+        )
+    })?;
     for (model_id, content, status, error, _) in results {
         let event_type = if *status == ResponseStatus::Error {
             TraceEventType::ResponseErrored
@@ -1120,7 +1903,7 @@ async fn append_model_result_traces(
             TraceEventType::ResponseCompleted
         };
 
-        append_canvas_trace(
+        latest_commit = match append_canvas_trace_expecting_authority(
             twin_store_arc.clone(),
             session_id,
             event_type,
@@ -1132,27 +1915,36 @@ async fn append_model_result_traces(
                 "content": content,
                 "error": error,
             }),
+            expected,
         )
-        .await;
+        .await
+        {
+            Ok(commit) => commit,
+            Err(error) => return Err(error.with_fallback_commit(latest_commit)),
+        };
+        expected = latest_commit.authority_token.clone().ok_or_else(|| {
+            CanvasTraceMutationError::precommit(
+                "Canvas response trace did not advance the content authority generation",
+            )
+            .with_fallback_commit(latest_commit.clone())
+        })?;
     }
+    Ok(latest_commit)
 }
 
-fn emit_canvas_error(
-    window: &tauri::Window,
+fn emit_canvas_error<S: CanvasEventSink>(
+    window: &S,
     session_id: &str,
     tile_id: &str,
     model_id: &str,
     error: &str,
 ) {
-    let _ = window.emit(
-        "canvas-stream",
-        CanvasStreamEvent::Error {
-            session_id: session_id.to_string(),
-            tile_id: tile_id.to_string(),
-            model_id: model_id.to_string(),
-            error: error.to_string(),
-        },
-    );
+    let _ = window.emit_canvas(CanvasStreamEvent::Error {
+        session_id: session_id.to_string(),
+        tile_id: tile_id.to_string(),
+        model_id: model_id.to_string(),
+        error: error.to_string(),
+    });
 }
 
 /// Emit an Error event for every model whose response was streamed
@@ -1161,12 +1953,12 @@ fn emit_canvas_error(
 /// complete response, `SessionSaved` would otherwise still fire, and the
 /// content silently reverts to an empty Pending stub the next time the
 /// session is reopened — with no error anywhere in the UI.
-fn emit_persistence_error(
-    window: &tauri::Window,
+fn emit_persistence_error<S: CanvasEventSink>(
+    window: &S,
     session_id: &str,
     tile_id: &str,
     model_ids: &[String],
-    error: &anyhow::Error,
+    error: &(impl std::fmt::Display + ?Sized),
 ) {
     log::error!(
         "Failed to persist canvas tile '{}' responses for session '{}': {}",
@@ -1181,21 +1973,24 @@ fn emit_persistence_error(
     }
 }
 
-fn emit_canvas_complete(window: &tauri::Window, session_id: &str, tile_id: &str, model_id: &str, cost_usd: Option<f64>) {
-    let _ = window.emit(
-        "canvas-stream",
-        CanvasStreamEvent::Complete {
-            session_id: session_id.to_string(),
-            tile_id: tile_id.to_string(),
-            model_id: model_id.to_string(),
-            tokens_used: None,
-            cost_usd,
-        },
-    );
+fn emit_canvas_complete<S: CanvasEventSink>(
+    window: &S,
+    session_id: &str,
+    tile_id: &str,
+    model_id: &str,
+    cost_usd: Option<f64>,
+) {
+    let _ = window.emit_canvas(CanvasStreamEvent::Complete {
+        session_id: session_id.to_string(),
+        tile_id: tile_id.to_string(),
+        model_id: model_id.to_string(),
+        tokens_used: None,
+        cost_usd,
+    });
 }
 
-fn finalize_streamed_model_response(
-    window: &tauri::Window,
+fn finalize_streamed_model_response<S: CanvasEventSink>(
+    window: &S,
     session_id: &str,
     tile_id: &str,
     model_id: String,
@@ -1226,7 +2021,13 @@ fn classify_streamed_model_response(
             None,
         )
     } else {
-        (model_id, full_content, ResponseStatus::Completed, None, None)
+        (
+            model_id,
+            full_content,
+            ResponseStatus::Completed,
+            None,
+            None,
+        )
     }
 }
 
@@ -1235,6 +2036,8 @@ mod tests {
     use super::*;
     use crate::commands::canvas::test_support::build_tile;
     use crate::models::canvas::{ContextMode, TwinAnswerMode};
+    use crate::models::twin_event::{EntityId, RelationshipDirection, RelationshipPredicate};
+    use crate::models::twin_state::{RelationshipKey, RelationshipVariant};
 
     #[test]
     fn test_prompt_request_from_tile_preserves_web_search_settings() {
@@ -1256,9 +2059,16 @@ mod tests {
 
     #[test]
     fn test_prompt_request_from_tile_preserves_twin_settings() {
+        let relationship_variant = RelationshipVariant::new(vec![RelationshipKey {
+            subject_id: EntityId::parse("owner").unwrap(),
+            predicate: RelationshipPredicate::parse("works_with").unwrap(),
+            object_id: EntityId::parse("alex").unwrap(),
+            direction: RelationshipDirection::Directed,
+        }]);
         let tile = PromptTile {
-            context_mode: ContextMode::Twin,
+            context_mode: ContextMode::TwinHistory,
             twin_answer_mode: TwinAnswerMode::Simulation,
+            twin_relationship_variant: relationship_variant.clone(),
             twin_context_policy: Some("approved_plus_relevant_candidates".to_string()),
             twin_llm_provider: Some("ollama".to_string()),
             ..build_tile("tile-1", "Prompt", "openai/gpt-4", "Response", None, None)
@@ -1266,13 +2076,33 @@ mod tests {
 
         let request = prompt_request_from_tile(&tile, vec!["openai/gpt-4".to_string()], 0.7);
 
-        assert_eq!(request.context_mode, ContextMode::Twin);
+        assert_eq!(request.context_mode, ContextMode::TwinHistory);
         assert_eq!(request.twin_answer_mode, TwinAnswerMode::Simulation);
+        assert_eq!(request.twin_relationship_variant, relationship_variant);
         assert_eq!(
             request.twin_context_policy.as_deref(),
             Some("approved_plus_relevant_candidates")
         );
         assert_eq!(request.twin_llm_provider.as_deref(), Some("ollama"));
+    }
+
+    #[test]
+    fn twin_history_tiles_persist_the_effective_provider_instead_of_a_nullable_override() {
+        let provider =
+            persisted_twin_provider(&ContextMode::TwinHistory, None, &ModelProviderRoute::Ollama);
+
+        assert_eq!(provider.as_deref(), Some("ollama"));
+    }
+
+    #[test]
+    fn non_history_tiles_preserve_the_existing_provider_field() {
+        let provider = persisted_twin_provider(
+            &ContextMode::Twin,
+            Some("ollama".to_string()),
+            &ModelProviderRoute::OpenRouter,
+        );
+
+        assert_eq!(provider.as_deref(), Some("ollama"));
     }
 
     #[test]
@@ -1294,5 +2124,128 @@ mod tests {
         assert_eq!(update.2, ResponseStatus::Completed);
         assert_eq!(update.3, None);
         assert_eq!(update.1, "Answer");
+    }
+
+    #[test]
+    fn buffered_sink_preserves_tile_chunk_and_complete_order() {
+        let sink = BufferedCanvasEventSink::new();
+        let tile = build_tile("tile-1", "Prompt", "openai/gpt-4", "", None, None);
+
+        CanvasEventSink::emit_canvas(
+            &sink,
+            CanvasStreamEvent::TileCreated {
+                session_id: "session-1".into(),
+                tile,
+            },
+        )
+        .unwrap();
+        for chunk in ["hello", " world"] {
+            CanvasEventSink::emit_canvas(
+                &sink,
+                CanvasStreamEvent::Chunk {
+                    session_id: "session-1".into(),
+                    tile_id: "tile-1".into(),
+                    model_id: "openai/gpt-4".into(),
+                    chunk: chunk.into(),
+                },
+            )
+            .unwrap();
+        }
+        CanvasEventSink::emit_canvas(
+            &sink,
+            CanvasStreamEvent::Complete {
+                session_id: "session-1".into(),
+                tile_id: "tile-1".into(),
+                model_id: "openai/gpt-4".into(),
+                tokens_used: None,
+                cost_usd: Some(0.001),
+            },
+        )
+        .unwrap();
+
+        let batch = sink.drain();
+        let kinds = batch
+            .events
+            .iter()
+            .map(|event| {
+                serde_json::to_value(event).unwrap()["type"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(kinds, ["tile_created", "chunk", "chunk", "complete"]);
+        assert_eq!(batch.dropped_events, 0);
+        assert!(batch.total_bytes > 0);
+    }
+
+    #[test]
+    fn buffered_sink_preserves_error_terminal_and_never_exceeds_limits() {
+        let count_limited = BufferedCanvasEventSink::with_limits_for_tests(2, 4096);
+        for error in ["first", "second", "third"] {
+            CanvasEventSink::emit_canvas(
+                &count_limited,
+                CanvasStreamEvent::Error {
+                    session_id: "session-1".into(),
+                    tile_id: "tile-1".into(),
+                    model_id: "openai/gpt-4".into(),
+                    error: error.into(),
+                },
+            )
+            .unwrap();
+        }
+
+        let count_batch = count_limited.drain();
+        assert_eq!(count_batch.events.len(), 2);
+        assert!(count_batch.total_bytes <= 4096);
+        assert_eq!(count_batch.dropped_events, 1);
+        assert!(count_batch
+            .events
+            .iter()
+            .all(|event| matches!(event, CanvasStreamEvent::Error { .. })));
+
+        let byte_limited = BufferedCanvasEventSink::with_limits_for_tests(8, 256);
+        CanvasEventSink::emit_canvas(
+            &byte_limited,
+            CanvasStreamEvent::Error {
+                session_id: "session-1".into(),
+                tile_id: "tile-1".into(),
+                model_id: "openai/gpt-4".into(),
+                error: "x".repeat(512),
+            },
+        )
+        .unwrap();
+        let byte_batch = byte_limited.drain();
+        assert!(byte_batch.events.is_empty());
+        assert_eq!(byte_batch.total_bytes, 0);
+        assert_eq!(byte_batch.dropped_events, 1);
+    }
+
+    #[tokio::test]
+    async fn buffered_sink_wait_for_activity_does_not_miss_events() {
+        let sink = BufferedCanvasEventSink::new();
+        let event = || CanvasStreamEvent::Error {
+            session_id: "session-1".into(),
+            tile_id: "tile-1".into(),
+            model_id: "openai/gpt-4".into(),
+            error: "failed".into(),
+        };
+
+        CanvasEventSink::emit_canvas(&sink, event()).unwrap();
+        tokio::time::timeout(Duration::from_millis(250), sink.wait_for_activity())
+            .await
+            .expect("an event emitted before waiting must remain observable");
+        sink.drain();
+
+        let waiting_sink = sink.clone();
+        let waiter = tokio::spawn(async move {
+            waiting_sink.wait_for_activity().await;
+        });
+        tokio::task::yield_now().await;
+        CanvasEventSink::emit_canvas(&sink, event()).unwrap();
+        tokio::time::timeout(Duration::from_millis(250), waiter)
+            .await
+            .expect("an event emitted while waiting must wake the waiter")
+            .expect("activity waiter must not panic");
     }
 }

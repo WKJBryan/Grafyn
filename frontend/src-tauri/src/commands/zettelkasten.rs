@@ -1,4 +1,4 @@
-use crate::commands::{commit_note_writes, enqueue_vault_optimizer_note};
+use crate::commands::enqueue_vault_optimizer_note;
 use crate::models::link_discovery::{
     DismissLinkSuggestionResponse, LinkDiscoveryStatus, LinkSuggestionQueueEntry,
 };
@@ -162,6 +162,26 @@ fn deduplicate_links(links: Vec<ZettelLinkCandidate>) -> Vec<ZettelLinkCandidate
 
 // ── Tauri commands ───────────────────────────────────────────────────────
 
+async fn complete_link_note_mutation(
+    state: &AppState,
+    expected: &crate::services::vault_namespace::VaultAuthorityTokenV1,
+    prior_commit: Option<&crate::services::twin_events::MutationCommit>,
+    mutation: anyhow::Result<(
+        crate::models::note::Note,
+        crate::services::twin_events::MutationCommit,
+    )>,
+    operation: &str,
+) -> Result<crate::commands::CompletedKnowledgeNoteMutation, String> {
+    crate::commands::complete_knowledge_note_mutation(
+        state,
+        expected,
+        prior_commit,
+        mutation,
+        operation,
+    )
+    .await
+}
+
 /// Discover potential links for a note using multiple strategies
 #[tauri::command]
 pub async fn discover_links(
@@ -177,6 +197,8 @@ pub async fn discover_links(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::models::note::{NoteCreate, NoteStatus};
     use crate::services::link_discovery::DiscoverMode;
 
     #[test]
@@ -202,6 +224,174 @@ mod tests {
         assert!(!DiscoverMode::Algorithm.include_llm());
         assert!(!DiscoverMode::Manual.include_llm());
     }
+
+    #[tokio::test]
+    async fn link_mutation_recovers_exact_post_authority_commit_and_marks_note_dirty() {
+        let (mut state, vault, _data) =
+            crate::commands::commit_note_write_tests::build_test_state();
+        let coordinator = state.mutation_coordinator.as_ref().unwrap().clone();
+        state.knowledge_store = std::sync::Arc::new(tokio::sync::RwLock::new(
+            crate::services::knowledge_store::KnowledgeStore::with_event_recorder(
+                vault.path().to_path_buf(),
+                coordinator.current_namespace_path().unwrap(),
+                coordinator.clone(),
+            ),
+        ));
+        let (created, create_commit) = {
+            let expected = coordinator.current_authority_token().unwrap();
+            state
+                .knowledge_store
+                .write()
+                .await
+                .create_note_expecting_authority(
+                    NoteCreate {
+                        title: "Recovered link source".into(),
+                        content: "before".into(),
+                        relative_path: Some("recovered-link-source.md".into()),
+                        aliases: Vec::new(),
+                        status: NoteStatus::Draft,
+                        tags: Vec::new(),
+                        schema_version: crate::models::note::CURRENT_NOTE_SCHEMA_VERSION,
+                        migration_source: None,
+                        optimizer_managed: false,
+                        properties: Default::default(),
+                    },
+                    "note_editor",
+                    expected,
+                )
+                .unwrap()
+        };
+        assert!(matches!(
+            crate::commands::repair_after_authority_mutation(
+                &state,
+                &create_commit,
+                "link test setup"
+            )
+            .await,
+            crate::commands::PostAuthorityRepair::Ready(_)
+        ));
+        let expected = coordinator.current_authority_token().unwrap();
+        coordinator.fail_next_replays_before_targets(2);
+        let mutation = {
+            let mut store = state.knowledge_store.write().await;
+            store.update_note_expecting_authority(
+                &created.id,
+                NoteUpdate {
+                    content: Some("before\n\n## Related Concepts\n- [[Target]] (related)".into()),
+                    ..Default::default()
+                },
+                "note_editor",
+                expected.clone(),
+            )
+        };
+        let exact = crate::services::knowledge_store::knowledge_authority_advanced_outcome(
+            mutation.as_ref().unwrap_err(),
+        )
+        .unwrap()
+        .commit;
+
+        let completed =
+            complete_link_note_mutation(&state, &expected, None, mutation, "applied note link")
+                .await
+                .expect("the committed link should recover without retry");
+
+        assert_eq!(completed.note.id, created.id);
+        let recovered_commit = completed.commit.as_ref().unwrap();
+        assert_eq!(recovered_commit.mutation_id, exact.mutation_id);
+        assert_eq!(recovered_commit.authority_token, exact.authority_token);
+        assert_eq!(
+            recovered_commit.postcommit_warning,
+            exact.postcommit_warning
+        );
+        assert!(completed.repaired);
+        assert!(completed.note.content.contains("[[Target]]"));
+        assert_eq!(coordinator.pending_count().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn reverse_link_failure_repairs_forward_commit_and_forbids_blind_retry() {
+        let (mut state, vault, _data) =
+            crate::commands::commit_note_write_tests::build_test_state();
+        let coordinator = state.mutation_coordinator.as_ref().unwrap().clone();
+        state.knowledge_store = std::sync::Arc::new(tokio::sync::RwLock::new(
+            crate::services::knowledge_store::KnowledgeStore::with_event_recorder(
+                vault.path().to_path_buf(),
+                coordinator.current_namespace_path().unwrap(),
+                coordinator.clone(),
+            ),
+        ));
+        let (created, create_commit) = state
+            .knowledge_store
+            .write()
+            .await
+            .create_note_expecting_authority(
+                NoteCreate {
+                    title: "Partial link source".into(),
+                    content: "before".into(),
+                    relative_path: Some("partial-link-source.md".into()),
+                    aliases: Vec::new(),
+                    status: NoteStatus::Draft,
+                    tags: Vec::new(),
+                    schema_version: crate::models::note::CURRENT_NOTE_SCHEMA_VERSION,
+                    migration_source: None,
+                    optimizer_managed: false,
+                    properties: Default::default(),
+                },
+                "note_editor",
+                coordinator.current_authority_token().unwrap(),
+            )
+            .unwrap();
+        assert!(matches!(
+            crate::commands::repair_after_authority_mutation(
+                &state,
+                &create_commit,
+                "partial link setup"
+            )
+            .await,
+            crate::commands::PostAuthorityRepair::Ready(_)
+        ));
+        let (_, forward_commit) = state
+            .knowledge_store
+            .write()
+            .await
+            .update_note_expecting_authority(
+                &created.id,
+                NoteUpdate {
+                    content: Some("before\n\n## Related Concepts\n- [[Target]] (related)".into()),
+                    ..Default::default()
+                },
+                "note_editor",
+                coordinator.current_authority_token().unwrap(),
+            )
+            .unwrap();
+        let expected = forward_commit.authority_token.clone().unwrap();
+        let reverse_failure: anyhow::Result<(
+            crate::models::note::Note,
+            crate::services::twin_events::MutationCommit,
+        )> = Err(anyhow::anyhow!("injected reverse precommit failure"));
+
+        let error = complete_link_note_mutation(
+            &state,
+            &expected,
+            Some(&forward_commit),
+            reverse_failure,
+            "created reverse note link",
+        )
+        .await
+        .expect_err("partial bidirectional link must not look safely retryable");
+
+        assert!(error.contains("partially committed"));
+        assert!(error.contains("do not retry"));
+        coordinator.require_namespace_ready().unwrap();
+        assert!(state
+            .knowledge_store
+            .read()
+            .await
+            .get_note(&created.id)
+            .unwrap()
+            .content
+            .contains("[[Target]]"));
+    }
 }
 
 /// Apply discovered links to a note (creates bidirectional wikilinks)
@@ -211,9 +401,12 @@ pub async fn apply_links(
     #[allow(non_snake_case)] noteId: String,
     request: ApplyLinksRequest,
 ) -> Result<ApplyLinksResponse, String> {
+    let mut root_guard = Some(crate::commands::acquire_root_epoch(state.inner()).await?);
+    let mut root_epoch = crate::commands::capture_root_epoch(state.inner())?;
     let requested_candidates = if !request.candidates.is_empty() {
         deduplicate_links(request.candidates.clone())
     } else {
+        drop(root_guard.take());
         // Backward-compatibility path for older callers that only send IDs.
         let response = discover_for_note(
             state.inner(),
@@ -237,10 +430,16 @@ pub async fn apply_links(
             .filter(|c| requested.contains(&c.target_id))
             .collect()
     };
+    let root_guard = match root_guard {
+        Some(guard) => guard,
+        None => crate::commands::acquire_expected_root_epoch(state.inner(), &root_epoch).await?,
+    };
     let links_attempted = requested_candidates.len();
 
     let mut links_created = 0;
     let mut dirty_note_ids: HashSet<String> = HashSet::new();
+    let mut latest_commit = None;
+    let mut repair_pending = false;
 
     for candidate in &requested_candidates {
         let (target_title, target_content) = {
@@ -263,15 +462,29 @@ pub async fn apply_links(
             {
                 drop(store);
                 let mut store = state.knowledge_store.write().await;
-                store
-                    .update_note(
-                        &noteId,
-                        NoteUpdate {
-                            content: Some(new_content),
-                            ..Default::default()
-                        },
-                    )
-                    .map_err(|e| e.to_string())?;
+                let mutation = store.update_note_expecting_authority(
+                    &noteId,
+                    NoteUpdate {
+                        content: Some(new_content),
+                        ..Default::default()
+                    },
+                    "note_editor",
+                    root_epoch.clone(),
+                );
+                drop(store);
+                let completed = complete_link_note_mutation(
+                    state.inner(),
+                    &root_epoch,
+                    latest_commit.as_ref(),
+                    mutation,
+                    "applied forward note link",
+                )
+                .await?;
+                root_epoch = completed.continuation_authority;
+                if let Some(commit) = completed.commit {
+                    latest_commit = Some(commit);
+                    repair_pending = !completed.repaired;
+                }
                 true
             } else {
                 false
@@ -293,15 +506,30 @@ pub async fn apply_links(
                 add_wikilink_to_content(&target_content, &source_title, &reverse_type)
             {
                 let mut store = state.knowledge_store.write().await;
-                target_updated = store
-                    .update_note(
-                        &candidate.target_id,
-                        NoteUpdate {
-                            content: Some(new_content),
-                            ..Default::default()
-                        },
-                    )
-                    .is_ok();
+                let mutation = store.update_note_expecting_authority(
+                    &candidate.target_id,
+                    NoteUpdate {
+                        content: Some(new_content),
+                        ..Default::default()
+                    },
+                    "note_editor",
+                    root_epoch.clone(),
+                );
+                drop(store);
+                let completed = complete_link_note_mutation(
+                    state.inner(),
+                    &root_epoch,
+                    latest_commit.as_ref(),
+                    mutation,
+                    "applied reverse note link",
+                )
+                .await?;
+                root_epoch = completed.continuation_authority;
+                if let Some(commit) = completed.commit {
+                    latest_commit = Some(commit);
+                    repair_pending = !completed.repaired;
+                }
+                target_updated = true;
             }
         }
 
@@ -315,8 +543,23 @@ pub async fn apply_links(
     }
 
     if !dirty_note_ids.is_empty() {
-        let dirty_ids: Vec<String> = dirty_note_ids.iter().cloned().collect();
-        commit_note_writes(state.inner(), &dirty_ids, "links_applied").await?;
+        if let Some(commit) = latest_commit.as_ref() {
+            drop(root_guard);
+            if repair_pending {
+                crate::commands::acknowledge_reported_repair(
+                    crate::commands::repair_after_authority_mutation(
+                        state.inner(),
+                        commit,
+                        "applied note links",
+                    )
+                    .await,
+                );
+            }
+        } else {
+            root_guard.finish(state.inner()).await?;
+        }
+    } else {
+        root_guard.finish(state.inner()).await?;
     }
 
     Ok(ApplyLinksResponse {
@@ -334,8 +577,12 @@ pub async fn create_link(
     #[allow(non_snake_case)] targetId: String,
     #[allow(non_snake_case)] linkType: Option<String>,
 ) -> Result<CreateLinkResponse, String> {
+    let root_ticket = crate::commands::acquire_root_epoch(state.inner()).await?;
+    let mut root_epoch = root_ticket.authority().clone();
     let link_type = linkType.unwrap_or_else(|| "related".to_string());
     let mut dirty_note_ids: HashSet<String> = HashSet::new();
+    let mut latest_commit = None;
+    let mut repair_pending = false;
 
     // Get both notes
     let (source_title, target_title) = {
@@ -355,15 +602,29 @@ pub async fn create_link(
         {
             drop(store);
             let mut store = state.knowledge_store.write().await;
-            store
-                .update_note(
-                    &sourceId,
-                    NoteUpdate {
-                        content: Some(new_content),
-                        ..Default::default()
-                    },
-                )
-                .map_err(|e| e.to_string())?;
+            let mutation = store.update_note_expecting_authority(
+                &sourceId,
+                NoteUpdate {
+                    content: Some(new_content),
+                    ..Default::default()
+                },
+                "note_editor",
+                root_epoch.clone(),
+            );
+            drop(store);
+            let completed = complete_link_note_mutation(
+                state.inner(),
+                &root_epoch,
+                latest_commit.as_ref(),
+                mutation,
+                "created forward note link",
+            )
+            .await?;
+            root_epoch = completed.continuation_authority;
+            if let Some(commit) = completed.commit {
+                latest_commit = Some(commit);
+                repair_pending = !completed.repaired;
+            }
             dirty_note_ids.insert(sourceId.clone());
         }
     }
@@ -378,20 +639,50 @@ pub async fn create_link(
         {
             drop(store);
             let mut store = state.knowledge_store.write().await;
-            let _ = store.update_note(
+            let mutation = store.update_note_expecting_authority(
                 &targetId,
                 NoteUpdate {
                     content: Some(new_content),
                     ..Default::default()
                 },
+                "note_editor",
+                root_epoch.clone(),
             );
+            drop(store);
+            let completed = complete_link_note_mutation(
+                state.inner(),
+                &root_epoch,
+                latest_commit.as_ref(),
+                mutation,
+                "created reverse note link",
+            )
+            .await?;
+            if let Some(commit) = completed.commit {
+                latest_commit = Some(commit);
+                repair_pending = !completed.repaired;
+            }
             dirty_note_ids.insert(targetId.clone());
         }
     }
 
     if !dirty_note_ids.is_empty() {
-        let dirty_ids: Vec<String> = dirty_note_ids.iter().cloned().collect();
-        commit_note_writes(state.inner(), &dirty_ids, "link_created").await?;
+        if let Some(commit) = latest_commit.as_ref() {
+            drop(root_ticket);
+            if repair_pending {
+                crate::commands::acknowledge_reported_repair(
+                    crate::commands::repair_after_authority_mutation(
+                        state.inner(),
+                        commit,
+                        "created note link",
+                    )
+                    .await,
+                );
+            }
+        } else {
+            root_ticket.finish(state.inner()).await?;
+        }
+    } else {
+        root_ticket.finish(state.inner()).await?;
     }
 
     Ok(CreateLinkResponse {
@@ -415,8 +706,24 @@ pub async fn list_link_suggestion_queue(
     status: Option<String>,
     limit: Option<usize>,
 ) -> Result<Vec<LinkSuggestionQueueEntry>, String> {
-    let discovery = state.link_discovery.read().await;
-    Ok(discovery.list_queue_entries(status.as_deref(), limit.unwrap_or(25)))
+    let root_ticket = crate::commands::acquire_derived_root_epoch(state.inner()).await?;
+    let result = {
+        let service = state.link_discovery_service()?;
+        let mut discovery = service.write().await;
+        state
+            .mutation_coordinator
+            .as_ref()
+            .ok_or_else(|| "mutation coordinator is unavailable".to_string())?
+            .with_locked_derived_state(root_ticket.authority(), true, || {
+                discovery.reload_from_disk_checked().map_err(|error| {
+                    crate::services::twin_events::MutationError::Invalid(error.to_string())
+                })?;
+                Ok(discovery.list_queue_entries(status.as_deref(), limit.unwrap_or(25)))
+            })
+            .map_err(|error| error.to_string())?
+    };
+    root_ticket.finish(state.inner()).await?;
+    Ok(result)
 }
 
 /// Dismiss a cached suggestion so it does not reappear until the note changes again.
@@ -426,10 +733,28 @@ pub async fn dismiss_link_suggestion(
     #[allow(non_snake_case)] noteId: String,
     #[allow(non_snake_case)] targetId: String,
 ) -> Result<DismissLinkSuggestionResponse, String> {
-    let mut discovery = state.link_discovery.write().await;
-    let response = discovery.dismiss_suggestion(&noteId, &targetId);
-    drop(discovery);
-    enqueue_vault_optimizer_note(state.inner(), &noteId, "link_dismissed").await;
+    let root_ticket = crate::commands::acquire_derived_root_epoch(state.inner()).await?;
+    let response = {
+        let service = state.link_discovery_service()?;
+        let mut discovery = service.write().await;
+        state
+            .mutation_coordinator
+            .as_ref()
+            .ok_or_else(|| "mutation coordinator is unavailable".to_string())?
+            .with_locked_derived_state(root_ticket.authority(), true, || {
+                discovery.reload_from_disk_checked().map_err(|error| {
+                    crate::services::twin_events::MutationError::Invalid(error.to_string())
+                })?;
+                discovery
+                    .dismiss_suggestion_checked(&noteId, &targetId)
+                    .map_err(|error| {
+                        crate::services::twin_events::MutationError::Invalid(error.to_string())
+                    })
+            })
+            .map_err(|error| error.to_string())?
+    };
+    enqueue_vault_optimizer_note(state.inner(), &noteId, "link_dismissed").await?;
+    root_ticket.finish(state.inner()).await?;
     Ok(response)
 }
 
@@ -438,7 +763,26 @@ pub async fn dismiss_link_suggestion(
 pub async fn get_link_discovery_status(
     state: State<'_, AppState>,
 ) -> Result<LinkDiscoveryStatus, String> {
-    let settings = state.settings_service.read().await;
-    let discovery = state.link_discovery.read().await;
-    Ok(discovery.status(settings.get()))
+    let root_ticket = crate::commands::acquire_derived_root_epoch(state.inner()).await?;
+    let result = {
+        let settings = {
+            let settings_service = state.settings_service.read().await;
+            settings_service.get().clone()
+        };
+        let service = state.link_discovery_service()?;
+        let mut discovery = service.write().await;
+        state
+            .mutation_coordinator
+            .as_ref()
+            .ok_or_else(|| "mutation coordinator is unavailable".to_string())?
+            .with_locked_derived_state(root_ticket.authority(), true, || {
+                discovery.reload_from_disk_checked().map_err(|error| {
+                    crate::services::twin_events::MutationError::Invalid(error.to_string())
+                })?;
+                Ok(discovery.status(&settings))
+            })
+            .map_err(|error| error.to_string())?
+    };
+    root_ticket.finish(state.inner()).await?;
+    Ok(result)
 }

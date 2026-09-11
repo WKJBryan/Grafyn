@@ -1,4 +1,11 @@
-import { invoke } from '@tauri-apps/api/tauri'
+import { getRuntimeProfile, getTransport } from './transport'
+
+const invoke = (...args) => getTransport().invoke(...args)
+
+// Typed runtime health is installed before router mount and never includes secrets or paths.
+export const runtime = {
+  getStatus: () => invoke('get_runtime_status', {}),
+}
 
 // App boot API
 export const boot = {
@@ -91,9 +98,41 @@ export const canvas = {
     invoke('regenerate_response', { sessionId, tileId, modelId }),
 }
 
+// One-shot image generation stays separate from Canvas text persistence and streaming.
+export const images = {
+  discoverModels: () => invoke('discover_image_models', { request: {} }),
+
+  getModelCapability: (modelId) =>
+    invoke('get_image_model_capability', { request: { modelId } }),
+
+  generate: (request) => invoke('generate_image', { request }),
+
+  save: (request) => invoke('save_generated_image', { request }),
+
+  saveAs: (receiptId, retentionPolicy) =>
+    invoke('export_generated_image', { request: { receiptId, retentionPolicy } }),
+
+  shareGeneratedImage: (receiptId, retentionPolicy) =>
+    invoke('share_generated_image', { request: { receiptId, retentionPolicy } }),
+
+  load: (attachmentDigest) =>
+    invoke('load_generated_image', { request: { attachmentDigest } }),
+
+  discard: (receiptId) =>
+    invoke('discard_generated_image_receipt', { request: { receiptId } }),
+}
+
 // Twin collector API
 export const twin = {
   listRecords: () => invoke('list_user_records', {}),
+
+  createCompanionCapture: async (request) => {
+    const response = await invoke('create_companion_capture', { request })
+    return {
+      note: response.note,
+      observationEventId: response.observationEventId ?? response.observation_event_id,
+    }
+  },
 
   getRecord: (id) => invoke('get_user_record', { id }),
 
@@ -106,6 +145,18 @@ export const twin = {
   runInference: () => invoke('run_twin_inference', {}),
 
   getReview: () => invoke('get_twin_review', {}),
+
+  listObservations: (request) => invoke('list_twin_observations', { request }),
+
+  listProposals: (request) => invoke('list_twin_proposals', { request }),
+
+  reviewProposal: (request) => invoke('review_twin_proposal', { request }),
+
+  getStateProjection: (request) => invoke('get_twin_state_projection', { request }),
+
+  rankAttention: (request) => invoke('rank_twin_attention', { request }),
+
+  getEventTimeline: (request) => invoke('get_twin_event_timeline', { request }),
 
   resolveEvidence: (id) => invoke('resolve_user_record_evidence', { id }),
 
@@ -187,6 +238,19 @@ export const settings = {
   getOllamaStatus: () => invoke('get_ollama_status', {}),
 
   listOllamaModels: () => invoke('list_ollama_models', {}),
+}
+
+// Local E2EE sync foundation API. Transport remains manual until a relay exists.
+export const sync = {
+  getStatus: () => invoke('get_sync_status', {}),
+
+  listConflicts: () => invoke('list_sync_conflicts', {}),
+
+  exportOutbox: () => invoke('export_sync_outbox', {}),
+
+  importEnvelopes: (bundle) => invoke('import_sync_envelopes', { bundle }),
+
+  rebuildState: () => invoke('rebuild_sync_state', {}),
 }
 
 export const migration = {
@@ -288,4 +352,6 @@ export const importApi = {
   getSupportedFormats: () => invoke('get_supported_formats', {}),
 }
 
-export const isDesktopApp = () => typeof window !== 'undefined' && typeof window.__TAURI_IPC__ === 'function'
+export const isTauriApp = () => getRuntimeProfile().isTauri
+
+export const isDesktopApp = () => getRuntimeProfile().name === 'desktop-wide'

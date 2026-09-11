@@ -7,19 +7,29 @@ use crate::models::note::{
     PROP_TOPIC_KEY,
 };
 use crate::models::settings::UserSettings;
-use crate::services::atomic_io::write_atomic;
 use crate::services::knowledge_store::KnowledgeStore;
 use crate::services::topic_hub::normalize_topic_key;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use uuid::Uuid;
 
+mod publication;
+#[path = "vault_optimizer/rollback.rs"]
+mod rollback;
+#[cfg(test)]
+#[path = "vault_optimizer_rollback_tests.rs"]
+mod rollback_tests;
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct QueuedOptimizerNote {
+    #[serde(default)]
+    job_id: String,
     note_id: String,
     reason: String,
     enqueued_at: DateTime<Utc>,
@@ -28,6 +38,15 @@ struct QueuedOptimizerNote {
     /// parked into the inbox as a failed decision instead of retried forever.
     #[serde(default)]
     attempts: u32,
+    #[serde(default)]
+    pending_parking: Option<PendingOptimizerParkingV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PendingOptimizerParkingV1 {
+    error: String,
+    at: DateTime<Utc>,
 }
 
 /// A processing failure gets `MAX_OPTIMIZER_ATTEMPTS` tries (each a separate
@@ -36,9 +55,28 @@ struct QueuedOptimizerNote {
 /// entry (e.g. a note whose overlay path can never be written) can't spin
 /// forever and starve the rest of the queue.
 const MAX_OPTIMIZER_ATTEMPTS: u32 = 3;
+const OPTIMIZER_STATE_SCHEMA_VERSION: u16 = 1;
+const PENDING_PUBLICATIONS_DIRECTORY: &str = "pending-publications-v1";
+const MAX_PENDING_PUBLICATIONS: usize = 64;
+const MAX_PENDING_PUBLICATION_BYTES: usize = 16 * 1024 * 1024;
+const MAX_OPTIMIZER_STATE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_OPTIMIZER_AUDIT_BYTES: usize = 4 * 1024 * 1024;
+const MAX_OPTIMIZER_AUDIT_ENTRIES: usize = 4096;
+const MAX_OPTIMIZER_CHANGE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_OPTIMIZER_ORPHAN_TEMPS: usize = 64;
+const CHANGES_DIRECTORY: &str = "changes";
+const QUEUE_KEY: &str = "queue.json";
+const DECISIONS_KEY: &str = "decisions.json";
+const INBOX_KEY: &str = "inbox.json";
+const EVENTS_KEY: &str = "events.jsonl";
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct OptimizerState {
+    #[serde(default)]
+    schema_version: u16,
+    #[serde(default)]
+    state_revision: u64,
     #[serde(default)]
     queue: Vec<QueuedOptimizerNote>,
     #[serde(default)]
@@ -62,6 +100,7 @@ struct OptimizerState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct OptimizerChange {
     change_id: String,
     note_id: String,
@@ -76,53 +115,417 @@ struct OptimizerChange {
     #[serde(default)]
     note_after: Option<Note>,
     #[serde(default)]
+    markdown_before_digest: Option<crate::models::twin_event::ContentDigest>,
+    #[serde(default)]
+    markdown_relative_path: Option<String>,
+    #[serde(default)]
     created_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    exact_rollback: Option<rollback::ExactOptimizerRollbackMaterialV1>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PendingOptimizerPublication {
+    schema_version: u16,
+    phase: OptimizerPublicationPhase,
+    retry_fenced: bool,
+    audit_written: bool,
+    counted: bool,
+    queue_removed: bool,
+    #[serde(default)]
+    abort_queue_reconciled: bool,
+    expected_authority: Option<crate::services::vault_namespace::VaultAuthorityTokenV1>,
+    mutation_id: Option<crate::models::twin_event::ContentDigest>,
+    committed_authority: Option<crate::services::vault_namespace::VaultAuthorityTokenV1>,
+    target: OptimizerPublicationTarget,
+    job: QueuedOptimizerNote,
+    note: Note,
+    change_id: String,
+    decision: VaultOptimizerDecision,
+    change: OptimizerChange,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum OptimizerPublicationPhase {
+    RetryFenced,
+    Prepared,
+    Aborted,
+    Committed,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+enum OptimizerAuditEventV1 {
+    Rollback {
+        change_id: String,
+        #[serde(default)]
+        rollback_id: String,
+        at: DateTime<Utc>,
+    },
+    OptimizerParked {
+        #[serde(default)]
+        job_id: String,
+        note_id: String,
+        attempts: u32,
+        error: String,
+        at: DateTime<Utc>,
+    },
+    OptimizerApply {
+        note_id: String,
+        change_id: String,
+        at: DateTime<Utc>,
+        confidence: f64,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum OptimizerPublicationTarget {
+    Overlay {
+        note_id: String,
+        before_digest: Option<crate::models::twin_event::ContentDigest>,
+        after_digest: crate::models::twin_event::ContentDigest,
+        #[serde(default)]
+        source_relative_path: String,
+        #[serde(default)]
+        source_digest: Option<crate::models::twin_event::ContentDigest>,
+    },
+    Markdown {
+        relative_path: String,
+        before_digest: crate::models::twin_event::ContentDigest,
+        after_digest: crate::models::twin_event::ContentDigest,
+    },
 }
 
 #[derive(Debug, Clone)]
 pub struct VaultOptimizerService {
     optimizer_dir: PathBuf,
+    optimizer_root: Option<std::sync::Arc<crate::services::twin_events::AnchoredRoot>>,
+    #[cfg_attr(not(test), allow(dead_code))]
     queue_path: PathBuf,
+    #[cfg_attr(not(test), allow(dead_code))]
     decisions_path: PathBuf,
-    inbox_path: PathBuf,
+    #[cfg_attr(not(test), allow(dead_code))]
     events_path: PathBuf,
+    #[cfg_attr(not(test), allow(dead_code))]
     changes_dir: PathBuf,
     state: OptimizerState,
+    #[cfg(test)]
+    fail_prepared_publication_once: bool,
+    #[cfg(test)]
+    fail_committed_publication_once: bool,
+    #[cfg(test)]
+    fail_retry_fence_stage_after_write_once: bool,
+    #[cfg(test)]
+    fail_terminal_parking_after_publication_once: bool,
+    #[cfg(test)]
+    pause_after_retry_fence_once: Option<(
+        std::sync::Arc<std::sync::Barrier>,
+        std::sync::Arc<std::sync::Barrier>,
+    )>,
+    #[cfg(test)]
+    pause_before_markdown_digest_once: Option<(
+        std::sync::Arc<std::sync::Barrier>,
+        std::sync::Arc<std::sync::Barrier>,
+    )>,
+    #[cfg(test)]
+    pause_before_prepared_hook_once: Option<(
+        std::sync::Arc<std::sync::Barrier>,
+        std::sync::Arc<std::sync::Barrier>,
+    )>,
+    #[cfg(test)]
+    pause_after_prepared_publication_once: Option<(
+        std::sync::Arc<std::sync::Barrier>,
+        std::sync::Arc<std::sync::Barrier>,
+    )>,
 }
 
 impl VaultOptimizerService {
     pub fn new(data_path: PathBuf) -> Self {
+        let fallback_path = data_path.clone();
+        Self::try_new(data_path).unwrap_or_else(|error| {
+            log::error!("Failed to initialize vault optimizer state: {error}");
+            Self::empty_at(fallback_path)
+        })
+    }
+
+    pub(crate) fn try_new(data_path: PathBuf) -> Result<Self> {
         let optimizer_dir = data_path.join("vault_migration").join("optimizer");
         let queue_path = optimizer_dir.join("queue.json");
         let decisions_path = optimizer_dir.join("decisions.json");
-        let inbox_path = optimizer_dir.join("inbox.json");
         let events_path = optimizer_dir.join("events.jsonl");
         let changes_dir = optimizer_dir.join("changes");
-        let _ = std::fs::create_dir_all(&changes_dir);
+        std::fs::create_dir_all(&optimizer_dir)?;
+        let root = crate::services::twin_events::AnchoredRoot::open(&optimizer_dir)
+            .map_err(anyhow::Error::new)?;
+        root.open_directory(CHANGES_DIRECTORY, true)
+            .map_err(anyhow::Error::new)?;
+        root.open_directory(PENDING_PUBLICATIONS_DIRECTORY, true)
+            .map_err(anyhow::Error::new)?;
+        rollback::initialize_root(&root)?;
 
-        let state = std::fs::read_to_string(&queue_path)
-            .ok()
-            .and_then(|content| serde_json::from_str::<OptimizerState>(&content).ok())
-            .unwrap_or_default();
-
-        Self {
+        let mut service = Self {
             optimizer_dir,
+            optimizer_root: Some(std::sync::Arc::new(root)),
             queue_path,
             decisions_path,
-            inbox_path,
             events_path,
             changes_dir,
-            state,
+            state: OptimizerState::default(),
+            #[cfg(test)]
+            fail_prepared_publication_once: false,
+            #[cfg(test)]
+            fail_committed_publication_once: false,
+            #[cfg(test)]
+            fail_retry_fence_stage_after_write_once: false,
+            #[cfg(test)]
+            fail_terminal_parking_after_publication_once: false,
+            #[cfg(test)]
+            pause_after_retry_fence_once: None,
+            #[cfg(test)]
+            pause_before_markdown_digest_once: None,
+            #[cfg(test)]
+            pause_before_prepared_hook_once: None,
+            #[cfg(test)]
+            pause_after_prepared_publication_once: None,
+        };
+        let lock = service.acquire_state_lock()?;
+        let load_result = service.reload_from_disk_checked();
+        let unlock_result = lock.unlock().map_err(anyhow::Error::new);
+        load_result?;
+        unlock_result?;
+        Ok(service)
+    }
+
+    fn empty_at(data_path: PathBuf) -> Self {
+        let optimizer_dir = data_path.join("vault_migration").join("optimizer");
+        let optimizer_root = std::fs::create_dir_all(&optimizer_dir)
+            .ok()
+            .and_then(|()| crate::services::twin_events::AnchoredRoot::open(&optimizer_dir).ok())
+            .map(std::sync::Arc::new);
+        if let Some(root) = optimizer_root.as_deref() {
+            let _ = root.open_directory(CHANGES_DIRECTORY, true);
+            let _ = root.open_directory(PENDING_PUBLICATIONS_DIRECTORY, true);
+            let _ = rollback::initialize_root(root);
+        }
+        Self {
+            queue_path: optimizer_dir.join("queue.json"),
+            decisions_path: optimizer_dir.join("decisions.json"),
+            events_path: optimizer_dir.join("events.jsonl"),
+            changes_dir: optimizer_dir.join("changes"),
+            optimizer_dir,
+            optimizer_root,
+            state: OptimizerState::default(),
+            #[cfg(test)]
+            fail_prepared_publication_once: false,
+            #[cfg(test)]
+            fail_committed_publication_once: false,
+            #[cfg(test)]
+            fail_retry_fence_stage_after_write_once: false,
+            #[cfg(test)]
+            fail_terminal_parking_after_publication_once: false,
+            #[cfg(test)]
+            pause_after_retry_fence_once: None,
+            #[cfg(test)]
+            pause_before_markdown_digest_once: None,
+            #[cfg(test)]
+            pause_before_prepared_hook_once: None,
+            #[cfg(test)]
+            pause_after_prepared_publication_once: None,
         }
     }
 
+    pub(crate) fn uses_data_path(&self, data_path: &std::path::Path) -> bool {
+        self.optimizer_dir == data_path.join("vault_migration").join("optimizer")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn state_revision(&self) -> u64 {
+        self.state.state_revision
+    }
+
+    fn retained_optimizer_root(&self) -> Result<&crate::services::twin_events::AnchoredRoot> {
+        self.optimizer_root
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("vault optimizer filesystem root is unavailable"))
+    }
+
+    fn retained_optimizer_root_handle(
+        &self,
+    ) -> Result<std::sync::Arc<crate::services::twin_events::AnchoredRoot>> {
+        self.optimizer_root
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("vault optimizer filesystem root is unavailable"))
+    }
+
+    pub(crate) fn with_locked_fresh_state<T>(
+        &mut self,
+        action: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        let lock = self
+            .retained_optimizer_root()?
+            .lock_exclusive("state.lock")
+            .map_err(anyhow::Error::new)?;
+        let result = self.reload_from_disk_checked().and_then(|()| action(self));
+        lock.unlock()?;
+        result
+    }
+
+    pub(crate) fn acquire_state_lock(
+        &self,
+    ) -> Result<crate::services::twin_events::AnchoredExclusiveLock> {
+        self.retained_optimizer_root()?
+            .lock_exclusive("state.lock")
+            .map_err(anyhow::Error::new)
+    }
+
+    pub(crate) fn reload_from_disk_checked(&mut self) -> Result<()> {
+        let loaded = {
+            let root = self.retained_optimizer_root()?;
+            cleanup_optimizer_orphan_temps(root)?;
+            load_optimizer_state(root)?
+        };
+        self.state = loaded;
+        normalize_optimizer_job_ids(&mut self.state)?;
+        if self.state.schema_version > OPTIMIZER_STATE_SCHEMA_VERSION {
+            anyhow::bail!(
+                "unsupported vault optimizer state schema {}",
+                self.state.schema_version
+            );
+        }
+        self.validate_persisted_state()?;
+        self.recover_pending_parkings()
+    }
+
+    #[cfg(test)]
+    fn fail_next_prepared_publication(&mut self) {
+        self.fail_prepared_publication_once = true;
+    }
+
+    #[cfg(test)]
+    fn fail_next_committed_publication(&mut self) {
+        self.fail_committed_publication_once = true;
+    }
+
+    #[cfg(test)]
+    fn fail_next_retry_fence_stage_after_write(&mut self) {
+        self.fail_retry_fence_stage_after_write_once = true;
+    }
+
+    #[cfg(test)]
+    fn fail_next_terminal_parking_after_publication(&mut self) {
+        self.fail_terminal_parking_after_publication_once = true;
+    }
+
+    #[cfg(test)]
+    fn pause_after_retry_fence_once(
+        &mut self,
+        entered: std::sync::Arc<std::sync::Barrier>,
+        resume: std::sync::Arc<std::sync::Barrier>,
+    ) {
+        self.pause_after_retry_fence_once = Some((entered, resume));
+    }
+
+    #[cfg(test)]
+    fn pause_before_markdown_digest_once(
+        &mut self,
+        entered: std::sync::Arc<std::sync::Barrier>,
+        resume: std::sync::Arc<std::sync::Barrier>,
+    ) {
+        self.pause_before_markdown_digest_once = Some((entered, resume));
+    }
+
+    #[cfg(test)]
+    fn pause_before_prepared_hook_once(
+        &mut self,
+        entered: std::sync::Arc<std::sync::Barrier>,
+        resume: std::sync::Arc<std::sync::Barrier>,
+    ) {
+        self.pause_before_prepared_hook_once = Some((entered, resume));
+    }
+
+    #[cfg(test)]
+    fn pause_after_prepared_publication_once(
+        &mut self,
+        entered: std::sync::Arc<std::sync::Barrier>,
+        resume: std::sync::Arc<std::sync::Barrier>,
+    ) {
+        self.pause_after_prepared_publication_once = Some((entered, resume));
+    }
+
     pub fn bootstrap(&mut self, notes: &[Note]) {
+        if let Err(error) = self.bootstrap_checked(notes) {
+            log::error!("Failed to persist vault optimizer bootstrap: {error}");
+        }
+    }
+
+    pub(crate) fn bootstrap_checked(&mut self, notes: &[Note]) -> Result<()> {
         if self.state.queue.is_empty() {
             for note in notes.iter().filter(|note| !note.is_topic_hub()) {
                 self.enqueue_note(&note.id, "bootstrap");
             }
-            let _ = self.persist_state();
+            self.persist_state()?;
         }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_for_vault(&mut self, notes: &[Note]) {
+        if let Err(error) = self.reset_for_vault_checked(notes) {
+            log::error!("Failed to reset vault optimizer state: {error}");
+        }
+    }
+
+    pub(crate) fn reset_for_vault_checked(&mut self, notes: &[Note]) -> Result<()> {
+        self.state.queue.clear();
+        for note in notes.iter().filter(|note| !note.is_topic_hub()) {
+            self.enqueue_note(&note.id, "bootstrap");
+        }
+        self.persist_state()
+    }
+
+    fn validate_persisted_state(&self) -> Result<()> {
+        if self.state.queue.len() > MAX_OPTIMIZER_AUDIT_ENTRIES {
+            anyhow::bail!("optimizer queue exceeds 4096 entries");
+        }
+        let mut job_ids = HashSet::new();
+        let mut note_ids = HashSet::new();
+        for job in &self.state.queue {
+            parse_canonical_uuid(&job.job_id, "optimizer job ID")?;
+            if !job_ids.insert(job.job_id.as_str()) || !note_ids.insert(job.note_id.as_str()) {
+                anyhow::bail!("optimizer queue contains duplicate job identity");
+            }
+            if job.pending_parking.is_some() && job.attempts < MAX_OPTIMIZER_ATTEMPTS {
+                anyhow::bail!("optimizer parking witness precedes the terminal attempt");
+            }
+        }
+        self.load_decisions()?;
+        self.load_inbox()?;
+        self.load_events()?;
+        let root = self.retained_optimizer_root()?;
+        let names = root
+            .regular_file_names(CHANGES_DIRECTORY)
+            .map_err(anyhow::Error::new)?;
+        if names.len() > MAX_OPTIMIZER_AUDIT_ENTRIES {
+            anyhow::bail!("optimizer change audit exceeds 4096 entries");
+        }
+        for name in names {
+            let change_id = name
+                .strip_suffix(".json")
+                .ok_or_else(|| anyhow::anyhow!("invalid optimizer change filename"))?;
+            parse_canonical_uuid(change_id, "optimizer change ID")?;
+            let change = self.read_change(change_id)?;
+            if change.change_id != change_id {
+                anyhow::bail!("optimizer change filename identity mismatch");
+            }
+        }
+        for (_, pending) in self.load_pending_publications()? {
+            validate_pending_publication(&pending)?;
+        }
+        rollback::validate_pending_rollbacks(self)?;
+        Ok(())
     }
 
     pub fn enqueue_note(&mut self, note_id: &str, reason: &str) {
@@ -136,11 +539,23 @@ impl VaultOptimizerService {
         }
 
         self.state.queue.push(QueuedOptimizerNote {
+            job_id: Uuid::new_v4().to_string(),
             note_id: note_id.to_string(),
             reason: reason.to_string(),
             enqueued_at: Utc::now(),
             attempts: 0,
+            pending_parking: None,
         });
+    }
+
+    pub(crate) fn enqueue_note_checked(&mut self, note_id: &str, reason: &str) -> Result<bool> {
+        let before = self.state.queue.len();
+        self.enqueue_note(note_id, reason);
+        if self.state.queue.len() == before {
+            return Ok(false);
+        }
+        self.persist_state()?;
+        Ok(true)
     }
 
     pub fn status(&self, settings: &UserSettings) -> VaultOptimizerStatus {
@@ -169,6 +584,15 @@ impl VaultOptimizerService {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn queued_note_ids(&self) -> Vec<String> {
+        self.state
+            .queue
+            .iter()
+            .map(|job| job.note_id.clone())
+            .collect()
+    }
+
     pub fn list_decisions(&self, limit: usize) -> Result<Vec<VaultOptimizerDecision>> {
         let mut decisions = self.load_decisions()?;
         decisions.reverse();
@@ -190,53 +614,13 @@ impl VaultOptimizerService {
         Ok(inbox)
     }
 
-    pub fn rollback_change(
+    pub(crate) fn rollback_change_expecting_authority(
         &mut self,
         change_id: &str,
         store: &mut KnowledgeStore,
-    ) -> Result<VaultOptimizerRollbackResult> {
-        let path = self.changes_dir.join(format!("{}.json", change_id));
-        let data = std::fs::read_to_string(&path)
-            .with_context(|| format!("Optimizer change '{}' not found", change_id))?;
-        let change: OptimizerChange = serde_json::from_str(&data)?;
-
-        if let Some(overlay_before) = change.overlay_before {
-            if overlay_before.is_null() {
-                store.delete_overlay(&change.note_id)?;
-            } else {
-                store.write_overlay(&change.note_id, &overlay_before)?;
-            }
-        } else if let Some(note_before) = change.note_before {
-            store.update_note(
-                &change.note_id,
-                NoteUpdate {
-                    title: Some(note_before.title),
-                    content: Some(note_before.content),
-                    relative_path: Some(note_before.relative_path),
-                    aliases: Some(note_before.aliases),
-                    status: Some(note_before.status),
-                    tags: Some(note_before.tags),
-                    schema_version: Some(note_before.schema_version),
-                    migration_source: note_before.migration_source,
-                    optimizer_managed: Some(note_before.optimizer_managed),
-                    properties: Some(note_before.properties),
-                },
-            )?;
-        }
-
-        self.state.rollback_count += 1;
-        self.persist_state()?;
-        self.append_event(json!({
-            "type": "rollback",
-            "change_id": change_id,
-            "at": Utc::now(),
-        }))?;
-
-        Ok(VaultOptimizerRollbackResult {
-            change_id: change_id.to_string(),
-            rolled_back: true,
-            message: "Optimizer change rolled back".to_string(),
-        })
+        expected: crate::services::vault_namespace::VaultAuthorityTokenV1,
+    ) -> Result<OptimizerRollbackMutationOutcome> {
+        rollback::rollback_change(self, change_id, store, expected)
     }
 
     /// Advances the optimizer queue using only *read* access to the vault.
@@ -271,27 +655,70 @@ impl VaultOptimizerService {
         store: &KnowledgeStore,
         settings: &UserSettings,
     ) -> Result<OptimizerTick> {
+        self.prepare_next_internal(store, settings, None)
+    }
+
+    pub(crate) fn prepare_next_expecting_authority(
+        &mut self,
+        store: &KnowledgeStore,
+        settings: &UserSettings,
+        expected: crate::services::vault_namespace::VaultAuthorityTokenV1,
+    ) -> Result<OptimizerTick> {
+        self.prepare_next_internal(store, settings, Some(expected))
+    }
+
+    fn prepare_next_internal(
+        &mut self,
+        store: &KnowledgeStore,
+        settings: &UserSettings,
+        expected_authority: Option<crate::services::vault_namespace::VaultAuthorityTokenV1>,
+    ) -> Result<OptimizerTick> {
         if !settings.background_vault_optimizer_enabled {
-            return Ok(OptimizerTick::Idle);
+            return Ok(OptimizerTick::NoWrite);
         }
 
         let Some(job) = self.state.queue.first().cloned() else {
-            return Ok(OptimizerTick::Idle);
+            return Ok(OptimizerTick::NoWrite);
         };
+        if job.pending_parking.is_some() {
+            self.finish_pending_parking(&job)?;
+            return Ok(OptimizerTick::NoWrite);
+        }
+        if let Some((_, pending)) = self
+            .load_pending_publications()?
+            .into_iter()
+            .find(|(_, pending)| pending.job.job_id == job.job_id)
+        {
+            if pending.phase == OptimizerPublicationPhase::RetryFenced {
+                return Ok(OptimizerTick::RetryFenced(Box::new(
+                    RetryFencedOptimizerWrite {
+                        publication: pending,
+                    },
+                )));
+            }
+            // Prepared and Committed witnesses must be classified/finalized
+            // by a complete authority rebuild. They are never replayed as a
+            // fresh write with a new change identity.
+            return Ok(OptimizerTick::NoWrite);
+        }
 
-        let note = match store.get_note(&job.note_id) {
-            Ok(note) => note,
-            Err(error) => {
-                log::warn!("Skipping optimizer note '{}': {}", job.note_id, error);
+        let note = match store.optimizer_note_snapshot(&job.note_id) {
+            Ok(Some(snapshot)) => snapshot.note,
+            Ok(None) => {
+                log::warn!("Skipping missing optimizer note '{}'", job.note_id);
                 self.remove_queued_job(&job.note_id);
                 self.persist_state()?;
-                return Ok(OptimizerTick::Idle);
+                return Ok(OptimizerTick::NoWrite);
+            }
+            Err(error) => {
+                self.defer_or_park_job(job, error)?;
+                return Ok(OptimizerTick::NoWrite);
             }
         };
 
         if note.is_topic_hub() {
             self.complete_noop_job(&job.note_id)?;
-            return Ok(OptimizerTick::Idle);
+            return Ok(OptimizerTick::NoWrite);
         }
 
         // The note's original frontmatter failed to parse and is preserved verbatim
@@ -305,7 +732,7 @@ impl VaultOptimizerService {
                 note.id
             );
             self.complete_noop_job(&job.note_id)?;
-            return Ok(OptimizerTick::Idle);
+            return Ok(OptimizerTick::NoWrite);
         }
 
         // `background_vault_optimizer_llm_enabled` is meant to gate LLM-based
@@ -323,13 +750,13 @@ impl VaultOptimizerService {
             Ok(proposal) => proposal,
             Err(error) => {
                 self.defer_or_park_job(job, error)?;
-                return Ok(OptimizerTick::Idle);
+                return Ok(OptimizerTick::NoWrite);
             }
         };
 
         if proposal.is_empty() {
             self.complete_noop_job(&job.note_id)?;
-            return Ok(OptimizerTick::Idle);
+            return Ok(OptimizerTick::NoWrite);
         }
 
         if self.daily_write_cap_reached(settings) {
@@ -340,10 +767,11 @@ impl VaultOptimizerService {
             );
             // Leave the job queued untouched; it's retried on a later tick
             // (possibly after the daily counter rolls over to a new date).
-            return Ok(OptimizerTick::Idle);
+            return Ok(OptimizerTick::NoWrite);
         }
 
         let change_id = Uuid::new_v4().to_string();
+        let publication_time = Utc::now();
         let decision = VaultOptimizerDecision {
             id: change_id.clone(),
             note_id: Some(note.id.clone()),
@@ -351,44 +779,9 @@ impl VaultOptimizerService {
             confidence: proposal.confidence,
             reason: proposal.reason.clone(),
             diff_preview: proposal.diff_preview.clone(),
-            created_at: Some(Utc::now()),
+            created_at: Some(publication_time),
             change_id: Some(change_id.clone()),
         };
-
-        if settings.background_vault_optimizer_edit_mode == "sidecar_first" {
-            let write_result = (|| -> Result<OptimizerChange> {
-                let overlay_before = read_overlay_value(store, &note.id);
-                let overlay_after = json!({
-                    "aliases": proposal.aliases,
-                    "tags": proposal.tags,
-                    "schema_version": CURRENT_NOTE_SCHEMA_VERSION,
-                    "migration_source": "vault_optimizer",
-                    "optimizer_managed": false,
-                    "properties": proposal.properties,
-                });
-                store.write_overlay(&note.id, &overlay_after)?;
-                Ok(OptimizerChange {
-                    change_id: change_id.clone(),
-                    note_id: note.id.clone(),
-                    mode: "sidecar_first".to_string(),
-                    overlay_before,
-                    overlay_after: Some(overlay_after),
-                    created_at: Some(Utc::now()),
-                    ..Default::default()
-                })
-            })();
-
-            return match write_result {
-                Ok(change) => {
-                    self.finalize_applied_change(&job, &note, &change_id, decision, change)?;
-                    Ok(OptimizerTick::Applied(note.id.clone()))
-                }
-                Err(error) => {
-                    self.defer_or_park_job(job, error)?;
-                    Ok(OptimizerTick::Idle)
-                }
-            };
-        }
 
         Ok(OptimizerTick::Pending(Box::new(PendingOptimizerWrite {
             job,
@@ -396,6 +789,8 @@ impl VaultOptimizerService {
             change_id,
             decision,
             edit_mode: settings.background_vault_optimizer_edit_mode.clone(),
+            expected_authority,
+            prepared_state_revision: self.state.state_revision,
         })))
     }
 
@@ -428,28 +823,49 @@ impl VaultOptimizerService {
         &mut self,
         store: &mut KnowledgeStore,
         pending: PendingOptimizerWrite,
-    ) -> Result<Option<String>> {
+    ) -> Result<OptimizerMutationResult<OptimizerAppliedResult>> {
         let PendingOptimizerWrite {
             job,
             proposal,
             change_id,
             decision,
             edit_mode,
+            expected_authority,
+            prepared_state_revision,
         } = pending;
 
-        let current = match store.get_note(&job.note_id) {
-            Ok(current) => current,
-            Err(error) => {
+        if self.with_locked_fresh_state(|service| {
+            Ok(service
+                .load_pending_publications()?
+                .into_iter()
+                .any(|(_, pending)| pending.job.job_id == job.job_id))
+        })? {
+            return Ok(OptimizerMutationResult::NoWrite);
+        }
+
+        let snapshot = match store.optimizer_note_snapshot(&job.note_id) {
+            Ok(Some(snapshot)) => snapshot,
+            Ok(None) => {
                 log::warn!(
-                    "Skipping optimizer apply for note '{}': note disappeared between prepare and apply: {}",
-                    job.note_id,
-                    error
+                    "Skipping optimizer apply for note '{}': note disappeared between prepare and apply",
+                    job.note_id
                 );
-                self.remove_queued_job(&job.note_id);
-                self.persist_state()?;
-                return Ok(None);
+                self.complete_noop_job_fresh(&job.job_id)?;
+                return Ok(OptimizerMutationResult::NoWrite);
+            }
+            Err(error) => {
+                self.defer_or_park_job_fresh(&job.job_id, &error)?;
+                return Ok(OptimizerMutationResult::NoWrite);
             }
         };
+        let crate::services::knowledge_store::OptimizerNoteSnapshot {
+            note: current,
+            markdown_precondition,
+            markdown_raw_bytes,
+            overlay_value,
+            overlay_digest,
+            overlay_raw_bytes,
+        } = snapshot;
 
         // Same guard as `prepare_next`: an external edit in the gap may have
         // (re)introduced unparsable frontmatter that must be preserved
@@ -459,266 +875,832 @@ impl VaultOptimizerService {
                 "Skipping optimizer apply for note '{}': frontmatter became unparsable between prepare and apply",
                 current.id
             );
-            self.complete_noop_job(&job.note_id)?;
-            return Ok(None);
+            self.complete_noop_job_fresh(&job.job_id)?;
+            return Ok(OptimizerMutationResult::NoWrite);
         }
 
-        let write_result = store.update_note(
-            &current.id,
-            NoteUpdate {
-                title: None,
-                content: None,
-                // None preserves the note's CURRENT path — never reapply the
-                // snapshot's path over an interleaved user rename.
-                relative_path: None,
-                aliases: Some(merge_unique_strings(
-                    current.aliases.clone(),
-                    proposal.aliases.clone(),
-                )),
-                status: None,
-                tags: Some(merge_unique_strings(
-                    current.tags.clone(),
-                    proposal.tags.clone(),
-                )),
-                schema_version: Some(CURRENT_NOTE_SCHEMA_VERSION),
-                migration_source: Some("vault_optimizer".to_string()),
-                optimizer_managed: Some(false),
-                properties: Some(merge_note_properties(
-                    current.properties.clone(),
-                    proposal.properties.clone(),
-                )),
-            },
-        );
-
-        match write_result {
-            Ok(updated) => {
-                let change = OptimizerChange {
-                    change_id: change_id.clone(),
-                    note_id: current.id.clone(),
-                    mode: edit_mode,
-                    // `note_before` is the re-fetched CURRENT note (not the
-                    // stale snapshot), so a rollback restores the user's
-                    // interleaved edit instead of erasing it.
-                    note_before: Some(current.clone()),
-                    note_after: Some(updated),
-                    created_at: Some(Utc::now()),
-                    ..Default::default()
-                };
-                self.finalize_applied_change(&job, &current, &change_id, decision, change)?;
-                Ok(Some(current.id.clone()))
-            }
+        let refreshed_proposal = match build_optimizer_proposal(&current, store) {
+            Ok(proposal) => proposal,
             Err(error) => {
-                self.defer_or_park_job(job, error)?;
-                Ok(None)
+                self.defer_or_park_job_fresh(&job.job_id, &error)?;
+                return Ok(OptimizerMutationResult::NoWrite);
+            }
+        };
+        let bound_sidecar_overlay = (edit_mode == "sidecar_first").then(|| {
+            optimizer_sidecar_overlay(
+                &proposal,
+                markdown_precondition.relative_path(),
+                markdown_precondition.expected_digest(),
+            )
+        });
+        let sidecar_target_is_already_exact =
+            bound_sidecar_overlay.as_ref().is_some_and(|overlay| {
+                serde_json::to_vec_pretty(overlay)
+                    .ok()
+                    .map(|bytes| crate::services::twin_events::digest_bytes(&bytes))
+                    .as_ref()
+                    == overlay_digest.as_ref()
+            });
+        if refreshed_proposal != proposal && !sidecar_target_is_already_exact {
+            let error =
+                anyhow::anyhow!("optimizer source changed between proposal preparation and apply");
+            self.defer_or_park_job_fresh(&job.job_id, &error)?;
+            return Ok(OptimizerMutationResult::NoWrite);
+        }
+        if sidecar_target_is_already_exact {
+            // The external writer satisfied the exact proposal before this
+            // optimizer acquired an owner fence. Complete the queue item as a
+            // no-op; the strict coordinator path intentionally refuses to
+            // claim already-present bytes without an owned receipt.
+            self.complete_noop_job_fresh(&job.job_id)?;
+            return Ok(OptimizerMutationResult::NoWrite);
+        }
+        let proposal = refreshed_proposal;
+
+        #[cfg(test)]
+        if edit_mode != "sidecar_first" {
+            if let Some((entered, resume)) = self.pause_before_markdown_digest_once.take() {
+                entered.wait();
+                resume.wait();
+            }
+        }
+
+        let update = optimizer_note_update(&current, &proposal);
+        let publication_inputs = (|| -> Result<(
+            OptimizerPublicationTarget,
+            OptimizerChange,
+            Option<Note>,
+            Option<Value>,
+            NoteUpdate,
+            Note,
+        )> {
+
+            if edit_mode == "sidecar_first" {
+                let overlay_before = overlay_value;
+                let before_digest = overlay_digest;
+                let source_relative_path = markdown_precondition.relative_path().to_string();
+                let source_digest = markdown_precondition.expected_digest().clone();
+                let overlay_after = bound_sidecar_overlay
+                    .clone()
+                    .expect("sidecar overlay was constructed above");
+                let after_bytes = serde_json::to_vec_pretty(&overlay_after)?;
+                let after_digest = crate::services::twin_events::digest_bytes(&after_bytes);
+                let restore_before = before_digest.as_ref().map_or(
+                    crate::services::twin_events::BeforeImage::Absent,
+                    |digest| crate::services::twin_events::BeforeImage::Sha256(digest.clone()),
+                );
+                let apply_after =
+                    crate::services::twin_events::BeforeImage::Sha256(after_digest.clone());
+                let restore_utf8 = overlay_raw_bytes
+                    .map(String::from_utf8)
+                    .transpose()
+                    .context("optimizer overlay source is not UTF-8")?;
+                let rollback_governance = store.optimizer_overlay_governance(
+                    &source_relative_path,
+                    &markdown_raw_bytes,
+                    restore_utf8.as_deref().map(str::as_bytes),
+                )?;
+                let apply_governance = store.optimizer_overlay_governance(
+                    &source_relative_path,
+                    &markdown_raw_bytes,
+                    Some(&after_bytes),
+                )?;
+                let apply_payload_digest = rollback::effective_sidecar_digest(
+                    &source_digest,
+                    &apply_after,
+                );
+                let apply_evidence_digest = rollback::effective_sidecar_digest(
+                    &source_digest,
+                    &restore_before,
+                );
+                Ok((
+                    OptimizerPublicationTarget::Overlay {
+                        note_id: current.id.clone(),
+                        before_digest,
+                        after_digest,
+                        source_relative_path: source_relative_path.clone(),
+                        source_digest: Some(source_digest.clone()),
+                    },
+                    OptimizerChange {
+                        change_id: change_id.clone(),
+                        note_id: current.id.clone(),
+                        mode: edit_mode,
+                        overlay_before,
+                        overlay_after: Some(overlay_after.clone()),
+                        markdown_before_digest: Some(source_digest),
+                        markdown_relative_path: Some(source_relative_path),
+                        created_at: decision.created_at,
+                        exact_rollback: Some(rollback::ExactOptimizerRollbackMaterialV1 {
+                            schema_version:
+                                rollback::EXACT_OPTIMIZER_ROLLBACK_SCHEMA_VERSION,
+                            target_kind:
+                                crate::services::twin_events::TargetKind::OverlayJson,
+                            target_key: format!("{}.json", current.id),
+                            restore_before,
+                            restore_utf8,
+                            apply_after,
+                            source_relative_path: markdown_precondition
+                                .relative_path()
+                                .to_string(),
+                            source_digest: markdown_precondition.expected_digest().clone(),
+                            apply_payload_digest: apply_payload_digest.clone(),
+                            apply_evidence_digest: apply_evidence_digest.clone(),
+                            rollback_payload_digest: apply_evidence_digest,
+                            rollback_evidence_digest: apply_payload_digest,
+                            apply_governance,
+                            rollback_governance,
+                        }),
+                        ..Default::default()
+                    },
+                    None,
+                    Some(overlay_after),
+                    update.clone(),
+                    current.clone(),
+                ))
+            } else {
+                let before_path = store.serialized_note_bytes(&current)?.0;
+                let before_digest = markdown_precondition.expected_digest().clone();
+                let source_update = optimizer_note_update(&current, &proposal);
+                let exact =
+                    store.materialize_note_update_at(&current, source_update.clone(), Utc::now())?;
+                let (after_path, after_bytes) = store.serialized_note_bytes(&exact)?;
+                if before_path != after_path {
+                    anyhow::bail!("optimizer rewrite unexpectedly changed the note path");
+                }
+                let after_digest = crate::services::twin_events::digest_bytes(&after_bytes);
+                let restore_utf8 = String::from_utf8(markdown_raw_bytes)
+                    .context("optimizer Markdown source is not UTF-8")?;
+                Ok((
+                    OptimizerPublicationTarget::Markdown {
+                        relative_path: before_path.clone(),
+                        before_digest: before_digest.clone(),
+                        after_digest: after_digest.clone(),
+                    },
+                    OptimizerChange {
+                        change_id: change_id.clone(),
+                        note_id: current.id.clone(),
+                        mode: edit_mode,
+                        note_before: Some(current.clone()),
+                        note_after: Some(exact.clone()),
+                        markdown_before_digest: Some(before_digest.clone()),
+                        markdown_relative_path: Some(before_path.clone()),
+                        created_at: decision.created_at,
+                        exact_rollback: Some(rollback::ExactOptimizerRollbackMaterialV1 {
+                            schema_version:
+                                rollback::EXACT_OPTIMIZER_ROLLBACK_SCHEMA_VERSION,
+                            target_kind: crate::services::twin_events::TargetKind::Markdown,
+                            target_key: before_path.clone(),
+                            restore_before:
+                                crate::services::twin_events::BeforeImage::Sha256(
+                                    before_digest.clone(),
+                                ),
+                            restore_utf8: Some(restore_utf8),
+                            apply_after:
+                                crate::services::twin_events::BeforeImage::Sha256(
+                                    after_digest.clone(),
+                                ),
+                            source_relative_path: before_path,
+                            source_digest: before_digest.clone(),
+                            apply_payload_digest: after_digest.clone(),
+                            apply_evidence_digest: before_digest.clone(),
+                            rollback_payload_digest: before_digest,
+                            rollback_evidence_digest: after_digest,
+                            apply_governance: store.optimizer_note_governance(&exact),
+                            rollback_governance: store.optimizer_note_governance(&current),
+                        }),
+                        ..Default::default()
+                    },
+                    Some(exact),
+                    None,
+                    source_update,
+                    current.clone(),
+                ))
+            }
+        })();
+        let (target, change, _exact_note, _overlay_after, publication_update, publication_note) =
+            match publication_inputs {
+                Ok(inputs) => inputs,
+                Err(error) => {
+                    self.defer_or_park_job_fresh(&job.job_id, &error)?;
+                    return Ok(OptimizerMutationResult::NoWrite);
+                }
+            };
+
+        let publication = PendingOptimizerPublication {
+            schema_version: 1,
+            phase: OptimizerPublicationPhase::RetryFenced,
+            retry_fenced: true,
+            audit_written: false,
+            counted: false,
+            queue_removed: false,
+            abort_queue_reconciled: false,
+            expected_authority: expected_authority.clone(),
+            mutation_id: None,
+            committed_authority: None,
+            target,
+            job: job.clone(),
+            note: publication_note,
+            change_id: change_id.to_string(),
+            decision,
+            change,
+        };
+        let stage_result = self.with_locked_fresh_state(|service| {
+            if let Some((_, existing)) = service
+                .load_pending_publications()?
+                .into_iter()
+                .find(|(_, pending)| pending.job.job_id == job.job_id)
+            {
+                if existing.change_id == publication.change_id
+                    && serde_json::to_value(&existing)? != serde_json::to_value(&publication)?
+                {
+                    anyhow::bail!("optimizer retry-fence identity collision");
+                }
+                return Ok(false);
+            }
+            if service.state.state_revision != prepared_state_revision
+                || !service
+                    .state
+                    .queue
+                    .iter()
+                    .any(|queued| queued.job_id == job.job_id && queued.note_id == job.note_id)
+            {
+                anyhow::bail!("vault optimizer state changed before pending apply");
+            }
+            if expected_authority.is_some() {
+                service.preflight_publication_audit(&publication)?;
+                service.stage_pending_publication(&publication)?;
+                #[cfg(test)]
+                if std::mem::take(&mut service.fail_retry_fence_stage_after_write_once) {
+                    anyhow::bail!("injected optimizer RetryFenced stage ambiguity");
+                }
+            }
+            Ok(true)
+        });
+        match stage_result {
+            Ok(false) => return Ok(OptimizerMutationResult::NoWrite),
+            Ok(true) => {}
+            Err(error) => {
+                if expected_authority.is_some() {
+                    self.preserve_retry_fence_or_defer(&change_id, &job.job_id, &error)?;
+                } else {
+                    self.defer_or_park_job_fresh(&job.job_id, &error)?;
+                }
+                return Ok(OptimizerMutationResult::NoWrite);
+            }
+        }
+        #[cfg(test)]
+        if let Some((entered, resume)) = self.pause_after_retry_fence_once.take() {
+            entered.wait();
+            resume.wait();
+        }
+        self.commit_staged_publication(store, publication, Some(publication_update))
+    }
+
+    pub fn apply_retry_fenced(
+        &mut self,
+        store: &mut KnowledgeStore,
+        pending: RetryFencedOptimizerWrite,
+    ) -> Result<OptimizerMutationResult<OptimizerAppliedResult>> {
+        let publication = pending.publication;
+        self.with_locked_fresh_state(|service| {
+            let persisted = service
+                .load_pending_publications()?
+                .into_iter()
+                .find(|(_, candidate)| candidate.change_id == publication.change_id)
+                .map(|(_, candidate)| candidate)
+                .ok_or_else(|| anyhow::anyhow!("optimizer retry fence no longer exists"))?;
+            if persisted.phase != OptimizerPublicationPhase::RetryFenced
+                || serde_json::to_value(&persisted)? != serde_json::to_value(&publication)?
+            {
+                anyhow::bail!("optimizer retry fence changed before resume");
+            }
+            if !service
+                .state
+                .queue
+                .iter()
+                .any(|job| job.job_id == publication.job.job_id)
+            {
+                anyhow::bail!("optimizer retry-fenced queue job no longer exists");
+            }
+            service.preflight_publication_audit(&publication)
+        })?;
+        self.commit_staged_publication(store, publication, None)
+    }
+}
+
+fn parse_canonical_uuid(value: &str, label: &str) -> Result<Uuid> {
+    let parsed = Uuid::parse_str(value).with_context(|| format!("invalid {label}"))?;
+    if parsed.to_string() != value {
+        anyhow::bail!("noncanonical {label}");
+    }
+    Ok(parsed)
+}
+
+fn publication_inbox_entry(
+    pending: &PendingOptimizerPublication,
+) -> Result<VaultOptimizerInboxEntry> {
+    let created_at = pending
+        .decision
+        .created_at
+        .ok_or_else(|| anyhow::anyhow!("optimizer publication lacks its stable time"))?;
+    Ok(VaultOptimizerInboxEntry {
+        id: pending.change_id.clone(),
+        note_id: Some(pending.note.id.clone()),
+        status: "applied".to_string(),
+        title: pending.note.title.clone(),
+        reason: pending.decision.reason.clone(),
+        diff_preview: pending.decision.diff_preview.clone(),
+        confidence: pending.decision.confidence,
+        created_at: Some(created_at),
+        change_id: Some(pending.change_id.clone()),
+    })
+}
+
+fn publication_audit_event(pending: &PendingOptimizerPublication) -> Result<OptimizerAuditEventV1> {
+    let created_at = pending
+        .decision
+        .created_at
+        .ok_or_else(|| anyhow::anyhow!("optimizer publication lacks its stable time"))?;
+    Ok(OptimizerAuditEventV1::OptimizerApply {
+        note_id: pending.note.id.clone(),
+        change_id: pending.change_id.clone(),
+        at: created_at,
+        confidence: pending.decision.confidence,
+    })
+}
+
+fn merge_optimizer_decision(
+    values: &mut Vec<VaultOptimizerDecision>,
+    candidate: VaultOptimizerDecision,
+) -> Result<()> {
+    if let Some(existing) = values
+        .iter()
+        .find(|existing| existing.id == candidate.id || existing.change_id == candidate.change_id)
+    {
+        if existing == &candidate {
+            return Ok(());
+        }
+        anyhow::bail!("optimizer decision identity collision");
+    }
+    values.push(candidate);
+    Ok(())
+}
+
+fn merge_optimizer_inbox(
+    values: &mut Vec<VaultOptimizerInboxEntry>,
+    candidate: VaultOptimizerInboxEntry,
+) -> Result<()> {
+    if let Some(existing) = values.iter().find(|existing| {
+        existing.id == candidate.id
+            || (candidate.change_id.is_some() && existing.change_id == candidate.change_id)
+    }) {
+        if existing == &candidate {
+            return Ok(());
+        }
+        anyhow::bail!("optimizer inbox identity collision");
+    }
+    values.push(candidate);
+    Ok(())
+}
+
+fn merge_optimizer_event(
+    values: &mut Vec<OptimizerAuditEventV1>,
+    candidate: OptimizerAuditEventV1,
+) -> Result<()> {
+    let candidate_change_id = match &candidate {
+        OptimizerAuditEventV1::OptimizerApply { change_id, .. }
+        | OptimizerAuditEventV1::Rollback { change_id, .. } => Some(change_id.as_str()),
+        OptimizerAuditEventV1::OptimizerParked { job_id, .. } if !job_id.is_empty() => {
+            Some(job_id.as_str())
+        }
+        OptimizerAuditEventV1::OptimizerParked { .. } => None,
+    };
+    if let Some(change_id) = candidate_change_id {
+        if let Some(existing) = values.iter().find(|existing| {
+            matches!(
+                (existing, &candidate),
+                (
+                    OptimizerAuditEventV1::OptimizerApply {
+                        change_id: existing_id,
+                        ..
+                    },
+                    OptimizerAuditEventV1::OptimizerApply { .. }
+                ) if existing_id == change_id
+            ) || matches!(
+                (existing, &candidate),
+                (
+                    OptimizerAuditEventV1::Rollback {
+                        change_id: existing_id,
+                        ..
+                    },
+                    OptimizerAuditEventV1::Rollback { .. }
+                ) if existing_id == change_id
+            ) || matches!(
+                (existing, &candidate),
+                (
+                    OptimizerAuditEventV1::OptimizerParked {
+                        job_id: existing_id,
+                        ..
+                    },
+                    OptimizerAuditEventV1::OptimizerParked { .. }
+                ) if !existing_id.is_empty() && existing_id == change_id
+            )
+        }) {
+            if existing == &candidate {
+                return Ok(());
+            }
+            anyhow::bail!("optimizer event audit identity collision");
+        }
+    }
+    values.push(candidate);
+    Ok(())
+}
+
+fn merge_optimizer_change(
+    values: &mut HashMap<String, OptimizerChange>,
+    candidate: OptimizerChange,
+) -> Result<()> {
+    if let Some(existing) = values.get(&candidate.change_id) {
+        if serde_json::to_value(existing)? == serde_json::to_value(&candidate)? {
+            return Ok(());
+        }
+        anyhow::bail!("optimizer change identity collision");
+    }
+    values.insert(candidate.change_id.clone(), candidate);
+    Ok(())
+}
+
+fn validate_json_audit_capacity<T: Serialize>(values: &[T], label: &str) -> Result<()> {
+    if values.len() > MAX_OPTIMIZER_AUDIT_ENTRIES {
+        anyhow::bail!("{label} exceed 4096 entries");
+    }
+    if serde_json::to_vec_pretty(values)?.len() > MAX_OPTIMIZER_AUDIT_BYTES {
+        anyhow::bail!("{label} exceed the 4 MiB limit");
+    }
+    Ok(())
+}
+
+fn serialize_optimizer_events(events: &[OptimizerAuditEventV1]) -> Result<Vec<u8>> {
+    if events.len() > MAX_OPTIMIZER_AUDIT_ENTRIES {
+        anyhow::bail!("optimizer event audit exceeds 4096 entries");
+    }
+    let mut bytes = Vec::new();
+    for event in events {
+        serde_json::to_writer(&mut bytes, event)?;
+        bytes.push(b'\n');
+        if bytes.len() > MAX_OPTIMIZER_AUDIT_BYTES {
+            anyhow::bail!("optimizer event audit exceeds its 4 MiB limit");
+        }
+    }
+    Ok(bytes)
+}
+
+fn normalize_optimizer_job_ids(state: &mut OptimizerState) -> Result<()> {
+    let mut seen = HashSet::new();
+    for (index, job) in state.queue.iter_mut().enumerate() {
+        if job.job_id.is_empty() {
+            let mut hasher = Sha256::new();
+            hasher.update(b"grafyn.optimizer.legacy-job.v1");
+            hasher.update((index as u64).to_be_bytes());
+            hasher.update((job.note_id.len() as u64).to_be_bytes());
+            hasher.update(job.note_id.as_bytes());
+            hasher.update((job.reason.len() as u64).to_be_bytes());
+            hasher.update(job.reason.as_bytes());
+            hasher.update(job.enqueued_at.timestamp_millis().to_be_bytes());
+            let digest = hasher.finalize();
+            let mut bytes = [0_u8; 16];
+            bytes.copy_from_slice(&digest[..16]);
+            bytes[6] = (bytes[6] & 0x0f) | 0x50;
+            bytes[8] = (bytes[8] & 0x3f) | 0x80;
+            job.job_id = Uuid::from_bytes(bytes).to_string();
+        } else {
+            parse_canonical_uuid(&job.job_id, "optimizer job ID")?;
+        }
+        if !seen.insert(job.job_id.clone()) {
+            anyhow::bail!("optimizer queue contains duplicate job IDs");
+        }
+    }
+    Ok(())
+}
+
+fn load_optimizer_state(
+    root: &crate::services::twin_events::AnchoredRoot,
+) -> Result<OptimizerState> {
+    let Some(bytes) = root
+        .read_bounded(QUEUE_KEY, MAX_OPTIMIZER_STATE_BYTES)
+        .map_err(anyhow::Error::new)?
+    else {
+        return Ok(OptimizerState::default());
+    };
+    serde_json::from_slice(&bytes).context("invalid optimizer queue state")
+}
+
+fn load_bounded_json_vec<T: serde::de::DeserializeOwned>(
+    root: &crate::services::twin_events::AnchoredRoot,
+    key: &str,
+    label: &str,
+) -> Result<Vec<T>> {
+    let Some(bytes) = root
+        .read_bounded(key, MAX_OPTIMIZER_AUDIT_BYTES)
+        .map_err(anyhow::Error::new)?
+    else {
+        return Ok(Vec::new());
+    };
+    let values: Vec<T> =
+        serde_json::from_slice(&bytes).with_context(|| format!("invalid {label}"))?;
+    if values.len() > MAX_OPTIMIZER_AUDIT_ENTRIES {
+        anyhow::bail!("{label} exceed 4096 entries");
+    }
+    Ok(values)
+}
+
+fn write_bounded_json_vec<T: Serialize>(
+    root: &crate::services::twin_events::AnchoredRoot,
+    key: &str,
+    values: &[T],
+) -> Result<()> {
+    if values.len() > MAX_OPTIMIZER_AUDIT_ENTRIES {
+        anyhow::bail!("optimizer audit exceeds 4096 entries");
+    }
+    let bytes = serde_json::to_vec_pretty(values)?;
+    if bytes.len() > MAX_OPTIMIZER_AUDIT_BYTES {
+        anyhow::bail!("optimizer audit exceeds its 4 MiB limit");
+    }
+    root.put_atomic(key, &bytes).map_err(anyhow::Error::new)
+}
+
+fn pending_publication_key(change_id: &str) -> Result<String> {
+    parse_canonical_uuid(change_id, "optimizer change ID")?;
+    Ok(format!("{PENDING_PUBLICATIONS_DIRECTORY}/{change_id}.json"))
+}
+
+fn cleanup_optimizer_orphan_temps(root: &crate::services::twin_events::AnchoredRoot) -> Result<()> {
+    for (directory, durable_limit) in [
+        (PENDING_PUBLICATIONS_DIRECTORY, MAX_PENDING_PUBLICATIONS),
+        (
+            rollback::PENDING_ROLLBACKS_DIRECTORY,
+            rollback::MAX_PENDING_ROLLBACKS,
+        ),
+        (CHANGES_DIRECTORY, MAX_OPTIMIZER_AUDIT_ENTRIES),
+    ] {
+        let names = root
+            .regular_file_names_bounded(directory, durable_limit + MAX_OPTIMIZER_ORPHAN_TEMPS)
+            .map_err(anyhow::Error::new)?;
+        if names.len() > durable_limit + MAX_OPTIMIZER_ORPHAN_TEMPS {
+            anyhow::bail!("optimizer {directory} directory exceeds its bounded entry limit");
+        }
+        let orphans = names
+            .into_iter()
+            .filter(|name| {
+                name.strip_prefix('.')
+                    .and_then(|name| name.strip_suffix(".tmp"))
+                    .is_some_and(|id| parse_canonical_uuid(id, "optimizer orphan temp ID").is_ok())
+            })
+            .collect::<Vec<_>>();
+        if orphans.len() > MAX_OPTIMIZER_ORPHAN_TEMPS {
+            anyhow::bail!("optimizer {directory} has too many orphan temporary files");
+        }
+        for name in orphans {
+            root.delete(&format!("{directory}/{name}"))
+                .map_err(anyhow::Error::new)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_pending_publication(pending: &PendingOptimizerPublication) -> Result<()> {
+    if pending.schema_version != 1 {
+        anyhow::bail!("unsupported optimizer pending-publication schema");
+    }
+    pending_publication_key(&pending.change_id)?;
+    parse_canonical_uuid(&pending.job.job_id, "optimizer job ID")?;
+    if pending.job.note_id != pending.note.id
+        || pending.decision.id != pending.change_id
+        || pending.decision.change_id.as_deref() != Some(pending.change_id.as_str())
+        || pending.decision.note_id.as_deref() != Some(pending.note.id.as_str())
+        || pending.decision.kind != "optimizer_update"
+        || pending.change.change_id != pending.change_id
+        || pending.change.note_id != pending.note.id
+        || pending.expected_authority.is_none()
+        || !pending.retry_fenced
+        || pending.decision.created_at.is_none()
+        || pending.change.created_at != pending.decision.created_at
+        || pending.counted && !pending.audit_written
+        || pending.queue_removed && !pending.counted
+    {
+        anyhow::bail!("invalid optimizer pending-publication identity");
+    }
+    match (&pending.target, &pending.change) {
+        (
+            OptimizerPublicationTarget::Overlay {
+                note_id,
+                before_digest,
+                after_digest,
+                source_relative_path,
+                source_digest,
+            },
+            change,
+        ) => {
+            let after = change.overlay_after.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("optimizer overlay publication lacks its exact after image")
+            })?;
+            let after_bytes = serde_json::to_vec_pretty(after)?;
+            let source_digest = source_digest.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("optimizer overlay publication lacks its source digest")
+            })?;
+            let provenance = after
+                .get("_grafyn_optimizer_source_v1")
+                .and_then(Value::as_object);
+            if note_id != &pending.note.id
+                || source_relative_path != &pending.note.relative_path
+                || change.mode != "sidecar_first"
+                || change.note_before.is_some()
+                || change.note_after.is_some()
+                || change.markdown_before_digest.as_ref() != Some(source_digest)
+                || change.markdown_relative_path.as_deref() != Some(source_relative_path.as_str())
+                || change.overlay_before.is_some() != before_digest.is_some()
+                || provenance
+                    .and_then(|value| value.get("relative_path"))
+                    .and_then(Value::as_str)
+                    != Some(source_relative_path.as_str())
+                || provenance
+                    .and_then(|value| value.get("sha256"))
+                    .and_then(Value::as_str)
+                    != Some(source_digest.as_str())
+                || crate::services::twin_events::digest_bytes(&after_bytes) != *after_digest
+            {
+                anyhow::bail!("invalid optimizer overlay-publication binding");
+            }
+        }
+        (
+            OptimizerPublicationTarget::Markdown {
+                relative_path,
+                before_digest,
+                after_digest,
+            },
+            change,
+        ) => {
+            let before = change.note_before.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("optimizer Markdown publication lacks its exact before note")
+            })?;
+            let after = change.note_after.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("optimizer Markdown publication lacks its exact after note")
+            })?;
+            let (after_path, after_bytes) = KnowledgeStore::canonical_serialized_note_bytes(after)?;
+            if change.mode != "full_rewrite"
+                || change.overlay_before.is_some()
+                || change.overlay_after.is_some()
+                || change.markdown_relative_path.as_deref() != Some(relative_path.as_str())
+                || serde_json::to_value(before)? != serde_json::to_value(&pending.note)?
+                || change.markdown_before_digest.as_ref() != Some(before_digest)
+                || before.id != pending.note.id
+                || after.id != pending.note.id
+                || &after_path != relative_path
+                || crate::services::twin_events::digest_bytes(&after_bytes) != *after_digest
+            {
+                anyhow::bail!("invalid optimizer Markdown-publication binding");
             }
         }
     }
-
-    /// Persists an applied change (sidecar overlay or full-rewrite note
-    /// update): writes the change record, decision, and inbox entry, bumps
-    /// the accepted/daily-write counters, and — only now that the write has
-    /// actually succeeded — removes the job from the queue.
-    fn finalize_applied_change(
-        &mut self,
-        job: &QueuedOptimizerNote,
-        note: &Note,
-        change_id: &str,
-        decision: VaultOptimizerDecision,
-        change: OptimizerChange,
-    ) -> Result<()> {
-        let inbox_entry = VaultOptimizerInboxEntry {
-            id: change_id.to_string(),
-            note_id: Some(note.id.clone()),
-            status: "applied".to_string(),
-            title: note.title.clone(),
-            reason: decision.reason.clone(),
-            diff_preview: decision.diff_preview.clone(),
-            confidence: decision.confidence,
-            created_at: decision.created_at,
-            change_id: Some(change_id.to_string()),
+    if let Some(material) = pending.change.exact_rollback.as_ref() {
+        material.validate(&pending.change)?;
+        let target_matches = match &pending.target {
+            OptimizerPublicationTarget::Overlay {
+                note_id,
+                after_digest,
+                ..
+            } => {
+                material.target_kind == crate::services::twin_events::TargetKind::OverlayJson
+                    && material.target_key == format!("{note_id}.json")
+                    && material.apply_after
+                        == crate::services::twin_events::BeforeImage::Sha256(after_digest.clone())
+            }
+            OptimizerPublicationTarget::Markdown {
+                relative_path,
+                after_digest,
+                ..
+            } => {
+                material.target_kind == crate::services::twin_events::TargetKind::Markdown
+                    && material.target_key == *relative_path
+                    && material.apply_after
+                        == crate::services::twin_events::BeforeImage::Sha256(after_digest.clone())
+            }
         };
-
-        self.write_change(&change)?;
-        self.push_decision(decision.clone())?;
-        self.push_inbox(inbox_entry)?;
-        self.append_event(json!({
-            "type": "optimizer_apply",
-            "note_id": note.id,
-            "change_id": change_id,
-            "at": Utc::now(),
-            "confidence": decision.confidence,
-        }))?;
-
-        self.state.accepted_count += 1;
-        self.state.last_run_at = Some(Utc::now());
-        self.record_daily_write();
-        self.remove_queued_job(&job.note_id);
-        self.persist_state()?;
-        Ok(())
+        if !target_matches {
+            anyhow::bail!("optimizer exact rollback does not bind its publication target");
+        }
     }
-
-    /// Records a processing failure for `job`. Below `MAX_OPTIMIZER_ATTEMPTS`
-    /// the job stays queued (in its original position) with `attempts`
-    /// incremented, so it's retried on a later tick. At the limit it's parked:
-    /// removed from the queue and recorded in the inbox with status `"failed"`
-    /// so a human can see it, instead of spinning on a poisoned entry forever.
-    fn defer_or_park_job(
-        &mut self,
-        mut job: QueuedOptimizerNote,
-        error: anyhow::Error,
-    ) -> Result<()> {
-        job.attempts += 1;
-        log::warn!(
-            "Vault optimizer job for note '{}' failed (attempt {}/{}): {}",
-            job.note_id,
-            job.attempts,
-            MAX_OPTIMIZER_ATTEMPTS,
-            error
-        );
-
-        if job.attempts >= MAX_OPTIMIZER_ATTEMPTS {
-            self.remove_queued_job(&job.note_id);
-            let inbox_entry = VaultOptimizerInboxEntry {
-                id: Uuid::new_v4().to_string(),
-                note_id: Some(job.note_id.clone()),
-                status: "failed".to_string(),
-                title: job.note_id.clone(),
-                reason: format!(
-                    "Vault optimizer parked after {} failed attempts: {}",
-                    job.attempts, error
-                ),
-                diff_preview: String::new(),
-                confidence: 0.0,
-                created_at: Some(Utc::now()),
-                change_id: None,
-            };
-            self.push_inbox(inbox_entry)?;
-            self.append_event(json!({
-                "type": "optimizer_parked",
-                "note_id": job.note_id,
-                "attempts": job.attempts,
-                "error": error.to_string(),
-                "at": Utc::now(),
-            }))?;
-        } else if let Some(entry) = self
-            .state
-            .queue
-            .iter_mut()
-            .find(|entry| entry.note_id == job.note_id)
+    match (
+        pending.phase,
+        pending.mutation_id.as_ref(),
+        pending.committed_authority.as_ref(),
+    ) {
+        (OptimizerPublicationPhase::RetryFenced, None, None)
+            if !pending.audit_written
+                && !pending.counted
+                && !pending.queue_removed
+                && !pending.abort_queue_reconciled => {}
+        (OptimizerPublicationPhase::Prepared, Some(_), None)
+            if !pending.audit_written
+                && !pending.counted
+                && !pending.queue_removed
+                && !pending.abort_queue_reconciled => {}
+        (OptimizerPublicationPhase::Aborted, Some(_), committed)
+            if !pending.audit_written && !pending.counted && !pending.queue_removed =>
         {
-            entry.attempts = job.attempts;
+            if let Some(committed) = committed {
+                let expected = pending.expected_authority.as_ref().unwrap();
+                if committed.root_scope != expected.root_scope
+                    || committed.lease_epoch_uuid != expected.lease_epoch_uuid
+                    || Some(committed.authority_generation)
+                        != expected.authority_generation.checked_add(1)
+                {
+                    anyhow::bail!("invalid optimizer aborted-publication authority");
+                }
+            }
         }
-
-        self.persist_state()?;
-        Ok(())
-    }
-
-    fn remove_queued_job(&mut self, note_id: &str) {
-        if let Some(pos) = self
-            .state
-            .queue
-            .iter()
-            .position(|entry| entry.note_id == note_id)
-        {
-            self.state.queue.remove(pos);
+        (OptimizerPublicationPhase::Committed, Some(_), Some(committed)) => {
+            if pending.abort_queue_reconciled {
+                anyhow::bail!("invalid optimizer committed abort reconciliation");
+            }
+            let expected = pending.expected_authority.as_ref().unwrap();
+            if committed.root_scope != expected.root_scope
+                || committed.lease_epoch_uuid != expected.lease_epoch_uuid
+                || Some(committed.authority_generation)
+                    != expected.authority_generation.checked_add(1)
+            {
+                anyhow::bail!("invalid optimizer committed-publication authority");
+            }
         }
+        _ => anyhow::bail!("invalid optimizer pending-publication phase fields"),
     }
+    Ok(())
+}
 
-    fn complete_noop_job(&mut self, note_id: &str) -> Result<()> {
-        self.remove_queued_job(note_id);
-        self.state.last_run_at = Some(Utc::now());
-        self.persist_state()
+fn write_pending_publication(
+    root: &crate::services::twin_events::AnchoredRoot,
+    pending: &PendingOptimizerPublication,
+) -> Result<()> {
+    validate_pending_publication(pending)?;
+    let bytes = serde_json::to_vec_pretty(pending)?;
+    if bytes.len() > MAX_PENDING_PUBLICATION_BYTES {
+        anyhow::bail!("optimizer pending publication exceeds its 16 MiB limit");
     }
-
-    /// Whether today's write count has already reached
-    /// `background_vault_optimizer_max_daily_writes`. Only meaningful once at
-    /// least one write has happened today; a fresh day always reports `false`
-    /// regardless of yesterday's count.
-    fn daily_write_cap_reached(&self, settings: &UserSettings) -> bool {
-        let today = Utc::now().date_naive().to_string();
-        self.state.daily_write_date.as_deref() == Some(today.as_str())
-            && self.state.daily_write_count >= settings.background_vault_optimizer_max_daily_writes
+    root.open_directory(PENDING_PUBLICATIONS_DIRECTORY, true)
+        .map_err(anyhow::Error::new)?;
+    let names = root
+        .regular_file_names(PENDING_PUBLICATIONS_DIRECTORY)
+        .map_err(anyhow::Error::new)?;
+    let key = pending_publication_key(&pending.change_id)?;
+    let filename = format!("{}.json", pending.change_id);
+    if names.len() >= MAX_PENDING_PUBLICATIONS && !names.contains(&filename) {
+        anyhow::bail!("optimizer pending publications have reached 64 entries");
     }
+    root.put_atomic(&key, &bytes).map_err(anyhow::Error::new)
+}
 
-    /// Records that a write happened "now", rolling the counter over to 1 if
-    /// the stored date isn't today. Persisted as part of `OptimizerState` so
-    /// the cap survives an app restart.
-    fn record_daily_write(&mut self) {
-        let today = Utc::now().date_naive().to_string();
-        if self.state.daily_write_date.as_deref() == Some(today.as_str()) {
-            self.state.daily_write_count += 1;
-        } else {
-            self.state.daily_write_date = Some(today);
-            self.state.daily_write_count = 1;
+fn remove_pending_publication(
+    root: &crate::services::twin_events::AnchoredRoot,
+    change_id: &str,
+) -> Result<()> {
+    root.delete(&pending_publication_key(change_id)?)
+        .map_err(anyhow::Error::new)
+}
+
+fn load_pending_publications(
+    root: &crate::services::twin_events::AnchoredRoot,
+) -> Result<Vec<(String, PendingOptimizerPublication)>> {
+    let mut names = root
+        .regular_file_names(PENDING_PUBLICATIONS_DIRECTORY)
+        .map_err(anyhow::Error::new)?;
+    if names.len() > MAX_PENDING_PUBLICATIONS {
+        anyhow::bail!("optimizer pending publications exceed 64 entries");
+    }
+    names.sort();
+    let mut loaded = Vec::with_capacity(names.len());
+    let mut owned_jobs = HashSet::new();
+    for name in names {
+        let change_id = name
+            .strip_suffix(".json")
+            .ok_or_else(|| anyhow::anyhow!("invalid optimizer pending-publication filename"))?;
+        parse_canonical_uuid(change_id, "optimizer pending-publication filename")?;
+        let key = format!("{PENDING_PUBLICATIONS_DIRECTORY}/{name}");
+        let bytes = root
+            .read_bounded(&key, MAX_PENDING_PUBLICATION_BYTES)
+            .map_err(anyhow::Error::new)?
+            .ok_or_else(|| anyhow::anyhow!("optimizer pending publication disappeared"))?;
+        let pending: PendingOptimizerPublication =
+            serde_json::from_slice(&bytes).context("invalid optimizer pending publication")?;
+        if pending.change_id != change_id {
+            anyhow::bail!("invalid optimizer pending-publication filename identity");
         }
+        validate_pending_publication(&pending)?;
+        if !owned_jobs.insert(pending.job.job_id.clone()) {
+            anyhow::bail!("optimizer job has multiple pending-publication owners");
+        }
+        loaded.push((key, pending));
     }
-
-    fn persist_state(&self) -> Result<()> {
-        std::fs::create_dir_all(&self.optimizer_dir)?;
-        write_atomic(
-            &self.queue_path,
-            serde_json::to_string_pretty(&self.state)?.as_bytes(),
-        )?;
-        Ok(())
-    }
-
-    fn load_decisions(&self) -> Result<Vec<VaultOptimizerDecision>> {
-        let decisions = std::fs::read_to_string(&self.decisions_path)
-            .ok()
-            .and_then(|content| serde_json::from_str::<Vec<VaultOptimizerDecision>>(&content).ok())
-            .unwrap_or_default();
-        Ok(decisions)
-    }
-
-    fn push_decision(&self, decision: VaultOptimizerDecision) -> Result<()> {
-        let mut decisions = self.load_decisions()?;
-        decisions.push(decision);
-        write_atomic(
-            &self.decisions_path,
-            serde_json::to_string_pretty(&decisions)?.as_bytes(),
-        )?;
-        Ok(())
-    }
-
-    fn load_inbox(&self) -> Result<Vec<VaultOptimizerInboxEntry>> {
-        let inbox = std::fs::read_to_string(&self.inbox_path)
-            .ok()
-            .and_then(|content| {
-                serde_json::from_str::<Vec<VaultOptimizerInboxEntry>>(&content).ok()
-            })
-            .unwrap_or_default();
-        Ok(inbox)
-    }
-
-    fn push_inbox(&self, entry: VaultOptimizerInboxEntry) -> Result<()> {
-        let mut inbox = self.load_inbox()?;
-        inbox.push(entry);
-        write_atomic(
-            &self.inbox_path,
-            serde_json::to_string_pretty(&inbox)?.as_bytes(),
-        )?;
-        Ok(())
-    }
-
-    fn write_change(&self, change: &OptimizerChange) -> Result<()> {
-        std::fs::create_dir_all(&self.changes_dir)?;
-        write_atomic(
-            &self.changes_dir.join(format!("{}.json", change.change_id)),
-            serde_json::to_string_pretty(change)?.as_bytes(),
-        )?;
-        Ok(())
-    }
-
-    fn append_event(&self, event: Value) -> Result<()> {
-        std::fs::create_dir_all(&self.optimizer_dir)?;
-        use std::io::Write;
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.events_path)?;
-        writeln!(file, "{}", serde_json::to_string(&event)?)?;
-        Ok(())
-    }
+    Ok(loaded)
 }
 
 /// Outcome of a single [`VaultOptimizerService::prepare_next`] tick.
@@ -735,17 +1717,73 @@ pub enum OptimizerTick {
     /// dequeued inside `prepare_next`), the daily write cap reached, or a
     /// transient processing error that was recorded and deferred/parked.
     /// Nothing was written, so there is nothing to reindex.
-    Idle,
-    /// A `sidecar_first` overlay write was already applied to disk (and the
-    /// job already dequeued) inside this call. The note identified here has
-    /// stale search/chunk/topic-hub state that the caller must refresh —
-    /// see `commands::commit_note_index_refresh` — after releasing every
-    /// lock it took to drive this tick.
-    Applied(String),
+    NoWrite,
+    /// A durable pre-effect witness owns the queue job. Any process may
+    /// resume this exact publication; the shared mutation coordinator
+    /// serializes the authority CAS, while the stable witness keeps its audit
+    /// reservation across crashes and rebuilds.
+    RetryFenced(Box<RetryFencedOptimizerWrite>),
+    /// The governed authority write committed. The caller must repair from
+    /// this exact commit token even when best-effort optimizer publication
+    /// returned a warning.
+    Committed {
+        result: OptimizerAppliedResult,
+        commit: crate::services::twin_events::MutationCommit,
+        warning: Option<crate::models::mutation::CommittedMutationWarningV1>,
+    },
     /// A non-`sidecar_first` edit mode computed a proposal but needs a real
     /// `KnowledgeStore::update_note` rewrite to apply it. Pass this to
     /// [`VaultOptimizerService::apply_pending`] under a write lock.
     Pending(Box<PendingOptimizerWrite>),
+}
+
+#[derive(Debug, Clone)]
+pub struct RetryFencedOptimizerWrite {
+    publication: PendingOptimizerPublication,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OptimizerAppliedResult {
+    note_id: String,
+    change_id: String,
+}
+
+impl OptimizerAppliedResult {
+    pub fn note_id(&self) -> &str {
+        &self.note_id
+    }
+
+    pub fn change_id(&self) -> &str {
+        &self.change_id
+    }
+}
+
+#[must_use = "committed optimizer writes must consume their exact mutation commit"]
+#[derive(Debug)]
+pub enum OptimizerMutationResult<T> {
+    NoWrite,
+    Committed {
+        result: T,
+        commit: crate::services::twin_events::MutationCommit,
+        warning: Option<crate::models::mutation::CommittedMutationWarningV1>,
+    },
+}
+
+#[must_use = "optimizer rollback authority changes must consume their exact mutation commit"]
+#[derive(Debug)]
+pub(crate) enum OptimizerRollbackMutationOutcome {
+    NoWrite(VaultOptimizerRollbackResult),
+    Committed {
+        result: VaultOptimizerRollbackResult,
+        commit: crate::services::twin_events::MutationCommit,
+        warning: Option<crate::models::mutation::CommittedMutationWarningV1>,
+    },
+    Partial {
+        result: VaultOptimizerRollbackResult,
+        commit: crate::services::twin_events::MutationCommit,
+        warning: crate::models::mutation::CommittedMutationWarningV1,
+        recovery_pending: bool,
+    },
 }
 
 /// A rules-based proposal that was accepted but needs a mutable, cache-
@@ -766,9 +1804,11 @@ pub struct PendingOptimizerWrite {
     change_id: String,
     decision: VaultOptimizerDecision,
     edit_mode: String,
+    expected_authority: Option<crate::services::vault_namespace::VaultAuthorityTokenV1>,
+    prepared_state_revision: u64,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 struct OptimizerProposal {
     aliases: Vec<String>,
     tags: Vec<String>,
@@ -782,6 +1822,25 @@ impl OptimizerProposal {
     fn is_empty(&self) -> bool {
         self.aliases.is_empty() && self.tags.is_empty() && self.properties.is_empty()
     }
+}
+
+fn optimizer_sidecar_overlay(
+    proposal: &OptimizerProposal,
+    source_relative_path: &str,
+    source_digest: &crate::models::twin_event::ContentDigest,
+) -> Value {
+    json!({
+        "aliases": proposal.aliases,
+        "tags": proposal.tags,
+        "schema_version": CURRENT_NOTE_SCHEMA_VERSION,
+        "migration_source": "vault_optimizer",
+        "optimizer_managed": false,
+        "properties": proposal.properties,
+        "_grafyn_optimizer_source_v1": {
+            "relative_path": source_relative_path,
+            "sha256": source_digest,
+        },
+    })
 }
 
 fn build_optimizer_proposal(note: &Note, store: &KnowledgeStore) -> Result<OptimizerProposal> {
@@ -877,6 +1936,30 @@ fn merge_note_properties(
     existing
 }
 
+fn optimizer_note_update(current: &Note, proposal: &OptimizerProposal) -> NoteUpdate {
+    NoteUpdate {
+        title: None,
+        content: None,
+        relative_path: None,
+        aliases: Some(merge_unique_strings(
+            current.aliases.clone(),
+            proposal.aliases.clone(),
+        )),
+        status: None,
+        tags: Some(merge_unique_strings(
+            current.tags.clone(),
+            proposal.tags.clone(),
+        )),
+        schema_version: Some(CURRENT_NOTE_SCHEMA_VERSION),
+        migration_source: Some("vault_optimizer".to_string()),
+        optimizer_managed: Some(false),
+        properties: Some(merge_note_properties(
+            current.properties.clone(),
+            proposal.properties.clone(),
+        )),
+    }
+}
+
 fn merge_unique_strings(existing: Vec<String>, additions: Vec<String>) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut values = Vec::new();
@@ -893,434 +1976,6 @@ fn merge_unique_strings(existing: Vec<String>, additions: Vec<String>) -> Vec<St
     values
 }
 
-fn read_overlay_value(store: &KnowledgeStore, note_id: &str) -> Option<Value> {
-    let path = store.overlay_path(note_id);
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|content| serde_json::from_str::<Value>(&content).ok())
-}
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::models::note::{NoteCreate, NoteStatus};
-    use crate::services::atomic_io::assert_no_tmp_siblings;
-    use tempfile::tempdir;
-
-    fn make_note_create(title: &str) -> NoteCreate {
-        NoteCreate {
-            title: title.to_string(),
-            content: format!("Content for {}", title),
-            relative_path: None,
-            aliases: Vec::new(),
-            status: NoteStatus::Draft,
-            tags: Vec::new(),
-            schema_version: CURRENT_NOTE_SCHEMA_VERSION,
-            migration_source: None,
-            optimizer_managed: false,
-            properties: HashMap::new(),
-        }
-    }
-
-    fn make_note(id: &str, title: &str) -> Note {
-        let now = Utc::now();
-        Note {
-            id: id.to_string(),
-            title: title.to_string(),
-            content: format!("Content of {}", title),
-            relative_path: format!("{}.md", id),
-            aliases: Vec::new(),
-            status: NoteStatus::Draft,
-            tags: Vec::new(),
-            created_at: now,
-            updated_at: now,
-            schema_version: crate::models::note::CURRENT_NOTE_SCHEMA_VERSION,
-            migration_source: None,
-            optimizer_managed: false,
-            wikilinks: Vec::new(),
-            parsed_links: Vec::new(),
-            properties: HashMap::new(),
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn queue_state_writes_are_atomic_with_no_tmp_litter() {
-        let data_dir = tempdir().expect("temp dir should be created");
-        let mut service = VaultOptimizerService::new(data_dir.path().to_path_buf());
-
-        service.bootstrap(&[make_note("note-1", "Optimizer Adoption")]);
-
-        let persisted =
-            std::fs::read_to_string(&service.queue_path).expect("queue.json should exist");
-        assert!(persisted.contains("note-1"));
-        assert_no_tmp_siblings(&service.optimizer_dir);
-    }
-
-    #[test]
-    fn daily_write_cap_defers_third_write_in_same_day() {
-        let vault_dir = tempdir().expect("vault tempdir should be created");
-        let data_dir = tempdir().expect("data tempdir should be created");
-        let mut store = KnowledgeStore::new(
-            vault_dir.path().to_path_buf(),
-            data_dir.path().to_path_buf(),
-        );
-
-        let notes = vec![
-            store
-                .create_note(make_note_create("Alpha Topic"))
-                .expect("note 1 should be created"),
-            store
-                .create_note(make_note_create("Beta Topic"))
-                .expect("note 2 should be created"),
-            store
-                .create_note(make_note_create("Gamma Topic"))
-                .expect("note 3 should be created"),
-        ];
-
-        let mut service = VaultOptimizerService::new(data_dir.path().to_path_buf());
-        service.bootstrap(&notes);
-        assert_eq!(service.state.queue.len(), 3);
-
-        let settings = UserSettings {
-            background_vault_optimizer_max_daily_writes: 2,
-            ..UserSettings::default()
-        };
-
-        assert!(matches!(
-            service
-                .prepare_next(&store, &settings)
-                .expect("tick 1 should not error"),
-            OptimizerTick::Applied(_)
-        ));
-        assert!(matches!(
-            service
-                .prepare_next(&store, &settings)
-                .expect("tick 2 should not error"),
-            OptimizerTick::Applied(_)
-        ));
-        assert_eq!(
-            service.state.queue.len(),
-            1,
-            "two notes should have been dequeued after being written"
-        );
-        assert_eq!(service.state.accepted_count, 2);
-        assert_eq!(service.state.daily_write_count, 2);
-
-        let queue_before_cap = service.state.queue.clone();
-        assert!(matches!(
-            service
-                .prepare_next(&store, &settings)
-                .expect("tick 3 (capped) should not error"),
-            OptimizerTick::Idle
-        ));
-        assert_eq!(
-            service.state.queue.len(),
-            1,
-            "the third note must stay queued once the daily cap is hit"
-        );
-        assert_eq!(
-            service.state.queue, queue_before_cap,
-            "the deferred job must be untouched (no attempts bump, no removal)"
-        );
-        assert_eq!(
-            service.state.accepted_count, 2,
-            "no write should be recorded past the daily cap"
-        );
-    }
-
-    #[test]
-    fn apply_pending_merges_against_current_note_not_stale_snapshot() {
-        // Between `prepare_next` (read lock) and `apply_pending` (write lock)
-        // there is a real await suspension in the background worker, so a
-        // concurrent user `update_note` can land in the gap. The apply stage
-        // must merge the proposal's ADDITIONS against the note's CURRENT
-        // state, not the snapshot captured in `prepare_next` — otherwise it
-        // silently drops the user's fresh tag and reverts their rename.
-        let vault_dir = tempdir().expect("vault tempdir should be created");
-        let data_dir = tempdir().expect("data tempdir should be created");
-        let mut store = KnowledgeStore::new(
-            vault_dir.path().to_path_buf(),
-            data_dir.path().to_path_buf(),
-        );
-
-        let note = store
-            .create_note(make_note_create("Interleaved Edit Topic"))
-            .expect("note should be created");
-
-        let mut service = VaultOptimizerService::new(data_dir.path().to_path_buf());
-        service.bootstrap(std::slice::from_ref(&note));
-
-        let settings = UserSettings {
-            background_vault_optimizer_edit_mode: "full_rewrite".to_string(),
-            ..UserSettings::default()
-        };
-
-        let pending = match service
-            .prepare_next(&store, &settings)
-            .expect("prepare should not error")
-        {
-            OptimizerTick::Pending(pending) => pending,
-            other => panic!(
-                "full_rewrite mode must return a pending write, got {:?}",
-                other
-            ),
-        };
-
-        // Simulate the interleaved user edit landing between the read-locked
-        // prepare stage and the write-locked apply stage: add a tag and move
-        // the note to a new path.
-        store
-            .update_note(
-                &note.id,
-                NoteUpdate {
-                    tags: Some(vec!["user-fresh-tag".to_string()]),
-                    relative_path: Some("renamed-by-user.md".to_string()),
-                    ..Default::default()
-                },
-            )
-            .expect("interleaved user edit should succeed");
-
-        let applied_note_id = service
-            .apply_pending(&mut store, *pending)
-            .expect("apply should not error");
-        assert_eq!(
-            applied_note_id.as_deref(),
-            Some(note.id.as_str()),
-            "apply_pending must report the written note id for reindexing"
-        );
-
-        let final_note = store.get_note(&note.id).expect("note should still exist");
-        assert!(
-            final_note.tags.iter().any(|tag| tag == "user-fresh-tag"),
-            "the user's interleaved tag must survive the optimizer apply, got tags: {:?}",
-            final_note.tags
-        );
-        assert!(
-            final_note
-                .tags
-                .iter()
-                .any(|tag| tag == "interleaved_edit_topic"),
-            "the proposal's additive tag must still be applied, got tags: {:?}",
-            final_note.tags
-        );
-        assert_eq!(
-            final_note.relative_path, "renamed-by-user.md",
-            "the user's interleaved rename must not be reverted to the snapshot path"
-        );
-    }
-
-    #[test]
-    fn apply_pending_parks_job_when_note_deleted_in_the_gap() {
-        // If the note is deleted between prepare and apply, the apply stage
-        // must not resurrect it — the job is dropped like any missing note.
-        let vault_dir = tempdir().expect("vault tempdir should be created");
-        let data_dir = tempdir().expect("data tempdir should be created");
-        let mut store = KnowledgeStore::new(
-            vault_dir.path().to_path_buf(),
-            data_dir.path().to_path_buf(),
-        );
-
-        let note = store
-            .create_note(make_note_create("Deleted In Gap Topic"))
-            .expect("note should be created");
-
-        let mut service = VaultOptimizerService::new(data_dir.path().to_path_buf());
-        service.bootstrap(std::slice::from_ref(&note));
-
-        let settings = UserSettings {
-            background_vault_optimizer_edit_mode: "full_rewrite".to_string(),
-            ..UserSettings::default()
-        };
-
-        let pending = match service
-            .prepare_next(&store, &settings)
-            .expect("prepare should not error")
-        {
-            OptimizerTick::Pending(pending) => pending,
-            other => panic!(
-                "full_rewrite mode must return a pending write, got {:?}",
-                other
-            ),
-        };
-
-        store
-            .delete_note(&note.id)
-            .expect("interleaved delete should succeed");
-
-        let applied_note_id = service
-            .apply_pending(&mut store, *pending)
-            .expect("apply of a deleted note must not error");
-        assert_eq!(
-            applied_note_id, None,
-            "no note id should be reported for reindexing when the note was deleted in the gap"
-        );
-
-        assert!(
-            store.get_note(&note.id).is_err(),
-            "the optimizer must not resurrect a note deleted in the gap"
-        );
-        assert!(
-            service.state.queue.is_empty(),
-            "the job for a deleted note must be dropped from the queue"
-        );
-        assert_eq!(
-            service.state.accepted_count, 0,
-            "no write should be recorded for a deleted note"
-        );
-    }
-
-    #[test]
-    fn run_next_ignores_llm_enabled_because_no_llm_path_exists() {
-        // vault_optimizer has no LLM/network call path today:
-        // `build_optimizer_proposal` is purely rule-based, and neither
-        // `prepare_next` nor `apply_pending` reference `OpenRouterService` or
-        // any network client anywhere in this file (confirmed by inspection —
-        // there is no seam to stub). This test characterizes that fact:
-        // toggling `background_vault_optimizer_llm_enabled` produces
-        // identical decisions, proving enabling it doesn't silently add
-        // behavior and disabling it doesn't block the rules pipeline. If an
-        // LLM-backed enrichment step is ever added, it must be gated on this
-        // flag and this test should then be replaced with one that exercises
-        // the real seam.
-        fn run_with_llm_flag(llm_enabled: bool) -> VaultOptimizerDecision {
-            let vault_dir = tempdir().expect("vault tempdir should be created");
-            let data_dir = tempdir().expect("data tempdir should be created");
-            let mut store = KnowledgeStore::new(
-                vault_dir.path().to_path_buf(),
-                data_dir.path().to_path_buf(),
-            );
-            let note = store
-                .create_note(make_note_create("Shared Topic"))
-                .expect("note should be created");
-
-            let mut service = VaultOptimizerService::new(data_dir.path().to_path_buf());
-            service.bootstrap(&[note]);
-
-            let settings = UserSettings {
-                background_vault_optimizer_llm_enabled: llm_enabled,
-                ..UserSettings::default()
-            };
-            assert!(matches!(
-                service
-                    .prepare_next(&store, &settings)
-                    .expect("tick should not error"),
-                OptimizerTick::Applied(_)
-            ));
-
-            service
-                .list_decisions(1)
-                .expect("decisions should be readable")
-                .into_iter()
-                .next()
-                .expect("a decision should have been recorded")
-        }
-
-        let disabled = run_with_llm_flag(false);
-        let enabled = run_with_llm_flag(true);
-
-        assert_eq!(disabled.reason, enabled.reason);
-        assert_eq!(disabled.diff_preview, enabled.diff_preview);
-        assert_eq!(disabled.confidence, enabled.confidence);
-    }
-
-    /// Forces `write_overlay` to fail by replacing the overlay directory
-    /// (auto-created by `KnowledgeStore::new`) with a regular file, so
-    /// `create_dir_all(parent)` inside `write_overlay` errors instead of
-    /// writing the sidecar JSON. Returns the poisoned store and the note that
-    /// will always fail to process.
-    fn seed_poisoned_note(
-        vault_dir: &std::path::Path,
-        data_dir: &std::path::Path,
-    ) -> (KnowledgeStore, Note) {
-        let mut store = KnowledgeStore::new(vault_dir.to_path_buf(), data_dir.to_path_buf());
-        let note = store
-            .create_note(make_note_create("Poison Topic"))
-            .expect("note should be created");
-
-        let overlay_dir = store
-            .overlay_path(&note.id)
-            .parent()
-            .expect("overlay path should have a parent")
-            .to_path_buf();
-        std::fs::remove_dir_all(&overlay_dir).expect("overlay dir should be removable");
-        std::fs::write(&overlay_dir, b"blocking file")
-            .expect("blocking file should be writable in place of the overlay dir");
-
-        (store, note)
-    }
-
-    #[test]
-    fn processing_error_keeps_job_queued_and_increments_attempts() {
-        let vault_dir = tempdir().expect("vault tempdir should be created");
-        let data_dir = tempdir().expect("data tempdir should be created");
-        let (store, note) = seed_poisoned_note(vault_dir.path(), data_dir.path());
-
-        let mut service = VaultOptimizerService::new(data_dir.path().to_path_buf());
-        service.bootstrap(std::slice::from_ref(&note));
-
-        let settings = UserSettings::default();
-
-        assert!(matches!(
-            service
-                .prepare_next(&store, &settings)
-                .expect("a processing error must not bubble up as Err"),
-            OptimizerTick::Idle
-        ));
-
-        assert_eq!(
-            service.state.queue.len(),
-            1,
-            "a failed job must stay queued, not be dropped"
-        );
-        assert_eq!(service.state.queue[0].note_id, note.id);
-        assert_eq!(
-            service.state.queue[0].attempts, 1,
-            "the first failure should record exactly one attempt"
-        );
-        assert_eq!(
-            service.state.accepted_count, 0,
-            "no write should have been recorded for a failed job"
-        );
-    }
-
-    #[test]
-    fn poison_job_is_parked_after_max_attempts() {
-        let vault_dir = tempdir().expect("vault tempdir should be created");
-        let data_dir = tempdir().expect("data tempdir should be created");
-        let (store, note) = seed_poisoned_note(vault_dir.path(), data_dir.path());
-
-        let mut service = VaultOptimizerService::new(data_dir.path().to_path_buf());
-        service.bootstrap(std::slice::from_ref(&note));
-
-        let settings = UserSettings::default();
-
-        for attempt in 1..=MAX_OPTIMIZER_ATTEMPTS {
-            assert!(matches!(
-                service
-                    .prepare_next(&store, &settings)
-                    .expect("a processing error must not bubble up as Err"),
-                OptimizerTick::Idle
-            ));
-            if attempt < MAX_OPTIMIZER_ATTEMPTS {
-                assert_eq!(
-                    service.state.queue.len(),
-                    1,
-                    "job should still be queued before the attempt limit"
-                );
-            }
-        }
-
-        assert!(
-            service.state.queue.is_empty(),
-            "a poisoned job must be dropped from the queue after {} attempts",
-            MAX_OPTIMIZER_ATTEMPTS
-        );
-        let inbox = service
-            .inbox(Some("failed"), 10)
-            .expect("inbox should be readable");
-        assert_eq!(inbox.len(), 1);
-        assert_eq!(inbox[0].note_id.as_deref(), Some(note.id.as_str()));
-        assert_eq!(inbox[0].status, "failed");
-    }
-}
+#[path = "vault_optimizer_tests.rs"]
+mod tests;

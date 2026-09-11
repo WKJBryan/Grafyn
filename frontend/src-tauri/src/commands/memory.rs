@@ -11,11 +11,16 @@ pub async fn recall_relevant(
     request: RecallRequest,
     state: State<'_, AppState>,
 ) -> Result<Vec<RecallResult>, String> {
-    let results =
-        run_retrieval(state.inner(), &request.query, request.limit, &request.context_note_ids)
-            .await?;
+    let root_ticket = crate::commands::acquire_derived_root_epoch(state.inner()).await?;
+    let results = run_retrieval(
+        state.inner(),
+        &request.query,
+        request.limit,
+        &request.context_note_ids,
+    )
+    .await?;
 
-    Ok(results
+    let result = results
         .into_iter()
         .map(|r| RecallResult {
             note_id: r.note.id,
@@ -26,7 +31,9 @@ pub async fn recall_relevant(
             graph_boost: 0.0,
             total_score: r.score,
         })
-        .collect())
+        .collect();
+    root_ticket.finish(state.inner()).await?;
+    Ok(result)
 }
 
 /// Find contradictions for a note
@@ -35,12 +42,21 @@ pub async fn find_contradictions(
     note_id: String,
     state: State<'_, AppState>,
 ) -> Result<Vec<Contradiction>, String> {
-    let search = state.search_service.read().await;
-    let store = state.knowledge_store.read().await;
-
-    state
-        .memory_service
-        .find_contradictions(&search, &store, &note_id)
+    let root_ticket = crate::commands::acquire_derived_root_epoch(state.inner()).await?;
+    let note = {
+        let store = state.knowledge_store.read().await;
+        store
+            .get_note(&note_id)
+            .map_err(|error| error.to_string())?
+    };
+    let result = {
+        let search = state.search_service.read().await;
+        state
+            .memory_service
+            .find_contradictions_for_note(&search, &note)?
+    };
+    root_ticket.finish(state.inner()).await?;
+    Ok(result)
 }
 
 /// Extract claims from conversation
@@ -49,6 +65,7 @@ pub async fn extract_claims(
     request: ExtractRequest,
     state: State<'_, AppState>,
 ) -> Result<Vec<ExtractedClaim>, String> {
+    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
     Ok(state
         .memory_service
         .extract_from_conversation(&request.messages))

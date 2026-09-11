@@ -111,7 +111,12 @@ impl OllamaService {
             model: model.to_string(),
             messages: all_messages,
             stream: false,
-            options: temperature.map(|temperature| OllamaOptions { temperature }),
+            options: temperature.map(|temperature| OllamaOptions {
+                temperature: Some(temperature),
+                top_p: None,
+                num_predict: None,
+                stop: None,
+            }),
         };
 
         let response = self
@@ -154,6 +159,128 @@ impl OllamaService {
         system_prompt: Option<&str>,
         temperature: Option<f64>,
     ) -> Result<impl futures::Stream<Item = Result<String>>> {
+        let options = temperature.map(|temperature| OllamaOptions {
+            temperature: Some(temperature),
+            top_p: None,
+            num_predict: None,
+            stop: None,
+        });
+        self.chat_stream_internal(model, messages, system_prompt, options)
+            .await
+    }
+
+    pub async fn chat_stream_with_options(
+        &self,
+        model: &str,
+        messages: Vec<ChatMessage>,
+        system_prompt: Option<&str>,
+        temperature: f64,
+        top_p: f64,
+        max_tokens: Option<u32>,
+        stop_sequences: Option<Vec<String>>,
+    ) -> Result<impl futures::Stream<Item = Result<String>>> {
+        self.chat_stream_internal(
+            model,
+            messages,
+            system_prompt,
+            Some(OllamaOptions {
+                temperature: Some(temperature),
+                top_p: Some(top_p),
+                num_predict: max_tokens,
+                stop: stop_sequences,
+            }),
+        )
+        .await
+    }
+
+    pub async fn generate_completion_stream(
+        &self,
+        model: &str,
+        prompt: &str,
+        temperature: f64,
+        top_p: f64,
+        max_tokens: Option<u32>,
+    ) -> Result<impl futures::Stream<Item = Result<String>>> {
+        if model.trim().is_empty() {
+            return Err(anyhow::anyhow!("No Ollama model selected"));
+        }
+
+        let request = OllamaGenerateRequest {
+            model: model.to_string(),
+            prompt: prompt.to_string(),
+            raw: true,
+            stream: true,
+            options: Some(OllamaOptions {
+                temperature: Some(temperature),
+                top_p: Some(top_p),
+                num_predict: max_tokens,
+                stop: None,
+            }),
+        };
+
+        let response = self
+            .client
+            .post(format!("{}/api/generate", self.base_url))
+            .json(&request)
+            .send()
+            .await
+            .context("Failed to reach Ollama. Is Ollama running locally?")?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let error_text = response.text().await.unwrap_or_default();
+            return Err(anyhow::anyhow!(
+                "Ollama API error ({}): {}",
+                status,
+                error_text
+            ));
+        }
+
+        let byte_stream = Box::pin(response.bytes_stream());
+        let stream = futures::stream::unfold(
+            (byte_stream, String::new()),
+            |(mut inner, mut buffer)| async move {
+                loop {
+                    if let Some(pos) = buffer.find('\n') {
+                        let line = buffer[..pos].to_string();
+                        buffer = buffer[pos + 1..].to_string();
+                        return Some((parse_ollama_generate_line(&line), (inner, buffer)));
+                    }
+                    match inner.next().await {
+                        Some(Ok(bytes)) => {
+                            buffer.push_str(&String::from_utf8_lossy(&bytes));
+                        }
+                        Some(Err(error)) => {
+                            return Some((
+                                Err(anyhow::anyhow!("Ollama stream error: {}", error)),
+                                (inner, buffer),
+                            ));
+                        }
+                        None => {
+                            if !buffer.trim().is_empty() {
+                                let remaining = std::mem::take(&mut buffer);
+                                return Some((
+                                    parse_ollama_generate_line(&remaining),
+                                    (inner, buffer),
+                                ));
+                            }
+                            return None;
+                        }
+                    }
+                }
+            },
+        );
+
+        Ok(stream)
+    }
+
+    async fn chat_stream_internal(
+        &self,
+        model: &str,
+        messages: Vec<ChatMessage>,
+        system_prompt: Option<&str>,
+        options: Option<OllamaOptions>,
+    ) -> Result<impl futures::Stream<Item = Result<String>>> {
         if model.trim().is_empty() {
             return Err(anyhow::anyhow!(
                 "Select an Ollama model for local vault/twin responses before sending vault context"
@@ -173,7 +300,7 @@ impl OllamaService {
             model: model.to_string(),
             messages: all_messages,
             stream: true,
-            options: temperature.map(|temperature| OllamaOptions { temperature }),
+            options,
         };
 
         let response = self
@@ -257,8 +384,25 @@ struct OllamaChatRequest {
 }
 
 #[derive(Debug, Serialize)]
+struct OllamaGenerateRequest {
+    model: String,
+    prompt: String,
+    raw: bool,
+    stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    options: Option<OllamaOptions>,
+}
+
+#[derive(Debug, Serialize)]
 struct OllamaOptions {
-    temperature: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_p: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    num_predict: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stop: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -309,6 +453,14 @@ struct OllamaStreamLine {
     error: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct OllamaGenerateStreamLine {
+    response: Option<String>,
+    #[serde(default)]
+    done: bool,
+    error: Option<String>,
+}
+
 fn normalize_base_url(base_url: &str) -> String {
     let trimmed = base_url.trim().trim_end_matches('/');
     if trimmed.is_empty() {
@@ -337,6 +489,24 @@ fn parse_ollama_line(line: &str) -> Result<String> {
         .message
         .map(|message| message.content)
         .unwrap_or_default())
+}
+
+fn parse_ollama_generate_line(line: &str) -> Result<String> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return Ok(String::new());
+    }
+
+    let parsed: OllamaGenerateStreamLine =
+        serde_json::from_str(trimmed).context("Failed to parse Ollama generate stream line")?;
+    if let Some(error) = parsed.error {
+        return Err(anyhow::anyhow!("Ollama stream error: {}", error));
+    }
+    if parsed.done {
+        return Ok(String::new());
+    }
+
+    Ok(parsed.response.unwrap_or_default())
 }
 
 #[cfg(test)]
@@ -378,7 +548,12 @@ mod tests {
                 content: "Which option do I choose?".to_string(),
             }],
             stream: false,
-            options: Some(OllamaOptions { temperature: 0.2 }),
+            options: Some(OllamaOptions {
+                temperature: Some(0.2),
+                top_p: None,
+                num_predict: None,
+                stop: None,
+            }),
         };
 
         let value = serde_json::to_value(request).unwrap();

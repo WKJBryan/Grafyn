@@ -18,6 +18,7 @@ const releaseManifestFiles = [
   'frontend/src-tauri/Cargo.toml',
   'frontend/src-tauri/Cargo.lock',
   'frontend/src-tauri/tauri.conf.json',
+  'frontend/src-tauri/tauri.desktop.conf.json',
 ]
 
 function fail(message, details = '') {
@@ -120,12 +121,13 @@ function assertValidVersion(version) {
 function getVersionState() {
   const packageJson = readJson('package.json')
   const tauriConfig = readJson('src-tauri/tauri.conf.json')
+  const desktopConfig = readJson('src-tauri/tauri.desktop.conf.json')
   const cargoToml = readText('src-tauri/Cargo.toml')
-  const windowTitle = tauriConfig.tauri?.windows?.[0]?.title || ''
+  const windowTitle = desktopConfig.app?.windows?.[0]?.title || ''
 
   return {
     packageVersion: packageJson.version,
-    tauriVersion: tauriConfig.package?.version || '',
+    tauriVersion: tauriConfig.version || '',
     cargoVersion: extractCargoVersion(cargoToml),
     windowTitle,
   }
@@ -155,7 +157,7 @@ function assertVersionsAligned() {
     if (versions.windowTitle !== expectedTitle) {
       fail(
         'window title version is out of sync',
-        `  expected "${expectedTitle}" in frontend/src-tauri/tauri.conf.json but found "${versions.windowTitle}"`,
+        `  expected "${expectedTitle}" in frontend/src-tauri/tauri.desktop.conf.json but found "${versions.windowTitle}"`,
       )
     }
   }

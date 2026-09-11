@@ -109,9 +109,17 @@ function ensureNonEmptyFile(filePath) {
   }
 }
 
+function isMobileTarget(target) {
+  return target.includes('android') || target.includes('ios')
+}
+
 function main() {
   const options = parseArgs(process.argv.slice(2))
   const target = options.target || resolveHostTarget()
+  if (isMobileTarget(target)) {
+    console.log(`Skipping desktop MCP sidecar for mobile target ${target}`)
+    return
+  }
   const isWindowsTarget = target.includes('windows')
   const profile = options.release ? 'release' : 'debug'
   const extension = isWindowsTarget ? '.exe' : ''

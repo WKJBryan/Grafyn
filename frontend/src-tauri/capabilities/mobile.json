@@ -1,0 +1,13 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "mobile",
+  "description": "Minimal Android access for the Grafyn companion window",
+  "windows": ["main"],
+  "platforms": ["android"],
+  "permissions": [
+    "core:default",
+    "os:allow-platform",
+    "opener:allow-open-url",
+    "opener:allow-default-urls"
+  ]
+}

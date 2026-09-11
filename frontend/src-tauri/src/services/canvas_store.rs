@@ -6,31 +6,93 @@ use crate::services::atomic_io::write_atomic;
 use anyhow::{Context, Result};
 use chrono::Utc;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use walkdir::WalkDir;
+
+pub type TileResponseUpdate = (
+    String,
+    String,
+    crate::models::canvas::ResponseStatus,
+    Option<String>,
+    Option<f64>,
+);
+
+pub(crate) fn scoped_canvas_path(
+    data_path: impl AsRef<Path>,
+    root_scope: &crate::models::twin_event::ContentDigest,
+) -> PathBuf {
+    data_path
+        .as_ref()
+        .join("canvas")
+        .join("v1")
+        .join(root_scope.as_str())
+}
+
+pub(crate) fn require_canvas_only_commit(
+    commit: &crate::services::twin_events::MutationCommit,
+) -> Result<()> {
+    anyhow::ensure!(
+        commit.authority_token.is_none(),
+        "Canvas-only mutation unexpectedly advanced content authority"
+    );
+    Ok(())
+}
 
 /// Service for managing canvas sessions (JSON file storage) with in-memory cache.
 ///
 /// The cache eliminates repeated disk reads — every get_session/list_sessions call
 /// returns from memory. Writes update the cache first then flush to disk (write-through).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct CanvasStore {
     data_path: PathBuf,
     /// Full session cache, populated lazily on first access per session.
     session_cache: HashMap<String, CanvasSession>,
     /// Whether the session list cache has been populated from disk.
     list_cache_ready: bool,
+    pending_bases: HashMap<String, CanvasSession>,
+    event_recorder: Arc<dyn crate::services::twin_events::EventRecorder>,
+    root_capability: Option<Arc<crate::services::twin_events::AnchoredRoot>>,
 }
 
 impl CanvasStore {
     pub fn new(data_path: PathBuf) -> Self {
+        Self::with_event_recorder(
+            data_path,
+            Arc::new(crate::services::twin_events::NoopEventRecorder),
+        )
+    }
+
+    pub fn with_event_recorder(
+        data_path: PathBuf,
+        event_recorder: Arc<dyn crate::services::twin_events::EventRecorder>,
+    ) -> Self {
         // Ensure directory exists
         std::fs::create_dir_all(&data_path).ok();
+        let root_capability = crate::services::twin_events::AnchoredRoot::open(&data_path)
+            .ok()
+            .map(Arc::new);
         Self {
             data_path,
             session_cache: HashMap::new(),
             list_cache_ready: false,
+            pending_bases: HashMap::new(),
+            event_recorder,
+            root_capability,
         }
+    }
+
+    pub fn replace_root_path(&mut self, data_path: PathBuf) -> Result<()> {
+        std::fs::create_dir_all(&data_path)
+            .with_context(|| format!("Failed to create Canvas root: {}", data_path.display()))?;
+        crate::services::twin_events::validate_real_directory(&data_path, "Canvas root")
+            .map_err(anyhow::Error::new)?;
+        let root_capability = crate::services::twin_events::AnchoredRoot::open(&data_path)
+            .map_err(anyhow::Error::new)?;
+        self.data_path = data_path;
+        self.root_capability = Some(Arc::new(root_capability));
+        self.reload_authoritative_state();
+        Ok(())
     }
 
     fn collect_descendant_tile_ids(
@@ -109,6 +171,14 @@ impl CanvasStore {
         self.list_cache_ready = true;
     }
 
+    /// Drop every process-local Canvas snapshot so the next read is sourced
+    /// from durable bytes captured after the caller's authority ticket.
+    pub(crate) fn reload_authoritative_state(&mut self) {
+        self.session_cache.clear();
+        self.pending_bases.clear();
+        self.list_cache_ready = false;
+    }
+
     /// List all sessions (metadata only)
     pub fn list_sessions(&mut self) -> Result<Vec<SessionMeta>> {
         self.ensure_list_cache();
@@ -144,6 +214,14 @@ impl CanvasStore {
                 .with_context(|| format!("Session not found: {}", id))?;
             self.session_cache.insert(id.to_string(), session);
         }
+        if !self.pending_bases.contains_key(id) {
+            let base = self
+                .session_cache
+                .get(id)
+                .expect("session was loaded")
+                .clone();
+            self.pending_bases.insert(id.to_string(), base);
+        }
         Ok(self.session_cache.get_mut(id).unwrap())
     }
 
@@ -171,6 +249,35 @@ impl CanvasStore {
         self.write_session_file(&session)?;
         self.session_cache.insert(id, session.clone());
         Ok(session)
+    }
+
+    pub fn update_branch_memory(
+        &mut self,
+        session_id: &str,
+        branch_key: &str,
+        memory: CanvasWorkingMemory,
+    ) -> Result<()> {
+        let session = self.get_session_mut(session_id)?;
+        session
+            .branch_memories
+            .insert(branch_key.to_string(), memory);
+        session.updated_at = Utc::now();
+        let session = session.clone();
+        self.write_session_file(&session)?;
+        Ok(())
+    }
+
+    pub fn update_working_memory(
+        &mut self,
+        session_id: &str,
+        memory: CanvasWorkingMemory,
+    ) -> Result<()> {
+        let session = self.get_session_mut(session_id)?;
+        session.working_memory = memory;
+        session.updated_at = Utc::now();
+        let session = session.clone();
+        self.write_session_file(&session)?;
+        Ok(())
     }
 
     /// Update an existing session
@@ -206,19 +313,99 @@ impl CanvasStore {
     pub fn delete_session(&mut self, id: &str) -> Result<()> {
         Self::validate_session_id(id)?;
         let path = self.session_path(id);
-        std::fs::remove_file(&path).with_context(|| format!("Failed to delete session: {}", id))?;
+        if self.event_recorder.is_noop() {
+            std::fs::remove_file(&path)
+                .with_context(|| format!("Failed to delete session: {}", id))?;
+        } else {
+            let commit = self
+                .event_recorder
+                .commit_mutation(
+                    crate::services::twin_events::MutationOrigin::Local,
+                    crate::models::twin_event::CausalStream::LocalOnly,
+                    crate::models::twin_event::SourceChannel::parse("canvas")
+                        .map_err(anyhow::Error::msg)?,
+                    vec![crate::services::twin_events::TargetMutation::tombstone(
+                        crate::services::twin_events::TargetKind::CanvasJson,
+                        format!("{id}.json"),
+                    )],
+                    Vec::new(),
+                )
+                .map_err(anyhow::Error::new)?;
+            require_canvas_only_commit(&commit)?;
+        }
         self.session_cache.remove(id);
+        self.pending_bases.remove(id);
         Ok(())
     }
 
     /// Add a prompt tile to a session
     pub fn add_tile(&mut self, session_id: &str, tile: PromptTile) -> Result<CanvasSession> {
+        self.add_tile_internal(session_id, tile, None)
+            .map(|(session, _)| session)
+    }
+
+    pub(crate) fn add_tile_expecting_authority(
+        &mut self,
+        session_id: &str,
+        tile: PromptTile,
+        expected: crate::services::vault_namespace::VaultAuthorityTokenV1,
+    ) -> Result<(CanvasSession, crate::services::twin_events::MutationCommit)> {
+        self.add_tile_internal(session_id, tile, Some(expected))
+    }
+
+    fn add_tile_internal(
+        &mut self,
+        session_id: &str,
+        tile: PromptTile,
+        expected: Option<crate::services::vault_namespace::VaultAuthorityTokenV1>,
+    ) -> Result<(CanvasSession, crate::services::twin_events::MutationCommit)> {
+        Self::validate_tile_twin_evidence(&tile)?;
         let session = self.get_session_mut(session_id)?;
         session.prompt_tiles.push(tile);
         session.updated_at = Utc::now();
         let session = session.clone();
-        self.write_session_file(&session)?;
-        Ok(session)
+        let commit = self.write_session_file_internal(&session, None, expected)?;
+        Ok((session, commit))
+    }
+
+    pub fn add_decision_tile(
+        &mut self,
+        session_id: &str,
+        tile: PromptTile,
+        twin_store: &mut crate::services::twin::TwinStore,
+        decision: crate::models::twin::DecisionEpisodeCreate,
+    ) -> Result<CanvasSession> {
+        self.add_decision_tile_internal(session_id, tile, twin_store, decision, None)
+            .map(|(session, _)| session)
+    }
+
+    pub(crate) fn add_decision_tile_expecting_authority(
+        &mut self,
+        session_id: &str,
+        tile: PromptTile,
+        twin_store: &mut crate::services::twin::TwinStore,
+        decision: crate::models::twin::DecisionEpisodeCreate,
+        expected: crate::services::vault_namespace::VaultAuthorityTokenV1,
+    ) -> Result<(CanvasSession, crate::services::twin_events::MutationCommit)> {
+        self.add_decision_tile_internal(session_id, tile, twin_store, decision, Some(expected))
+    }
+
+    fn add_decision_tile_internal(
+        &mut self,
+        session_id: &str,
+        tile: PromptTile,
+        twin_store: &mut crate::services::twin::TwinStore,
+        decision: crate::models::twin::DecisionEpisodeCreate,
+        expected: Option<crate::services::vault_namespace::VaultAuthorityTokenV1>,
+    ) -> Result<(CanvasSession, crate::services::twin_events::MutationCommit)> {
+        Self::validate_tile_twin_evidence(&tile)?;
+        let session = self.get_session_mut(session_id)?;
+        session.prompt_tiles.push(tile);
+        session.updated_at = Utc::now();
+        let session = session.clone();
+        let commit =
+            self.write_session_file_internal(&session, Some((twin_store, decision)), expected)?;
+        Ok((session, commit))
     }
 
     /// Delete a prompt tile and its children from a session
@@ -266,34 +453,6 @@ impl CanvasStore {
                 && !Self::debate_uses_deleted_response(debate, tile_id, model_id)
         });
 
-        session.updated_at = Utc::now();
-        let session = session.clone();
-        self.write_session_file(&session)?;
-        Ok(())
-    }
-
-    pub fn update_branch_memory(
-        &mut self,
-        session_id: &str,
-        branch_key: &str,
-        memory: CanvasWorkingMemory,
-    ) -> Result<()> {
-        let session = self.get_session_mut(session_id)?;
-        session.branch_memories.insert(branch_key.to_string(), memory);
-        session.updated_at = Utc::now();
-        let session = session.clone();
-        self.write_session_file(&session)?;
-        Ok(())
-    }
-
-    /// Replace the compiled session working memory and persist.
-    pub fn update_working_memory(
-        &mut self,
-        session_id: &str,
-        memory: CanvasWorkingMemory,
-    ) -> Result<()> {
-        let session = self.get_session_mut(session_id)?;
-        session.working_memory = memory;
         session.updated_at = Utc::now();
         let session = session.clone();
         self.write_session_file(&session)?;
@@ -423,16 +582,53 @@ impl CanvasStore {
 
     /// Add a debate to a session
     pub fn add_debate(&mut self, session_id: &str, debate: Debate) -> Result<()> {
+        self.add_debate_internal(session_id, debate, None)
+            .map(|_| ())
+    }
+
+    pub(crate) fn add_debate_expecting_authority(
+        &mut self,
+        session_id: &str,
+        debate: Debate,
+        expected: crate::services::vault_namespace::VaultAuthorityTokenV1,
+    ) -> Result<crate::services::twin_events::MutationCommit> {
+        self.add_debate_internal(session_id, debate, Some(expected))
+    }
+
+    fn add_debate_internal(
+        &mut self,
+        session_id: &str,
+        debate: Debate,
+        expected: Option<crate::services::vault_namespace::VaultAuthorityTokenV1>,
+    ) -> Result<crate::services::twin_events::MutationCommit> {
         let session = self.get_session_mut(session_id)?;
         session.debates.push(debate);
         session.updated_at = Utc::now();
         let session = session.clone();
-        self.write_session_file(&session)?;
-        Ok(())
+        self.write_session_file_internal(&session, None, expected)
     }
 
     /// Update a debate's rounds
     pub fn update_debate(&mut self, session_id: &str, debate: &Debate) -> Result<()> {
+        self.update_debate_internal(session_id, debate, None)
+            .map(|_| ())
+    }
+
+    pub(crate) fn update_debate_expecting_authority(
+        &mut self,
+        session_id: &str,
+        debate: &Debate,
+        expected: crate::services::vault_namespace::VaultAuthorityTokenV1,
+    ) -> Result<crate::services::twin_events::MutationCommit> {
+        self.update_debate_internal(session_id, debate, Some(expected))
+    }
+
+    fn update_debate_internal(
+        &mut self,
+        session_id: &str,
+        debate: &Debate,
+        expected: Option<crate::services::vault_namespace::VaultAuthorityTokenV1>,
+    ) -> Result<crate::services::twin_events::MutationCommit> {
         let session = self.get_session_mut(session_id)?;
 
         if let Some(existing) = session.debates.iter_mut().find(|d| d.id == debate.id) {
@@ -441,8 +637,7 @@ impl CanvasStore {
 
         session.updated_at = Utc::now();
         let session = session.clone();
-        self.write_session_file(&session)?;
-        Ok(())
+        self.write_session_file_internal(&session, None, expected)
     }
 
     /// Batch update multiple tile responses in a single read/write cycle.
@@ -451,14 +646,29 @@ impl CanvasStore {
         &mut self,
         session_id: &str,
         tile_id: &str,
-        updates: &[(
-            String,
-            String,
-            crate::models::canvas::ResponseStatus,
-            Option<String>,
-            Option<f64>,
-        )],
+        updates: &[TileResponseUpdate],
     ) -> Result<()> {
+        self.batch_update_tile_responses_internal(session_id, tile_id, updates, None)
+            .map(|_| ())
+    }
+
+    pub(crate) fn batch_update_tile_responses_expecting_authority(
+        &mut self,
+        session_id: &str,
+        tile_id: &str,
+        updates: &[TileResponseUpdate],
+        expected: crate::services::vault_namespace::VaultAuthorityTokenV1,
+    ) -> Result<crate::services::twin_events::MutationCommit> {
+        self.batch_update_tile_responses_internal(session_id, tile_id, updates, Some(expected))
+    }
+
+    fn batch_update_tile_responses_internal(
+        &mut self,
+        session_id: &str,
+        tile_id: &str,
+        updates: &[TileResponseUpdate],
+        expected: Option<crate::services::vault_namespace::VaultAuthorityTokenV1>,
+    ) -> Result<crate::services::twin_events::MutationCommit> {
         let session = self.get_session_mut(session_id)?;
 
         if let Some(tile) = session.prompt_tiles.iter_mut().find(|t| t.id == tile_id) {
@@ -473,8 +683,7 @@ impl CanvasStore {
         }
 
         let session = session.clone();
-        self.write_session_file(&session)?;
-        Ok(())
+        self.write_session_file_internal(&session, None, expected)
     }
 
     /// Update a tile's response content (for streaming)
@@ -488,6 +697,48 @@ impl CanvasStore {
         error: Option<&str>,
         cost_usd: Option<f64>,
     ) -> Result<()> {
+        self.update_tile_response_internal(
+            session_id, tile_id, model_id, content, status, error, cost_usd, None,
+        )
+        .map(|_| ())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn update_tile_response_expecting_authority(
+        &mut self,
+        session_id: &str,
+        tile_id: &str,
+        model_id: &str,
+        content: &str,
+        status: crate::models::canvas::ResponseStatus,
+        error: Option<&str>,
+        cost_usd: Option<f64>,
+        expected: crate::services::vault_namespace::VaultAuthorityTokenV1,
+    ) -> Result<crate::services::twin_events::MutationCommit> {
+        self.update_tile_response_internal(
+            session_id,
+            tile_id,
+            model_id,
+            content,
+            status,
+            error,
+            cost_usd,
+            Some(expected),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn update_tile_response_internal(
+        &mut self,
+        session_id: &str,
+        tile_id: &str,
+        model_id: &str,
+        content: &str,
+        status: crate::models::canvas::ResponseStatus,
+        error: Option<&str>,
+        cost_usd: Option<f64>,
+        expected: Option<crate::services::vault_namespace::VaultAuthorityTokenV1>,
+    ) -> Result<crate::services::twin_events::MutationCommit> {
         let session = self.get_session_mut(session_id)?;
 
         if let Some(tile) = session.prompt_tiles.iter_mut().find(|t| t.id == tile_id) {
@@ -500,21 +751,52 @@ impl CanvasStore {
         }
 
         let session = session.clone();
-        self.write_session_file(&session)?;
-        Ok(())
+        self.write_session_file_internal(&session, None, expected)
     }
 
     /// Save a full session object (used after streaming completes)
     pub fn save_session(&mut self, session: &CanvasSession) -> Result<()> {
+        self.save_session_internal(session, None).map(|_| ())
+    }
+
+    pub(crate) fn save_session_expecting_authority(
+        &mut self,
+        session: &CanvasSession,
+        expected: crate::services::vault_namespace::VaultAuthorityTokenV1,
+    ) -> Result<crate::services::twin_events::MutationCommit> {
+        self.save_session_internal(session, Some(expected))
+    }
+
+    fn save_session_internal(
+        &mut self,
+        session: &CanvasSession,
+        expected: Option<crate::services::vault_namespace::VaultAuthorityTokenV1>,
+    ) -> Result<crate::services::twin_events::MutationCommit> {
+        Self::validate_session_twin_evidence(session)?;
+        if let Some(base) = self.session_cache.get(&session.id).cloned() {
+            self.pending_bases.insert(session.id.clone(), base);
+        }
         self.session_cache
             .insert(session.id.clone(), session.clone());
-        self.write_session_file(session)
+        self.write_session_file_internal(session, None, expected)
     }
 
     /// Validate that a session ID doesn't contain path traversal sequences
     fn validate_session_id(id: &str) -> Result<()> {
         if id.is_empty() || id.contains('/') || id.contains('\\') || id.contains("..") {
             anyhow::bail!("Invalid session ID: {}", id);
+        }
+        Ok(())
+    }
+
+    fn validate_tile_twin_evidence(tile: &PromptTile) -> Result<()> {
+        tile.validate_twin_relationship_context(None)
+            .map_err(anyhow::Error::msg)
+    }
+
+    fn validate_session_twin_evidence(session: &CanvasSession) -> Result<()> {
+        for tile in &session.prompt_tiles {
+            Self::validate_tile_twin_evidence(tile)?;
         }
         Ok(())
     }
@@ -526,352 +808,265 @@ impl CanvasStore {
 
     /// Read and parse a session file
     fn read_session_file(&self, path: &std::path::Path) -> Result<CanvasSession> {
-        let content = std::fs::read_to_string(path)
-            .with_context(|| format!("Failed to read file: {:?}", path))?;
+        self.read_session_file_optional(path)?
+            .ok_or_else(|| anyhow::anyhow!("Failed to read file: {:?}", path))
+    }
 
-        serde_json::from_str(&content)
-            .with_context(|| format!("Failed to parse session: {:?}", path))
+    fn read_session_file_optional(&self, path: &std::path::Path) -> Result<Option<CanvasSession>> {
+        const CANVAS_JSON_LIMIT: usize = 16 * 1024 * 1024;
+        let relative = path
+            .strip_prefix(&self.data_path)
+            .map_err(|_| anyhow::anyhow!("Canvas read escaped the configured store root"))?
+            .to_string_lossy()
+            .replace('\\', "/");
+        let root = self
+            .root_capability
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Canvas store root capability could not be acquired"))?;
+        let Some(bytes) = root
+            .read_bounded(&relative, CANVAS_JSON_LIMIT)
+            .map_err(anyhow::Error::new)?
+        else {
+            return Ok(None);
+        };
+        let session = serde_json::from_slice(&bytes)
+            .with_context(|| format!("Failed to parse session: {:?}", path))?;
+        Self::validate_session_twin_evidence(&session)
+            .with_context(|| format!("Invalid Twin evidence in session: {:?}", path))?;
+        Ok(Some(session))
     }
 
     /// Write a session to file
-    fn write_session_file(&self, session: &CanvasSession) -> Result<()> {
-        let path = self.session_path(&session.id);
-        let content = serde_json::to_string_pretty(session)?;
-
-        write_atomic(&path, content.as_bytes())
-            .with_context(|| format!("Failed to write session: {:?}", path))?;
-
-        Ok(())
+    fn write_session_file(&mut self, session: &CanvasSession) -> Result<()> {
+        self.write_session_file_internal(session, None, None)
+            .map(|_| ())
     }
+
+    fn write_session_file_internal(
+        &mut self,
+        session: &CanvasSession,
+        mut decision: Option<(
+            &mut crate::services::twin::TwinStore,
+            crate::models::twin::DecisionEpisodeCreate,
+        )>,
+        expected_authority: Option<crate::services::vault_namespace::VaultAuthorityTokenV1>,
+    ) -> Result<crate::services::twin_events::MutationCommit> {
+        Self::validate_session_twin_evidence(session)?;
+        let path = self.session_path(&session.id);
+        let candidate = session.clone();
+        let cached_base = self.pending_bases.remove(&session.id);
+        let before_error_fallback = self.read_session_file_optional(&path)?;
+        if self.event_recorder.is_noop() {
+            if decision.is_some() {
+                anyhow::bail!("compound decision capture requires a mutation coordinator");
+            }
+            let content = serde_json::to_string_pretty(&candidate)?;
+            write_atomic(&path, content.as_bytes())
+                .with_context(|| format!("Failed to write session: {:?}", path))?;
+            return Ok(crate::services::twin_events::MutationCommit {
+                mutation_id: None,
+                events: Vec::new(),
+                authority_token: None,
+                postcommit_warning: false,
+            });
+        }
+
+        let recorder = self.event_recorder.clone();
+        let session_id = candidate.id.clone();
+        let path_for_plan = path.clone();
+        let mut committed_session = None;
+        let mut committed_decision_trace = None;
+        let mut planner = || {
+            let durable_before =
+                self.read_session_file_optional(&path_for_plan)
+                    .map_err(|error| {
+                        crate::services::twin_events::MutationError::Invalid(error.to_string())
+                    })?;
+            let after = match (&cached_base, &durable_before) {
+                (Some(base), Some(durable)) => {
+                    merge_canvas_session_change(base, &candidate, durable).map_err(|error| {
+                        crate::services::twin_events::MutationError::Invalid(error.to_string())
+                    })?
+                }
+                _ => candidate.clone(),
+            };
+            Self::validate_session_twin_evidence(&after).map_err(|error| {
+                crate::services::twin_events::MutationError::Invalid(error.to_string())
+            })?;
+            let content = serde_json::to_string_pretty(&after).map_err(|error| {
+                crate::services::twin_events::MutationError::Invalid(error.to_string())
+            })?;
+            let events = recorder.recorded_events()?;
+            let mut drafts = crate::services::twin_events::canvas_transition_drafts(
+                durable_before.as_ref(),
+                &after,
+                &events,
+                crate::services::twin_events::digest_bytes(content.as_bytes()),
+            )
+            .map_err(crate::services::twin_events::MutationError::Invalid)?;
+            let mut targets = vec![crate::services::twin_events::TargetMutation::put(
+                crate::services::twin_events::TargetKind::CanvasJson,
+                format!("{session_id}.json"),
+                content,
+            )];
+            if let Some((twin_store, create)) = decision.as_mut() {
+                let (_episode, trace, values, decision_drafts) = twin_store
+                    .plan_decision_episode_mutation(create.clone())
+                    .map_err(|error| {
+                        crate::services::twin_events::MutationError::Invalid(error.to_string())
+                    })?;
+                targets.extend(twin_store.governed_json_targets(values).map_err(|error| {
+                    crate::services::twin_events::MutationError::Invalid(error.to_string())
+                })?);
+                drafts.extend(decision_drafts);
+                committed_decision_trace = Some(trace);
+            }
+            committed_session = Some(after);
+            let mut plan = crate::services::twin_events::MutationPlan::new(
+                crate::models::twin_event::CausalStream::SyncEligible,
+                crate::models::twin_event::SourceChannel::parse("canvas")
+                    .map_err(crate::services::twin_events::MutationError::Invalid)?,
+                targets,
+                drafts,
+            );
+            if let Some(expected) = expected_authority.clone() {
+                plan = plan.expecting_authority(expected);
+            }
+            Ok(Some(plan))
+        };
+        let persist = recorder.commit_planned_mutation(
+            crate::services::twin_events::MutationOrigin::Local,
+            &mut planner,
+        );
+        let commit = match persist {
+            Ok(commit) => commit,
+            Err(error) => {
+                match self.read_session_file(&path) {
+                    Ok(durable) => {
+                        self.session_cache.insert(session.id.clone(), durable);
+                    }
+                    Err(_) => {
+                        if let Some(before) = before_error_fallback {
+                            self.session_cache.insert(session.id.clone(), before);
+                        } else {
+                            self.session_cache.remove(&session.id);
+                        }
+                    }
+                }
+                return Err(anyhow::Error::new(error));
+            }
+        };
+        if let Some(committed) = committed_session {
+            self.session_cache.insert(session.id.clone(), committed);
+        }
+        if let (Some((twin_store, _)), Some(trace)) = (decision.as_mut(), committed_decision_trace)
+        {
+            twin_store.cache_committed_trace(trace);
+        }
+        Ok(commit)
+    }
+}
+
+fn merge_canvas_session_change(
+    base: &CanvasSession,
+    candidate: &CanvasSession,
+    durable: &CanvasSession,
+) -> Result<CanvasSession> {
+    let base = serde_json::to_value(base)?;
+    let candidate = serde_json::to_value(candidate)?;
+    let mut durable = serde_json::to_value(durable)?;
+    merge_canvas_value(&base, &candidate, &mut durable);
+    Ok(serde_json::from_value(durable)?)
+}
+
+fn merge_canvas_value(
+    base: &serde_json::Value,
+    candidate: &serde_json::Value,
+    durable: &mut serde_json::Value,
+) {
+    if base == candidate {
+        return;
+    }
+    match (base, candidate, durable) {
+        (
+            serde_json::Value::Object(base),
+            serde_json::Value::Object(candidate),
+            serde_json::Value::Object(durable),
+        ) => {
+            for (key, candidate_value) in candidate {
+                match (base.get(key), durable.get_mut(key)) {
+                    (Some(base_value), Some(durable_value)) => {
+                        merge_canvas_value(base_value, candidate_value, durable_value)
+                    }
+                    _ => {
+                        durable.insert(key.clone(), candidate_value.clone());
+                    }
+                }
+            }
+        }
+        (
+            serde_json::Value::Array(base),
+            serde_json::Value::Array(candidate),
+            serde_json::Value::Array(durable),
+        ) if canvas_array_identity_key(base, candidate, durable).is_some() => {
+            let key = canvas_array_identity_key(base, candidate, durable).expect("checked key");
+            let base_ids = base
+                .iter()
+                .filter_map(|value| canvas_identity(value, key))
+                .collect::<HashSet<_>>();
+            let candidate_ids = candidate
+                .iter()
+                .filter_map(|value| canvas_identity(value, key))
+                .collect::<HashSet<_>>();
+            durable.retain(|value| {
+                canvas_identity(value, key)
+                    .is_none_or(|id| !base_ids.contains(&id) || candidate_ids.contains(&id))
+            });
+            for candidate_value in candidate {
+                let Some(id) = canvas_identity(candidate_value, key) else {
+                    continue;
+                };
+                let base_value = base
+                    .iter()
+                    .find(|value| canvas_identity(value, key).as_deref() == Some(id.as_str()));
+                let durable_value = durable
+                    .iter_mut()
+                    .find(|value| canvas_identity(value, key).as_deref() == Some(id.as_str()));
+                match (base_value, durable_value) {
+                    (Some(base_value), Some(durable_value)) => {
+                        merge_canvas_value(base_value, candidate_value, durable_value)
+                    }
+                    (None, None) => durable.push(candidate_value.clone()),
+                    _ => {}
+                }
+            }
+        }
+        (_, candidate, durable) => *durable = candidate.clone(),
+    }
+}
+
+fn canvas_array_identity_key(
+    base: &[serde_json::Value],
+    candidate: &[serde_json::Value],
+    durable: &[serde_json::Value],
+) -> Option<&'static str> {
+    ["id", "round_number", "model_id"].into_iter().find(|key| {
+        base.iter()
+            .chain(candidate)
+            .chain(durable)
+            .all(|value| canvas_identity(value, key).is_some())
+            && !(base.is_empty() && candidate.is_empty() && durable.is_empty())
+    })
+}
+
+fn canvas_identity(value: &serde_json::Value, key: &str) -> Option<String> {
+    let value = value.as_object()?.get(key)?;
+    value
+        .as_str()
+        .map(str::to_string)
+        .or_else(|| value.as_u64().map(|value| value.to_string()))
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::models::canvas::{
-        CanvasWorkingMemory, Debate, ModelPosition, ModelResponse, PromptTile, ResponseStatus,
-        SessionCreate,
-    };
-    use crate::services::atomic_io::assert_no_tmp_siblings;
-    use tempfile::tempdir;
-
-    #[test]
-    fn session_writes_are_atomic_with_no_tmp_litter() {
-        let temp_dir = tempdir().expect("temp dir should be created");
-        let mut store = CanvasStore::new(temp_dir.path().to_path_buf());
-
-        let session = store
-            .create_session(SessionCreate {
-                title: "Atomic Session".to_string(),
-                description: Some("adoption test".to_string()),
-                tags: Vec::new(),
-            })
-            .expect("session should be created");
-
-        let session_file = temp_dir.path().join(format!("{}.json", session.id));
-        let persisted = std::fs::read_to_string(&session_file).expect("session file should exist");
-        assert!(persisted.contains("Atomic Session"));
-        assert_no_tmp_siblings(temp_dir.path());
-    }
-
-    fn build_response(model_id: &str) -> ModelResponse {
-        ModelResponse {
-            model_id: model_id.to_string(),
-            model_name: model_id.to_string(),
-            status: ResponseStatus::Completed,
-            ..ModelResponse::default()
-        }
-    }
-
-    fn build_tile(
-        id: &str,
-        parent_tile_id: Option<&str>,
-        parent_model_id: Option<&str>,
-        model_ids: &[&str],
-    ) -> PromptTile {
-        let mut tile = PromptTile {
-            id: id.to_string(),
-            parent_tile_id: parent_tile_id.map(str::to_string),
-            parent_model_id: parent_model_id.map(str::to_string),
-            ..PromptTile::default()
-        };
-
-        tile.models = model_ids
-            .iter()
-            .map(|model_id| model_id.to_string())
-            .collect();
-        for model_id in model_ids {
-            tile.responses
-                .insert((*model_id).to_string(), build_response(model_id));
-        }
-
-        tile
-    }
-
-    fn build_debate(id: &str, source_tile_ids: &[&str], participating_models: &[&str]) -> Debate {
-        Debate {
-            id: id.to_string(),
-            source_tile_ids: source_tile_ids
-                .iter()
-                .map(|tile_id| tile_id.to_string())
-                .collect(),
-            participating_models: participating_models
-                .iter()
-                .map(|model_id| model_id.to_string())
-                .collect(),
-            ..Debate::default()
-        }
-    }
-
-    #[test]
-    fn delete_tile_removes_all_descendants() {
-        let temp_dir = tempdir().expect("temp dir should be created");
-        let mut store = CanvasStore::new(temp_dir.path().to_path_buf());
-        let session = store
-            .create_session(SessionCreate {
-                title: "Tree".to_string(),
-                description: None,
-                tags: Vec::new(),
-            })
-            .expect("session should be created");
-
-        let root = PromptTile {
-            id: "root".to_string(),
-            ..PromptTile::default()
-        };
-        let child = PromptTile {
-            id: "child".to_string(),
-            parent_tile_id: Some("root".to_string()),
-            ..PromptTile::default()
-        };
-        let grandchild = PromptTile {
-            id: "grandchild".to_string(),
-            parent_tile_id: Some("child".to_string()),
-            ..PromptTile::default()
-        };
-        let unrelated = PromptTile {
-            id: "unrelated".to_string(),
-            ..PromptTile::default()
-        };
-
-        store
-            .add_tile(&session.id, root)
-            .expect("root should be added");
-        store
-            .add_tile(&session.id, child)
-            .expect("child should be added");
-        store
-            .add_tile(&session.id, grandchild)
-            .expect("grandchild should be added");
-        store
-            .add_tile(&session.id, unrelated)
-            .expect("unrelated should be added");
-
-        store
-            .delete_tile(&session.id, "root")
-            .expect("delete should succeed");
-
-        let remaining_ids: Vec<String> = store
-            .get_session(&session.id)
-            .expect("session should still load")
-            .prompt_tiles
-            .into_iter()
-            .map(|tile| tile.id)
-            .collect();
-
-        assert_eq!(remaining_ids, vec!["unrelated".to_string()]);
-    }
-
-    #[test]
-    fn delete_tile_removes_debates_for_removed_subtree() {
-        let temp_dir = tempdir().expect("temp dir should be created");
-        let mut store = CanvasStore::new(temp_dir.path().to_path_buf());
-        let session = store
-            .create_session(SessionCreate {
-                title: "Debates".to_string(),
-                description: None,
-                tags: Vec::new(),
-            })
-            .expect("session should be created");
-
-        store
-            .add_tile(&session.id, build_tile("root", None, None, &["model-a"]))
-            .expect("root should be added");
-        store
-            .add_tile(
-                &session.id,
-                build_tile("child", Some("root"), Some("model-a"), &["model-a"]),
-            )
-            .expect("child should be added");
-        store
-            .add_tile(&session.id, build_tile("sibling", None, None, &["model-b"]))
-            .expect("sibling should be added");
-        store
-            .add_debate(
-                &session.id,
-                build_debate("debate-root", &["child"], &["model-a"]),
-            )
-            .expect("root debate should be added");
-        store
-            .add_debate(
-                &session.id,
-                build_debate("debate-sibling", &["sibling"], &["model-b"]),
-            )
-            .expect("sibling debate should be added");
-
-        store
-            .delete_tile(&session.id, "root")
-            .expect("delete should succeed");
-
-        let session = store
-            .get_session(&session.id)
-            .expect("session should still load");
-        let remaining_tile_ids: Vec<String> = session
-            .prompt_tiles
-            .into_iter()
-            .map(|tile| tile.id)
-            .collect();
-        let remaining_debate_ids: Vec<String> = session
-            .debates
-            .into_iter()
-            .map(|debate| debate.id)
-            .collect();
-
-        assert_eq!(remaining_tile_ids, vec!["sibling".to_string()]);
-        assert_eq!(remaining_debate_ids, vec!["debate-sibling".to_string()]);
-    }
-
-    #[test]
-    fn delete_response_removes_only_the_deleted_model_branch() {
-        let temp_dir = tempdir().expect("temp dir should be created");
-        let mut store = CanvasStore::new(temp_dir.path().to_path_buf());
-        let session = store
-            .create_session(SessionCreate {
-                title: "Responses".to_string(),
-                description: None,
-                tags: Vec::new(),
-            })
-            .expect("session should be created");
-
-        store
-            .add_tile(
-                &session.id,
-                build_tile("root", None, None, &["model-a", "model-b"]),
-            )
-            .expect("root should be added");
-        store
-            .add_tile(
-                &session.id,
-                build_tile("branch-a", Some("root"), Some("model-a"), &["model-a"]),
-            )
-            .expect("branch-a should be added");
-        store
-            .add_tile(
-                &session.id,
-                build_tile(
-                    "branch-a-child",
-                    Some("branch-a"),
-                    Some("model-a"),
-                    &["model-a"],
-                ),
-            )
-            .expect("branch-a-child should be added");
-        store
-            .add_tile(
-                &session.id,
-                build_tile("branch-b", Some("root"), Some("model-b"), &["model-b"]),
-            )
-            .expect("branch-b should be added");
-        store
-            .add_debate(
-                &session.id,
-                build_debate("debate-a", &["root"], &["model-a"]),
-            )
-            .expect("debate-a should be added");
-        store
-            .add_debate(
-                &session.id,
-                build_debate("debate-branch-a", &["branch-a"], &["model-a"]),
-            )
-            .expect("debate-branch-a should be added");
-        store
-            .add_debate(
-                &session.id,
-                build_debate("debate-b", &["root"], &["model-b"]),
-            )
-            .expect("debate-b should be added");
-
-        store
-            .delete_response(&session.id, "root", "model-a")
-            .expect("delete response should succeed");
-
-        let session = store
-            .get_session(&session.id)
-            .expect("session should still load");
-        let remaining_tile_ids: Vec<String> = session
-            .prompt_tiles
-            .iter()
-            .map(|tile| tile.id.clone())
-            .collect();
-        let remaining_debate_ids: Vec<String> = session
-            .debates
-            .iter()
-            .map(|debate| debate.id.clone())
-            .collect();
-        let root = session
-            .prompt_tiles
-            .iter()
-            .find(|tile| tile.id == "root")
-            .expect("root tile should remain");
-
-        assert_eq!(
-            remaining_tile_ids,
-            vec!["root".to_string(), "branch-b".to_string()]
-        );
-        assert_eq!(root.models, vec!["model-b".to_string()]);
-        assert!(!root.responses.contains_key("model-a"));
-        assert_eq!(remaining_debate_ids, vec!["debate-b".to_string()]);
-    }
-
-    #[test]
-    fn update_working_memory_persists_compiled_session_state() {
-        let temp_dir = tempdir().expect("temp dir should be created");
-        let mut store = CanvasStore::new(temp_dir.path().to_path_buf());
-        let session = store
-            .create_session(SessionCreate {
-                title: "Memory session".to_string(),
-                description: None,
-                tags: Vec::new(),
-            })
-            .expect("session should be created");
-
-        let memory = CanvasWorkingMemory {
-            version: 1,
-            compiled_from_tile_id: Some("tile-1".to_string()),
-            question: "Should we compact instead of truncate?".to_string(),
-            summary: "The thread is about replacing 240-character chops with compiled state."
-                .to_string(),
-            model_positions: vec![ModelPosition {
-                model_id: "openai/gpt-4".to_string(),
-                stance: "Prefer compiled summaries.".to_string(),
-            }],
-            ..CanvasWorkingMemory::default()
-        };
-
-        store
-            .update_working_memory(&session.id, memory.clone())
-            .expect("working memory should persist");
-
-        let reloaded = store
-            .get_session(&session.id)
-            .expect("session should reload");
-        assert_eq!(reloaded.working_memory.version, 1);
-        assert_eq!(
-            reloaded.working_memory.question,
-            "Should we compact instead of truncate?"
-        );
-        assert_eq!(reloaded.working_memory.summary, memory.summary);
-        assert_eq!(reloaded.working_memory.model_positions.len(), 1);
-        assert!(!reloaded.working_memory.is_empty());
-    }
-}
+#[path = "canvas_store_tests.rs"]
+mod tests;

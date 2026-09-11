@@ -18,6 +18,8 @@
 
 mod shared;
 
+mod prediction_terminality;
+
 mod working_memory;
 
 mod context;
@@ -25,7 +27,9 @@ mod context;
 mod streaming;
 pub use streaming::*;
 
+#[cfg(desktop)]
 mod debate;
+#[cfg(desktop)]
 pub use debate::*;
 
 mod session;

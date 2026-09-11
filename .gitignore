@@ -3,6 +3,8 @@ nul
 .claude/settings.local.json
 *.key
 .playwright-mcp/
+.worktrees/
+.tooling/
 
 # Build artifacts & sidecar binaries
 frontend/src-tauri/binaries/

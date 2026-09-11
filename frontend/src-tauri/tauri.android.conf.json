@@ -1,0 +1,24 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Grafyn",
+        "fullscreen": false,
+        "resizable": true,
+        "visible": true,
+        "useHttpsScheme": true
+      }
+    ],
+    "security": {
+      "capabilities": ["mobile"],
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' https: data: blob:; connect-src 'self' https://openrouter.ai"
+    }
+  },
+  "bundle": {
+    "android": {
+      "minSdkVersion": 24
+    }
+  }
+}

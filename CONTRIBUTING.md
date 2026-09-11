@@ -1,18 +1,75 @@
 # Contributing to Grafyn
 
-Thanks for considering a contribution. Grafyn is a local-first desktop app with firm product rules — read them first; they're short and they're enforced in review.
+Thanks for considering a contribution. Grafyn is a local-first client and local core with firm product rules — read them first; they're short and they're enforced in review.
 
 ## Product Rules
 
 These are non-negotiable design constraints, not style preferences:
 
-- **Desktop-first, local-first.** Do not add a hosted backend for core vault or twin storage.
+- **Client-owned and local-first.** Do not add a hosted backend for core vault or twin storage. Any future opaque sync relay remains a separate service boundary.
 - **Twin records are evidence-linked claims, not personality labels.** Every inferred record must trace back to the prompts, sessions, and excerpts that support it.
 - **Never train on or use records marked `rejected`, `private`, or `no_train`.** Rejected records exist only as exportable negative evidence.
 - **Candidate records** may influence live RAG answers only when relevant to the prompt, and must be disclosed as tentative.
 - **Advisor mode is the default** for decision support. **Simulation mode requires a configured Twin Identity** and uses first-person model-facing instructions; disclosure that it's a configured simulation belongs in the app UI and docs, not inside the Simulation system prompt.
 - **Twin accuracy evaluation is external by design.** The app captures and exports; it does not score, benchmark, or display accuracy results. Don't build eval UIs.
 - Scratch-trained personal models are future research, not current product behavior.
+
+## Licensing and sign-off
+
+Contributions use **inbound equals outbound** licensing. Contributions to the Grafyn client and local core are submitted under [MPL-2.0](LICENSE). Contributions to a package that explicitly declares `Apache-2.0 OR MPL-2.0` are submitted under that same choice of licenses. Existing third-party notices and license boundaries must be preserved.
+
+Grafyn uses the [Developer Certificate of Origin 1.1](https://developercertificate.org/) rather than copyright assignment or a broad contributor agreement. Sign every commit with a `Signed-off-by` trailer:
+
+```text
+Signed-off-by: Jane Developer <jane@example.com>
+```
+
+Git can add the trailer for you:
+
+```bash
+git commit -s
+```
+
+By signing off, you certify the following unmodified DCO 1.1 text:
+
+```text
+Developer Certificate of Origin
+Version 1.1
+
+Copyright (C) 2004, 2006 The Linux Foundation and its contributors.
+
+Everyone is permitted to copy and distribute verbatim copies of this
+license document, but changing it is not allowed.
+
+
+Developer's Certificate of Origin 1.1
+
+By making a contribution to this project, I certify that:
+
+(a) The contribution was created in whole or in part by me and I
+    have the right to submit it under the open source license
+    indicated in the file; or
+
+(b) The contribution is based upon previous work that, to the best
+    of my knowledge, is covered under an appropriate open source
+    license and I have the right under that license to submit that
+    work with modifications, whether created in whole or in part
+    by me, under the same open source license (unless I am
+    permitted to submit under a different license), as indicated
+    in the file; or
+
+(c) The contribution was provided directly to me by some other
+    person who certified (a), (b) or (c) and I have not modified
+    it.
+
+(d) I understand and agree that this project and the contribution
+    are public and that a record of the contribution (including all
+    personal information I submit with it, including my sign-off) is
+    maintained indefinitely and may be redistributed consistent with
+    this project or the open source license(s) involved.
+```
+
+If a contribution contains copied, generated, or third-party material, identify its source and license in the pull request. Do not remove existing notices or submit material you do not have the right to contribute under the applicable outbound license.
 
 ## Build From Source
 

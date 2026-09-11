@@ -2,8 +2,9 @@ import { describe, expect, it, beforeEach, vi } from 'vitest'
 import { mount, flushPromises } from '@vue/test-utils'
 import ImportView from '@/views/ImportView.vue'
 
-const dialog = vi.hoisted(() => ({
-  open: vi.fn()
+const transport = vi.hoisted(() => ({
+  openExternal: vi.fn(),
+  nativePlugins: true,
 }))
 
 const api = vi.hoisted(() => ({
@@ -20,7 +21,10 @@ const api = vi.hoisted(() => ({
   }
 }))
 
-vi.mock('@tauri-apps/api/dialog', () => dialog)
+vi.mock('@/api/transport', () => ({
+  getRuntimeProfile: () => ({ nativePlugins: transport.nativePlugins }),
+  getTransport: () => transport,
+}))
 vi.mock('@/api/client', () => api)
 vi.mock('@/composables/useToast', () => ({
   useToast: () => ({
@@ -45,7 +49,8 @@ function mountView() {
 describe('ImportView', () => {
   beforeEach(() => {
     vi.clearAllMocks()
-    dialog.open.mockResolvedValue('C:/tmp/interview.md')
+    transport.nativePlugins = true
+    transport.openExternal.mockResolvedValue('C:/tmp/interview.md')
     api.importApi.preview.mockResolvedValue({
       platform: 'interview',
       total_conversations: 1,
@@ -94,11 +99,14 @@ describe('ImportView', () => {
     await wrapper.find('[data-guide="import-file-btn"]').trigger('click')
     await flushPromises()
 
-    expect(dialog.open).toHaveBeenCalledWith(expect.objectContaining({
+    expect(transport.openExternal).toHaveBeenCalledWith({
+      type: 'file-dialog',
+      options: expect.objectContaining({
       filters: expect.arrayContaining([
         expect.objectContaining({ extensions: expect.arrayContaining(['md', 'txt', 'docx', 'pdf']) })
       ])
-    }))
+      }),
+    })
     expect(api.importApi.preview).toHaveBeenCalledWith('C:/tmp/interview.md')
     expect(wrapper.text()).toContain('interview')
     expect(wrapper.text()).toContain('Interview Transcript')
@@ -177,5 +185,16 @@ describe('ImportView', () => {
     // Verify the wrapper exists for content max-width centering
     const contentWrapper = wrapper.find('.import-view-content')
     expect(contentWrapper.exists()).toBe(true)
+  })
+
+  it('disables the native file picker when the desktop profile has no plugin authority', async () => {
+    transport.nativePlugins = false
+    const wrapper = mountView()
+    const picker = wrapper.find('[data-guide="import-file-btn"]')
+
+    expect(picker.attributes('disabled')).toBeDefined()
+    await picker.trigger('click')
+
+    expect(transport.openExternal).not.toHaveBeenCalled()
   })
 })

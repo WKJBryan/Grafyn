@@ -1,17 +1,22 @@
-use super::shared::ModelProviderRoute;
+pub(super) use super::prediction_terminality::fail_requested_prediction_if_same_root;
+mod twin_history;
+use super::shared::{
+    preserve_canvas_mutation_error, repair_canvas_trace_error, ModelProviderRoute, ModelRoute,
+};
 use super::working_memory::{
-    build_canvas_messages, compose_system_prompt, format_working_memory_for_prompt,
+    build_canvas_messages as build_memory_canvas_messages, compose_system_prompt,
     memory_for_follow_up, rewrite_retrieval_query,
 };
 use crate::commands::run_retrieval;
 use crate::models::canvas::{
-    CanvasSession, ContextMode, DecisionPromptMetadata, PromptRequest, PromptType, TileContextNote,
-    TwinAnswerMode,
+    CanvasSession, ContextMode, DecisionPromptMetadata, PromptRequest, PromptTile, PromptType,
+    ResponseStatus, TileContextNote, TwinAnswerMode, TwinEvidenceSnapshot,
 };
 use crate::models::note::ChunkResult;
 use crate::models::twin::{
     ActionGap, ConstitutionItem, ConstitutionSetup, DecisionEpisode, TwinContextRecord,
 };
+use crate::models::twin_state::SelectionDestination;
 use crate::services::ollama::OllamaService;
 use crate::services::openrouter::{ChatMessage, OpenRouterService};
 use crate::services::retrieval::RetrievalResult;
@@ -20,6 +25,7 @@ use crate::AppState;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use twin_history::build_compact_history_messages;
 
 const MIN_RETRIEVAL_SCORE_FOR_NOTES: f32 = 5.0;
 const MIN_CANVAS_QUERY_TOKEN_LEN: usize = 3;
@@ -32,11 +38,18 @@ const CANVAS_RETRIEVAL_STOPWORDS: &[&str] = &[
 ];
 
 // Twin context assembly
-pub(super) const TWIN_CONTEXT_VERSION: &str = "ctx-v2-cases-lexical";
+pub(super) const TWIN_CONTEXT_VERSION: &str = "ctx-v3-reviewed-authority";
 const TWIN_CONTEXT_TOKEN_BUDGET: usize = 4000;
 const MAX_TWIN_CASE_CONTEXT: usize = 5;
 const TWIN_CASE_FIELD_MAX_CHARS: usize = 800;
 const TWIN_CASE_CORRECTION_MAX_CHARS: usize = 500;
+
+#[derive(Debug, Clone)]
+struct ConversationTurn {
+    prompt: String,
+    response: String,
+    model_id: String,
+}
 
 #[derive(Debug, Clone)]
 pub(super) struct ResolvedPromptContext {
@@ -52,6 +65,7 @@ pub(super) struct ResolvedPromptContext {
     pub(super) twin_context_prompt: Option<String>,
     pub(super) context_version: Option<String>,
     pub(super) decision_case_ids: Vec<String>,
+    pub(super) twin_evidence_snapshot: Option<TwinEvidenceSnapshot>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -167,8 +181,25 @@ pub(super) async fn resolve_prompt_context(
     state: &AppState,
     session: &CanvasSession,
     request: &PromptRequest,
+    replay_tile: Option<&PromptTile>,
+    model_route: &ModelRoute,
 ) -> Result<ResolvedPromptContext, String> {
     let messages = build_canvas_messages(session, request)?;
+
+    if request.context_mode == ContextMode::TwinHistory {
+        return twin_history::resolve_twin_history_prompt_context(
+            state,
+            messages,
+            session,
+            request,
+            replay_tile,
+            match model_route.provider {
+                ModelProviderRoute::Ollama => SelectionDestination::Local,
+                ModelProviderRoute::OpenRouter => SelectionDestination::Network,
+            },
+        )
+        .await;
+    }
 
     if request.context_mode == ContextMode::Twin {
         return resolve_twin_prompt_context(state, messages, session, request).await;
@@ -179,12 +210,10 @@ pub(super) async fn resolve_prompt_context(
         ContextMode::KnowledgeSearch | ContextMode::Semantic
     ) {
         let pinned_ids = session.pinned_note_ids.clone();
-        let retrieval_query = rewrite_retrieval_query(
-            &request.prompt,
-            &memory_for_follow_up(session, request),
-        );
 
         // Quality gate: note-level retrieval to check if vault has relevant content
+        let retrieval_query =
+            rewrite_retrieval_query(&request.prompt, &memory_for_follow_up(session, request));
         let retrieval_results = run_retrieval(state, &retrieval_query, 5, &pinned_ids)
             .await
             .unwrap_or_default();
@@ -196,7 +225,19 @@ pub(super) async fn resolve_prompt_context(
                 request.prompt,
                 retrieval_decision
             );
-            return resolve_pinned_only_context(state, session, request, messages).await;
+            return Ok(ResolvedPromptContext {
+                messages,
+                context_notes: Vec::new(),
+                approved_twin_records: Vec::new(),
+                candidate_twin_records: Vec::new(),
+                constitution_items: Vec::new(),
+                action_gaps: Vec::new(),
+                system_prompt: compose_system_prompt(session, request, None),
+                twin_context_prompt: None,
+                context_version: None,
+                decision_case_ids: Vec::new(),
+                twin_evidence_snapshot: None,
+            });
         }
 
         // Check if chunk-level retrieval is enabled
@@ -218,7 +259,7 @@ pub(super) async fn resolve_prompt_context(
                         &chunk_index,
                         &graph,
                         &priority,
-                        &retrieval_query,
+                        &request.prompt,
                         token_budget,
                         &pinned_ids,
                     )
@@ -271,8 +312,6 @@ pub(super) async fn resolve_prompt_context(
                 .collect();
 
             let note_prompt = build_chunk_context_prompt(&chunks);
-            let context_notes =
-                merge_pinned_context_notes(state, context_notes, &pinned_ids).await;
 
             Ok(ResolvedPromptContext {
                 messages,
@@ -285,6 +324,7 @@ pub(super) async fn resolve_prompt_context(
                 twin_context_prompt: None,
                 context_version: None,
                 decision_case_ids: Vec::new(),
+                twin_evidence_snapshot: None,
             })
         } else {
             log::info!("Canvas using note-level context (chunk retrieval disabled)");
@@ -310,6 +350,7 @@ pub(super) async fn resolve_prompt_context(
             twin_context_prompt: None,
             context_version: None,
             decision_case_ids: Vec::new(),
+            twin_evidence_snapshot: None,
         })
     }
 }
@@ -321,15 +362,11 @@ async fn resolve_twin_prompt_context(
     request: &PromptRequest,
 ) -> Result<ResolvedPromptContext, String> {
     let pinned_ids = session.pinned_note_ids.clone();
-    let retrieval_query = rewrite_retrieval_query(
-        &request.prompt,
-        &memory_for_follow_up(session, request),
-    );
-    let retrieval_results = run_retrieval(state, &retrieval_query, 5, &pinned_ids)
+    let retrieval_results = run_retrieval(state, &request.prompt, 5, &pinned_ids)
         .await
         .unwrap_or_default();
 
-    let should_use_notes = should_use_retrieved_notes(&retrieval_query, &retrieval_results)
+    let should_use_notes = should_use_retrieved_notes(&request.prompt, &retrieval_results)
         == RetrievalDecisionReason::UseRetrievedNotes;
     let mut context_notes = Vec::new();
     let mut note_contexts = Vec::new();
@@ -352,7 +389,7 @@ async fn resolve_twin_prompt_context(
                         &chunk_index,
                         &graph,
                         &priority,
-                        &retrieval_query,
+                        &request.prompt,
                         token_budget,
                         &pinned_ids,
                     )
@@ -398,37 +435,16 @@ async fn resolve_twin_prompt_context(
         }
     }
 
-    let pinned_notes = fetch_notes_by_ids(state, &pinned_ids).await;
-    for (id, title, content) in pinned_notes {
-        if !note_contexts.iter().any(|(existing, _, _)| existing == &id) {
-            note_contexts.push((id.clone(), title.clone(), content.clone()));
-            context_notes.push(TileContextNote {
-                id,
-                title,
-                snippet: truncate_note_context_content(&content, 200),
-                score: 0.0,
-                pinned: true,
-            });
-        }
-    }
-
     let constitution_query =
-        decision_context_query(&retrieval_query, request.decision_metadata.as_ref());
-    let (
-        setup,
-        approved_twin_records,
-        candidate_twin_records,
-        constitution_items,
-        action_gaps,
-        decision_cases,
-    ) = {
+        decision_context_query(&request.prompt, request.decision_metadata.as_ref());
+    let (setup, approved_twin_records, constitution_items, action_gaps, decision_cases) = {
         let mut twin_store = state.twin_store.write().await;
         let setup = twin_store
             .get_constitution_setup()
             .map_err(|error| error.to_string())?;
         validate_twin_identity_for_answer_mode(&setup, &request.twin_answer_mode)?;
-        let (approved, candidate) = twin_store
-            .select_context_records(&retrieval_query)
+        let (approved, _) = twin_store
+            .select_context_records(&request.prompt)
             .map_err(|error| error.to_string())?;
         let (constitution_items, action_gaps) = twin_store
             .select_constitution_context(&constitution_query)
@@ -438,8 +454,10 @@ async fn resolve_twin_prompt_context(
             .map_err(|error| error.to_string())?;
         (
             setup,
-            approved,
-            candidate,
+            approved
+                .into_iter()
+                .filter(is_model_authoritative_twin_record)
+                .collect(),
             constitution_items,
             action_gaps,
             decision_cases,
@@ -450,7 +468,7 @@ async fn resolve_twin_prompt_context(
         decision_cases,
         constitution_items,
         approved_twin_records,
-        candidate_twin_records,
+        Vec::new(),
         action_gaps,
         note_contexts,
         TWIN_CONTEXT_TOKEN_BUDGET,
@@ -473,15 +491,6 @@ async fn resolve_twin_prompt_context(
         &request.prompt_type,
         request.decision_metadata.as_ref(),
     );
-    let twin_prompt = match format_working_memory_for_prompt(&session.working_memory) {
-        Some(memory) => format!("{memory}\n\n{twin_prompt}"),
-        None => twin_prompt,
-    };
-    let system_prompt = match &request.system_prompt {
-        Some(user_sp) if !user_sp.trim().is_empty() => format!("{twin_prompt}\n\n{user_sp}"),
-        _ => twin_prompt.clone(),
-    };
-
     Ok(ResolvedPromptContext {
         messages,
         context_notes,
@@ -489,10 +498,11 @@ async fn resolve_twin_prompt_context(
         candidate_twin_records: selection.candidates,
         constitution_items: selection.constitution_items,
         action_gaps: selection.action_gaps,
-        system_prompt: Some(system_prompt),
+        system_prompt: compose_system_prompt(session, request, Some(twin_prompt.clone())),
         twin_context_prompt: Some(twin_prompt),
         context_version: Some(TWIN_CONTEXT_VERSION.to_string()),
         decision_case_ids,
+        twin_evidence_snapshot: None,
     })
 }
 
@@ -525,7 +535,7 @@ async fn resolve_note_level_context(
 ) -> Result<ResolvedPromptContext, String> {
     let note_contexts = fetch_note_contexts(state, retrieval_results).await;
 
-    let mut context_notes: Vec<TileContextNote> = retrieval_results
+    let context_notes: Vec<TileContextNote> = retrieval_results
         .iter()
         .map(|r| TileContextNote {
             id: r.note.id.clone(),
@@ -535,16 +545,8 @@ async fn resolve_note_level_context(
             pinned: pinned_ids.contains(&r.note.id),
         })
         .collect();
-    context_notes = merge_pinned_context_notes(state, context_notes, pinned_ids).await;
 
-    let mut prompt_notes = note_contexts;
-    for note in &context_notes {
-        if note.pinned && !prompt_notes.iter().any(|(id, _, _)| id == &note.id) {
-            prompt_notes.push((note.id.clone(), note.title.clone(), note.snippet.clone()));
-        }
-    }
-
-    let note_prompt = build_note_context_prompt(&prompt_notes);
+    let note_prompt = build_note_context_prompt(&note_contexts);
 
     Ok(ResolvedPromptContext {
         messages,
@@ -557,89 +559,127 @@ async fn resolve_note_level_context(
         twin_context_prompt: None,
         context_version: None,
         decision_case_ids: Vec::new(),
+        twin_evidence_snapshot: None,
     })
 }
 
-async fn resolve_pinned_only_context(
-    state: &AppState,
+fn build_canvas_messages(
     session: &CanvasSession,
     request: &PromptRequest,
-    messages: Vec<ChatMessage>,
-) -> Result<ResolvedPromptContext, String> {
-    let pinned = fetch_notes_by_ids(state, &session.pinned_note_ids).await;
-    let context_notes: Vec<TileContextNote> = pinned
-        .iter()
-        .map(|(id, title, content)| TileContextNote {
-            id: id.clone(),
-            title: title.clone(),
-            snippet: truncate_note_context_content(content, 200),
-            score: 0.0,
-            pinned: true,
-        })
-        .collect();
-    let inner = if pinned.is_empty() {
-        None
-    } else {
-        Some(build_note_context_prompt(&pinned))
-    };
-
-    Ok(ResolvedPromptContext {
-        messages,
-        context_notes,
-        approved_twin_records: Vec::new(),
-        candidate_twin_records: Vec::new(),
-        constitution_items: Vec::new(),
-        action_gaps: Vec::new(),
-        system_prompt: compose_system_prompt(session, request, inner),
-        twin_context_prompt: None,
-        context_version: None,
-        decision_case_ids: Vec::new(),
-    })
-}
-
-async fn fetch_notes_by_ids(
-    state: &AppState,
-    ids: &[String],
-) -> Vec<(String, String, String)> {
-    if ids.is_empty() {
-        return Vec::new();
+) -> Result<Vec<ChatMessage>, String> {
+    if request.parent_debate_id.is_some() {
+        return build_memory_canvas_messages(session, request);
     }
-    let store = state.knowledge_store.read().await;
-    ids.iter()
-        .filter_map(|id| {
-            store.get_note(id).ok().map(|note| {
-                let truncated = truncate_note_context_content(&note.content, 1500);
-                (note.id.clone(), note.title.clone(), truncated)
-            })
-        })
-        .collect()
+    match request.context_mode {
+        ContextMode::TwinHistory => {
+            if request.parent_tile_id.is_none() && request.parent_model_id.is_none() {
+                Ok(vec![ChatMessage {
+                    role: "user".to_string(),
+                    content: request.prompt.clone(),
+                }])
+            } else {
+                build_compact_history_messages(session, request)
+            }
+        }
+        _ => build_memory_canvas_messages(session, request),
+    }
 }
 
-async fn merge_pinned_context_notes(
-    state: &AppState,
-    mut context_notes: Vec<TileContextNote>,
-    pinned_ids: &[String],
-) -> Vec<TileContextNote> {
-    let missing: Vec<String> = pinned_ids
-        .iter()
-        .filter(|id| !context_notes.iter().any(|note| &note.id == *id))
-        .cloned()
-        .collect();
-    for (id, title, content) in fetch_notes_by_ids(state, &missing).await {
-        context_notes.push(TileContextNote {
-            id,
-            title,
-            snippet: truncate_note_context_content(&content, 200),
-            score: 0.0,
-            pinned: true,
+fn build_full_history_messages(
+    session: &CanvasSession,
+    request: &PromptRequest,
+) -> Result<Vec<ChatMessage>, String> {
+    let turns = build_selected_parent_chain(session, request)?;
+    let mut messages = Vec::with_capacity((turns.len() * 2) + 1);
+
+    for turn in turns {
+        messages.push(ChatMessage {
+            role: "user".to_string(),
+            content: turn.prompt,
+        });
+        messages.push(ChatMessage {
+            role: "assistant".to_string(),
+            content: turn.response,
         });
     }
-    for note in &mut context_notes {
-        if pinned_ids.contains(&note.id) {
-            note.pinned = true;
+
+    messages.push(ChatMessage {
+        role: "user".to_string(),
+        content: request.prompt.clone(),
+    });
+
+    Ok(messages)
+}
+
+fn build_selected_parent_chain(
+    session: &CanvasSession,
+    request: &PromptRequest,
+) -> Result<Vec<ConversationTurn>, String> {
+    let mut tile_id = request
+        .parent_tile_id
+        .clone()
+        .ok_or_else(|| "Context mode requires a parent tile".to_string())?;
+    let mut model_id = request
+        .parent_model_id
+        .clone()
+        .ok_or_else(|| "Context mode requires a parent model".to_string())?;
+    let mut visited = HashSet::new();
+    let mut turns = Vec::new();
+
+    loop {
+        let visit_key = format!("{}::{}", tile_id, model_id);
+        if !visited.insert(visit_key) {
+            return Err("Detected a cycle while reconstructing canvas history".to_string());
+        }
+
+        let tile = session
+            .prompt_tiles
+            .iter()
+            .find(|t| t.id == tile_id)
+            .ok_or_else(|| format!("Parent tile not found in session: {}", tile_id))?;
+        tile.validate_twin_relationship_context(Some(&request.twin_relationship_variant))?;
+        let response = tile.responses.get(&model_id).ok_or_else(|| {
+            format!(
+                "Parent response not found for tile {} and model {}",
+                tile_id, model_id
+            )
+        })?;
+        if response.status != ResponseStatus::Completed {
+            return Err(format!(
+                "Parent response must be completed for tile {} and model {}",
+                tile_id, model_id
+            ));
+        }
+        if response.content.trim().is_empty() {
+            return Err(format!(
+                "Parent response must contain non-empty content for tile {} and model {}",
+                tile_id, model_id
+            ));
+        }
+
+        turns.push(ConversationTurn {
+            prompt: tile.prompt.clone(),
+            response: response.content.clone(),
+            model_id: model_id.clone(),
+        });
+
+        match (&tile.parent_tile_id, &tile.parent_model_id) {
+            (Some(next_tile_id), Some(next_model_id)) => {
+                tile_id = next_tile_id.clone();
+                model_id = next_model_id.clone();
+            }
+            (None, None) => break,
+            _ => {
+                return Err(format!(
+                    "Incomplete parent linkage for tile {} while reconstructing history",
+                    tile.id
+                ))
+            }
         }
     }
-    context_notes
+
+    turns.reverse();
+    Ok(turns)
 }
 
 /// Build a system prompt that includes retrieved note context.
@@ -886,9 +926,11 @@ fn build_twin_prediction_user_message(
 /// provider, then re-lock to attach.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn run_sealed_twin_prediction(
+    root_state: AppState,
+    root_epoch: crate::services::vault_namespace::VaultAuthorityTokenV1,
     twin_store: Arc<RwLock<TwinStore>>,
     openrouter: Arc<RwLock<OpenRouterService>>,
-    ollama: Arc<RwLock<OllamaService>>,
+    ollama: Option<Arc<RwLock<OllamaService>>>,
     provider_route: ModelProviderRoute,
     prediction_model: String,
     episode_id: String,
@@ -900,28 +942,43 @@ pub(super) async fn run_sealed_twin_prediction(
     context_version: String,
     decision_metadata: Option<DecisionPromptMetadata>,
 ) {
-    let built = {
+    let initial_root_guard = match crate::commands::acquire_expected_derived_root_epoch(
+        &root_state,
+        &root_epoch,
+    )
+    .await
+    {
+        Ok(guard) => guard,
+        Err(error) => {
+            log::warn!("Sealed prediction abandoned after root transition: {error}");
+            fail_requested_prediction_if_same_root(
+                &root_state,
+                &twin_store,
+                &episode_id,
+                &root_epoch,
+                "initial authority validation",
+            )
+            .await;
+            return;
+        }
+    };
+    let built: Result<(String, String), String> = {
         let mut store = twin_store.write().await;
-        let setup = match store.get_constitution_setup() {
-            Ok(setup) => setup,
-            Err(error) => {
-                log::warn!("Sealed prediction setup load failed for {episode_id}: {error}");
-                let _ = store.mark_twin_prediction_failed(&episode_id);
-                return;
-            }
-        };
+        (|| {
+            let setup = store
+                .get_constitution_setup()
+                .map_err(|error| format!("sealed prediction setup load failed: {error}"))?;
 
-        let system_prompt = if let Some(prompt) = twin_context_prompt {
-            prompt
-        } else {
-            // Non-Twin-context decision tile: build a twin-only context on
-            // the spot so predictions cover every decision, not just
-            // Twin-mode ones (skipping them would bias the eval sample).
-            let query = decision_context_query(&prompt, decision_metadata.as_ref());
-            let selections =
-                store
+            let system_prompt = if let Some(prompt) = twin_context_prompt {
+                prompt
+            } else {
+                // Non-Twin-context decision tile: build a twin-only context on
+                // the spot so predictions cover every decision, not just
+                // Twin-mode ones (skipping them would bias the eval sample).
+                let query = decision_context_query(&prompt, decision_metadata.as_ref());
+                let (approved, constitution_items, action_gaps, cases) = store
                     .select_context_records(&prompt)
-                    .and_then(|(approved, candidates)| {
+                    .and_then(|(approved, _)| {
                         let (constitution_items, action_gaps) =
                             store.select_constitution_context(&query)?;
                         let cases = store.select_decision_cases(
@@ -929,50 +986,73 @@ pub(super) async fn run_sealed_twin_prediction(
                             Some(&episode_id),
                             MAX_TWIN_CASE_CONTEXT,
                         )?;
-                        Ok((approved, candidates, constitution_items, action_gaps, cases))
-                    });
-            match selections {
-                Ok((approved, candidates, constitution_items, action_gaps, cases)) => {
-                    let selection = apply_twin_context_budget(
-                        cases,
-                        constitution_items,
-                        approved,
-                        candidates,
-                        action_gaps,
-                        Vec::new(),
-                        TWIN_CONTEXT_TOKEN_BUDGET,
-                    );
-                    let answer_mode = if has_twin_identity(&setup) {
-                        TwinAnswerMode::Simulation
-                    } else {
-                        TwinAnswerMode::Advisor
-                    };
-                    build_twin_context_prompt(
-                        &setup,
-                        &selection.cases,
-                        &selection.notes,
-                        &selection.approved,
-                        &selection.candidates,
-                        &selection.constitution_items,
-                        &selection.action_gaps,
-                        &answer_mode,
-                        &PromptType::Decision,
-                        decision_metadata.as_ref(),
-                    )
-                }
-                Err(error) => {
-                    log::warn!("Sealed prediction context build failed for {episode_id}: {error}");
-                    let _ = store.mark_twin_prediction_failed(&episode_id);
-                    return;
-                }
-            }
-        };
+                        Ok((approved, constitution_items, action_gaps, cases))
+                    })
+                    .map_err(|error| format!("sealed prediction context build failed: {error}"))?;
+                let selection = apply_twin_context_budget(
+                    cases,
+                    constitution_items,
+                    approved
+                        .into_iter()
+                        .filter(is_model_authoritative_twin_record)
+                        .collect(),
+                    Vec::new(),
+                    action_gaps,
+                    Vec::new(),
+                    TWIN_CONTEXT_TOKEN_BUDGET,
+                );
+                let answer_mode = if has_twin_identity(&setup) {
+                    TwinAnswerMode::Simulation
+                } else {
+                    TwinAnswerMode::Advisor
+                };
+                build_twin_context_prompt(
+                    &setup,
+                    &selection.cases,
+                    &selection.notes,
+                    &selection.approved,
+                    &selection.candidates,
+                    &selection.constitution_items,
+                    &selection.action_gaps,
+                    &answer_mode,
+                    &PromptType::Decision,
+                    decision_metadata.as_ref(),
+                )
+            };
 
-        let user_message =
-            build_twin_prediction_user_message(&setup, &decision, &options, stakes.as_deref());
-        (system_prompt, user_message)
+            let user_message =
+                build_twin_prediction_user_message(&setup, &decision, &options, stakes.as_deref());
+            Ok((system_prompt, user_message))
+        })()
     };
-    let (system_prompt, user_message) = built;
+    let (system_prompt, user_message) = match built {
+        Ok(built) => built,
+        Err(error) => {
+            log::warn!("Sealed prediction input failed for {episode_id}: {error}");
+            drop(initial_root_guard);
+            fail_requested_prediction_if_same_root(
+                &root_state,
+                &twin_store,
+                &episode_id,
+                &root_epoch,
+                "input construction",
+            )
+            .await;
+            return;
+        }
+    };
+    if let Err(error) = initial_root_guard.finish(&root_state).await {
+        log::warn!("Sealed prediction context discarded after authority change: {error}");
+        fail_requested_prediction_if_same_root(
+            &root_state,
+            &twin_store,
+            &episode_id,
+            &root_epoch,
+            "post-context authority validation",
+        )
+        .await;
+        return;
+    }
 
     let messages = vec![ChatMessage {
         role: "user".to_string(),
@@ -980,10 +1060,16 @@ pub(super) async fn run_sealed_twin_prediction(
     }];
     let result = match provider_route {
         ModelProviderRoute::Ollama => {
-            let ollama = ollama.read().await;
-            ollama
-                .chat(&prediction_model, messages, Some(&system_prompt), Some(0.2))
-                .await
+            if let Some(ollama) = ollama {
+                let ollama = ollama.read().await;
+                ollama
+                    .chat(&prediction_model, messages, Some(&system_prompt), Some(0.2))
+                    .await
+            } else {
+                Err(anyhow::anyhow!(
+                    "Local Ollama is unavailable on this runtime"
+                ))
+            }
         }
         ModelProviderRoute::OpenRouter => {
             let openrouter = openrouter.read().await;
@@ -1002,25 +1088,111 @@ pub(super) async fn run_sealed_twin_prediction(
         }
     };
 
+    let root_guard =
+        match crate::commands::acquire_expected_root_epoch(&root_state, &root_epoch).await {
+            Ok(guard) => guard,
+            Err(error) => {
+                log::warn!("Sealed prediction result discarded after root transition: {error}");
+                fail_requested_prediction_if_same_root(
+                    &root_state,
+                    &twin_store,
+                    &episode_id,
+                    &root_epoch,
+                    "post-network authority validation",
+                )
+                .await;
+                return;
+            }
+        };
     match result {
         Ok(raw) => {
             let draft = parse_twin_prediction(&raw, &options);
             let mut store = twin_store.write().await;
-            if let Err(error) = store.attach_twin_prediction(
+            let commit = match store.attach_twin_prediction_expecting_authority(
                 &episode_id,
                 draft,
                 &prediction_model,
                 &context_version,
+                root_epoch.clone(),
             ) {
-                log::warn!("Failed to seal twin prediction for {episode_id}: {error}");
+                Ok((_, commit)) => commit,
+                Err(error) => {
+                    let error = preserve_canvas_mutation_error(error);
+                    log::warn!("Failed to seal twin prediction for {episode_id}: {error}");
+                    drop(store);
+                    drop(root_guard);
+                    let repair = repair_canvas_trace_error(
+                        &root_state,
+                        &error,
+                        "sealed prediction persistence",
+                    )
+                    .await;
+                    let failed_epoch = match &repair {
+                        crate::commands::PostAuthorityRepair::Ready(epoch) => epoch.clone(),
+                        _ => error
+                            .repair_commit()
+                            .and_then(|commit| commit.authority_token.clone())
+                            .unwrap_or_else(|| root_epoch.clone()),
+                    };
+                    crate::commands::acknowledge_reported_repair(repair);
+                    fail_requested_prediction_if_same_root(
+                        &root_state,
+                        &twin_store,
+                        &episode_id,
+                        &failed_epoch,
+                        "prediction persistence",
+                    )
+                    .await;
+                    return;
+                }
+            };
+            if commit.authority_token.is_none() {
+                drop(store);
+                drop(root_guard);
+                fail_requested_prediction_if_same_root(
+                    &root_state,
+                    &twin_store,
+                    &episode_id,
+                    &root_epoch,
+                    "prediction persistence without terminal authority",
+                )
+                .await;
+                return;
+            }
+            drop(store);
+            drop(root_guard);
+            if let crate::commands::PostAuthorityRepair::Unavailable(error) =
+                crate::commands::repair_after_authority_mutation(
+                    &root_state,
+                    &commit,
+                    "sealed prediction",
+                )
+                .await
+            {
+                // The sealed state is already durable; the repair seam leaves
+                // derived state unavailable without inviting a duplicate write.
+                log::warn!("Failed to publish sealed prediction authority: {error}");
             }
         }
         Err(error) => {
             log::warn!("Sealed twin prediction call failed for {episode_id}: {error}");
-            let mut store = twin_store.write().await;
-            let _ = store.mark_twin_prediction_failed(&episode_id);
+            drop(root_guard);
+            fail_requested_prediction_if_same_root(
+                &root_state,
+                &twin_store,
+                &episode_id,
+                &root_epoch,
+                "provider failure",
+            )
+            .await;
         }
     }
+}
+
+fn is_model_authoritative_twin_record(record: &TwinContextRecord) -> bool {
+    record.promotion_state == crate::models::twin::PromotionState::Endorsed
+        && (record.kind != crate::models::twin::UserRecordKind::Preference
+            || record.source_label.as_deref() == Some("governed_projection"))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1029,13 +1201,17 @@ fn build_twin_context_prompt(
     decision_cases: &[DecisionEpisode],
     notes: &[(String, String, String)],
     approved_records: &[TwinContextRecord],
-    candidate_records: &[TwinContextRecord],
+    _candidate_records: &[TwinContextRecord],
     constitution_items: &[ConstitutionItem],
     action_gaps: &[ActionGap],
     answer_mode: &TwinAnswerMode,
     prompt_type: &PromptType,
     decision_metadata: Option<&DecisionPromptMetadata>,
 ) -> String {
+    let approved_records = approved_records
+        .iter()
+        .filter(|record| is_model_authoritative_twin_record(record))
+        .collect::<Vec<_>>();
     let mut prompt = String::from(
         "## Twin Operating Contract\n\n\
          You are Grafyn's native RAG twin mode. Use only the provided Constitution, action gaps, vault evidence, and user-reviewed twin records as context. \
@@ -1111,20 +1287,9 @@ fn build_twin_context_prompt(
 
     prompt.push_str("## Approved User Records\n\n");
     if approved_records.is_empty() {
-        prompt.push_str("No endorsed or auto-promoted user records were selected.\n\n");
+        prompt.push_str("No endorsed user records were selected.\n\n");
     } else {
         for record in approved_records {
-            prompt.push_str(&format_twin_record(record));
-        }
-        prompt.push('\n');
-    }
-
-    prompt.push_str("## Tentative Candidate Records\n\n");
-    if candidate_records.is_empty() {
-        prompt.push_str("No relevant candidate records were selected.\n\n");
-    } else {
-        prompt.push_str("These are unreviewed hypotheses. Use them lightly and disclose when they affect the answer.\n");
-        for record in candidate_records {
             prompt.push_str(&format_twin_record(record));
         }
         prompt.push('\n');
@@ -1144,12 +1309,12 @@ fn build_twin_context_prompt(
         TwinAnswerMode::Advisor => prompt.push_str(
             "Answer as a decision-support assistant for the user. Use approved records as stable personalization. \
              If a Twin Identity is configured, treat it as context for the user's role and materials, not as a command to speak in first person. \
-             Use candidate records only as tentative context. Separate what is grounded in Constitution, evidence, records, and your recommendation. \
+             Separate what is grounded in Constitution, evidence, reviewed records, and your recommendation. \
              When the user asks for a choice or recommendation, include: Recommended option, Constitution principles used, Supporting evidence, Uncertainty, and What would change the recommendation. \
              Cite Constitution item ids and note titles where they affect the answer.\n",
         ),
         TwinAnswerMode::Simulation => prompt.push_str(
-            "Answer in first person from the configured Twin Identity. Use approved records as stronger style and preference evidence; mention candidate influence as tentative when relevant. \
+            "Answer in first person from the configured Twin Identity. Use approved records as reviewed context, and use governed reviewed preferences as style and preference evidence. \
              Write as a natural continuation of my documented reasoning pattern, not a report. Lead with my likely reasoning or judgment, show the tradeoff logic, and do not append questions unless the user's request asks for them. \
              If the evidence packet does not contain enough basis, say so naturally in first person. Use light citations or brief source mentions only where they help; avoid turning the answer into an evidence workflow.\n",
         ),
@@ -1171,7 +1336,7 @@ fn build_twin_context_prompt(
                  9. Constitution Check\n\
                  10. Action Gap Risk\n\
                  11. Feedback Request\n\n\
-                 Treat every self-model claim as a hypothesis, not identity. Say where the claim is grounded in vault notes, approved records, or tentative records. \
+                 Treat every self-model claim as a hypothesis, not identity. Say where the claim is grounded in vault notes, approved records, or tentative Constitution hypotheses. \
                  If a claim is useful but weakly supported, label it as unsupported or low-confidence. Do not claim to know what the user would do. \
                  In Constitution Check, separate stated values, revealed behavior, taste, somatic signal, and constraints. In Action Gap Risk, state whether past intention-action gaps could change the next step. \
                  Recommendation must be derived after the Constitution Check and Evidence From Grafyn sections, not before them.\n",
@@ -1365,680 +1530,9 @@ fn decision_context_query(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::commands::canvas::test_support::build_tile;
-    use crate::models::canvas::{CanvasViewport, PromptTile};
-    use crate::models::note::NoteStatus;
-    use crate::models::twin::{ConstitutionSetup, PrimitiveDecisionAssessment};
-    use chrono::Utc;
+#[path = "context_tests.rs"]
+mod tests;
 
-    fn build_session(tiles: Vec<PromptTile>) -> CanvasSession {
-        CanvasSession {
-            id: "session-1".to_string(),
-            title: "Canvas".to_string(),
-            description: None,
-            prompt_tiles: tiles,
-            debates: Vec::new(),
-            viewport: CanvasViewport::default(),
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-            tags: Vec::new(),
-            status: "draft".to_string(),
-            pinned_note_ids: Vec::new(),
-            working_memory: crate::models::canvas::CanvasWorkingMemory::default(),
-            branch_memories: std::collections::HashMap::new(),
-        }
-    }
-
-    #[allow(dead_code)]
-    fn build_request(
-        prompt: &str,
-        parent_tile_id: &str,
-        parent_model_id: &str,
-        context_mode: ContextMode,
-    ) -> PromptRequest {
-        PromptRequest {
-            prompt: prompt.to_string(),
-            prompt_type: PromptType::Standard,
-            system_prompt: None,
-            models: vec!["openai/gpt-4".to_string()],
-            position: None,
-            context_mode,
-            twin_answer_mode: TwinAnswerMode::default(),
-            twin_context_policy: None,
-            twin_llm_provider: None,
-            decision_metadata: None,
-            parent_tile_id: Some(parent_tile_id.to_string()),
-            parent_model_id: Some(parent_model_id.to_string()),
-            parent_debate_id: None,
-            temperature: 0.7,
-            max_tokens: None,
-            web_search: false,
-            web_search_max_results: 5,
-            reasoning_effort: "none".to_string(),
-        }
-    }
-
-    fn build_root_request(prompt: &str, context_mode: ContextMode) -> PromptRequest {
-        PromptRequest {
-            prompt: prompt.to_string(),
-            prompt_type: PromptType::Standard,
-            system_prompt: None,
-            models: vec!["openai/gpt-4".to_string()],
-            position: None,
-            context_mode,
-            twin_answer_mode: TwinAnswerMode::default(),
-            twin_context_policy: None,
-            twin_llm_provider: None,
-            decision_metadata: None,
-            parent_tile_id: None,
-            parent_model_id: None,
-            parent_debate_id: None,
-            temperature: 0.7,
-            max_tokens: None,
-            web_search: false,
-            web_search_max_results: 5,
-            reasoning_effort: "none".to_string(),
-        }
-    }
-
-    fn build_retrieval_result(
-        id: &str,
-        title: &str,
-        snippet: &str,
-        score: f32,
-        reasons: &[&str],
-    ) -> RetrievalResult {
-        RetrievalResult {
-            note: crate::models::note::NoteMeta {
-                id: id.to_string(),
-                title: title.to_string(),
-                relative_path: format!("{}.md", id),
-                aliases: Vec::new(),
-                status: NoteStatus::default(),
-                tags: Vec::new(),
-                created_at: Utc::now(),
-                updated_at: Utc::now(),
-                schema_version: crate::models::note::CURRENT_NOTE_SCHEMA_VERSION,
-                migration_source: None,
-                optimizer_managed: false,
-            },
-            score,
-            snippet: snippet.to_string(),
-            relevance_reasons: reasons.iter().map(|reason| reason.to_string()).collect(),
-        }
-    }
-
-    fn build_constitution_item(
-        id: &str,
-        claim: &str,
-        status: crate::models::twin::ConstitutionStatus,
-        source_type: &str,
-    ) -> ConstitutionItem {
-        ConstitutionItem {
-            id: id.to_string(),
-            claim: claim.to_string(),
-            dimension: "values".to_string(),
-            scope: vec!["general".to_string()],
-            priority: 0.8,
-            confidence: 0.82,
-            status,
-            evidence_refs: vec![crate::models::twin::EvidenceRef {
-                trace_id: format!("trace-{}", id),
-                event_id: format!("event-{}", id),
-                session_id: "session-1".to_string(),
-                tile_id: None,
-                model_id: None,
-                note: Some("Evidence note".to_string()),
-                source_type: Some(source_type.to_string()),
-                source_id: Some(format!("source-{}", id)),
-                source_label: Some("Interview question".to_string()),
-                excerpt: Some("Can you give a concrete example?".to_string()),
-                speaker_role: Some("user".to_string()),
-            }],
-            tensions: Vec::new(),
-            linked_record_ids: Vec::new(),
-            source: Some("interview_behavior_inference".to_string()),
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-        }
-    }
-
-    fn build_action_gap(id: &str) -> ActionGap {
-        ActionGap {
-            id: id.to_string(),
-            stated_value: "Protect mission alignment".to_string(),
-            revealed_behavior: "Accepts attractive adjacent projects".to_string(),
-            driver_hypothesis: Some("Funding pressure".to_string()),
-            somatic_taste_signal: Some("Prestige pull".to_string()),
-            decision_risk: "May divert faculty from core mission work".to_string(),
-            evidence_refs: Vec::new(),
-            linked_record_ids: Vec::new(),
-            confidence: 0.72,
-            status: crate::models::twin::ConstitutionStatus::Active,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-        }
-    }
-
-    fn test_twin_identity_setup() -> ConstitutionSetup {
-        ConstitutionSetup {
-            twin_name: Some("Alex Chen".into()),
-            twin_role: Some("founder deciding from product evidence".into()),
-            source_boundaries: vec!["Use reviewed notes and uploaded interviews only.".into()],
-            ..ConstitutionSetup::default()
-        }
-    }
-
-    #[test]
-    fn test_build_note_context_prompt_with_notes() {
-        let notes = vec![
-            ("id1".into(), "Note A".into(), "Content of A".into()),
-            ("id2".into(), "Note B".into(), "Content of B".into()),
-        ];
-        let prompt = build_note_context_prompt(&notes);
-
-        assert!(prompt.contains("Note A"));
-        assert!(prompt.contains("Content of A"));
-        assert!(prompt.contains("Note B"));
-        assert!(prompt.contains("id: id1"));
-    }
-
-    #[test]
-    fn test_build_note_context_prompt_empty() {
-        let notes: Vec<(String, String, String)> = vec![];
-        let prompt = build_note_context_prompt(&notes);
-
-        assert!(prompt.contains("No relevant notes were found"));
-    }
-
-    #[test]
-    fn test_build_chunk_context_prompt_groups_by_parent() {
-        let chunks = vec![
-            ChunkResult {
-                chunk_id: "c1".into(),
-                parent_note_id: "note-a".into(),
-                parent_title: "Note A".into(),
-                text: "First paragraph of A".into(),
-                start_char: 0,
-                end_char: 20,
-                depth_score: 1.0,
-                search_score: 5.0,
-                token_estimate: 10,
-            },
-            ChunkResult {
-                chunk_id: "c2".into(),
-                parent_note_id: "note-b".into(),
-                parent_title: "Note B".into(),
-                text: "Content of B".into(),
-                start_char: 0,
-                end_char: 12,
-                depth_score: 1.0,
-                search_score: 4.0,
-                token_estimate: 8,
-            },
-            ChunkResult {
-                chunk_id: "c3".into(),
-                parent_note_id: "note-a".into(),
-                parent_title: "Note A".into(),
-                text: "Second paragraph of A".into(),
-                start_char: 21,
-                end_char: 42,
-                depth_score: 0.5,
-                search_score: 3.5,
-                token_estimate: 10,
-            },
-        ];
-        let prompt = build_chunk_context_prompt(&chunks);
-
-        // Both chunks from Note A should be under the same heading
-        assert!(prompt.contains("### Note A (id: note-a)"));
-        assert!(prompt.contains("First paragraph of A"));
-        assert!(prompt.contains("Second paragraph of A"));
-        assert!(prompt.contains("### Note B (id: note-b)"));
-        assert!(prompt.contains("Content of B"));
-        // Note A should appear before Note B (insertion order from chunks)
-        let a_pos = prompt.find("Note A").unwrap();
-        let b_pos = prompt.find("Note B").unwrap();
-        assert!(a_pos < b_pos);
-    }
-
-    #[test]
-    fn test_build_chunk_context_prompt_empty() {
-        let chunks: Vec<ChunkResult> = vec![];
-        let prompt = build_chunk_context_prompt(&chunks);
-        assert!(prompt.contains("No relevant notes were found"));
-    }
-
-    #[test]
-    fn twin_context_prompt_separates_approved_candidates_and_advisor_instructions() {
-        let approved = vec![TwinContextRecord {
-            id: "record-approved".into(),
-            kind: crate::models::twin::UserRecordKind::Preference,
-            content: "User prefers evidence-backed implementation detail.".into(),
-            confidence: 0.9,
-            promotion_state: crate::models::twin::PromotionState::Endorsed,
-            evidence_count: 4,
-            source_label: Some("approved".into()),
-        }];
-        let candidates = vec![TwinContextRecord {
-            id: "record-candidate".into(),
-            kind: crate::models::twin::UserRecordKind::ReasoningPattern,
-            content: "User may prefer red-team critique before shipping.".into(),
-            confidence: 0.62,
-            promotion_state: crate::models::twin::PromotionState::Candidate,
-            evidence_count: 1,
-            source_label: Some("candidate".into()),
-        }];
-        let constitution = vec![
-            build_constitution_item(
-                "constitution-active",
-                "Prefer mission alignment before opportunistic funding.",
-                crate::models::twin::ConstitutionStatus::Active,
-                "interview-question",
-            ),
-            build_constitution_item(
-                "constitution-candidate",
-                "May prefer negotiation before rejection.",
-                crate::models::twin::ConstitutionStatus::Candidate,
-                "behavior",
-            ),
-            build_constitution_item(
-                "constitution-rejected",
-                "Rejected claims must not leak.",
-                crate::models::twin::ConstitutionStatus::Rejected,
-                "note",
-            ),
-            build_constitution_item(
-                "constitution-not-me",
-                "Not-me claims must not leak.",
-                crate::models::twin::ConstitutionStatus::NotMe,
-                "note",
-            ),
-            build_constitution_item(
-                "constitution-no-train",
-                "No-train claims must not leak.",
-                crate::models::twin::ConstitutionStatus::NoTrain,
-                "note",
-            ),
-        ];
-        let gaps = vec![build_action_gap("gap-1")];
-
-        let prompt = build_twin_context_prompt(
-            &ConstitutionSetup::default(),
-            &[],
-            &[(
-                "note-1".into(),
-                "Decision Notes".into(),
-                "### Message 2: Interviewee\nExpert says accept grants when partnerships are strategic.".into(),
-            )],
-            &approved,
-            &candidates,
-            &constitution,
-            &gaps,
-            &TwinAnswerMode::Advisor,
-            &PromptType::Standard,
-            None,
-        );
-
-        assert!(prompt.contains("## Twin Operating Contract"));
-        assert!(prompt.contains("## Reviewed Constitution"));
-        assert!(prompt.contains("Prefer mission alignment before opportunistic funding."));
-        assert!(prompt.contains("Interview question"));
-        assert!(prompt.contains("## Action Gap Risks"));
-        assert!(prompt.contains("May divert faculty from core mission work"));
-        assert!(prompt.contains("## Relevant Evidence"));
-        assert!(prompt.contains("Expert says accept grants when partnerships are strategic."));
-        assert!(prompt.contains("## Approved User Records"));
-        assert!(prompt.contains("## Tentative Candidate Records"));
-        assert!(prompt.contains("Candidate Constitution Hypotheses"));
-        assert!(prompt.contains("May prefer negotiation before rejection."));
-        assert!(!prompt.contains("Rejected claims must not leak."));
-        assert!(!prompt.contains("Not-me claims must not leak."));
-        assert!(!prompt.contains("No-train claims must not leak."));
-        assert!(prompt.contains("Use interviewee answers as evidence about the interviewee"));
-        assert!(prompt.contains("Do not use evidence to justify a preselected answer"));
-        assert!(prompt.contains("Recommended option"));
-        assert!(prompt.contains("decision-support assistant"));
-    }
-
-    #[test]
-    fn twin_context_prompt_labels_simulation_mode() {
-        let setup = test_twin_identity_setup();
-        let prompt = build_twin_context_prompt(
-            &setup,
-            &[],
-            &[],
-            &[],
-            &[],
-            &[],
-            &[],
-            &TwinAnswerMode::Simulation,
-            &PromptType::Standard,
-            None,
-        );
-
-        assert!(prompt.contains("## Twin Identity"));
-        assert!(prompt.contains("I am Alex Chen."));
-        assert!(prompt.contains("My role/context is founder deciding from product evidence."));
-        assert!(prompt.contains("Use reviewed notes and uploaded interviews only."));
-        assert!(prompt.contains("Continue my documented reasoning pattern"));
-        assert!(prompt.contains("do not append questions unless the user's request asks for them"));
-        assert!(!prompt.contains("reflective questions"));
-        assert!(!prompt.contains("next question"));
-        assert!(!prompt.contains("not the user's actual view"));
-        assert!(prompt.contains("## Reviewed Constitution"));
-    }
-
-    #[test]
-    fn twin_context_prompt_rejects_simulation_without_identity() {
-        let setup = ConstitutionSetup::default();
-
-        let result = validate_twin_identity_for_answer_mode(&setup, &TwinAnswerMode::Simulation);
-
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .contains("Twin Identity requires Name and Role / context"));
-    }
-
-    #[test]
-    fn decision_advisor_prompt_uses_reflection_card_structure() {
-        let metadata = DecisionPromptMetadata {
-            decision: "Should Grafyn build Decision Mirror first?".into(),
-            options: vec!["Decision Mirror".into(), "Topology layer".into()],
-            stakes: Some("Product direction".into()),
-            initial_leaning: Some("Decision Mirror first".into()),
-            review_date: Some("2026-05-15".into()),
-        };
-
-        let prompt = build_twin_context_prompt(
-            &ConstitutionSetup::default(),
-            &[],
-            &[],
-            &[],
-            &[],
-            &[],
-            &[],
-            &TwinAnswerMode::Advisor,
-            &PromptType::Decision,
-            Some(&metadata),
-        );
-
-        assert!(prompt.contains("Decision Mirror session"));
-        assert!(prompt.contains("Reflection Card"));
-        assert!(prompt.contains("Blind Spot Hypothesis"));
-        assert!(prompt.contains("Recommendation must be derived after the Constitution Check and Evidence From Grafyn sections"));
-        assert!(prompt.contains("Decision: Should Grafyn build Decision Mirror first?"));
-        assert!(prompt.contains("Topology layer"));
-    }
-
-    #[test]
-    fn decision_simulation_prompt_uses_base_simulation_without_decision_style_block() {
-        let metadata = DecisionPromptMetadata {
-            decision: "Should Grafyn build Decision Mirror first?".into(),
-            options: vec!["Decision Mirror".into(), "Topology layer".into()],
-            stakes: Some("Product direction".into()),
-            initial_leaning: Some("Decision Mirror first".into()),
-            review_date: Some("2026-05-15".into()),
-        };
-
-        let prompt = build_twin_context_prompt(
-            &test_twin_identity_setup(),
-            &[],
-            &[],
-            &[],
-            &[],
-            &[],
-            &[],
-            &TwinAnswerMode::Simulation,
-            &PromptType::Decision,
-            Some(&metadata),
-        );
-
-        assert!(!prompt.contains("Reflection Card"));
-        assert!(!prompt.contains("Evidence From Grafyn"));
-        assert!(!prompt.contains("Blind Spot Hypothesis"));
-        assert!(!prompt.contains("Decision Mirror Simulation Style"));
-        assert!(!prompt.contains("Decision Mirror simulation session"));
-        assert!(!prompt.contains("natural first-person reflection"));
-        assert!(!prompt.contains("numbered headings"));
-        assert!(prompt.contains("do not append questions unless the user's request asks for them"));
-        assert!(!prompt.contains("not the user's actual view"));
-        assert!(prompt.contains("Decision: Should Grafyn build Decision Mirror first?"));
-    }
-
-    fn test_decision_case(
-        id: &str,
-        decision: &str,
-        lesson: Option<&str>,
-        note: Option<&str>,
-    ) -> DecisionEpisode {
-        let now = Utc::now();
-        DecisionEpisode {
-            id: id.to_string(),
-            session_id: "session-1".to_string(),
-            tile_id: format!("tile-{id}"),
-            decision: decision.to_string(),
-            options: vec!["Ship now".to_string(), "Wait a sprint".to_string()],
-            stakes: None,
-            initial_leaning: Some("Ship now".to_string()),
-            selected_response: None,
-            chosen_option: Some("Wait a sprint".to_string()),
-            confidence: None,
-            review_date: None,
-            outcome: None,
-            regret_score: None,
-            lesson: lesson.map(|text| text.to_string()),
-            missed_something: None,
-            primitive_assessment: PrimitiveDecisionAssessment::default(),
-            twin_prediction: None,
-            prediction_status: None,
-            agreement: None,
-            correction_note: note.map(|text| text.to_string()),
-            context_version: None,
-            outcome_recorded_at: None,
-            created_at: now,
-            updated_at: now,
-        }
-    }
-
-    #[test]
-    fn twin_context_prompt_renders_past_decision_cases_verbatim() {
-        let case = test_decision_case(
-            "case-1",
-            "Ship the importer before polish?",
-            Some("I always regret shipping before the empty states are done."),
-            Some("Twin assumed I optimize for speed; I optimize for trust."),
-        );
-
-        let prompt = build_twin_context_prompt(
-            &ConstitutionSetup::default(),
-            &[case],
-            &[],
-            &[],
-            &[],
-            &[],
-            &[],
-            &TwinAnswerMode::Advisor,
-            &PromptType::Standard,
-            None,
-        );
-
-        assert!(prompt.contains("## Past Decision Cases"));
-        assert!(prompt.contains("Past decision: Ship the importer before polish?"));
-        assert!(prompt.contains("Options: Ship now | Wait a sprint"));
-        assert!(prompt.contains("Chose: Wait a sprint"));
-        assert!(prompt.contains("I always regret shipping before the empty states are done."));
-        assert!(prompt.contains("Twin assumed I optimize for speed; I optimize for trust."));
-        assert!(prompt.contains("Weight them above abstracted records"));
-    }
-
-    #[test]
-    fn twin_context_budget_keeps_cases_and_drops_notes_when_tight() {
-        let case = test_decision_case("case-1", "Ship the importer before polish?", None, None);
-        let big_note = (
-            "note-1".to_string(),
-            "Big note".to_string(),
-            "evidence ".repeat(400),
-        );
-
-        let selection = apply_twin_context_budget(
-            vec![case],
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            vec![big_note],
-            60,
-        );
-
-        assert_eq!(selection.cases.len(), 1);
-        assert!(selection.notes.is_empty());
-    }
-
-    #[test]
-    fn sealed_prediction_prompt_is_immersed_with_identity_and_never_meta_framed() {
-        let setup = test_twin_identity_setup();
-        let options = vec!["Ship now".to_string(), "Wait a sprint".to_string()];
-        let user_message = build_twin_prediction_user_message(
-            &setup,
-            "Ship the importer before polish?",
-            &options,
-            Some("Launch trust"),
-        );
-        let system_prompt = build_twin_context_prompt(
-            &setup,
-            &[],
-            &[],
-            &[],
-            &[],
-            &[],
-            &[],
-            &TwinAnswerMode::Simulation,
-            &PromptType::Decision,
-            None,
-        );
-
-        assert!(user_message.contains("I am Alex Chen."));
-        assert!(user_message.contains("Which option do I choose?"));
-        assert!(user_message.contains("1. Ship now"));
-        assert!(user_message.contains("2. Wait a sprint"));
-        assert!(user_message.contains("predicted_option"));
-
-        // The full model-facing prompt must never meta-frame the twin.
-        let full_prompt = format!("{system_prompt}\n{user_message}").to_lowercase();
-        for forbidden in [
-            "simulate",
-            "roleplay",
-            "role-play",
-            "predict what the user",
-            "what would the user",
-            "pretend to be",
-        ] {
-            assert!(
-                !full_prompt.contains(forbidden),
-                "model-facing prompt contains forbidden meta-framing: {forbidden}"
-            );
-        }
-    }
-
-    #[test]
-    fn sealed_prediction_prompt_uses_advisor_framing_without_identity() {
-        let options = vec!["Ship now".to_string(), "Wait a sprint".to_string()];
-        let user_message = build_twin_prediction_user_message(
-            &ConstitutionSetup::default(),
-            "Ship the importer before polish?",
-            &options,
-            None,
-        );
-
-        assert!(!user_message.contains("I am "));
-        assert!(user_message.contains("best fits this decision-maker's"));
-        assert!(user_message.contains("predicted_option"));
-    }
-
-    #[test]
-    fn test_root_prompt_without_parent_ids_ignores_unrelated_canvas_tiles() {
-        let session = build_session(vec![
-            build_tile(
-                "tile-1",
-                "Unrelated root prompt",
-                "openai/gpt-4",
-                "Unrelated root response",
-                None,
-                None,
-            ),
-            build_tile(
-                "tile-2",
-                "Unrelated branch prompt",
-                "openai/gpt-4",
-                "Unrelated branch response",
-                Some("tile-1"),
-                Some("openai/gpt-4"),
-            ),
-        ]);
-        let request = build_root_request("Fresh root prompt", ContextMode::None);
-
-        let messages = build_canvas_messages(&session, &request).unwrap();
-
-        assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].role, "user");
-        assert_eq!(messages[0].content, "Fresh root prompt");
-    }
-
-    #[test]
-    fn test_should_use_retrieved_notes_accepts_relevant_matches() {
-        let results = vec![build_retrieval_result(
-            "note-1",
-            "Mirofish architecture ideas",
-            "A note about robust social media posting architecture.",
-            12.0,
-            &["keyword match"],
-        )];
-
-        let decision = should_use_retrieved_notes(
-            "How can I make the Mirofish social media architecture more robust?",
-            &results,
-        );
-
-        assert_eq!(decision, RetrievalDecisionReason::UseRetrievedNotes);
-    }
-
-    #[test]
-    fn test_should_use_retrieved_notes_rejects_off_topic_matches() {
-        let results = vec![build_retrieval_result(
-            "note-1",
-            "Claude skills overview",
-            "General AI skills and coding workflow tips.",
-            72.0,
-            &["keyword match", "hub (5 backlinks)"],
-        )];
-
-        let decision = should_use_retrieved_notes(
-            "How can I make the Mirofish social media architecture more robust?",
-            &results,
-        );
-
-        assert_eq!(decision, RetrievalDecisionReason::NoLexicalOverlap);
-    }
-
-    #[test]
-    fn test_should_use_retrieved_notes_rejects_graph_only_results() {
-        let results = vec![build_retrieval_result(
-            "note-1",
-            "Mirofish architecture",
-            "A note about robust social media posting architecture.",
-            20.0,
-            &["graph neighbor (1 hop)", "hub (4 backlinks)"],
-        )];
-
-        let decision = should_use_retrieved_notes(
-            "How can I make the Mirofish social media architecture more robust?",
-            &results,
-        );
-
-        assert_eq!(decision, RetrievalDecisionReason::NoKeywordMatch);
-    }
-}
+#[cfg(test)]
+#[path = "context_prediction_tests.rs"]
+mod prediction_tests;

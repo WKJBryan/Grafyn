@@ -1,23 +1,380 @@
 //! Settings service for managing user preferences
 
+use crate::models::runtime::RuntimeKind;
 use crate::models::settings::{SettingsStatus, SettingsUpdate, UserSettings};
-use crate::services::atomic_io::write_atomic;
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+#[cfg(test)]
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 const KEYRING_SERVICE: &str = "com.grafyn.app";
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 const OPENROUTER_KEY_ACCOUNT: &str = "openrouter_api_key";
 
+const LEGACY_TWIN_ASSIGNMENT_KEY: &str = "twin/legacy-assignment-v1.json";
+const LEGACY_TWIN_ASSIGNMENT_STAGING_KEY: &str = "twin/mutations/staging/v1";
+const LEGACY_TWIN_ASSIGNMENT_LIMIT: usize = 4096;
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum LegacyTwinAssignmentState {
+    Prepared,
+    Committed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyTwinAssignmentV1 {
+    schema_version: u16,
+    root_scope: crate::models::twin_event::ContentDigest,
+    lease_epoch_uuid: String,
+    legacy_name: String,
+    current_name: String,
+    state: LegacyTwinAssignmentState,
+}
+
+pub(crate) fn prepare_twin_data_path_locked(
+    data_path: &Path,
+    vault_path: &Path,
+    lease: &crate::services::twin_events::ActiveMarkdownRootLeaseV1,
+    process_lock: &crate::services::twin_events::CoordinatorProcessLock,
+) -> Result<PathBuf> {
+    prepare_twin_data_path_locked_inner(
+        data_path,
+        vault_path,
+        lease,
+        process_lock,
+        &mut || {},
+        &mut || {},
+    )
+}
+
+#[cfg(test)]
+fn prepare_twin_data_path_locked_with_rename_hook(
+    data_path: &Path,
+    vault_path: &Path,
+    lease: &crate::services::twin_events::ActiveMarkdownRootLeaseV1,
+    process_lock: &crate::services::twin_events::CoordinatorProcessLock,
+    mut rename_hook: impl FnMut(),
+) -> Result<PathBuf> {
+    prepare_twin_data_path_locked_inner(
+        data_path,
+        vault_path,
+        lease,
+        process_lock,
+        &mut || {},
+        &mut rename_hook,
+    )
+}
+
+#[cfg(test)]
+fn prepare_twin_data_path_locked_with_marker_install_hook(
+    data_path: &Path,
+    vault_path: &Path,
+    lease: &crate::services::twin_events::ActiveMarkdownRootLeaseV1,
+    process_lock: &crate::services::twin_events::CoordinatorProcessLock,
+    mut marker_install_hook: impl FnMut(),
+) -> Result<PathBuf> {
+    prepare_twin_data_path_locked_inner(
+        data_path,
+        vault_path,
+        lease,
+        process_lock,
+        &mut marker_install_hook,
+        &mut || {},
+    )
+}
+
+fn prepare_twin_data_path_locked_inner(
+    data_path: &Path,
+    vault_path: &Path,
+    lease: &crate::services::twin_events::ActiveMarkdownRootLeaseV1,
+    process_lock: &crate::services::twin_events::CoordinatorProcessLock,
+    marker_install_hook: &mut impl FnMut(),
+    rename_hook: &mut impl FnMut(),
+) -> Result<PathBuf> {
+    crate::services::twin_events::validate_real_directory(data_path, "Grafyn data root")
+        .map_err(anyhow::Error::new)?;
+    crate::services::twin_events::validate_real_directory(vault_path, "Markdown vault root")
+        .map_err(anyhow::Error::new)?;
+    let current = crate::models::settings::twin_data_path_for_scope(data_path, &lease.root_scope);
+    let legacy = crate::models::settings::legacy_twin_data_path_for_vault(data_path, vault_path);
+    let current_name = current
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| anyhow::anyhow!("Twin namespace is not UTF-8"))?;
+    let legacy_name = legacy
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| anyhow::anyhow!("legacy Twin namespace is not UTF-8"))?;
+    let root =
+        crate::services::twin_events::AnchoredRoot::open(data_path).map_err(anyhow::Error::new)?;
+    if !process_lock
+        .covers_data_path(data_path)
+        .map_err(anyhow::Error::new)?
+    {
+        anyhow::bail!("legacy Twin assignment lock belongs to another data root");
+    }
+    let expected_scope = if lease.is_stable() {
+        crate::services::sync::identity::load_vault_identity(vault_path)
+            .map_err(anyhow::Error::new)?
+            .root_scope
+    } else {
+        crate::services::twin_events::root_identity_for_path(vault_path)
+            .map_err(anyhow::Error::new)?
+    };
+    let durable_lease: crate::services::twin_events::ActiveMarkdownRootLeaseV1 =
+        serde_json::from_slice(
+            &root
+                .read_bounded("twin/events/active-markdown-root-v1.json", 4096)
+                .map_err(anyhow::Error::new)?
+                .ok_or_else(|| anyhow::anyhow!("active Markdown root lease is missing"))?,
+        )
+        .context("invalid active Markdown root lease")?;
+    if &durable_lease != lease || lease.root_scope != expected_scope {
+        anyhow::bail!("legacy Twin assignment lease changed");
+    }
+    if lease.is_stable() {
+        std::fs::create_dir_all(&current)?;
+        crate::services::twin_events::validate_real_directory(&current, "Twin namespace")
+            .map_err(anyhow::Error::new)?;
+        return Ok(current);
+    }
+    root.open_directory("twin", true)
+        .map_err(anyhow::Error::new)?;
+    let current_key = format!("twin/{current_name}");
+    let legacy_key = format!("twin/{legacy_name}");
+    let has_current = root
+        .directory_exists(&current_key)
+        .map_err(anyhow::Error::new)?;
+    let has_legacy = root
+        .directory_exists(&legacy_key)
+        .map_err(anyhow::Error::new)?;
+    let assignment = match root
+        .read_bounded(LEGACY_TWIN_ASSIGNMENT_KEY, LEGACY_TWIN_ASSIGNMENT_LIMIT)
+        .map_err(anyhow::Error::new)?
+    {
+        Some(bytes) => Some(
+            serde_json::from_slice::<LegacyTwinAssignmentV1>(&bytes)
+                .context("invalid legacy Twin assignment")?,
+        ),
+        None => None,
+    };
+    if let Some(assignment) = &assignment {
+        let matches_authority = assignment.schema_version == 1
+            && assignment.root_scope == lease.root_scope
+            && assignment.lease_epoch_uuid == lease.epoch_uuid
+            && assignment.legacy_name == legacy_name
+            && assignment.current_name == current_name;
+        if !matches_authority && assignment.state == LegacyTwinAssignmentState::Prepared {
+            anyhow::bail!("prepared legacy Twin assignment belongs to another root authority");
+        }
+        if !matches_authority
+            && (assignment.schema_version != 1
+                || assignment.root_scope != lease.root_scope
+                || assignment.lease_epoch_uuid != lease.epoch_uuid
+                || assignment.legacy_name != legacy_name
+                || assignment.current_name != current_name)
+        {
+            if has_legacy {
+                anyhow::bail!("legacy Twin namespace belongs to another root authority");
+            }
+            return Ok(current);
+        }
+        if assignment.state == LegacyTwinAssignmentState::Prepared {
+            match (has_legacy, has_current) {
+                (true, false) => {}
+                (false, true) => {
+                    write_legacy_twin_assignment(
+                        &root,
+                        &LegacyTwinAssignmentV1 {
+                            state: LegacyTwinAssignmentState::Committed,
+                            ..assignment.clone()
+                        },
+                    )?;
+                    return Ok(current);
+                }
+                (false, false) => {
+                    anyhow::bail!(
+                        "prepared legacy Twin assignment has neither source nor destination"
+                    )
+                }
+                (true, true) => anyhow::bail!(
+                    "legacy and current Twin namespaces both exist; refusing to merge"
+                ),
+            }
+        }
+    }
+    if has_current && has_legacy {
+        anyhow::bail!("legacy and current Twin namespaces both exist; refusing to merge");
+    }
+    if has_legacy {
+        #[cfg(not(windows))]
+        {
+            let _ = (marker_install_hook, rename_hook);
+            anyhow::bail!(
+                "legacy Twin namespace uses a case-folded root hash and is ambiguous on this platform"
+            );
+        }
+        #[cfg(windows)]
+        {
+            let prepared = LegacyTwinAssignmentV1 {
+                schema_version: 1,
+                root_scope: lease.root_scope.clone(),
+                lease_epoch_uuid: lease.epoch_uuid.clone(),
+                legacy_name: legacy_name.to_string(),
+                current_name: current_name.to_string(),
+                state: LegacyTwinAssignmentState::Prepared,
+            };
+            if assignment.is_none() {
+                install_initial_legacy_twin_assignment(&root, &prepared, marker_install_hook)?;
+            }
+            rename_twin_namespace_no_replace(&root, &legacy_key, &current_key, rename_hook)?;
+        }
+    }
+    if assignment
+        .as_ref()
+        .is_some_and(|assignment| assignment.state == LegacyTwinAssignmentState::Prepared)
+        || has_legacy
+    {
+        write_legacy_twin_assignment(
+            &root,
+            &LegacyTwinAssignmentV1 {
+                schema_version: 1,
+                root_scope: lease.root_scope.clone(),
+                lease_epoch_uuid: lease.epoch_uuid.clone(),
+                legacy_name: legacy_name.to_string(),
+                current_name: current_name.to_string(),
+                state: LegacyTwinAssignmentState::Committed,
+            },
+        )?;
+    }
+    Ok(current)
+}
+
+fn rename_twin_namespace_no_replace(
+    root: &crate::services::twin_events::AnchoredRoot,
+    legacy_key: &str,
+    current_key: &str,
+    rename_hook: &mut impl FnMut(),
+) -> Result<()> {
+    #[cfg(test)]
+    {
+        root.rename_no_replace_with_hook(legacy_key, current_key, false, || rename_hook())
+            .map_err(anyhow::Error::new)
+    }
+    #[cfg(not(test))]
+    {
+        let _ = rename_hook;
+        root.rename_no_replace(legacy_key, current_key, false)
+            .map_err(anyhow::Error::new)
+    }
+}
+
+fn write_legacy_twin_assignment(
+    root: &crate::services::twin_events::AnchoredRoot,
+    assignment: &LegacyTwinAssignmentV1,
+) -> Result<()> {
+    root.put_atomic(
+        LEGACY_TWIN_ASSIGNMENT_KEY,
+        &encoded_legacy_twin_assignment(assignment)?,
+    )
+    .map_err(anyhow::Error::new)
+}
+
+fn install_initial_legacy_twin_assignment(
+    root: &crate::services::twin_events::AnchoredRoot,
+    assignment: &LegacyTwinAssignmentV1,
+    marker_install_hook: &mut impl FnMut(),
+) -> Result<()> {
+    let bytes = encoded_legacy_twin_assignment(assignment)?;
+    marker_install_hook();
+    root.install_no_clobber(
+        LEGACY_TWIN_ASSIGNMENT_KEY,
+        LEGACY_TWIN_ASSIGNMENT_STAGING_KEY,
+        &bytes,
+    )
+    .map_err(anyhow::Error::new)?;
+    let durable = root
+        .read_bounded(LEGACY_TWIN_ASSIGNMENT_KEY, LEGACY_TWIN_ASSIGNMENT_LIMIT)
+        .map_err(anyhow::Error::new)?
+        .ok_or_else(|| anyhow::anyhow!("legacy Twin assignment disappeared after install"))?;
+    let durable: LegacyTwinAssignmentV1 =
+        serde_json::from_slice(&durable).context("invalid legacy Twin assignment")?;
+    if &durable != assignment {
+        anyhow::bail!("legacy Twin assignment was concurrently installed by another authority");
+    }
+    Ok(())
+}
+
+fn encoded_legacy_twin_assignment(assignment: &LegacyTwinAssignmentV1) -> Result<Vec<u8>> {
+    let mut bytes = serde_json::to_vec_pretty(assignment)?;
+    bytes.push(b'\n');
+    if bytes.len() > LEGACY_TWIN_ASSIGNMENT_LIMIT {
+        anyhow::bail!("legacy Twin assignment exceeds its size limit");
+    }
+    Ok(bytes)
+}
+
 /// Service for managing user settings
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SettingsService {
     config_path: PathBuf,
+    data_path: PathBuf,
     settings: UserSettings,
+    key_source: crate::services::root_transition::OpenRouterKeySource,
+    active_key_version: Option<String>,
+    environment_runtime_secret: bool,
+    allow_environment_fallback: bool,
+    secret_store: Arc<dyn crate::services::sync::secrets::SecretStore>,
+    runtime_kind: RuntimeKind,
 }
 
 impl SettingsService {
+    #[cfg(all(feature = "mcp", not(any(target_os = "android", target_os = "ios"))))]
+    pub(crate) fn recover_root_transition_at(data_path: &Path) -> Result<()> {
+        let config_dir = dirs::config_dir()
+            .or_else(dirs::data_local_dir)
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("Grafyn");
+        std::fs::create_dir_all(&config_dir).context("Failed to create Grafyn config directory")?;
+        std::fs::create_dir_all(data_path).context("Failed to create Grafyn data directory")?;
+        let store = crate::services::root_transition::RootTransitionStore::new(
+            data_path,
+            config_dir.join("settings.json"),
+            Arc::new(crate::services::sync::secrets::KeyringSecretStore),
+        )
+        .map_err(anyhow::Error::new)?;
+        store.recover().map_err(anyhow::Error::new)?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(config_path: PathBuf, settings: UserSettings) -> Self {
+        let data_path = config_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("data");
+        std::fs::create_dir_all(&data_path).expect("test data directory");
+        Self {
+            config_path,
+            data_path,
+            settings,
+            key_source: crate::services::root_transition::OpenRouterKeySource::Unset,
+            active_key_version: None,
+            environment_runtime_secret: false,
+            allow_environment_fallback: true,
+            secret_store: Arc::new(
+                crate::services::root_transition::MemoryVersionedSecretStore::default(),
+            ),
+            runtime_kind: RuntimeKind::Desktop,
+        }
+    }
+
     /// Create a SettingsService with default settings (used as fallback)
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     pub fn load_defaults() -> Self {
         let config_dir = dirs::config_dir()
             .or_else(|| dirs::data_local_dir())
@@ -34,11 +391,19 @@ impl SettingsService {
 
         Self {
             config_path: config_dir.join("settings.json"),
+            data_path: UserSettings::default().effective_data_path(),
             settings: UserSettings::default(),
+            key_source: crate::services::root_transition::OpenRouterKeySource::Unset,
+            active_key_version: None,
+            environment_runtime_secret: false,
+            allow_environment_fallback: true,
+            secret_store: Arc::new(crate::services::sync::secrets::KeyringSecretStore),
+            runtime_kind: RuntimeKind::Desktop,
         }
     }
 
     /// Load settings from disk or create defaults
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     pub fn load() -> Result<Self> {
         let config_dir = dirs::config_dir()
             .or_else(|| dirs::data_local_dir())
@@ -53,44 +418,185 @@ impl SettingsService {
             );
         }
         let config_path = config_dir.join("settings.json");
+        let data_path = UserSettings::default().effective_data_path();
+        std::fs::create_dir_all(&data_path).context("Failed to create Grafyn data directory")?;
+        let secret_store: Arc<dyn crate::services::sync::secrets::SecretStore> =
+            Arc::new(crate::services::sync::secrets::KeyringSecretStore);
+        let transition_store = crate::services::root_transition::RootTransitionStore::new(
+            &data_path,
+            &config_path,
+            secret_store.clone(),
+        )
+        .map_err(anyhow::Error::new)?;
+        let startup = transition_store
+            .load_startup_settings(
+                crate::services::root_transition::StartupSecretPolicy::AllowLegacy,
+                || {
+                    load_openrouter_api_key().map_err(|error| {
+                        crate::services::twin_events::MutationError::Io(error.to_string())
+                    })
+                },
+                || {
+                    clear_openrouter_api_key().map_err(|error| {
+                        crate::services::twin_events::MutationError::Io(error.to_string())
+                    })
+                },
+            )
+            .map_err(anyhow::Error::new)?;
+        let settings = startup.settings;
+        let key_source = startup.key_source;
+        let active_key_version = startup.active_key_version;
 
-        let mut settings: UserSettings = load_settings_from_file(&config_path)?;
-
-        let mut migrated_legacy_plaintext_key = false;
-
-        // Prefer OS keychain storage for API keys.
-        if let Some(stored_key) = load_openrouter_api_key() {
-            settings.openrouter_api_key = Some(stored_key);
-        } else if let Some(legacy_key) = settings.openrouter_api_key.clone() {
-            if !legacy_key.is_empty() {
-                if let Err(error) = store_openrouter_api_key(&legacy_key) {
-                    log::warn!("Failed to migrate OpenRouter key to OS keychain: {}", error);
-                }
-                migrated_legacy_plaintext_key = true;
-            }
-        }
-
-        let service = Self {
+        Ok(Self {
             config_path,
+            data_path,
             settings,
-        };
+            key_source,
+            active_key_version,
+            environment_runtime_secret: false,
+            allow_environment_fallback: true,
+            secret_store,
+            runtime_kind: RuntimeKind::Desktop,
+        })
+    }
 
-        // Re-save after migration so settings.json no longer contains plaintext API keys.
-        if migrated_legacy_plaintext_key {
-            if let Err(error) = service.save() {
-                log::warn!(
-                    "Failed to persist settings cleanup after key migration: {}",
-                    error
-                );
+    #[cfg(feature = "tauri-app")]
+    pub(crate) fn load_for_runtime(
+        bootstrap: &crate::app_runtime::RuntimeBootstrap,
+    ) -> Result<Self> {
+        match bootstrap.kind {
+            RuntimeKind::Desktop => {
+                #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                {
+                    Self::load()
+                }
+                #[cfg(any(target_os = "android", target_os = "ios"))]
+                {
+                    anyhow::bail!("desktop runtime is unavailable on this target")
+                }
             }
+            RuntimeKind::Android => Self::load_android(bootstrap),
         }
+    }
 
-        Ok(service)
+    #[cfg(feature = "tauri-app")]
+    fn load_android(bootstrap: &crate::app_runtime::RuntimeBootstrap) -> Result<Self> {
+        bootstrap.paths.prepare().map_err(anyhow::Error::msg)?;
+        let config_path = bootstrap.paths.config_dir.join("settings.json");
+        let data_path = bootstrap.paths.data_dir.clone();
+        let vault_path = std::fs::canonicalize(&bootstrap.paths.vault_dir)
+            .context("Failed to canonicalize the app-private vault")?;
+        let secret_store = bootstrap.secret_store.clone();
+        let transition_store = crate::services::root_transition::RootTransitionStore::new(
+            &data_path,
+            &config_path,
+            secret_store.clone(),
+        )
+        .map_err(anyhow::Error::new)?;
+        transition_store
+            .load_startup_settings(
+                crate::services::root_transition::StartupSecretPolicy::RejectPlaintext {
+                    resolve_versioned_secrets: bootstrap.secure_secrets.is_ready(),
+                },
+                || Ok(None),
+                || Ok(()),
+            )
+            .map_err(anyhow::Error::new)?;
+        let snapshot = transition_store
+            .patch_settings_guarded_with_secret_resolution(
+                |fresh| {
+                    fresh.vault_path = Some(vault_path.to_string_lossy().into_owned());
+                    fresh.setup_completed = true;
+                    fresh.mcp_enabled = false;
+                    fresh.twin_llm_provider = "openrouter".to_string();
+                    fresh.ollama_model.clear();
+                    fresh.background_link_discovery_enabled = false;
+                    fresh.background_link_discovery_llm_enabled = false;
+                    fresh.background_vault_optimizer_enabled = false;
+                    fresh.background_vault_optimizer_llm_enabled = false;
+                    Ok(())
+                },
+                bootstrap.secure_secrets.is_ready(),
+            )
+            .map_err(anyhow::Error::new)?;
+
+        Ok(Self {
+            config_path,
+            data_path,
+            settings: snapshot.settings,
+            key_source: snapshot.key_source,
+            active_key_version: snapshot.active_key_version,
+            environment_runtime_secret: false,
+            allow_environment_fallback: false,
+            secret_store,
+            runtime_kind: RuntimeKind::Android,
+        })
+    }
+
+    #[cfg(feature = "e2e-test-runtime")]
+    pub(crate) fn load_for_e2e(
+        config_path: PathBuf,
+        data_path: PathBuf,
+        vault_path: PathBuf,
+        secret_store: Arc<dyn crate::services::sync::secrets::SecretStore>,
+    ) -> Result<Self> {
+        let config_dir = config_path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("E2E settings path has no parent"))?;
+        std::fs::create_dir_all(config_dir).context("Failed to create E2E config directory")?;
+        std::fs::create_dir_all(&data_path).context("Failed to create E2E data directory")?;
+        let data_path =
+            std::fs::canonicalize(data_path).context("Failed to canonicalize the E2E data root")?;
+        let vault_path =
+            std::fs::canonicalize(vault_path).context("Failed to canonicalize the E2E vault")?;
+        let transition_store = crate::services::root_transition::RootTransitionStore::new(
+            &data_path,
+            &config_path,
+            secret_store.clone(),
+        )
+        .map_err(anyhow::Error::new)?;
+        let startup = transition_store
+            .load_startup_settings(
+                crate::services::root_transition::StartupSecretPolicy::RejectPlaintext {
+                    resolve_versioned_secrets: true,
+                },
+                || Ok(None),
+                || Ok(()),
+            )
+            .map_err(anyhow::Error::new)?;
+        let snapshot = transition_store
+            .patch_settings_guarded(|fresh| {
+                fresh.vault_path = Some(vault_path.to_string_lossy().into_owned());
+                fresh.setup_completed = true;
+                fresh.mcp_enabled = false;
+                fresh.background_link_discovery_enabled = false;
+                fresh.background_link_discovery_llm_enabled = false;
+                fresh.background_vault_optimizer_enabled = false;
+                fresh.background_vault_optimizer_llm_enabled = false;
+                Ok(())
+            })
+            .map_err(anyhow::Error::new)?;
+
+        Ok(Self {
+            config_path,
+            data_path,
+            settings: snapshot.settings,
+            key_source: startup.key_source,
+            active_key_version: startup.active_key_version,
+            environment_runtime_secret: false,
+            allow_environment_fallback: false,
+            secret_store,
+            runtime_kind: RuntimeKind::Desktop,
+        })
     }
 
     /// Get current settings
     pub fn get(&self) -> &UserSettings {
         &self.settings
+    }
+
+    pub(crate) fn secret_store(&self) -> Arc<dyn crate::services::sync::secrets::SecretStore> {
+        self.secret_store.clone()
     }
 
     /// Get settings status for frontend
@@ -99,164 +605,78 @@ impl SettingsService {
     }
 
     /// Update settings and persist to disk
+    #[cfg(test)]
     pub fn update(&mut self, update: SettingsUpdate) -> Result<UserSettings> {
-        // Apply updates
-        if let Some(vault_path) = update.vault_path {
-            // Validate the path exists (or can be created)
-            let path = PathBuf::from(&vault_path);
-            if !path.exists() {
-                std::fs::create_dir_all(&path).context("Failed to create vault directory")?;
-            }
-            self.settings.vault_path = Some(vault_path);
+        if update.openrouter_api_key.is_some() {
+            anyhow::bail!("OpenRouter key updates require the coordinated settings boundary");
         }
-
-        if let Some(api_key) = update.openrouter_api_key {
-            self.settings.openrouter_api_key = if api_key.is_empty() {
-                if let Err(error) = clear_openrouter_api_key() {
-                    log::warn!(
-                        "Failed to clear OpenRouter API key from OS keychain: {}",
-                        error
-                    );
-                }
-                None
-            } else {
-                if let Err(error) = store_openrouter_api_key(&api_key) {
-                    log::warn!(
-                        "Failed to store OpenRouter API key in OS keychain: {}",
-                        error
-                    );
-                }
-                Some(api_key)
-            };
+        if update.vault_path.is_some() {
+            anyhow::bail!("vault changes require the coordinated settings boundary");
         }
-
-        if let Some(setup_completed) = update.setup_completed {
-            self.settings.setup_completed = setup_completed;
+        let environment_runtime_secret = self.environment_runtime_secret();
+        let snapshot = self
+            .root_transition_store()?
+            .patch_settings_guarded(|fresh| {
+                apply_update_fields(fresh, &update).map_err(|error| {
+                    crate::services::twin_events::MutationError::Invalid(error.to_string())
+                })
+            })
+            .map_err(anyhow::Error::new)?;
+        self.settings = snapshot.settings;
+        self.key_source = snapshot.key_source;
+        if snapshot.key_source == crate::services::root_transition::OpenRouterKeySource::Unset {
+            self.settings.openrouter_api_key = environment_runtime_secret;
         }
-
-        if let Some(theme) = update.theme {
-            self.settings.theme = theme;
-        }
-
-        if let Some(mcp_enabled) = update.mcp_enabled {
-            self.settings.mcp_enabled = mcp_enabled;
-        }
-
-        if let Some(llm_model) = update.llm_model {
-            self.settings.llm_model = if llm_model.is_empty() {
-                crate::models::settings::default_llm_model()
-            } else {
-                llm_model
-            };
-        }
-
-        if let Some(twin_llm_provider) = update.twin_llm_provider {
-            self.settings.twin_llm_provider =
-                match twin_llm_provider.trim().to_ascii_lowercase().as_str() {
-                    "ollama" => "ollama".to_string(),
-                    _ => "openrouter".to_string(),
-                };
-        }
-
-        if let Some(ollama_base_url) = update.ollama_base_url {
-            let trimmed = ollama_base_url.trim().trim_end_matches('/').to_string();
-            self.settings.ollama_base_url = if trimmed.is_empty() {
-                "http://localhost:11434".to_string()
-            } else {
-                trimmed
-            };
-        }
-
-        if let Some(ollama_model) = update.ollama_model {
-            self.settings.ollama_model = ollama_model.trim().to_string();
-        }
-
-        if let Some(smart_web_search) = update.smart_web_search {
-            self.settings.smart_web_search = smart_web_search;
-        }
-
-        if let Some(background_link_discovery_enabled) = update.background_link_discovery_enabled {
-            self.settings.background_link_discovery_enabled = background_link_discovery_enabled;
-        }
-
-        if let Some(background_link_discovery_llm_enabled) =
-            update.background_link_discovery_llm_enabled
-        {
-            self.settings.background_link_discovery_llm_enabled =
-                background_link_discovery_llm_enabled;
-        }
-
-        if let Some(background_vault_optimizer_enabled) = update.background_vault_optimizer_enabled
-        {
-            self.settings.background_vault_optimizer_enabled = background_vault_optimizer_enabled;
-        }
-
-        if let Some(background_vault_optimizer_llm_enabled) =
-            update.background_vault_optimizer_llm_enabled
-        {
-            self.settings.background_vault_optimizer_llm_enabled =
-                background_vault_optimizer_llm_enabled;
-        }
-
-        if let Some(background_vault_optimizer_budget_monthly) =
-            update.background_vault_optimizer_budget_monthly
-        {
-            self.settings.background_vault_optimizer_budget_monthly =
-                background_vault_optimizer_budget_monthly;
-        }
-
-        if let Some(background_vault_optimizer_max_daily_writes) =
-            update.background_vault_optimizer_max_daily_writes
-        {
-            self.settings.background_vault_optimizer_max_daily_writes =
-                background_vault_optimizer_max_daily_writes.max(1);
-        }
-
-        if let Some(background_vault_optimizer_edit_mode) =
-            update.background_vault_optimizer_edit_mode
-        {
-            self.settings.background_vault_optimizer_edit_mode =
-                if background_vault_optimizer_edit_mode.trim().is_empty() {
-                    "sidecar_first".to_string()
-                } else {
-                    background_vault_optimizer_edit_mode
-                };
-        }
-
-        if let Some(background_vault_optimizer_program_enabled) =
-            update.background_vault_optimizer_program_enabled
-        {
-            self.settings.background_vault_optimizer_program_enabled =
-                background_vault_optimizer_program_enabled;
-        }
-
-        if let Some(vault_optimizer_program_path) = update.vault_optimizer_program_path {
-            self.settings.vault_optimizer_program_path =
-                if vault_optimizer_program_path.trim().is_empty() {
-                    "_grafyn/program.md".to_string()
-                } else {
-                    vault_optimizer_program_path.replace('\\', "/")
-                };
-        }
-
-        if let Some(canvas_model_presets) = update.canvas_model_presets {
-            self.settings.canvas_model_presets = canvas_model_presets;
-        }
-
-        // Persist to disk
-        self.save()?;
-
+        self.active_key_version = snapshot.active_key_version;
         Ok(self.settings.clone())
     }
 
-    /// Save settings to disk
-    fn save(&self) -> Result<()> {
-        let json =
-            serde_json::to_string_pretty(&self.settings).context("Failed to serialize settings")?;
-        write_atomic(&self.config_path, json.as_bytes())
-            .context("Failed to write settings file")?;
-        log::info!("Settings saved to {:?}", self.config_path);
-        Ok(())
+    pub(crate) fn root_transition_store(
+        &self,
+    ) -> Result<crate::services::root_transition::RootTransitionStore> {
+        crate::services::root_transition::RootTransitionStore::new(
+            &self.data_path,
+            &self.config_path,
+            self.secret_store.clone(),
+        )
+        .map_err(anyhow::Error::new)
+    }
+
+    pub(crate) fn publish_runtime_authority(
+        &mut self,
+        mut settings: UserSettings,
+        key_source: crate::services::root_transition::OpenRouterKeySource,
+        active_key_version: Option<String>,
+        resolved_secret: Option<String>,
+    ) {
+        settings.openrouter_api_key = resolved_secret;
+        self.settings = settings;
+        self.key_source = key_source;
+        self.active_key_version = active_key_version;
+        self.environment_runtime_secret = false;
+    }
+
+    pub(crate) fn adopt_environment_runtime_secret(&mut self, secret: String) {
+        if self.runtime_kind == RuntimeKind::Desktop
+            && self.key_source == crate::services::root_transition::OpenRouterKeySource::Unset
+            && self.active_key_version.is_none()
+            && !secret.is_empty()
+        {
+            self.settings.openrouter_api_key = Some(secret);
+            self.environment_runtime_secret = true;
+        }
+    }
+
+    pub(crate) fn environment_runtime_secret(&self) -> Option<String> {
+        self.environment_runtime_secret
+            .then(|| self.settings.openrouter_api_key.clone())
+            .flatten()
+    }
+
+    pub(crate) fn allows_environment_fallback(&self) -> bool {
+        self.allow_environment_fallback
+            && self.runtime_kind == RuntimeKind::Desktop
+            && self.key_source == crate::services::root_transition::OpenRouterKeySource::Unset
     }
 
     /// Get the effective vault path
@@ -266,7 +686,7 @@ impl SettingsService {
 
     /// Get the effective data path
     pub fn data_path(&self) -> PathBuf {
-        self.settings.effective_data_path()
+        self.data_path.clone()
     }
 
     /// Get OpenRouter API key (if configured)
@@ -276,31 +696,149 @@ impl SettingsService {
 
     /// Check if initial setup is needed
     pub fn needs_setup(&self) -> bool {
-        self.settings.needs_setup()
-    }
-
-    /// Mark setup as completed
-    pub fn complete_setup(&mut self) -> Result<()> {
-        self.settings.setup_completed = true;
-        self.save()
+        self.runtime_kind == RuntimeKind::Desktop && self.settings.needs_setup()
     }
 
     /// Check if MCP sidecar is enabled in settings
     pub fn mcp_enabled(&self) -> bool {
-        self.settings.mcp_enabled
+        self.runtime_kind == RuntimeKind::Desktop && self.settings.mcp_enabled
     }
 
-    /// Clear the OpenRouter API key
-    pub fn clear_openrouter_key(&mut self) -> Result<()> {
-        if let Err(error) = clear_openrouter_api_key() {
-            log::warn!(
-                "Failed to clear OpenRouter API key from OS keychain: {}",
-                error
-            );
-        }
-        self.settings.openrouter_api_key = None;
-        self.save()
+    pub(crate) fn runtime_kind(&self) -> RuntimeKind {
+        self.runtime_kind
     }
+
+    pub(crate) fn validate_update_for_runtime(&self, update: &SettingsUpdate) -> Result<()> {
+        if self.runtime_kind != RuntimeKind::Android {
+            return Ok(());
+        }
+        if update.vault_path.is_some() {
+            anyhow::bail!("Android uses an app-private vault that cannot be changed");
+        }
+        if update
+            .twin_llm_provider
+            .as_deref()
+            .is_some_and(|provider| !provider.trim().eq_ignore_ascii_case("openrouter"))
+        {
+            anyhow::bail!("Android Twin chat requires the OpenRouter provider");
+        }
+        if update.mcp_enabled.is_some()
+            || update.ollama_base_url.is_some()
+            || update.ollama_model.is_some()
+            || update.background_link_discovery_enabled.is_some()
+            || update.background_link_discovery_llm_enabled.is_some()
+            || update.background_vault_optimizer_enabled.is_some()
+            || update.background_vault_optimizer_llm_enabled.is_some()
+            || update.background_vault_optimizer_budget_monthly.is_some()
+            || update.background_vault_optimizer_max_daily_writes.is_some()
+            || update.background_vault_optimizer_edit_mode.is_some()
+            || update.background_vault_optimizer_program_enabled.is_some()
+            || update.vault_optimizer_program_path.is_some()
+        {
+            anyhow::bail!("Desktop-only settings are unavailable on Android");
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+fn choose_legacy_authority(keychain: Option<String>, plaintext: Option<String>) -> Option<String> {
+    keychain.or(plaintext)
+}
+
+pub(crate) fn apply_update_fields(
+    settings: &mut UserSettings,
+    update: &SettingsUpdate,
+) -> Result<()> {
+    if let Some(vault_path) = update.vault_path.as_deref() {
+        let path = PathBuf::from(vault_path);
+        crate::services::twin_events::validate_real_directory(&path, "vault directory")
+            .map_err(anyhow::Error::new)?;
+        settings.vault_path = Some(
+            std::fs::canonicalize(path)
+                .context("Failed to canonicalize vault directory")?
+                .to_string_lossy()
+                .into_owned(),
+        );
+    }
+    if let Some(api_key) = update.openrouter_api_key.as_deref() {
+        settings.openrouter_api_key = (!api_key.is_empty()).then(|| api_key.to_string());
+    }
+    if let Some(value) = update.setup_completed {
+        settings.setup_completed = value;
+    }
+    if let Some(value) = &update.theme {
+        settings.theme.clone_from(value);
+    }
+    if let Some(value) = update.mcp_enabled {
+        settings.mcp_enabled = value;
+    }
+    if let Some(value) = &update.llm_model {
+        settings.llm_model = if value.is_empty() {
+            crate::models::settings::default_llm_model()
+        } else {
+            value.clone()
+        };
+    }
+    if let Some(value) = &update.twin_llm_provider {
+        settings.twin_llm_provider = match value.trim().to_ascii_lowercase().as_str() {
+            "ollama" => "ollama".to_string(),
+            _ => "openrouter".to_string(),
+        };
+    }
+    if let Some(value) = &update.ollama_base_url {
+        let trimmed = value.trim().trim_end_matches('/').to_string();
+        settings.ollama_base_url = if trimmed.is_empty() {
+            "http://localhost:11434".to_string()
+        } else {
+            trimmed
+        };
+    }
+    if let Some(value) = &update.ollama_model {
+        settings.ollama_model = value.trim().to_string();
+    }
+    if let Some(value) = update.smart_web_search {
+        settings.smart_web_search = value;
+    }
+    if let Some(value) = update.background_link_discovery_enabled {
+        settings.background_link_discovery_enabled = value;
+    }
+    if let Some(value) = update.background_link_discovery_llm_enabled {
+        settings.background_link_discovery_llm_enabled = value;
+    }
+    if let Some(value) = update.background_vault_optimizer_enabled {
+        settings.background_vault_optimizer_enabled = value;
+    }
+    if let Some(value) = update.background_vault_optimizer_llm_enabled {
+        settings.background_vault_optimizer_llm_enabled = value;
+    }
+    if let Some(value) = update.background_vault_optimizer_budget_monthly {
+        settings.background_vault_optimizer_budget_monthly = value;
+    }
+    if let Some(value) = update.background_vault_optimizer_max_daily_writes {
+        settings.background_vault_optimizer_max_daily_writes = value.max(1);
+    }
+    if let Some(value) = &update.background_vault_optimizer_edit_mode {
+        settings.background_vault_optimizer_edit_mode = if value.trim().is_empty() {
+            "sidecar_first".to_string()
+        } else {
+            value.clone()
+        };
+    }
+    if let Some(value) = update.background_vault_optimizer_program_enabled {
+        settings.background_vault_optimizer_program_enabled = value;
+    }
+    if let Some(value) = &update.vault_optimizer_program_path {
+        settings.vault_optimizer_program_path = if value.trim().is_empty() {
+            "_grafyn/program.md".to_string()
+        } else {
+            value.replace('\\', "/")
+        };
+    }
+    if let Some(value) = &update.canvas_model_presets {
+        settings.canvas_model_presets.clone_from(value);
+    }
+    Ok(())
 }
 
 /// Load settings from `config_path`. If the file doesn't exist, returns defaults. If it
@@ -315,6 +853,7 @@ impl SettingsService {
 ///
 /// Only parse failures are quarantined. An I/O read error (e.g. permissions) is
 /// propagated as before, since the file itself may be perfectly fine.
+#[cfg(test)]
 fn load_settings_from_file(config_path: &Path) -> Result<UserSettings> {
     if !config_path.exists() {
         return Ok(UserSettings::default());
@@ -338,6 +877,7 @@ fn load_settings_from_file(config_path: &Path) -> Result<UserSettings> {
 
 /// Rename a corrupt file to `{name}.corrupt-{unix-timestamp}` in the same directory.
 /// Best-effort: if the rename itself fails, log and leave the file in place.
+#[cfg(test)]
 fn quarantine_corrupt_file(path: &Path) {
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -368,41 +908,33 @@ fn quarantine_corrupt_file(path: &Path) {
     }
 }
 
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn keyring_entry() -> Result<keyring::Entry> {
     keyring::Entry::new(KEYRING_SERVICE, OPENROUTER_KEY_ACCOUNT)
         .context("Failed to initialize OS keychain entry")
 }
 
-fn load_openrouter_api_key() -> Option<String> {
-    let entry = match keyring_entry() {
-        Ok(entry) => entry,
-        Err(error) => {
-            log::debug!("OpenRouter keychain unavailable: {}", error);
-            return None;
-        }
-    };
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn load_openrouter_api_key() -> Result<Option<String>> {
+    let entry = keyring_entry()?;
     match entry.get_password() {
-        Ok(password) if !password.is_empty() => Some(password),
-        Ok(_) => None,
+        Ok(password) if !password.is_empty() => Ok(Some(password)),
+        Ok(_) | Err(keyring::Error::NoEntry) => Ok(None),
         Err(error) => {
-            log::debug!("OpenRouter key not available in OS keychain: {}", error);
-            None
+            Err(anyhow::Error::new(error).context("Failed to read legacy OpenRouter key"))
         }
     }
 }
 
-fn store_openrouter_api_key(api_key: &str) -> Result<()> {
-    let entry = keyring_entry()?;
-    entry
-        .set_password(api_key)
-        .context("Failed to store OpenRouter API key in OS keychain")
-}
-
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn clear_openrouter_api_key() -> Result<()> {
     let entry = keyring_entry()?;
-    entry
-        .delete_password()
-        .context("Failed to delete OpenRouter API key from OS keychain")
+    match entry.delete_password() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(error) => {
+            Err(anyhow::Error::new(error).context("Failed to delete legacy OpenRouter API key"))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -410,6 +942,270 @@ mod tests {
     use super::*;
     use crate::models::settings::CanvasModelPreset;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn legacy_twin_path(data: &Path, vault: &Path) -> PathBuf {
+        let normalized = vault
+            .to_string_lossy()
+            .replace('\\', "/")
+            .to_ascii_lowercase();
+        let normalized = normalized.strip_prefix("//?/").unwrap_or(&normalized);
+        let mut hash = 0xcbf29ce484222325_u64;
+        for byte in normalized.as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        data.join("twin").join(format!("{hash:016x}"))
+    }
+
+    #[test]
+    fn legacy_twin_namespace_moves_once_without_merge() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let vault = temp.path().join("vault");
+        std::fs::create_dir_all(data.join("twin")).unwrap();
+        std::fs::create_dir(&vault).unwrap();
+        let legacy = legacy_twin_path(&data, &vault);
+        std::fs::create_dir(&legacy).unwrap();
+        std::fs::write(legacy.join("record.json"), "legacy").unwrap();
+
+        let events = Arc::new(crate::services::twin_events::TwinEventStore::new(&data));
+        events.initialize().unwrap();
+        let coordinator = crate::services::twin_events::MutationCoordinator::new(
+            &data,
+            &vault,
+            events,
+            Arc::new(crate::services::twin_events::NoopMutationLifecycle),
+        )
+        .unwrap();
+        let guard = coordinator.begin_root_transition().unwrap();
+        let lease = guard.current_lease().unwrap();
+
+        #[cfg(not(windows))]
+        {
+            assert!(guard.prepare_twin_data_path(&vault, &lease).is_err());
+            return;
+        }
+        #[cfg(windows)]
+        let current = guard.prepare_twin_data_path(&vault, &lease).unwrap();
+        assert!(!legacy.exists());
+        assert_eq!(
+            std::fs::read_to_string(current.join("record.json")).unwrap(),
+            "legacy"
+        );
+
+        std::fs::create_dir(&legacy).unwrap();
+        assert!(guard.prepare_twin_data_path(&vault, &lease).is_err());
+        assert!(legacy.exists());
+        assert!(current.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn legacy_twin_assignment_preserves_a_raced_destination() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let vault = temp.path().join("vault");
+        std::fs::create_dir_all(data.join("twin")).unwrap();
+        std::fs::create_dir(&vault).unwrap();
+        let legacy = legacy_twin_path(&data, &vault);
+        std::fs::create_dir(&legacy).unwrap();
+        std::fs::write(legacy.join("record.json"), "legacy").unwrap();
+
+        let events = Arc::new(crate::services::twin_events::TwinEventStore::new(&data));
+        events.initialize().unwrap();
+        let coordinator = crate::services::twin_events::MutationCoordinator::new(
+            &data,
+            &vault,
+            events,
+            Arc::new(crate::services::twin_events::NoopMutationLifecycle),
+        )
+        .unwrap();
+        let guard = coordinator.begin_root_transition().unwrap();
+        let lease = guard.current_lease().unwrap();
+        drop(guard);
+        drop(coordinator);
+        let current = crate::models::settings::twin_data_path_for_scope(&data, &lease.root_scope);
+        let lock =
+            crate::services::twin_events::acquire_shared_coordinator_process_lock(&data).unwrap();
+
+        let error =
+            prepare_twin_data_path_locked_with_rename_hook(&data, &vault, &lease, &lock, || {
+                std::fs::create_dir(&current).unwrap();
+                std::fs::write(current.join("record.json"), "foreign").unwrap();
+            })
+            .unwrap_err();
+
+        assert!(error.to_string().contains("no-replace rename failed"));
+        assert_eq!(
+            std::fs::read_to_string(legacy.join("record.json")).unwrap(),
+            "legacy"
+        );
+        assert_eq!(
+            std::fs::read_to_string(current.join("record.json")).unwrap(),
+            "foreign"
+        );
+        lock.unlock().unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn legacy_twin_assignment_preserves_a_raced_marker() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let vault = temp.path().join("vault");
+        std::fs::create_dir_all(data.join("twin")).unwrap();
+        std::fs::create_dir(&vault).unwrap();
+        let legacy = legacy_twin_path(&data, &vault);
+        std::fs::create_dir(&legacy).unwrap();
+        std::fs::write(legacy.join("record.json"), "legacy").unwrap();
+
+        let events = Arc::new(crate::services::twin_events::TwinEventStore::new(&data));
+        events.initialize().unwrap();
+        let coordinator = crate::services::twin_events::MutationCoordinator::new(
+            &data,
+            &vault,
+            events,
+            Arc::new(crate::services::twin_events::NoopMutationLifecycle),
+        )
+        .unwrap();
+        let guard = coordinator.begin_root_transition().unwrap();
+        let lease = guard.current_lease().unwrap();
+        drop(guard);
+        drop(coordinator);
+        let marker = data.join(LEGACY_TWIN_ASSIGNMENT_KEY.replace('/', "\\"));
+        let lock =
+            crate::services::twin_events::acquire_shared_coordinator_process_lock(&data).unwrap();
+
+        let error = prepare_twin_data_path_locked_with_marker_install_hook(
+            &data,
+            &vault,
+            &lease,
+            &lock,
+            || std::fs::write(&marker, b"foreign-marker").unwrap(),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("invalid legacy Twin assignment"));
+        assert_eq!(std::fs::read(&marker).unwrap(), b"foreign-marker");
+        assert_eq!(
+            std::fs::read_to_string(legacy.join("record.json")).unwrap(),
+            "legacy"
+        );
+        lock.unlock().unwrap();
+    }
+
+    #[test]
+    fn prepared_legacy_twin_assignment_rejects_neither_namespace() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let vault = temp.path().join("vault");
+        std::fs::create_dir_all(data.join("twin")).unwrap();
+        std::fs::create_dir(&vault).unwrap();
+        let events = Arc::new(crate::services::twin_events::TwinEventStore::new(&data));
+        events.initialize().unwrap();
+        let coordinator = crate::services::twin_events::MutationCoordinator::new(
+            &data,
+            &vault,
+            events,
+            Arc::new(crate::services::twin_events::NoopMutationLifecycle),
+        )
+        .unwrap();
+        let guard = coordinator.begin_root_transition().unwrap();
+        let lease = guard.current_lease().unwrap();
+        let current = crate::models::settings::twin_data_path_for_scope(&data, &lease.root_scope);
+        let legacy = legacy_twin_path(&data, &vault);
+        let root = crate::services::twin_events::AnchoredRoot::open(&data).unwrap();
+        write_legacy_twin_assignment(
+            &root,
+            &LegacyTwinAssignmentV1 {
+                schema_version: 1,
+                root_scope: lease.root_scope.clone(),
+                lease_epoch_uuid: lease.epoch_uuid.clone(),
+                legacy_name: legacy.file_name().unwrap().to_str().unwrap().into(),
+                current_name: current.file_name().unwrap().to_str().unwrap().into(),
+                state: LegacyTwinAssignmentState::Prepared,
+            },
+        )
+        .unwrap();
+
+        let error = guard.prepare_twin_data_path(&vault, &lease).unwrap_err();
+
+        assert!(error.to_string().contains("neither"));
+        let marker: LegacyTwinAssignmentV1 = serde_json::from_slice(
+            &root
+                .read_bounded(LEGACY_TWIN_ASSIGNMENT_KEY, LEGACY_TWIN_ASSIGNMENT_LIMIT)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(marker.state, LegacyTwinAssignmentState::Prepared);
+    }
+
+    #[test]
+    fn prepared_legacy_twin_assignment_rejects_foreign_authority() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let vault = temp.path().join("vault");
+        let foreign_vault = temp.path().join("foreign-vault");
+        std::fs::create_dir_all(data.join("twin")).unwrap();
+        std::fs::create_dir(&vault).unwrap();
+        std::fs::create_dir(&foreign_vault).unwrap();
+        let events = Arc::new(crate::services::twin_events::TwinEventStore::new(&data));
+        events.initialize().unwrap();
+        let coordinator = crate::services::twin_events::MutationCoordinator::new(
+            &data,
+            &vault,
+            events,
+            Arc::new(crate::services::twin_events::NoopMutationLifecycle),
+        )
+        .unwrap();
+        let guard = coordinator.begin_root_transition().unwrap();
+        let lease = guard.current_lease().unwrap();
+        let current = crate::models::settings::twin_data_path_for_scope(&data, &lease.root_scope);
+        let legacy = legacy_twin_path(&data, &vault);
+        let root = crate::services::twin_events::AnchoredRoot::open(&data).unwrap();
+        write_legacy_twin_assignment(
+            &root,
+            &LegacyTwinAssignmentV1 {
+                schema_version: 1,
+                root_scope: crate::services::twin_events::root_identity_for_path(&foreign_vault)
+                    .unwrap(),
+                lease_epoch_uuid: lease.epoch_uuid.clone(),
+                legacy_name: legacy.file_name().unwrap().to_str().unwrap().into(),
+                current_name: current.file_name().unwrap().to_str().unwrap().into(),
+                state: LegacyTwinAssignmentState::Prepared,
+            },
+        )
+        .unwrap();
+
+        let error = guard.prepare_twin_data_path(&vault, &lease).unwrap_err();
+        assert!(error.to_string().contains("another root authority"));
+    }
+
+    fn vault_update(path: impl Into<String>) -> SettingsUpdate {
+        SettingsUpdate {
+            vault_path: Some(path.into()),
+            openrouter_api_key: None,
+            setup_completed: None,
+            theme: None,
+            mcp_enabled: None,
+            llm_model: None,
+            twin_llm_provider: None,
+            ollama_base_url: None,
+            ollama_model: None,
+            smart_web_search: None,
+            background_link_discovery_enabled: None,
+            background_link_discovery_llm_enabled: None,
+            background_vault_optimizer_enabled: None,
+            background_vault_optimizer_llm_enabled: None,
+            background_vault_optimizer_budget_monthly: None,
+            background_vault_optimizer_max_daily_writes: None,
+            background_vault_optimizer_edit_mode: None,
+            background_vault_optimizer_program_enabled: None,
+            vault_optimizer_program_path: None,
+            canvas_model_presets: None,
+        }
+    }
 
     #[test]
     fn test_default_settings() {
@@ -440,10 +1236,7 @@ mod tests {
         std::fs::create_dir_all(&temp_dir).expect("temp dir should be created");
         let config_path = temp_dir.join("settings.json");
 
-        let mut service = SettingsService {
-            config_path: config_path.clone(),
-            settings: UserSettings::default(),
-        };
+        let mut service = SettingsService::for_test(config_path.clone(), UserSettings::default());
 
         let presets = vec![CanvasModelPreset {
             id: "preset-1".to_string(),
@@ -493,10 +1286,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().expect("temp dir should be created");
         let config_path = temp_dir.path().join("settings.json");
 
-        let mut service = SettingsService {
-            config_path: config_path.clone(),
-            settings: UserSettings::default(),
-        };
+        let mut service = SettingsService::for_test(config_path.clone(), UserSettings::default());
 
         service
             .update(SettingsUpdate {
@@ -526,6 +1316,78 @@ mod tests {
         let persisted = std::fs::read_to_string(&config_path).expect("settings file should exist");
         assert!(persisted.contains("\"theme\": \"dark\""));
         crate::services::atomic_io::assert_no_tmp_siblings(temp_dir.path());
+    }
+
+    #[test]
+    fn vault_update_requires_an_existing_real_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("settings.json");
+        let mut service = SettingsService::for_test(config_path, UserSettings::default());
+        let missing = temp.path().join("missing");
+        assert!(service
+            .update(vault_update(missing.to_string_lossy()))
+            .is_err());
+        assert!(!missing.exists());
+
+        let regular_file = temp.path().join("not-a-vault");
+        std::fs::write(&regular_file, b"not a directory").unwrap();
+        assert!(service
+            .update(vault_update(regular_file.to_string_lossy()))
+            .is_err());
+
+        let real = temp.path().join("real-vault");
+        let link = temp.path().join("linked-vault");
+        std::fs::create_dir(&real).unwrap();
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_dir(&real, &link);
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(&real, &link);
+        if linked.is_ok() {
+            assert!(service
+                .update(vault_update(link.to_string_lossy()))
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn ordinary_settings_service_update_rejects_even_a_valid_vault_change() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("settings.json");
+        let vault = temp.path().join("vault");
+        std::fs::create_dir(&vault).unwrap();
+        let before = UserSettings::default();
+        let mut service = SettingsService::for_test(config_path, before.clone());
+
+        let error = service
+            .update(vault_update(vault.to_string_lossy()))
+            .expect_err("vault changes must use the coordinated command boundary");
+        assert!(error.to_string().contains("coordinated settings boundary"));
+        assert_eq!(service.get().vault_path, before.vault_path);
+        assert_eq!(service.get().theme, before.theme);
+    }
+
+    #[test]
+    fn legacy_secret_authority_prefers_keychain_over_stale_plaintext() {
+        assert_eq!(
+            choose_legacy_authority(Some("new-keychain".into()), Some("stale-file".into())),
+            Some("new-keychain".into())
+        );
+        assert_eq!(
+            choose_legacy_authority(None, Some("file-fallback".into())),
+            Some("file-fallback".into())
+        );
+    }
+
+    #[test]
+    fn failed_settings_persistence_does_not_publish_runtime_values() {
+        let temp = tempfile::tempdir().unwrap();
+        let before = UserSettings::default();
+        let mut service = SettingsService::for_test(temp.path().to_path_buf(), before.clone());
+        let mut update = vault_update(temp.path().to_string_lossy());
+        update.vault_path = None;
+        update.theme = Some("dark".into());
+        assert!(service.update(update).is_err());
+        assert_eq!(service.get().theme, before.theme);
     }
 
     #[test]

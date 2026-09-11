@@ -514,7 +514,12 @@ async function handleSaveNote(id, data) {
     if (id) {
       await notesApi.update(id, saveData)
     } else {
-      const created = await notesApi.create(saveData)
+      const created = await notesApi.create({
+        title: saveData.title,
+        content: saveData.content,
+        status: saveData.status,
+        tags: saveData.tags
+      })
       selectedNoteId.value = created.id
     }
     await loadNotes()

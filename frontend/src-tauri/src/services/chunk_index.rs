@@ -12,6 +12,7 @@ use tantivy::{doc, Index, IndexReader, IndexWriter, ReloadPolicy};
 /// Parallel index to SearchService — indexes TextTiling segments of notes
 /// for paragraph-granularity retrieval. Each note produces 1-N chunk documents.
 pub struct ChunkIndex {
+    index_path: PathBuf,
     #[allow(dead_code)]
     index: Index,
     reader: IndexReader,
@@ -61,6 +62,7 @@ impl ChunkIndex {
             .context("Failed to create chunk index writer")?;
 
         Ok(Self {
+            index_path,
             index,
             reader,
             writer: Some(writer),
@@ -116,6 +118,7 @@ impl ChunkIndex {
             .context("Failed to create chunk index reader")?;
 
         Ok(Self {
+            index_path,
             index,
             reader,
             writer: None,
@@ -127,6 +130,10 @@ impl ChunkIndex {
             end_char_field,
             depth_score_field,
         })
+    }
+
+    pub(crate) fn uses_data_path(&self, data_path: &std::path::Path) -> bool {
+        self.index_path == data_path.join("chunk_index")
     }
 
     pub fn is_readonly(&self) -> bool {
@@ -190,6 +197,10 @@ impl ChunkIndex {
             self.reader.reload()?;
         }
         Ok(())
+    }
+
+    pub fn reload_reader(&self) -> Result<()> {
+        self.reader.reload().map_err(Into::into)
     }
 
     /// Reindex all notes.

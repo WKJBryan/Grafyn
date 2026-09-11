@@ -9,19 +9,266 @@ use crate::models::twin::{
 use crate::models::twin::{
     ExportBundle, ExportFileSummary, PromotionState, TraceEventType, TwinExportRequest, UserRecord,
 };
-use crate::services::atomic_io::write_atomic;
-use anyhow::{Context, Result};
+use crate::models::twin_event::{
+    AuthorityClass, CausalStream, EventId, EvidenceType, Governance, Identifier,
+    MemoryReviewDecision, ReviewState, Sensitivity, TwinEvent, TwinEventPayload, Visibility,
+};
+use anyhow::Result;
 use chrono::Utc;
 use serde_json::{json, Value};
 use std::collections::hash_map::DefaultHasher;
 #[cfg(test)]
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{Hash, Hasher};
 use std::path::Path;
 
 const DEFAULT_EVAL_PERCENTAGE: u8 = 10;
 const DEFAULT_HOLDOUT_PERCENTAGE: u8 = 10;
+const EXPORT_BUNDLE_SCHEMA_VERSION: u16 = 3;
+const PROJECTION_EXPORT_SCHEMA_VERSION: u16 = 1;
+
+fn exposure_allows_export(governance: &Governance) -> bool {
+    governance.allowed_uses.export
+        && governance.visibility == Visibility::SyncedVault
+        && governance.sensitivity != Sensitivity::Restricted
+}
+
+fn relationship_allows_export(governance: &Governance) -> bool {
+    exposure_allows_export(governance)
+        && matches!(
+            governance.review,
+            ReviewState::NotApplicable | ReviewState::Accepted
+        )
+}
+
+fn accepted_memory_id(event: &TwinEvent) -> Option<&Identifier> {
+    let TwinEventPayload::MemoryReviewed(review) = &event.payload else {
+        return None;
+    };
+    (review.decision == MemoryReviewDecision::Accept
+        && event.governance.review == ReviewState::Accepted
+        && matches!(
+            event.governance.authority,
+            AuthorityClass::ReviewedMemory
+                | AuthorityClass::CanonicalUserRule
+                | AuthorityClass::DeterministicallyVerified { .. }
+        ))
+    .then_some(&review.memory_id)
+}
+
+fn event_allows_export(
+    event: &TwinEvent,
+    accepted_memories: &BTreeSet<Identifier>,
+    active_superseded: &BTreeSet<EventId>,
+) -> bool {
+    if active_superseded.contains(&event.event_id)
+        || event.causal_stream != CausalStream::SyncEligible
+        || !exposure_allows_export(&event.governance)
+        || event
+            .context
+            .relationships
+            .iter()
+            .any(|relationship| !relationship_allows_export(&relationship.governance))
+    {
+        return false;
+    }
+    match &event.payload {
+        TwinEventPayload::MemoryProposed(proposal) => {
+            event.governance.review == ReviewState::Pending
+                && event.governance.authority == AuthorityClass::EvidenceObservation
+                && accepted_memories.contains(&proposal.memory_id)
+        }
+        TwinEventPayload::MemoryReviewed(_) => accepted_memory_id(event).is_some(),
+        _ => matches!(
+            event.governance.review,
+            ReviewState::NotApplicable | ReviewState::Accepted
+        ),
+    }
+}
+
+fn time_active(event: &TwinEvent, reference_time: chrono::DateTime<Utc>) -> bool {
+    event.valid_from.is_none_or(|from| reference_time >= from)
+        && event.valid_to.is_none_or(|to| reference_time <= to)
+}
+
+fn active_superseded_ids(
+    events: &[TwinEvent],
+    reference_time: chrono::DateTime<Utc>,
+) -> BTreeSet<EventId> {
+    events
+        .iter()
+        .filter(|event| {
+            time_active(event, reference_time)
+                && !matches!(
+                    event.governance.review,
+                    ReviewState::Rejected | ReviewState::Superseded
+                )
+        })
+        .flat_map(|event| event.supersedes.iter().cloned())
+        .collect()
+}
+
+fn event_reference_ids(event: &TwinEvent) -> Option<Vec<EventId>> {
+    event
+        .evidence
+        .iter()
+        .chain(
+            event
+                .context
+                .relationships
+                .iter()
+                .flat_map(|relationship| &relationship.evidence),
+        )
+        .filter(|evidence| evidence.evidence_type == EvidenceType::Event)
+        .map(|evidence| EventId::parse(evidence.source_id.as_str()).ok())
+        .collect()
+}
+
+fn export_dependencies(event: &TwinEvent, ordered: &[TwinEvent]) -> Option<BTreeSet<EventId>> {
+    let mut dependencies = event
+        .causal_parents
+        .iter()
+        .chain(&event.supersedes)
+        .chain(&event.reinforces)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    dependencies.extend(event_reference_ids(event)?);
+    let semantic = match &event.payload {
+        TwinEventPayload::MemoryReviewed(review) => {
+            let matches = ordered
+                .iter()
+                .filter_map(|candidate| match &candidate.payload {
+                    TwinEventPayload::MemoryProposed(proposal)
+                        if proposal.memory_id == review.memory_id =>
+                    {
+                        Some(candidate.event_id.clone())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            (matches.len() == 1).then(|| matches[0].clone())
+        }
+        TwinEventPayload::DecisionOutcomeRecorded(outcome) => {
+            let matches = ordered
+                .iter()
+                .filter_map(|candidate| match &candidate.payload {
+                    TwinEventPayload::DecisionRecorded(decision)
+                        if decision.decision_id == outcome.decision_id =>
+                    {
+                        Some(candidate.event_id.clone())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            (matches.len() == 1).then(|| matches[0].clone())
+        }
+        _ => Some(event.event_id.clone()),
+    }?;
+    if semantic != event.event_id {
+        dependencies.insert(semantic);
+    }
+    Some(dependencies)
+}
+
+fn events_known_at_reference(
+    ordered: &[TwinEvent],
+    reference_time: chrono::DateTime<Utc>,
+) -> Result<Vec<TwinEvent>> {
+    let mut known = ordered
+        .iter()
+        .filter(|event| event.recorded_at <= reference_time)
+        .cloned()
+        .collect::<Vec<_>>();
+    loop {
+        let known_ids = known
+            .iter()
+            .map(|event| event.event_id.clone())
+            .collect::<BTreeSet<_>>();
+        let rejected = known
+            .iter()
+            .filter(|event| {
+                export_dependencies(event, &known).is_none_or(|dependencies| {
+                    dependencies
+                        .iter()
+                        .any(|dependency| !known_ids.contains(dependency))
+                })
+            })
+            .map(|event| event.event_id.clone())
+            .collect::<BTreeSet<_>>();
+        if rejected.is_empty() {
+            break;
+        }
+        known.retain(|event| !rejected.contains(&event.event_id));
+    }
+    crate::services::twin_events::topological_order(&known).map_err(anyhow::Error::new)
+}
+
+fn retained_export_events(
+    events: Vec<TwinEvent>,
+    reference_time: chrono::DateTime<Utc>,
+) -> Result<Vec<TwinEvent>> {
+    let ordered =
+        crate::services::twin_events::topological_order(&events).map_err(anyhow::Error::new)?;
+    let known = events_known_at_reference(&ordered, reference_time)?;
+    let current_projection = crate::services::twin_events::project(&known, reference_time)
+        .map_err(anyhow::Error::new)?;
+    let accepted_memories = current_projection
+        .reviewed_memories
+        .iter()
+        .filter(|memory| {
+            memory.causal_stream == CausalStream::SyncEligible
+                && exposure_allows_export(&memory.governance)
+        })
+        .map(|memory| memory.item_id.clone())
+        .collect::<BTreeSet<_>>();
+    let active_superseded = active_superseded_ids(&known, reference_time);
+    let by_id = known
+        .iter()
+        .map(|event| (event.event_id.clone(), event))
+        .collect::<BTreeMap<_, _>>();
+    let mut retained = known
+        .iter()
+        .filter(|event| event_allows_export(event, &accepted_memories, &active_superseded))
+        .map(|event| event.event_id.clone())
+        .collect::<BTreeSet<_>>();
+
+    loop {
+        let rejected = retained
+            .iter()
+            .filter(|id| {
+                let event = by_id[id];
+                let dependencies = export_dependencies(event, &known);
+                let has_missing_dependency = dependencies
+                    .as_ref()
+                    .is_none_or(|ids| ids.iter().any(|dependency| !retained.contains(dependency)));
+                let has_no_retained_acceptance = match &event.payload {
+                    TwinEventPayload::MemoryProposed(proposal) => {
+                        !retained.iter().any(|candidate| {
+                            accepted_memory_id(by_id[candidate]) == Some(&proposal.memory_id)
+                        })
+                    }
+                    _ => false,
+                };
+                has_missing_dependency || has_no_retained_acceptance
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if rejected.is_empty() {
+            break;
+        }
+        for id in rejected {
+            retained.remove(&id);
+        }
+    }
+
+    let retained = known
+        .into_iter()
+        .filter(|event| retained.contains(&event.event_id))
+        .collect::<Vec<_>>();
+    crate::services::twin_events::topological_order(&retained).map_err(anyhow::Error::new)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExportSplit {
@@ -32,12 +279,55 @@ enum ExportSplit {
 
 impl TwinStore {
     pub fn export_bundle(&mut self, request: TwinExportRequest) -> Result<ExportBundle> {
-        self.ensure_record_cache()?;
+        let (bundle, _commit) = self.export_bundle_with_commit(request)?;
+        Ok(bundle)
+    }
+
+    pub(crate) fn export_bundle_with_commit(
+        &mut self,
+        request: TwinExportRequest,
+    ) -> Result<(ExportBundle, crate::services::twin_events::MutationCommit)> {
+        if self.event_recorder.is_noop() {
+            let (bundle, materialized_files) = self.materialize_export_bundle(&request)?;
+            for (path, content) in materialized_files {
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                crate::services::atomic_io::write_atomic(&path, content.as_bytes())?;
+            }
+            return Ok((bundle, Self::tokenless_mutation_commit()));
+        }
+
+        let mut committed_bundle = None;
+        let commit = self.commit_planned_twin_mutation(|store| {
+            let (bundle, materialized_files) = store.materialize_export_bundle(&request)?;
+            let targets = store.governed_json_targets(materialized_files)?;
+            committed_bundle = Some(bundle);
+            Ok(Some(crate::services::twin_events::MutationPlan::new(
+                crate::models::twin_event::CausalStream::SyncEligible,
+                crate::models::twin_event::SourceChannel::parse("legacy_twin")
+                    .map_err(anyhow::Error::msg)?,
+                targets,
+                Vec::new(),
+            )))
+        })?;
+        let bundle = committed_bundle
+            .ok_or_else(|| anyhow::anyhow!("Export mutation completed without a bundle"))?;
+        Ok((bundle, commit))
+    }
+
+    fn materialize_export_bundle(
+        &mut self,
+        request: &TwinExportRequest,
+    ) -> Result<(ExportBundle, Vec<(std::path::PathBuf, String)>)> {
+        self.invalidate_mutation_caches();
+        self.rebuild_mutation_caches()?;
 
         let eval_percentage = request.eval_percentage.unwrap_or(DEFAULT_EVAL_PERCENTAGE);
         let holdout_percentage = request
             .holdout_percentage
             .unwrap_or(DEFAULT_HOLDOUT_PERCENTAGE);
+        let reference_time = request.reference_time.unwrap_or_else(Utc::now);
 
         if eval_percentage + holdout_percentage >= 100 {
             anyhow::bail!("Eval and holdout percentages must total less than 100");
@@ -50,13 +340,6 @@ impl TwinStore {
         Self::validate_file_id(bundle_name)?;
 
         let output_dir = self.exports_path.join(bundle_name);
-        std::fs::create_dir_all(&output_dir).with_context(|| {
-            format!(
-                "Failed to create export directory: {}",
-                output_dir.display()
-            )
-        })?;
-
         let approved_path = output_dir.join("approved_user_records.jsonl");
         let candidate_path = output_dir.join("candidate_user_records.jsonl");
         let rejected_path = output_dir.join("rejected_user_records.jsonl");
@@ -68,7 +351,58 @@ impl TwinStore {
         let action_gaps_path = output_dir.join("action_gaps.jsonl");
         let decision_episodes_path = output_dir.join("decision_episodes.jsonl");
         let feedback_events_path = output_dir.join("feedback_events.jsonl");
+        let twin_events_path = output_dir.join("twin_events.jsonl");
+        let projection_manifest_path = output_dir.join("projection_manifest.json");
         let manifest_path = output_dir.join("manifest.json");
+        let mut materialized_files = Vec::new();
+
+        let retained_events =
+            retained_export_events(self.event_recorder.recorded_events()?, reference_time)?;
+        let twin_event_lines = retained_events
+            .iter()
+            .map(serde_json::to_string)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let projection = crate::services::twin_events::project(&retained_events, reference_time)
+            .map_err(anyhow::Error::new)?;
+        let reviewed_ids = projection
+            .reviewed_memories
+            .iter()
+            .map(|memory| memory.item_id.clone())
+            .collect::<BTreeSet<_>>();
+        let reviewed_relationship_groups = projection
+            .relationship_variants
+            .iter()
+            .filter_map(|group| {
+                let reviewed_memory_ids = group
+                    .reviewed_memory_ids
+                    .iter()
+                    .filter(|id| reviewed_ids.contains(*id))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                (!reviewed_memory_ids.is_empty()).then(|| {
+                    json!({
+                        "relationship_variant": group.relationship_variant,
+                        "reviewed_memory_ids": reviewed_memory_ids,
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+        let projection_manifest = json!({
+            "schema_version": PROJECTION_EXPORT_SCHEMA_VERSION,
+            "reference_time": reference_time,
+            "source_projection": {
+                "schema_version": projection.schema_version,
+                "projection_version": projection.projection_version,
+                "attention_profile_version": projection.attention_profile_version,
+                "snapshot_id": projection.snapshot_id,
+            },
+            "applied_event_ids": projection.applied_event_ids,
+            "reviewed_memories": projection.reviewed_memories,
+            "reviewed_relationship_groups": reviewed_relationship_groups,
+        });
+        let reviewed_memory_count = projection_manifest["reviewed_memories"]
+            .as_array()
+            .map_or(0, Vec::len);
 
         let mut records: Vec<UserRecord> = self.record_cache.values().cloned().collect();
         records.sort_by(|a, b| a.id.cmp(&b.id));
@@ -86,7 +420,7 @@ impl TwinStore {
             let line = serde_json::to_string(&Self::record_to_export_value(&record))?;
 
             match record.promotion_state {
-                PromotionState::AutoPromoted | PromotionState::Endorsed => {
+                PromotionState::Endorsed => {
                     included_record_ids.push(record.id.clone());
                     approved_lines.push(line.clone());
                     match Self::split_for_record(&record, eval_percentage, holdout_percentage) {
@@ -101,18 +435,20 @@ impl TwinStore {
                 PromotionState::Rejected => {
                     rejected_lines.push(line);
                 }
-                PromotionState::Private | PromotionState::NoTrain => {
+                PromotionState::AutoPromoted
+                | PromotionState::Private
+                | PromotionState::NoTrain => {
                     private_or_no_train_record_ids.push(record.id.clone());
                 }
             }
         }
 
-        self.write_jsonl_file(&approved_path, &approved_lines)?;
-        self.write_jsonl_file(&candidate_path, &candidate_lines)?;
-        self.write_jsonl_file(&rejected_path, &rejected_lines)?;
-        self.write_jsonl_file(&train_path, &train_lines)?;
-        self.write_jsonl_file(&eval_path, &eval_lines)?;
-        self.write_jsonl_file(&holdout_path, &holdout_lines)?;
+        materialized_files.push(Self::jsonl_target(&approved_path, &approved_lines));
+        materialized_files.push(Self::jsonl_target(&candidate_path, &candidate_lines));
+        materialized_files.push(Self::jsonl_target(&rejected_path, &rejected_lines));
+        materialized_files.push(Self::jsonl_target(&train_path, &train_lines));
+        materialized_files.push(Self::jsonl_target(&eval_path, &eval_lines));
+        materialized_files.push(Self::jsonl_target(&holdout_path, &holdout_lines));
         let decision_mirror_config = self.get_decision_mirror_config()?;
         let benchmark_lines = self
             .list_decision_episodes_with_reflections()?
@@ -133,19 +469,21 @@ impl TwinStore {
                 }))
             })
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        self.write_jsonl_file(&benchmark_path, &benchmark_lines)?;
+        materialized_files.push(Self::jsonl_target(&benchmark_path, &benchmark_lines));
         let constitution_lines = self
             .list_constitution_items()?
             .into_iter()
+            .filter(|item| !self.artifact_has_only_legacy_auto_support(&item.linked_record_ids))
             .map(|item| serde_json::to_string(&item))
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        self.write_jsonl_file(&constitution_path, &constitution_lines)?;
+        materialized_files.push(Self::jsonl_target(&constitution_path, &constitution_lines));
         let action_gap_lines = self
             .list_action_gaps()?
             .into_iter()
+            .filter(|gap| !self.artifact_has_only_legacy_auto_support(&gap.linked_record_ids))
             .map(|gap| serde_json::to_string(&gap))
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        self.write_jsonl_file(&action_gaps_path, &action_gap_lines)?;
+        materialized_files.push(Self::jsonl_target(&action_gaps_path, &action_gap_lines));
 
         // Decision episodes with sealed-prediction integrity: while an
         // episode has no recorded choice, its prediction exports as a
@@ -174,7 +512,10 @@ impl TwinStore {
                 serde_json::to_string(&value).map_err(anyhow::Error::from)
             })
             .collect::<Result<Vec<_>>>()?;
-        self.write_jsonl_file(&decision_episodes_path, &decision_episode_lines)?;
+        materialized_files.push(Self::jsonl_target(
+            &decision_episodes_path,
+            &decision_episode_lines,
+        ));
 
         // Ranking / Matches-Me / insight raw material. Privacy rule: skip
         // events that are evidence for records now marked Rejected, Private,
@@ -185,7 +526,10 @@ impl TwinStore {
             .filter(|record| {
                 matches!(
                     record.promotion_state,
-                    PromotionState::Rejected | PromotionState::Private | PromotionState::NoTrain
+                    PromotionState::AutoPromoted
+                        | PromotionState::Rejected
+                        | PromotionState::Private
+                        | PromotionState::NoTrain
                 )
             })
             .flat_map(|record| {
@@ -223,57 +567,103 @@ impl TwinStore {
                     .collect::<Vec<_>>()
             })
             .collect::<Result<Vec<_>>>()?;
-        self.write_jsonl_file(&feedback_events_path, &feedback_event_lines)?;
+        materialized_files.push(Self::jsonl_target(
+            &feedback_events_path,
+            &feedback_event_lines,
+        ));
+        materialized_files.push(Self::jsonl_target(&twin_events_path, &twin_event_lines));
+        materialized_files.push((
+            projection_manifest_path.clone(),
+            serde_json::to_string_pretty(&projection_manifest)?,
+        ));
 
         let manifest = serde_json::json!({
-            "bundle_schema_version": 2,
-            "generated_at": Utc::now(),
-            "root_path": self.root_path.display().to_string(),
+            "bundle_schema_version": EXPORT_BUNDLE_SCHEMA_VERSION,
+            "generated_at": reference_time,
+            "reference_time": reference_time,
             "eval_percentage": eval_percentage,
             "holdout_percentage": holdout_percentage,
             "included_record_ids": included_record_ids,
+            "split_files": {
+                "train": {
+                    "path": "train.jsonl",
+                    "count": train_lines.len(),
+                },
+                "eval": {
+                    "path": "eval.jsonl",
+                    "count": eval_lines.len(),
+                },
+                "holdout": {
+                    "path": "holdout.jsonl",
+                    "count": holdout_lines.len(),
+                },
+            },
             "record_files": {
                 "approved_user_records": {
-                    "path": approved_path.display().to_string(),
+                    "path": "approved_user_records.jsonl",
                     "count": approved_lines.len(),
                 },
                 "candidate_user_records": {
-                    "path": candidate_path.display().to_string(),
+                    "path": "candidate_user_records.jsonl",
                     "count": candidate_lines.len(),
                 },
                 "rejected_user_records": {
-                    "path": rejected_path.display().to_string(),
+                    "path": "rejected_user_records.jsonl",
                     "count": rejected_lines.len(),
                 },
                 "decision_mirror_benchmark": {
-                    "path": benchmark_path.display().to_string(),
+                    "path": "decision_mirror_benchmark.jsonl",
                     "count": benchmark_lines.len(),
                 },
                 "constitution_items": {
-                    "path": constitution_path.display().to_string(),
+                    "path": "constitution_items.jsonl",
                     "count": constitution_lines.len(),
                 },
                 "action_gaps": {
-                    "path": action_gaps_path.display().to_string(),
+                    "path": "action_gaps.jsonl",
                     "count": action_gap_lines.len(),
                 },
                 "decision_episodes": {
-                    "path": decision_episodes_path.display().to_string(),
+                    "path": "decision_episodes.jsonl",
                     "count": decision_episode_lines.len(),
                 },
                 "feedback_events": {
-                    "path": feedback_events_path.display().to_string(),
+                    "path": "feedback_events.jsonl",
                     "count": feedback_event_lines.len(),
+                },
+            },
+            "event_files": {
+                "twin_events": {
+                    "path": "twin_events.jsonl",
+                    "schema_version": 1,
+                    "count": twin_event_lines.len(),
+                },
+                "projection_manifest": {
+                    "path": "projection_manifest.json",
+                    "schema_version": PROJECTION_EXPORT_SCHEMA_VERSION,
+                    "count": reviewed_memory_count,
                 },
             },
             "excluded_counts": {
                 "private_or_no_train": private_or_no_train_record_ids.len(),
             }
         });
-        self.write_pretty_json(&manifest_path, &manifest)?;
+        materialized_files.push((
+            manifest_path.clone(),
+            serde_json::to_string_pretty(&manifest)?,
+        ));
 
-        Ok(ExportBundle {
+        let bundle = ExportBundle {
             output_dir: output_dir.display().to_string(),
+            reference_time,
+            twin_events: ExportFileSummary {
+                path: twin_events_path.display().to_string(),
+                count: twin_event_lines.len(),
+            },
+            projection_manifest: ExportFileSummary {
+                path: projection_manifest_path.display().to_string(),
+                count: reviewed_memory_count,
+            },
             approved_user_records: ExportFileSummary {
                 path: approved_path.display().to_string(),
                 count: approved_lines.len(),
@@ -321,7 +711,8 @@ impl TwinStore {
             manifest_path: manifest_path.display().to_string(),
             included_records: train_lines.len() + eval_lines.len() + holdout_lines.len(),
             excluded_records: private_or_no_train_record_ids.len(),
-        })
+        };
+        Ok((bundle, materialized_files))
     }
 
     fn split_for_record(
@@ -371,13 +762,12 @@ impl TwinStore {
         })
     }
 
-    fn write_jsonl_file(&self, path: &Path, lines: &[String]) -> Result<()> {
+    fn jsonl_target(path: &Path, lines: &[String]) -> (std::path::PathBuf, String) {
         let mut content = lines.join("\n");
         if !content.is_empty() {
             content.push('\n');
         }
-        write_atomic(path, content.as_bytes())
-            .with_context(|| format!("Failed to write JSONL file: {}", path.display()))
+        (path.to_path_buf(), content)
     }
 }
 
@@ -387,25 +777,133 @@ mod tests {
     use crate::models::twin::{default_record_confidence, PromotionState, UserRecordKind};
     use tempfile::tempdir;
 
+    fn coordinated_store(
+        root: &std::path::Path,
+    ) -> (
+        TwinStore,
+        std::sync::Arc<crate::services::twin_events::MutationCoordinator>,
+    ) {
+        let data = root.join("data");
+        let vault = root.join("vault");
+        let twin_root = data.join("twin").join("scope-one");
+        std::fs::create_dir_all(&twin_root).unwrap();
+        std::fs::create_dir(&vault).unwrap();
+        let events = std::sync::Arc::new(crate::services::twin_events::TwinEventStore::new(&data));
+        events.initialize().unwrap();
+        let coordinator = std::sync::Arc::new(
+            crate::services::twin_events::MutationCoordinator::new(
+                &data,
+                &vault,
+                events,
+                std::sync::Arc::new(crate::services::twin_events::NoopMutationLifecycle),
+            )
+            .unwrap(),
+        );
+        (
+            TwinStore::with_event_recorder(twin_root, data.join("twin"), coordinator.clone()),
+            coordinator,
+        )
+    }
+
+    #[test]
+    fn coordinated_export_installs_the_complete_bundle_in_one_authority_generation() {
+        let root = tempdir().unwrap();
+        let (mut store, coordinator) = coordinated_store(root.path());
+        let before = coordinator.current_authority_token().unwrap();
+
+        let (bundle, commit) = store
+            .export_bundle_with_commit(TwinExportRequest::default())
+            .unwrap();
+
+        let committed = commit
+            .authority_token
+            .as_ref()
+            .expect("export must return its authority token");
+        assert_eq!(
+            committed.authority_generation,
+            before.authority_generation + 1
+        );
+        assert_eq!(committed, &coordinator.current_authority_token().unwrap());
+        for path in [
+            &bundle.approved_user_records.path,
+            &bundle.candidate_user_records.path,
+            &bundle.rejected_user_records.path,
+            &bundle.train.path,
+            &bundle.eval.path,
+            &bundle.holdout.path,
+            &bundle.manifest_path,
+        ] {
+            assert!(std::path::Path::new(path).is_file(), "missing {path}");
+        }
+    }
+
+    #[test]
+    fn coordinated_export_reloads_peer_records_inside_its_single_mutation() {
+        let root = tempdir().unwrap();
+        let (mut exporter, coordinator) = coordinated_store(root.path());
+        assert!(exporter.list_user_records().unwrap().is_empty());
+        let data = root.path().join("data");
+        let mut peer = TwinStore::with_event_recorder(
+            data.join("twin/scope-one"),
+            data.join("twin"),
+            coordinator.clone(),
+        );
+        let (record, _) = peer
+            .create_user_record_with_commit(UserRecordCreate {
+                kind: UserRecordKind::Fact,
+                content: "Peer record must be exported".to_string(),
+                origin: RecordOrigin::User,
+                evidence_refs: Vec::new(),
+                confidence: 0.9,
+                promotion_state: Some(PromotionState::Candidate),
+                valid_from: None,
+                valid_until: None,
+                links: Vec::new(),
+                metadata: HashMap::new(),
+            })
+            .unwrap();
+        let before_export = coordinator.current_authority_token().unwrap();
+
+        let (bundle, commit) = exporter
+            .export_bundle_with_commit(TwinExportRequest::default())
+            .unwrap();
+
+        assert_eq!(bundle.candidate_user_records.count, 1);
+        assert!(std::fs::read_to_string(&bundle.candidate_user_records.path)
+            .unwrap()
+            .contains(&record.id));
+        assert_eq!(
+            commit
+                .authority_token
+                .as_ref()
+                .unwrap()
+                .authority_generation,
+            before_export.authority_generation + 1
+        );
+    }
+
     #[test]
     fn export_separates_approved_candidate_and_rejected_records() {
         let temp_dir = tempdir().expect("temp dir should be created");
         let mut store = TwinStore::new(temp_dir.path().to_path_buf());
 
-        store
+        let approved = store
             .create_user_record(UserRecordCreate {
                 kind: UserRecordKind::Fact,
                 content: "Approved".to_string(),
                 origin: RecordOrigin::User,
                 evidence_refs: Vec::new(),
                 confidence: 0.9,
-                promotion_state: Some(PromotionState::Endorsed),
+                promotion_state: Some(PromotionState::Candidate),
                 valid_from: None,
                 valid_until: None,
                 links: Vec::new(),
                 metadata: HashMap::new(),
             })
             .expect("approved record should be created");
+        store
+            .set_user_record_promotion(&approved.id, PromotionState::Endorsed, None)
+            .expect("approved record should be endorsed explicitly");
         store
             .create_user_record(UserRecordCreate {
                 kind: UserRecordKind::Preference,
@@ -420,20 +918,23 @@ mod tests {
                 metadata: HashMap::new(),
             })
             .expect("candidate record should be created");
-        store
+        let rejected = store
             .create_user_record(UserRecordCreate {
                 kind: UserRecordKind::ReasoningPattern,
                 content: "Rejected".to_string(),
                 origin: RecordOrigin::Inferred,
                 evidence_refs: Vec::new(),
                 confidence: 0.8,
-                promotion_state: Some(PromotionState::Rejected),
+                promotion_state: Some(PromotionState::Candidate),
                 valid_from: None,
                 valid_until: None,
                 links: Vec::new(),
                 metadata: HashMap::new(),
             })
             .expect("rejected record should be created");
+        store
+            .set_user_record_promotion(&rejected.id, PromotionState::Rejected, None)
+            .expect("record should be rejected explicitly");
 
         let bundle = store
             .export_bundle(TwinExportRequest::default())
@@ -445,6 +946,123 @@ mod tests {
         assert!(std::path::Path::new(&bundle.approved_user_records.path).exists());
         assert!(std::path::Path::new(&bundle.candidate_user_records.path).exists());
         assert!(std::path::Path::new(&bundle.rejected_user_records.path).exists());
+    }
+
+    #[test]
+    fn legacy_auto_promoted_is_excluded_from_every_export_and_training_split() {
+        let temp_dir = tempdir().expect("temp dir should be created");
+        let mut store = TwinStore::new(temp_dir.path().to_path_buf());
+        let now = Utc::now();
+        let legacy = UserRecord {
+            id: "legacy-auto".to_string(),
+            kind: UserRecordKind::Preference,
+            content: "legacy content must not export".to_string(),
+            evidence_refs: Vec::new(),
+            confidence: 1.0,
+            origin: RecordOrigin::Inferred,
+            promotion_state: PromotionState::AutoPromoted,
+            created_at: now,
+            updated_at: now,
+            valid_from: None,
+            valid_until: None,
+            links: Vec::new(),
+            metadata: HashMap::new(),
+        };
+        store.record_cache.insert(legacy.id.clone(), legacy);
+        store.records_cache_ready = true;
+        let bundle = store.export_bundle(TwinExportRequest::default()).unwrap();
+        for path in [
+            &bundle.approved_user_records.path,
+            &bundle.candidate_user_records.path,
+            &bundle.rejected_user_records.path,
+            &bundle.train.path,
+            &bundle.eval.path,
+            &bundle.holdout.path,
+        ] {
+            let content = std::fs::read_to_string(path).unwrap();
+            assert!(!content.contains("legacy content must not export"));
+        }
+        assert_eq!(bundle.included_records, 0);
+    }
+
+    #[test]
+    fn materialized_legacy_artifacts_are_excluded_from_exports_and_benchmarks() {
+        let temp_dir = tempdir().expect("temp dir should be created");
+        let mut store = TwinStore::new(temp_dir.path().to_path_buf());
+        let now = Utc::now();
+        let legacy = UserRecord {
+            id: "legacy-artifact-record".to_string(),
+            kind: UserRecordKind::Preference,
+            content: "legacy artifact authority".to_string(),
+            evidence_refs: Vec::new(),
+            confidence: 1.0,
+            origin: RecordOrigin::Inferred,
+            promotion_state: PromotionState::AutoPromoted,
+            created_at: now,
+            updated_at: now,
+            valid_from: None,
+            valid_until: None,
+            links: Vec::new(),
+            metadata: HashMap::new(),
+        };
+        assert!(store
+            .write_pretty_json(
+                &store.records_path.join("legacy-artifact-record.json"),
+                &legacy,
+            )
+            .unwrap()
+            .authority_token
+            .is_none());
+        let item = store
+            .create_constitution_item(crate::models::twin::ConstitutionItemCreate {
+                claim: "legacy-only constitution export".to_string(),
+                dimension: "values".to_string(),
+                scope: Vec::new(),
+                priority: 1.0,
+                confidence: 1.0,
+                status: crate::models::twin::ConstitutionStatus::Active,
+                evidence_refs: Vec::new(),
+                tensions: Vec::new(),
+                linked_record_ids: vec![legacy.id.clone()],
+                source: None,
+            })
+            .unwrap();
+        let gap = store
+            .create_action_gap(crate::models::twin::ActionGapCreate {
+                stated_value: "Move quickly".to_string(),
+                revealed_behavior: "Waited".to_string(),
+                driver_hypothesis: None,
+                somatic_taste_signal: None,
+                decision_risk: "legacy-only action gap export".to_string(),
+                evidence_refs: Vec::new(),
+                linked_record_ids: vec![legacy.id],
+                confidence: 1.0,
+                status: crate::models::twin::ConstitutionStatus::Active,
+            })
+            .unwrap();
+        store
+            .record_reflection_card(crate::models::twin::ReflectionCardCreate {
+                decision_episode_id: "legacy-decision".to_string(),
+                session_id: "legacy-session".to_string(),
+                tile_id: "legacy-tile".to_string(),
+                model_id: "test-model".to_string(),
+                content: "Decision frame with cited legacy evidence".to_string(),
+                cited_note_ids: Vec::new(),
+                cited_user_record_ids: Vec::new(),
+                cited_constitution_item_ids: vec![item.id.clone()],
+                cited_action_gap_ids: vec![gap.id.clone()],
+                evidence_packet: None,
+            })
+            .unwrap();
+
+        let bundle = store.export_bundle(TwinExportRequest::default()).unwrap();
+        let constitution = std::fs::read_to_string(&bundle.constitution_items.path).unwrap();
+        let gaps = std::fs::read_to_string(&bundle.action_gaps.path).unwrap();
+        let benchmark = std::fs::read_to_string(&bundle.decision_mirror_benchmark.path).unwrap();
+        assert!(!constitution.contains(&item.id));
+        assert!(!gaps.contains(&gap.id));
+        assert!(!benchmark.contains(&item.id));
+        assert!(!benchmark.contains(&gap.id));
     }
 
     fn prediction_options() -> Vec<String> {
@@ -506,7 +1124,7 @@ mod tests {
                 json!({"ranking": ["a", "b"]}),
             )
             .expect("event should append");
-        store
+        let private = store
             .create_user_record(UserRecordCreate {
                 kind: UserRecordKind::Preference,
                 content: "Private claim".to_string(),
@@ -525,13 +1143,16 @@ mod tests {
                     speaker_role: None,
                 }],
                 confidence: default_record_confidence(),
-                promotion_state: Some(PromotionState::Private),
+                promotion_state: Some(PromotionState::Candidate),
                 valid_from: None,
                 valid_until: None,
                 links: Vec::new(),
                 metadata: HashMap::new(),
             })
             .expect("private record should be created");
+        store
+            .set_user_record_promotion(&private.id, PromotionState::Private, None)
+            .expect("record should be made private explicitly");
 
         let bundle = store
             .export_bundle(TwinExportRequest::default())
@@ -562,3 +1183,7 @@ mod tests {
         assert!(feedback_content.contains(&exportable_event.id));
     }
 }
+
+#[cfg(test)]
+#[path = "export_events_tests.rs"]
+mod export_events_tests;

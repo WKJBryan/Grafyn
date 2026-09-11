@@ -1,6 +1,8 @@
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
-import { boot as bootApi } from '@/api/client'
+import { boot as bootApi, runtime as runtimeApi } from '@/api/client'
+import { getTransport, setRuntimeStatus } from '@/api/transport'
+import { normalizeRuntimeStatus } from '@/platform/capabilities'
 
 const BOOT_POLL_INTERVAL_MS = 2000
 const BOOT_WATCHDOG_INTERVAL_MS = 1000
@@ -18,6 +20,10 @@ function defaultStatus() {
 
 function isTerminalStatus(status) {
   return !!status?.ready || status?.phase === 'failed' || !!status?.error
+}
+
+function isTerminalFailure(status) {
+  return status?.phase === 'failed' || !!status?.error
 }
 
 function progressSignature(status) {
@@ -147,6 +153,18 @@ export const useBootStore = defineStore('boot', () => {
     applyNonTerminalStatus(nextStatus)
   }
 
+  async function applyAuthoritativeStatus(nextStatus = defaultStatus()) {
+    if (isTerminalFailure(nextStatus)) {
+      setRuntimeStatus(null)
+      try {
+        setRuntimeStatus(normalizeRuntimeStatus(await runtimeApi.getStatus()))
+      } catch (runtimeError) {
+        console.error('Failed to refresh runtime capability status:', runtimeError)
+      }
+    }
+    setStatus(nextStatus)
+  }
+
   function dismissSplash() {
     dismissed.value = true
   }
@@ -159,7 +177,7 @@ export const useBootStore = defineStore('boot', () => {
       const current = await bootApi.status()
 
       if (isTerminalStatus(current)) {
-        setStatus(current)
+        await applyAuthoritativeStatus(current)
       } else {
         applyNonTerminalStatus(current)
       }
@@ -197,18 +215,18 @@ export const useBootStore = defineStore('boot', () => {
 
     try {
       if (!listening.value) {
-        const { listen } = await import('@tauri-apps/api/event')
-        unlisten = await listen('boot-status', (event) => {
-          setStatus(event.payload)
+        unlisten = await getTransport().listen('boot-status', (event) => {
+          void applyAuthoritativeStatus(event.payload)
         })
         listening.value = true
       }
 
       const current = await bootApi.status()
-      setStatus(current)
+      await applyAuthoritativeStatus(current)
     } catch (err) {
       clearSyntheticFailure()
       stopMonitoring()
+      setRuntimeStatus(null)
       setStatus({
         phase: 'failed',
         message: 'Startup failed',

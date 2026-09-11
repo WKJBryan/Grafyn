@@ -104,7 +104,7 @@
             </button>
             <button
               class="dropdown-item"
-              title="Capture a durable fact, preference, or reasoning record"
+              title="Capture a durable fact or reasoning record"
               @click="handleTwinMenuAction(handleCaptureInsight)"
             >
               Capture Insight
@@ -292,6 +292,14 @@
       </button>
       <button
         class="btn btn-secondary"
+        type="button"
+        aria-label="Open image generation"
+        @click="showImageGeneration = true"
+      >
+        Generate Image
+      </button>
+      <button
+        class="btn btn-secondary"
         :disabled="selectedLLMNodes.length < 2"
         @click="handleStartDebate"
       >
@@ -322,6 +330,11 @@
       @create-preset="handleCreatePreset"
       @update-preset="handleUpdatePreset"
       @delete-preset="handleDeletePreset"
+    />
+
+    <ImageGenerationDialog
+      v-if="showImageGeneration"
+      @close="showImageGeneration = false"
     />
 
     <!-- Add Model Dialog -->
@@ -421,6 +434,7 @@ import LLMNode from './LLMNode.vue'
 import DebateNode from './DebateNode.vue'
 import PromptDialog from './PromptDialog.vue'
 import AddModelDialog from './AddModelDialog.vue'
+import ImageGenerationDialog from './ImageGenerationDialog.vue'
 import PinnedNotesPanel from './PinnedNotesPanel.vue'
 import GIcon from '@/components/ui/GIcon.vue'
 
@@ -444,6 +458,7 @@ const surface = ref(null)
 const viewport = ref({ x: 0, y: 0, zoom: 1 })
 const selectedNodes = ref([])  // Format: "prompt:{id}", "llm:{tileId}:{modelId}", "debate:{id}"
 const showPromptDialog = ref(false)
+const showImageGeneration = ref(false)
 const saving = ref(false)
 const exportingTwin = ref(false)
 const saveMessage = ref(null)
@@ -473,28 +488,18 @@ const promptTiles = computed(() => canvasStore.promptTiles)
 const debates = computed(() => canvasStore.debates)
 const availableModels = computed(() => canvasStore.availableModels)
 const compactToolbarStats = computed(() => {
-  const parts = [
+  return [
     formatCount(promptTiles.value.length, 'prompt'),
     formatCount(llmNodes.value.length, 'response'),
     formatCount(debates.value.length, 'debate')
-  ]
-  const memory = session.value?.working_memory
-  if (memory?.summary) {
-    parts.push(`Memory · v${memory.version || 1}`)
-  }
-  return parts.join(' / ')
+  ].join(' / ')
 })
 const toolbarStatsTitle = computed(() => {
-  const parts = [
+  return [
     formatCount(promptTiles.value.length, 'prompt', true),
     formatCount(llmNodes.value.length, 'response', true),
     formatCount(debates.value.length, 'debate', true)
-  ]
-  const memory = session.value?.working_memory
-  if (memory?.summary) {
-    parts.push(memory.question || memory.summary)
-  }
-  return parts.join(', ')
+  ].join(', ')
 })
 const loading = computed(() => canvasStore.loading)
 const streamingModels = computed(() => canvasStore.streamingModels)
@@ -1163,14 +1168,21 @@ async function handleCaptureInsight() {
   if (!session.value) return
 
   const kind = globalThis.prompt?.(
-    'Record kind? Use fact, preference, or reasoning_pattern.',
+    'Record kind? Use fact or reasoning_pattern.',
     'fact'
   )
   if (typeof kind !== 'string') return
 
   const normalizedKind = kind.trim().toLowerCase()
-  if (!['fact', 'preference', 'reasoning_pattern'].includes(normalizedKind)) {
-    showCanvasMessage('error', 'Insight kind must be fact, preference, or reasoning_pattern')
+  if (normalizedKind === 'preference') {
+    showCanvasMessage(
+      'error',
+      'Use Capture Twin preference on a completed global response so it remains reviewed evidence.'
+    )
+    return
+  }
+  if (!['fact', 'reasoning_pattern'].includes(normalizedKind)) {
+    showCanvasMessage('error', 'Insight kind must be fact or reasoning_pattern')
     return
   }
 
@@ -1459,6 +1471,7 @@ async function handlePromptSubmit({
         decisionMetadata,
         reasoningEffort,
         selectedTwinLlmProvider,
+        null,
         activeBranchContext.parentDebateId
       )
     } else if (activeBranchContext) {

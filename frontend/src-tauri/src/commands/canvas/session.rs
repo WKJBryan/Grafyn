@@ -1,5 +1,7 @@
-use super::shared::append_canvas_trace;
-use crate::commands::commit_note_write;
+use super::shared::{
+    append_canvas_trace_expecting_authority, append_optional_canvas_audit_trace,
+    preserve_canvas_mutation_error, repair_canvas_trace_error,
+};
 use crate::models::canvas::{
     AvailableModel, CanvasSession, CanvasViewport, LLMNodePositionUpdate, ResponseStatus,
     SessionCreate, SessionMeta, SessionUpdate, TilePosition, TilePositionUpdate,
@@ -9,20 +11,44 @@ use crate::models::twin::TraceEventType;
 use crate::AppState;
 use serde_json::json;
 use std::collections::HashMap;
-use tauri::State;
+use tauri::{Emitter, State};
+
+async fn repair_optional_canvas_audit_trace(
+    state: &AppState,
+    commit: Option<crate::services::twin_events::MutationCommit>,
+    operation: &str,
+) {
+    if let Some(commit) = commit {
+        crate::commands::acknowledge_reported_repair(
+            crate::commands::repair_after_authority_mutation(state, &commit, operation).await,
+        );
+    }
+}
 
 /// List all canvas sessions
 #[tauri::command]
 pub async fn list_sessions(state: State<'_, AppState>) -> Result<Vec<SessionMeta>, String> {
-    let mut store = state.canvas_store.write().await;
-    store.list_sessions().map_err(|e| e.to_string())
+    let root_ticket = crate::commands::acquire_root_epoch(state.inner()).await?;
+    let result = {
+        let mut store = state.canvas_store.write().await;
+        store.reload_authoritative_state();
+        store.list_sessions().map_err(|e| e.to_string())?
+    };
+    root_ticket.finish(state.inner()).await?;
+    Ok(result)
 }
 
 /// Get a single session by ID
 #[tauri::command]
 pub async fn get_session(id: String, state: State<'_, AppState>) -> Result<CanvasSession, String> {
-    let mut store = state.canvas_store.write().await;
-    store.get_session(&id).map_err(|e| e.to_string())
+    let root_ticket = crate::commands::acquire_root_epoch(state.inner()).await?;
+    let result = {
+        let mut store = state.canvas_store.write().await;
+        store.reload_authoritative_state();
+        store.get_session(&id).map_err(|e| e.to_string())?
+    };
+    root_ticket.finish(state.inner()).await?;
+    Ok(result)
 }
 
 /// Create a new canvas session
@@ -31,11 +57,12 @@ pub async fn create_session(
     session: SessionCreate,
     state: State<'_, AppState>,
 ) -> Result<CanvasSession, String> {
+    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
     let mut store = state.canvas_store.write().await;
     let created = store.create_session(session).map_err(|e| e.to_string())?;
     drop(store);
 
-    append_canvas_trace(
+    let trace_commit = append_optional_canvas_audit_trace(
         state.twin_store.clone(),
         &created.id,
         TraceEventType::SessionCreated,
@@ -47,6 +74,7 @@ pub async fn create_session(
         }),
     )
     .await;
+    repair_optional_canvas_audit_trace(state.inner(), trace_commit, "Canvas session create").await;
 
     Ok(created)
 }
@@ -58,13 +86,14 @@ pub async fn update_session(
     update: SessionUpdate,
     state: State<'_, AppState>,
 ) -> Result<CanvasSession, String> {
+    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
     let mut store = state.canvas_store.write().await;
     let updated = store
         .update_session(&id, update)
         .map_err(|e| e.to_string())?;
     drop(store);
 
-    append_canvas_trace(
+    let trace_commit = append_optional_canvas_audit_trace(
         state.twin_store.clone(),
         &updated.id,
         TraceEventType::SessionUpdated,
@@ -78,6 +107,7 @@ pub async fn update_session(
         }),
     )
     .await;
+    repair_optional_canvas_audit_trace(state.inner(), trace_commit, "Canvas session update").await;
 
     Ok(updated)
 }
@@ -85,11 +115,12 @@ pub async fn update_session(
 /// Delete a canvas session
 #[tauri::command]
 pub async fn delete_session(id: String, state: State<'_, AppState>) -> Result<(), String> {
+    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
     let mut store = state.canvas_store.write().await;
     store.delete_session(&id).map_err(|e| e.to_string())?;
     drop(store);
 
-    append_canvas_trace(
+    let trace_commit = append_optional_canvas_audit_trace(
         state.twin_store.clone(),
         &id,
         TraceEventType::SessionDeleted,
@@ -98,6 +129,7 @@ pub async fn delete_session(id: String, state: State<'_, AppState>) -> Result<()
         }),
     )
     .await;
+    repair_optional_canvas_audit_trace(state.inner(), trace_commit, "Canvas session delete").await;
 
     Ok(())
 }
@@ -122,6 +154,7 @@ pub async fn update_tile_position(
     position: TilePositionUpdate,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
+    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
     let mut store = state.canvas_store.write().await;
     store
         .update_tile_position(&session_id, &tile_id, position)
@@ -136,13 +169,14 @@ pub async fn delete_tile(
     tile_id: String,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
+    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
     let mut store = state.canvas_store.write().await;
     store
         .delete_tile(&session_id, &tile_id)
         .map_err(|e| e.to_string())?;
     drop(store);
 
-    append_canvas_trace(
+    let trace_commit = append_optional_canvas_audit_trace(
         state.twin_store.clone(),
         &session_id,
         TraceEventType::TileDeleted,
@@ -151,6 +185,7 @@ pub async fn delete_tile(
         }),
     )
     .await;
+    repair_optional_canvas_audit_trace(state.inner(), trace_commit, "Canvas tile delete").await;
 
     Ok(())
 }
@@ -163,13 +198,14 @@ pub async fn delete_response(
     model_id: String,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
+    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
     let mut store = state.canvas_store.write().await;
     store
         .delete_response(&session_id, &tile_id, &model_id)
         .map_err(|e| e.to_string())?;
     drop(store);
 
-    append_canvas_trace(
+    let trace_commit = append_optional_canvas_audit_trace(
         state.twin_store.clone(),
         &session_id,
         TraceEventType::ResponseDeleted,
@@ -179,6 +215,7 @@ pub async fn delete_response(
         }),
     )
     .await;
+    repair_optional_canvas_audit_trace(state.inner(), trace_commit, "Canvas response delete").await;
 
     Ok(())
 }
@@ -190,6 +227,7 @@ pub async fn update_viewport(
     viewport: CanvasViewport,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
+    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
     let mut store = state.canvas_store.write().await;
     store
         .update_viewport(&session_id, viewport)
@@ -205,6 +243,7 @@ pub async fn update_llm_node_position(
     position: LLMNodePositionUpdate,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
+    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
     let mut store = state.canvas_store.write().await;
     store
         .update_llm_node_position(&session_id, &tile_id, &model_id, position)
@@ -218,6 +257,7 @@ pub async fn auto_arrange(
     positions: HashMap<String, TilePosition>,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
+    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
     let mut store = state.canvas_store.write().await;
     store
         .batch_update_positions(&session_id, positions)
@@ -227,10 +267,14 @@ pub async fn auto_arrange(
 /// Export canvas session to a note (returns note info)
 #[tauri::command]
 pub async fn export_to_note(
+    window: tauri::WebviewWindow,
     session_id: String,
     state: State<'_, AppState>,
 ) -> Result<serde_json::Value, String> {
+    let root_ticket = crate::commands::acquire_root_epoch(state.inner()).await?;
+    let input_authority = root_ticket.authority().clone();
     let mut store = state.canvas_store.write().await;
+    store.reload_authoritative_state();
     let session = store.get_session(&session_id).map_err(|e| e.to_string())?;
     drop(store);
 
@@ -273,8 +317,9 @@ pub async fn export_to_note(
     // Create note via knowledge store
     let mut ks = state.knowledge_store.write().await;
 
-    let note = ks
-        .create_note(NoteCreate {
+    root_ticket.validate(state.inner()).await?;
+    let note_result = ks.create_note_expecting_authority(
+        NoteCreate {
             title: session.title.clone(),
             content,
             relative_path: None,
@@ -285,14 +330,29 @@ pub async fn export_to_note(
             migration_source: None,
             optimizer_managed: false,
             properties: HashMap::new(),
-        })
-        .map_err(|e| e.to_string())?;
+        },
+        "canvas",
+        input_authority,
+    );
+    let (note, note_commit) = match note_result {
+        Ok(committed) => committed,
+        Err(error) => {
+            let error = preserve_canvas_mutation_error(error);
+            drop(ks);
+            drop(root_ticket);
+            crate::commands::acknowledge_reported_repair(
+                repair_canvas_trace_error(state.inner(), &error, "Canvas note export").await,
+            );
+            return Err(error.to_string());
+        }
+    };
 
     drop(ks);
 
-    commit_note_write(state.inner(), &note.id, "note_exported").await?;
-
-    append_canvas_trace(
+    let Some(note_authority) = note_commit.authority_token.clone() else {
+        return Err("Canvas export did not advance the content authority generation".into());
+    };
+    let trace_commit = match append_canvas_trace_expecting_authority(
         state.twin_store.clone(),
         &session_id,
         TraceEventType::NoteExported,
@@ -300,9 +360,47 @@ pub async fn export_to_note(
             "note_id": note.id.clone(),
             "title": note.title.clone(),
         }),
+        note_authority,
     )
-    .await;
-
+    .await
+    {
+        Ok(commit) => commit,
+        Err(error) => {
+            let error = error.with_fallback_commit(note_commit.clone());
+            drop(root_ticket);
+            crate::commands::acknowledge_reported_repair(
+                repair_canvas_trace_error(state.inner(), &error, "Canvas note export").await,
+            );
+            log::error!(
+                "Canvas note export committed, but its audit trace could not be appended: {error}"
+            );
+            let _ = window.emit(
+                "canvas-stream",
+                crate::models::canvas::CanvasStreamEvent::Error {
+                    session_id: session_id.clone(),
+                    tile_id: "note-export".to_string(),
+                    model_id: "system".to_string(),
+                    error: format!(
+                        "Canvas note export was saved, but its required trace failed: {error}"
+                    ),
+                },
+            );
+            return Ok(serde_json::json!({
+                "note_id": note.id,
+                "title": note.title,
+                "updated": false,
+            }));
+        }
+    };
+    drop(root_ticket);
+    crate::commands::acknowledge_reported_repair(
+        crate::commands::repair_after_authority_mutation(
+            state.inner(),
+            &trace_commit,
+            "Canvas note export",
+        )
+        .await,
+    );
     Ok(serde_json::json!({
         "note_id": note.id,
         "title": note.title,

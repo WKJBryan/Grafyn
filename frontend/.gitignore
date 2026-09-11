@@ -31,3 +31,4 @@ dist-ssr
 # Build output
 build
 .cache
+src-tauri/gen/schemas/

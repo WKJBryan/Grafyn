@@ -6,22 +6,38 @@
         class="confirm-overlay"
         @click.self="handleCancel"
       >
-        <div class="confirm-dialog">
+        <div
+          ref="dialog"
+          class="confirm-dialog"
+          role="alertdialog"
+          aria-modal="true"
+          :aria-labelledby="titleId"
+          :aria-describedby="messageId"
+          tabindex="-1"
+        >
           <div class="confirm-header">
             <span class="confirm-icon">{{ icon }}</span>
-            <h3>{{ title }}</h3>
+            <h3 :id="titleId">
+              {{ title }}
+            </h3>
           </div>
-          <p class="confirm-message">
+          <p
+            :id="messageId"
+            class="confirm-message"
+          >
             {{ message }}
           </p>
           <div class="confirm-actions">
             <button
+              ref="cancelButton"
+              type="button"
               class="btn btn-secondary"
               @click="handleCancel"
             >
               {{ cancelLabel }}
             </button>
             <button
+              type="button"
               class="btn"
               :class="confirmClass"
               @click="handleConfirm"
@@ -36,7 +52,7 @@
 </template>
 
 <script setup>
-import { computed } from 'vue'
+import { computed, getCurrentInstance, nextTick, onBeforeUnmount, ref, watch } from 'vue'
 
 const props = defineProps({
   visible: { type: Boolean, default: false },
@@ -48,6 +64,13 @@ const props = defineProps({
 })
 
 const emit = defineEmits(['confirm', 'cancel'])
+const instanceId = getCurrentInstance()?.uid ?? 'fallback'
+const titleId = `confirm-dialog-title-${instanceId}`
+const messageId = `confirm-dialog-message-${instanceId}`
+const dialog = ref(null)
+const cancelButton = ref(null)
+let opener = null
+let listening = false
 
 const icon = computed(() => {
   const icons = { danger: '\u26A0', warning: '\u26A0', info: '\u2139' }
@@ -62,6 +85,73 @@ const confirmClass = computed(() => {
   }
   return classes[props.variant] || 'btn-danger'
 })
+
+watch(() => props.visible, async visible => {
+  if (visible) {
+    opener = document.activeElement instanceof HTMLElement ? document.activeElement : null
+    startListening()
+    await nextTick()
+    cancelButton.value?.focus()
+    return
+  }
+  stopListening()
+  await nextTick()
+  restoreFocus()
+}, { immediate: true })
+
+onBeforeUnmount(() => {
+  stopListening()
+  restoreFocus()
+})
+
+function startListening() {
+  if (listening) return
+  window.addEventListener('keydown', handleKeydown, true)
+  listening = true
+}
+
+function stopListening() {
+  if (!listening) return
+  window.removeEventListener('keydown', handleKeydown, true)
+  listening = false
+}
+
+function restoreFocus() {
+  if (opener?.isConnected) opener.focus()
+  opener = null
+}
+
+function handleKeydown(event) {
+  if (event.key === 'Escape') {
+    event.preventDefault()
+    event.stopImmediatePropagation()
+    handleCancel()
+    return
+  }
+  if (event.key === 'Tab') trapFocus(event)
+}
+
+function trapFocus(event) {
+  const controls = [...(dialog.value?.querySelectorAll(
+    'button:not([disabled]), a[href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+  ) || [])]
+  event.stopImmediatePropagation()
+  if (!controls.length) {
+    event.preventDefault()
+    dialog.value?.focus()
+    return
+  }
+  const first = controls[0]
+  const last = controls.at(-1)
+  const focusOutside = !dialog.value?.contains(document.activeElement)
+  if (event.shiftKey && (document.activeElement === first || focusOutside)) {
+    event.preventDefault()
+    last.focus()
+  } else if (!event.shiftKey && (document.activeElement === last || focusOutside)) {
+    event.preventDefault()
+    first.focus()
+  }
+}
 
 function handleConfirm() {
   emit('confirm')
@@ -125,6 +215,7 @@ function handleCancel() {
 }
 
 .btn {
+  min-height: 44px;
   padding: var(--spacing-sm) var(--spacing-md);
   border: none;
   border-radius: var(--radius-md);

@@ -19,6 +19,8 @@ pub(super) fn build_response(model_id: &str, content: &str) -> ModelResponse {
         error: None,
         tokens_used: None,
         cost_usd: None,
+        provider: Some("openrouter".to_string()),
+        provenance: Some("canvas_openrouter".to_string()),
         created_at: chrono::Utc::now(),
         position: TilePosition::default(),
     }
@@ -51,6 +53,8 @@ pub(super) fn build_tile(
         context_notes: Vec::new(),
         approved_twin_records: Vec::new(),
         candidate_twin_records: Vec::new(),
+        twin_evidence_snapshot: None,
+        twin_relationship_variant: crate::models::twin_state::RelationshipVariant::global(),
         twin_answer_mode: TwinAnswerMode::default(),
         twin_context_policy: None,
         twin_llm_provider: None,

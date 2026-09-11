@@ -6,8 +6,46 @@ use tantivy::query::QueryParser;
 use tantivy::schema::*;
 use tantivy::{doc, Index, IndexReader, IndexWriter, ReloadPolicy};
 
+#[derive(Debug)]
+pub enum SearchOpenError {
+    WriterBusy(tantivy::TantivyError),
+    CorruptOrIncompatible(tantivy::TantivyError),
+    Other(anyhow::Error),
+}
+
+impl SearchOpenError {
+    pub fn is_writer_busy(&self) -> bool {
+        matches!(self, Self::WriterBusy(_))
+    }
+
+    pub fn is_corrupt_or_incompatible(&self) -> bool {
+        matches!(self, Self::CorruptOrIncompatible(_))
+    }
+}
+
+impl std::fmt::Display for SearchOpenError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::WriterBusy(error) | Self::CorruptOrIncompatible(error) => error.fmt(formatter),
+            Self::Other(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for SearchOpenError {}
+
+fn classify_tantivy_open(error: tantivy::TantivyError) -> SearchOpenError {
+    match error {
+        error @ (tantivy::TantivyError::DataCorruption(_)
+        | tantivy::TantivyError::IncompatibleIndex(_)
+        | tantivy::TantivyError::SchemaError(_)) => SearchOpenError::CorruptOrIncompatible(error),
+        error => SearchOpenError::Other(anyhow::Error::new(error)),
+    }
+}
+
 /// Full-text search service using Tantivy
 pub struct SearchService {
+    index_path: PathBuf,
     index: Index,
     reader: IndexReader,
     writer: Option<IndexWriter>,
@@ -20,9 +58,10 @@ pub struct SearchService {
 }
 
 impl SearchService {
-    pub fn new(data_path: PathBuf) -> Result<Self> {
+    pub fn new(data_path: PathBuf) -> std::result::Result<Self, SearchOpenError> {
         let index_path = data_path.join("search_index");
-        std::fs::create_dir_all(&index_path)?;
+        std::fs::create_dir_all(&index_path)
+            .map_err(|error| SearchOpenError::Other(error.into()))?;
 
         // Define schema
         let mut schema_builder = Schema::builder();
@@ -37,23 +76,24 @@ impl SearchService {
 
         // Open or create index
         let index = if index_path.join("meta.json").exists() {
-            Index::open_in_dir(&index_path).context("Failed to open existing index")?
+            Index::open_in_dir(&index_path).map_err(classify_tantivy_open)?
         } else {
-            Index::create_in_dir(&index_path, schema.clone())
-                .context("Failed to create new index")?
+            Index::create_in_dir(&index_path, schema.clone()).map_err(classify_tantivy_open)?
         };
 
         let reader = index
             .reader_builder()
             .reload_policy(ReloadPolicy::OnCommitWithDelay)
             .try_into()
-            .context("Failed to create index reader")?;
+            .map_err(classify_tantivy_open)?;
 
-        let writer = index
-            .writer(50_000_000)
-            .context("Failed to create index writer")?;
+        let writer = index.writer(50_000_000).map_err(|error| match error {
+            error @ tantivy::TantivyError::LockFailure(_, _) => SearchOpenError::WriterBusy(error),
+            error => classify_tantivy_open(error),
+        })?;
 
         Ok(Self {
+            index_path,
             index,
             reader,
             writer: Some(writer),
@@ -101,6 +141,7 @@ impl SearchService {
             .context("Failed to create index reader")?;
 
         Ok(Self {
+            index_path,
             index,
             reader,
             writer: None, // No writer — read-only mode
@@ -110,6 +151,10 @@ impl SearchService {
             tags_field,
             status_field,
         })
+    }
+
+    pub(crate) fn uses_data_path(&self, data_path: &std::path::Path) -> bool {
+        self.index_path == data_path.join("search_index")
     }
 
     /// Whether this service has write capabilities (index updates).
@@ -161,6 +206,10 @@ impl SearchService {
         Ok(())
     }
 
+    pub fn reload_reader(&self) -> Result<()> {
+        self.reader.reload().map_err(Into::into)
+    }
+
     /// Reindex all notes
     pub fn reindex_all(&mut self, notes: &[Note]) -> Result<()> {
         let writer = self.writer.as_mut().context("Writer not available")?;
@@ -179,8 +228,7 @@ impl SearchService {
             ))?;
         }
 
-        writer.commit()?;
-        Ok(())
+        self.commit()
     }
 
     /// Search notes by query string
@@ -322,4 +370,63 @@ fn create_snippet(content: &str, query: &str, max_len: usize) -> String {
     }
 
     snippet
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::note::{NoteStatus, CURRENT_NOTE_SCHEMA_VERSION};
+    use chrono::Utc;
+
+    fn note(id: &str, content: &str) -> Note {
+        Note {
+            id: id.to_string(),
+            title: id.to_string(),
+            content: content.to_string(),
+            relative_path: format!("{id}.md"),
+            aliases: Vec::new(),
+            status: NoteStatus::Draft,
+            tags: Vec::new(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            schema_version: CURRENT_NOTE_SCHEMA_VERSION,
+            migration_source: None,
+            optimizer_managed: false,
+            wikilinks: Vec::new(),
+            parsed_links: Vec::new(),
+            properties: Default::default(),
+            frontmatter_raw_fallback: None,
+        }
+    }
+
+    #[test]
+    fn full_reindex_is_visible_to_the_existing_reader_before_return() {
+        let root = tempfile::tempdir().unwrap();
+        let mut search = SearchService::new(root.path().to_path_buf()).unwrap();
+
+        search
+            .reindex_all(&[note("fresh", "generation sentinel")])
+            .unwrap();
+
+        let results = search.search("generation", 10).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].note.id, "fresh");
+    }
+
+    #[test]
+    fn a_second_writer_is_typed_busy_and_never_destroys_the_healthy_index() {
+        let root = tempfile::tempdir().unwrap();
+        let first = SearchService::new(root.path().to_path_buf()).unwrap();
+        let sentinel = root.path().join("search_index/sentinel");
+        std::fs::write(&sentinel, b"healthy").unwrap();
+
+        let error = match SearchService::new(root.path().to_path_buf()) {
+            Ok(_) => panic!("a second Tantivy writer must not open"),
+            Err(error) => error,
+        };
+
+        assert!(error.is_writer_busy());
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"healthy");
+        drop(first);
+    }
 }

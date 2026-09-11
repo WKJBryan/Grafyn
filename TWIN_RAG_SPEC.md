@@ -14,9 +14,28 @@ Stage 1 already captures explicit and passive evidence:
 - Canvas behavior: branching, model comparison, debate, regeneration, note export, and think-harder flows.
 - Notes behavior: note creation/update and canonical promotion.
 - Inferred user records: `fact`, `preference`, and `reasoning_pattern`.
-- Review states: `auto_promoted`, `candidate`, `endorsed`, `rejected`, `private`, and `no_train`.
+- Review states: `candidate`, `endorsed`, `rejected`, `private`, and `no_train`. The legacy serialized `auto_promoted` value remains readable for audit only and is treated as pending/candidate rather than authority.
 
-Approved and candidate records are stored separately from rejected records during export. Rejected records are negative evidence for future pipelines, not live personalization context.
+Only explicitly endorsed records enter approved export/training splits. Candidate and rejected records retain their separate legacy review/export surfaces, while legacy `auto_promoted` records are excluded from all export and training files. Rejected records are negative evidence for future pipelines, not live personalization context.
+
+## Governed State Core
+
+The append-only Twin event spine now has a pure deterministic read-model layer:
+
+- exact repeated observations create pending proposal drafts after three supports;
+- exact affirm/deny observations create two pending drafts and an unresolved contradiction cluster;
+- global, single-relationship, and composite-relationship variants remain distinct;
+- relationship identity retains restrictive or inactive qualifiers, while effective exposure intersects the causal lane plus event, every relationship qualifier, support, and event-evidence governance as immutable provenance; expiry/rejection may end current relationship applicability but never relax exposure, and any local source keeps the result local and unsyncable;
+- only an explicit accepted `MemoryReviewed` event creates reviewed memory;
+- the current review frontier removes superseded reviews and compares complete effective outcomes, so divergent concurrent edits/governance remain pending while identical outcomes converge;
+- validity, expiry, reinforcement, and supersession are evaluated at an explicit reference time;
+- derived proposal counts, exposure, bounded context, confirmation time, and timeline representative use all matching supports, while only item/draft evidence lists keep the stable lowest 64 event IDs;
+- projection snapshots require declared v1 versions and sorted/unique top-level and nested vectors before accepting content-derived snapshot IDs;
+- Recall, Decision, Simulation, Reflection, and Capture Review use fixed integer attention profiles with hard governance gates before scoring.
+
+Legacy materialized Constitution/action-gap artifacts linked only to `auto_promoted` records receive a read-time overlay: listings downgrade them to Candidate, and Canvas context, Decision evidence, export, and benchmark/training consumers exclude them without rewriting disk. Independent support from an Endorsed record preserves the artifact.
+
+This layer is implemented as pure Rust entry points. Capture hooks and projection-backed UI/API integration belong to later tasks; no current command is documented as emitting these events yet.
 
 ## Native RAG Twin Architecture
 
@@ -27,7 +46,7 @@ Context assembly:
 - Require Twin Identity name and role/context before Simulation mode can run.
 - Inject Twin Identity before Constitution so the model has a first-person operating identity before it receives priors and evidence.
 - Retrieve relevant vault notes/chunks through Grafyn's existing retrieval service.
-- Include approved twin records: `endorsed` and `auto_promoted`.
+- Include approved twin records only when explicitly `endorsed`.
 - Include candidate records only when locally relevant to the prompt.
 - Exclude `rejected`, `private`, and `no_train` records from live answer context.
 - Store used note ids and twin record ids on the prompt tile and trace event.
@@ -42,7 +61,7 @@ The model receives a system prompt with separated sections:
 - `Tentative Candidate Records`
 - `Answer Instructions`
 
-Candidate records are labeled as unreviewed hypotheses and must not be treated as facts.
+Candidate records are labeled as unreviewed hypotheses and must not be treated as facts. Legacy `auto_promoted` records are not admitted to either prompt section.
 
 ## Answer Modes
 

@@ -3,8 +3,10 @@
 //! Compact mode injects compiled session state plus the last two parent-chain
 //! turns. It does not truncate older turns to a character budget.
 
+use super::streaming::CanvasEventSink;
 use crate::models::canvas::{
-    CanvasSession, CanvasStreamEvent, CanvasWorkingMemory, ContextMode, ModelPosition, PromptRequest,
+    CanvasSession, CanvasStreamEvent, CanvasWorkingMemory, ContextMode, ModelPosition,
+    PromptRequest,
 };
 use crate::models::twin::TraceEventType;
 use crate::services::canvas_store::CanvasStore;
@@ -92,6 +94,16 @@ pub(super) fn build_canvas_messages(
                 }])
             }
         }
+        ContextMode::TwinHistory => {
+            if request.parent_tile_id.is_none() && request.parent_model_id.is_none() {
+                Ok(vec![ChatMessage {
+                    role: "user".to_string(),
+                    content: request.prompt.clone(),
+                }])
+            } else {
+                build_compact_history_messages(session, request)
+            }
+        }
     }
 }
 
@@ -120,11 +132,14 @@ pub(super) fn compose_system_prompt(
         {
             parts.push(recap.to_string());
         }
-    } else if let Some(memory) = format_working_memory_for_prompt(&memory_for_follow_up(session, request))
+    } else if let Some(memory) =
+        format_working_memory_for_prompt(&memory_for_follow_up(session, request))
     {
         parts.push(memory);
     }
-    if let Some(inner) = inner.map(|value| value.trim().to_string()).filter(|value| !value.is_empty())
+    if let Some(inner) = inner
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
     {
         parts.push(inner);
     }
@@ -419,15 +434,15 @@ fn estimate_tokens(text: &str) -> usize {
     text.split_whitespace().count() * 4 / 3 + 1
 }
 
-pub(super) fn spawn_working_memory_compile(
-    window: tauri::Window,
+pub(super) fn spawn_working_memory_compile<S: CanvasEventSink>(
+    window: S,
     session_id: String,
     tile_id: String,
     model_id: String,
     canvas_store: Arc<RwLock<CanvasStore>>,
     twin_store: Arc<RwLock<TwinStore>>,
     openrouter: Arc<RwLock<OpenRouterService>>,
-    ollama: Arc<RwLock<OllamaService>>,
+    ollama: Option<Arc<RwLock<OllamaService>>>,
     settings: Arc<RwLock<SettingsService>>,
 ) {
     tauri::async_runtime::spawn(async move {
@@ -449,15 +464,15 @@ pub(super) fn spawn_working_memory_compile(
     });
 }
 
-async fn compile_session_working_memory(
-    window: tauri::Window,
+async fn compile_session_working_memory<S: CanvasEventSink>(
+    window: S,
     session_id: String,
     tile_id: String,
     model_id: String,
     canvas_store: Arc<RwLock<CanvasStore>>,
     twin_store: Arc<RwLock<TwinStore>>,
     openrouter: Arc<RwLock<OpenRouterService>>,
-    ollama: Arc<RwLock<OllamaService>>,
+    ollama: Option<Arc<RwLock<OllamaService>>>,
     settings: Arc<RwLock<SettingsService>>,
 ) -> Result<(), String> {
     let session = {
@@ -470,20 +485,23 @@ async fn compile_session_working_memory(
         .get(&branch_key)
         .cloned()
         .unwrap_or_default();
-    if previous.compiled_from_tile_id.as_deref() == Some(tile_id.as_str()) && !previous.is_empty()
-    {
+    if previous.compiled_from_tile_id.as_deref() == Some(tile_id.as_str()) && !previous.is_empty() {
         return Ok(());
     }
 
     let compile_user = build_compile_user_prompt(&session, &tile_id, &model_id);
     let settings_snapshot = settings.read().await.get().clone();
-    let use_ollama = settings_snapshot.twin_llm_provider.eq_ignore_ascii_case("ollama");
+    let use_ollama = settings_snapshot
+        .twin_llm_provider
+        .eq_ignore_ascii_case("ollama");
 
     let raw = if use_ollama {
         let model = settings_snapshot.ollama_model.trim();
         if model.is_empty() {
             return Err("Select an Ollama model before compiling session memory".to_string());
         }
+        let ollama =
+            ollama.ok_or_else(|| "Local Ollama is unavailable on this runtime".to_string())?;
         let ollama = ollama.read().await;
         ollama
             .chat(
@@ -533,13 +551,10 @@ async fn compile_session_working_memory(
             .map_err(|e| e.to_string())?;
     }
 
-    let _ = window.emit(
-        "canvas-stream",
-        CanvasStreamEvent::WorkingMemoryUpdated {
-            session_id: session_id.clone(),
-            working_memory: compiled.clone(),
-        },
-    );
+    let _ = window.emit_canvas(CanvasStreamEvent::WorkingMemoryUpdated {
+        session_id: session_id.clone(),
+        working_memory: compiled.clone(),
+    });
 
     let mut twin = twin_store.write().await;
     let _ = twin.append_trace_event(
@@ -576,7 +591,10 @@ fn build_compile_user_prompt(session: &CanvasSession, tile_id: &str, model_id: &
         body.push_str("\nLatest prompt:\n");
         body.push_str(&tile.prompt);
         if let Some(response) = tile.responses.get(model_id) {
-            body.push_str(&format!("\nThis model's answer ({model_id}):\n{}\n", response.content));
+            body.push_str(&format!(
+                "\nThis model's answer ({model_id}):\n{}\n",
+                response.content
+            ));
         }
         body.push_str("\nDo not include sibling models on the same prompt.\n");
     }
@@ -586,10 +604,10 @@ fn build_compile_user_prompt(session: &CanvasSession, tile_id: &str, model_id: &
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::test_support::build_tile;
-    use crate::models::canvas::{CanvasViewport, PromptType, TwinAnswerMode};
+    use super::*;
     use crate::models::canvas::PromptTile;
+    use crate::models::canvas::{CanvasViewport, PromptType, TwinAnswerMode};
 
     fn build_session(tiles: Vec<PromptTile>) -> CanvasSession {
         CanvasSession {
@@ -623,6 +641,7 @@ mod tests {
             position: None,
             context_mode,
             twin_answer_mode: TwinAnswerMode::default(),
+            twin_relationship_variant: crate::models::twin_state::RelationshipVariant::global(),
             twin_context_policy: None,
             twin_llm_provider: None,
             decision_metadata: None,
@@ -639,7 +658,14 @@ mod tests {
 
     fn four_turn_session() -> CanvasSession {
         build_session(vec![
-            build_tile("tile-1", "Prompt 1", "openai/gpt-4", "Response 1", None, None),
+            build_tile(
+                "tile-1",
+                "Prompt 1",
+                "openai/gpt-4",
+                "Response 1",
+                None,
+                None,
+            ),
             build_tile(
                 "tile-2",
                 "Prompt 2",
@@ -679,11 +705,15 @@ mod tests {
         assert_eq!(messages[2].content, "Prompt 4");
         assert_eq!(messages[3].content, "Response 4");
         assert_eq!(messages[4].content, "Prompt 5");
+        assert!(!messages.iter().any(|message| message
+            .content
+            .contains("Conversation summary before the most recent turns")));
         assert!(!messages
             .iter()
-            .any(|message| message.content.contains("Conversation summary before the most recent turns")));
-        assert!(!messages.iter().any(|message| message.content.contains("Prompt 1")));
-        assert!(!messages.iter().any(|message| message.content.contains("Response 1")));
+            .any(|message| message.content.contains("Prompt 1")));
+        assert!(!messages
+            .iter()
+            .any(|message| message.content.contains("Response 1")));
     }
 
     #[test]
@@ -692,14 +722,15 @@ mod tests {
         session.branch_memories.insert(
             branch_memory_key("tile-4", "openai/gpt-4"),
             CanvasWorkingMemory {
-            version: 2,
-            question: "Should we compact instead of truncate?".to_string(),
-            summary: "Earlier turns decided compiled state beats 240-character chops.".to_string(),
-            model_positions: vec![ModelPosition {
-                model_id: "openai/gpt-4".to_string(),
-                stance: "Prefer a session summary.".to_string(),
-            }],
-            ..CanvasWorkingMemory::default()
+                version: 2,
+                question: "Should we compact instead of truncate?".to_string(),
+                summary: "Earlier turns decided compiled state beats 240-character chops."
+                    .to_string(),
+                model_positions: vec![ModelPosition {
+                    model_id: "openai/gpt-4".to_string(),
+                    stance: "Prefer a session summary.".to_string(),
+                }],
+                ..CanvasWorkingMemory::default()
             },
         );
         let request = build_request("Prompt 5", "tile-4", "openai/gpt-4", ContextMode::Compact);
@@ -715,9 +746,9 @@ mod tests {
         assert_eq!(messages[1].content, "Prompt 3");
         assert_eq!(messages[2].content, "Response 3");
         assert_eq!(messages.last().unwrap().content, "Prompt 5");
-        assert!(!messages
-            .iter()
-            .any(|message| message.content.contains("Conversation summary before the most recent turns")));
+        assert!(!messages.iter().any(|message| message
+            .content
+            .contains("Conversation summary before the most recent turns")));
     }
 
     #[test]
@@ -733,8 +764,13 @@ mod tests {
 
         assert_eq!(messages[0].content, "Prompt 3");
         assert_eq!(messages[1].content, "Response 3");
-        assert_eq!(messages.last().unwrap().content, "What about the other option?");
-        assert!(!messages.iter().any(|message| message.content.contains("Prompt 1")));
+        assert_eq!(
+            messages.last().unwrap().content,
+            "What about the other option?"
+        );
+        assert!(!messages
+            .iter()
+            .any(|message| message.content.contains("Prompt 1")));
     }
 
     #[test]
@@ -748,6 +784,7 @@ mod tests {
             position: None,
             context_mode: ContextMode::None,
             twin_answer_mode: TwinAnswerMode::default(),
+            twin_relationship_variant: crate::models::twin_state::RelationshipVariant::global(),
             twin_context_policy: None,
             twin_llm_provider: None,
             decision_metadata: None,
@@ -794,7 +831,10 @@ mod tests {
         assert_eq!(parsed.version, 2);
         assert_eq!(parsed.question, "Should we compact?");
         assert_eq!(parsed.summary, "Use compiled state.");
-        assert_eq!(parsed.constraints, vec!["Keep Twin review-gated".to_string()]);
+        assert_eq!(
+            parsed.constraints,
+            vec!["Keep Twin review-gated".to_string()]
+        );
         assert_eq!(parsed.compiled_from_tile_id.as_deref(), Some("tile-9"));
     }
 
@@ -805,7 +845,8 @@ mod tests {
             summary: "Keep me".to_string(),
             ..CanvasWorkingMemory::default()
         };
-        let parsed = parse_working_memory_response("not json at all", &previous, Some("tile-1".to_string()));
+        let parsed =
+            parse_working_memory_response("not json at all", &previous, Some("tile-1".to_string()));
         assert_eq!(parsed.version, 3);
         assert_eq!(parsed.summary, "Keep me");
     }
@@ -826,6 +867,7 @@ mod tests {
             position: None,
             context_mode: ContextMode::None,
             twin_answer_mode: TwinAnswerMode::default(),
+            twin_relationship_variant: crate::models::twin_state::RelationshipVariant::global(),
             twin_context_policy: None,
             twin_llm_provider: None,
             decision_metadata: None,
@@ -842,7 +884,9 @@ mod tests {
         assert_eq!(messages.len(), 2);
         assert!(messages[0].content.contains("rent versus moving"));
         assert_eq!(messages[1].content, "Draft the email.");
-        assert!(!messages.iter().any(|message| message.content.contains("Prompt 1")));
+        assert!(!messages
+            .iter()
+            .any(|message| message.content.contains("Prompt 1")));
     }
 
     #[test]
@@ -858,7 +902,14 @@ mod tests {
     #[test]
     fn full_history_interleaves_user_and_assistant_turns() {
         let session = build_session(vec![
-            build_tile("tile-1", "Root prompt", "openai/gpt-4", "Root response", None, None),
+            build_tile(
+                "tile-1",
+                "Root prompt",
+                "openai/gpt-4",
+                "Root response",
+                None,
+                None,
+            ),
             build_tile(
                 "tile-2",
                 "Branch prompt",
@@ -868,7 +919,12 @@ mod tests {
                 Some("openai/gpt-4"),
             ),
         ]);
-        let request = build_request("Final prompt", "tile-2", "openai/gpt-4", ContextMode::FullHistory);
+        let request = build_request(
+            "Final prompt",
+            "tile-2",
+            "openai/gpt-4",
+            ContextMode::FullHistory,
+        );
         let messages = build_full_history_messages(&session, &request).unwrap();
         assert_eq!(messages.len(), 5);
         assert_eq!(messages[0].content, "Root prompt");

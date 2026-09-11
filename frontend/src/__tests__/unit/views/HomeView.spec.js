@@ -401,6 +401,85 @@ describe('HomeView', () => {
         title: 'Updated'
       }))
     })
+
+    it('strips the UI-only note type only at the production create boundary', async () => {
+      vi.spyOn(apiClient.notes, 'list').mockResolvedValue([])
+      const createSpy = vi.spyOn(apiClient.notes, 'create').mockResolvedValue({
+        id: 'new-note',
+        title: 'Atomic Thought',
+        content: 'Body',
+        status: 'draft',
+        tags: ['research']
+      })
+      vi.spyOn(apiClient.notes, 'get').mockResolvedValue({
+        id: 'new-note',
+        title: 'Atomic Thought',
+        content: 'Body',
+        status: 'draft',
+        tags: ['research']
+      })
+
+      wrapper = mount(HomeView)
+      await flushPromises()
+
+      await wrapper.get('[data-guide="new-note-btn"]').trigger('click')
+      wrapper.findComponent({ name: 'TopicSelector' }).vm.$emit('create', {
+        note_type: 'atomic',
+        topic: 'research'
+      })
+      await flushPromises()
+
+      const editor = wrapper.findComponent({ name: 'NoteEditor' })
+      expect(editor.props('note')).toMatchObject({
+        note_type: 'atomic',
+        tags: ['research']
+      })
+
+      editor.vm.$emit('save', '', {
+        title: 'Atomic Thought',
+        content: 'Body',
+        status: 'draft',
+        tags: ['research'],
+        note_type: 'atomic'
+      })
+      await flushPromises()
+
+      expect(createSpy).toHaveBeenCalledWith({
+        title: 'Atomic Thought',
+        content: 'Body',
+        status: 'draft',
+        tags: ['research']
+      })
+    })
+  })
+
+  // ============================================================================
+  // Desktop first-run setup
+  // ============================================================================
+
+  describe('Desktop first-run setup', () => {
+    it('opens setup before loading notes when the Tauri 2 runtime is desktop', async () => {
+      vi.mocked(apiClient.isDesktopApp).mockReturnValue(true)
+      const statusSpy = vi.spyOn(apiClient.settings, 'getStatus').mockResolvedValue({ needs_setup: true })
+      const listSpy = vi.spyOn(apiClient.notes, 'list').mockResolvedValue([])
+
+      wrapper = mount(HomeView)
+      await flushPromises()
+
+      expect(statusSpy).toHaveBeenCalledOnce()
+      expect(wrapper.findComponent({ name: 'SettingsModal' }).props('isSetup')).toBe(true)
+      expect(listSpy).not.toHaveBeenCalled()
+    })
+
+    it('does not call the desktop setup command in a mobile runtime', async () => {
+      const statusSpy = vi.spyOn(apiClient.settings, 'getStatus')
+      vi.spyOn(apiClient.notes, 'list').mockResolvedValue([])
+
+      wrapper = mount(HomeView)
+      await flushPromises()
+
+      expect(statusSpy).not.toHaveBeenCalled()
+    })
   })
 
   // ============================================================================

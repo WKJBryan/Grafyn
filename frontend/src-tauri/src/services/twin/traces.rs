@@ -1,6 +1,5 @@
 use super::shared::{
-    excerpt, extract_event_model_id, extract_event_tile_id, first_payload_string,
-    load_or_quarantine, payload_string,
+    excerpt, extract_event_model_id, extract_event_tile_id, first_payload_string, payload_string,
 };
 use super::TwinStore;
 use crate::models::twin::{
@@ -8,12 +7,11 @@ use crate::models::twin::{
 };
 #[cfg(test)]
 use crate::models::twin::{RecordOrigin, UserRecordCreate};
-use anyhow::{Context, Result};
+use anyhow::Result;
 use chrono::Utc;
 #[cfg(test)]
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use walkdir::WalkDir;
+use std::path::PathBuf;
 
 fn resolve_event_evidence(
     trace: &SessionTrace,
@@ -133,6 +131,119 @@ impl TwinStore {
         event_type: TraceEventType,
         payload: serde_json::Value,
     ) -> Result<TraceEvent> {
+        let (event, _commit) =
+            self.append_trace_event_with_commit(session_id, event_type, payload)?;
+        Ok(event)
+    }
+
+    pub(crate) fn append_trace_event_with_commit(
+        &mut self,
+        session_id: &str,
+        event_type: TraceEventType,
+        payload: serde_json::Value,
+    ) -> Result<(TraceEvent, crate::services::twin_events::MutationCommit)> {
+        self.append_trace_event_internal(session_id, event_type, payload, None)
+    }
+
+    pub(crate) fn append_trace_event_expecting_authority(
+        &mut self,
+        session_id: &str,
+        event_type: TraceEventType,
+        payload: serde_json::Value,
+        expected: crate::services::vault_namespace::VaultAuthorityTokenV1,
+    ) -> Result<(TraceEvent, crate::services::twin_events::MutationCommit)> {
+        self.append_trace_event_internal(session_id, event_type, payload, Some(expected))
+    }
+
+    fn append_trace_event_internal(
+        &mut self,
+        session_id: &str,
+        event_type: TraceEventType,
+        payload: serde_json::Value,
+        expected: Option<crate::services::vault_namespace::VaultAuthorityTokenV1>,
+    ) -> Result<(TraceEvent, crate::services::twin_events::MutationCommit)> {
+        if !self.event_recorder.is_noop() {
+            Self::validate_file_id(session_id)?;
+            let recorder = self.event_recorder.clone();
+            let mut committed = None;
+            let mut planner = || {
+                let (event, trace) = self
+                    .plan_trace_event(session_id, event_type.clone(), payload.clone())
+                    .map_err(|error| {
+                        crate::services::twin_events::MutationError::Invalid(error.to_string())
+                    })?;
+                let target = self
+                    .serialized_trace_target(&trace)
+                    .and_then(|value| self.governed_json_targets(vec![value]))
+                    .map_err(|error| {
+                        crate::services::twin_events::MutationError::Invalid(error.to_string())
+                    })?;
+                committed = Some((event, trace));
+                let mut plan = crate::services::twin_events::MutationPlan::new(
+                    crate::models::twin_event::CausalStream::LocalOnly,
+                    crate::models::twin_event::SourceChannel::parse("legacy_twin")
+                        .map_err(crate::services::twin_events::MutationError::Invalid)?,
+                    target,
+                    Vec::new(),
+                );
+                if let Some(expected) = expected.clone() {
+                    plan = plan.expecting_authority(expected);
+                }
+                Ok(Some(plan))
+            };
+            let result = recorder.commit_planned_mutation(
+                crate::services::twin_events::MutationOrigin::Local,
+                &mut planner,
+            );
+            let commit = match result {
+                Ok(commit) => commit,
+                Err(error) => {
+                    let Some(commit) = error.authority_advanced_commit() else {
+                        self.invalidate_mutation_caches();
+                        return Err(anyhow::Error::new(error));
+                    };
+                    let target_aborted = error.authority_advanced_target_aborted();
+                    self.invalidate_mutation_caches();
+                    let recovery = recorder.recover_pending_mutations();
+                    if target_aborted {
+                        return Err(anyhow::Error::new(error));
+                    }
+                    if recovery.is_err() {
+                        return Ok((
+                            committed
+                                .ok_or_else(|| anyhow::anyhow!("trace append was not planned"))?
+                                .0,
+                            commit,
+                        ));
+                    }
+                    commit
+                }
+            };
+            let (event, trace) =
+                committed.ok_or_else(|| anyhow::anyhow!("trace append was not planned"))?;
+            self.cache_committed_trace(trace);
+            return Ok((event, commit));
+        }
+        let (event, trace) = self.plan_trace_event(session_id, event_type, payload)?;
+        self.write_trace_file(&trace)?;
+        self.cache_committed_trace(trace);
+        Ok((
+            event,
+            crate::services::twin_events::MutationCommit {
+                mutation_id: None,
+                events: Vec::new(),
+                authority_token: None,
+                postcommit_warning: false,
+            },
+        ))
+    }
+
+    pub(super) fn plan_trace_event(
+        &self,
+        session_id: &str,
+        event_type: TraceEventType,
+        payload: serde_json::Value,
+    ) -> Result<(TraceEvent, SessionTrace)> {
         Self::validate_file_id(session_id)?;
         let now = Utc::now();
         let event = TraceEvent {
@@ -141,54 +252,63 @@ impl TwinStore {
             created_at: now,
             payload,
         };
-
-        let trace = self.get_or_create_trace_mut(session_id)?;
+        let path = self.trace_file_path(session_id);
+        let mut trace = self
+            .read_twin_json_bounded(&path)?
+            .unwrap_or_else(|| SessionTrace::new(session_id));
         trace.updated_at = now;
         trace.events.push(event.clone());
-        let trace = trace.clone();
-        self.write_trace_file(&trace)?;
+        Ok((event, trace))
+    }
 
-        Ok(event)
+    pub(super) fn serialized_trace_target(
+        &self,
+        trace: &SessionTrace,
+    ) -> Result<(PathBuf, String)> {
+        Ok((
+            self.trace_file_path(&trace.session_id),
+            serde_json::to_string_pretty(trace)?,
+        ))
+    }
+
+    pub(crate) fn cache_committed_trace(&mut self, _trace: SessionTrace) {
+        self.invalidate_mutation_caches();
     }
 
     pub fn get_session_trace(&mut self, session_id: &str) -> Result<SessionTrace> {
         Self::validate_file_id(session_id)?;
+        self.ensure_trace_cache()?;
         if let Some(trace) = self.trace_cache.get(session_id) {
             return Ok(trace.clone());
         }
-
-        let path = self.trace_file_path(session_id);
-        if !path.exists() {
-            let trace = SessionTrace::new(session_id);
-            self.trace_cache
-                .insert(session_id.to_string(), trace.clone());
-            return Ok(trace);
-        }
-
-        let trace = self.read_trace_file(&path)?;
-        self.trace_cache
-            .insert(session_id.to_string(), trace.clone());
-        Ok(trace)
+        Ok(SessionTrace::new(session_id))
     }
 
     pub(super) fn list_session_traces(&mut self) -> Result<Vec<SessionTrace>> {
-        for entry in WalkDir::new(&self.traces_path)
-            .min_depth(1)
-            .max_depth(1)
-            .into_iter()
-            .filter_map(|entry| entry.ok())
-        {
-            let path = entry.path();
-            if path.extension().is_some_and(|ext| ext == "json") {
-                if let Some(trace) = load_or_quarantine::<SessionTrace>(path, "trace") {
-                    self.trace_cache.insert(trace.session_id.clone(), trace);
-                }
-            }
-        }
-
+        self.ensure_trace_cache()?;
         let mut traces = self.trace_cache.values().cloned().collect::<Vec<_>>();
         traces.sort_by(|a, b| a.session_id.cmp(&b.session_id));
         Ok(traces)
+    }
+
+    pub(super) fn list_session_traces_durable(&self) -> Result<Vec<SessionTrace>> {
+        let mut traces = self.list_twin_json_bounded("traces")?;
+        traces.sort_by(|a: &SessionTrace, b: &SessionTrace| a.session_id.cmp(&b.session_id));
+        Ok(traces)
+    }
+
+    fn ensure_trace_cache(&mut self) -> Result<()> {
+        if self.traces_cache_ready {
+            return Ok(());
+        }
+        let traces = self
+            .list_session_traces_durable()?
+            .into_iter()
+            .map(|trace| (trace.session_id.clone(), trace))
+            .collect();
+        self.trace_cache = traces;
+        self.traces_cache_ready = true;
+        Ok(())
     }
 
     pub(super) fn resolve_evidence_refs(
@@ -218,37 +338,42 @@ impl TwinStore {
         Ok(resolved)
     }
 
-    fn get_or_create_trace_mut(&mut self, session_id: &str) -> Result<&mut SessionTrace> {
-        if !self.trace_cache.contains_key(session_id) {
-            let path = self.trace_file_path(session_id);
-            let trace = if path.exists() {
-                self.read_trace_file(&path)?
+    pub(super) fn resolve_evidence_refs_durable(
+        &self,
+        refs: &[EvidenceRef],
+    ) -> Result<Vec<ResolvedEvidenceRef>> {
+        let mut resolved = Vec::new();
+        for evidence_ref in refs {
+            let trace_id = if evidence_ref.trace_id.trim().is_empty() {
+                &evidence_ref.session_id
             } else {
-                SessionTrace::new(session_id)
+                &evidence_ref.trace_id
             };
-            self.trace_cache.insert(session_id.to_string(), trace);
+            let Some(trace) =
+                self.read_twin_json_bounded::<SessionTrace>(&self.trace_file_path(trace_id))?
+            else {
+                continue;
+            };
+            let Some(event) = trace
+                .events
+                .iter()
+                .find(|event| event.id == evidence_ref.event_id)
+            else {
+                continue;
+            };
+            resolved.push(resolve_event_evidence(&trace, event, evidence_ref));
         }
-
-        Ok(self
-            .trace_cache
-            .get_mut(session_id)
-            .expect("trace inserted"))
+        resolved.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        Ok(resolved)
     }
 
     pub(super) fn trace_file_path(&self, session_id: &str) -> PathBuf {
         self.traces_path.join(format!("{}.json", session_id))
     }
 
-    pub(super) fn read_trace_file(&self, path: &Path) -> Result<SessionTrace> {
-        let content = std::fs::read_to_string(path)
-            .with_context(|| format!("Failed to read trace file: {}", path.display()))?;
-        serde_json::from_str(&content)
-            .with_context(|| format!("Failed to parse trace file: {}", path.display()))
-    }
-
     fn write_trace_file(&self, trace: &SessionTrace) -> Result<()> {
         let path = self.trace_file_path(&trace.session_id);
-        self.write_pretty_json(&path, trace)
+        self.write_pretty_json(&path, trace).map(|_commit| ())
     }
 }
 
@@ -257,6 +382,34 @@ mod tests {
     use super::*;
     use crate::models::twin::{PromotionState, UserRecordKind};
     use tempfile::tempdir;
+
+    fn coordinated_store(
+        root: &std::path::Path,
+    ) -> (
+        TwinStore,
+        std::sync::Arc<crate::services::twin_events::MutationCoordinator>,
+    ) {
+        let data = root.join("data");
+        let vault = root.join("vault");
+        let twin_root = data.join("twin").join("scope-one");
+        std::fs::create_dir_all(&twin_root).unwrap();
+        std::fs::create_dir(&vault).unwrap();
+        let events = std::sync::Arc::new(crate::services::twin_events::TwinEventStore::new(&data));
+        events.initialize().unwrap();
+        let coordinator = std::sync::Arc::new(
+            crate::services::twin_events::MutationCoordinator::new(
+                &data,
+                &vault,
+                events,
+                std::sync::Arc::new(crate::services::twin_events::NoopMutationLifecycle),
+            )
+            .unwrap(),
+        );
+        (
+            TwinStore::with_event_recorder(twin_root, data.join("twin"), coordinator.clone()),
+            coordinator,
+        )
+    }
 
     #[test]
     fn evidence_resolution_returns_trace_session_model_and_excerpts() {
@@ -341,5 +494,132 @@ mod tests {
         assert_eq!(trace.events.len(), 1);
         assert_eq!(trace.events[0].id, event.id);
         assert_eq!(trace.events[0].event_type, TraceEventType::PromptSubmitted);
+    }
+
+    #[test]
+    fn interrupted_trace_append_is_recovered_before_the_next_fresh_plan() {
+        let root = tempdir().unwrap();
+        let (mut store, coordinator) = coordinated_store(root.path());
+        coordinator.fail_once_at(crate::services::twin_events::MutationFaultPoint::AfterStage);
+
+        let (_, commit) = store
+            .append_trace_event_with_commit(
+                "session-1",
+                TraceEventType::PromptSubmitted,
+                serde_json::json!({ "prompt": "first" }),
+            )
+            .unwrap();
+        assert!(commit.postcommit_warning);
+        let second = store
+            .append_trace_event(
+                "session-1",
+                TraceEventType::PromptSubmitted,
+                serde_json::json!({ "prompt": "second" }),
+            )
+            .unwrap();
+
+        let trace = store.get_session_trace("session-1").unwrap();
+        assert_eq!(trace.events.len(), 2);
+        assert_eq!(trace.events[1].id, second.id);
+        assert_eq!(coordinator.pending_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn post_authority_trace_fault_returns_recovery_commit_without_duplicate_trace() {
+        let root = tempdir().unwrap();
+        let (mut store, coordinator) = coordinated_store(root.path());
+        let expected = coordinator.current_authority_token().unwrap();
+        coordinator.fail_next_replays_before_targets(1);
+        coordinator
+            .fail_once_at(crate::services::twin_events::MutationFaultPoint::AfterAuthorityAdvance);
+
+        let (event, commit) = store
+            .append_trace_event_expecting_authority(
+                "session-1",
+                TraceEventType::PromptSubmitted,
+                serde_json::json!({ "prompt": "recover exactly once" }),
+                expected.clone(),
+            )
+            .expect("authority-advanced work must return its exact recovery commit");
+
+        let authority = commit
+            .authority_token
+            .as_ref()
+            .expect("recovery commit must carry authority");
+        assert_eq!(
+            authority.authority_generation,
+            expected.authority_generation + 1
+        );
+        assert!(commit.mutation_id.is_some());
+        assert!(commit.postcommit_warning);
+        coordinator.recover_pending().unwrap();
+        store.rebuild_mutation_caches().unwrap();
+        let trace = store.get_session_trace("session-1").unwrap();
+        assert_eq!(trace.events.len(), 1);
+        assert_eq!(trace.events[0].id, event.id);
+        assert_eq!(coordinator.pending_count().unwrap(), 0);
+        let receipts = root.path().join("data/twin/mutations/receipts/v1");
+        assert_eq!(std::fs::read_dir(receipts).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn post_authority_guard_abort_is_not_reported_as_a_committed_trace() {
+        let root = tempdir().unwrap();
+        let (store, coordinator) = coordinated_store(root.path());
+        let expected = coordinator.current_authority_token().unwrap();
+        let trace_path = store.trace_file_path("session-guard-drift");
+        let entered = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let resume = std::sync::Arc::new(std::sync::Barrier::new(2));
+        coordinator.pause_after_authority_advance_once(entered.clone(), resume.clone());
+
+        let worker = std::thread::spawn(move || {
+            let mut store = store;
+            let result = store.append_trace_event_expecting_authority(
+                "session-guard-drift",
+                TraceEventType::PromptSubmitted,
+                serde_json::json!({ "prompt": "must not be reported as durable" }),
+                expected,
+            );
+            (store, result)
+        });
+
+        entered.wait();
+        let external_trace = SessionTrace::new("session-guard-drift");
+        std::fs::create_dir_all(trace_path.parent().unwrap()).unwrap();
+        crate::services::atomic_io::write_atomic(
+            &trace_path,
+            serde_json::to_vec_pretty(&external_trace)
+                .unwrap()
+                .as_slice(),
+        )
+        .unwrap();
+        resume.wait();
+
+        let (mut store, result) = worker.join().unwrap();
+        let error = result.expect_err("an aborted trace target must not return normal success");
+        let commit = error
+            .downcast_ref::<crate::services::twin_events::MutationError>()
+            .and_then(|error| error.authority_advanced_commit())
+            .expect("post-authority abort must retain its exact non-retryable commit");
+        assert_eq!(
+            commit
+                .authority_token
+                .as_ref()
+                .unwrap()
+                .authority_generation,
+            coordinator
+                .current_authority_token()
+                .unwrap()
+                .authority_generation
+        );
+        store.rebuild_mutation_caches().unwrap();
+        let reloaded = store.get_session_trace("session-guard-drift").unwrap();
+        assert_eq!(reloaded.session_id, external_trace.session_id);
+        assert_eq!(reloaded.created_at, external_trace.created_at);
+        assert_eq!(reloaded.updated_at, external_trace.updated_at);
+        assert!(reloaded.events.is_empty());
+        assert_eq!(coordinator.pending_count().unwrap(), 0);
+        let receipts = root.path().join("data/twin/mutations/receipts/v1");
+        assert_eq!(std::fs::read_dir(receipts).unwrap().count(), 0);
     }
 }

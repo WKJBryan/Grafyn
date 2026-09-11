@@ -1,10 +1,18 @@
+pub mod attachment;
 pub mod boot;
 pub mod canvas;
 pub mod feedback;
+pub mod image_generation;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub mod import;
 pub mod link_discovery;
 pub mod memory;
 pub mod migration;
+pub mod mutation;
 pub mod note;
+pub mod runtime;
 pub mod settings;
+pub mod sync;
 pub mod twin;
+pub mod twin_event;
+pub mod twin_state;

@@ -4,12 +4,33 @@ import { createPinia, setActivePinia } from 'pinia'
 import { useCanvasStore, THINK_HARDER_PROMPT, THINK_HARDER_WEB_SEARCH_MAX_RESULTS } from '@/stores/canvas'
 import * as apiClient from '@/api/client'
 
-const listenMock = vi.fn()
-const unlistenMock = vi.fn()
+const { listenMock, unlistenMock } = vi.hoisted(() => ({
+  listenMock: vi.fn(),
+  unlistenMock: vi.fn(),
+}))
 
 vi.mock('@tauri-apps/api/event', () => ({
   listen: listenMock,
 }))
+
+function mockCompletedSendPrompt(tileId, modelId) {
+  let streamHandler
+  listenMock.mockImplementation(async (_eventName, handler) => {
+    streamHandler = handler
+    return unlistenMock
+  })
+  return vi.spyOn(apiClient.canvas, 'sendPrompt').mockImplementation(async () => {
+    streamHandler({
+      payload: {
+        session_id: 'session-1',
+        type: 'complete',
+        tile_id: tileId,
+        model_id: modelId
+      }
+    })
+    return tileId
+  })
+}
 
 describe('Canvas Store', () => {
   it('keeps the provider-reported cost when a streamed response completes', async () => {
@@ -37,6 +58,147 @@ describe('Canvas Store', () => {
     setActivePinia(createPinia())
     vi.clearAllMocks()
     listenMock.mockResolvedValue(unlistenMock)
+  })
+
+  it('sendCompanionPrompt defaults to a single-model Twin-history Advisor request', async () => {
+    const sendPromptSpy = mockCompletedSendPrompt('tile-companion', 'openai/gpt-4')
+    const store = useCanvasStore()
+    store.currentSession = { id: 'session-1', prompt_tiles: [], debates: [] }
+
+    const tileId = await store.sendCompanionPrompt({
+      prompt: 'What should I do next?',
+      modelId: 'openai/gpt-4'
+    })
+
+    expect(sendPromptSpy).toHaveBeenCalledWith('session-1', expect.objectContaining({
+      prompt: 'What should I do next?',
+      models: ['openai/gpt-4'],
+      context_mode: 'twin_history',
+      twin_answer_mode: 'advisor',
+      twin_relationship_variant: { relationships: [] }
+    }))
+    expect(sendPromptSpy.mock.calls[0][1]).not.toHaveProperty('position')
+    expect(tileId).toBe('tile-companion')
+    expect(store.isStreaming).toBe(false)
+    expect(store.error).toBeNull()
+  })
+
+  it('sendCompanionPrompt forwards an explicit Simulation answer mode for Twin history', async () => {
+    const sendPromptSpy = mockCompletedSendPrompt('tile-simulation', 'openai/gpt-4')
+    const store = useCanvasStore()
+    store.currentSession = { id: 'session-1', prompt_tiles: [], debates: [] }
+
+    await store.sendCompanionPrompt({
+      prompt: 'How would I respond?',
+      modelId: 'openai/gpt-4',
+      mode: 'twin',
+      answerMode: 'simulation',
+      relationshipVariant: {
+        relationships: [{
+          subject_id: 'owner',
+          predicate: 'with',
+          object_id: 'person-alex',
+          direction: 'directed'
+        }]
+      }
+    })
+
+    expect(sendPromptSpy).toHaveBeenCalledWith('session-1', expect.objectContaining({
+      context_mode: 'twin_history',
+      twin_answer_mode: 'simulation',
+      twin_relationship_variant: {
+        relationships: [{
+          subject_id: 'owner',
+          predicate: 'with',
+          object_id: 'person-alex',
+          direction: 'directed'
+        }]
+      }
+    }))
+  })
+
+  it.each([
+    ['knowledge', 'simulation'],
+    ['twin', 'impersonation']
+  ])(
+    'sendCompanionPrompt rejects mode %s with answer mode %s before starting a stream',
+    async (mode, answerMode) => {
+      const sendPromptSpy = mockCompletedSendPrompt('tile-invalid-answer-mode', 'openai/gpt-4')
+      const store = useCanvasStore()
+      store.currentSession = { id: 'session-1', prompt_tiles: [], debates: [] }
+
+      await expect(store.sendCompanionPrompt({
+        prompt: 'Continue',
+        modelId: 'openai/gpt-4',
+        mode,
+        answerMode
+      })).rejects.toThrow(/answer mode|Simulation requires Twin/i)
+
+      expect(sendPromptSpy).not.toHaveBeenCalled()
+      expect(listenMock).not.toHaveBeenCalled()
+    }
+  )
+
+  it.each([
+    ['plain', 'none'],
+    ['knowledge', 'knowledge_search'],
+    ['twin', 'twin_history']
+  ])('sendCompanionPrompt maps %s mode to %s context', async (mode, contextMode) => {
+    const sendPromptSpy = mockCompletedSendPrompt(`tile-${mode}`, 'openai/gpt-4')
+    const store = useCanvasStore()
+    store.currentSession = { id: 'session-1', prompt_tiles: [], debates: [] }
+
+    await store.sendCompanionPrompt({
+      prompt: 'Continue',
+      modelId: 'openai/gpt-4',
+      mode
+    })
+
+    expect(sendPromptSpy).toHaveBeenCalledWith('session-1', expect.objectContaining({
+      context_mode: contextMode
+    }))
+  })
+
+  it.each(['semantic', 'constructor'])(
+    'sendCompanionPrompt rejects unknown mode %s before starting a stream',
+    async (mode) => {
+      const sendPromptSpy = mockCompletedSendPrompt('tile-invalid', 'openai/gpt-4')
+      const store = useCanvasStore()
+      store.currentSession = { id: 'session-1', prompt_tiles: [], debates: [] }
+
+      await expect(store.sendCompanionPrompt({
+        prompt: 'Continue',
+        modelId: 'openai/gpt-4',
+        mode
+      })).rejects.toThrow(/companion mode/i)
+
+      expect(sendPromptSpy).not.toHaveBeenCalled()
+      expect(listenMock).not.toHaveBeenCalled()
+      expect(store.isStreaming).toBe(false)
+    }
+  )
+
+  it('sendCompanionPrompt forwards parent IDs and provider without changing them', async () => {
+    const sendPromptSpy = mockCompletedSendPrompt('tile-child', 'llama3.2')
+    const store = useCanvasStore()
+    store.currentSession = { id: 'session-1', prompt_tiles: [], debates: [] }
+
+    await store.sendCompanionPrompt({
+      prompt: 'Continue from that answer',
+      modelId: 'llama3.2',
+      mode: 'knowledge',
+      parentTileId: 'tile-parent',
+      parentModelId: 'openai/gpt-4',
+      provider: 'ollama'
+    })
+
+    expect(sendPromptSpy).toHaveBeenCalledWith('session-1', expect.objectContaining({
+      models: ['llama3.2'],
+      context_mode: 'knowledge_search',
+      parent_tile_id: 'tile-parent',
+      parent_model_id: 'openai/gpt-4',
+      twin_llm_provider: 'ollama'
+    }))
   })
 
   it('thinkHarderFromResponse creates a same-model full-history request with deeper defaults and no max token cap', async () => {
@@ -507,6 +669,87 @@ describe('Canvas Store', () => {
     })
   })
 
+  it('regenerateResponse restores the exact completed response when replay is rejected before streaming', async () => {
+    vi.spyOn(apiClient.canvas, 'regenerateResponse').mockRejectedValue(
+      new Error('Twin History persisted prompt context can no longer be reproduced')
+    )
+    const previousResponse = {
+      id: 'response-1',
+      model_id: 'openai/gpt-4',
+      model_name: 'GPT-4',
+      status: 'completed',
+      content: 'Durable prior answer',
+      error: null,
+      error_message: null,
+      cost_usd: 0.003,
+      provider: 'openrouter',
+      provenance: 'canvas_openrouter',
+      position: { x: 0, y: 0, width: 280, height: 200 }
+    }
+    const store = useCanvasStore()
+    store.currentSession = {
+      id: 'session-1',
+      prompt_tiles: [{
+        id: 'tile-1',
+        prompt: 'Hello',
+        responses: { 'openai/gpt-4': { ...previousResponse, position: { ...previousResponse.position } } }
+      }],
+      debates: []
+    }
+
+    await expect(store.regenerateResponse('tile-1', 'openai/gpt-4')).rejects.toThrow(
+      'can no longer be reproduced'
+    )
+
+    expect(store.currentSession.prompt_tiles[0].responses['openai/gpt-4']).toEqual(previousResponse)
+    expect(store.streamingModels.size).toBe(0)
+  })
+
+  it('regenerateResponse rejection does not restore into a different current session', async () => {
+    const store = useCanvasStore()
+    vi.spyOn(apiClient.canvas, 'regenerateResponse').mockImplementation(async () => {
+      store.currentSession = {
+        id: 'session-B',
+        prompt_tiles: [{
+          id: 'tile-1',
+          responses: {
+            'openai/gpt-4': {
+              status: 'completed',
+              content: 'Session B answer',
+              position: { x: 10, y: 10, width: 280, height: 200 }
+            }
+          }
+        }],
+        debates: []
+      }
+      throw new Error('Twin History replay rejected')
+    })
+    store.currentSession = {
+      id: 'session-A',
+      prompt_tiles: [{
+        id: 'tile-1',
+        responses: {
+          'openai/gpt-4': {
+            status: 'completed',
+            content: 'Session A answer',
+            position: { x: 0, y: 0, width: 280, height: 200 }
+          }
+        }
+      }],
+      debates: []
+    }
+
+    await expect(store.regenerateResponse('tile-1', 'openai/gpt-4')).rejects.toThrow(
+      'replay rejected'
+    )
+
+    expect(store.currentSession.id).toBe('session-B')
+    expect(store.currentSession.prompt_tiles[0].responses['openai/gpt-4']).toMatchObject({
+      status: 'completed',
+      content: 'Session B answer'
+    })
+  })
+
   it('sendPrompt stores empty model completions as an error response', async () => {
     let streamHandler
     listenMock.mockImplementation(async (_eventName, handler) => {
@@ -558,6 +801,24 @@ describe('Canvas Store', () => {
       content: '',
       error_message: 'No response returned from model'
     })
+  })
+
+  it('does not publish a late session A send failure as session B store error', async () => {
+    let rejectSessionA
+    vi.spyOn(apiClient.canvas, 'sendPrompt').mockImplementation(() => new Promise((resolve, reject) => {
+      rejectSessionA = reject
+    }))
+    const store = useCanvasStore()
+    store.currentSession = { id: 'session-A', prompt_tiles: [], debates: [] }
+
+    const pendingSend = store.sendPrompt('Hello from A', ['openai/gpt-4'])
+    await flushPromises()
+    store.currentSession = { id: 'session-B', prompt_tiles: [], debates: [] }
+    rejectSessionA(new Error('Session A provider failed'))
+
+    await expect(pendingSend).rejects.toThrow('Session A provider failed')
+    expect(store.currentSession.id).toBe('session-B')
+    expect(store.error).toBeNull()
   })
 
   it('scopes concurrent sendPrompt streams per tile so same-model interleaved chunks do not cross-contaminate', async () => {
@@ -765,6 +1026,107 @@ describe('Canvas Store', () => {
     })
   })
 
+  it('does not let an invalidated session load overwrite a newer destination owner', async () => {
+    let finishLoad
+    vi.spyOn(apiClient.canvas, 'get').mockImplementation(() => new Promise(resolve => {
+      finishLoad = () => resolve({
+        id: 'stale-canvas',
+        prompt_tiles: [],
+        debates: [],
+      })
+    }))
+    const store = useCanvasStore()
+
+    const pending = store.loadSession('stale-canvas')
+    store.clearSession()
+    store.currentSession = {
+      id: 'twin-chat',
+      tags: ['companion-twin-chat'],
+      prompt_tiles: [],
+      debates: [],
+    }
+    finishLoad()
+    await pending
+
+    expect(store.currentSession.id).toBe('twin-chat')
+  })
+
+  it('does not let an invalidated session create install itself over a newer owner', async () => {
+    let finishCreate
+    vi.spyOn(apiClient.canvas, 'create').mockImplementation(() => new Promise(resolve => {
+      finishCreate = () => resolve({
+        id: 'stale-created',
+        tags: [],
+        prompt_tiles: [],
+        debates: [],
+      })
+    }))
+    const store = useCanvasStore()
+
+    const pending = store.createSession({ title: 'Stale create' })
+    store.clearSession()
+    store.currentSession = {
+      id: 'new-owner',
+      tags: ['companion-twin-chat'],
+      prompt_tiles: [],
+      debates: [],
+    }
+    finishCreate()
+
+    await expect(pending).resolves.toBeNull()
+    expect(store.currentSession.id).toBe('new-owner')
+    expect(store.sessions.some(session => session.id === 'stale-created')).toBe(false)
+    expect(store.loading).toBe(false)
+  })
+
+  it('does not let a stale create clear loading owned by a newer session load', async () => {
+    let finishCreate
+    let finishLoad
+    vi.spyOn(apiClient.canvas, 'create').mockImplementation(() => new Promise(resolve => {
+      finishCreate = () => resolve({ id: 'stale-created', prompt_tiles: [], debates: [] })
+    }))
+    vi.spyOn(apiClient.canvas, 'get').mockImplementation(() => new Promise(resolve => {
+      finishLoad = () => resolve({ id: 'new-owner', prompt_tiles: [], debates: [] })
+    }))
+    const store = useCanvasStore()
+
+    const pendingCreate = store.createSession({ title: 'Stale create' })
+    const pendingLoad = store.loadSession('new-owner')
+    finishCreate()
+    await pendingCreate
+
+    expect(store.loading).toBe(true)
+    expect(store.currentSession).toBeNull()
+
+    finishLoad()
+    await pendingLoad
+    expect(store.currentSession.id).toBe('new-owner')
+    expect(store.loading).toBe(false)
+  })
+
+  it('clears loading when deleting a session invalidates an in-flight session load', async () => {
+    let finishLoad
+    vi.spyOn(apiClient.canvas, 'get').mockImplementation(() => new Promise(resolve => {
+      finishLoad = () => resolve({
+        id: 'stale-canvas',
+        prompt_tiles: [],
+        debates: [],
+      })
+    }))
+    vi.spyOn(apiClient.canvas, 'delete').mockResolvedValue()
+    const store = useCanvasStore()
+    store.sessions = [{ id: 'deleted-session', prompt_tiles: [], debates: [] }]
+
+    const pending = store.loadSession('stale-canvas')
+    expect(store.loading).toBe(true)
+    await store.deleteSession('deleted-session')
+
+    expect(store.loading).toBe(false)
+    finishLoad()
+    await pending
+    expect(store.loading).toBe(false)
+  })
+
   it('deleteTile removes the full descendant tree from the current session', async () => {
     vi.spyOn(apiClient.canvas, 'deleteTile').mockResolvedValue()
 
@@ -938,6 +1300,64 @@ describe('Canvas Store', () => {
     expect(result.created_record_ids).toEqual(['rec-1'])
   })
 
+  it('deduplicates in-flight feedback by session, tile, and model', async () => {
+    let finishFeedback
+    const feedbackSpy = vi.spyOn(apiClient.twin, 'recordCanvasFeedback').mockImplementation(
+      () => new Promise(resolve => { finishFeedback = resolve })
+    )
+    const store = useCanvasStore()
+    store.currentSession = {
+      id: 'session-1',
+      prompt_tiles: [],
+      debates: [],
+    }
+
+    const first = store.recordPreferenceFeedback('tile-1', 'model-a', 'accept')
+    const duplicate = store.recordPreferenceFeedback('tile-1', 'model-a', 'reject')
+
+    expect(feedbackSpy).toHaveBeenCalledOnce()
+    expect(store.feedbackInFlight.has('session-1:tile-1:model-a')).toBe(true)
+    await expect(duplicate).resolves.toBeNull()
+
+    finishFeedback({ trace_event_id: 'evt-1', created_record_ids: [] })
+    await first
+    expect(store.feedbackInFlight.size).toBe(0)
+  })
+
+  it('passes the frozen response witness through explicit insight capture', async () => {
+    const feedbackSpy = vi.spyOn(apiClient.twin, 'recordCanvasFeedback').mockResolvedValue({
+      trace_event_id: 'evt-1',
+      created_record_ids: ['rec-1']
+    })
+    const store = useCanvasStore()
+    store.currentSession = {
+      id: 'session-1',
+      prompt_tiles: [],
+      debates: [],
+    }
+
+    await store.captureInsight('preference', 'Concrete details', {
+      response: { tile_id: 'tile-1', model_id: 'model-a' },
+      responseWitness: {
+        response_id: 'response-a',
+        response_content: 'The exact visible answer',
+      },
+    })
+
+    expect(feedbackSpy).toHaveBeenCalledWith('session-1', {
+      feedback_type: 'insight',
+      kind: 'preference',
+      content: 'Concrete details',
+      rationale: null,
+      response: { tile_id: 'tile-1', model_id: 'model-a' },
+      response_witness: {
+        response_id: 'response-a',
+        response_content: 'The exact visible answer',
+      },
+      confidence: 0.8,
+    })
+  })
+
   it('session_saved reconciles silently mid-stream: no loading flash, no clobbered stream content, no reverted drag', async () => {
     const handlers = []
     listenMock.mockImplementation(async (_eventName, handler) => {
@@ -1089,6 +1509,59 @@ describe('Canvas Store', () => {
     // Let A's stream finish so the operation resolves cleanly
     broadcast({ session_id: 'session-A', type: 'complete', tile_id: 'tile-A1', model_id: 'openai/gpt-4' })
     await promise
+    expect(store.streamingModels.size).toBe(0)
+  })
+
+  it('drops late tile and response mutations after switching sessions but clears the stream tracker', async () => {
+    let streamHandler
+    listenMock.mockImplementation(async (_eventName, handler) => {
+      streamHandler = handler
+      return unlistenMock
+    })
+    vi.spyOn(apiClient.canvas, 'sendPrompt').mockResolvedValue('tile-A1')
+    const store = useCanvasStore()
+    store.currentSession = { id: 'session-A', prompt_tiles: [], debates: [] }
+
+    const promise = store.sendCompanionPrompt({
+      prompt: 'Background Twin prompt',
+      modelId: 'openai/gpt-4'
+    })
+    await flushPromises()
+    store.currentSession = {
+      id: 'session-B',
+      prompt_tiles: [{ id: 'tile-B1', prompt: 'Foreground', responses: {} }],
+      debates: []
+    }
+
+    streamHandler({ payload: {
+      session_id: 'session-A',
+      type: 'tile_created',
+      tile: {
+        id: 'tile-A1',
+        prompt: 'Background Twin prompt',
+        responses: {
+          'openai/gpt-4': { status: 'pending', content: '', position: { x: 0, y: 0, width: 280, height: 200 } }
+        }
+      }
+    } })
+    streamHandler({ payload: {
+      session_id: 'session-A',
+      type: 'chunk',
+      tile_id: 'tile-A1',
+      model_id: 'openai/gpt-4',
+      chunk: 'must not appear'
+    } })
+    streamHandler({ payload: {
+      session_id: 'session-A',
+      type: 'complete',
+      tile_id: 'tile-A1',
+      model_id: 'openai/gpt-4'
+    } })
+
+    await promise
+
+    expect(store.currentSession.id).toBe('session-B')
+    expect(store.currentSession.prompt_tiles.map(tile => tile.id)).toEqual(['tile-B1'])
     expect(store.streamingModels.size).toBe(0)
   })
 

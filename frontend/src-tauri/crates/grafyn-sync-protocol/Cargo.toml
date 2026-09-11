@@ -1,0 +1,23 @@
+[package]
+name = "grafyn-sync-protocol"
+version = "0.1.0"
+description = "Transport-neutral encrypted sync envelopes for Grafyn"
+license = "Apache-2.0 OR MPL-2.0"
+repository = "https://github.com/WKJBryan/Grafyn"
+edition = "2021"
+rust-version = "1.93"
+
+[dependencies]
+base64 = { version = "0.23.1", default-features = false, features = ["alloc"] }
+chacha20poly1305 = { version = "0.11.0", default-features = false, features = ["zeroize"] }
+ed25519-dalek = { version = "3.0.0", default-features = false, features = ["zeroize"] }
+getrandom = { version = "0.4.3", default-features = false }
+hkdf = { version = "0.13.0", default-features = false }
+hmac = { version = "0.13.0", default-features = false, features = ["zeroize"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = { version = "0.11.0", default-features = false, features = ["zeroize"] }
+zeroize = { version = "1.9.0", default-features = false, features = ["alloc"] }
+
+[lints.rust]
+unsafe_code = "forbid"

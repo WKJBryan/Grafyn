@@ -1,29 +1,110 @@
-use crate::models::canvas::{CanvasSession, ModelResponse, PromptTile};
+use crate::models::canvas::CanvasSession;
 use crate::models::twin::{
-    ActionGap, CanvasFeedbackRequest, CanvasFeedbackResult, CanvasFeedbackType, CanvasResponseRef,
+    ActionGap, CanvasFeedbackRequest, CanvasFeedbackResult, CanvasResponseRef,
     ConstitutionInferenceSummary, ConstitutionItem, ConstitutionItemCreate, ConstitutionItemUpdate,
     ConstitutionReviewRequest, ConstitutionSetup, DecisionEpisode, DecisionEpisodeWithReflections,
-    DecisionMirrorConfig, DecisionMirrorConfigUpdate, DecisionOutcomeUpdate, EvidenceRef,
-    MemoryDigestItem, MemoryDigestReviewRequest, PromotionState, RecordOrigin, ResolvedEvidenceRef,
-    SessionTrace, TraceEvent, TraceEventType, TwinExportRequest, TwinInferenceRunSummary,
-    TwinReviewRecord, UserRecord, UserRecordCreate, UserRecordKind, UserRecordUpdate,
+    DecisionMirrorConfig, DecisionMirrorConfigUpdate, DecisionOutcomeUpdate, MemoryDigestItem,
+    MemoryDigestReviewRequest, PromotionState, ResolvedEvidenceRef, SessionTrace,
+    TwinExportRequest, TwinInferenceRunSummary, TwinReviewRecord, UserRecord, UserRecordCreate,
+    UserRecordUpdate,
 };
 use crate::AppState;
-use serde_json::json;
 use tauri::State;
+
+async fn run_twin_mutation<T>(
+    state: &AppState,
+    operation_name: &str,
+    operation: impl FnOnce(
+        &mut crate::services::twin::TwinStore,
+    ) -> anyhow::Result<(T, crate::services::twin_events::MutationCommit)>,
+) -> Result<T, String> {
+    let root_ticket = crate::commands::acquire_root_epoch(state).await?;
+    let result = {
+        let mut store = state.twin_store.write().await;
+        operation(&mut store)
+    };
+    finish_twin_mutation(state, root_ticket, operation_name, result).await
+}
+
+async fn finish_twin_mutation<T>(
+    state: &AppState,
+    root_ticket: crate::commands::RootReadTicket,
+    operation_name: &str,
+    result: anyhow::Result<(T, crate::services::twin_events::MutationCommit)>,
+) -> Result<T, String> {
+    match result {
+        Ok((value, commit)) if commit.authority_token.is_some() => {
+            drop(root_ticket);
+            match crate::commands::repair_after_authority_mutation(state, &commit, operation_name)
+                .await
+            {
+                crate::commands::PostAuthorityRepair::NotRequired
+                | crate::commands::PostAuthorityRepair::Ready(_)
+                | crate::commands::PostAuthorityRepair::Unavailable(_) => {}
+            }
+            Ok(value)
+        }
+        Ok((value, _commit)) => {
+            root_ticket.finish(state).await?;
+            Ok(value)
+        }
+        Err(error) => {
+            if let Some(commit) = error
+                .downcast_ref::<crate::services::twin_events::MutationError>()
+                .and_then(|error| error.authority_advanced_commit())
+            {
+                drop(root_ticket);
+                match crate::commands::repair_after_authority_mutation(
+                    state,
+                    &commit,
+                    operation_name,
+                )
+                .await
+                {
+                    crate::commands::PostAuthorityRepair::NotRequired
+                    | crate::commands::PostAuthorityRepair::Ready(_)
+                    | crate::commands::PostAuthorityRepair::Unavailable(_) => {}
+                }
+                return Err(format!(
+                    "{operation_name} committed and is being recovered; do not retry"
+                ));
+            }
+            root_ticket.finish(state).await?;
+            Err(error.to_string())
+        }
+    }
+}
 
 #[tauri::command]
 pub async fn list_user_records(state: State<'_, AppState>) -> Result<Vec<UserRecord>, String> {
-    let mut store = state.twin_store.write().await;
-    store.list_user_records().map_err(|error| error.to_string())
+    let root_ticket = crate::commands::acquire_root_epoch(state.inner()).await?;
+    let result = {
+        let mut store = state.twin_store.write().await;
+        store
+            .rebuild_mutation_caches()
+            .map_err(|error| error.to_string())?;
+        store
+            .list_user_records()
+            .map_err(|error| error.to_string())?
+    };
+    root_ticket.finish(state.inner()).await?;
+    Ok(result)
 }
 
 #[tauri::command]
 pub async fn get_user_record(id: String, state: State<'_, AppState>) -> Result<UserRecord, String> {
-    let mut store = state.twin_store.write().await;
-    store
-        .get_user_record(&id)
-        .map_err(|error| error.to_string())
+    let root_ticket = crate::commands::acquire_root_epoch(state.inner()).await?;
+    let result = {
+        let mut store = state.twin_store.write().await;
+        store
+            .rebuild_mutation_caches()
+            .map_err(|error| error.to_string())?;
+        store
+            .get_user_record(&id)
+            .map_err(|error| error.to_string())?
+    };
+    root_ticket.finish(state.inner()).await?;
+    Ok(result)
 }
 
 #[tauri::command]
@@ -31,10 +112,10 @@ pub async fn create_user_record(
     record: UserRecordCreate,
     state: State<'_, AppState>,
 ) -> Result<UserRecord, String> {
-    let mut store = state.twin_store.write().await;
-    store
-        .create_user_record(record)
-        .map_err(|error| error.to_string())
+    run_twin_mutation(state.inner(), "user record create", move |store| {
+        store.create_user_record_with_commit(record)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -43,10 +124,10 @@ pub async fn update_user_record(
     update: UserRecordUpdate,
     state: State<'_, AppState>,
 ) -> Result<UserRecord, String> {
-    let mut store = state.twin_store.write().await;
-    store
-        .update_user_record(&id, update)
-        .map_err(|error| error.to_string())
+    run_twin_mutation(state.inner(), "user record update", move |store| {
+        store.update_user_record_with_commit(&id, update)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -54,26 +135,36 @@ pub async fn get_session_trace(
     session_id: String,
     state: State<'_, AppState>,
 ) -> Result<SessionTrace, String> {
-    let mut store = state.twin_store.write().await;
-    store
-        .get_session_trace(&session_id)
-        .map_err(|error| error.to_string())
+    let root_ticket = crate::commands::acquire_derived_root_epoch(state.inner()).await?;
+    let result = {
+        let mut store = state.twin_store.write().await;
+        store
+            .get_session_trace(&session_id)
+            .map_err(|error| error.to_string())?
+    };
+    root_ticket.finish(state.inner()).await?;
+    Ok(result)
 }
 
 #[tauri::command]
 pub async fn run_twin_inference(
     state: State<'_, AppState>,
 ) -> Result<TwinInferenceRunSummary, String> {
-    let mut store = state.twin_store.write().await;
-    store
-        .run_twin_inference()
-        .map_err(|error| error.to_string())
+    run_twin_mutation(state.inner(), "Twin inference", |store| {
+        store.run_twin_inference_with_commit()
+    })
+    .await
 }
 
 #[tauri::command]
 pub async fn get_twin_review(state: State<'_, AppState>) -> Result<Vec<TwinReviewRecord>, String> {
-    let mut store = state.twin_store.write().await;
-    store.get_twin_review().map_err(|error| error.to_string())
+    let root_ticket = crate::commands::acquire_derived_root_epoch(state.inner()).await?;
+    let result = {
+        let mut store = state.twin_store.write().await;
+        store.get_twin_review().map_err(|error| error.to_string())?
+    };
+    root_ticket.finish(state.inner()).await?;
+    Ok(result)
 }
 
 #[tauri::command]
@@ -81,10 +172,15 @@ pub async fn resolve_user_record_evidence(
     id: String,
     state: State<'_, AppState>,
 ) -> Result<Vec<ResolvedEvidenceRef>, String> {
-    let mut store = state.twin_store.write().await;
-    store
-        .resolve_user_record_evidence(&id)
-        .map_err(|error| error.to_string())
+    let root_ticket = crate::commands::acquire_derived_root_epoch(state.inner()).await?;
+    let result = {
+        let mut store = state.twin_store.write().await;
+        store
+            .resolve_user_record_evidence(&id)
+            .map_err(|error| error.to_string())?
+    };
+    root_ticket.finish(state.inner()).await?;
+    Ok(result)
 }
 
 #[tauri::command]
@@ -94,10 +190,10 @@ pub async fn set_user_record_promotion(
     rationale: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<UserRecord, String> {
-    let mut store = state.twin_store.write().await;
-    store
-        .set_user_record_promotion(&id, promotion_state, rationale)
-        .map_err(|error| error.to_string())
+    run_twin_mutation(state.inner(), "user record review", move |store| {
+        store.set_user_record_promotion_with_commit(&id, promotion_state, rationale)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -105,20 +201,25 @@ pub async fn export_twin_data(
     request: TwinExportRequest,
     state: State<'_, AppState>,
 ) -> Result<crate::models::twin::ExportBundle, String> {
-    let mut store = state.twin_store.write().await;
-    store
-        .export_bundle(request)
-        .map_err(|error| error.to_string())
+    run_twin_mutation(state.inner(), "Twin export", move |store| {
+        store.export_bundle_with_commit(request)
+    })
+    .await
 }
 
 #[tauri::command]
 pub async fn list_decision_episodes(
     state: State<'_, AppState>,
 ) -> Result<Vec<DecisionEpisodeWithReflections>, String> {
-    let store = state.twin_store.read().await;
-    store
-        .list_decision_episodes_with_reflections()
-        .map_err(|error| error.to_string())
+    let root_ticket = crate::commands::acquire_derived_root_epoch(state.inner()).await?;
+    let result = {
+        let store = state.twin_store.read().await;
+        store
+            .list_decision_episodes_with_reflections()
+            .map_err(|error| error.to_string())?
+    };
+    root_ticket.finish(state.inner()).await?;
+    Ok(result)
 }
 
 #[tauri::command]
@@ -127,20 +228,73 @@ pub async fn update_decision_outcome(
     update: DecisionOutcomeUpdate,
     state: State<'_, AppState>,
 ) -> Result<DecisionEpisode, String> {
-    let mut store = state.twin_store.write().await;
-    store
-        .update_decision_outcome(&id, update)
-        .map_err(|error| error.to_string())
+    let root_ticket = crate::commands::acquire_root_epoch(state.inner()).await?;
+    let selected_response_id = if let Some(selected) = update.selected_response.as_ref() {
+        let session_id = {
+            let mut store = state.twin_store.write().await;
+            store
+                .rebuild_mutation_caches()
+                .map_err(|error| error.to_string())?;
+            store
+                .get_decision_episode(&id)
+                .map_err(|error| error.to_string())?
+                .session_id
+        };
+        let session = {
+            let mut canvas = state.canvas_store.write().await;
+            canvas.reload_authoritative_state();
+            canvas
+                .get_session(&session_id)
+                .map_err(|error| error.to_string())?
+        };
+        Some(
+            resolve_persisted_response_id(&session, selected)
+                .ok_or_else(|| "Selected Canvas response no longer exists".to_string())?,
+        )
+    } else {
+        None
+    };
+    root_ticket.validate(state.inner()).await?;
+    let result = {
+        let mut store = state.twin_store.write().await;
+        store.update_decision_outcome_with_response_id_and_commit(&id, update, selected_response_id)
+    };
+    finish_twin_mutation(
+        state.inner(),
+        root_ticket,
+        "decision outcome update",
+        result,
+    )
+    .await
+}
+
+fn resolve_persisted_response_id(
+    session: &CanvasSession,
+    selected: &CanvasResponseRef,
+) -> Option<String> {
+    session
+        .prompt_tiles
+        .iter()
+        .find(|tile| tile.id == selected.tile_id)?
+        .responses
+        .values()
+        .find(|response| response.model_id == selected.model_id)
+        .map(|response| response.id.clone())
 }
 
 #[tauri::command]
 pub async fn get_decision_mirror_config(
     state: State<'_, AppState>,
 ) -> Result<DecisionMirrorConfig, String> {
-    let store = state.twin_store.read().await;
-    store
-        .get_decision_mirror_config()
-        .map_err(|error| error.to_string())
+    let root_ticket = crate::commands::acquire_derived_root_epoch(state.inner()).await?;
+    let result = {
+        let store = state.twin_store.read().await;
+        store
+            .get_decision_mirror_config()
+            .map_err(|error| error.to_string())?
+    };
+    root_ticket.finish(state.inner()).await?;
+    Ok(result)
 }
 
 #[tauri::command]
@@ -148,33 +302,32 @@ pub async fn update_decision_mirror_config(
     update: DecisionMirrorConfigUpdate,
     state: State<'_, AppState>,
 ) -> Result<DecisionMirrorConfig, String> {
-    // Read-modify-write over the config file: must hold the write lock so two
-    // concurrent updates can't both read the same on-disk state and have the
-    // second writer silently clobber the first's change.
-    let store = state.twin_store.write().await;
-    store
-        .update_decision_mirror_config(update)
-        .map_err(|error| error.to_string())
+    run_twin_mutation(
+        state.inner(),
+        "decision mirror config update",
+        move |store| store.update_decision_mirror_config_with_commit(update),
+    )
+    .await
 }
 
 #[tauri::command]
 pub async fn reset_decision_mirror_config(
     state: State<'_, AppState>,
 ) -> Result<DecisionMirrorConfig, String> {
-    let store = state.twin_store.read().await;
-    store
-        .reset_decision_mirror_config()
-        .map_err(|error| error.to_string())
+    run_twin_mutation(state.inner(), "decision mirror config reset", |store| {
+        store.reset_decision_mirror_config_with_commit()
+    })
+    .await
 }
 
 #[tauri::command]
 pub async fn list_memory_digest(
     state: State<'_, AppState>,
 ) -> Result<Vec<MemoryDigestItem>, String> {
-    let mut store = state.twin_store.write().await;
-    store
-        .list_memory_digest()
-        .map_err(|error| error.to_string())
+    run_twin_mutation(state.inner(), "memory digest refresh", |store| {
+        store.list_memory_digest_with_commit()
+    })
+    .await
 }
 
 #[tauri::command]
@@ -183,20 +336,25 @@ pub async fn review_memory_digest_item(
     request: MemoryDigestReviewRequest,
     state: State<'_, AppState>,
 ) -> Result<MemoryDigestItem, String> {
-    let mut store = state.twin_store.write().await;
-    store
-        .review_memory_digest_item(&id, request)
-        .map_err(|error| error.to_string())
+    run_twin_mutation(state.inner(), "memory digest review", move |store| {
+        store.review_memory_digest_item_with_commit(&id, request)
+    })
+    .await
 }
 
 #[tauri::command]
 pub async fn list_constitution_items(
     state: State<'_, AppState>,
 ) -> Result<Vec<ConstitutionItem>, String> {
-    let store = state.twin_store.read().await;
-    store
-        .list_constitution_items()
-        .map_err(|error| error.to_string())
+    let root_ticket = crate::commands::acquire_derived_root_epoch(state.inner()).await?;
+    let result = {
+        let store = state.twin_store.read().await;
+        store
+            .list_constitution_items()
+            .map_err(|error| error.to_string())?
+    };
+    root_ticket.finish(state.inner()).await?;
+    Ok(result)
 }
 
 #[tauri::command]
@@ -204,12 +362,10 @@ pub async fn create_constitution_item(
     item: ConstitutionItemCreate,
     state: State<'_, AppState>,
 ) -> Result<ConstitutionItem, String> {
-    // Write lock: create_constitution_item does a read-modify-write file
-    // sequence (see update_decision_mirror_config above for why read() is unsafe here).
-    let store = state.twin_store.write().await;
-    store
-        .create_constitution_item(item)
-        .map_err(|error| error.to_string())
+    run_twin_mutation(state.inner(), "constitution item create", move |store| {
+        store.create_constitution_item_with_commit(item)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -218,14 +374,10 @@ pub async fn update_constitution_item(
     update: ConstitutionItemUpdate,
     state: State<'_, AppState>,
 ) -> Result<ConstitutionItem, String> {
-    // Write lock: update_constitution_item reads the current item file, applies the
-    // update, then writes it back. Two concurrent updates to the same item under a
-    // shared read lock could both read the pre-update file and the second writer
-    // would silently clobber the first's change.
-    let store = state.twin_store.write().await;
-    store
-        .update_constitution_item(&id, update)
-        .map_err(|error| error.to_string())
+    run_twin_mutation(state.inner(), "constitution item update", move |store| {
+        store.update_constitution_item_with_commit(&id, update)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -234,16 +386,23 @@ pub async fn review_constitution_item(
     request: ConstitutionReviewRequest,
     state: State<'_, AppState>,
 ) -> Result<ConstitutionItem, String> {
-    let mut store = state.twin_store.write().await;
-    store
-        .review_constitution_item(&id, request)
-        .map_err(|error| error.to_string())
+    run_twin_mutation(state.inner(), "constitution item review", move |store| {
+        store.review_constitution_item_with_commit(&id, request)
+    })
+    .await
 }
 
 #[tauri::command]
 pub async fn list_action_gaps(state: State<'_, AppState>) -> Result<Vec<ActionGap>, String> {
-    let store = state.twin_store.read().await;
-    store.list_action_gaps().map_err(|error| error.to_string())
+    let root_ticket = crate::commands::acquire_derived_root_epoch(state.inner()).await?;
+    let result = {
+        let store = state.twin_store.read().await;
+        store
+            .list_action_gaps()
+            .map_err(|error| error.to_string())?
+    };
+    root_ticket.finish(state.inner()).await?;
+    Ok(result)
 }
 
 #[tauri::command]
@@ -252,20 +411,25 @@ pub async fn review_action_gap(
     request: ConstitutionReviewRequest,
     state: State<'_, AppState>,
 ) -> Result<ActionGap, String> {
-    let mut store = state.twin_store.write().await;
-    store
-        .review_action_gap(&id, request)
-        .map_err(|error| error.to_string())
+    run_twin_mutation(state.inner(), "action gap review", move |store| {
+        store.review_action_gap_with_commit(&id, request)
+    })
+    .await
 }
 
 #[tauri::command]
 pub async fn get_constitution_setup(
     state: State<'_, AppState>,
 ) -> Result<ConstitutionSetup, String> {
-    let store = state.twin_store.read().await;
-    store
-        .get_constitution_setup()
-        .map_err(|error| error.to_string())
+    let root_ticket = crate::commands::acquire_derived_root_epoch(state.inner()).await?;
+    let result = {
+        let store = state.twin_store.read().await;
+        store
+            .get_constitution_setup()
+            .map_err(|error| error.to_string())?
+    };
+    root_ticket.finish(state.inner()).await?;
+    Ok(result)
 }
 
 #[tauri::command]
@@ -273,24 +437,26 @@ pub async fn save_constitution_setup(
     setup: ConstitutionSetup,
     state: State<'_, AppState>,
 ) -> Result<ConstitutionSetup, String> {
-    let mut store = state.twin_store.write().await;
-    store
-        .save_constitution_setup(setup)
-        .map_err(|error| error.to_string())
+    run_twin_mutation(state.inner(), "constitution setup save", move |store| {
+        store.save_constitution_setup_with_commit(setup)
+    })
+    .await
 }
 
 #[tauri::command]
 pub async fn run_constitution_inference(
     state: State<'_, AppState>,
 ) -> Result<ConstitutionInferenceSummary, String> {
+    let root_ticket = crate::commands::acquire_root_epoch(state.inner()).await?;
     let notes = {
         let store = state.knowledge_store.read().await;
         store.list_full_notes().map_err(|error| error.to_string())?
     };
-    let mut store = state.twin_store.write().await;
-    store
-        .run_constitution_inference_with_notes(&notes)
-        .map_err(|error| error.to_string())
+    let result = {
+        let mut store = state.twin_store.write().await;
+        store.run_constitution_inference_with_notes_and_commit(&notes)
+    };
+    finish_twin_mutation(state.inner(), root_ticket, "constitution inference", result).await
 }
 
 #[tauri::command]
@@ -299,393 +465,92 @@ pub async fn record_canvas_feedback(
     request: CanvasFeedbackRequest,
     state: State<'_, AppState>,
 ) -> Result<CanvasFeedbackResult, String> {
+    let root_ticket = crate::commands::acquire_root_epoch(state.inner()).await?;
     let session = {
         let mut canvas_store = state.canvas_store.write().await;
+        canvas_store.reload_authoritative_state();
         canvas_store
             .get_session(&session_id)
             .map_err(|error| error.to_string())?
     };
+    root_ticket.validate(state.inner()).await?;
 
-    let payload = build_feedback_payload(&session, &request)?;
-    let trace_event = {
+    let result = {
         let mut twin_store = state.twin_store.write().await;
-        twin_store
-            .append_trace_event(
-                &session_id,
-                trace_event_type_for_feedback(&request.feedback_type),
-                payload,
-            )
-            .map_err(|error| error.to_string())?
+        twin_store.record_canvas_feedback_with_commit(&session, request)
     };
-
-    let mut created_record_ids = Vec::new();
-    if let Some(record_create) =
-        build_record_from_feedback(&session, &session_id, &trace_event, &request)?
-    {
-        let record = {
-            let mut twin_store = state.twin_store.write().await;
-            twin_store
-                .create_user_record(record_create)
-                .map_err(|error| error.to_string())?
-        };
-        created_record_ids.push(record.id);
-    }
-
-    Ok(CanvasFeedbackResult {
-        trace_event_id: trace_event.id,
-        created_record_ids,
-    })
-}
-
-fn trace_event_type_for_feedback(feedback_type: &CanvasFeedbackType) -> TraceEventType {
-    match feedback_type {
-        CanvasFeedbackType::Ranking => TraceEventType::RankingRecorded,
-        CanvasFeedbackType::Insight => TraceEventType::InsightCaptured,
-        CanvasFeedbackType::Accept
-        | CanvasFeedbackType::Reject
-        | CanvasFeedbackType::Correction => TraceEventType::FeedbackRecorded,
-    }
-}
-
-fn build_feedback_payload(
-    session: &CanvasSession,
-    request: &CanvasFeedbackRequest,
-) -> Result<serde_json::Value, String> {
-    let payload = match &request.feedback_type {
-        CanvasFeedbackType::Accept
-        | CanvasFeedbackType::Reject
-        | CanvasFeedbackType::Correction => {
-            let response_ref = request
-                .response
-                .as_ref()
-                .ok_or_else(|| "A response reference is required".to_string())?;
-            let (tile, response) = find_response(session, response_ref)?;
-            json!({
-                "feedback_type": request.feedback_type,
-                "response": response_snapshot(response_ref, tile, response),
-                "content": request.content,
-                "rationale": request.rationale,
-                "kind": request.kind,
-            })
-        }
-        CanvasFeedbackType::Ranking => {
-            if request.ranked_responses.len() < 2 {
-                return Err("At least two ranked responses are required".to_string());
-            }
-
-            let ranked = request
-                .ranked_responses
-                .iter()
-                .enumerate()
-                .map(|(index, response_ref)| {
-                    let (tile, response) = find_response(session, response_ref)?;
-                    Ok(json!({
-                        "rank": index + 1,
-                        "response": response_snapshot(response_ref, tile, response),
-                    }))
-                })
-                .collect::<Result<Vec<_>, String>>()?;
-
-            json!({
-                "feedback_type": request.feedback_type,
-                "ranked_responses": ranked,
-                "content": request.content,
-                "rationale": request.rationale,
-            })
-        }
-        CanvasFeedbackType::Insight => {
-            if request.kind.is_none() {
-                return Err("Insight capture requires a record kind".to_string());
-            }
-
-            let evidence = if let Some(response_ref) = request.response.as_ref() {
-                let (tile, response) = find_response(session, response_ref)?;
-                Some(response_snapshot(response_ref, tile, response))
-            } else {
-                None
-            };
-
-            json!({
-                "feedback_type": request.feedback_type,
-                "kind": request.kind,
-                "content": request.content,
-                "rationale": request.rationale,
-                "evidence": evidence,
-            })
-        }
-    };
-
-    Ok(payload)
-}
-
-fn build_record_from_feedback(
-    session: &CanvasSession,
-    session_id: &str,
-    trace_event: &TraceEvent,
-    request: &CanvasFeedbackRequest,
-) -> Result<Option<UserRecordCreate>, String> {
-    let mut evidence_refs = Vec::new();
-
-    if let Some(response_ref) = request.response.as_ref() {
-        evidence_refs.push(EvidenceRef {
-            trace_id: session_id.to_string(),
-            event_id: trace_event.id.clone(),
-            session_id: session_id.to_string(),
-            tile_id: Some(response_ref.tile_id.clone()),
-            model_id: Some(response_ref.model_id.clone()),
-            note: request.rationale.clone(),
-            source_type: Some("behavior".to_string()),
-            source_id: Some(trace_event.id.clone()),
-            source_label: Some("Canvas feedback".to_string()),
-            excerpt: request.rationale.clone(),
-            speaker_role: Some("user".to_string()),
-        });
-    } else if let Some(first_ranked) = request.ranked_responses.first() {
-        evidence_refs.push(EvidenceRef {
-            trace_id: session_id.to_string(),
-            event_id: trace_event.id.clone(),
-            session_id: session_id.to_string(),
-            tile_id: Some(first_ranked.tile_id.clone()),
-            model_id: Some(first_ranked.model_id.clone()),
-            note: request.rationale.clone(),
-            source_type: Some("behavior".to_string()),
-            source_id: Some(trace_event.id.clone()),
-            source_label: Some("Canvas ranking".to_string()),
-            excerpt: request.rationale.clone(),
-            speaker_role: Some("user".to_string()),
-        });
-    } else {
-        evidence_refs.push(EvidenceRef {
-            trace_id: session_id.to_string(),
-            event_id: trace_event.id.clone(),
-            session_id: session_id.to_string(),
-            tile_id: None,
-            model_id: None,
-            note: request.rationale.clone(),
-            source_type: Some("behavior".to_string()),
-            source_id: Some(trace_event.id.clone()),
-            source_label: Some("Canvas feedback".to_string()),
-            excerpt: request.rationale.clone(),
-            speaker_role: Some("user".to_string()),
-        });
-    }
-
-    let record = match &request.feedback_type {
-        CanvasFeedbackType::Accept | CanvasFeedbackType::Reject => {
-            let response_ref = request
-                .response
-                .as_ref()
-                .ok_or_else(|| "A response reference is required".to_string())?;
-            let (tile, response) = find_response(session, response_ref)?;
-            let label = match &request.feedback_type {
-                CanvasFeedbackType::Accept => "Accepted",
-                CanvasFeedbackType::Reject => "Rejected",
-                _ => unreachable!(),
-            };
-            let content = request.content.clone().unwrap_or_else(|| {
-                format!(
-                    "{} response from {} for prompt: {}",
-                    label, response.model_name, tile.prompt
-                )
-            });
-
-            Some(UserRecordCreate {
-                kind: request.kind.clone().unwrap_or(UserRecordKind::Preference),
-                content,
-                evidence_refs,
-                confidence: request.confidence,
-                origin: RecordOrigin::User,
-                promotion_state: Some(PromotionState::AutoPromoted),
-                valid_from: None,
-                valid_until: None,
-                links: request.links.clone(),
-                metadata: json!({
-                    "feedback_type": request.feedback_type,
-                    "prompt": tile.prompt,
-                    "model_id": response.model_id,
-                    "model_name": response.model_name,
-                    "response_excerpt": excerpt(&response.content),
-                    "rationale": request.rationale,
-                })
-                .as_object()
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                .collect(),
-            })
-        }
-        CanvasFeedbackType::Ranking => {
-            if request.ranked_responses.len() < 2 {
-                return Err("At least two ranked responses are required".to_string());
-            }
-
-            let ranked_snapshots = request
-                .ranked_responses
-                .iter()
-                .enumerate()
-                .map(|(index, response_ref)| {
-                    let (tile, response) = find_response(session, response_ref)?;
-                    Ok(json!({
-                        "rank": index + 1,
-                        "tile_id": response_ref.tile_id,
-                        "model_id": response.model_id,
-                        "model_name": response.model_name,
-                        "prompt": tile.prompt,
-                        "response_excerpt": excerpt(&response.content),
-                    }))
-                })
-                .collect::<Result<Vec<_>, String>>()?;
-
-            let content = request.content.clone().unwrap_or_else(|| {
-                let summary = ranked_snapshots
-                    .iter()
-                    .map(|snapshot| {
-                        format!(
-                            "{}. {}",
-                            snapshot["rank"].as_u64().unwrap_or_default(),
-                            snapshot["model_name"].as_str().unwrap_or("model")
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" > ");
-                format!("Preference ranking recorded: {}", summary)
-            });
-
-            Some(UserRecordCreate {
-                kind: request.kind.clone().unwrap_or(UserRecordKind::Preference),
-                content,
-                evidence_refs,
-                confidence: request.confidence,
-                origin: RecordOrigin::User,
-                promotion_state: Some(PromotionState::AutoPromoted),
-                valid_from: None,
-                valid_until: None,
-                links: request.links.clone(),
-                metadata: json!({
-                    "feedback_type": request.feedback_type,
-                    "rationale": request.rationale,
-                    "ranked_responses": ranked_snapshots,
-                })
-                .as_object()
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                .collect(),
-            })
-        }
-        CanvasFeedbackType::Correction => {
-            let content = request
-                .content
-                .clone()
-                .ok_or_else(|| "Correction feedback requires content".to_string())?;
-
-            Some(UserRecordCreate {
-                kind: request.kind.clone().unwrap_or(UserRecordKind::Fact),
-                content,
-                evidence_refs,
-                confidence: request.confidence,
-                origin: RecordOrigin::User,
-                promotion_state: Some(PromotionState::AutoPromoted),
-                valid_from: None,
-                valid_until: None,
-                links: request.links.clone(),
-                metadata: json!({
-                    "feedback_type": request.feedback_type,
-                    "rationale": request.rationale,
-                })
-                .as_object()
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                .collect(),
-            })
-        }
-        CanvasFeedbackType::Insight => {
-            let content = request
-                .content
-                .clone()
-                .ok_or_else(|| "Insight capture requires content".to_string())?;
-            let kind = request
-                .kind
-                .clone()
-                .ok_or_else(|| "Insight capture requires a record kind".to_string())?;
-
-            Some(UserRecordCreate {
-                kind,
-                content,
-                evidence_refs,
-                confidence: request.confidence,
-                origin: RecordOrigin::User,
-                promotion_state: Some(PromotionState::AutoPromoted),
-                valid_from: None,
-                valid_until: None,
-                links: request.links.clone(),
-                metadata: json!({
-                    "feedback_type": request.feedback_type,
-                    "rationale": request.rationale,
-                })
-                .as_object()
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                .collect(),
-            })
-        }
-    };
-
-    Ok(record)
-}
-
-fn response_snapshot(
-    response_ref: &CanvasResponseRef,
-    tile: &PromptTile,
-    response: &ModelResponse,
-) -> serde_json::Value {
-    json!({
-        "tile_id": response_ref.tile_id,
-        "model_id": response.model_id,
-        "model_name": response.model_name,
-        "prompt": tile.prompt,
-        "response_content": response.content,
-        "status": response.status,
-    })
-}
-
-fn find_response<'a>(
-    session: &'a CanvasSession,
-    response_ref: &CanvasResponseRef,
-) -> Result<(&'a PromptTile, &'a ModelResponse), String> {
-    let tile = session
-        .prompt_tiles
-        .iter()
-        .find(|tile| tile.id == response_ref.tile_id)
-        .ok_or_else(|| format!("Tile not found: {}", response_ref.tile_id))?;
-    let response = tile
-        .responses
-        .get(&response_ref.model_id)
-        .ok_or_else(|| format!("Response not found: {}", response_ref.model_id))?;
-
-    Ok((tile, response))
-}
-
-fn excerpt(content: &str) -> String {
-    const MAX_LEN: usize = 220;
-    if content.chars().count() <= MAX_LEN {
-        return content.to_string();
-    }
-
-    let mut excerpt: String = content.chars().take(MAX_LEN).collect();
-    excerpt.push_str("...");
-    excerpt
+    finish_twin_mutation(state.inner(), root_ticket, "Canvas feedback", result).await
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::models::twin::{ConstitutionItemCreate, ConstitutionItemUpdate};
+    use super::{resolve_persisted_response_id, run_twin_mutation};
+    use crate::models::canvas::{CanvasSession, ModelResponse, PromptTile};
+    use crate::models::twin::{ConstitutionItemCreate, ConstitutionItemUpdate, TwinExportRequest};
     use crate::services::twin::TwinStore;
     use std::sync::Arc;
     use tempfile::tempdir;
     use tokio::sync::RwLock;
+
+    #[tokio::test]
+    async fn export_command_repairs_its_exact_commit_and_publishes_ready() {
+        let (mut state, _vault_dir, data_dir) =
+            crate::commands::commit_note_write_tests::build_test_state();
+        let coordinator = state.mutation_coordinator.as_ref().unwrap().clone();
+        let initial = coordinator.current_authority_token().unwrap();
+        *state.loaded_authority.write().await = Some(initial.clone());
+        let twin_target_root = data_dir.path().join("twin");
+        let twin_root = twin_target_root.join("scope-one");
+        state.twin_store = Arc::new(RwLock::new(TwinStore::with_event_recorder(
+            twin_root,
+            twin_target_root,
+            coordinator.clone(),
+        )));
+
+        let bundle = run_twin_mutation(&state, "Twin export", |store| {
+            store.export_bundle_with_commit(TwinExportRequest::default())
+        })
+        .await
+        .expect("export and exact-token repair should succeed");
+
+        let ready = coordinator.current_authority_token().unwrap();
+        assert_eq!(ready.authority_generation, initial.authority_generation + 1);
+        assert_eq!(state.loaded_authority.read().await.as_ref(), Some(&ready));
+        coordinator.require_namespace_ready().unwrap();
+        assert!(std::path::Path::new(&bundle.manifest_path).is_file());
+    }
+
+    #[test]
+    fn selected_outcome_response_resolves_the_persisted_canvas_response_id() {
+        let mut session = CanvasSession {
+            id: "session-one".to_string(),
+            ..CanvasSession::default()
+        };
+        let mut tile = PromptTile {
+            id: "tile-one".to_string(),
+            ..PromptTile::default()
+        };
+        tile.responses.insert(
+            "model-a".to_string(),
+            ModelResponse {
+                id: "response-persisted".to_string(),
+                model_id: "model-a".to_string(),
+                ..ModelResponse::default()
+            },
+        );
+        session.prompt_tiles.push(tile);
+        assert_eq!(
+            resolve_persisted_response_id(
+                &session,
+                &crate::models::twin::CanvasResponseRef {
+                    tile_id: "tile-one".to_string(),
+                    model_id: "model-a".to_string(),
+                }
+            )
+            .as_deref(),
+            Some("response-persisted")
+        );
+    }
 
     /// Regression test for the read-modify-write lock fix: `update_constitution_item`
     /// reads the current item file, applies the update's `Some` fields, and writes the
@@ -703,7 +568,7 @@ mod tests {
         let store = Arc::new(RwLock::new(TwinStore::new(temp_dir.path().to_path_buf())));
 
         let item = {
-            let guard = store.read().await;
+            let mut guard = store.write().await;
             guard
                 .create_constitution_item(ConstitutionItemCreate {
                     claim: "Original claim".to_string(),
@@ -725,7 +590,7 @@ mod tests {
         let claim_update = tokio::spawn(async move {
             // Mirrors the fixed `update_constitution_item` command: acquire the
             // write lock for the whole read-modify-write sequence.
-            let guard = store_a.write().await;
+            let mut guard = store_a.write().await;
             guard
                 .update_constitution_item(
                     &item_id_a,
@@ -740,7 +605,7 @@ mod tests {
         let store_b = store.clone();
         let item_id_b = item.id.clone();
         let priority_update = tokio::spawn(async move {
-            let guard = store_b.write().await;
+            let mut guard = store_b.write().await;
             guard
                 .update_constitution_item(
                     &item_id_b,

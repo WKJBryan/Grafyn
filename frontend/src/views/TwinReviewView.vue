@@ -11,7 +11,7 @@
       </div>
       <div class="header-title">
         <h1>Twin Workspace</h1>
-        <span>{{ twinStore.healthSummary }}</span>
+        <span>{{ isEvidenceTab ? (evidenceStore.scope === 'pilot' ? "Bryan’s isolated pilot" : 'Current vault evidence') : twinStore.healthSummary }}</span>
       </div>
       <div class="header-actions">
         <button
@@ -55,7 +55,12 @@
       </nav>
 
       <main class="workspace-main">
-        <TwinOverviewTab v-if="twinStore.activeTab === 'overview'" />
+        <EvidenceWorkspace
+          v-if="isEvidenceTab"
+          :tab="twinStore.activeTab"
+        />
+
+        <TwinOverviewTab v-else-if="twinStore.activeTab === 'overview'" />
 
         <TwinConstitutionTab v-else-if="twinStore.activeTab === 'constitution'" />
 
@@ -89,6 +94,8 @@
 import { computed, onMounted } from 'vue'
 import { useRoute } from 'vue-router'
 import { useTwinStore } from '@/stores/twin'
+import { useEvidenceStore } from '@/stores/evidence'
+import EvidenceWorkspace from '@/components/twin/EvidenceWorkspace.vue'
 import EvidenceDrawer from '@/components/twin/EvidenceDrawer.vue'
 import TwinOverviewTab from '@/components/twin/TwinOverviewTab.vue'
 import TwinActionGapsTab from '@/components/twin/TwinActionGapsTab.vue'
@@ -101,12 +108,26 @@ import TwinConfigTab from '@/components/twin/TwinConfigTab.vue'
 import '@/components/twin/twin-workspace.css'
 
 const twinStore = useTwinStore()
+const evidenceStore = useEvidenceStore()
+const isEvidenceTab = computed(() =>
+  ['interview', 'goals', 'relationships', 'prediction'].includes(twinStore.activeTab)
+)
 
 const navGroups = computed(() => [
   {
     id: 'home',
     label: null,
     tabs: [{ id: 'overview', label: 'Overview', count: null }]
+  },
+  {
+    id: 'pilot',
+    label: 'Evidence workspace',
+    tabs: [
+      { id: 'interview', label: 'Interview', count: null },
+      { id: 'goals', label: 'Goals', count: null },
+      { id: 'relationships', label: 'Evidence Graph', count: null },
+      { id: 'prediction', label: 'Predict a Decision', count: null }
+    ]
   },
   {
     id: 'work',

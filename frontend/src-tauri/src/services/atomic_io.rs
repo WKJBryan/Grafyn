@@ -1,33 +1,9 @@
-//! Atomic file writes: write to a same-directory temp file, fsync, then rename over the
-//! target. On NTFS/ext4 (same volume) `rename` is atomic, so readers never observe a
-//! partially-written file: if the writing process is interrupted, the target is either
-//! the old complete content or the new complete content, never a truncated mix of both.
-//!
-//! Durability note: the temp file's contents are fsynced (`File::sync_all`) before the
-//! rename, but the parent directory entry is not fsynced afterwards. After a power loss
-//! the rename itself may not have reached disk (the old content survives), but the
-//! target is never left truncated.
-//!
-//! Transient-lock note: on Windows, renaming over a destination that is concurrently
-//! being replaced (or briefly held open by antivirus/indexer scans) can return a
-//! transient `PermissionDenied`. The rename is therefore retried a bounded number of
-//! times with short backoff (~150ms worst case) before the error is surfaced; on Unix
-//! `PermissionDenied` is almost always real and simply fails after the same bounded
-//! retries.
+//! Capability-scoped atomic writes using a random, no-follow, same-directory temporary
+//! file. The selected parent directory is opened once and retained through publication,
+//! so a path swap or preplanted symlink cannot redirect the write.
 
-use std::io::Write;
+use crate::services::twin_events::AnchoredRoot;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
-
-/// Maximum rename attempts for transient `PermissionDenied` failures.
-const RENAME_ATTEMPTS: u32 = 5;
-/// Initial backoff between rename attempts; doubles each retry (10, 20, 40, 80 ms).
-const RENAME_BACKOFF: Duration = Duration::from_millis(10);
-
-/// Monotonic counter to disambiguate concurrent writers within the same process that
-/// share a pid (e.g. multiple threads writing to the same directory at once).
-static WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Write `contents` to `path` atomically.
 ///
@@ -37,68 +13,20 @@ static WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// best-effort basis so failed writes don't leave litter behind.
 pub fn write_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("atomic-write");
-
-    let pid = std::process::id();
-    let counter = WRITE_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let tmp_path = dir.join(format!("{file_name}.tmp-{pid}-{counter}"));
-
-    let result = (|| -> std::io::Result<()> {
-        let mut file = std::fs::File::create(&tmp_path)?;
-        file.write_all(contents)?;
-        file.sync_all()?;
-        drop(file);
-        rename_with_retry(&tmp_path, path)?;
-        Ok(())
-    })();
-
-    if result.is_err() {
-        let _ = std::fs::remove_file(&tmp_path);
-    }
-
-    result
+    let file_name = path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "atomic target needs a filename",
+        )
+    })?;
+    let root = AnchoredRoot::open_external_directory(dir).map_err(|error| {
+        std::io::Error::other(format!("atomic parent acquisition failed: {error}"))
+    })?;
+    root.put_atomic_leaf(file_name, contents)
+        .map_err(|error| std::io::Error::other(format!("atomic publication failed: {error}")))
 }
 
-/// Rename with a bounded retry on transient Windows errors.
-///
-/// On Windows, `MoveFileExW` onto a destination that is concurrently being replaced —
-/// or briefly held open by an antivirus or search-indexer scan — can return a transient
-/// ACCESS_DENIED (os error 5, `PermissionDenied`) or ERROR_SHARING_VIOLATION (os error
-/// 32, which does NOT map to `PermissionDenied`). Both are retried (up to
-/// [`RENAME_ATTEMPTS`] times with doubling backoff starting at [`RENAME_BACKOFF`]);
-/// every other error is returned immediately. If all attempts fail, the last error is
-/// returned.
-fn rename_with_retry(from: &Path, to: &Path) -> std::io::Result<()> {
-    const ERROR_SHARING_VIOLATION: i32 = 32;
-    fn is_transient(err: &std::io::Error) -> bool {
-        err.kind() == std::io::ErrorKind::PermissionDenied
-            || err.raw_os_error() == Some(ERROR_SHARING_VIOLATION)
-    }
-
-    let mut backoff = RENAME_BACKOFF;
-    let mut last_err = None;
-
-    for attempt in 0..RENAME_ATTEMPTS {
-        match std::fs::rename(from, to) {
-            Ok(()) => return Ok(()),
-            Err(err) if is_transient(&err) => {
-                last_err = Some(err);
-                if attempt + 1 < RENAME_ATTEMPTS {
-                    std::thread::sleep(backoff);
-                    backoff *= 2;
-                }
-            }
-            Err(err) => return Err(err),
-        }
-    }
-
-    Err(last_err.expect("retry loop always records an error before exhausting attempts"))
-}
-
-/// Test helper: assert that `dir` contains no `*.tmp-*` litter from `write_atomic`.
+/// Test helper: assert that `dir` contains no random atomic-write temp litter.
 /// Used by per-store adoption tests to prove each store's public write API leaves
 /// no temp files behind.
 #[cfg(test)]
@@ -107,16 +35,11 @@ pub fn assert_no_tmp_siblings(dir: &Path) {
         .expect("read_dir for tmp-sibling check")
         .filter_map(|entry| entry.ok())
         .map(|entry| entry.path())
-        .filter(|p| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .map(|n| n.contains(".tmp-"))
-                .unwrap_or(false)
-        })
+        .filter(|p| is_atomic_temporary(p))
         .collect();
     assert!(
         leftovers.is_empty(),
-        "expected no *.tmp-* files in {}, found: {:?}",
+        "expected no atomic temp files in {}, found: {:?}",
         dir.display(),
         leftovers
     );
@@ -130,18 +53,32 @@ mod tests {
     /// Return the tmp-file siblings of `path` left behind in its parent directory, if any.
     fn tmp_siblings(path: &Path) -> Vec<std::path::PathBuf> {
         let dir = path.parent().unwrap();
-        let file_name = path.file_name().unwrap().to_str().unwrap();
         std::fs::read_dir(dir)
             .unwrap()
             .filter_map(|entry| entry.ok())
             .map(|entry| entry.path())
-            .filter(|p| {
-                p.file_name()
-                    .and_then(|n| n.to_str())
-                    .map(|n| n != file_name && n.starts_with(file_name) && n.contains(".tmp-"))
-                    .unwrap_or(false)
-            })
+            .filter(|p| is_atomic_temporary(p))
             .collect()
+    }
+
+    #[cfg(unix)]
+    fn symlink_file(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::unix::fs::symlink(target, link)
+    }
+
+    #[cfg(windows)]
+    fn symlink_file(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::windows::fs::symlink_file(target, link)
+    }
+
+    #[cfg(unix)]
+    fn symlink_dir(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::unix::fs::symlink(target, link)
+    }
+
+    #[cfg(windows)]
+    fn symlink_dir(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::windows::fs::symlink_dir(target, link)
     }
 
     #[test]
@@ -252,4 +189,86 @@ mod tests {
         );
         assert!(tmp_siblings(&path).is_empty());
     }
+
+    #[test]
+    fn preplanted_exact_temp_and_final_symlinks_cannot_redirect_atomic_write() {
+        let dir = tempdir().expect("tempdir");
+        let victim = dir.path().join("victim.txt");
+        std::fs::write(&victim, b"private victim").unwrap();
+        let path = dir.path().join("selected.png");
+        let temporary_name = format!(".{}.tmp", uuid::Uuid::new_v4());
+        let preplanted = dir.path().join(&temporary_name);
+        if let Err(error) = symlink_file(&victim, &preplanted) {
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::Unsupported
+            ) || error.raw_os_error() == Some(1314)
+            {
+                return;
+            }
+            panic!("preplant symlink: {error}");
+        }
+
+        let root = AnchoredRoot::open_external_directory(dir.path()).unwrap();
+        let error = root
+            .put_atomic_leaf_with_temporary_for_test(
+                path.file_name().unwrap(),
+                std::ffi::OsStr::new(&temporary_name),
+                b"first payload",
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("temporary publication"));
+        assert_eq!(std::fs::read(&victim).unwrap(), b"private victim");
+        assert!(!path.exists());
+
+        symlink_file(&victim, &path).unwrap();
+        write_atomic(&path, b"replacement payload").unwrap();
+        assert_eq!(std::fs::read(&victim).unwrap(), b"private victim");
+        assert_eq!(std::fs::read(&path).unwrap(), b"replacement payload");
+        assert!(!std::fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    #[test]
+    fn intermediate_directory_reparse_is_rejected_when_supported() {
+        let dir = tempdir().expect("tempdir");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        let redirect = dir.path().join("redirect");
+        if let Err(error) = symlink_dir(&outside, &redirect) {
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::Unsupported
+            ) || error.raw_os_error() == Some(1314)
+            {
+                return;
+            }
+            panic!("intermediate symlink: {error}");
+        }
+        let redirected_target = redirect.join("selected.png");
+        assert!(write_atomic(&redirected_target, b"private").is_err());
+        assert!(!outside.join("selected.png").exists());
+    }
+
+    #[test]
+    fn parent_traversal_is_unconditionally_rejected() {
+        let dir = tempdir().expect("tempdir");
+        let safe = dir.path().join("safe");
+        std::fs::create_dir(&safe).unwrap();
+        let traversing_target = safe.join("..").join("escaped.png");
+        assert!(write_atomic(&traversing_target, b"private").is_err());
+        assert!(!dir.path().join("escaped.png").exists());
+    }
+}
+
+#[cfg(test)]
+fn is_atomic_temporary(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_prefix('.'))
+        .and_then(|name| name.strip_suffix(".tmp"))
+        .and_then(|value| uuid::Uuid::parse_str(value).ok())
+        .is_some_and(|value| value.get_version_num() == 4)
 }

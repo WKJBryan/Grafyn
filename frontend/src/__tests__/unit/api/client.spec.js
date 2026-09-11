@@ -12,26 +12,39 @@
  * - MCP API methods (getStatus, getConfigSnippet)
  * - Memory API methods (recall, contradictions, extract)
  * - Zettelkasten API methods (discoverLinks, applyLinks, createLink, getLinkTypes)
- * - isDesktopApp detects the Tauri IPC bridge
+ * - isDesktopApp detects a Tauri 2 desktop runtime without admitting mobile
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 
 // vi.hoisted ensures mockInvoke is declared before vi.mock's hoisted factory runs
-const { mockInvoke } = vi.hoisted(() => ({ mockInvoke: vi.fn() }))
-vi.mock('@tauri-apps/api/tauri', () => ({
+const { mockInvoke, runtime } = vi.hoisted(() => ({
+  mockInvoke: vi.fn(),
+  runtime: {
+    isTauri: false,
+    platform: 'windows',
+  },
+}))
+vi.mock('@tauri-apps/api/core', () => ({
   invoke: mockInvoke,
+  isTauri: () => runtime.isTauri,
+}))
+vi.mock('@tauri-apps/plugin-os', () => ({
+  platform: () => runtime.platform,
 }))
 
 import {
   boot,
+  runtime as runtimeApi,
   notes,
   search,
   graph,
   canvas,
+  images,
   twin,
   feedback,
   settings,
+  sync,
   mcp,
   memory,
   zettelkasten,
@@ -41,15 +54,32 @@ import {
 describe('API Client (Tauri)', () => {
   beforeEach(() => {
     mockInvoke.mockReset()
+    runtime.isTauri = false
+    runtime.platform = 'windows'
+    delete window.__TAURI_IPC__
   })
 
   describe('isDesktopApp', () => {
-    it('detects the Tauri IPC bridge', () => {
-      delete window.__TAURI_IPC__
+    it('uses the Tauri 2 runtime API instead of the removed Tauri 1 IPC global', () => {
+      window.__TAURI_IPC__ = vi.fn()
       expect(isDesktopApp()).toBe(false)
 
-      window.__TAURI_IPC__ = vi.fn()
+      runtime.isTauri = true
       expect(isDesktopApp()).toBe(true)
+    })
+
+    it.each(['windows', 'macos', 'linux'])('admits the %s desktop runtime', (platform) => {
+      runtime.isTauri = true
+      runtime.platform = platform
+
+      expect(isDesktopApp()).toBe(true)
+    })
+
+    it.each(['android', 'ios'])('rejects the %s mobile runtime', (platform) => {
+      runtime.isTauri = true
+      runtime.platform = platform
+
+      expect(isDesktopApp()).toBe(false)
     })
   })
 
@@ -274,6 +304,140 @@ describe('API Client (Tauri)', () => {
       expect(mockInvoke).toHaveBeenCalledWith('get_twin_review', {})
     })
 
+    it('createCompanionCapture() invokes the exact command and normalizes its response', async () => {
+      const request = {
+        content: 'A field note',
+        captureKind: 'text',
+        context: {
+          person: '',
+          role: '',
+          relationship: '',
+          environment: 'train',
+          activity: 'reading',
+          goal: '',
+        },
+        attachmentDigests: [],
+        grafynSync: 'inherit',
+      }
+      mockInvoke.mockResolvedValue({
+        note: { id: 'note-1', title: 'A field note' },
+        observation_event_id: 'event-1',
+      })
+
+      await expect(twin.createCompanionCapture(request)).resolves.toEqual({
+        note: { id: 'note-1', title: 'A field note' },
+        observationEventId: 'event-1',
+      })
+      expect(mockInvoke).toHaveBeenCalledWith('create_companion_capture', { request })
+      expect(request).not.toHaveProperty('title')
+    })
+
+    it('listObservations() invokes list_twin_observations with its exact request', async () => {
+      const request = {
+        referenceTime: '2026-08-31T10:00:00Z',
+        filter: {
+          relationships: [{
+            subjectId: 'owner',
+            predicate: 'works_with',
+            objectId: 'person-a',
+            direction: 'directed'
+          }],
+          goals: ['ship'],
+          tags: ['work']
+        },
+        cursor: 'cursor-observation',
+        limit: 25
+      }
+
+      mockInvoke.mockResolvedValue({ items: [] })
+      await twin.listObservations(request)
+
+      expect(mockInvoke).toHaveBeenCalledWith('list_twin_observations', { request })
+    })
+
+    it('listProposals() invokes list_twin_proposals with its exact request', async () => {
+      const request = {
+        referenceTime: '2026-08-31T10:00:00Z',
+        filter: { relationships: [], goals: [], tags: ['planning'] },
+        cursor: null,
+        limit: 20
+      }
+
+      mockInvoke.mockResolvedValue({ items: [] })
+      await twin.listProposals(request)
+
+      expect(mockInvoke).toHaveBeenCalledWith('list_twin_proposals', { request })
+    })
+
+    it('reviewProposal() invokes review_twin_proposal with optimistic snapshot fields', async () => {
+      const request = {
+        memoryId: 'memory-1',
+        decision: 'accept',
+        reviewedClaim: {
+          subject_id: 'owner',
+          predicate: 'prefers',
+          object: 'evidence first',
+          polarity: 'affirmed'
+        },
+        rationale: 'This matches my intent.',
+        expectedSnapshotId: 'a'.repeat(64),
+        snapshotReferenceTime: '2026-08-31T10:00:00Z'
+      }
+
+      mockInvoke.mockResolvedValue({ reviewEventId: 'event-1' })
+      await twin.reviewProposal(request)
+
+      expect(mockInvoke).toHaveBeenCalledWith('review_twin_proposal', { request })
+    })
+
+    it('getStateProjection() invokes get_twin_state_projection with its exact request', async () => {
+      const request = { referenceTime: '2026-08-31T10:00:00Z' }
+
+      mockInvoke.mockResolvedValue({ snapshot_id: 'a'.repeat(64) })
+      await twin.getStateProjection(request)
+
+      expect(mockInvoke).toHaveBeenCalledWith('get_twin_state_projection', { request })
+    })
+
+    it('rankAttention() invokes rank_twin_attention with its exact request', async () => {
+      const request = {
+        referenceTime: '2026-08-31T10:00:00Z',
+        profile: 'decision',
+        query: 'What should I prioritize?',
+        relationshipVariant: {
+          relationships: [{
+            subject_id: 'owner',
+            predicate: 'works_with',
+            object_id: 'person-a',
+            direction: 'directed'
+          }]
+        },
+        goals: ['ship'],
+        destination: 'local',
+        filter: { relationships: [], goals: ['ship'], tags: [] },
+        limit: 10
+      }
+
+      mockInvoke.mockResolvedValue({ trace: { selected: [], excluded: [] } })
+      await twin.rankAttention(request)
+
+      expect(mockInvoke).toHaveBeenCalledWith('rank_twin_attention', { request })
+    })
+
+    it('getEventTimeline() invokes get_twin_event_timeline with its exact request', async () => {
+      const request = {
+        referenceTime: '2026-08-31T10:00:00Z',
+        filter: { relationships: [], goals: ['ship'], tags: ['work'] },
+        cursor: 'cursor-timeline',
+        limit: 30
+      }
+
+      mockInvoke.mockResolvedValue({ items: [] })
+      await twin.getEventTimeline(request)
+
+      expect(mockInvoke).toHaveBeenCalledWith('get_twin_event_timeline', { request })
+    })
+
     it('resolveEvidence() invokes resolve_user_record_evidence', async () => {
       mockInvoke.mockResolvedValue([])
       await twin.resolveEvidence('record-1')
@@ -441,6 +605,111 @@ describe('API Client (Tauri)', () => {
       mockInvoke.mockResolvedValue([])
       await settings.listOllamaModels()
       expect(mockInvoke).toHaveBeenCalledWith('list_ollama_models', {})
+    })
+  })
+
+  describe('Runtime API', () => {
+    it('gets the typed backend runtime status', async () => {
+      mockInvoke.mockResolvedValue({ schemaVersion: 1, runtime: 'android' })
+
+      await runtimeApi.getStatus()
+
+      expect(mockInvoke).toHaveBeenCalledWith('get_runtime_status', {})
+    })
+  })
+
+  describe('Generated image API', () => {
+    it('maps discovery, capability, generation, save, export, share, and load to strict request DTOs', async () => {
+      mockInvoke.mockResolvedValue({})
+
+      await images.discoverModels()
+      expect(mockInvoke).toHaveBeenLastCalledWith('discover_image_models', { request: {} })
+
+      await images.getModelCapability('author/image-model')
+      expect(mockInvoke).toHaveBeenLastCalledWith('get_image_model_capability', {
+        request: { modelId: 'author/image-model' },
+      })
+
+      await images.generate({
+        prompt: 'A quiet workspace',
+        modelId: 'author/image-model',
+        resolution: '1024x1024',
+        aspectRatio: '1:1',
+      })
+      expect(mockInvoke).toHaveBeenLastCalledWith('generate_image', {
+        request: {
+          prompt: 'A quiet workspace',
+          modelId: 'author/image-model',
+          resolution: '1024x1024',
+          aspectRatio: '1:1',
+        },
+      })
+
+      await images.save({
+        receiptId: '018f0ca8-2e42-7c1e-ae13-7b35f09b4501',
+        annotation: 'Concept sketch',
+        retentionPolicy: 'strip_metadata',
+        grafynSync: 'local_only',
+      })
+      expect(mockInvoke).toHaveBeenLastCalledWith('save_generated_image', {
+        request: {
+          receiptId: '018f0ca8-2e42-7c1e-ae13-7b35f09b4501',
+          annotation: 'Concept sketch',
+          retentionPolicy: 'strip_metadata',
+          grafynSync: 'local_only',
+        },
+      })
+
+      await images.saveAs('018f0ca8-2e42-7c1e-ae13-7b35f09b4501', 'strip_metadata')
+      expect(mockInvoke).toHaveBeenLastCalledWith('export_generated_image', {
+        request: {
+          receiptId: '018f0ca8-2e42-7c1e-ae13-7b35f09b4501',
+          retentionPolicy: 'strip_metadata',
+        },
+      })
+
+      await images.shareGeneratedImage(
+        '018f0ca8-2e42-7c1e-ae13-7b35f09b4501',
+        'retain_original',
+      )
+      expect(mockInvoke).toHaveBeenLastCalledWith('share_generated_image', {
+        request: {
+          receiptId: '018f0ca8-2e42-7c1e-ae13-7b35f09b4501',
+          retentionPolicy: 'retain_original',
+        },
+      })
+
+      await images.load('a'.repeat(64))
+      expect(mockInvoke).toHaveBeenLastCalledWith('load_generated_image', {
+        request: { attachmentDigest: 'a'.repeat(64) },
+      })
+
+      await images.discard('018f0ca8-2e42-7c1e-ae13-7b35f09b4501')
+      expect(mockInvoke).toHaveBeenLastCalledWith('discard_generated_image_receipt', {
+        request: { receiptId: '018f0ca8-2e42-7c1e-ae13-7b35f09b4501' },
+      })
+    })
+  })
+
+  // ============================================================================
+  // Sync foundation API
+  // ============================================================================
+
+  describe('Sync foundation API', () => {
+    it('uses only the local status, conflict, ciphertext, import, and rebuild commands', async () => {
+      const bundle = { schemaVersion: 1, envelopes: ['{"ciphertext":"opaque"}'] }
+      mockInvoke.mockResolvedValue({})
+
+      await sync.getStatus()
+      expect(mockInvoke).toHaveBeenLastCalledWith('get_sync_status', {})
+      await sync.listConflicts()
+      expect(mockInvoke).toHaveBeenLastCalledWith('list_sync_conflicts', {})
+      await sync.exportOutbox()
+      expect(mockInvoke).toHaveBeenLastCalledWith('export_sync_outbox', {})
+      await sync.importEnvelopes(bundle)
+      expect(mockInvoke).toHaveBeenLastCalledWith('import_sync_envelopes', { bundle })
+      await sync.rebuildState()
+      expect(mockInvoke).toHaveBeenLastCalledWith('rebuild_sync_state', {})
     })
   })
 

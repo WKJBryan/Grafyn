@@ -25,6 +25,7 @@ pub struct McpInfo {
 #[tauri::command]
 pub async fn get_mcp_status(state: State<'_, AppState>) -> Result<McpInfo, String> {
     let binary_path = find_mcp_binary();
+    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
     let settings = state.settings_service.read().await;
     let vault_path = settings.vault_path();
     let data_path = settings.data_path();
@@ -48,6 +49,7 @@ pub async fn get_mcp_status(state: State<'_, AppState>) -> Result<McpInfo, Strin
 #[tauri::command]
 pub async fn get_mcp_config_snippet(state: State<'_, AppState>) -> Result<String, String> {
     let binary_path = find_mcp_binary();
+    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
     let settings = state.settings_service.read().await;
     let vault_path = settings.vault_path();
     let data_path = settings.data_path();

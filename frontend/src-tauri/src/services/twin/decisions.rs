@@ -1,6 +1,5 @@
 use super::shared::{
-    excerpt, extract_event_model_id, extract_event_tile_id, lexical_terms, load_or_quarantine,
-    payload_string,
+    excerpt, extract_event_model_id, extract_event_tile_id, lexical_terms, payload_string,
 };
 use super::TwinStore;
 use crate::models::twin::{
@@ -12,13 +11,28 @@ use crate::models::twin::{
 };
 #[cfg(test)]
 use crate::models::twin::{DecisionMirrorPreset, PrimitiveDecisionAssessment};
-use anyhow::{Context, Result};
+use anyhow::Result;
 use chrono::Utc;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use walkdir::WalkDir;
+
+type DecisionEpisodeMutationPlan = (
+    DecisionEpisode,
+    SessionTrace,
+    Vec<(PathBuf, String)>,
+    Vec<crate::services::twin_events::TwinEventDraft>,
+);
+type TwinJsonWrites = Vec<(PathBuf, String)>;
+type DecisionOutcomeMutation = (
+    SessionTrace,
+    TwinJsonWrites,
+    Vec<crate::services::twin_events::TwinEventDraft>,
+);
+type DecisionOutcomePlan = (DecisionEpisode, Option<DecisionOutcomeMutation>);
+type TwinPredictionPlan = (DecisionEpisode, Option<SessionTrace>, TwinJsonWrites);
+type ReflectionCardPlan = (ReflectionCard, SessionTrace, TwinJsonWrites);
 
 fn clamp_decision_mirror_weights(mut weights: DecisionMirrorWeights) -> DecisionMirrorWeights {
     weights.notes_weight = clamp_weight(weights.notes_weight);
@@ -50,10 +64,26 @@ fn clamp_weight(weight: f32) -> f32 {
     }
 }
 
+fn apply_decision_mirror_config_update(
+    config: &mut DecisionMirrorConfig,
+    update: &DecisionMirrorConfigUpdate,
+) {
+    if let Some(preset) = update.preset.clone() {
+        config.weights = DecisionMirrorWeights::for_preset(&preset);
+        config.preset = preset;
+    }
+    if let Some(weights) = update.weights.clone() {
+        config.weights = clamp_decision_mirror_weights(weights);
+    }
+    if let Some(advanced_enabled) = update.advanced_enabled {
+        config.advanced_enabled = advanced_enabled;
+    }
+}
+
 fn promotion_state_label(state: &PromotionState) -> &'static str {
     match state {
         PromotionState::Candidate => "Candidate",
-        PromotionState::AutoPromoted => "Auto-promoted",
+        PromotionState::AutoPromoted => "Candidate (legacy)",
         PromotionState::Endorsed => "Endorsed",
         PromotionState::Rejected => "Rejected",
         PromotionState::Private => "Private",
@@ -479,53 +509,165 @@ fn decision_case_relevance(episode: &DecisionEpisode, query_terms: &HashSet<Stri
 
 impl TwinStore {
     pub fn get_decision_mirror_config(&self) -> Result<DecisionMirrorConfig> {
-        if !self.decision_mirror_config_path.exists() {
-            return Ok(DecisionMirrorConfig::default());
-        }
-
-        let content =
-            std::fs::read_to_string(&self.decision_mirror_config_path).with_context(|| {
-                format!(
-                    "Failed to read decision mirror config {}",
-                    self.decision_mirror_config_path.display()
-                )
-            })?;
-        let mut config: DecisionMirrorConfig =
-            serde_json::from_str(&content).context("Failed to parse decision mirror config")?;
+        let mut config: DecisionMirrorConfig = self
+            .read_twin_json_bounded(&self.decision_mirror_config_path)?
+            .unwrap_or_default();
         config.weights = clamp_decision_mirror_weights(config.weights);
         Ok(config)
     }
 
     pub fn update_decision_mirror_config(
-        &self,
+        &mut self,
         update: DecisionMirrorConfigUpdate,
     ) -> Result<DecisionMirrorConfig> {
-        let mut config = self.get_decision_mirror_config()?;
-        if let Some(preset) = update.preset {
-            config.weights = DecisionMirrorWeights::for_preset(&preset);
-            config.preset = preset;
-        }
-        if let Some(weights) = update.weights {
-            config.weights = clamp_decision_mirror_weights(weights);
-        }
-        if let Some(advanced_enabled) = update.advanced_enabled {
-            config.advanced_enabled = advanced_enabled;
-        }
-
-        self.write_decision_mirror_config_file(&config)?;
+        let (config, _commit) = self.update_decision_mirror_config_with_commit(update)?;
         Ok(config)
     }
 
-    pub fn reset_decision_mirror_config(&self) -> Result<DecisionMirrorConfig> {
-        let config = DecisionMirrorConfig::default();
+    pub(crate) fn update_decision_mirror_config_with_commit(
+        &mut self,
+        update: DecisionMirrorConfigUpdate,
+    ) -> Result<(
+        DecisionMirrorConfig,
+        crate::services::twin_events::MutationCommit,
+    )> {
+        if !self.event_recorder.is_noop() {
+            let recorder = self.event_recorder.clone();
+            let mut committed = None;
+            let mut planner = || {
+                let mut config = self.get_decision_mirror_config().map_err(|error| {
+                    crate::services::twin_events::MutationError::Invalid(error.to_string())
+                })?;
+                apply_decision_mirror_config_update(&mut config, &update);
+                let content = serde_json::to_string_pretty(&config).map_err(|error| {
+                    crate::services::twin_events::MutationError::Invalid(error.to_string())
+                })?;
+                let targets = self
+                    .governed_json_targets(vec![(
+                        self.decision_mirror_config_path.clone(),
+                        content,
+                    )])
+                    .map_err(|error| {
+                        crate::services::twin_events::MutationError::Invalid(error.to_string())
+                    })?;
+                committed = Some(config);
+                Ok(Some(crate::services::twin_events::MutationPlan::new(
+                    crate::models::twin_event::CausalStream::LocalOnly,
+                    crate::models::twin_event::SourceChannel::parse("legacy_twin")
+                        .map_err(crate::services::twin_events::MutationError::Invalid)?,
+                    targets,
+                    Vec::new(),
+                )))
+            };
+            let result = recorder.commit_planned_mutation(
+                crate::services::twin_events::MutationOrigin::Local,
+                &mut planner,
+            );
+            let commit = self.finish_mutation_commit(result)?;
+            let config =
+                committed.ok_or_else(|| anyhow::anyhow!("config update was not planned"))?;
+            self.invalidate_mutation_caches();
+            return Ok((config, commit));
+        }
+        let mut config = self.get_decision_mirror_config()?;
+        apply_decision_mirror_config_update(&mut config, &update);
+
         self.write_decision_mirror_config_file(&config)?;
+        self.invalidate_mutation_caches();
+        Ok((config, Self::tokenless_mutation_commit()))
+    }
+
+    pub fn reset_decision_mirror_config(&mut self) -> Result<DecisionMirrorConfig> {
+        let (config, _commit) = self.reset_decision_mirror_config_with_commit()?;
         Ok(config)
+    }
+
+    pub(crate) fn reset_decision_mirror_config_with_commit(
+        &mut self,
+    ) -> Result<(
+        DecisionMirrorConfig,
+        crate::services::twin_events::MutationCommit,
+    )> {
+        let config = DecisionMirrorConfig::default();
+        let commit = if self.event_recorder.is_noop() {
+            self.write_decision_mirror_config_file(&config)?;
+            Self::tokenless_mutation_commit()
+        } else {
+            let values = vec![(
+                self.decision_mirror_config_path.clone(),
+                serde_json::to_string_pretty(&config)?,
+            )];
+            let targets = self.governed_json_targets(values)?;
+            let result = self.event_recorder.commit_mutation(
+                crate::services::twin_events::MutationOrigin::Local,
+                crate::models::twin_event::CausalStream::LocalOnly,
+                crate::models::twin_event::SourceChannel::parse("legacy_twin")
+                    .map_err(anyhow::Error::msg)?,
+                targets,
+                Vec::new(),
+            );
+            self.finish_mutation_commit(result)?
+        };
+        self.invalidate_mutation_caches();
+        Ok((config, commit))
     }
 
     pub fn record_decision_episode(
         &mut self,
         create: DecisionEpisodeCreate,
     ) -> Result<DecisionEpisode> {
+        self.record_decision_episode_with_commit(create)
+            .map(|(episode, _commit)| episode)
+    }
+
+    pub(crate) fn record_decision_episode_with_commit(
+        &mut self,
+        create: DecisionEpisodeCreate,
+    ) -> Result<(
+        DecisionEpisode,
+        crate::services::twin_events::MutationCommit,
+    )> {
+        if !self.event_recorder.is_noop() {
+            let recorder = self.event_recorder.clone();
+            let mut committed = None;
+            let mut planner = || {
+                let (episode, trace, values, drafts) = self
+                    .plan_decision_episode_mutation(create.clone())
+                    .map_err(|error| {
+                        crate::services::twin_events::MutationError::Invalid(error.to_string())
+                    })?;
+                let targets = self.governed_json_targets(values).map_err(|error| {
+                    crate::services::twin_events::MutationError::Invalid(error.to_string())
+                })?;
+                committed = Some((episode, trace));
+                Ok(Some(crate::services::twin_events::MutationPlan::new(
+                    crate::models::twin_event::CausalStream::SyncEligible,
+                    crate::models::twin_event::SourceChannel::parse("legacy_twin")
+                        .map_err(crate::services::twin_events::MutationError::Invalid)?,
+                    targets,
+                    drafts,
+                )))
+            };
+            let result = recorder.commit_planned_mutation(
+                crate::services::twin_events::MutationOrigin::Local,
+                &mut planner,
+            );
+            let commit = self.finish_mutation_commit(result)?;
+            let (episode, trace) =
+                committed.ok_or_else(|| anyhow::anyhow!("decision episode was not planned"))?;
+            self.cache_committed_trace(trace);
+            return Ok((episode, commit));
+        }
+        let (episode, trace, values, drafts) = self.plan_decision_episode_mutation(create)?;
+        let commit = self.commit_governed_json_targets(values, drafts)?;
+        self.cache_committed_trace(trace);
+        Ok((episode, commit))
+    }
+
+    pub(crate) fn plan_decision_episode_mutation(
+        &self,
+        create: DecisionEpisodeCreate,
+    ) -> Result<DecisionEpisodeMutationPlan> {
         Self::validate_file_id(&create.id)?;
         Self::validate_file_id(&create.session_id)?;
         Self::validate_file_id(&create.tile_id)?;
@@ -565,8 +707,57 @@ impl TwinStore {
             updated_at: now,
         };
 
-        self.write_decision_file(&episode)?;
-        self.append_trace_event(
+        let digest = Self::governed_json_digest(&episode)?;
+        let mut draft = crate::services::twin_events::TwinEventDraft::observed(
+            crate::models::twin_event::TwinEventPayload::DecisionRecorded(
+                crate::models::twin_event::DecisionRecorded {
+                    decision_id: crate::models::twin_event::Identifier::parse(&episode.id)
+                        .map_err(anyhow::Error::msg)?,
+                    decision: crate::models::twin_event::BoundedContent::parse(&episode.decision)
+                        .map_err(anyhow::Error::msg)?,
+                    options: episode
+                        .options
+                        .iter()
+                        .map(crate::models::twin_event::BoundedContent::parse)
+                        .collect::<std::result::Result<Vec<_>, _>>()
+                        .map_err(anyhow::Error::msg)?,
+                    stakes: episode
+                        .stakes
+                        .as_deref()
+                        .map(crate::models::twin_event::BoundedContent::parse)
+                        .transpose()
+                        .map_err(anyhow::Error::msg)?,
+                    initial_leaning: episode
+                        .initial_leaning
+                        .as_deref()
+                        .map(crate::models::twin_event::BoundedContent::parse)
+                        .transpose()
+                        .map_err(anyhow::Error::msg)?,
+                    review_date: episode
+                        .review_date
+                        .as_deref()
+                        .map(crate::models::twin_event::BoundedLabel::parse)
+                        .transpose()
+                        .map_err(anyhow::Error::msg)?,
+                    primitive_assessment:
+                        crate::models::twin_event::PrimitiveDecisionAssessmentPayload::from_legacy(
+                            &episode.primitive_assessment,
+                        )
+                        .map_err(anyhow::Error::msg)?,
+                },
+            ),
+            episode.updated_at,
+            crate::models::twin_event::SourceChannel::parse("legacy_twin")
+                .map_err(anyhow::Error::msg)?,
+            crate::services::twin_events::standard_capture_governance(),
+        );
+        draft.evidence.push(crate::models::twin_event::EvidenceRef {
+            evidence_type: crate::models::twin_event::EvidenceType::TwinRecord,
+            source_id: crate::models::twin_event::Identifier::parse(&episode.id)
+                .map_err(anyhow::Error::msg)?,
+            digest: Some(digest),
+        });
+        let (_, trace) = self.plan_trace_event(
             &episode.session_id,
             TraceEventType::DecisionEpisodeCreated,
             json!({
@@ -580,34 +771,26 @@ impl TwinStore {
                 "primitive_assessment": episode.primitive_assessment,
             }),
         )?;
+        let values = vec![
+            (
+                self.decision_file_path(&episode.id),
+                serde_json::to_string_pretty(&episode)?,
+            ),
+            self.serialized_trace_target(&trace)?,
+        ];
 
-        Ok(episode)
+        Ok((episode, trace, values, vec![draft]))
     }
 
     pub fn list_decision_episodes(&self) -> Result<Vec<DecisionEpisode>> {
-        let mut episodes = Vec::new();
-        if !self.decisions_path.exists() {
-            return Ok(episodes);
-        }
-
-        for entry in WalkDir::new(&self.decisions_path)
-            .min_depth(1)
-            .max_depth(1)
-            .into_iter()
-            .filter_map(|entry| entry.ok())
-        {
-            let path = entry.path();
-            if path.extension().is_some_and(|ext| ext == "json") {
-                if let Some(episode) =
-                    load_or_quarantine::<DecisionEpisode>(path, "decision episode")
-                {
-                    episodes.push(episode);
-                }
-            }
-        }
-
+        let mut episodes = self.list_twin_json_bounded::<DecisionEpisode>("decisions")?;
         episodes.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
         Ok(episodes)
+    }
+
+    pub fn get_decision_episode(&self, id: &str) -> Result<DecisionEpisode> {
+        Self::validate_file_id(id)?;
+        self.read_decision_file(&self.decision_file_path(id))
     }
 
     /// Select past decided episodes as verbatim behavioral cases for twin
@@ -673,14 +856,108 @@ impl TwinStore {
         id: &str,
         update: DecisionOutcomeUpdate,
     ) -> Result<DecisionEpisode> {
+        self.update_decision_outcome_with_response_id(id, update, None)
+    }
+
+    pub fn update_decision_outcome_with_response_id(
+        &mut self,
+        id: &str,
+        update: DecisionOutcomeUpdate,
+        selected_response_id: Option<String>,
+    ) -> Result<DecisionEpisode> {
+        let (episode, _commit) = self.update_decision_outcome_with_response_id_and_commit(
+            id,
+            update,
+            selected_response_id,
+        )?;
+        Ok(episode)
+    }
+
+    pub(crate) fn update_decision_outcome_with_response_id_and_commit(
+        &mut self,
+        id: &str,
+        update: DecisionOutcomeUpdate,
+        selected_response_id: Option<String>,
+    ) -> Result<(
+        DecisionEpisode,
+        crate::services::twin_events::MutationCommit,
+    )> {
         Self::validate_file_id(id)?;
+        if !self.event_recorder.is_noop() {
+            let recorder = self.event_recorder.clone();
+            let mut committed = None;
+            let mut planner = || {
+                let (episode, mutation) = self
+                    .plan_decision_outcome_mutation(id, &update, selected_response_id.as_deref())
+                    .map_err(|error| {
+                        crate::services::twin_events::MutationError::Invalid(error.to_string())
+                    })?;
+                committed = Some((episode, mutation.as_ref().map(|value| value.0.clone())));
+                let Some((_trace, values, drafts)) = mutation else {
+                    return Ok(None);
+                };
+                let targets = self.governed_json_targets(values).map_err(|error| {
+                    crate::services::twin_events::MutationError::Invalid(error.to_string())
+                })?;
+                Ok(Some(crate::services::twin_events::MutationPlan::new(
+                    crate::models::twin_event::CausalStream::SyncEligible,
+                    crate::models::twin_event::SourceChannel::parse("legacy_twin")
+                        .map_err(crate::services::twin_events::MutationError::Invalid)?,
+                    targets,
+                    drafts,
+                )))
+            };
+            let result = recorder.commit_planned_mutation(
+                crate::services::twin_events::MutationOrigin::Local,
+                &mut planner,
+            );
+            let commit = self.finish_mutation_commit(result)?;
+            let (episode, trace) =
+                committed.ok_or_else(|| anyhow::anyhow!("decision outcome was not planned"))?;
+            if let Some(trace) = trace {
+                self.cache_committed_trace(trace);
+            } else {
+                self.invalidate_mutation_caches();
+            }
+            return Ok((episode, commit));
+        }
+
+        let (episode, mutation) =
+            self.plan_decision_outcome_mutation(id, &update, selected_response_id.as_deref())?;
+        let commit = if let Some((trace, values, drafts)) = mutation {
+            let commit = self.commit_governed_json_targets(values, drafts)?;
+            self.cache_committed_trace(trace);
+            commit
+        } else {
+            self.invalidate_mutation_caches();
+            Self::tokenless_mutation_commit()
+        };
+        Ok((episode, commit))
+    }
+
+    fn plan_decision_outcome_mutation(
+        &self,
+        id: &str,
+        update: &DecisionOutcomeUpdate,
+        selected_response_id: Option<&str>,
+    ) -> Result<DecisionOutcomePlan> {
         let path = self.decision_file_path(id);
         let mut episode = self.read_decision_file(&path)?;
+        let before = serde_json::to_value(&episode)?;
+        let explicit_outcome = update.outcome.clone();
+        let explicit_choice = update.chosen_option.clone();
+        let explicit_confidence = update.confidence;
+        let explicit_review_date = update.review_date.clone();
+        let explicit_correction = update.correction_note.clone();
+        let explicit_regret = update.regret_score;
+        let explicit_lesson = update.lesson.clone();
+        let explicit_missed = update.missed_something.clone();
+        let explicit_primitive = update.primitive_assessment.clone();
 
-        if let Some(selected_response) = update.selected_response {
+        if let Some(selected_response) = update.selected_response.clone() {
             episode.selected_response = Some(selected_response);
         }
-        if let Some(chosen_option) = update.chosen_option {
+        if let Some(chosen_option) = update.chosen_option.clone() {
             // Canonicalize label/case variants ("b", "Option 2", extra
             // whitespace) against the recorded options; unmatched free text
             // is kept as-is (legacy and "other" outcomes stay recordable).
@@ -692,25 +969,25 @@ impl TwinStore {
         if let Some(confidence) = update.confidence {
             episode.confidence = Some(confidence.clamp(0.0, 1.0));
         }
-        if let Some(review_date) = update.review_date {
+        if let Some(review_date) = update.review_date.clone() {
             episode.review_date = Some(review_date);
         }
-        if let Some(outcome) = update.outcome {
+        if let Some(outcome) = update.outcome.clone() {
             episode.outcome = Some(outcome);
         }
         if let Some(regret_score) = update.regret_score {
             episode.regret_score = Some(regret_score.min(10));
         }
-        if let Some(lesson) = update.lesson {
+        if let Some(lesson) = update.lesson.clone() {
             episode.lesson = Some(lesson);
         }
-        if let Some(missed_something) = update.missed_something {
+        if let Some(missed_something) = update.missed_something.clone() {
             episode.missed_something = Some(missed_something);
         }
-        if let Some(primitive_assessment) = update.primitive_assessment {
+        if let Some(primitive_assessment) = update.primitive_assessment.clone() {
             episode.primitive_assessment = primitive_assessment;
         }
-        if let Some(correction_note) = update.correction_note {
+        if let Some(correction_note) = update.correction_note.clone() {
             episode.correction_note = Some(correction_note);
         }
 
@@ -731,9 +1008,92 @@ impl TwinStore {
             }
         }
 
+        if serde_json::to_value(&episode)? == before {
+            return Ok((episode, None));
+        }
         episode.updated_at = Utc::now();
-        self.write_decision_file(&episode)?;
-        self.append_trace_event(
+        let drafts = {
+            let confidence_basis_points =
+                explicit_confidence.map(|value| (value.clamp(0.0, 1.0) * 10_000.0).round() as u16);
+            if explicit_outcome.is_none()
+                && explicit_choice.is_none()
+                && selected_response_id.is_none()
+                && confidence_basis_points.is_none()
+                && explicit_review_date.is_none()
+                && explicit_correction.is_none()
+                && explicit_regret.is_none()
+                && explicit_lesson.is_none()
+                && explicit_missed.is_none()
+                && explicit_primitive.is_none()
+            {
+                anyhow::bail!("decision outcome mutation has no governed follow-up field");
+            }
+            let payload = crate::models::twin_event::TwinEventPayload::DecisionOutcomeRecorded(
+                crate::models::twin_event::DecisionOutcomeRecorded {
+                    decision_id: crate::models::twin_event::Identifier::parse(&episode.id)
+                        .map_err(anyhow::Error::msg)?,
+                    outcome: explicit_outcome
+                        .as_deref()
+                        .map(crate::models::twin_event::BoundedContent::parse)
+                        .transpose()
+                        .map_err(anyhow::Error::msg)?,
+                    chosen_option: explicit_choice
+                        .as_deref()
+                        .map(crate::models::twin_event::BoundedContent::parse)
+                        .transpose()
+                        .map_err(anyhow::Error::msg)?,
+                    selected_response_id: selected_response_id
+                        .map(crate::models::twin_event::Identifier::parse)
+                        .transpose()
+                        .map_err(anyhow::Error::msg)?,
+                    confidence_basis_points,
+                    review_date: explicit_review_date
+                        .as_deref()
+                        .map(crate::models::twin_event::BoundedLabel::parse)
+                        .transpose()
+                        .map_err(anyhow::Error::msg)?,
+                    correction_note: explicit_correction
+                        .as_deref()
+                        .map(crate::models::twin_event::BoundedContent::parse)
+                        .transpose()
+                        .map_err(anyhow::Error::msg)?,
+                    regret_score: explicit_regret,
+                    lesson: explicit_lesson
+                        .as_deref()
+                        .map(crate::models::twin_event::BoundedContent::parse)
+                        .transpose()
+                        .map_err(anyhow::Error::msg)?,
+                    missed_something: explicit_missed
+                        .as_deref()
+                        .map(crate::models::twin_event::BoundedContent::parse)
+                        .transpose()
+                        .map_err(anyhow::Error::msg)?,
+                    primitive_assessment: explicit_primitive
+                        .as_ref()
+                        .map(
+                            crate::models::twin_event::PrimitiveDecisionAssessmentPayload::from_legacy,
+                        )
+                        .transpose()
+                        .map_err(anyhow::Error::msg)?,
+                },
+            );
+            let digest = Self::governed_json_digest(&episode)?;
+            let mut draft = crate::services::twin_events::TwinEventDraft::observed(
+                payload,
+                episode.updated_at,
+                crate::models::twin_event::SourceChannel::parse("legacy_twin")
+                    .map_err(anyhow::Error::msg)?,
+                crate::services::twin_events::standard_capture_governance(),
+            );
+            draft.evidence.push(crate::models::twin_event::EvidenceRef {
+                evidence_type: crate::models::twin_event::EvidenceType::TwinRecord,
+                source_id: crate::models::twin_event::Identifier::parse(&episode.id)
+                    .map_err(anyhow::Error::msg)?,
+                digest: Some(digest),
+            });
+            vec![draft]
+        };
+        let (_, trace) = self.plan_trace_event(
             &episode.session_id,
             TraceEventType::OutcomeFollowUpRecorded,
             json!({
@@ -756,8 +1116,18 @@ impl TwinStore {
                     .map(|prediction| prediction.context_version.clone()),
             }),
         )?;
-
-        Ok(episode)
+        let trace_target = self.serialized_trace_target(&trace)?;
+        Ok((
+            episode.clone(),
+            Some((
+                trace,
+                vec![
+                    (path, serde_json::to_string_pretty(&episode)?),
+                    trace_target,
+                ],
+                drafts,
+            )),
+        ))
     }
 
     /// Seal a twin prediction onto an episode. Refuses (as a logged no-op
@@ -772,7 +1142,106 @@ impl TwinStore {
         model_id: &str,
         context_version: &str,
     ) -> Result<DecisionEpisode> {
+        self.attach_twin_prediction_internal(episode_id, draft, model_id, context_version, None)
+            .map(|(episode, _)| episode)
+    }
+
+    pub(crate) fn attach_twin_prediction_expecting_authority(
+        &mut self,
+        episode_id: &str,
+        draft: TwinPredictionDraft,
+        model_id: &str,
+        context_version: &str,
+        expected: crate::services::vault_namespace::VaultAuthorityTokenV1,
+    ) -> Result<(
+        DecisionEpisode,
+        crate::services::twin_events::MutationCommit,
+    )> {
+        self.attach_twin_prediction_internal(
+            episode_id,
+            draft,
+            model_id,
+            context_version,
+            Some(expected),
+        )
+    }
+
+    fn attach_twin_prediction_internal(
+        &mut self,
+        episode_id: &str,
+        draft: TwinPredictionDraft,
+        model_id: &str,
+        context_version: &str,
+        expected: Option<crate::services::vault_namespace::VaultAuthorityTokenV1>,
+    ) -> Result<(
+        DecisionEpisode,
+        crate::services::twin_events::MutationCommit,
+    )> {
         Self::validate_file_id(episode_id)?;
+        if !self.event_recorder.is_noop() {
+            let recorder = self.event_recorder.clone();
+            let mut committed = None;
+            let mut planner = || {
+                let (episode, trace, values) = self
+                    .plan_twin_prediction_mutation(episode_id, &draft, model_id, context_version)
+                    .map_err(|error| {
+                        crate::services::twin_events::MutationError::Invalid(error.to_string())
+                    })?;
+                committed = Some((episode, trace));
+                if values.is_empty() {
+                    return Ok(None);
+                }
+                let targets = self.governed_json_targets(values).map_err(|error| {
+                    crate::services::twin_events::MutationError::Invalid(error.to_string())
+                })?;
+                let mut plan = crate::services::twin_events::MutationPlan::new(
+                    crate::models::twin_event::CausalStream::LocalOnly,
+                    crate::models::twin_event::SourceChannel::parse("legacy_twin")
+                        .map_err(crate::services::twin_events::MutationError::Invalid)?,
+                    targets,
+                    Vec::new(),
+                );
+                if let Some(expected) = expected.clone() {
+                    plan = plan.expecting_authority(expected);
+                }
+                Ok(Some(plan))
+            };
+            let result = recorder.commit_planned_mutation(
+                crate::services::twin_events::MutationOrigin::Local,
+                &mut planner,
+            );
+            let commit = self.finish_mutation_commit(result)?;
+            let (episode, trace) =
+                committed.ok_or_else(|| anyhow::anyhow!("Twin prediction was not planned"))?;
+            if let Some(trace) = trace {
+                self.cache_committed_trace(trace);
+            } else {
+                self.invalidate_mutation_caches();
+            }
+            return Ok((episode, commit));
+        }
+        let (episode, trace, values) =
+            self.plan_twin_prediction_mutation(episode_id, &draft, model_id, context_version)?;
+        let commit = if values.is_empty() {
+            Self::tokenless_mutation_commit()
+        } else {
+            self.commit_governed_json_targets(values, Vec::new())?
+        };
+        if let Some(trace) = trace {
+            self.cache_committed_trace(trace);
+        } else {
+            self.invalidate_mutation_caches();
+        }
+        Ok((episode, commit))
+    }
+
+    fn plan_twin_prediction_mutation(
+        &self,
+        episode_id: &str,
+        draft: &TwinPredictionDraft,
+        model_id: &str,
+        context_version: &str,
+    ) -> Result<TwinPredictionPlan> {
         let path = self.decision_file_path(episode_id);
         let mut episode = self.read_decision_file(&path)?;
 
@@ -783,22 +1252,25 @@ impl TwinStore {
             );
             episode.prediction_status = Some("outcome_recorded_first".to_string());
             episode.updated_at = Utc::now();
-            self.write_decision_file(&episode)?;
-            return Ok(episode);
+            return Ok((
+                episode.clone(),
+                None,
+                vec![(path, serde_json::to_string_pretty(&episode)?)],
+            ));
         }
         if episode.twin_prediction.is_some() {
             log::warn!(
                 "Episode {} already has a sealed twin prediction; ignoring duplicate",
                 episode_id
             );
-            return Ok(episode);
+            return Ok((episode, None, Vec::new()));
         }
 
         let prediction = TwinPrediction {
-            predicted_option: draft.predicted_option,
+            predicted_option: draft.predicted_option.clone(),
             matched_option_index: draft.matched_option_index,
             confidence: draft.confidence,
-            rationale: draft.rationale,
+            rationale: draft.rationale.clone(),
             parse_mode: draft.parse_mode.clone(),
             model_id: model_id.to_string(),
             context_version: context_version.to_string(),
@@ -808,9 +1280,7 @@ impl TwinStore {
         episode.twin_prediction = Some(prediction);
         episode.prediction_status = Some("sealed".to_string());
         episode.updated_at = Utc::now();
-        self.write_decision_file(&episode)?;
-
-        self.append_trace_event(
+        let (_, trace) = self.plan_trace_event(
             &episode.session_id,
             TraceEventType::TwinPredictionSealed,
             json!({
@@ -822,29 +1292,234 @@ impl TwinStore {
                 "sealed_at": sealed_at,
             }),
         )?;
-
-        Ok(episode)
+        let values = vec![
+            (path, serde_json::to_string_pretty(&episode)?),
+            self.serialized_trace_target(&trace)?,
+        ];
+        Ok((episode, Some(trace), values))
     }
 
     /// Record that the hidden prediction call failed, so exported episodes
     /// distinguish "no prediction because the call failed" from "agreed to
     /// not predict" — silent gaps would inflate measured accuracy.
     pub fn mark_twin_prediction_failed(&mut self, episode_id: &str) -> Result<()> {
+        self.mark_twin_prediction_failed_internal(episode_id, None)
+            .map(|_| ())
+    }
+
+    pub(crate) fn mark_twin_prediction_failed_with_commit(
+        &mut self,
+        episode_id: &str,
+    ) -> Result<crate::services::twin_events::MutationCommit> {
+        self.mark_twin_prediction_failed_internal(episode_id, None)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mark_twin_prediction_failed_expecting_authority(
+        &mut self,
+        episode_id: &str,
+        expected: crate::services::vault_namespace::VaultAuthorityTokenV1,
+    ) -> Result<crate::services::twin_events::MutationCommit> {
+        self.mark_twin_prediction_failed_internal(episode_id, Some(expected))
+    }
+
+    fn mark_twin_prediction_failed_internal(
+        &mut self,
+        episode_id: &str,
+        expected: Option<crate::services::vault_namespace::VaultAuthorityTokenV1>,
+    ) -> Result<crate::services::twin_events::MutationCommit> {
         Self::validate_file_id(episode_id)?;
+        if !self.event_recorder.is_noop() {
+            let recorder = self.event_recorder.clone();
+            let mut planner = || {
+                let path = self.decision_file_path(episode_id);
+                let mut episode = self.read_decision_file(&path).map_err(|error| {
+                    crate::services::twin_events::MutationError::Invalid(error.to_string())
+                })?;
+                if episode.twin_prediction.is_some()
+                    || episode.chosen_option.is_some()
+                    || episode.prediction_status.as_deref() != Some("requested")
+                {
+                    return Ok(None);
+                }
+                episode.prediction_status = Some("failed".to_string());
+                episode.updated_at = Utc::now();
+                let content = serde_json::to_string_pretty(&episode).map_err(|error| {
+                    crate::services::twin_events::MutationError::Invalid(error.to_string())
+                })?;
+                let targets =
+                    self.governed_json_targets(vec![(path, content)])
+                        .map_err(|error| {
+                            crate::services::twin_events::MutationError::Invalid(error.to_string())
+                        })?;
+                let mut plan = crate::services::twin_events::MutationPlan::new(
+                    crate::models::twin_event::CausalStream::LocalOnly,
+                    crate::models::twin_event::SourceChannel::parse("legacy_twin")
+                        .map_err(crate::services::twin_events::MutationError::Invalid)?,
+                    targets,
+                    Vec::new(),
+                );
+                if let Some(expected) = expected.clone() {
+                    plan = plan.expecting_authority(expected);
+                }
+                Ok(Some(plan))
+            };
+            let result = recorder.commit_planned_mutation(
+                crate::services::twin_events::MutationOrigin::Local,
+                &mut planner,
+            );
+            let commit = self.finish_mutation_commit(result)?;
+            self.invalidate_mutation_caches();
+            return Ok(commit);
+        }
         let path = self.decision_file_path(episode_id);
         let mut episode = self.read_decision_file(&path)?;
-        if episode.twin_prediction.is_some() || episode.chosen_option.is_some() {
-            return Ok(());
+        if episode.twin_prediction.is_some()
+            || episode.chosen_option.is_some()
+            || episode.prediction_status.as_deref() != Some("requested")
+        {
+            return Ok(crate::services::twin_events::MutationCommit {
+                mutation_id: None,
+                events: Vec::new(),
+                authority_token: None,
+                postcommit_warning: false,
+            });
         }
         episode.prediction_status = Some("failed".to_string());
         episode.updated_at = Utc::now();
-        self.write_decision_file(&episode)
+        self.write_decision_file(&episode)?;
+        Ok(crate::services::twin_events::MutationCommit {
+            mutation_id: None,
+            events: Vec::new(),
+            authority_token: None,
+            postcommit_warning: false,
+        })
+    }
+
+    fn constitution_citation_is_supported(&self, id: &str) -> bool {
+        Self::validate_file_id(id).is_ok()
+            && self
+                .read_constitution_file(&self.constitution_file_path(id))
+                .ok()
+                .is_some_and(|item| {
+                    !self.artifact_has_only_legacy_auto_support(&item.linked_record_ids)
+                })
+    }
+
+    fn action_gap_citation_is_supported(&self, id: &str) -> bool {
+        Self::validate_file_id(id).is_ok()
+            && self
+                .read_action_gap_file(&self.action_gap_file_path(id))
+                .ok()
+                .is_some_and(|gap| {
+                    !self.artifact_has_only_legacy_auto_support(&gap.linked_record_ids)
+                })
+    }
+
+    fn filter_artifact_citations(
+        &self,
+        constitution_ids: &mut Vec<String>,
+        action_gap_ids: &mut Vec<String>,
+        packet: &mut DecisionEvidencePacket,
+    ) {
+        constitution_ids.retain(|id| self.constitution_citation_is_supported(id));
+        action_gap_ids.retain(|id| self.action_gap_citation_is_supported(id));
+        packet
+            .selected_sources
+            .retain(|source| match source.source_type.as_str() {
+                "constitution_item" => self.constitution_citation_is_supported(&source.id),
+                "action_gap" => self.action_gap_citation_is_supported(&source.id),
+                _ => true,
+            });
+    }
+
+    fn overlay_legacy_artifacts_on_reflection(&self, card: &mut ReflectionCard) {
+        self.filter_artifact_citations(
+            &mut card.cited_constitution_item_ids,
+            &mut card.cited_action_gap_ids,
+            &mut card.evidence_packet,
+        );
+        let config = card
+            .evidence_packet
+            .config_snapshot
+            .clone()
+            .unwrap_or_default();
+        card.scores = score_reflection_card(
+            &card.content,
+            &card.cited_note_ids,
+            &card.cited_user_record_ids,
+            &card.cited_constitution_item_ids,
+            &card.cited_action_gap_ids,
+            &config,
+        );
     }
 
     pub fn record_reflection_card(
         &mut self,
         create: ReflectionCardCreate,
     ) -> Result<ReflectionCard> {
+        self.record_reflection_card_internal(create, None)
+            .map(|(card, _)| card)
+    }
+
+    pub(crate) fn record_reflection_card_expecting_authority(
+        &mut self,
+        create: ReflectionCardCreate,
+        expected: crate::services::vault_namespace::VaultAuthorityTokenV1,
+    ) -> Result<(ReflectionCard, crate::services::twin_events::MutationCommit)> {
+        self.record_reflection_card_internal(create, Some(expected))
+    }
+
+    fn record_reflection_card_internal(
+        &mut self,
+        create: ReflectionCardCreate,
+        expected: Option<crate::services::vault_namespace::VaultAuthorityTokenV1>,
+    ) -> Result<(ReflectionCard, crate::services::twin_events::MutationCommit)> {
+        if !self.event_recorder.is_noop() {
+            let recorder = self.event_recorder.clone();
+            let mut committed = None;
+            let mut planner = || {
+                let (card, trace, values) = self
+                    .plan_reflection_card_mutation(create.clone())
+                    .map_err(|error| {
+                        crate::services::twin_events::MutationError::Invalid(error.to_string())
+                    })?;
+                let targets = self.governed_json_targets(values).map_err(|error| {
+                    crate::services::twin_events::MutationError::Invalid(error.to_string())
+                })?;
+                committed = Some((card, trace));
+                let mut plan = crate::services::twin_events::MutationPlan::new(
+                    crate::models::twin_event::CausalStream::LocalOnly,
+                    crate::models::twin_event::SourceChannel::parse("legacy_twin")
+                        .map_err(crate::services::twin_events::MutationError::Invalid)?,
+                    targets,
+                    Vec::new(),
+                );
+                if let Some(expected) = expected.clone() {
+                    plan = plan.expecting_authority(expected);
+                }
+                Ok(Some(plan))
+            };
+            let result = recorder.commit_planned_mutation(
+                crate::services::twin_events::MutationOrigin::Local,
+                &mut planner,
+            );
+            let commit = self.finish_mutation_commit(result)?;
+            let (card, trace) =
+                committed.ok_or_else(|| anyhow::anyhow!("reflection card was not planned"))?;
+            self.cache_committed_trace(trace);
+            return Ok((card, commit));
+        }
+        let (card, trace, values) = self.plan_reflection_card_mutation(create)?;
+        let commit = self.commit_governed_json_targets(values, Vec::new())?;
+        self.cache_committed_trace(trace);
+        Ok((card, commit))
+    }
+
+    fn plan_reflection_card_mutation(
+        &mut self,
+        mut create: ReflectionCardCreate,
+    ) -> Result<ReflectionCardPlan> {
         Self::validate_file_id(&create.decision_episode_id)?;
         Self::validate_file_id(&create.session_id)?;
         Self::validate_file_id(&create.tile_id)?;
@@ -863,6 +1538,11 @@ impl TwinStore {
         if evidence_packet.config_snapshot.is_none() {
             evidence_packet.config_snapshot = Some(config.clone());
         }
+        self.filter_artifact_citations(
+            &mut create.cited_constitution_item_ids,
+            &mut create.cited_action_gap_ids,
+            &mut evidence_packet,
+        );
         let scores = score_reflection_card(
             &create.content,
             &create.cited_note_ids,
@@ -887,8 +1567,7 @@ impl TwinStore {
             created_at: Utc::now(),
         };
 
-        self.write_reflection_file(&card)?;
-        self.append_trace_event(
+        let (_, trace) = self.plan_trace_event(
             &card.session_id,
             TraceEventType::ReflectionCardRecorded,
             json!({
@@ -904,8 +1583,14 @@ impl TwinStore {
                 "evidence_packet": card.evidence_packet,
             }),
         )?;
-
-        Ok(card)
+        let values = vec![
+            (
+                self.reflection_file_path(&card.id),
+                serde_json::to_string_pretty(&card)?,
+            ),
+            self.serialized_trace_target(&trace)?,
+        ];
+        Ok((card, trace, values))
     }
 
     fn build_decision_evidence_packet(
@@ -933,13 +1618,14 @@ impl TwinStore {
         for id in cited_user_record_ids {
             if let Ok(record) = self.get_user_record(id) {
                 let (source_type, weight) = match &record.promotion_state {
-                    PromotionState::Endorsed | PromotionState::AutoPromoted => {
+                    PromotionState::Endorsed => {
                         ("approved_record", weights.approved_records_weight)
                     }
                     PromotionState::Candidate => {
                         ("candidate_record", weights.candidate_records_weight)
                     }
-                    PromotionState::Rejected
+                    PromotionState::AutoPromoted
+                    | PromotionState::Rejected
                     | PromotionState::Private
                     | PromotionState::NoTrain => {
                         continue;
@@ -959,30 +1645,32 @@ impl TwinStore {
         }
 
         for id in cited_constitution_item_ids {
-            let label = self
-                .read_constitution_file(&self.constitution_file_path(id))
-                .ok()
-                .map(|item| excerpt(&item.claim))
-                .unwrap_or_else(|| format!("Constitution {}", id));
+            let Ok(item) = self.read_constitution_file(&self.constitution_file_path(id)) else {
+                continue;
+            };
+            if self.artifact_has_only_legacy_auto_support(&item.linked_record_ids) {
+                continue;
+            }
             selected_sources.push(DecisionEvidenceSource {
                 source_type: "constitution_item".to_string(),
                 id: id.clone(),
-                label,
+                label: excerpt(&item.claim),
                 weight: weights.constitution_weight,
                 reason: "Higher-order constitution item selected for decision framing".to_string(),
             });
         }
 
         for id in cited_action_gap_ids {
-            let label = self
-                .read_action_gap_file(&self.action_gap_file_path(id))
-                .ok()
-                .map(|gap| excerpt(&gap.decision_risk))
-                .unwrap_or_else(|| format!("Action Gap {}", id));
+            let Ok(gap) = self.read_action_gap_file(&self.action_gap_file_path(id)) else {
+                continue;
+            };
+            if self.artifact_has_only_legacy_auto_support(&gap.linked_record_ids) {
+                continue;
+            }
             selected_sources.push(DecisionEvidenceSource {
                 source_type: "action_gap".to_string(),
                 id: id.clone(),
-                label,
+                label: excerpt(&gap.decision_risk),
                 weight: weights.action_gaps_weight,
                 reason: "Action gap selected as decision risk context".to_string(),
             });
@@ -1087,44 +1775,24 @@ impl TwinStore {
     }
 
     fn read_decision_file(&self, path: &Path) -> Result<DecisionEpisode> {
-        let content = std::fs::read_to_string(path)
-            .with_context(|| format!("Failed to read decision file: {}", path.display()))?;
-        serde_json::from_str(&content)
-            .with_context(|| format!("Failed to parse decision file: {}", path.display()))
+        self.read_twin_json_bounded(path)?
+            .ok_or_else(|| anyhow::anyhow!("Failed to read decision file: {}", path.display()))
     }
 
     fn write_decision_mirror_config_file(&self, config: &DecisionMirrorConfig) -> Result<()> {
         self.write_pretty_json(&self.decision_mirror_config_path, config)
+            .map(|_commit| ())
     }
 
     fn write_decision_file(&self, episode: &DecisionEpisode) -> Result<()> {
         let path = self.decision_file_path(&episode.id);
-        self.write_pretty_json(&path, episode)
-    }
-
-    fn write_reflection_file(&self, card: &ReflectionCard) -> Result<()> {
-        let path = self.reflection_file_path(&card.id);
-        self.write_pretty_json(&path, card)
+        self.write_pretty_json(&path, episode).map(|_commit| ())
     }
 
     pub(super) fn list_reflection_cards(&self) -> Result<Vec<ReflectionCard>> {
-        let mut cards = Vec::new();
-        if !self.reflections_path.exists() {
-            return Ok(cards);
-        }
-
-        for entry in WalkDir::new(&self.reflections_path)
-            .min_depth(1)
-            .max_depth(1)
-            .into_iter()
-            .filter_map(|entry| entry.ok())
-        {
-            let path = entry.path();
-            if path.extension().is_some_and(|ext| ext == "json") {
-                if let Some(card) = load_or_quarantine::<ReflectionCard>(path, "reflection card") {
-                    cards.push(card);
-                }
-            }
+        let mut cards = self.list_twin_json_bounded::<ReflectionCard>("reflections")?;
+        for card in &mut cards {
+            self.overlay_legacy_artifacts_on_reflection(card);
         }
 
         cards.sort_by(|a, b| b.created_at.cmp(&a.created_at));
@@ -1134,21 +1802,7 @@ impl TwinStore {
     pub(super) fn decision_evidence_refs(&self, decision_id: &str) -> Result<Vec<EvidenceRef>> {
         Self::validate_file_id(decision_id)?;
         let mut refs = Vec::new();
-        for entry in WalkDir::new(&self.traces_path)
-            .min_depth(1)
-            .max_depth(1)
-            .into_iter()
-            .filter_map(|entry| entry.ok())
-        {
-            let path = entry.path();
-            if !path.extension().is_some_and(|ext| ext == "json") {
-                continue;
-            }
-            let Some(trace) = load_or_quarantine::<SessionTrace>(path, "trace") else {
-                // A corrupt trace only omits its own evidence refs; the
-                // decision's evidence from healthy traces is still collected.
-                continue;
-            };
+        for trace in self.list_session_traces_durable()? {
             for event in trace.events {
                 let event_decision_id =
                     payload_string(&event.payload, &["decision_episode_id"]).unwrap_or_default();
@@ -1177,11 +1831,9 @@ impl TwinStore {
     fn decision_feedback_events(&self, episode: &DecisionEpisode) -> Result<Vec<TraceEvent>> {
         Self::validate_file_id(&episode.session_id)?;
         let path = self.trace_file_path(&episode.session_id);
-        if !path.exists() {
+        let Some(trace) = self.read_twin_json_bounded::<SessionTrace>(&path)? else {
             return Ok(Vec::new());
-        }
-
-        let trace = self.read_trace_file(&path)?;
+        };
         let mut events = trace
             .events
             .into_iter()
@@ -1206,655 +1858,5 @@ impl TwinStore {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use tempfile::tempdir;
-
-    #[test]
-    fn decision_episode_and_reflection_card_persist_with_scores() {
-        let temp_dir = tempdir().expect("temp dir should be created");
-        let mut store = TwinStore::new(temp_dir.path().to_path_buf());
-
-        let episode = store
-            .record_decision_episode(DecisionEpisodeCreate {
-                id: "decision-1".to_string(),
-                session_id: "session-1".to_string(),
-                tile_id: "tile-1".to_string(),
-                decision: "Should Grafyn build Decision Mirror first?".to_string(),
-                options: vec!["Decision Mirror".to_string(), "Topology".to_string()],
-                stakes: Some("Product direction".to_string()),
-                initial_leaning: Some("Decision Mirror".to_string()),
-                review_date: Some("2026-05-15".to_string()),
-                primitive_assessment: PrimitiveDecisionAssessment {
-                    stakes: Some("high".to_string()),
-                    reversibility: Some("medium".to_string()),
-                    time_horizon: Some("weeks".to_string()),
-                    uncertainty: Some("medium".to_string()),
-                    agency: Some("high".to_string()),
-                    value_tension: Some("ambition vs proof".to_string()),
-                    constraint_pressure: None,
-                    taste_aesthetic_pull: None,
-                    somatic_signal: None,
-                    action_gap_risk: None,
-                    outcome_feedback: None,
-                },
-                context_version: None,
-            })
-            .expect("decision episode should persist");
-
-        let card = store
-            .record_reflection_card(ReflectionCardCreate {
-                decision_episode_id: episode.id.clone(),
-                session_id: episode.session_id.clone(),
-                tile_id: episode.tile_id.clone(),
-                model_id: "openai/gpt-4".to_string(),
-                content: [
-                    "## Decision Frame",
-                    "You seem pulled toward ambitious topology.",
-                    "## Likely Reasoning Pattern",
-                    "You tend to prefer large architecture.",
-                    "## Recommendation",
-                    "Build the smaller proof first.",
-                ]
-                .join("\n"),
-                cited_note_ids: Vec::new(),
-                cited_user_record_ids: Vec::new(),
-                cited_constitution_item_ids: Vec::new(),
-                cited_action_gap_ids: Vec::new(),
-                evidence_packet: None,
-            })
-            .expect("reflection card should persist");
-
-        assert_eq!(card.decision_episode_id, "decision-1");
-        assert!(card.scores.unsupported_claim_count > 0);
-        assert!(card.scores.overall_score <= 1.0);
-        assert_eq!(card.evidence_packet.selected_sources.len(), 0);
-        assert_eq!(
-            card.evidence_packet
-                .config_snapshot
-                .as_ref()
-                .expect("config snapshot should persist")
-                .preset,
-            DecisionMirrorPreset::Balanced
-        );
-        store
-            .append_trace_event(
-                &episode.session_id,
-                TraceEventType::FeedbackRecorded,
-                json!({
-                    "feedback_type": "reject",
-                    "response": {
-                        "tile_id": episode.tile_id.clone(),
-                        "model_id": "openai/gpt-4",
-                    },
-                    "rationale": "Decision Mirror reflection marked Not Me",
-                }),
-            )
-            .expect("feedback event should persist");
-
-        let decision_rows = store
-            .list_decision_episodes_with_reflections()
-            .expect("decision rows should list with traces");
-        assert_eq!(decision_rows[0].reflection_cards.len(), 1);
-        assert_eq!(decision_rows[0].feedback_events.len(), 1);
-        assert_eq!(
-            decision_rows[0].feedback_events[0]
-                .payload
-                .get("feedback_type")
-                .and_then(|value| value.as_str()),
-            Some("reject")
-        );
-        let episodes = store
-            .list_decision_episodes()
-            .expect("episodes should list");
-        assert_eq!(episodes.len(), 1);
-
-        let legacy_card: ReflectionCard = serde_json::from_str(
-            r#"{
-                "id": "legacy-card",
-                "decision_episode_id": "decision-1",
-                "session_id": "session-1",
-                "tile_id": "tile-1",
-                "model_id": "openai/gpt-4",
-                "content": "legacy reflection",
-                "scores": { "overall_score": 0.5 },
-                "created_at": "2026-05-08T00:00:00Z"
-            }"#,
-        )
-        .expect("legacy reflection cards should deserialize");
-        assert!(legacy_card.evidence_packet.config_snapshot.is_none());
-    }
-
-    #[test]
-    fn decision_mirror_config_presets_persist() {
-        let temp_dir = tempdir().expect("temp dir should be created");
-        let store = TwinStore::new(temp_dir.path().to_path_buf());
-
-        let default_config = store
-            .get_decision_mirror_config()
-            .expect("default config should load");
-        assert_eq!(default_config.preset, DecisionMirrorPreset::Balanced);
-
-        let updated = store
-            .update_decision_mirror_config(DecisionMirrorConfigUpdate {
-                preset: Some(DecisionMirrorPreset::EvidenceStrict),
-                weights: None,
-                advanced_enabled: Some(true),
-            })
-            .expect("config should update");
-        assert_eq!(updated.preset, DecisionMirrorPreset::EvidenceStrict);
-        assert!(
-            updated.weights.evidence_grounding_weight
-                > default_config.weights.evidence_grounding_weight
-        );
-
-        let persisted = store
-            .get_decision_mirror_config()
-            .expect("persisted config should load");
-        assert_eq!(persisted.preset, DecisionMirrorPreset::EvidenceStrict);
-
-        let reset = store
-            .reset_decision_mirror_config()
-            .expect("config should reset");
-        assert_eq!(reset.preset, DecisionMirrorPreset::Balanced);
-    }
-
-    #[test]
-    fn decision_episode_old_json_loads_with_default_prediction_fields() {
-        let temp_dir = tempdir().expect("temp dir should be created");
-        let store = TwinStore::new(temp_dir.path().to_path_buf());
-
-        let old_json = r#"{
-            "id": "legacy-episode",
-            "session_id": "session-1",
-            "tile_id": "tile-1",
-            "decision": "Ship now or wait?",
-            "options": ["Ship now", "Wait"],
-            "chosen_option": "Ship now",
-            "created_at": "2026-01-01T00:00:00Z",
-            "updated_at": "2026-01-01T00:00:00Z"
-        }"#;
-        std::fs::create_dir_all(&store.decisions_path).expect("decisions dir");
-        std::fs::write(store.decisions_path.join("legacy-episode.json"), old_json)
-            .expect("legacy episode should write");
-
-        let episodes = store
-            .list_decision_episodes()
-            .expect("legacy episode should deserialize");
-        assert_eq!(episodes.len(), 1);
-        let episode = &episodes[0];
-        assert!(episode.twin_prediction.is_none());
-        assert!(episode.prediction_status.is_none());
-        assert!(episode.agreement.is_none());
-        assert!(episode.correction_note.is_none());
-        assert!(episode.context_version.is_none());
-        assert!(episode.outcome_recorded_at.is_none());
-    }
-
-    #[test]
-    fn sealed_prediction_redacted_from_reflections_until_outcome() {
-        let temp_dir = tempdir().expect("temp dir should be created");
-        let mut store = TwinStore::new(temp_dir.path().to_path_buf());
-
-        let episode = store
-            .record_decision_episode(DecisionEpisodeCreate {
-                id: "decision-sealed".to_string(),
-                session_id: "session-1".to_string(),
-                tile_id: "tile-1".to_string(),
-                decision: "Take the Denver job?".to_string(),
-                options: vec!["Take it".to_string(), "Stay".to_string()],
-                stakes: None,
-                initial_leaning: None,
-                review_date: None,
-                primitive_assessment: PrimitiveDecisionAssessment::default(),
-                context_version: Some("ctx-test".to_string()),
-            })
-            .expect("decision episode should persist");
-        assert_eq!(episode.prediction_status.as_deref(), Some("requested"));
-
-        let mut sealed = episode.clone();
-        sealed.twin_prediction = Some(TwinPrediction {
-            predicted_option: "Stay".to_string(),
-            matched_option_index: Some(1),
-            confidence: Some(0.7),
-            rationale: Some("Family proximity outweighs salary here.".to_string()),
-            parse_mode: "json".to_string(),
-            model_id: "test/model".to_string(),
-            context_version: "ctx-test".to_string(),
-            sealed_at: Utc::now(),
-        });
-        sealed.prediction_status = Some("sealed".to_string());
-        store
-            .write_decision_file(&sealed)
-            .expect("sealed episode should write");
-
-        let listed = store
-            .list_decision_episodes_with_reflections()
-            .expect("episodes should list");
-        let item = listed
-            .iter()
-            .find(|item| item.episode.id == "decision-sealed")
-            .expect("episode should be listed");
-        assert!(item.prediction_sealed);
-        assert!(item.episode.twin_prediction.is_none());
-
-        store
-            .update_decision_outcome(
-                "decision-sealed",
-                DecisionOutcomeUpdate {
-                    chosen_option: Some("Stay".to_string()),
-                    ..DecisionOutcomeUpdate::default()
-                },
-            )
-            .expect("outcome should record");
-
-        let listed = store
-            .list_decision_episodes_with_reflections()
-            .expect("episodes should list after outcome");
-        let item = listed
-            .iter()
-            .find(|item| item.episode.id == "decision-sealed")
-            .expect("episode should be listed after outcome");
-        assert!(!item.prediction_sealed);
-        let prediction = item
-            .episode
-            .twin_prediction
-            .as_ref()
-            .expect("prediction should be revealed after outcome");
-        assert_eq!(prediction.predicted_option, "Stay");
-    }
-
-    fn decided_episode(
-        store: &mut TwinStore,
-        id: &str,
-        decision: &str,
-        chosen: &str,
-        correction_note: Option<&str>,
-    ) -> DecisionEpisode {
-        let episode = store
-            .record_decision_episode(DecisionEpisodeCreate {
-                id: id.to_string(),
-                session_id: "session-1".to_string(),
-                tile_id: format!("tile-{id}"),
-                decision: decision.to_string(),
-                options: vec!["Option A".to_string(), "Option B".to_string()],
-                stakes: None,
-                initial_leaning: None,
-                review_date: None,
-                primitive_assessment: PrimitiveDecisionAssessment::default(),
-                context_version: None,
-            })
-            .expect("episode should persist");
-        let mut decided = episode.clone();
-        decided.chosen_option = Some(chosen.to_string());
-        decided.correction_note = correction_note.map(|note| note.to_string());
-        store
-            .write_decision_file(&decided)
-            .expect("decided episode should write");
-        decided
-    }
-
-    #[test]
-    fn decision_cases_rank_relevance_above_correction_notes() {
-        let temp_dir = tempdir().expect("temp dir should be created");
-        let mut store = TwinStore::new(temp_dir.path().to_path_buf());
-
-        decided_episode(
-            &mut store,
-            "case-relevant",
-            "Accept the Denver relocation offer with higher salary?",
-            "Option B",
-            None,
-        );
-        decided_episode(
-            &mut store,
-            "case-correction",
-            "Buy the relocation boxes early?",
-            "Option A",
-            Some("Twin guessed wrong here"),
-        );
-        // Undecided episode must never appear as a case.
-        store
-            .record_decision_episode(DecisionEpisodeCreate {
-                id: "case-undecided".to_string(),
-                session_id: "session-1".to_string(),
-                tile_id: "tile-undecided".to_string(),
-                decision: "Relocation salary salary salary?".to_string(),
-                options: vec!["A".to_string(), "B".to_string()],
-                stakes: None,
-                initial_leaning: None,
-                review_date: None,
-                primitive_assessment: PrimitiveDecisionAssessment::default(),
-                context_version: None,
-            })
-            .expect("undecided episode should persist");
-
-        let cases = store
-            .select_decision_cases("Denver relocation salary decision", None, 5)
-            .expect("cases should select");
-        assert_eq!(cases.len(), 2);
-        // The strongly relevant case outranks the weakly relevant one even
-        // though the weak one carries a correction note.
-        assert_eq!(cases[0].id, "case-relevant");
-        assert_eq!(cases[1].id, "case-correction");
-        assert!(cases.iter().all(|case| case.id != "case-undecided"));
-
-        let excluded = store
-            .select_decision_cases(
-                "Denver relocation salary decision",
-                Some("case-relevant"),
-                5,
-            )
-            .expect("exclusion should apply");
-        assert!(excluded.iter().all(|case| case.id != "case-relevant"));
-
-        // Zero overlap: most recent decided cases, capped at two.
-        let recent = store
-            .select_decision_cases("zzz qqq xyzzy", None, 5)
-            .expect("fallback should select");
-        assert!(!recent.is_empty());
-        assert!(recent.len() <= 2);
-        assert!(recent.iter().all(|case| case.chosen_option.is_some()));
-    }
-
-    fn prediction_options() -> Vec<String> {
-        vec![
-            "Take the Denver job".to_string(),
-            "Stay in Austin".to_string(),
-        ]
-    }
-
-    #[test]
-    fn parse_twin_prediction_strict_json() {
-        let raw = r#"{"predicted_option": "Stay in Austin", "option_index": 2, "confidence": 0.8, "rationale": "Family proximity wins."}"#;
-        let draft = parse_twin_prediction(raw, &prediction_options());
-        assert_eq!(draft.parse_mode, "json");
-        assert_eq!(draft.matched_option_index, Some(1));
-        assert_eq!(draft.predicted_option, "Stay in Austin");
-        assert_eq!(draft.confidence, Some(0.8));
-        assert_eq!(draft.rationale.as_deref(), Some("Family proximity wins."));
-    }
-
-    #[test]
-    fn parse_twin_prediction_fenced_json_with_language_tag() {
-        let raw = "```json\n{\"predicted_option\": \"Take the Denver job\", \"option_index\": 1, \"confidence\": 0.6, \"rationale\": \"Growth.\"}\n```";
-        let draft = parse_twin_prediction(raw, &prediction_options());
-        assert_eq!(draft.parse_mode, "json");
-        assert_eq!(draft.matched_option_index, Some(0));
-    }
-
-    #[test]
-    fn parse_twin_prediction_index_as_string_and_one_based() {
-        let raw = r#"{"option_index": "1", "confidence": 0.5}"#;
-        let draft = parse_twin_prediction(raw, &prediction_options());
-        // 1-based reading preferred: "1" means the first listed option.
-        assert_eq!(draft.matched_option_index, Some(0));
-        assert_eq!(draft.predicted_option, "Take the Denver job");
-    }
-
-    #[test]
-    fn parse_twin_prediction_text_beats_conflicting_index() {
-        let raw = r#"{"predicted_option": "Stay in Austin", "option_index": 1, "confidence": 0.9}"#;
-        let draft = parse_twin_prediction(raw, &prediction_options());
-        // The option text is what the model said; the conflicting index loses.
-        assert_eq!(draft.matched_option_index, Some(1));
-    }
-
-    #[test]
-    fn parse_twin_prediction_out_of_range_index_with_valid_text() {
-        let raw = r#"{"predicted_option": "Stay in Austin", "option_index": 9}"#;
-        let draft = parse_twin_prediction(raw, &prediction_options());
-        assert_eq!(draft.matched_option_index, Some(1));
-    }
-
-    #[test]
-    fn parse_twin_prediction_bare_text_and_labels() {
-        let options = prediction_options();
-        let bare = parse_twin_prediction("  Stay in Austin\n", &options);
-        assert_eq!(bare.parse_mode, "string_match");
-        assert_eq!(bare.matched_option_index, Some(1));
-
-        let letter = parse_twin_prediction("B", &options);
-        assert_eq!(letter.matched_option_index, Some(1));
-
-        let labeled = parse_twin_prediction("Option 2", &options);
-        assert_eq!(labeled.matched_option_index, Some(1));
-    }
-
-    #[test]
-    fn parse_twin_prediction_garbage_falls_to_raw() {
-        let long_garbage = "I think there are many considerations here ".repeat(40);
-        let draft = parse_twin_prediction(&long_garbage, &prediction_options());
-        assert_eq!(draft.parse_mode, "raw");
-        assert!(draft.matched_option_index.is_none());
-        assert!(draft.predicted_option.chars().count() <= 500);
-    }
-
-    #[test]
-    fn parse_twin_prediction_reversed_braces_does_not_panic() {
-        // The closing brace appears BEFORE the opening one, so `raw.find('{')` finds a
-        // start index greater than `raw.rfind('}')`'s end index. Slicing `&raw[start..=end]`
-        // without checking `start <= end` panics — which previously crashed the spawned
-        // sealed-prediction task, silently skipping both `attach_twin_prediction` and
-        // `mark_twin_prediction_failed`.
-        let raw = "Option A} — but {incomplete";
-        let draft = parse_twin_prediction(raw, &prediction_options());
-        // No panic reaching here is the primary assertion. The malformed brace pair is
-        // simply not treated as JSON, so it falls through the same fallback chain as any
-        // other non-JSON text.
-        assert_ne!(draft.parse_mode, "json");
-    }
-
-    #[test]
-    fn extract_json_slice_rejects_reversed_braces() {
-        assert_eq!(extract_json_slice("Option A} — but {incomplete"), None);
-        assert_eq!(extract_json_slice("no braces here"), None);
-        assert_eq!(extract_json_slice("only open {"), None);
-        assert_eq!(extract_json_slice("only close }"), None);
-        assert_eq!(
-            extract_json_slice(r#"prefix {"a": 1} suffix"#),
-            Some(r#"{"a": 1}"#)
-        );
-    }
-
-    #[test]
-    fn parse_twin_prediction_sanitizes_confidence() {
-        let options = prediction_options();
-        let percent = parse_twin_prediction(
-            r#"{"predicted_option": "Stay in Austin", "confidence": 73}"#,
-            &options,
-        );
-        assert_eq!(percent.confidence, Some(0.73));
-
-        let overshoot = parse_twin_prediction(
-            r#"{"predicted_option": "Stay in Austin", "confidence": 1.2}"#,
-            &options,
-        );
-        assert_eq!(overshoot.confidence, Some(1.0));
-
-        let negative = parse_twin_prediction(
-            r#"{"predicted_option": "Stay in Austin", "confidence": -0.1}"#,
-            &options,
-        );
-        assert_eq!(negative.confidence, Some(0.0));
-
-        let null = parse_twin_prediction(
-            r#"{"predicted_option": "Stay in Austin", "confidence": null}"#,
-            &options,
-        );
-        assert!(null.confidence.is_none());
-    }
-
-    #[test]
-    fn attach_twin_prediction_refuses_after_outcome_and_duplicates() {
-        let temp_dir = tempdir().expect("temp dir should be created");
-        let mut store = TwinStore::new(temp_dir.path().to_path_buf());
-
-        let episode = store
-            .record_decision_episode(DecisionEpisodeCreate {
-                id: "decision-attach".to_string(),
-                session_id: "session-1".to_string(),
-                tile_id: "tile-1".to_string(),
-                decision: "Take the Denver job?".to_string(),
-                options: prediction_options(),
-                stakes: None,
-                initial_leaning: None,
-                review_date: None,
-                primitive_assessment: PrimitiveDecisionAssessment::default(),
-                context_version: Some("ctx-test".to_string()),
-            })
-            .expect("episode should persist");
-
-        let draft = parse_twin_prediction("Stay in Austin", &prediction_options());
-        let sealed = store
-            .attach_twin_prediction(&episode.id, draft.clone(), "test/model", "ctx-test")
-            .expect("first attach should seal");
-        assert_eq!(sealed.prediction_status.as_deref(), Some("sealed"));
-        let first_sealed_at = sealed.twin_prediction.as_ref().unwrap().sealed_at;
-
-        // Duplicate attach is a no-op.
-        let duplicate = store
-            .attach_twin_prediction(&episode.id, draft.clone(), "other/model", "ctx-test")
-            .expect("duplicate attach should not error");
-        assert_eq!(
-            duplicate.twin_prediction.as_ref().unwrap().sealed_at,
-            first_sealed_at
-        );
-        assert_eq!(
-            duplicate.twin_prediction.as_ref().unwrap().model_id,
-            "test/model"
-        );
-
-        // Outcome-first race: attach after the choice is recorded.
-        let late_episode = store
-            .record_decision_episode(DecisionEpisodeCreate {
-                id: "decision-late".to_string(),
-                session_id: "session-1".to_string(),
-                tile_id: "tile-2".to_string(),
-                decision: "Take the Denver job?".to_string(),
-                options: prediction_options(),
-                stakes: None,
-                initial_leaning: None,
-                review_date: None,
-                primitive_assessment: PrimitiveDecisionAssessment::default(),
-                context_version: None,
-            })
-            .expect("episode should persist");
-        store
-            .update_decision_outcome(
-                &late_episode.id,
-                DecisionOutcomeUpdate {
-                    chosen_option: Some("Stay in Austin".to_string()),
-                    ..DecisionOutcomeUpdate::default()
-                },
-            )
-            .expect("outcome should record");
-        let refused = store
-            .attach_twin_prediction(&late_episode.id, draft, "test/model", "ctx-test")
-            .expect("late attach should not error");
-        assert!(refused.twin_prediction.is_none());
-        assert_eq!(
-            refused.prediction_status.as_deref(),
-            Some("outcome_recorded_first")
-        );
-    }
-
-    #[test]
-    fn outcome_computes_agreement_and_canonicalizes_choice() {
-        let temp_dir = tempdir().expect("temp dir should be created");
-        let mut store = TwinStore::new(temp_dir.path().to_path_buf());
-
-        let episode = store
-            .record_decision_episode(DecisionEpisodeCreate {
-                id: "decision-agree".to_string(),
-                session_id: "session-1".to_string(),
-                tile_id: "tile-1".to_string(),
-                decision: "Take the Denver job?".to_string(),
-                options: prediction_options(),
-                stakes: None,
-                initial_leaning: None,
-                review_date: None,
-                primitive_assessment: PrimitiveDecisionAssessment::default(),
-                context_version: Some("ctx-test".to_string()),
-            })
-            .expect("episode should persist");
-        let draft = parse_twin_prediction("Stay in Austin", &prediction_options());
-        store
-            .attach_twin_prediction(&episode.id, draft, "test/model", "ctx-test")
-            .expect("prediction should seal");
-
-        // Label + case variant resolves to the canonical option text and
-        // agreement computes via index comparison.
-        let updated = store
-            .update_decision_outcome(
-                &episode.id,
-                DecisionOutcomeUpdate {
-                    chosen_option: Some("option 2".to_string()),
-                    correction_note: None,
-                    ..DecisionOutcomeUpdate::default()
-                },
-            )
-            .expect("outcome should record");
-        assert_eq!(updated.chosen_option.as_deref(), Some("Stay in Austin"));
-        assert_eq!(updated.agreement, Some(true));
-        assert!(updated.outcome_recorded_at.is_some());
-
-        // Editing the choice recomputes agreement and accepts a correction
-        // note; outcome_recorded_at is not reset.
-        let first_recorded_at = updated.outcome_recorded_at;
-        let edited = store
-            .update_decision_outcome(
-                &episode.id,
-                DecisionOutcomeUpdate {
-                    chosen_option: Some("  TAKE the denver JOB ".to_string()),
-                    correction_note: Some("Twin overweighted family proximity.".to_string()),
-                    ..DecisionOutcomeUpdate::default()
-                },
-            )
-            .expect("edited outcome should record");
-        assert_eq!(edited.chosen_option.as_deref(), Some("Take the Denver job"));
-        assert_eq!(edited.agreement, Some(false));
-        assert_eq!(
-            edited.correction_note.as_deref(),
-            Some("Twin overweighted family proximity.")
-        );
-        assert_eq!(edited.outcome_recorded_at, first_recorded_at);
-    }
-
-    #[test]
-    fn outcome_without_prediction_records_no_agreement_and_keeps_free_text() {
-        let temp_dir = tempdir().expect("temp dir should be created");
-        let mut store = TwinStore::new(temp_dir.path().to_path_buf());
-
-        let episode = store
-            .record_decision_episode(DecisionEpisodeCreate {
-                id: "decision-free".to_string(),
-                session_id: "session-1".to_string(),
-                tile_id: "tile-1".to_string(),
-                decision: "Take the Denver job?".to_string(),
-                options: prediction_options(),
-                stakes: None,
-                initial_leaning: None,
-                review_date: None,
-                primitive_assessment: PrimitiveDecisionAssessment::default(),
-                context_version: None,
-            })
-            .expect("episode should persist");
-
-        let updated = store
-            .update_decision_outcome(
-                &episode.id,
-                DecisionOutcomeUpdate {
-                    chosen_option: Some("Negotiated a remote arrangement instead".to_string()),
-                    ..DecisionOutcomeUpdate::default()
-                },
-            )
-            .expect("outcome should record");
-        // Free text that matches no option is preserved verbatim.
-        assert_eq!(
-            updated.chosen_option.as_deref(),
-            Some("Negotiated a remote arrangement instead")
-        );
-        assert!(updated.agreement.is_none());
-    }
-}
+#[path = "decisions_tests.rs"]
+mod tests;

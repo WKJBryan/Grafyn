@@ -298,19 +298,19 @@ const displayRounds = computed(() => {
 
 const hasRounds = computed(() => displayRounds.value.length > 0)
 
-const nodeStyle = computed(() => ({
-  left: `${props.debate.position.x}px`,
-  top: `${props.debate.position.y}px`,
-  width: `${props.debate.position.width || 280}px`,
-  minHeight: `${props.debate.position.height || 200}px`
-}))
-
 const recapPreview = computed(() => {
   const recap = props.debate.recap?.trim()
   if (!recap) return null
   const sentences = recap.split(/(?<=[.!?])\s+/)
   return sentences.slice(0, 2).join(' ')
 })
+
+const nodeStyle = computed(() => ({
+  left: `${props.debate.position.x}px`,
+  top: `${props.debate.position.y}px`,
+  width: `${props.debate.position.width || 280}px`,
+  minHeight: `${props.debate.position.height || 200}px`
+}))
 
 // Methods
 function toggleExpand() {

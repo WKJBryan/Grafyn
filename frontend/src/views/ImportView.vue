@@ -16,7 +16,7 @@
         <button
           class="btn btn-primary file-btn"
           data-guide="import-file-btn"
-          :disabled="loading"
+          :disabled="loading || !nativeFilePickerAvailable"
           @click="handlePickFile"
         >
           {{ loading ? 'Reading file...' : 'Choose Export File' }}
@@ -334,11 +334,12 @@
 
 <script setup>
 import { ref, reactive, computed } from 'vue'
-import { open } from '@tauri-apps/api/dialog'
 import { importApi, zettelkasten, notes } from '@/api/client'
+import { getRuntimeProfile, getTransport } from '@/api/transport'
 import { useToast } from '@/composables/useToast'
 
 const toast = useToast()
+const nativeFilePickerAvailable = getRuntimeProfile().nativePlugins === true
 
 const loading = ref(false)
 const importing = ref(false)
@@ -403,15 +404,19 @@ function isSelected(noteId, targetId) {
 }
 
 async function handlePickFile() {
+  if (!nativeFilePickerAvailable) return
   error.value = null
 
-  const selected = await open({
-    multiple: false,
-    filters: [
-      { name: 'Supported imports', extensions: ['json', 'dms', 'md', 'txt', 'docx', 'pdf'] },
-      { name: 'JSON', extensions: ['json', 'dms'] },
-      { name: 'Documents', extensions: ['md', 'txt', 'docx', 'pdf'] }
-    ],
+  const selected = await getTransport().openExternal({
+    type: 'file-dialog',
+    options: {
+      multiple: false,
+      filters: [
+        { name: 'Supported imports', extensions: ['json', 'dms', 'md', 'txt', 'docx', 'pdf'] },
+        { name: 'JSON', extensions: ['json', 'dms'] },
+        { name: 'Documents', extensions: ['md', 'txt', 'docx', 'pdf'] }
+      ],
+    },
   })
 
   if (!selected) return

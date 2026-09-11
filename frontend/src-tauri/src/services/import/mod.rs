@@ -1,6 +1,8 @@
 pub mod chatgpt;
 pub mod claude;
+pub mod decision_table;
 pub mod document;
+pub mod file;
 pub mod gemini;
 pub mod grok;
 pub mod semantic_links;

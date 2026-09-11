@@ -12,7 +12,7 @@
 
 <p align="center">
   <a href="https://github.com/WKJBryan/Grafyn/releases/latest"><img src="https://img.shields.io/github/v/release/WKJBryan/Grafyn?style=flat-square&color=blue" alt="Release"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL--3.0-green?style=flat-square" alt="License: GPL-3.0"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MPL--2.0-green?style=flat-square" alt="License: MPL-2.0"></a>
   <a href="https://github.com/WKJBryan/Grafyn/actions/workflows/test.yml"><img src="https://img.shields.io/github/actions/workflow/status/WKJBryan/Grafyn/test.yml?branch=main&style=flat-square&label=tests" alt="Tests"></a>
   <a href="https://github.com/WKJBryan/Grafyn/releases"><img src="https://img.shields.io/github/downloads/WKJBryan/Grafyn/total?style=flat-square&color=orange" alt="Downloads"></a>
 </p>
@@ -34,7 +34,7 @@
 2. **A multi-model canvas** — ask several AI models the same question side by side, with your own notes automatically retrieved as context. Compare, branch, make them debate.
 3. **A twin evidence recorder** — as you work, Grafyn captures how you think: what you accept, reject, correct, and prefer. That evidence powers an experimental retrieval-based "digital twin" today, and exports cleanly for whatever you want to train tomorrow.
 
-Everything runs on your machine. The only thing that ever leaves it is the prompt context you send to the AI models you choose.
+Core storage, indexing, projection, and review run on your machine. Network traffic occurs only through features you configure or invoke, such as model requests, optional web search, update checks, and explicit sync/export transport.
 
 > **Early development** — the vault and canvas are solid daily tools; the twin is an honest experiment. See [Project Status](#project-status) for exactly what's stable.
 
@@ -92,7 +92,7 @@ It shares the vault and indexes with the app, falling back to read-only search w
 
 The long-term bet: the hardest part of a personal AI isn't the model — it's the evidence. Grafyn is built to capture that evidence as a side effect of work you're doing anyway.
 
-As you use the canvas, feedback controls (`Matches Me`, `Not Me`, `Correct`, `Rank`, `Capture Insight`) and passive signals (what you branch from, promote, export) become **evidence-linked records** of your facts, preferences, and reasoning patterns — specific claims you can trace back to the exact prompts and sessions that support them, never broad personality labels. You review everything in the **Twin Workspace** (`/twin`): endorse, reject, mark private or no-train.
+Canvas feedback and branching are retained as evidence, not silently promoted into truth. A separate **Capture Twin preference** action accepts only user-written text tied to a completed persisted global response. Three matching captures from three distinct responses produce a pending proposal; that proposal still needs explicit review before it can ground Advisor or Simulation. Other feedback and generic insights remain claim-empty evidence. The **Twin Workspace** (`/twin`) keeps proposal review and legacy record governance visible.
 
 What that enables today, all **experimental**:
 
@@ -106,8 +106,8 @@ Records you mark `rejected`, `private`, or `no_train` are never used in live ans
 
 ## Privacy & Your Data
 
-- **Local-first, no hosted backend.** Notes, indexes, twin evidence, canvas sessions — all files on your disk. Delete the folder and it's gone.
-- **What leaves your machine:** only the prompt context sent to the model runtime you configured (OpenRouter, or nothing external at all with Ollama). Optional web search is per-prompt and visible.
+- **Local-first, no hosted backend.** Notes and the Markdown vault are local, while canonical Twin events, settings, caches, and secret references also live in OS application storage. A complete deletion must remove both the vault and Grafyn's OS app data/config/cache, plus its keychain/Keystore entries.
+- **What leaves your machine:** only traffic for a feature you configure or invoke: model prompts/context, optional web search, update checks, explicit feedback, and manual sync/export transport. Ollama can keep model prompts local.
 - **Your API key** is stored in the OS keychain, not in config files.
 - **Twin evidence is yours.** Nothing is trained on your data by Grafyn; exports exist so *you* can train elsewhere, on your terms.
 
@@ -124,6 +124,8 @@ Records you mark `rejected`, `private`, or `no_train` are never used in live ans
 | Vault Optimizer (background vault improvements) | ✅ Stable |
 | Structured vault migration (preview/apply/rollback) | ✅ Stable |
 | MCP server (`grafyn-mcp`) for Claude Desktop / Codex Desktop | ✅ Stable |
+| Android compact companion | 🧪 Early; installed-app native verification is still pending |
+| Local manual E2EE sync foundation | 🧪 Experimental; no hosted relay, account, or pairing service |
 | Native RAG twin (Advisor + Simulation modes) | 🧪 Experimental |
 | Twin Identity, Constitution, Decision Mirror | 🧪 Experimental |
 | Twin evidence capture and review dashboard | 🧪 Experimental |
@@ -134,21 +136,20 @@ Twin data capture and export are dependable today; twin *accuracy* is not yet a 
 
 ## Architecture
 
-One desktop binary: Vue 3 frontend, Rust backend, local filesystem storage.
+One shared Rust library powers target-specific Tauri 2 shells. Desktop releases bundle the thin `grafyn` app binary and the standalone `grafyn-mcp` sidecar; Android packages the same core behind a smaller command allowlist and app-private storage. A feature-gated `grafyn-test-runtime` binary exists only for development system tests and is excluded from release capabilities.
 
 ```text
-Tauri Desktop App
-├── Vue 3 Frontend        Notes · Graph · Canvas · Twin Workspace
-├── Rust Backend          Knowledge store · Tantivy search · Graph index
-│                         Canvas sessions · Twin evidence store · LLM runtimes
-├── grafyn-mcp            Native MCP server (stdio) sharing the same vault
-└── ~/Documents/Grafyn/   vault/ (markdown) · data/ (indexes, sessions, twin)
+Tauri 2 shared Rust core
+├── Desktop-wide shell    Notes · Graph · spatial Canvas · Twin Workspace
+├── Android companion     Capture · Recall · Twin review/chat · linear Canvas
+├── Local data            Markdown vault · indexes · events · projections
+└── grafyn-mcp            Desktop-only stdio server sharing the desktop vault
 ```
 
 | Layer | Technology |
 |-------|------------|
 | Frontend | Vue 3, Vite, Pinia, D3.js |
-| Desktop | Tauri 1.8 |
+| App shells | Tauri 2 (desktop and Android) |
 | Backend | Rust |
 | Search | Tantivy |
 | LLM runtime | OpenRouter (reqwest) · Ollama for local models |
@@ -157,10 +158,18 @@ Tauri Desktop App
 
 Deeper architecture notes live in [CLAUDE.md](CLAUDE.md).
 
+## Editions and licensing
+
+The open client and local core in this repository are available under [MPL-2.0](LICENSE). The existing [`grafyn-sync-protocol`](frontend/src-tauri/crates/grafyn-sync-protocol) crate is available under `Apache-2.0 OR MPL-2.0` to support independent implementations.
+
+The approved design also leaves room for a future optional hosted service that relays opaque end-to-end encrypted operations. That hosted service, along with billing and operations, is a separate proprietary boundary and is not currently available. Local capture, recall, export, and access to local data do not depend on it.
+
+See [RELICENSING.md](RELICENSING.md) for the provenance audit and change record, [CONTRIBUTING.md](CONTRIBUTING.md) for DCO sign-off, and [TRADEMARKS.md](TRADEMARKS.md) for the name and logo policy.
+
 ## Contributing
 
 Contributions are welcome — the project has a full CI pipeline (tests, lint, multi-platform release smoke) and firm product rules around twin data ethics and local-first storage. Start with [CONTRIBUTING.md](CONTRIBUTING.md) for setup, test commands, and the rules that keep the twin honest.
 
 ## License
 
-[GPL-3.0](LICENSE) — Grafyn is free software; improvements to it stay free.
+[MPL-2.0](LICENSE) — modifications to covered source files remain available under the MPL's file-level terms.

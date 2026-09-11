@@ -2,7 +2,9 @@ import { createApp } from 'vue'
 import { createPinia } from 'pinia'
 import App from './App.vue'
 import router from './router'
-import { settings } from './api/client'
+import { runtime, settings } from './api/client'
+import { getRuntimeProfile, getTransport, setRuntimeStatus } from './api/transport'
+import { normalizeRuntimeStatus } from './platform/capabilities'
 import { resolveThemePreference, useThemeStore } from './stores/theme'
 import './style.css'
 
@@ -21,8 +23,10 @@ window.addEventListener('grafyn-app-mounted', () => {
   appShellShown = true
 
   requestAnimationFrame(() => {
-    if (window.__TAURI__) {
-      import('@tauri-apps/api/window').then(({ appWindow }) => appWindow.show())
+    const runtimeProfile = getRuntimeProfile()
+    if (runtimeProfile.name === 'desktop-wide' && runtimeProfile.nativePlugins === true) {
+      getTransport().showMainWindow()
+        .catch((error) => console.error('Failed to show Grafyn window:', error))
     }
     removeBootstrapSplash()
   })
@@ -40,7 +44,18 @@ async function syncThemeFromSettings() {
   }
 }
 
+async function syncRuntimeStatus() {
+  if (!getRuntimeProfile().isTauri) return
+
+  try {
+    setRuntimeStatus(normalizeRuntimeStatus(await runtime.getStatus()))
+  } catch (error) {
+    console.error('Failed to load runtime capability status:', error)
+  }
+}
+
 async function bootstrap() {
+  await syncRuntimeStatus()
   await syncThemeFromSettings()
 
   const app = createApp(App)

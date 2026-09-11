@@ -38,10 +38,17 @@ const files = [
     rel: 'src-tauri/tauri.conf.json',
     update(content) {
       const json = JSON.parse(content);
-      const old = json.package.version;
-      json.package.version = version;
-      // Also update the window title which includes the version
-      for (const win of json.tauri?.windows || []) {
+      const old = json.version;
+      json.version = version;
+      return { old, content: JSON.stringify(json, null, 2) + '\n' };
+    },
+  },
+  {
+    rel: 'src-tauri/tauri.desktop.conf.json',
+    update(content) {
+      const json = JSON.parse(content);
+      const old = json.app?.windows?.[0]?.title || '?';
+      for (const win of json.app?.windows || []) {
         if (win.title && /^Grafyn v\d/.test(win.title)) {
           win.title = `Grafyn v${version}`;
         }

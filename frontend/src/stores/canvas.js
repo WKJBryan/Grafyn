@@ -1,7 +1,7 @@
 import { defineStore } from 'pinia'
 import { ref, shallowRef, computed, triggerRef, toRaw } from 'vue'
 import { canvas as canvasApi, twin as twinApi } from '@/api/client'
-import { useAsyncOperation } from '@/composables/useAsyncOperation'
+import { getTransport } from '@/api/transport'
 
 export const DEFAULT_WEB_SEARCH_MAX_RESULTS = 5
 export const THINK_HARDER_WEB_SEARCH_MAX_RESULTS = 8
@@ -22,11 +22,13 @@ export const useCanvasStore = defineStore('canvas', () => {
   const availableModels = ref([])
   const loading = ref(false)
   const error = ref(null)
-  const { run } = useAsyncOperation(loading, error)
+  const errorSessionId = ref(null)
+  let sessionLoadGeneration = 0
   // shallowRef avoids deep reactivity tracking — these update on every streaming chunk,
   // so deep proxying wastes cycles. Use triggerRef() after mutations to notify watchers.
   const streamingModels = shallowRef(new Set())
   const streamingModelCounts = new Map()
+  const feedbackInFlight = shallowRef(new Set())
   // Debate streaming state: { [debateId]: { currentRound, models: { [modelId]: text }, completedRounds: [] } }
   // Kept as ref() (not shallowRef) because deeply nested mutations need automatic reactivity for streaming display
   const debateStreamingContent = ref({})
@@ -126,18 +128,7 @@ export const useCanvasStore = defineStore('canvas', () => {
       debates: (session.debates || []).map(debate => ({
         ...debate,
         reasoning_effort: normalizeReasoningEffort(debate.reasoning_effort)
-      })),
-      working_memory: session.working_memory || {
-        version: 0,
-        summary: '',
-        question: '',
-        constraints: [],
-        open_questions: [],
-        decisions: [],
-        tried: [],
-        model_positions: [],
-        note_ids: []
-      }
+      }))
     }
   }
 
@@ -177,6 +168,10 @@ export const useCanvasStore = defineStore('canvas', () => {
     return { ...fetchedResponse, position: localResponse.position || fetchedResponse.position }
   }
 
+  function isCurrentSession(sessionId) {
+    return currentSession.value?.id === sessionId
+  }
+
   function mergeSavedSession(fetched) {
     // Stale-save guard: session_saved can arrive for a session the user has already
     // switched away from (its stream finishing in the background). Applying that fetch
@@ -210,8 +205,7 @@ export const useCanvasStore = defineStore('canvas', () => {
       ...fetched,
       viewport: currentSession.value.viewport ?? fetched.viewport,
       prompt_tiles: mergedTiles,
-      debates: mergedDebates,
-      working_memory: fetched.working_memory || currentSession.value.working_memory
+      debates: mergedDebates
     }
   }
 
@@ -293,11 +287,11 @@ export const useCanvasStore = defineStore('canvas', () => {
   // Actions
   async function loadSessions() {
     loading.value = true
-    error.value = null
+    clearError()
     try {
       sessions.value = await canvasApi.list()
     } catch (err) {
-      error.value = err.message || 'Failed to load sessions'
+      setError(err.message || 'Failed to load sessions')
       console.error('Failed to load canvas sessions:', err)
     } finally {
       loading.value = false
@@ -305,25 +299,41 @@ export const useCanvasStore = defineStore('canvas', () => {
   }
 
   async function loadSession(sessionId) {
+    const generation = ++sessionLoadGeneration
     loading.value = true
-    error.value = null
+    clearError()
     try {
-      currentSession.value = normalizeSession(await canvasApi.get(sessionId))
+      const session = normalizeSession(await canvasApi.get(sessionId))
+      if (generation !== sessionLoadGeneration) return null
+      currentSession.value = session
+      return session
     } catch (err) {
-      error.value = err.message || 'Failed to load session'
+      if (generation !== sessionLoadGeneration) return null
+      setError(err.message || 'Failed to load session', sessionId)
       console.error('Failed to load canvas session:', err)
+      return null
     } finally {
-      loading.value = false
+      if (generation === sessionLoadGeneration) loading.value = false
     }
   }
 
   async function createSession(data = {}) {
-    return run(async () => {
+    const generation = ++sessionLoadGeneration
+    loading.value = true
+    clearError()
+    try {
       const session = normalizeSession(await canvasApi.create(data))
+      if (generation !== sessionLoadGeneration) return null
       sessions.value.unshift(session)
       currentSession.value = session
       return session
-    })
+    } catch (err) {
+      if (generation !== sessionLoadGeneration) return null
+      setError(err.message || 'Failed to create session')
+      throw err
+    } finally {
+      if (generation === sessionLoadGeneration) loading.value = false
+    }
   }
 
   async function updateSession(sessionId, data) {
@@ -343,7 +353,7 @@ export const useCanvasStore = defineStore('canvas', () => {
 
       return updated
     } catch (err) {
-      error.value = err.message || 'Failed to update session'
+      if (isCurrentSession(sessionId)) setError(err.message || 'Failed to update session', sessionId)
       console.error('Failed to update canvas session:', err)
       throw err
     }
@@ -352,33 +362,34 @@ export const useCanvasStore = defineStore('canvas', () => {
   async function deleteSession(sessionId) {
     try {
       await canvasApi.delete(sessionId)
+      sessionLoadGeneration += 1
+      loading.value = false
       sessions.value = sessions.value.filter(s => s.id !== sessionId)
 
       if (currentSession.value?.id === sessionId) {
         currentSession.value = null
       }
     } catch (err) {
-      error.value = err.message || 'Failed to delete session'
+      if (isCurrentSession(sessionId)) setError(err.message || 'Failed to delete session', sessionId)
       console.error('Failed to delete canvas session:', err)
       throw err
     }
   }
 
   async function loadModels() {
-    error.value = null
+    clearError()
     try {
       availableModels.value = await canvasApi.getModels()
     } catch (err) {
-      error.value = err.message || 'Failed to load models'
+      setError(err.message || 'Failed to load models')
       console.error('Failed to load models:', err)
     }
   }
 
-  // Helper to set up Tauri event listener for canvas-stream events
+  // Helper to set up the transport event listener for canvas-stream events
   // Returns unlisten cleanup handle
   async function setupTauriStreamListener(sessionId, handlers) {
-    const { listen } = await import('@tauri-apps/api/event')
-    const unlisten = await listen('canvas-stream', (event) => {
+    const unlisten = await getTransport().listen('canvas-stream', (event) => {
       const data = event.payload
       // Filter events for this session
       if (data.session_id !== sessionId) return
@@ -412,6 +423,7 @@ export const useCanvasStore = defineStore('canvas', () => {
     decisionMetadata = null,
     reasoningEffort = 'none',
     twinLlmProvider = null,
+    twinRelationshipVariant = null,
     parentDebateId = null
   ) {
     if (!currentSession.value) {
@@ -419,7 +431,7 @@ export const useCanvasStore = defineStore('canvas', () => {
     }
 
     const sessionId = currentSession.value.id
-    error.value = null
+    clearError()
 
     // Calculate position for new tile when branching from a parent response
     let position = undefined
@@ -470,29 +482,37 @@ export const useCanvasStore = defineStore('canvas', () => {
         twin_answer_mode: twinAnswerMode,
         twin_context_policy: contextMode === 'twin' ? 'approved_plus_relevant_candidates' : null,
         twin_llm_provider: twinLlmProvider,
+        ...(twinRelationshipVariant
+          ? { twin_relationship_variant: twinRelationshipVariant }
+          : {}),
         decision_metadata: decisionMetadata,
         reasoning_effort: normalizeReasoningEffort(reasoningEffort),
-        position,
+        ...(position ? { position } : {}),
         web_search: webSearch,
         web_search_max_results: webSearchMaxResults
       }
 
       const applyContextNotes = (data) => {
-        if (currentSession.value) {
+        if (isCurrentSession(sessionId)) {
           const tile = currentSession.value.prompt_tiles.find(t => t.id === data.tile_id)
           if (tile) tile.context_notes = data.notes || []
         }
       }
       const applyChunk = (data) => {
+        if (!isCurrentSession(sessionId)) return
         modelContent[data.model_id] = (modelContent[data.model_id] || '') + data.chunk
         updateTileResponseLocal(data.tile_id, data.model_id, modelContent[data.model_id], 'streaming')
       }
       const applyComplete = (data) => {
-        updateTileResponseLocal(data.tile_id, data.model_id, modelContent[data.model_id], 'completed', null, data.cost_usd)
+        if (isCurrentSession(sessionId)) {
+          updateTileResponseLocal(data.tile_id, data.model_id, modelContent[data.model_id], 'completed', null, data.cost_usd)
+        }
         tracker.clear(`${ownTileId}:${data.model_id}`)
       }
       const applyError = (data) => {
-        updateTileResponseLocal(data.tile_id, data.model_id, '', 'error', data.error)
+        if (isCurrentSession(sessionId)) {
+          updateTileResponseLocal(data.tile_id, data.model_id, '', 'error', data.error)
+        }
         tracker.clear(`${ownTileId}:${data.model_id}`)
       }
       const scopedAppliers = { context_notes: applyContextNotes, chunk: applyChunk, complete: applyComplete, error: applyError }
@@ -503,7 +523,7 @@ export const useCanvasStore = defineStore('canvas', () => {
           // Safe for every concurrent listener: push-if-absent dedupes the tile so N
           // concurrent operations broadcasting to each other's listeners still result
           // in exactly one push per tile, regardless of which operation it belongs to.
-          if (currentSession.value && data.tile) {
+          if (isCurrentSession(sessionId) && data.tile) {
             const exists = currentSession.value.prompt_tiles.some(t => t.id === data.tile.id)
             if (!exists) currentSession.value.prompt_tiles.push(data.tile)
           }
@@ -551,7 +571,7 @@ export const useCanvasStore = defineStore('canvas', () => {
         unlisten()
       }
     } catch (err) {
-      error.value = err.message || 'Failed to send prompt'
+      if (isCurrentSession(sessionId)) setError(err.message || 'Failed to send prompt', sessionId)
       console.error('Failed to send prompt:', err)
       throw err
     } finally {
@@ -814,7 +834,7 @@ export const useCanvasStore = defineStore('canvas', () => {
     }
 
     const sessionId = currentSession.value.id
-    error.value = null
+    clearError()
 
     // Mark models as streaming
     participatingModels.forEach(m => addStreaming(m))
@@ -897,7 +917,7 @@ export const useCanvasStore = defineStore('canvas', () => {
         unlisten()
       }
     } catch (err) {
-      error.value = err.message || 'Failed to start debate'
+      setError(err.message || 'Failed to start debate', sessionId)
       console.error('Failed to start debate:', err)
       throw err
     } finally {
@@ -911,7 +931,7 @@ export const useCanvasStore = defineStore('canvas', () => {
     }
 
     if (!prompt || !prompt.trim()) {
-      error.value = 'Enter a prompt to continue the debate.'
+      setError('Enter a prompt to continue the debate.', currentSession.value.id)
       throw new Error(error.value)
     }
 
@@ -977,7 +997,7 @@ export const useCanvasStore = defineStore('canvas', () => {
         unlisten()
       }
     } catch (err) {
-      error.value = err.message || 'Failed to continue debate'
+      setError(err.message || 'Failed to continue debate', sessionId)
       throw err
     } finally {
       participatingModels.forEach(m => removeStreaming(m))
@@ -990,7 +1010,7 @@ export const useCanvasStore = defineStore('canvas', () => {
     }
 
     const sessionId = currentSession.value.id
-    error.value = null
+    clearError()
 
     try {
       const result = await canvasApi.exportToNote(sessionId)
@@ -1002,7 +1022,7 @@ export const useCanvasStore = defineStore('canvas', () => {
 
       return result
     } catch (err) {
-      error.value = err.message || 'Failed to export to note'
+      setError(err.message || 'Failed to export to note', sessionId)
       console.error('Failed to export canvas to note:', err)
       throw err
     }
@@ -1020,7 +1040,7 @@ export const useCanvasStore = defineStore('canvas', () => {
     }
 
     const sessionId = currentSession.value.id
-    error.value = null
+    clearError()
 
     // tileId is known synchronously (an existing tile), so streaming keys can be
     // marked immediately — no need to learn ownership asynchronously like sendPrompt.
@@ -1035,7 +1055,7 @@ export const useCanvasStore = defineStore('canvas', () => {
 
       const unlisten = await setupTauriStreamListener(sessionId, {
         models_added: (data) => {
-          if (data.tile_id !== tileId) return
+          if (data.tile_id !== tileId || !isCurrentSession(sessionId)) return
           const targetTile = currentSession.value.prompt_tiles.find(t => t.id === data.tile_id)
           if (targetTile) {
             for (const [modelId, response] of Object.entries(data.responses)) {
@@ -1044,18 +1064,22 @@ export const useCanvasStore = defineStore('canvas', () => {
           }
         },
         chunk: (data) => {
-          if (data.tile_id !== tileId || !newModelIds.includes(data.model_id)) return
+          if (data.tile_id !== tileId || !newModelIds.includes(data.model_id) || !isCurrentSession(sessionId)) return
           modelContent[data.model_id] = (modelContent[data.model_id] || '') + data.chunk
           updateTileResponseLocal(tileId, data.model_id, modelContent[data.model_id], 'streaming')
         },
         complete: (data) => {
           if (data.tile_id !== tileId || !newModelIds.includes(data.model_id)) return
-          updateTileResponseLocal(tileId, data.model_id, modelContent[data.model_id], 'completed', null, data.cost_usd)
+          if (isCurrentSession(sessionId)) {
+            updateTileResponseLocal(tileId, data.model_id, modelContent[data.model_id], 'completed', null, data.cost_usd)
+          }
           tracker.clear(`${tileId}:${data.model_id}`)
         },
         error: (data) => {
           if (data.tile_id !== tileId || !newModelIds.includes(data.model_id)) return
-          updateTileResponseLocal(tileId, data.model_id, '', 'error', data.error)
+          if (isCurrentSession(sessionId)) {
+            updateTileResponseLocal(tileId, data.model_id, '', 'error', data.error)
+          }
           tracker.clear(`${tileId}:${data.model_id}`)
         },
         session_saved: async () => {
@@ -1070,7 +1094,7 @@ export const useCanvasStore = defineStore('canvas', () => {
         unlisten()
       }
     } catch (err) {
-      error.value = err.message || 'Failed to add models'
+      setError(err.message || 'Failed to add models', sessionId)
       console.error('Failed to add models to tile:', err)
       throw err
     } finally {
@@ -1090,7 +1114,14 @@ export const useCanvasStore = defineStore('canvas', () => {
     }
 
     const sessionId = currentSession.value.id
-    error.value = null
+    clearError()
+    const previousResponse = {
+      ...tile.responses[modelId],
+      position: tile.responses[modelId].position
+        ? { ...tile.responses[modelId].position }
+        : tile.responses[modelId].position
+    }
+    let invokeAccepted = false
 
     // tileId is known synchronously (an existing tile), so the streaming key can be
     // marked immediately.
@@ -1106,18 +1137,22 @@ export const useCanvasStore = defineStore('canvas', () => {
 
       const unlisten = await setupTauriStreamListener(sessionId, {
         chunk: (data) => {
-          if (data.tile_id !== tileId || data.model_id !== modelId) return
+          if (data.tile_id !== tileId || data.model_id !== modelId || !isCurrentSession(sessionId)) return
           content += data.chunk
           updateTileResponseLocal(tileId, modelId, content, 'streaming')
         },
         complete: (data) => {
           if (data.tile_id !== tileId || data.model_id !== modelId) return
-          updateTileResponseLocal(tileId, modelId, content, 'completed', null, data.cost_usd)
+          if (isCurrentSession(sessionId)) {
+            updateTileResponseLocal(tileId, modelId, content, 'completed', null, data.cost_usd)
+          }
           tracker.clear(streamingKey)
         },
         error: (data) => {
           if (data.tile_id !== tileId || data.model_id !== modelId) return
-          updateTileResponseLocal(tileId, modelId, '', 'error', data.error)
+          if (isCurrentSession(sessionId)) {
+            updateTileResponseLocal(tileId, modelId, '', 'error', data.error)
+          }
           tracker.clear(streamingKey)
         },
         session_saved: async () => {
@@ -1127,12 +1162,22 @@ export const useCanvasStore = defineStore('canvas', () => {
 
       try {
         await canvasApi.regenerateResponse(sessionId, tileId, modelId)
+        invokeAccepted = true
         await waitForModelsComplete([streamingKey], 120000)
       } finally {
         unlisten()
       }
     } catch (err) {
-      error.value = err.message || 'Failed to regenerate response'
+      if (!invokeAccepted && isCurrentSession(sessionId)) {
+        const currentTile = currentSession.value.prompt_tiles.find(item => item.id === tileId)
+        const currentResponse = currentTile?.responses?.[modelId]
+        if (currentResponse?.status === 'streaming' && currentResponse.content === '') {
+          currentTile.responses[modelId] = previousResponse
+        }
+      }
+      if (isCurrentSession(sessionId)) {
+        setError(err.message || 'Failed to regenerate response', sessionId)
+      }
       console.error('Failed to regenerate response:', err)
       throw err
     } finally {
@@ -1140,20 +1185,29 @@ export const useCanvasStore = defineStore('canvas', () => {
     }
   }
 
+  function setError(message, sessionId = null) {
+    error.value = message
+    errorSessionId.value = sessionId
+  }
+
   function clearError() {
     error.value = null
+    errorSessionId.value = null
   }
 
   function clearSession() {
+    sessionLoadGeneration += 1
     currentSession.value = null
+    loading.value = false
   }
 
   function reset() {
+    sessionLoadGeneration += 1
     sessions.value = []
     currentSession.value = null
     availableModels.value = []
     loading.value = false
-    error.value = null
+    clearError()
     clearStreaming()
     debateStreamingContent.value = {}
   }
@@ -1221,6 +1275,58 @@ export const useCanvasStore = defineStore('canvas', () => {
     )
   }
 
+  async function sendCompanionPrompt({
+    prompt,
+    modelId,
+    mode = 'twin',
+    answerMode = 'advisor',
+    parentTileId = null,
+    parentModelId = null,
+    provider = null,
+    relationshipVariant = { relationships: [] }
+  }) {
+    let contextMode
+    switch (mode) {
+      case 'plain':
+        contextMode = 'none'
+        break
+      case 'knowledge':
+        contextMode = 'knowledge_search'
+        break
+      case 'twin':
+        contextMode = 'twin_history'
+        break
+      default:
+        throw new Error(`Unsupported companion mode: ${mode}`)
+    }
+
+    if (!['advisor', 'simulation'].includes(answerMode)) {
+      throw new Error(`Unsupported companion answer mode: ${answerMode}`)
+    }
+    if (answerMode === 'simulation' && mode !== 'twin') {
+      throw new Error('Simulation requires Twin context')
+    }
+
+    return sendPrompt(
+      prompt,
+      [modelId],
+      null,
+      0.7,
+      null,
+      parentTileId,
+      parentModelId,
+      contextMode,
+      answerMode,
+      false,
+      DEFAULT_WEB_SEARCH_MAX_RESULTS,
+      'standard',
+      null,
+      'none',
+      provider,
+      relationshipVariant
+    )
+  }
+
   async function thinkHarderFromResponse(parentTileId, parentModelId, options = {}) {
     const webSearch = options.webSearch ?? true
     const webSearchMaxResults = webSearch
@@ -1257,15 +1363,26 @@ export const useCanvasStore = defineStore('canvas', () => {
   }
 
   async function recordPreferenceFeedback(tileId, modelId, feedbackType, rationale = null, content = null) {
-    return recordCanvasFeedback({
-      feedback_type: feedbackType,
-      response: {
-        tile_id: tileId,
-        model_id: modelId
-      },
-      rationale,
-      content
-    })
+    if (!currentSession.value) throw new Error('No active session')
+    const sessionId = currentSession.value.id
+    const key = `${sessionId}:${tileId}:${modelId}`
+    if (feedbackInFlight.value.has(key)) return null
+    feedbackInFlight.value.add(key)
+    triggerRef(feedbackInFlight)
+    try {
+      return await twinApi.recordCanvasFeedback(sessionId, {
+        feedback_type: feedbackType,
+        response: {
+          tile_id: tileId,
+          model_id: modelId
+        },
+        rationale,
+        content
+      })
+    } finally {
+      feedbackInFlight.value.delete(key)
+      triggerRef(feedbackInFlight)
+    }
   }
 
   async function recordSelectionRanking(responseRefs, rationale = null, content = null) {
@@ -1298,6 +1415,7 @@ export const useCanvasStore = defineStore('canvas', () => {
       content,
       rationale: options.rationale ?? null,
       response: options.response ?? null,
+      response_witness: options.responseWitness ?? null,
       confidence: options.confidence ?? 0.8
     })
   }
@@ -1352,7 +1470,9 @@ export const useCanvasStore = defineStore('canvas', () => {
     availableModels,
     loading,
     error,
+    errorSessionId,
     streamingModels,
+    feedbackInFlight,
     debateStreamingContent,
     // Getters
     promptTiles,
@@ -1384,6 +1504,7 @@ export const useCanvasStore = defineStore('canvas', () => {
     reset,
     getParentResponseContent,
     branchFromResponse,
+    sendCompanionPrompt,
     thinkHarderFromResponse,
     addModelToTile,
     regenerateResponse,

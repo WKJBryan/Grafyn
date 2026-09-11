@@ -34,6 +34,28 @@ vi.mock('@/api/client', () => ({
   twin: api
 }))
 
+vi.mock('@/api/evidence', () => ({
+  evidence: {
+    snapshot: vi.fn().mockResolvedValue({
+      subject_id: 'bryan-pilot',
+      subject_name: 'Bryan',
+      interview_draft: null,
+      sources: [],
+      goals: [],
+      cases: [],
+      relationships: [],
+      jobs: []
+    }),
+    listPredictions: vi.fn().mockResolvedValue({ records: [], batches: [] }),
+    saveInterview: vi.fn(),
+    saveGoal: vi.fn(),
+    predict: vi.fn(),
+    recordChoice: vi.fn(),
+    reviewRelationship: vi.fn(),
+    installEmbeddings: vi.fn()
+  }
+}))
+
 function mountView() {
   return mount(TwinReviewView, {
     global: {

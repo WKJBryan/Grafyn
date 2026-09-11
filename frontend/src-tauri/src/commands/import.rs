@@ -1,4 +1,3 @@
-use crate::commands::commit_note_writes;
 use crate::models::import::{
     ConversationMetadata, ImportLinkSuggestion, ImportPreview, ImportResult, ParsedConversation,
     ParsedMessage,
@@ -19,8 +18,46 @@ enum ParsedImport {
     Conversations {
         platform: String,
         conversations: Vec<ParsedConversation>,
+        source_content: String,
     },
-    Document(document::DocumentImportBatch),
+    Document {
+        batch: document::DocumentImportBatch,
+        source_content: String,
+    },
+}
+
+struct ImportAuthorityErrorOutcome {
+    notice: String,
+    note_ids: Vec<String>,
+    recovered: bool,
+    target_aborted: bool,
+}
+
+async fn finish_import_authority_error(
+    state: &AppState,
+    error: &anyhow::Error,
+    operation: &str,
+) -> Option<ImportAuthorityErrorOutcome> {
+    let outcome = crate::services::knowledge_store::knowledge_authority_advanced_outcome(error)?;
+    let repair =
+        crate::commands::repair_after_authority_mutation(state, &outcome.commit, "import").await;
+    let recovered =
+        !outcome.target_aborted && matches!(repair, crate::commands::PostAuthorityRepair::Ready(_));
+    let notice = if outcome.target_aborted {
+        format!(
+            "{operation} was not applied after vault authority changed; refresh state before deciding whether to retry."
+        )
+    } else if recovered {
+        format!("{operation} committed and recovered; do not retry.")
+    } else {
+        format!("{operation} committed and recovery is pending; do not retry.")
+    };
+    Some(ImportAuthorityErrorOutcome {
+        notice,
+        note_ids: outcome.note_ids,
+        recovered,
+        target_aborted: outcome.target_aborted,
+    })
 }
 
 /// Preview content in an import file (auto-detects format).
@@ -34,8 +71,9 @@ pub async fn preview_import(
         ParsedImport::Conversations {
             platform,
             conversations,
+            ..
         } => (platform, conversations),
-        ParsedImport::Document(batch) => (
+        ParsedImport::Document { batch, .. } => (
             "document".to_string(),
             batch
                 .items
@@ -63,19 +101,32 @@ pub async fn apply_import(
     conversation_ids: Vec<String>,
     state: State<'_, AppState>,
 ) -> Result<ImportResult, String> {
+    let _root_epoch = crate::commands::acquire_root_epoch(state.inner()).await?;
     match parse_import_file(&file_path).await? {
-        ParsedImport::Conversations { conversations, .. } => {
-            apply_conversation_import(conversations, conversation_ids, state).await
+        ParsedImport::Conversations {
+            conversations,
+            source_content,
+            ..
+        } => {
+            apply_conversation_import(
+                conversations,
+                conversation_ids,
+                source_content,
+                state.clone(),
+            )
+            .await
         }
-        ParsedImport::Document(batch) => {
-            apply_document_import(batch, conversation_ids, state).await
-        }
+        ParsedImport::Document {
+            batch,
+            source_content,
+        } => apply_document_import(batch, conversation_ids, source_content, state.clone()).await,
     }
 }
 
 async fn apply_conversation_import(
     all_conversations: Vec<ParsedConversation>,
     conversation_ids: Vec<String>,
+    source_content: String,
     state: State<'_, AppState>,
 ) -> Result<ImportResult, String> {
     let to_import: Vec<_> = if conversation_ids.is_empty() {
@@ -158,22 +209,45 @@ async fn apply_conversation_import(
         };
 
         // Create the note
-        let created = {
+        let mutation = {
             let mut store = state.knowledge_store.write().await;
-            match store.create_note(note_create) {
-                Ok(note) => note,
-                Err(e) => {
-                    errors.push(format!("Failed to create '{}': {}", conv.title, e));
+            store.import_note_container_with_commit(
+                vec![note_create],
+                &conv.id,
+                source_content.as_bytes(),
+            )
+        };
+        let (created, commit) = match mutation {
+            Ok((mut notes, commit)) => (notes.remove(0), commit),
+            Err(error) => {
+                if let Some(outcome) = finish_import_authority_error(
+                    state.inner(),
+                    &error,
+                    &format!("Import '{}'", conv.title),
+                )
+                .await
+                {
+                    if outcome.recovered {
+                        note_ids.extend(outcome.note_ids);
+                    } else if outcome.target_aborted {
+                        skipped += 1;
+                    }
+                    errors.push(outcome.notice);
+                } else {
+                    errors.push(format!("Failed to create '{}': {}", conv.title, error));
                     skipped += 1;
-                    continue;
                 }
+                continue;
             }
         };
 
         note_ids.push(created.id.clone());
+        if let crate::commands::PostAuthorityRepair::Unavailable(warning) =
+            crate::commands::repair_after_authority_mutation(state.inner(), &commit, "import").await
+        {
+            errors.push(warning.to_string());
+        }
     }
-
-    commit_note_writes(state.inner(), &note_ids, "import").await?;
 
     let imported = note_ids.len();
     let message = format!(
@@ -196,6 +270,7 @@ async fn apply_conversation_import(
 async fn apply_document_import(
     batch: document::DocumentImportBatch,
     selected_ids: Vec<String>,
+    source_content: String,
     state: State<'_, AppState>,
 ) -> Result<ImportResult, String> {
     let to_import = if selected_ids.is_empty() {
@@ -210,9 +285,10 @@ async fn apply_document_import(
 
     let mut note_ids = Vec::new();
     let mut errors = Vec::new();
-    let mut skipped = 0;
+    let skipped = 0;
     let mut imported_section_titles = Vec::new();
     let mut section_inputs = Vec::new();
+    let mut creates = Vec::with_capacity(to_import.len());
 
     for item in &to_import {
         let mut properties = item.metadata.clone();
@@ -231,27 +307,73 @@ async fn apply_document_import(
             properties,
         };
 
-        let created = {
-            let mut store = state.knowledge_store.write().await;
-            match store.create_note(note_create) {
-                Ok(note) => note,
-                Err(e) => {
-                    errors.push(format!("Failed to create '{}': {}", item.title, e));
-                    skipped += 1;
-                    continue;
-                }
-            }
-        };
-
         if item.content_kind == "document_section" {
             imported_section_titles.push(item.title.clone());
             section_inputs.push((item.title.clone(), item.content.clone()));
         }
 
-        note_ids.push(created.id.clone());
+        creates.push(note_create);
     }
 
-    commit_note_writes(state.inner(), &note_ids, "import").await?;
+    if !creates.is_empty() {
+        let requested_count = creates.len();
+        let mutation = {
+            let mut store = state.knowledge_store.write().await;
+            store.import_note_container_with_commit(
+                creates,
+                &batch.source_title,
+                source_content.as_bytes(),
+            )
+        };
+        let (created, commit) = match mutation {
+            Ok(result) => result,
+            Err(error) => {
+                if let Some(outcome) = finish_import_authority_error(
+                    state.inner(),
+                    &error,
+                    &format!("Import '{}'", batch.source_title),
+                )
+                .await
+                {
+                    let imported = if outcome.recovered {
+                        note_ids.extend(outcome.note_ids);
+                        note_ids.len()
+                    } else {
+                        0
+                    };
+                    errors.push(outcome.notice);
+                    return Ok(ImportResult {
+                        imported,
+                        skipped: if outcome.target_aborted {
+                            requested_count
+                        } else {
+                            0
+                        },
+                        note_ids,
+                        errors,
+                        semantic_link_suggestions: Vec::new(),
+                        semantic_link_error: None,
+                        message: if outcome.recovered {
+                            "The document import committed and recovered; do not retry.".to_string()
+                        } else if outcome.target_aborted {
+                            "The document import was not applied after vault authority changed."
+                                .to_string()
+                        } else {
+                            "The document import committed and is being recovered; do not retry."
+                                .to_string()
+                        },
+                    });
+                }
+                return Err(format!("Failed to import document: {error}"));
+            }
+        };
+        note_ids.extend(created.into_iter().map(|note| note.id));
+        if let crate::commands::PostAuthorityRepair::Unavailable(warning) =
+            crate::commands::repair_after_authority_mutation(state.inner(), &commit, "import").await
+        {
+            errors.push(warning.to_string());
+        }
+    }
 
     let (semantic_link_suggestions, semantic_link_error) =
         suggest_import_links_if_available(state.inner(), section_inputs).await;
@@ -337,6 +459,7 @@ async fn parse_import_file(file_path: &str) -> Result<ParsedImport, String> {
         return Ok(ParsedImport::Conversations {
             platform: platform.to_string(),
             conversations,
+            source_content: content,
         });
     }
 
@@ -356,7 +479,10 @@ async fn parse_import_file(file_path: &str) -> Result<ParsedImport, String> {
         document::parse_document_text(file_name, extension, &content)
     }
     .map_err(|e| format!("Could not import content: {}", e))?;
-    Ok(ParsedImport::Document(batch))
+    Ok(ParsedImport::Document {
+        batch,
+        source_content: content,
+    })
 }
 
 async fn read_import_content(file_path: &str) -> Result<String, String> {
@@ -471,7 +597,7 @@ fn extract_docx_text(bytes: &[u8]) -> Result<String, String> {
             },
             Ok(Event::Text(event)) if in_text_run => {
                 let decoded = event
-                    .xml_content()
+                    .xml10_content()
                     .map_err(|e| format!("Failed to decode DOCX text: {}", e))?;
                 text.push_str(&decoded);
             }
@@ -501,9 +627,74 @@ fn extract_docx_text(bytes: &[u8]) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lopdf::content::{Content, Operation};
+    use lopdf::dictionary;
+    use lopdf::{Bookmark, Document, Object, Stream};
     use std::fs::File;
     use std::io::Write;
     use zip::write::FileOptions;
+
+    fn write_valid_pdf(path: &Path, text: &str, outline_title: Option<&str>) {
+        let mut document = Document::with_version("1.5");
+        let pages_id = document.new_object_id();
+        let font_id = document.add_object(lopdf::dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type1",
+            "BaseFont" => "Courier",
+        });
+        let resources_id = document.add_object(lopdf::dictionary! {
+            "Font" => lopdf::dictionary! { "F1" => font_id },
+        });
+        let content = Content {
+            operations: vec![
+                Operation::new("BT", vec![]),
+                Operation::new("Tf", vec!["F1".into(), 12.into()]),
+                Operation::new("Td", vec![72.into(), 720.into()]),
+                Operation::new("Tj", vec![Object::string_literal(text)]),
+                Operation::new("ET", vec![]),
+            ],
+        };
+        let content_id = document.add_object(Stream::new(
+            lopdf::dictionary! {},
+            content.encode().expect("encode PDF content"),
+        ));
+        let page_id = document.add_object(lopdf::dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "Contents" => content_id,
+        });
+        document.objects.insert(
+            pages_id,
+            Object::Dictionary(lopdf::dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![page_id.into()],
+                "Count" => 1,
+                "Resources" => resources_id,
+                "MediaBox" => vec![0.into(), 0.into(), 595.into(), 842.into()],
+            }),
+        );
+        let catalog_id = document.add_object(lopdf::dictionary! {
+            "Type" => "Catalog",
+            "Pages" => pages_id,
+        });
+        document.trailer.set("Root", catalog_id);
+
+        if let Some(title) = outline_title {
+            document.add_bookmark(
+                Bookmark::new(title.to_string(), [0.0, 0.0, 0.0], 0, page_id),
+                None,
+            );
+            if let Some(outline_id) = document.build_outline() {
+                let catalog = document
+                    .get_object_mut(catalog_id)
+                    .and_then(Object::as_dict_mut)
+                    .expect("PDF catalog");
+                catalog.set("Outlines", Object::Reference(outline_id));
+            }
+        }
+
+        document.save(path).expect("save PDF fixture");
+    }
 
     #[tokio::test]
     async fn read_import_content_extracts_docx_transcript_text() {
@@ -526,5 +717,77 @@ mod tests {
         assert!(content.contains("Interviewer: How do you decide what to trust?"));
         assert!(content.contains("Expert: I need a real demo first."));
         assert_eq!(import::detect_platform(&content), Some("interview"));
+    }
+
+    #[tokio::test]
+    async fn read_import_content_extracts_valid_pdf_text() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("evidence.pdf");
+        write_valid_pdf(&path, "Evidence before conclusions.", None);
+
+        let content = read_import_content(path.to_string_lossy().as_ref())
+            .await
+            .expect("PDF content");
+
+        assert_eq!(content, "Evidence before conclusions.");
+    }
+
+    #[tokio::test]
+    async fn extract_pdf_outline_titles_reads_valid_pdf_bookmark() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("outlined.pdf");
+        write_valid_pdf(&path, "Outlined evidence.", Some("Import Overview"));
+
+        let titles = extract_pdf_outline_titles(path.to_string_lossy().as_ref()).await;
+
+        assert_eq!(titles, vec!["Import Overview"]);
+    }
+
+    #[tokio::test]
+    async fn authority_advanced_import_is_repaired_and_never_reported_as_failed() {
+        let (mut state, vault, _data) =
+            crate::commands::commit_note_write_tests::build_test_state();
+        let coordinator = state.mutation_coordinator.as_ref().unwrap().clone();
+        state.knowledge_store = std::sync::Arc::new(tokio::sync::RwLock::new(
+            crate::services::knowledge_store::KnowledgeStore::with_event_recorder(
+                vault.path().to_path_buf(),
+                coordinator.current_namespace_path().unwrap(),
+                coordinator.clone(),
+            ),
+        ));
+        coordinator.fail_next_replays_before_targets(2);
+        let error = {
+            let mut store = state.knowledge_store.write().await;
+            store
+                .import_note_container_with_commit(
+                    vec![NoteCreate {
+                        title: "Recovered import".into(),
+                        content: "one durable import".into(),
+                        relative_path: Some("recovered-import.md".into()),
+                        aliases: Vec::new(),
+                        status: NoteStatus::Evidence,
+                        tags: Vec::new(),
+                        schema_version: crate::models::note::CURRENT_NOTE_SCHEMA_VERSION,
+                        migration_source: Some("import".into()),
+                        optimizer_managed: false,
+                        properties: Default::default(),
+                    }],
+                    "recovered-container",
+                    b"source",
+                )
+                .expect_err("the first call must expose authority-advanced recovery")
+        };
+
+        let outcome = finish_import_authority_error(&state, &error, "Import 'recovered-container'")
+            .await
+            .expect("authority-advanced import must have a non-retryable outcome");
+        assert!(outcome
+            .notice
+            .contains("committed and recovered; do not retry"));
+        assert!(!outcome.notice.contains("Failed"));
+        assert_eq!(outcome.note_ids, vec!["recovered-import"]);
+        assert!(outcome.recovered);
+        assert_eq!(coordinator.pending_count().unwrap(), 0);
+        assert!(vault.path().join("recovered-import.md").exists());
     }
 }

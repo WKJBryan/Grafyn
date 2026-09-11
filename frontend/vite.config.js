@@ -1,9 +1,11 @@
 import { defineConfig } from 'vite'
 import vue from '@vitejs/plugin-vue'
+import { createRequire } from 'node:module'
 import { fileURLToPath, URL } from 'node:url'
-import { readFileSync } from 'node:fs'
+import { resolve } from 'node:path'
 
-const pkg = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf-8'))
+const require = createRequire(import.meta.url)
+const pkg = require('./package.json')
 
 // https://vitejs.dev/config/
 export default defineConfig({
@@ -27,14 +29,17 @@ export default defineConfig({
   envPrefix: ['VITE_', 'TAURI_'],
   build: {
     // Tauri uses Chromium on Windows and WebKit on macOS/Linux
-    target: process.env.TAURI_PLATFORM === 'windows' ? 'chrome105' : 'safari13',
+    target: process.env.TAURI_ENV_PLATFORM === 'windows' ? 'chrome105' : 'safari13',
     // Don't minify for debug builds. vite 8 bundles with Rolldown and keeps
     // esbuild out of the default tree, so use the built-in (oxc) minifier
     // rather than 'esbuild' (which would pull a still-flagged esbuild back in).
-    minify: !process.env.TAURI_DEBUG,
+    minify: !process.env.TAURI_ENV_DEBUG,
     // Produce sourcemaps for debug builds
-    sourcemap: !!process.env.TAURI_DEBUG,
+    sourcemap: !!process.env.TAURI_ENV_DEBUG,
     rollupOptions: {
+      input: {
+        main: resolve(__dirname, 'index.html'),
+      },
       output: {
         // vite 8 bundles with Rolldown, which only accepts the function form of
         // manualChunks (the object map form is Rollup-only and throws).

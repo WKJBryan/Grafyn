@@ -1,0 +1,114 @@
+{
+  "version": "contextual-relationships-synthetic-v1",
+  "authorship": "Developer-authored synthetic labels, not user-adjudicated study data or personal accuracy evidence.",
+  "pairs": [
+    {
+      "id": "equivalent_delivery",
+      "category": "concrete paraphrase",
+      "left": "For the parcel pilot, delivery succeeds when every package reaches its recipient within two days of dispatch.",
+      "right": "The parcel pilot counts delivery as successful only if all recipients receive their packages no later than 48 hours after dispatch.",
+      "expected_verdict": "equivalent",
+      "expected_direction": "symmetric",
+      "label_reason": "Same population, success condition and time anchor expressed differently."
+    },
+    {
+      "id": "equivalent_release",
+      "category": "decision procedure paraphrase",
+      "left": "I postpone the accounting release whenever a failing test could let customers lose saved invoices.",
+      "right": "If a test failure puts stored customer invoices at risk, my rule is to delay shipping the accounting update.",
+      "expected_verdict": "equivalent",
+      "expected_direction": "symmetric",
+      "label_reason": "Both statements apply the same release rule under the same condition."
+    },
+    {
+      "id": "different_metrics",
+      "category": "same topic different counting rule",
+      "left": "Campaign Alpha aims for 10000 advertisement views this month; repeated views by the same person count separately.",
+      "right": "Campaign Beta aims for 10000 unique paying customers this month; repeated purchases by one person count once.",
+      "expected_verdict": "related",
+      "expected_direction": "symmetric",
+      "label_reason": "Both are campaign targets, but views and unique paying customers are different metrics in separate campaigns."
+    },
+    {
+      "id": "different_beneficiaries",
+      "category": "same topic different beneficiaries",
+      "left": "The north-campus workshop aims to train 200 school teachers in spreadsheet skills by December.",
+      "right": "The south-campus workshop aims to train 200 hospital nurses in spreadsheet skills by December.",
+      "expected_verdict": "related",
+      "expected_direction": "symmetric",
+      "label_reason": "Training topic and count match, but the beneficiaries and workshop scopes differ."
+    },
+    {
+      "id": "different_deadlines",
+      "category": "same topic different deadlines",
+      "left": "The coastal nursery project targets planting 500 seedlings by 30 June 2027.",
+      "right": "The inland nursery project targets planting 500 seedlings by 31 December 2027.",
+      "expected_verdict": "related",
+      "expected_direction": "symmetric",
+      "label_reason": "Related planting goals with different scopes and deadlines do not contradict each other."
+    },
+    {
+      "id": "generic_vocabulary",
+      "category": "generic vocabulary false positive",
+      "left": "The network team will switch the production server to a new routing table during maintenance.",
+      "right": "The dining room team will switch the wooden table to the corner before dinner service.",
+      "expected_verdict": "unrelated",
+      "expected_direction": "symmetric",
+      "label_reason": "Shared words such as switch, table and service refer to unrelated activities."
+    },
+    {
+      "id": "finite_budget_conflict",
+      "category": "contextual resource conflict",
+      "left": "This Saturday's entire event budget is 100 dollars with no borrowing. The indoor plan spends 70 dollars from that budget.",
+      "right": "For the same Saturday event and the same fixed 100-dollar budget, the outdoor plan spends 60 dollars. Running both plans requires paying both full costs.",
+      "expected_verdict": "conflicts",
+      "expected_direction": "symmetric",
+      "label_reason": "Executing both plans would exceed the explicit shared budget; neither plan alone exceeds it."
+    },
+    {
+      "id": "badge_enables_entry",
+      "category": "explicit enabling mechanism",
+      "left": "Issuing an active warehouse access badge to a worker unlocks that worker's gate access.",
+      "right": "The worker's intended next step is entering the warehouse through its badge-controlled gate.",
+      "expected_verdict": "enables",
+      "expected_direction": "left_to_right",
+      "label_reason": "Issuing the badge enables the stated entry action through the described gate mechanism."
+    },
+    {
+      "id": "installation_enables_reports",
+      "category": "reverse enabling direction",
+      "left": "The operations team's goal is to run the new inventory reports on workstation C.",
+      "right": "Installing the licensed reporting application on workstation C makes running those inventory reports possible.",
+      "expected_verdict": "enables",
+      "expected_direction": "right_to_left",
+      "label_reason": "The installation in the right passage enables the report-running goal in the left passage."
+    },
+    {
+      "id": "closure_inhibits_loading",
+      "category": "explicit inhibiting mechanism",
+      "left": "Closing the only loading dock for resurfacing blocks all truck loading there until the work finishes.",
+      "right": "The dispatch team plans to load trucks at that dock while the resurfacing work is underway.",
+      "expected_verdict": "inhibits",
+      "expected_direction": "left_to_right",
+      "label_reason": "The closure explicitly obstructs loading at the same place during the same time."
+    },
+    {
+      "id": "reopening_requires_signoff",
+      "category": "reverse prerequisite direction",
+      "left": "The safety sign-off is the inspector's clearance after checking this bridge.",
+      "right": "Reopening this bridge to traffic is permitted only after that safety sign-off; clearance is mandatory.",
+      "expected_verdict": "requires",
+      "expected_direction": "right_to_left",
+      "label_reason": "Reopening on the right requires the sign-off defined on the left, rather than the reverse."
+    },
+    {
+      "id": "unknown_mechanism",
+      "category": "insufficient contextual evidence",
+      "left": "The project log says that it changed after they adjusted that thing, without identifying the thing or the change.",
+      "right": "A second project note says that the result may matter to the plan, but does not identify the result, plan or mechanism.",
+      "expected_verdict": "insufficient",
+      "expected_direction": "symmetric",
+      "label_reason": "Unresolved referents prevent a grounded determination of the pair's relationship."
+    }
+  ]
+}

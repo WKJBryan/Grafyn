@@ -1,3 +1,4 @@
+use crate::models::twin_event::ContentDigest;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -38,7 +39,8 @@ impl VaultOptimizerEditMode {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
 pub struct MarkdownMigrationRequest {
     #[serde(default)]
     pub mode: MarkdownMigrationMode,
@@ -55,6 +57,7 @@ pub struct MarkdownMigrationRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct MarkdownMigrationPreviewSummary {
     pub total_scanned_notes: usize,
     pub files_without_frontmatter: usize,
@@ -72,6 +75,7 @@ pub struct MarkdownMigrationPreviewSummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct MarkdownMigrationTopicCandidate {
     pub topic_key: String,
     pub display_name: String,
@@ -84,6 +88,7 @@ pub struct MarkdownMigrationTopicCandidate {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct MarkdownMigrationNoteProposal {
     pub note_id: String,
     pub title: String,
@@ -102,8 +107,21 @@ pub struct MarkdownMigrationNoteProposal {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct MarkdownMigrationPreview {
+    #[serde(default)]
+    pub schema_version: u16,
     pub preview_id: String,
+    /// Required for current previews. `None` is reserved for audit-only legacy files.
+    #[serde(default)]
+    pub root_scope: Option<ContentDigest>,
+    /// Exact content authority captured for this preview. Missing means the
+    /// persisted preview predates strict authority snapshots and is audit-only.
+    #[serde(default)]
+    pub authority: Option<MigrationAuthoritySnapshotV1>,
+    /// Canonical request used to derive this preview. Missing means audit-only.
+    #[serde(default)]
+    pub request: Option<MarkdownMigrationRequest>,
     pub vault_path: String,
     #[serde(default)]
     pub created_at: Option<DateTime<Utc>>,
@@ -113,14 +131,72 @@ pub struct MarkdownMigrationPreview {
     pub hub_folder: String,
     #[serde(default)]
     pub program_path: String,
+    /// Program-file state observed by the preview. Missing means audit-only legacy data.
+    #[serde(default)]
+    pub expected_program_target: Option<ExpectedProgramTarget>,
+    /// Digest of the canonical program contents this preview would create.
+    #[serde(default)]
+    pub program_after_digest: Option<ContentDigest>,
     #[serde(default)]
     pub summary: MarkdownMigrationPreviewSummary,
     #[serde(default)]
     pub topic_candidates: Vec<MarkdownMigrationTopicCandidate>,
     #[serde(default)]
     pub note_proposals: Vec<MarkdownMigrationNoteProposal>,
+    /// Complete sorted Markdown inventory plus the exact overlay state that
+    /// influenced each parsed note. Missing/empty legacy inventories are
+    /// audit-only and cannot be applied.
+    #[serde(default)]
+    pub source_inventory: Vec<MarkdownMigrationSourceV1>,
+    /// Complete sorted overlay directory inventory, including orphan overlays.
+    #[serde(default)]
+    pub overlay_inventory: Vec<MarkdownMigrationOverlaySourceV1>,
     #[serde(default)]
     pub ambiguous_titles: HashMap<String, Vec<String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MigrationAuthoritySnapshotV1 {
+    pub root_scope: ContentDigest,
+    pub lease_epoch_uuid: String,
+    pub authority_generation: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MarkdownMigrationSourceV1 {
+    pub relative_path: String,
+    pub markdown_digest: ContentDigest,
+    pub byte_len: u64,
+    #[serde(default)]
+    pub note_id: Option<String>,
+    pub overlay: MigrationSourceStateV1,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum MigrationSourceStateV1 {
+    Absent,
+    Present {
+        digest: ContentDigest,
+        byte_len: u64,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MarkdownMigrationOverlaySourceV1 {
+    pub relative_path: String,
+    pub digest: ContentDigest,
+    pub byte_len: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ExpectedProgramTarget {
+    Absent,
+    Present { digest: ContentDigest },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -140,6 +216,23 @@ pub struct MarkdownMigrationApplyResult {
     pub skipped_fallback_note_ids: Vec<String>,
     #[serde(default)]
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning: Option<crate::models::mutation::CommittedMutationWarningV1>,
+    #[serde(skip)]
+    pub(crate) accepted_request: Option<MarkdownMigrationRequest>,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct MarkdownMigrationRollbackResult {
+    pub run_id: String,
+    #[serde(default)]
+    pub rolled_back: bool,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning: Option<crate::models::mutation::CommittedMutationWarningV1>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -173,7 +266,8 @@ pub struct VaultOptimizerSettingsUpdate {
     pub vault_optimizer_program_path: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct VaultOptimizerDecision {
     pub id: String,
     #[serde(default)]
@@ -192,7 +286,8 @@ pub struct VaultOptimizerDecision {
     pub change_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct VaultOptimizerInboxEntry {
     pub id: String,
     #[serde(default)]
@@ -238,4 +333,6 @@ pub struct VaultOptimizerRollbackResult {
     pub rolled_back: bool,
     #[serde(default)]
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning: Option<crate::models::mutation::CommittedMutationWarningV1>,
 }

@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct CanvasModelPreset {
     pub id: String,
     pub name: String,
@@ -15,7 +16,8 @@ fn default_canvas_model_presets() -> Vec<CanvasModelPreset> {
 }
 
 /// User-configurable settings for the desktop app
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UserSettings {
     /// Path to the vault (markdown notes folder)
     /// If None, uses default ~/Documents/Grafyn/vault
@@ -97,6 +99,62 @@ pub struct UserSettings {
     /// Saved model presets for canvas prompts
     #[serde(default = "default_canvas_model_presets")]
     pub canvas_model_presets: Vec<CanvasModelPreset>,
+}
+
+impl std::fmt::Debug for UserSettings {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let openrouter_api_key = self.openrouter_api_key.as_ref().map(|_| "[REDACTED]");
+        formatter
+            .debug_struct("UserSettings")
+            .field("vault_path", &self.vault_path)
+            .field("openrouter_api_key", &openrouter_api_key)
+            .field("setup_completed", &self.setup_completed)
+            .field("theme", &self.theme)
+            .field("mcp_enabled", &self.mcp_enabled)
+            .field("llm_model", &self.llm_model)
+            .field("twin_llm_provider", &self.twin_llm_provider)
+            .field("ollama_base_url", &self.ollama_base_url)
+            .field("ollama_model", &self.ollama_model)
+            .field("smart_web_search", &self.smart_web_search)
+            .field(
+                "background_link_discovery_enabled",
+                &self.background_link_discovery_enabled,
+            )
+            .field(
+                "background_link_discovery_llm_enabled",
+                &self.background_link_discovery_llm_enabled,
+            )
+            .field(
+                "background_vault_optimizer_enabled",
+                &self.background_vault_optimizer_enabled,
+            )
+            .field(
+                "background_vault_optimizer_llm_enabled",
+                &self.background_vault_optimizer_llm_enabled,
+            )
+            .field(
+                "background_vault_optimizer_budget_monthly",
+                &self.background_vault_optimizer_budget_monthly,
+            )
+            .field(
+                "background_vault_optimizer_max_daily_writes",
+                &self.background_vault_optimizer_max_daily_writes,
+            )
+            .field(
+                "background_vault_optimizer_edit_mode",
+                &self.background_vault_optimizer_edit_mode,
+            )
+            .field(
+                "background_vault_optimizer_program_enabled",
+                &self.background_vault_optimizer_program_enabled,
+            )
+            .field(
+                "vault_optimizer_program_path",
+                &self.vault_optimizer_program_path,
+            )
+            .field("canvas_model_presets", &self.canvas_model_presets)
+            .finish()
+    }
 }
 
 fn default_theme() -> String {
@@ -194,27 +252,45 @@ impl UserSettings {
     /// Get the effective vault path (with default fallback)
     pub fn effective_vault_path(&self) -> std::path::PathBuf {
         if let Some(ref path) = self.vault_path {
-            std::path::PathBuf::from(path)
-        } else {
-            // Default to ~/Documents/Grafyn/vault
-            dirs::document_dir()
+            return std::path::PathBuf::from(path);
+        }
+
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        {
+            // Default to ~/Documents/Grafyn/vault on desktop hosts.
+            return dirs::document_dir()
                 .unwrap_or_else(|| std::path::PathBuf::from("."))
                 .join("Grafyn")
-                .join("vault")
+                .join("vault");
+        }
+
+        #[cfg(any(target_os = "android", target_os = "ios"))]
+        {
+            panic!("mobile runtime must inject its app-private vault path")
         }
     }
 
     /// Get the effective data path (always in app data directory)
     pub fn effective_data_path(&self) -> std::path::PathBuf {
-        dirs::data_local_dir()
-            .unwrap_or_else(|| {
-                dirs::document_dir().unwrap_or_else(|| std::path::PathBuf::from("."))
-            })
-            .join("Grafyn")
-            .join("data")
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        {
+            return dirs::data_local_dir()
+                .unwrap_or_else(|| {
+                    dirs::document_dir().unwrap_or_else(|| std::path::PathBuf::from("."))
+                })
+                .join("Grafyn")
+                .join("data");
+        }
+
+        #[cfg(any(target_os = "android", target_os = "ios"))]
+        {
+            panic!("mobile runtime data paths must come from RuntimeBootstrap")
+        }
     }
 
-    pub fn effective_twin_data_path(&self) -> std::path::PathBuf {
+    pub fn effective_twin_data_path(
+        &self,
+    ) -> Result<std::path::PathBuf, crate::services::twin_events::MutationError> {
         twin_data_path_for_vault(&self.effective_data_path(), &self.effective_vault_path())
     }
 }
@@ -222,21 +298,37 @@ impl UserSettings {
 pub fn twin_data_path_for_vault(
     data_path: &std::path::Path,
     vault_path: &std::path::Path,
+) -> Result<std::path::PathBuf, crate::services::twin_events::MutationError> {
+    let identity = crate::services::sync::identity::load_or_create_vault_identity(vault_path)?;
+    Ok(twin_data_path_for_scope(data_path, &identity.root_scope))
+}
+
+pub(crate) fn twin_data_path_for_scope(
+    data_path: &std::path::Path,
+    scope: &crate::models::twin_event::ContentDigest,
+) -> std::path::PathBuf {
+    data_path.join("twin").join(scope.as_str())
+}
+
+pub(crate) fn legacy_twin_data_path_for_vault(
+    data_path: &std::path::Path,
+    vault_path: &std::path::Path,
 ) -> std::path::PathBuf {
     let normalized = vault_path
         .to_string_lossy()
         .replace('\\', "/")
         .to_ascii_lowercase();
+    let normalized = normalized.strip_prefix("//?/").unwrap_or(&normalized);
     let mut hash = 0xcbf29ce484222325_u64;
     for byte in normalized.as_bytes() {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x100000001b3);
     }
-    data_path.join("twin").join(format!("{:016x}", hash))
+    data_path.join("twin").join(format!("{hash:016x}"))
 }
 
 /// Settings update request from frontend
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct SettingsUpdate {
     pub vault_path: Option<String>,
     pub openrouter_api_key: Option<String>,
@@ -258,6 +350,62 @@ pub struct SettingsUpdate {
     pub background_vault_optimizer_program_enabled: Option<bool>,
     pub vault_optimizer_program_path: Option<String>,
     pub canvas_model_presets: Option<Vec<CanvasModelPreset>>,
+}
+
+impl std::fmt::Debug for SettingsUpdate {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let openrouter_api_key = self.openrouter_api_key.as_ref().map(|_| "[REDACTED]");
+        formatter
+            .debug_struct("SettingsUpdate")
+            .field("vault_path", &self.vault_path)
+            .field("openrouter_api_key", &openrouter_api_key)
+            .field("setup_completed", &self.setup_completed)
+            .field("theme", &self.theme)
+            .field("mcp_enabled", &self.mcp_enabled)
+            .field("llm_model", &self.llm_model)
+            .field("twin_llm_provider", &self.twin_llm_provider)
+            .field("ollama_base_url", &self.ollama_base_url)
+            .field("ollama_model", &self.ollama_model)
+            .field("smart_web_search", &self.smart_web_search)
+            .field(
+                "background_link_discovery_enabled",
+                &self.background_link_discovery_enabled,
+            )
+            .field(
+                "background_link_discovery_llm_enabled",
+                &self.background_link_discovery_llm_enabled,
+            )
+            .field(
+                "background_vault_optimizer_enabled",
+                &self.background_vault_optimizer_enabled,
+            )
+            .field(
+                "background_vault_optimizer_llm_enabled",
+                &self.background_vault_optimizer_llm_enabled,
+            )
+            .field(
+                "background_vault_optimizer_budget_monthly",
+                &self.background_vault_optimizer_budget_monthly,
+            )
+            .field(
+                "background_vault_optimizer_max_daily_writes",
+                &self.background_vault_optimizer_max_daily_writes,
+            )
+            .field(
+                "background_vault_optimizer_edit_mode",
+                &self.background_vault_optimizer_edit_mode,
+            )
+            .field(
+                "background_vault_optimizer_program_enabled",
+                &self.background_vault_optimizer_program_enabled,
+            )
+            .field(
+                "vault_optimizer_program_path",
+                &self.vault_optimizer_program_path,
+            )
+            .field("canvas_model_presets", &self.canvas_model_presets)
+            .finish()
+    }
 }
 
 /// Response for settings status check
@@ -369,17 +517,86 @@ mod tests {
 
     #[test]
     fn twin_data_path_is_scoped_by_vault_path() {
-        let data_path = std::path::PathBuf::from("C:/Users/bryan/AppData/Local/Grafyn/data");
-        let first = twin_data_path_for_vault(&data_path, std::path::Path::new("C:/Vault/A"));
-        let same_case_changed =
-            twin_data_path_for_vault(&data_path, std::path::Path::new("c:/vault/a"));
-        let second = twin_data_path_for_vault(&data_path, std::path::Path::new("C:/Vault/B"));
+        let temp = tempfile::tempdir().unwrap();
+        let data_path = temp.path().join("data");
+        let first_vault = temp.path().join("VaultA");
+        let second_vault = temp.path().join("VaultB");
+        std::fs::create_dir(&data_path).unwrap();
+        std::fs::create_dir(&first_vault).unwrap();
+        std::fs::create_dir(&second_vault).unwrap();
+        let first = twin_data_path_for_vault(&data_path, &first_vault).unwrap();
+        let second = twin_data_path_for_vault(&data_path, &second_vault).unwrap();
 
-        assert_eq!(first, same_case_changed);
         assert_ne!(first, second);
         assert_eq!(
             first.parent().map(std::path::Path::to_path_buf),
             Some(data_path.join("twin"))
         );
+        assert_eq!(
+            first
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap()
+                .len(),
+            64
+        );
+    }
+
+    #[test]
+    fn twin_data_path_follows_the_descriptor_across_a_directory_move() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_path = temp.path().join("data");
+        let original = temp.path().join("original");
+        let moved = temp.path().join("moved");
+        std::fs::create_dir(&data_path).unwrap();
+        std::fs::create_dir(&original).unwrap();
+        let before = twin_data_path_for_vault(&data_path, &original).unwrap();
+
+        std::fs::rename(&original, &moved).unwrap();
+        let after = twin_data_path_for_vault(&data_path, &moved).unwrap();
+
+        assert_eq!(after, before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_case_distinct_vaults_have_distinct_twin_namespaces() {
+        let temp = tempfile::tempdir().unwrap();
+        let upper = temp.path().join("A");
+        let lower = temp.path().join("a");
+        std::fs::create_dir(&upper).unwrap();
+        std::fs::create_dir(&lower).unwrap();
+        assert_ne!(
+            twin_data_path_for_vault(temp.path(), &upper).unwrap(),
+            twin_data_path_for_vault(temp.path(), &lower).unwrap()
+        );
+    }
+
+    #[test]
+    fn user_settings_debug_redacts_openrouter_plaintext() {
+        let secret = "settings-debug-super-secret";
+        let settings = UserSettings {
+            openrouter_api_key: Some(secret.to_string()),
+            ..UserSettings::default()
+        };
+
+        let debug = format!("{settings:?}");
+
+        assert!(!debug.contains(secret));
+        assert!(debug.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn settings_update_debug_redacts_openrouter_plaintext() {
+        let secret = "settings-update-debug-super-secret";
+        let update: SettingsUpdate = serde_json::from_value(serde_json::json!({
+            "openrouter_api_key": secret,
+        }))
+        .unwrap();
+
+        let debug = format!("{update:?}");
+
+        assert!(!debug.contains(secret));
+        assert!(debug.contains("[REDACTED]"));
     }
 }

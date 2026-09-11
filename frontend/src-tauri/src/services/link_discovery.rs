@@ -9,6 +9,7 @@ use crate::services::atomic_io::write_atomic;
 use crate::services::retrieval::RetrievalResult;
 use crate::services::similarity::{sparse_cosine, SimilarityProvider, TfIdfProvider};
 use crate::services::yake::{self, YakeConfig, STOPWORDS};
+use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use lazy_static::lazy_static;
 use regex::Regex;
@@ -27,6 +28,7 @@ use crate::AppState;
 const MAX_LOCAL_CANDIDATES: usize = 40;
 const DEFAULT_CHUNK_LIMIT: usize = 60;
 const PROFILE_VECTOR_TEXT_LIMIT: usize = 1600;
+const LINK_STATE_SCHEMA_VERSION: u16 = 1;
 
 lazy_static! {
     static ref PROPER_NOUN_RE: Regex = Regex::new(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+\b").unwrap();
@@ -96,13 +98,20 @@ struct StoredDiscoveryNote {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct PersistedQueueState {
+    #[serde(default)]
+    schema_version: u16,
+    #[serde(default)]
+    state_revision: u64,
     #[serde(default)]
     queue: Vec<QueuedNote>,
     #[serde(default)]
     sweep_cursor: usize,
     #[serde(default)]
     last_run_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    current_note_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -190,14 +199,27 @@ pub struct LinkDiscoveryService {
     sweep_cursor: usize,
     last_run_at: Option<DateTime<Utc>>,
     current_note_id: Option<String>,
+    state_revision: u64,
 }
 
 impl LinkDiscoveryService {
     pub fn new(data_path: PathBuf) -> Self {
+        Self::try_new(data_path).unwrap_or_else(|error| {
+            log::error!("Failed to initialize link discovery state: {error}");
+            Self::empty()
+        })
+    }
+
+    pub(crate) fn try_new(data_path: PathBuf) -> Result<Self> {
         let base_dir = data_path.join("link_discovery");
         let notes_dir = base_dir.join("notes");
         let queue_path = base_dir.join("queue.json");
-        let _ = std::fs::create_dir_all(&notes_dir);
+        std::fs::create_dir_all(&notes_dir).with_context(|| {
+            format!(
+                "Failed to create link discovery directory {}",
+                notes_dir.display()
+            )
+        })?;
 
         let mut service = Self {
             notes_dir,
@@ -208,12 +230,52 @@ impl LinkDiscoveryService {
             sweep_cursor: 0,
             last_run_at: None,
             current_note_id: None,
+            state_revision: 0,
         };
-        service.load_from_disk();
-        service
+        service.load_from_disk_checked()?;
+        Ok(service)
+    }
+
+    fn empty() -> Self {
+        Self {
+            notes_dir: PathBuf::new(),
+            queue_path: PathBuf::new(),
+            profiles: HashMap::new(),
+            stored_notes: HashMap::new(),
+            queue: Vec::new(),
+            sweep_cursor: 0,
+            last_run_at: None,
+            current_note_id: None,
+            state_revision: 0,
+        }
+    }
+
+    pub(crate) fn uses_data_path(&self, data_path: &std::path::Path) -> bool {
+        self.notes_dir == data_path.join("link_discovery").join("notes")
+    }
+
+    pub(crate) fn reload_from_disk_checked(&mut self) -> Result<()> {
+        self.profiles.clear();
+        self.stored_notes.clear();
+        self.queue.clear();
+        self.sweep_cursor = 0;
+        self.last_run_at = None;
+        self.current_note_id = None;
+        self.state_revision = 0;
+        self.load_from_disk_checked()
+    }
+
+    pub(crate) fn state_revision(&self) -> u64 {
+        self.state_revision
     }
 
     pub fn bootstrap(&mut self, notes: &[Note]) {
+        if let Err(error) = self.bootstrap_checked(notes) {
+            log::error!("Failed to persist link discovery bootstrap: {error}");
+        }
+    }
+
+    pub(crate) fn bootstrap_checked(&mut self, notes: &[Note]) -> Result<()> {
         let actual_ids: HashSet<String> = notes.iter().map(|note| note.id.clone()).collect();
         let title_to_id = build_reference_index(notes);
 
@@ -244,7 +306,7 @@ impl LinkDiscoveryService {
 
             self.profiles.insert(note.id.clone(), profile.clone());
             self.stored_notes.insert(note.id.clone(), record.clone());
-            self.persist_note_record(&note.id);
+            self.persist_note_record_checked(&note.id)?;
 
             if content_changed {
                 self.enqueue(note.id.clone(), QueuePriority::Dirty);
@@ -263,10 +325,12 @@ impl LinkDiscoveryService {
             .cloned()
             .collect::<Vec<_>>();
         for note_id in deleted_ids {
-            self.remove_note(&note_id);
+            self.remove_note_checked(&note_id)?;
         }
 
-        self.persist_queue_state();
+        self.persist_queue_state_checked()?;
+        self.advance_state_revision_checked()?;
+        Ok(())
     }
 
     pub fn sync_note(&mut self, note: &Note) {
@@ -315,6 +379,9 @@ impl LinkDiscoveryService {
             self.enqueue(note.id.clone(), QueuePriority::Unlinked);
         }
         self.persist_queue_state();
+        if let Err(error) = self.advance_state_revision_checked() {
+            log::error!("Failed to advance link discovery revision: {error}");
+        }
     }
 
     pub fn sync_notes(&mut self, notes: &[Note]) {
@@ -324,6 +391,12 @@ impl LinkDiscoveryService {
     }
 
     pub fn remove_note(&mut self, note_id: &str) {
+        if let Err(error) = self.remove_note_checked(note_id) {
+            log::error!("Failed to remove link discovery note '{note_id}': {error}");
+        }
+    }
+
+    pub(crate) fn remove_note_checked(&mut self, note_id: &str) -> Result<()> {
         self.profiles.remove(note_id);
         self.stored_notes.remove(note_id);
         self.queue.retain(|queued| queued.note_id != note_id);
@@ -333,9 +406,13 @@ impl LinkDiscoveryService {
             .filter(|current| current != note_id);
 
         let file_path = self.note_file_path(note_id);
-        if file_path.exists() {
-            let _ = std::fs::remove_file(&file_path);
+        match std::fs::remove_file(&file_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
         }
+        self.advance_state_revision_checked()?;
+        Ok(())
     }
 
     pub fn record_links_applied(&mut self, note_id: &str, target_ids: &[String]) {
@@ -369,6 +446,9 @@ impl LinkDiscoveryService {
         }
 
         self.persist_queue_state();
+        if let Err(error) = self.advance_state_revision_checked() {
+            log::error!("Failed to advance link discovery revision: {error}");
+        }
     }
 
     pub fn snapshot_for_note(&self, note_id: &str) -> Option<DiscoverySnapshot> {
@@ -403,8 +483,25 @@ impl LinkDiscoveryService {
         links: Vec<ZettelLinkCandidate>,
         exploratory_links: Vec<ZettelLinkCandidate>,
     ) -> Option<DiscoverLinksResponse> {
+        match self.store_discovery_result_checked(note_id, links, exploratory_links) {
+            Ok(response) => response,
+            Err(error) => {
+                log::error!("Failed to persist discovery result for '{note_id}': {error}");
+                None
+            }
+        }
+    }
+
+    pub(crate) fn store_discovery_result_checked(
+        &mut self,
+        note_id: &str,
+        links: Vec<ZettelLinkCandidate>,
+        exploratory_links: Vec<ZettelLinkCandidate>,
+    ) -> Result<Option<DiscoverLinksResponse>> {
         let response_record = {
-            let record = self.stored_notes.get_mut(note_id)?;
+            let Some(record) = self.stored_notes.get_mut(note_id) else {
+                return Ok(None);
+            };
             let cached_at = Utc::now();
 
             record.links = links;
@@ -421,13 +518,14 @@ impl LinkDiscoveryService {
             profile.is_stale = false;
         }
 
-        self.persist_note_record(note_id);
-        Some(self.build_response_from_record(
+        self.persist_note_record_checked(note_id)?;
+        self.advance_state_revision_checked()?;
+        Ok(Some(self.build_response_from_record(
             note_id,
             &response_record,
             MAX_LOCAL_CANDIDATES,
             "fresh",
-        ))
+        )))
     }
 
     pub fn list_queue_entries(
@@ -489,6 +587,22 @@ impl LinkDiscoveryService {
         note_id: &str,
         target_id: &str,
     ) -> DismissLinkSuggestionResponse {
+        self.dismiss_suggestion_checked(note_id, target_id)
+            .unwrap_or_else(|error| {
+                log::error!("Failed to dismiss suggestion for '{note_id}': {error}");
+                DismissLinkSuggestionResponse {
+                    note_id: note_id.to_string(),
+                    removed: false,
+                    remaining: 0,
+                }
+            })
+    }
+
+    pub(crate) fn dismiss_suggestion_checked(
+        &mut self,
+        note_id: &str,
+        target_id: &str,
+    ) -> Result<DismissLinkSuggestionResponse> {
         let mut removed = false;
         let mut remaining = 0;
 
@@ -503,14 +617,15 @@ impl LinkDiscoveryService {
                 .retain(|candidate| candidate.target_id != target_id);
             remaining = record.links.len() + record.exploratory_links.len();
             removed = before != remaining;
-            self.persist_note_record(note_id);
+            self.persist_note_record_checked(note_id)?;
         }
 
-        DismissLinkSuggestionResponse {
+        self.advance_state_revision_checked()?;
+        Ok(DismissLinkSuggestionResponse {
             note_id: note_id.to_string(),
             removed,
             remaining,
-        }
+        })
     }
 
     pub fn status(&self, settings: &UserSettings) -> LinkDiscoveryStatus {
@@ -552,8 +667,19 @@ impl LinkDiscoveryService {
         &mut self,
         settings: &UserSettings,
     ) -> Option<BackgroundDiscoveryJob> {
+        self.next_background_job_checked(settings)
+            .unwrap_or_else(|error| {
+                log::error!("Failed to persist link discovery worker state: {error}");
+                None
+            })
+    }
+
+    pub(crate) fn next_background_job_checked(
+        &mut self,
+        settings: &UserSettings,
+    ) -> Result<Option<BackgroundDiscoveryJob>> {
         if !settings.background_link_discovery_enabled || self.current_note_id.is_some() {
-            return None;
+            return Ok(None);
         }
 
         if self.queue.is_empty() {
@@ -566,12 +692,15 @@ impl LinkDiscoveryService {
                 .then_with(|| a.enqueued_at.cmp(&b.enqueued_at))
         });
 
-        let next = self.queue.first()?.clone();
+        let Some(next) = self.queue.first().cloned() else {
+            return Ok(None);
+        };
         self.queue.remove(0);
         self.current_note_id = Some(next.note_id.clone());
-        self.persist_queue_state();
+        self.persist_queue_state_checked()?;
+        self.advance_state_revision_checked()?;
 
-        Some(BackgroundDiscoveryJob {
+        Ok(Some(BackgroundDiscoveryJob {
             note_id: next.note_id,
             mode: if settings.background_link_discovery_llm_enabled
                 && next.priority.is_high_priority()
@@ -581,10 +710,20 @@ impl LinkDiscoveryService {
                 DiscoverMode::Algorithm
             },
             priority: next.priority.as_str().to_string(),
-        })
+        }))
     }
 
     pub fn complete_background_job(&mut self, note_id: &str, requeue_priority: Option<&str>) {
+        if let Err(error) = self.complete_background_job_checked(note_id, requeue_priority) {
+            log::error!("Failed to persist completed link discovery job: {error}");
+        }
+    }
+
+    pub(crate) fn complete_background_job_checked(
+        &mut self,
+        note_id: &str,
+        requeue_priority: Option<&str>,
+    ) -> Result<()> {
         if self.current_note_id.as_deref() == Some(note_id) {
             self.current_note_id = None;
         }
@@ -594,7 +733,9 @@ impl LinkDiscoveryService {
             self.enqueue(note_id.to_string(), priority);
         }
 
-        self.persist_queue_state();
+        self.persist_queue_state_checked()?;
+        self.advance_state_revision_checked()?;
+        Ok(())
     }
 
     pub fn mark_note_stale(&mut self, note_id: &str, priority: &str) {
@@ -609,6 +750,9 @@ impl LinkDiscoveryService {
             );
             self.persist_note_record(note_id);
             self.persist_queue_state();
+            if let Err(error) = self.advance_state_revision_checked() {
+                log::error!("Failed to advance link discovery revision: {error}");
+            }
         }
     }
 
@@ -720,61 +864,106 @@ impl LinkDiscoveryService {
         }
     }
 
-    fn load_from_disk(&mut self) {
-        if self.notes_dir.exists() {
-            if let Ok(entries) = std::fs::read_dir(&self.notes_dir) {
-                for entry in entries.flatten() {
+    fn load_from_disk_checked(&mut self) -> Result<()> {
+        match std::fs::read_dir(&self.notes_dir) {
+            Ok(entries) => {
+                for entry in entries {
+                    let entry = entry?;
                     let path = entry.path();
                     if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
                         continue;
                     }
-
-                    if let Ok(contents) = std::fs::read_to_string(&path) {
-                        if let Ok(record) = serde_json::from_str::<StoredDiscoveryNote>(&contents) {
-                            let note_id = record.profile.note_id.clone();
-                            self.profiles
-                                .insert(note_id.clone(), record.profile.clone());
-                            self.stored_notes.insert(note_id, record);
-                        }
-                    }
+                    let contents = std::fs::read_to_string(&path)
+                        .with_context(|| format!("Failed to read {}", path.display()))?;
+                    let record = serde_json::from_str::<StoredDiscoveryNote>(&contents)
+                        .with_context(|| {
+                            format!("Invalid link discovery record {}", path.display())
+                        })?;
+                    let note_id = record.profile.note_id.clone();
+                    self.profiles
+                        .insert(note_id.clone(), record.profile.clone());
+                    self.stored_notes.insert(note_id, record);
                 }
             }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
         }
 
-        if self.queue_path.exists() {
-            if let Ok(contents) = std::fs::read_to_string(&self.queue_path) {
-                if let Ok(state) = serde_json::from_str::<PersistedQueueState>(&contents) {
-                    self.queue = state.queue;
-                    self.sweep_cursor = state.sweep_cursor;
-                    self.last_run_at = state.last_run_at;
+        match std::fs::read_to_string(&self.queue_path) {
+            Ok(contents) => {
+                let state =
+                    serde_json::from_str::<PersistedQueueState>(&contents).with_context(|| {
+                        format!("Invalid link discovery queue {}", self.queue_path.display())
+                    })?;
+                if state.schema_version > LINK_STATE_SCHEMA_VERSION {
+                    anyhow::bail!(
+                        "unsupported link discovery state schema {}",
+                        state.schema_version
+                    );
                 }
+                self.queue = state.queue;
+                self.sweep_cursor = state.sweep_cursor;
+                self.last_run_at = state.last_run_at;
+                self.current_note_id = state.current_note_id;
+                self.state_revision = state.state_revision;
             }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
         }
+        Ok(())
     }
 
     fn persist_note_record(&self, note_id: &str) {
-        if let Some(record) = self.stored_notes.get(note_id) {
-            let path = self.note_file_path(note_id);
-            if let Ok(contents) = serde_json::to_string_pretty(record) {
-                let _ = write_atomic(&path, contents.as_bytes());
-            }
+        if let Err(error) = self.persist_note_record_checked(note_id) {
+            log::error!("Failed to persist link discovery note '{note_id}': {error}");
         }
     }
 
+    fn persist_note_record_checked(&self, note_id: &str) -> Result<()> {
+        let Some(record) = self.stored_notes.get(note_id) else {
+            return Ok(());
+        };
+        let path = self.note_file_path(note_id);
+        let contents = serde_json::to_string_pretty(record)?;
+        write_atomic(&path, contents.as_bytes())?;
+        Ok(())
+    }
+
     fn persist_queue_state(&self) {
+        if let Err(error) = self.persist_queue_state_checked() {
+            log::error!("Failed to persist link discovery queue: {error}");
+        }
+    }
+
+    fn persist_queue_state_checked(&self) -> Result<()> {
         let state = PersistedQueueState {
+            schema_version: LINK_STATE_SCHEMA_VERSION,
+            state_revision: self.state_revision,
             queue: self.queue.clone(),
             sweep_cursor: self.sweep_cursor,
             last_run_at: self.last_run_at,
+            current_note_id: self.current_note_id.clone(),
         };
 
         if let Some(parent) = self.queue_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+            std::fs::create_dir_all(parent)?;
         }
+        let contents = serde_json::to_string_pretty(&state)?;
+        write_atomic(&self.queue_path, contents.as_bytes())?;
+        Ok(())
+    }
 
-        if let Ok(contents) = serde_json::to_string_pretty(&state) {
-            let _ = write_atomic(&self.queue_path, contents.as_bytes());
+    fn advance_state_revision_checked(&mut self) -> Result<()> {
+        let previous = self.state_revision;
+        self.state_revision = self
+            .state_revision
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("link discovery state revision exhausted"))?;
+        if let Err(error) = self.persist_queue_state_checked() {
+            self.state_revision = previous;
+            return Err(error);
         }
+        Ok(())
     }
 
     fn note_file_path(&self, note_id: &str) -> PathBuf {
@@ -1174,6 +1363,18 @@ pub async fn discover_for_note(
     max_links: usize,
     allow_cache: bool,
 ) -> Result<DiscoverLinksResponse, String> {
+    discover_for_note_at_epoch(state, note_id, mode, max_links, allow_cache, None).await
+}
+
+#[cfg(feature = "tauri-app")]
+pub(crate) async fn discover_for_note_at_epoch(
+    state: &AppState,
+    note_id: &str,
+    mode: DiscoverMode,
+    max_links: usize,
+    allow_cache: bool,
+    expected_root_epoch: Option<&crate::services::vault_namespace::VaultAuthorityTokenV1>,
+) -> Result<DiscoverLinksResponse, String> {
     let total_started_at = Instant::now();
 
     if mode == DiscoverMode::Manual {
@@ -1188,24 +1389,65 @@ pub async fn discover_for_note(
         });
     }
 
-    if allow_cache {
-        let discovery = state.link_discovery.read().await;
-        if let Some(cached) = discovery.get_cached_response(note_id, max_links) {
-            log::debug!(
-                "Discover links {:?} for '{}' served from cache",
-                mode,
-                note_id
-            );
-            return Ok(cached);
+    let mut root_ticket = Some(crate::commands::acquire_derived_root_epoch(state).await?);
+    if let Some(expected) = expected_root_epoch {
+        if root_ticket
+            .as_ref()
+            .expect("derived ticket was just acquired")
+            .authority()
+            != expected
+        {
+            return Err("Grafyn authority changed before link discovery began".into());
         }
     }
-
-    let snapshot = {
-        let discovery = state.link_discovery.read().await;
-        discovery
-            .snapshot_for_note(note_id)
-            .ok_or_else(|| format!("Note not found in link discovery cache: {}", note_id))?
+    let root_epoch = root_ticket
+        .as_ref()
+        .expect("derived ticket was just acquired")
+        .authority()
+        .clone();
+    let coordinator = state
+        .mutation_coordinator
+        .as_ref()
+        .ok_or_else(|| "mutation coordinator is unavailable".to_string())?;
+    let (cached, snapshot, all_profiles, initial_link_revision) = {
+        let service = state.link_discovery_service()?;
+        let mut discovery = service.write().await;
+        coordinator
+            .with_locked_derived_state(&root_epoch, true, || {
+                discovery.reload_from_disk_checked().map_err(|error| {
+                    crate::services::twin_events::MutationError::Invalid(error.to_string())
+                })?;
+                let cached = allow_cache
+                    .then(|| discovery.get_cached_response(note_id, max_links))
+                    .flatten();
+                let snapshot = discovery.snapshot_for_note(note_id).ok_or_else(|| {
+                    crate::services::twin_events::MutationError::Invalid(format!(
+                        "Note not found in link discovery cache: {note_id}"
+                    ))
+                })?;
+                Ok((
+                    cached,
+                    snapshot,
+                    discovery.profiles.clone(),
+                    discovery.state_revision(),
+                ))
+            })
+            .map_err(|error| error.to_string())?
     };
+
+    if let Some(cached) = cached {
+        log::debug!(
+            "Discover links {:?} for '{}' served from cache",
+            mode,
+            note_id
+        );
+        root_ticket
+            .take()
+            .expect("derived ticket is available")
+            .finish(state)
+            .await?;
+        return Ok(cached);
+    }
 
     let query = build_discovery_query(&snapshot.source_profile);
 
@@ -1270,11 +1512,10 @@ pub async fn discover_for_note(
 
     let ranking_started_at = Instant::now();
     let (mut ranked_links, mut exploratory_ranked) = {
-        let discovery = state.link_discovery.read().await;
         let ranked_links = build_local_ranked_candidates(
             &snapshot.source_profile,
             &snapshot.dismissed_target_ids,
-            &discovery.profiles,
+            &all_profiles,
             &note_results,
             &chunk_results,
             &second_hop_counts,
@@ -1293,7 +1534,7 @@ pub async fn discover_for_note(
 
         let exploratory_ranked = sample_exploratory_candidates(
             &snapshot.source_profile,
-            &discovery.profiles,
+            &all_profiles,
             &excluded_ids,
             exploratory_limit(max_links),
         );
@@ -1301,6 +1542,7 @@ pub async fn discover_for_note(
         (ranked_links, exploratory_ranked)
     };
 
+    drop(root_ticket.take());
     if mode.include_llm() {
         ranked_links =
             rerank_with_llm(state, &snapshot.source_profile, ranked_links, "strong", 8).await;
@@ -1337,18 +1579,41 @@ pub async fn discover_for_note(
         .map(|candidate| candidate.candidate.clone())
         .collect::<Vec<_>>();
 
-    let mut discovery = state.link_discovery.write().await;
-    let stored = discovery
-        .store_discovery_result(note_id, links.clone(), exploratory_links.clone())
-        .unwrap_or(DiscoverLinksResponse {
-            note_id: note_id.to_string(),
-            links: links.clone(),
-            exploratory_links: exploratory_links.clone(),
-            topic_hubs: Vec::new(),
-            cached_at: Some(Utc::now()),
-            is_stale: false,
-            source: "fresh".to_string(),
-        });
+    let publish_ticket =
+        crate::commands::acquire_expected_derived_root_epoch(state, &root_epoch).await?;
+    let stored = {
+        let service = state.link_discovery_service()?;
+        let mut discovery = service.write().await;
+        coordinator
+            .with_locked_derived_state(&root_epoch, true, || {
+                discovery.reload_from_disk_checked().map_err(|error| {
+                    crate::services::twin_events::MutationError::Invalid(error.to_string())
+                })?;
+                if discovery.state_revision() != initial_link_revision {
+                    return Err(
+                        crate::services::twin_events::MutationError::RecoveryConflict(
+                            "link discovery state changed while ranking was in flight".into(),
+                        ),
+                    );
+                }
+                discovery
+                    .store_discovery_result_checked(
+                        note_id,
+                        links.clone(),
+                        exploratory_links.clone(),
+                    )
+                    .map_err(|error| {
+                        crate::services::twin_events::MutationError::Invalid(error.to_string())
+                    })?
+                    .ok_or_else(|| {
+                        crate::services::twin_events::MutationError::RecoveryConflict(
+                            "link discovery source disappeared before publication".into(),
+                        )
+                    })
+            })
+            .map_err(|error| error.to_string())?
+    };
+    publish_ticket.finish(state).await?;
 
     Ok(DiscoverLinksResponse {
         note_id: stored.note_id,
@@ -1776,6 +2041,80 @@ mod tests {
 
         assert_eq!(job.note_id, "note-a");
         assert_eq!(job.priority, "dirty");
+    }
+
+    #[test]
+    fn peer_instances_reload_revision_before_mutating_the_same_queue() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let data = temp.path().join("data");
+        let vault = temp.path().join("vault");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::create_dir(&vault).unwrap();
+        let event_store =
+            std::sync::Arc::new(crate::services::twin_events::TwinEventStore::new(&data));
+        event_store.initialize().unwrap();
+        let coordinator = crate::services::twin_events::MutationCoordinator::new(
+            &data,
+            &vault,
+            event_store,
+            std::sync::Arc::new(crate::services::twin_events::NoopMutationLifecycle),
+        )
+        .unwrap();
+        let token = coordinator.current_authority_token().unwrap();
+        let scoped = crate::services::vault_namespace::scoped_data_path(&data, &token.root_scope);
+        let mut first = LinkDiscoveryService::new(scoped.clone());
+        let mut peer = LinkDiscoveryService::new(scoped);
+        let notes = [
+            make_note("note-a", "A", "alpha", &[], &[]),
+            make_note("note-b", "B", "beta", &[], &[]),
+        ];
+        coordinator
+            .with_locked_derived_state(&token, true, || {
+                first.reload_from_disk_checked().map_err(|error| {
+                    crate::services::twin_events::MutationError::Invalid(error.to_string())
+                })?;
+                first.bootstrap_checked(&notes).map_err(|error| {
+                    crate::services::twin_events::MutationError::Invalid(error.to_string())
+                })
+            })
+            .unwrap();
+
+        let first_job = coordinator
+            .with_locked_derived_state(&token, true, || {
+                first.reload_from_disk_checked().map_err(|error| {
+                    crate::services::twin_events::MutationError::Invalid(error.to_string())
+                })?;
+                let job = first
+                    .next_background_job_checked(&UserSettings::default())
+                    .map_err(|error| {
+                        crate::services::twin_events::MutationError::Invalid(error.to_string())
+                    })?
+                    .expect("first job");
+                first
+                    .complete_background_job_checked(&job.note_id, None)
+                    .map_err(|error| {
+                        crate::services::twin_events::MutationError::Invalid(error.to_string())
+                    })?;
+                Ok((job, first.state_revision()))
+            })
+            .unwrap();
+        let peer_job = coordinator
+            .with_locked_derived_state(&token, true, || {
+                peer.reload_from_disk_checked().map_err(|error| {
+                    crate::services::twin_events::MutationError::Invalid(error.to_string())
+                })?;
+                let job = peer
+                    .next_background_job_checked(&UserSettings::default())
+                    .map_err(|error| {
+                        crate::services::twin_events::MutationError::Invalid(error.to_string())
+                    })?
+                    .expect("peer job");
+                Ok((job, peer.state_revision()))
+            })
+            .unwrap();
+
+        assert_ne!(first_job.0.note_id, peer_job.0.note_id);
+        assert!(peer_job.1 > first_job.1);
     }
 
     #[test]

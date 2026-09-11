@@ -1,14 +1,8 @@
 use super::shared::{
-    append_canvas_trace, effective_model_ids, resolve_model_route, source_tile_context_provider,
+    append_canvas_trace_expecting_authority, effective_model_ids, preserve_canvas_mutation_error,
+    repair_canvas_trace_error, resolve_model_route, source_tile_context_provider,
     ModelProviderRoute,
 };
-use crate::services::canvas_store::CanvasStore;
-use crate::services::ollama::OllamaService;
-use crate::services::openrouter::OpenRouterService;
-use crate::services::settings::SettingsService;
-use crate::services::twin::TwinStore;
-use std::sync::Arc;
-use tokio::sync::RwLock;
 use crate::models::canvas::{
     CanvasStreamEvent, ContextMode, Debate, DebateContinueRequest, DebateResponse, DebateRound,
     DebateStartRequest, PromptType, TilePosition,
@@ -20,14 +14,7 @@ use chrono::Utc;
 use futures::StreamExt;
 use serde_json::json;
 use std::time::Duration;
-use tauri::State;
-
-fn no_cost_stream<S>(stream: S) -> std::pin::Pin<Box<dyn futures::Stream<Item = anyhow::Result<StreamUpdate>> + Send>>
-where
-    S: futures::Stream<Item = anyhow::Result<String>> + Send + 'static,
-{
-    Box::pin(stream.map(|result| result.map(|content| StreamUpdate { content, cost_usd: None })))
-}
+use tauri::{Emitter, State};
 
 fn format_previous_rounds(rounds: &[DebateRound]) -> String {
     let mut body = String::new();
@@ -78,10 +65,7 @@ Do not restart from the original prompt as if you hadn't heard anyone.\n",
     message
 }
 
-pub(super) fn build_chair_synthesis_prompt(
-    source_content: &str,
-    rounds: &[DebateRound],
-) -> String {
+pub(super) fn build_chair_synthesis_prompt(source_content: &str, rounds: &[DebateRound]) -> String {
     let mut message = String::from(
         "You were listening, not in the fight. Talk like a person who heard the room. \
 Do not use headings or bins like Agreed, Split, or Moved. Do not declare a winner. \
@@ -94,19 +78,36 @@ Do not invent a position nobody took.\n\n",
     message
 }
 
+fn no_cost_stream<S>(
+    stream: S,
+) -> std::pin::Pin<Box<dyn futures::Stream<Item = anyhow::Result<StreamUpdate>> + Send>>
+where
+    S: futures::Stream<Item = anyhow::Result<String>> + Send + 'static,
+{
+    Box::pin(stream.map(|result| {
+        result.map(|content| StreamUpdate {
+            content,
+            cost_usd: None,
+        })
+    }))
+}
+
 /// Start a debate between models with streaming via Tauri events
 #[tauri::command]
 pub async fn start_debate(
-    window: tauri::Window,
+    window: tauri::WebviewWindow,
     session_id: String,
     mut request: DebateStartRequest,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
+    let root_ticket = crate::commands::acquire_derived_root_epoch(state.inner()).await?;
+    let input_root_epoch = root_ticket.authority().clone();
     let debate_id = uuid::Uuid::new_v4().to_string();
     let now = Utc::now();
 
     // Collect source content from tiles
     let mut store = state.canvas_store.write().await;
+    store.reload_authoritative_state();
     let session = store.get_session(&session_id).map_err(|e| e.to_string())?;
     drop(store);
 
@@ -145,6 +146,7 @@ pub async fn start_debate(
             }
         }
     }
+    root_ticket.validate(state.inner()).await?;
 
     // Calculate position (to the right of source tiles)
     let max_x = session
@@ -179,12 +181,14 @@ pub async fn start_debate(
     // Save debate to session
     {
         let mut store = state.canvas_store.write().await;
-        store
-            .add_debate(&session_id, debate.clone())
+        let commit = store
+            .add_debate_expecting_authority(&session_id, debate.clone(), input_root_epoch.clone())
             .map_err(|e| e.to_string())?;
+        crate::services::canvas_store::require_canvas_only_commit(&commit)
+            .map_err(|error| error.to_string())?;
     }
 
-    append_canvas_trace(
+    let trace_commit = match append_canvas_trace_expecting_authority(
         state.twin_store.clone(),
         &session_id,
         TraceEventType::DebateStarted,
@@ -195,8 +199,60 @@ pub async fn start_debate(
             "debate_mode": debate.debate_mode.clone(),
             "max_rounds": request.max_rounds,
         }),
+        input_root_epoch,
     )
-    .await;
+    .await
+    {
+        Ok(commit) => commit,
+        Err(error) => {
+            drop(root_ticket);
+            crate::commands::acknowledge_reported_repair(
+                repair_canvas_trace_error(state.inner(), &error, "Canvas debate start").await,
+            );
+            log::error!("Canvas debate was saved, but its audit trace failed: {error}");
+            let _ = window.emit(
+                "canvas-stream",
+                CanvasStreamEvent::DebateCreated {
+                    session_id: session_id.clone(),
+                    debate: debate.clone(),
+                },
+            );
+            let _ = window.emit(
+                "canvas-stream",
+                CanvasStreamEvent::DebateError {
+                    session_id,
+                    debate_id: debate.id,
+                    model_id: "system".to_string(),
+                    error: format!(
+                        "Canvas debate was saved, but its required trace failed: {error}"
+                    ),
+                    round_number: 0,
+                },
+            );
+            return Ok(debate_id);
+        }
+    };
+    let root_epoch = match crate::commands::repair_after_authority_mutation(
+        state.inner(),
+        &trace_commit,
+        "Canvas debate start",
+    )
+    .await
+    {
+        crate::commands::PostAuthorityRepair::Ready(epoch) => epoch,
+        crate::commands::PostAuthorityRepair::Unavailable(_) => {
+            drop(root_ticket);
+            let _ = window.emit(
+                "canvas-stream",
+                CanvasStreamEvent::DebateCreated { session_id, debate },
+            );
+            return Ok(debate_id);
+        }
+        crate::commands::PostAuthorityRepair::NotRequired => {
+            return Err("Canvas debate trace did not mutate content authority".into());
+        }
+    };
+    drop(root_ticket);
 
     // Emit debate created
     let _ = window.emit(
@@ -219,9 +275,11 @@ pub async fn start_debate(
     let provider_route = model_route.provider.clone();
     let debate_id_clone = debate_id.clone();
     let session_id_clone = session_id.clone();
+    let stream_root_state = state.inner().clone();
 
     tauri::async_runtime::spawn(async move {
         let mut debate_state = debate;
+        let mut root_epoch = root_epoch;
 
         for round_num in 1..=max_rounds {
             let _ = window.emit(
@@ -258,9 +316,14 @@ pub async fn start_debate(
                 let provider_route = provider_route.clone();
 
                 join_set.spawn(async move {
+                    let response_provider = provider_route.provider_label().to_string();
+                    let response_provenance = provider_route.provenance_label(true).to_string();
                     let stream_result = match provider_route {
                         ModelProviderRoute::Ollama => {
-                            let ollama = ollama_arc.read().await;
+                            let ollama_handle = ollama_arc
+                                .as_ref()
+                                .expect("Ollama debate route was validated before spawning");
+                            let ollama = ollama_handle.read().await;
                             let result = ollama
                                 .chat_stream(&model_id, messages, None, Some(0.7))
                                 .await;
@@ -283,7 +346,15 @@ pub async fn start_debate(
                                 )
                                 .await;
                             drop(openrouter);
-                            result.map(|stream| Box::pin(stream) as std::pin::Pin<Box<dyn futures::Stream<Item = anyhow::Result<StreamUpdate>> + Send>>)
+                            result.map(|stream| {
+                                Box::pin(stream)
+                                    as std::pin::Pin<
+                                        Box<
+                                            dyn futures::Stream<Item = anyhow::Result<StreamUpdate>>
+                                                + Send,
+                                        >,
+                                    >
+                            })
                         }
                     };
 
@@ -333,6 +404,8 @@ pub async fn start_debate(
                                             content: full_content,
                                             stance: None,
                                             cost_usd: None,
+                                            provider: Some(response_provider.clone()),
+                                            provenance: Some(response_provenance.clone()),
                                         };
                                     }
                                     Ok(None) => break, // Stream ended naturally
@@ -353,6 +426,8 @@ pub async fn start_debate(
                                             content: full_content,
                                             stance: None,
                                             cost_usd: None,
+                                            provider: Some(response_provider.clone()),
+                                            provenance: Some(response_provenance.clone()),
                                         };
                                     }
                                 }
@@ -375,6 +450,8 @@ pub async fn start_debate(
                                 content: full_content,
                                 stance: None,
                                 cost_usd,
+                                provider: Some(response_provider.clone()),
+                                provenance: Some(response_provenance.clone()),
                             }
                         }
                         Err(e) => {
@@ -404,6 +481,8 @@ pub async fn start_debate(
                                 content: e.to_string(),
                                 stance: None,
                                 cost_usd: None,
+                                provider: Some(response_provider),
+                                provenance: Some(response_provenance),
                             }
                         }
                     }
@@ -427,13 +506,35 @@ pub async fn start_debate(
             };
             debate_state.rounds.push(round);
 
+            let round_root_guard =
+                match crate::commands::acquire_expected_root_epoch(&stream_root_state, &root_epoch)
+                    .await
+                {
+                    Ok(guard) => guard,
+                    Err(error) => {
+                        emit_debate_persist_error(
+                            &window,
+                            &session_id_clone,
+                            &debate_id_clone,
+                            round_num,
+                            &debate_state,
+                            &anyhow::anyhow!(error),
+                        );
+                        return;
+                    }
+                };
+
             // Persist after each round. If this fails, surface it instead of
             // silently continuing to stream rounds that will never survive a
             // session reopen.
-            let round_persisted = {
+            let round_commit = {
                 let mut store = canvas_store_arc.write().await;
-                match store.update_debate(&session_id_clone, &debate_state) {
-                    Ok(()) => true,
+                match store.update_debate_expecting_authority(
+                    &session_id_clone,
+                    &debate_state,
+                    root_epoch.clone(),
+                ) {
+                    Ok(commit) => commit,
                     Err(error) => {
                         emit_debate_persist_error(
                             &window,
@@ -443,14 +544,14 @@ pub async fn start_debate(
                             &debate_state,
                             &error,
                         );
-                        false
+                        return;
                     }
                 }
             };
-
-            if !round_persisted {
-                return;
-            }
+            root_epoch = round_commit
+                .authority_token
+                .unwrap_or_else(|| root_epoch.clone());
+            drop(round_root_guard);
         }
 
         // Mark debate as complete
@@ -460,10 +561,31 @@ pub async fn start_debate(
             .last()
             .map(|round| round.round_number)
             .unwrap_or(max_rounds);
-        let completion_persisted = {
+        let root_guard =
+            match crate::commands::acquire_expected_root_epoch(&stream_root_state, &root_epoch)
+                .await
+            {
+                Ok(guard) => guard,
+                Err(error) => {
+                    emit_debate_persist_error(
+                        &window,
+                        &session_id_clone,
+                        &debate_id_clone,
+                        final_round_number,
+                        &debate_state,
+                        &anyhow::anyhow!(error),
+                    );
+                    return;
+                }
+            };
+        let completion_commit = {
             let mut store = canvas_store_arc.write().await;
-            match store.update_debate(&session_id_clone, &debate_state) {
-                Ok(()) => true,
+            match store.update_debate_expecting_authority(
+                &session_id_clone,
+                &debate_state,
+                root_epoch.clone(),
+            ) {
+                Ok(commit) => commit,
                 Err(error) => {
                     emit_debate_persist_error(
                         &window,
@@ -473,31 +595,43 @@ pub async fn start_debate(
                         &debate_state,
                         &error,
                     );
-                    false
+                    return;
                 }
             }
         };
-
-        if completion_persisted {
-            spawn_debate_chair_synthesis(
-                window.clone(),
-                session_id_clone.clone(),
-                debate_id_clone.clone(),
-                source_content.clone(),
-                canvas_store_arc,
-                twin_store_arc,
-                openrouter_arc,
-                ollama_arc,
-                settings_arc,
-            );
-            let _ = window.emit(
-                "canvas-stream",
-                CanvasStreamEvent::DebateComplete {
-                    session_id: session_id_clone,
-                    debate_id: debate_id_clone,
-                },
-            );
+        root_epoch = completion_commit
+            .authority_token
+            .unwrap_or_else(|| root_epoch.clone());
+        drop(root_guard);
+        if !matches!(
+            crate::commands::repair_after_authority_token(
+                &stream_root_state,
+                &root_epoch,
+                "Canvas debate",
+            )
+            .await,
+            crate::commands::PostAuthorityRepair::Ready(_)
+        ) {
+            return;
         }
+        let _ = window.emit(
+            "canvas-stream",
+            CanvasStreamEvent::DebateComplete {
+                session_id: session_id_clone.clone(),
+                debate_id: debate_id_clone.clone(),
+            },
+        );
+        spawn_debate_chair_synthesis(
+            window,
+            session_id_clone,
+            debate_id_clone,
+            source_content,
+            canvas_store_arc,
+            twin_store_arc,
+            openrouter_arc,
+            ollama_arc,
+            settings_arc,
+        );
     });
 
     Ok(debate_id)
@@ -506,13 +640,16 @@ pub async fn start_debate(
 /// Continue a debate with a new round
 #[tauri::command]
 pub async fn continue_debate(
-    window: tauri::Window,
+    window: tauri::WebviewWindow,
     session_id: String,
     debate_id: String,
     request: DebateContinueRequest,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
+    let root_ticket = crate::commands::acquire_derived_root_epoch(state.inner()).await?;
+    let input_root_epoch = root_ticket.authority().clone();
     let mut store = state.canvas_store.write().await;
+    store.reload_authoritative_state();
     let session = store.get_session(&session_id).map_err(|e| e.to_string())?;
     drop(store);
 
@@ -522,20 +659,6 @@ pub async fn continue_debate(
         .find(|d| d.id == debate_id)
         .ok_or_else(|| "Debate not found".to_string())?
         .clone();
-    let mut source_content = String::new();
-    for tile_id in &debate.source_tile_ids {
-        if let Some(tile) = session.prompt_tiles.iter().find(|t| &t.id == tile_id) {
-            source_content.push_str(&format!("Prompt: {}\n", tile.prompt));
-            for model_id in &debate.participating_models {
-                if let Some(resp) = tile.responses.get(model_id) {
-                    source_content.push_str(&format!(
-                        "{} responded: {}\n",
-                        resp.model_name, resp.content
-                    ));
-                }
-            }
-        }
-    }
     let (source_has_vault_context, source_twin_provider) =
         source_tile_context_provider(&session, &debate.source_tile_ids);
     let model_route = {
@@ -556,7 +679,9 @@ pub async fn continue_debate(
             )?
         }
     };
-    append_canvas_trace(
+    root_ticket.validate(state.inner()).await?;
+
+    let trace_commit = match append_canvas_trace_expecting_authority(
         state.twin_store.clone(),
         &session_id,
         TraceEventType::DebateContinued,
@@ -565,8 +690,33 @@ pub async fn continue_debate(
             "prompt": request.prompt.clone(),
             "participating_models": debate.participating_models.clone(),
         }),
+        input_root_epoch,
     )
-    .await;
+    .await
+    {
+        Ok(commit) => commit,
+        Err(error) => {
+            drop(root_ticket);
+            crate::commands::acknowledge_reported_repair(
+                repair_canvas_trace_error(state.inner(), &error, "Canvas debate continue").await,
+            );
+            return Err(error.to_string());
+        }
+    };
+    let root_epoch = match crate::commands::repair_after_authority_mutation(
+        state.inner(),
+        &trace_commit,
+        "Canvas debate continue",
+    )
+    .await
+    {
+        crate::commands::PostAuthorityRepair::Ready(epoch) => epoch,
+        crate::commands::PostAuthorityRepair::Unavailable(_) => return Ok(()),
+        crate::commands::PostAuthorityRepair::NotRequired => {
+            return Err("Canvas debate trace did not mutate content authority".into());
+        }
+    };
+    drop(root_ticket);
 
     let openrouter_arc = state.openrouter.clone();
     let ollama_arc = state.ollama.clone();
@@ -576,9 +726,11 @@ pub async fn continue_debate(
     let models = effective_model_ids(&model_route, &debate.participating_models);
     let reasoning_effort = request.reasoning_effort.clone();
     let provider_route = model_route.provider.clone();
+    let stream_root_state = state.inner().clone();
 
     tauri::async_runtime::spawn(async move {
         let mut debate_state = debate;
+        let mut root_epoch = root_epoch;
         let round_num = debate_state.rounds.len() as u32 + 1;
 
         let _ = window.emit(
@@ -615,9 +767,14 @@ pub async fn continue_debate(
             let provider_route = provider_route.clone();
 
             join_set.spawn(async move {
+                let response_provider = provider_route.provider_label().to_string();
+                let response_provenance = provider_route.provenance_label(true).to_string();
                 let stream_result = match provider_route {
                     ModelProviderRoute::Ollama => {
-                        let ollama = ollama_arc.read().await;
+                        let ollama_handle = ollama_arc
+                            .as_ref()
+                            .expect("Ollama debate route was validated before spawning");
+                        let ollama = ollama_handle.read().await;
                         let result = ollama
                             .chat_stream(&model_id, messages, None, Some(0.7))
                             .await;
@@ -640,7 +797,15 @@ pub async fn continue_debate(
                             )
                             .await;
                         drop(openrouter);
-                        result.map(|stream| Box::pin(stream) as std::pin::Pin<Box<dyn futures::Stream<Item = anyhow::Result<StreamUpdate>> + Send>>)
+                        result.map(|stream| {
+                            Box::pin(stream)
+                                as std::pin::Pin<
+                                    Box<
+                                        dyn futures::Stream<Item = anyhow::Result<StreamUpdate>>
+                                            + Send,
+                                    >,
+                                >
+                        })
                     }
                 };
 
@@ -689,6 +854,8 @@ pub async fn continue_debate(
                                         content: full_content,
                                         stance: None,
                                         cost_usd: None,
+                                        provider: Some(response_provider.clone()),
+                                        provenance: Some(response_provenance.clone()),
                                     };
                                 }
                                 Ok(None) => break, // Stream ended naturally
@@ -709,6 +876,8 @@ pub async fn continue_debate(
                                         content: full_content,
                                         stance: None,
                                         cost_usd: None,
+                                        provider: Some(response_provider.clone()),
+                                        provenance: Some(response_provenance.clone()),
                                     };
                                 }
                             }
@@ -731,6 +900,8 @@ pub async fn continue_debate(
                             content: full_content,
                             stance: None,
                             cost_usd,
+                            provider: Some(response_provider.clone()),
+                            provenance: Some(response_provenance.clone()),
                         }
                     }
                     Err(e) => {
@@ -760,6 +931,8 @@ pub async fn continue_debate(
                             content: e.to_string(),
                             cost_usd: None,
                             stance: None,
+                            provider: Some(response_provider),
+                            provenance: Some(response_provenance),
                         }
                     }
                 }
@@ -777,17 +950,50 @@ pub async fn continue_debate(
         // Save round
         let round = DebateRound {
             round_number: round_num,
-            topic: request.prompt,
+            topic: request.prompt.clone(),
             responses: round_responses,
             created_at: Utc::now(),
         };
         debate_state.rounds.push(round);
 
-        let persisted = {
-            let mut store = canvas_store_arc.write().await;
-            match store.update_debate(&session_id, &debate_state) {
-                Ok(()) => true,
+        let root_guard =
+            match crate::commands::acquire_expected_root_epoch(&stream_root_state, &root_epoch)
+                .await
+            {
+                Ok(guard) => guard,
                 Err(error) => {
+                    emit_debate_persist_error(
+                        &window,
+                        &session_id,
+                        &debate_id,
+                        round_num,
+                        &debate_state,
+                        &anyhow::anyhow!(error),
+                    );
+                    return;
+                }
+            };
+
+        let commit = {
+            let mut store = canvas_store_arc.write().await;
+            match store.update_debate_expecting_authority(
+                &session_id,
+                &debate_state,
+                root_epoch.clone(),
+            ) {
+                Ok(commit) => commit,
+                Err(error) => {
+                    let error = preserve_canvas_mutation_error(error);
+                    drop(store);
+                    drop(root_guard);
+                    crate::commands::acknowledge_reported_repair(
+                        repair_canvas_trace_error(
+                            &stream_root_state,
+                            &error,
+                            "Canvas debate continuation persistence",
+                        )
+                        .await,
+                    );
                     emit_debate_persist_error(
                         &window,
                         &session_id,
@@ -796,31 +1002,41 @@ pub async fn continue_debate(
                         &debate_state,
                         &error,
                     );
-                    false
+                    return;
                 }
             }
         };
-
-        if persisted {
-            spawn_debate_chair_synthesis(
-                window.clone(),
-                session_id.clone(),
-                debate_id.clone(),
-                source_content.clone(),
-                canvas_store_arc,
-                twin_store_arc,
-                openrouter_arc,
-                ollama_arc,
-                settings_arc,
-            );
-            let _ = window.emit(
-                "canvas-stream",
-                CanvasStreamEvent::DebateComplete {
-                    session_id,
-                    debate_id,
-                },
-            );
+        root_epoch = commit.authority_token.unwrap_or_else(|| root_epoch.clone());
+        drop(root_guard);
+        if !matches!(
+            crate::commands::repair_after_authority_token(
+                &stream_root_state,
+                &root_epoch,
+                "Canvas debate continuation",
+            )
+            .await,
+            crate::commands::PostAuthorityRepair::Ready(_)
+        ) {
+            return;
         }
+        let _ = window.emit(
+            "canvas-stream",
+            CanvasStreamEvent::DebateComplete {
+                session_id: session_id.clone(),
+                debate_id: debate_id.clone(),
+            },
+        );
+        spawn_debate_chair_synthesis(
+            window,
+            session_id,
+            debate_id,
+            request.prompt.clone(),
+            canvas_store_arc,
+            twin_store_arc,
+            openrouter_arc,
+            ollama_arc,
+            settings_arc,
+        );
     });
 
     Ok(())
@@ -831,12 +1047,12 @@ pub async fn continue_debate(
 /// once. Emits a `DebateError` per participating model in the round that
 /// failed to persist so the frontend has something concrete to render.
 fn emit_debate_persist_error(
-    window: &tauri::Window,
+    window: &tauri::WebviewWindow,
     session_id: &str,
     debate_id: &str,
     round_number: u32,
     debate_state: &Debate,
-    error: &anyhow::Error,
+    error: &(impl std::fmt::Display + ?Sized),
 ) {
     log::error!(
         "Failed to persist debate '{}' round {} for session '{}': {}",
@@ -882,75 +1098,16 @@ fn emit_debate_persist_error(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::models::canvas::DebateResponse;
-
-    fn sample_round(number: u32, speaker: &str, content: &str) -> DebateRound {
-        DebateRound {
-            round_number: number,
-            topic: format!("Round {number}"),
-            responses: vec![DebateResponse {
-                model_id: speaker.to_string(),
-                model_name: speaker.to_string(),
-                content: content.to_string(),
-                stance: None,
-                cost_usd: None,
-            }],
-            created_at: Utc::now(),
-        }
-    }
-
-    #[test]
-    fn round_one_is_loose_talk_about_original_answers() {
-        let message = build_debate_round_user_message(
-            1,
-            "Prompt: move?\nGPT responded: take the job\n",
-            &[],
-            None,
-        );
-        assert!(message.contains("first round"));
-        assert!(message.contains("take the job"));
-        assert!(message.contains("Talk like a person"));
-        assert!(!message.to_lowercase().contains("understand:"));
-        assert!(!message.contains("Present your analysis"));
-        assert!(!message.contains("structured debate"));
-    }
-
-    #[test]
-    fn later_round_answers_previous_posts_not_the_original() {
-        let rounds = vec![sample_round(1, "GPT", "I'd still take it.")];
-        let message = build_debate_round_user_message(2, "Prompt: move?\n", &rounds, None);
-        assert!(message.contains("later round"));
-        assert!(message.contains("I'd still take it."));
-        assert!(message.contains("Do not restart"));
-        assert!(!message.contains("UNDERSTAND"));
-        assert!(!message.contains("POSITION"));
-    }
-
-    #[test]
-    fn chair_prompt_is_free_talk_not_a_checklist() {
-        let rounds = vec![sample_round(1, "GPT", "Go if rent works.")];
-        let message = build_chair_synthesis_prompt("Prompt: move?\n", &rounds);
-        assert!(message.contains("listening, not in the fight"));
-        assert!(message.contains("Where did the room land"));
-        assert!(!message.contains("Agreed:"));
-        assert!(!message.contains("JSON"));
-        assert!(!message.contains("name who moved"));
-    }
-}
-
 fn spawn_debate_chair_synthesis(
-    window: tauri::Window,
+    window: tauri::WebviewWindow,
     session_id: String,
     debate_id: String,
     source_content: String,
-    canvas_store: Arc<RwLock<CanvasStore>>,
-    twin_store: Arc<RwLock<TwinStore>>,
-    openrouter: Arc<RwLock<OpenRouterService>>,
-    ollama: Arc<RwLock<OllamaService>>,
-    settings: Arc<RwLock<SettingsService>>,
+    canvas_store: std::sync::Arc<tokio::sync::RwLock<crate::services::canvas_store::CanvasStore>>,
+    twin_store: std::sync::Arc<tokio::sync::RwLock<crate::services::twin::TwinStore>>,
+    openrouter: std::sync::Arc<tokio::sync::RwLock<crate::services::openrouter::OpenRouterService>>,
+    ollama: Option<std::sync::Arc<tokio::sync::RwLock<crate::services::ollama::OllamaService>>>,
+    settings: std::sync::Arc<tokio::sync::RwLock<crate::services::settings::SettingsService>>,
 ) {
     tauri::async_runtime::spawn(async move {
         if let Err(error) = run_debate_chair_synthesis(
@@ -972,15 +1129,15 @@ fn spawn_debate_chair_synthesis(
 }
 
 async fn run_debate_chair_synthesis(
-    window: tauri::Window,
+    window: tauri::WebviewWindow,
     session_id: String,
     debate_id: String,
     source_content: String,
-    canvas_store: Arc<RwLock<CanvasStore>>,
-    twin_store: Arc<RwLock<TwinStore>>,
-    openrouter: Arc<RwLock<OpenRouterService>>,
-    ollama: Arc<RwLock<OllamaService>>,
-    settings: Arc<RwLock<SettingsService>>,
+    canvas_store: std::sync::Arc<tokio::sync::RwLock<crate::services::canvas_store::CanvasStore>>,
+    twin_store: std::sync::Arc<tokio::sync::RwLock<crate::services::twin::TwinStore>>,
+    openrouter: std::sync::Arc<tokio::sync::RwLock<crate::services::openrouter::OpenRouterService>>,
+    ollama: Option<std::sync::Arc<tokio::sync::RwLock<crate::services::ollama::OllamaService>>>,
+    settings: std::sync::Arc<tokio::sync::RwLock<crate::services::settings::SettingsService>>,
 ) -> Result<(), String> {
     let debate = {
         let mut store = canvas_store.write().await;
@@ -995,7 +1152,9 @@ async fn run_debate_chair_synthesis(
 
     let prompt = build_chair_synthesis_prompt(&source_content, &debate.rounds);
     let settings_snapshot = settings.read().await.get().clone();
-    let use_ollama = settings_snapshot.twin_llm_provider.eq_ignore_ascii_case("ollama");
+    let use_ollama = settings_snapshot
+        .twin_llm_provider
+        .eq_ignore_ascii_case("ollama");
     let messages = vec![ChatMessage {
         role: "user".to_string(),
         content: prompt,
@@ -1006,6 +1165,8 @@ async fn run_debate_chair_synthesis(
         if model.is_empty() {
             return Err("Select an Ollama model before synthesizing a debate".to_string());
         }
+        let ollama =
+            ollama.ok_or_else(|| "Local Ollama is unavailable on this runtime".to_string())?;
         let ollama = ollama.read().await;
         ollama
             .chat(model, messages, None, Some(0.4))

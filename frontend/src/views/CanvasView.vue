@@ -197,7 +197,7 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useCanvasStore } from '@/stores/canvas'
 import { useThemeStore } from '@/stores/theme'
@@ -222,6 +222,7 @@ const newSessionDescription = ref('')
 const showSettingsModal = ref(false)
 const showDeleteConfirm = ref(false)
 const pendingDeleteSessionId = ref(null)
+const rejectedSessionId = ref(null)
 const _isDesktop = isDesktopApp()
 const guide = useGuide()
 
@@ -238,9 +239,23 @@ async function handleThemeToggle() {
 }
 
 // Computed
-const sessions = computed(() => canvasStore.sessions)
+const sessions = computed(() => canvasStore.sessions.filter(session => !isTwinChatSession(session)))
 const loading = computed(() => canvasStore.loading)
-const currentSessionId = computed(() => route.params.id || null)
+const currentSessionId = computed(() => (
+  route.params.id && route.params.id !== rejectedSessionId.value ? route.params.id : null
+))
+
+watch(() => route.params.id, id => {
+  if (id !== rejectedSessionId.value) rejectedSessionId.value = null
+})
+
+watch(() => canvasStore.currentSession, session => {
+  const routedId = typeof route.params.id === 'string' ? route.params.id : null
+  if (!routedId || session?.id !== routedId || !isTwinChatSession(session)) return
+  rejectedSessionId.value = routedId
+  canvasStore.clearSession()
+  router.replace('/canvas')
+}, { immediate: true })
 
 // Lifecycle
 onMounted(async () => {
@@ -317,6 +332,10 @@ function formatDate(dateStr) {
   if (!dateStr) return ''
   const date = new Date(dateStr)
   return date.toLocaleDateString()
+}
+
+function isTwinChatSession(session) {
+  return session?.tags?.includes('companion-twin-chat') === true
 }
 </script>
 
