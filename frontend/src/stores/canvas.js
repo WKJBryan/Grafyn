@@ -126,7 +126,18 @@ export const useCanvasStore = defineStore('canvas', () => {
       debates: (session.debates || []).map(debate => ({
         ...debate,
         reasoning_effort: normalizeReasoningEffort(debate.reasoning_effort)
-      }))
+      })),
+      working_memory: session.working_memory || {
+        version: 0,
+        summary: '',
+        question: '',
+        constraints: [],
+        open_questions: [],
+        decisions: [],
+        tried: [],
+        model_positions: [],
+        note_ids: []
+      }
     }
   }
 
@@ -199,7 +210,26 @@ export const useCanvasStore = defineStore('canvas', () => {
       ...fetched,
       viewport: currentSession.value.viewport ?? fetched.viewport,
       prompt_tiles: mergedTiles,
-      debates: mergedDebates
+      debates: mergedDebates,
+      working_memory: fetched.working_memory || currentSession.value.working_memory
+    }
+  }
+
+  function applyWorkingMemoryUpdate(data) {
+    if (!currentSession.value || currentSession.value.id !== data.session_id) return
+    currentSession.value = {
+      ...currentSession.value,
+      working_memory: data.working_memory
+    }
+  }
+
+  function applyDebateRecapUpdate(data) {
+    if (!currentSession.value || currentSession.value.id !== data.session_id) return
+    currentSession.value = {
+      ...currentSession.value,
+      debates: (currentSession.value.debates || []).map(debate =>
+        debate.id === data.debate_id ? { ...debate, recap: data.recap } : debate
+      )
     }
   }
 
@@ -353,6 +383,13 @@ export const useCanvasStore = defineStore('canvas', () => {
       // Filter events for this session
       if (data.session_id !== sessionId) return
 
+      if (data.type === 'working_memory_updated') {
+        applyWorkingMemoryUpdate(data)
+      }
+      if (data.type === 'debate_recap_updated') {
+        applyDebateRecapUpdate(data)
+      }
+
       const handler = handlers[data.type]
       if (handler) handler(data)
     })
@@ -374,7 +411,8 @@ export const useCanvasStore = defineStore('canvas', () => {
     promptType = 'standard',
     decisionMetadata = null,
     reasoningEffort = 'none',
-    twinLlmProvider = null
+    twinLlmProvider = null,
+    parentDebateId = null
   ) {
     if (!currentSession.value) {
       throw new Error('No active session')
@@ -427,6 +465,7 @@ export const useCanvasStore = defineStore('canvas', () => {
         temperature,
         parent_tile_id: parentTileId,
         parent_model_id: parentModelId,
+        parent_debate_id: parentDebateId,
         context_mode: contextMode,
         twin_answer_mode: twinAnswerMode,
         twin_context_policy: contextMode === 'twin' ? 'approved_plus_relevant_candidates' : null,
@@ -769,7 +808,7 @@ export const useCanvasStore = defineStore('canvas', () => {
     })
   }
 
-  async function startDebate(tileIds, participatingModels, mode = 'auto', maxRounds = 3) {
+  async function startDebate(tileIds, participatingModels, mode = 'auto', maxRounds = 2) {
     if (!currentSession.value) {
       throw new Error('No active session')
     }

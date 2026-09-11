@@ -24,6 +24,36 @@ function mountNode(debate = {}) {
 }
 
 describe('DebateNode', () => {
+  it('shows a prose recap instead of chopping the last round', () => {
+    const wrapper = mountNode({
+      recap: 'Nobody is signing tonight. The leftover fight is rent versus moving.',
+      rounds: [{
+        round_number: 1,
+        topic: 'Topic',
+        created_at: new Date().toISOString(),
+        responses: [{
+          model_id: 'openai/gpt-4o',
+          model_name: 'GPT-4o',
+          content: 'This long last-round speech should not be the preview.',
+          stance: null,
+          cost_usd: null
+        }]
+      }]
+    })
+
+    expect(wrapper.text()).toContain('Nobody is signing tonight.')
+    expect(wrapper.text()).not.toContain('This long last-round speech should not be the preview.')
+  })
+
+  it('emits reply when the recap is ready', async () => {
+    const wrapper = mountNode({
+      status: 'completed',
+      recap: 'The room wants an email, not another round.'
+    })
+    await wrapper.find('.reply-btn').trigger('click')
+    expect(wrapper.emitted('reply')[0]).toEqual(['debate-1'])
+  })
+
   it('shows each completed debate response cost in the expanded view', () => {
     const wrapper = mount(DebateNode, {
       props: {

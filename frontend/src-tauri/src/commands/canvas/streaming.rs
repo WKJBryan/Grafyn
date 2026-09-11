@@ -1,4 +1,5 @@
 use super::context::{resolve_prompt_context, run_sealed_twin_prediction, TWIN_CONTEXT_VERSION};
+use super::working_memory::spawn_working_memory_compile;
 use super::shared::{
     append_canvas_trace, effective_model_ids, resolve_model_route, ModelProviderRoute,
 };
@@ -114,6 +115,7 @@ pub async fn send_prompt(
         context_mode: request.context_mode,
         parent_tile_id: request.parent_tile_id,
         parent_model_id: request.parent_model_id,
+        parent_debate_id: request.parent_debate_id.clone(),
         context_notes: resolved_context.context_notes.clone(),
         approved_twin_records: resolved_context.approved_twin_records.clone(),
         candidate_twin_records: resolved_context.candidate_twin_records.clone(),
@@ -221,6 +223,7 @@ pub async fn send_prompt(
     let ollama_arc = state.ollama.clone();
     let canvas_store_arc = state.canvas_store.clone();
     let twin_store_arc = state.twin_store.clone();
+    let settings_arc = state.settings_service.clone();
     let models = request.models.clone();
     let messages = resolved_context.messages.clone();
     let system_prompt = resolved_context.system_prompt.clone();
@@ -457,9 +460,24 @@ pub async fn send_prompt(
             let _ = window.emit(
                 "canvas-stream",
                 CanvasStreamEvent::SessionSaved {
-                    session_id: session_id_clone,
+                    session_id: session_id_clone.clone(),
                 },
             );
+            for (model_id, _, status, _, _) in &results {
+                if *status == ResponseStatus::Completed {
+                    spawn_working_memory_compile(
+                        window.clone(),
+                        session_id_clone.clone(),
+                        tile_id_clone.clone(),
+                        model_id.clone(),
+                        canvas_store_arc.clone(),
+                        twin_store_arc.clone(),
+                        openrouter_arc.clone(),
+                        ollama_arc.clone(),
+                        settings_arc.clone(),
+                    );
+                }
+            }
         }
     });
 
@@ -597,6 +615,7 @@ pub async fn add_models_to_tile(
     let ollama_arc = state.ollama.clone();
     let canvas_store_arc = state.canvas_store.clone();
     let twin_store_arc = state.twin_store.clone();
+    let settings_arc = state.settings_service.clone();
     let messages = resolved_context.messages.clone();
     let system_prompt = resolved_context.system_prompt.clone();
     let web_search = prompt_request.web_search;
@@ -778,8 +797,25 @@ pub async fn add_models_to_tile(
         if persistence_ok {
             let _ = window.emit(
                 "canvas-stream",
-                CanvasStreamEvent::SessionSaved { session_id },
+                CanvasStreamEvent::SessionSaved {
+                    session_id: session_id.clone(),
+                },
             );
+            for (model_id, _, status, _, _) in &results {
+                if *status == ResponseStatus::Completed {
+                    spawn_working_memory_compile(
+                        window.clone(),
+                        session_id.clone(),
+                        tile_id.clone(),
+                        model_id.clone(),
+                        canvas_store_arc.clone(),
+                        twin_store_arc.clone(),
+                        openrouter_arc.clone(),
+                        ollama_arc.clone(),
+                        settings_arc.clone(),
+                    );
+                }
+            }
         }
     });
 
@@ -845,6 +881,7 @@ pub async fn regenerate_response(
     let ollama_arc = state.ollama.clone();
     let canvas_store_arc = state.canvas_store.clone();
     let twin_store_arc = state.twin_store.clone();
+    let settings_arc = state.settings_service.clone();
     let messages = resolved_context.messages.clone();
     let system_prompt = resolved_context.system_prompt.clone();
     let web_search = request.web_search;
@@ -1021,7 +1058,20 @@ pub async fn regenerate_response(
         if persistence_ok {
             let _ = window.emit(
                 "canvas-stream",
-                CanvasStreamEvent::SessionSaved { session_id },
+                CanvasStreamEvent::SessionSaved {
+                    session_id: session_id.clone(),
+                },
+            );
+            spawn_working_memory_compile(
+                window,
+                session_id,
+                tile_id,
+                model_id,
+                canvas_store_arc,
+                twin_store_arc,
+                openrouter_arc,
+                ollama_arc,
+                settings_arc,
             );
         }
     });
@@ -1047,6 +1097,7 @@ fn prompt_request_from_tile(
         decision_metadata: tile.decision_metadata.clone(),
         parent_tile_id: tile.parent_tile_id.clone(),
         parent_model_id: tile.parent_model_id.clone(),
+        parent_debate_id: tile.parent_debate_id.clone(),
         temperature,
         max_tokens: None,
         web_search: tile.web_search,

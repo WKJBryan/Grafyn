@@ -123,7 +123,7 @@ export const guideCategories = [
       {
         id: 'canvas-context',
         title: 'Semantic Note Context',
-        content: 'Canvas automatically retrieves relevant notes from your vault and includes them as context for AI responses. Pin specific notes for guaranteed inclusion.',
+        content: 'Canvas compiles session memory after each round, retrieves relevant vault notes, and always includes pinned notes. Compact mode uses that compiled state plus the last two turns — it does not chop older answers mid-sentence.',
         anchor: '[data-guide="pinned-notes-btn"]',
         sinceVersion: '0.1.1',
       },

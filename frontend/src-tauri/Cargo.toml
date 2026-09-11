@@ -23,13 +23,14 @@ tauri-build = { version = "1.5", features = [], optional = true }
 
 [dependencies]
 # Tauri core (optional — only needed for the desktop app binary)
-tauri = { version = "1.8", optional = true, features = [ "updater",
+tauri = { version = "1.8", optional = true, features = [
     "dialog-all",
     "fs-all",
     "path-all",
     "process-all",
     "protocol-all",
     "shell-open",
+    "updater",
     "window-all"
 ] }
 serde = { version = "1.0", features = ["derive"] }

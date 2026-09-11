@@ -93,6 +93,7 @@ pub enum TraceEventType {
     TileDeleted,
     ResponseDeleted,
     TwinPredictionSealed,
+    WorkingMemoryCompiled,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

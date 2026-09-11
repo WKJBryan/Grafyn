@@ -25,6 +25,10 @@ pub struct CanvasSession {
     pub status: String,
     #[serde(default)]
     pub pinned_note_ids: Vec<String>,
+    #[serde(default)]
+    pub working_memory: CanvasWorkingMemory,
+    #[serde(default)]
+    pub branch_memories: HashMap<String, CanvasWorkingMemory>,
 }
 
 fn default_status() -> String {
@@ -46,8 +50,59 @@ impl Default for CanvasSession {
             tags: Vec::new(),
             status: "draft".to_string(),
             pinned_note_ids: Vec::new(),
+            working_memory: CanvasWorkingMemory::default(),
+            branch_memories: HashMap::new(),
         }
     }
+}
+
+/// Compiled short-term state for a canvas session.
+///
+/// This is the compact artifact injected into follow-up prompts. It is rewritten
+/// by a sleep-time compile after a tile or debate round completes — not a
+/// truncated transcript.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct CanvasWorkingMemory {
+    #[serde(default)]
+    pub version: u32,
+    #[serde(default)]
+    pub updated_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub compiled_from_tile_id: Option<String>,
+    #[serde(default)]
+    pub question: String,
+    #[serde(default)]
+    pub constraints: Vec<String>,
+    #[serde(default)]
+    pub open_questions: Vec<String>,
+    #[serde(default)]
+    pub decisions: Vec<String>,
+    #[serde(default)]
+    pub tried: Vec<String>,
+    #[serde(default)]
+    pub model_positions: Vec<ModelPosition>,
+    #[serde(default)]
+    pub note_ids: Vec<String>,
+    #[serde(default)]
+    pub summary: String,
+}
+
+impl CanvasWorkingMemory {
+    pub fn is_empty(&self) -> bool {
+        self.summary.trim().is_empty()
+            && self.question.trim().is_empty()
+            && self.constraints.is_empty()
+            && self.open_questions.is_empty()
+            && self.decisions.is_empty()
+            && self.tried.is_empty()
+            && self.model_positions.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct ModelPosition {
+    pub model_id: String,
+    pub stance: String,
 }
 
 /// Canvas viewport state for zoom/pan
@@ -121,6 +176,8 @@ pub struct PromptTile {
     #[serde(default)]
     pub parent_model_id: Option<String>,
     #[serde(default)]
+    pub parent_debate_id: Option<String>,
+    #[serde(default)]
     pub context_notes: Vec<TileContextNote>,
     #[serde(default)]
     pub approved_twin_records: Vec<TwinContextRecord>,
@@ -158,6 +215,7 @@ impl Default for PromptTile {
             context_mode: ContextMode::default(),
             parent_tile_id: None,
             parent_model_id: None,
+            parent_debate_id: None,
             context_notes: Vec::new(),
             approved_twin_records: Vec::new(),
             candidate_twin_records: Vec::new(),
@@ -287,6 +345,10 @@ pub struct Debate {
     pub debate_mode: String,
     #[serde(default = "default_reasoning_effort")]
     pub reasoning_effort: String,
+    #[serde(default)]
+    pub recap: Option<String>,
+    #[serde(default)]
+    pub recap_updated_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -305,6 +367,8 @@ impl Default for Debate {
             position: TilePosition::default(),
             debate_mode: "auto".to_string(),
             reasoning_effort: default_reasoning_effort(),
+            recap: None,
+            recap_updated_at: None,
             created_at: Utc::now(),
         }
     }
@@ -404,6 +468,8 @@ pub struct PromptRequest {
     pub parent_tile_id: Option<String>,
     #[serde(default)]
     pub parent_model_id: Option<String>,
+    #[serde(default)]
+    pub parent_debate_id: Option<String>,
     #[serde(default = "default_temperature")]
     pub temperature: f64,
     #[serde(default)]
@@ -523,6 +589,22 @@ mod tests {
         assert_eq!(request.context_mode, ContextMode::Twin);
         assert_eq!(request.twin_answer_mode, TwinAnswerMode::Simulation);
     }
+
+    #[test]
+    fn canvas_session_defaults_working_memory_when_omitted() {
+        let session: CanvasSession = serde_json::from_value(json!({
+            "id": "session-1",
+            "title": "Legacy session",
+            "created_at": "2026-03-17T00:00:00Z",
+            "updated_at": "2026-03-17T00:00:00Z"
+        }))
+        .unwrap();
+
+        assert!(session.working_memory.summary.is_empty());
+        assert_eq!(session.working_memory.version, 0);
+        assert!(session.working_memory.model_positions.is_empty());
+        assert!(session.working_memory.is_empty());
+    }
 }
 
 /// Model pricing information
@@ -583,6 +665,10 @@ pub enum CanvasStreamEvent {
     SessionSaved {
         session_id: String,
     },
+    WorkingMemoryUpdated {
+        session_id: String,
+        working_memory: CanvasWorkingMemory,
+    },
     DebateCreated {
         session_id: String,
         debate: Debate,
@@ -617,6 +703,11 @@ pub enum CanvasStreamEvent {
         session_id: String,
         debate_id: String,
     },
+    DebateRecapUpdated {
+        session_id: String,
+        debate_id: String,
+        recap: String,
+    },
 }
 
 /// Request to start a debate
@@ -637,7 +728,7 @@ fn default_debate_mode() -> String {
 }
 
 fn default_max_rounds() -> u32 {
-    3
+    2
 }
 
 /// Request to continue a debate

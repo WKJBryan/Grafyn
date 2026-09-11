@@ -97,7 +97,7 @@ Grafyn is a **desktop-only** app — a single Tauri binary with a Vue frontend a
 | `notes.rs` | Note CRUD |
 | `search.rs` | Full-text search, find-similar, reindex |
 | `graph.rs` | Link graph: backlinks, outgoing, neighbors, unlinked, full graph, rebuild |
-| `canvas/` | Multi-LLM canvas (18 commands) with note context; streaming via `canvas-stream` Tauri events. Split across `session.rs` (session/tile CRUD), `streaming.rs` (`send_prompt`/`add_models_to_tile`/`regenerate_response`), `debate.rs` (`start_debate`/`continue_debate`), `context.rs` (retrieval + twin-context prompt assembly, incl. `build_twin_context_prompt()`), `shared.rs` (common helpers), and `mod.rs` (re-exports) |
+| `canvas/` | Multi-LLM canvas (18 commands) with note context; streaming via `canvas-stream` Tauri events. Split across `session.rs` (session/tile CRUD), `streaming.rs` (`send_prompt`/`add_models_to_tile`/`regenerate_response`), `debate.rs` (`start_debate`/`continue_debate`), `context.rs` (retrieval + twin-context prompt assembly, incl. `build_twin_context_prompt()`), `working_memory.rs` (compiled session memory, real compaction, query rewrite), `shared.rs` (common helpers), and `mod.rs` (re-exports) |
 | `distill.rs` | LLM + rules-based distillation, tag normalization |
 | `settings.rs` | Settings, first-run setup, OpenRouter key validation, Ollama status/models |
 | `feedback.rs` | Feedback with offline queue |
@@ -179,9 +179,13 @@ Discovers potential links using semantic similarity and LLM analysis. Three meth
 
 Compare responses from multiple LLM models simultaneously via OpenRouter. Features: parallel model streaming, infinite canvas with D3.js zoom/pan, model debate mode, session persistence in `data/canvas/`, **semantic note context** (retrieves relevant notes as LLM system prompt).
 
-**Semantic context mode:** When `context_mode == Semantic` (the default), `send_prompt` runs a two-stage pipeline: (1) note-level retrieval as a quality gate, (2) if `chunk_retrieval_enabled` (default: `true`), chunk-level retrieval fills relevant paragraphs within `default_token_budget` (default: 4000 tokens). Falls back to whole-note truncation (1500 chars) if chunks are empty or disabled. Pinned notes per session (`pinned_note_ids`) are always included. Context notes are stored on the tile and emitted via `ContextNotes` event for frontend display.
+**Semantic context mode:** When `context_mode == Semantic` / `knowledge_search` (the default), `send_prompt` runs a two-stage pipeline: (1) note-level retrieval as a quality gate, (2) if `chunk_retrieval_enabled` (default: `true`), chunk-level retrieval fills relevant paragraphs within `default_token_budget` (default: 4000 tokens). Falls back to whole-note truncation (1500 chars) if chunks are empty or disabled. Retrieval queries are rewritten with compiled session working memory (`question` / open questions / constraints). **Pinned notes are always included**, even when the quality gate rejects retrieved hits. Context notes are stored on the tile and emitted via `ContextNotes`.
 
-**Streaming architecture:** Commands return immediately, spawn async tasks, stream via `canvas-stream` Tauri events (`TileCreated`, `ContextNotes`, `Chunk`, `Complete`, `Error`, `SessionSaved`, debate variants). Frontend listens via `@tauri-apps/api/event`.
+**Session working memory and compaction:** After a tile persist succeeds, a cheap compile rewrites **branch** memory keyed by `tile_id::model_id` so siblings do not mix. Compact mode injects that branch block plus the last two parent-chain turns — it does **not** truncate older turns to 240 characters. Vault and Twin modes also attach those last two turns when branching. `context_mode=none` remains an escape hatch.
+
+**Debate:** Default two parallel rounds of loose talk (hear the room, then answer the others). No UNDERSTAND/THINK/POSITION skeleton. After the last round, a separate chair model (not a participant) talks once; that speech is `Debate.recap`. Reply from the debate node parents a new prompt on `parent_debate_id` and injects the recap, not every speech. Continue still adds an optional extra round. Twin records/Constitution stay review-gated. Do not use `services/memory.rs` for this path.
+
+**Streaming architecture:** Commands return immediately, spawn async tasks, stream via `canvas-stream` Tauri events (`TileCreated`, `ContextNotes`, `Chunk`, `Complete`, `Error`, `SessionSaved`, `WorkingMemoryUpdated`, debate variants). Frontend listens via `@tauri-apps/api/event`.
 
 Streaming commands: `send_prompt`, `start_debate`, `continue_debate`, `add_models_to_tile`, `regenerate_response`
 
@@ -195,14 +199,15 @@ Twin context mode is a native RAG path, not model-weight training. `frontend/src
 
 The prompt order is:
 
-1. Twin Operating Contract
-2. Twin Identity
-3. Reviewed Constitution
-4. Action Gap Risks
-5. Relevant Evidence
-6. Approved User Records
-7. Tentative Candidate Records
-8. Answer Instructions
+1. Session working memory (when compiled; omitted if empty)
+2. Twin Operating Contract
+3. Twin Identity
+4. Reviewed Constitution
+5. Action Gap Risks
+6. Relevant Evidence
+7. Approved User Records
+8. Tentative Candidate Records
+9. Answer Instructions
 
 Twin Identity lives in `ConstitutionSetup` and is persisted in `constitution_setup.json` with `twin_name`, `twin_role`, and optional `source_boundaries`. Name and role/context are required before `TwinAnswerMode::Simulation` can run. The backend enforces this in the twin context resolution path so direct IPC calls cannot bypass the setup gate.
 
@@ -211,6 +216,8 @@ Simulation mode uses first-person model-facing instructions such as `I am {twin_
 Twin Workspace (`/twin`) owns review and setup: user records, memory digest, Constitution items, action gaps, decision episodes/outcomes, Decision Mirror config, and guided setup. `Save Setup` writes guided setup Constitution items for operating priors; the identity fields are setup metadata and should not become normal Constitution items.
 
 See `TWIN_RAG_SPEC.md` for the full twin RAG specification and `WORKING_GUIDE.md` for release workflow details.
+
+**Proposed ingestion redesign (2026-09-05; not implemented):** `docs/superpowers/specs/2026-09-05-evidence-ingestion-design.md` describes target-person attribution, source-grounded decision extraction, automatic processing, content-based clustering, and reversible repair of existing derived data. Its graph extensions add local semantic similarity, link length representing relational closeness, source-backed link explanations, and concurrent person-specific goals with measurable targets, counting rules, timeframes, constraints, and first-/second-order consequence paths. Goals and contextual priorities can change; retain effective/recorded times and the goal revisions available for each prediction. Missing goal quantities and deadlines stay unresolved. Goal paths distinguish the person's causal beliefs from empirically supported effects; quantitative causal simulation is not yet specified. Keep proposed behavior distinct from the current implementation until the corresponding changes land.
 
 **Twin accuracy evaluation is external by design (owner decision, 2026-06-10):** Do NOT build in-app accuracy scoring, benchmark dashboards, or eval-result UIs. This is a public repo and the owner does not want to impose a specific evaluation format on users. The app's responsibility is **capture + export only**: sealed twin predictions at decision time, decision outcomes, feedback/ranking traces, and the JSONL export bundles (train/eval/holdout splits). Scoring, holdout replay, calibration analysis, and accuracy dashboards live in the owner's external evaluation harness (separate lab environment), consuming the exported data. See `TWIN_ACCURACY_ROADMAP.md`.
 
