@@ -1,0 +1,121 @@
+---
+import { withBase, GITHUB_REPO } from '../lib/paths.js';
+
+const here = Astro.url.pathname.replace(/\/$/, '') || '/';
+const links = [
+  { href: withBase('download/'), label: 'Download', match: '/download' },
+  { href: withBase('privacy/'), label: 'Privacy', match: '/privacy' },
+];
+---
+
+<header class="nav-shell">
+  <nav class="nav-pill" data-nav aria-label="Primary">
+    <a href={withBase()} class="flex items-center gap-2.5 pr-1">
+      <img
+        src={withBase('mark.png')}
+        alt=""
+        width="28"
+        height="28"
+        class="rounded-lg"
+      />
+      <span class="text-[15px] font-medium tracking-tight text-paper">Grafyn</span>
+    </a>
+
+    <div class="hidden items-center gap-1 md:flex">
+      {
+        links.map((link) => (
+          <a
+            href={link.href}
+            class:list={[
+              'rounded-full px-3 py-1.5 text-sm transition-colors duration-700 ease-[cubic-bezier(0.32,0.72,0,1)]',
+              here.endsWith(link.match)
+                ? 'text-paper'
+                : 'text-mute hover:text-paper',
+            ]}
+          >
+            {link.label}
+          </a>
+        ))
+      }
+      <a
+        href={GITHUB_REPO}
+        class="rounded-full px-3 py-1.5 text-sm text-mute hover:text-paper"
+      >
+        Source
+      </a>
+    </div>
+
+    <button
+      type="button"
+      class="burger grid h-10 w-10 place-items-center rounded-full md:hidden"
+      data-burger
+      aria-label="Open menu"
+      aria-expanded="false"
+      aria-controls="nav-overlay"
+    >
+      <span class="flex flex-col items-center gap-[3px]">
+        <span class="burger-line"></span>
+        <span class="burger-line"></span>
+      </span>
+    </button>
+  </nav>
+</header>
+
+<div class="nav-overlay md:hidden" id="nav-overlay" data-nav-overlay inert aria-hidden="true">
+  <div class="flex min-h-[100dvh] flex-col justify-end px-6 pb-16 pt-28">
+    <ul class="space-y-4">
+      <li>
+        <a
+          class="nav-overlay-link block text-4xl font-medium tracking-tight text-paper"
+          href={withBase()}
+        >
+          Home
+        </a>
+      </li>
+      {
+        links.map((link) => (
+          <li>
+            <a
+              class="nav-overlay-link block text-4xl font-medium tracking-tight text-paper"
+              href={link.href}
+            >
+              {link.label}
+            </a>
+          </li>
+        ))
+      }
+      <li>
+        <a
+          class="nav-overlay-link block text-4xl font-medium tracking-tight text-paper"
+          href={GITHUB_REPO}
+        >
+          Source
+        </a>
+      </li>
+    </ul>
+  </div>
+</div>
+
+<style>
+  .nav-overlay-link {
+    opacity: 0;
+    transform: translateY(2.5rem);
+    transition:
+      opacity 600ms cubic-bezier(0.32, 0.72, 0, 1),
+      transform 600ms cubic-bezier(0.32, 0.72, 0, 1);
+  }
+
+  .nav-overlay-link.is-shown {
+    opacity: 1;
+    transform: none;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .nav-overlay-link {
+      opacity: 1;
+      transform: none;
+    }
+  }
+</style>
+
+<script src="../scripts/nav.js"></script>

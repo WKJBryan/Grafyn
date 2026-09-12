@@ -1,0 +1,162 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <link rel="stylesheet" href="mock.css" />
+    <style>
+      .graph-head {
+        display: flex;
+        align-items: baseline;
+        justify-content: space-between;
+        padding: 26px 34px 0;
+      }
+      .graph-title { font-size: 22px; font-weight: 500; letter-spacing: -0.01em; }
+      .graph-stats { font-size: 12px; color: var(--faint); }
+      .legend { display: flex; gap: 16px; font-size: 11px; color: var(--mute); }
+      .legend span { display: inline-flex; align-items: center; gap: 6px; }
+      .legend i { width: 7px; height: 7px; border-radius: 999px; display: inline-block; }
+      .graph-area { position: relative; flex: 1; }
+      .glow {
+        position: absolute; inset: 0;
+        background: radial-gradient(640px 420px at 52% 46%, rgb(61 207 192 / 0.07), transparent 70%);
+      }
+      .rightbar {
+        width: 272px; flex: none;
+        border-left: 1px solid var(--rule);
+        background: var(--abyss);
+        padding: 22px 16px;
+        display: flex; flex-direction: column; gap: 14px;
+      }
+      .inbox-head { display: flex; align-items: baseline; justify-content: space-between; }
+      .inbox-title { font-size: 14px; font-weight: 500; }
+      .inbox-queue { font-size: 11px; color: var(--faint); }
+      .suggestion { padding: 14px; }
+      .suggestion h4 { font-size: 13px; font-weight: 500; line-height: 1.35; }
+      .suggestion .match { font-size: 11px; color: var(--faint); margin-top: 4px; }
+      .suggestion .desc { font-size: 12px; color: var(--mute); line-height: 1.5; margin-top: 8px; }
+      .suggestion .actions { display: flex; align-items: center; gap: 8px; margin-top: 12px; }
+      .suggestion .pct { margin-left: auto; font-size: 12px; color: var(--seed); }
+      .panel-label { font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--faint); }
+    </style>
+  </head>
+  <body>
+    <div class="shell">
+      <aside class="sidebar">
+        <div class="rail-label">Vault</div>
+        <div class="tree-item"><span class="fold open"></span>Architecture<span class="count">2</span></div>
+        <div class="tree-item nested"><span class="file-icon"></span>Local-First Sync</div>
+        <div class="tree-item nested active"><span class="file-icon"></span>Grafyn Architecture</div>
+        <div class="tree-item"><span class="fold open"></span>ML<span class="count">3</span></div>
+        <div class="tree-item nested"><span class="file-icon"></span>Embedding Models</div>
+        <div class="tree-item nested"><span class="file-icon"></span>Evaluation Harness</div>
+        <div class="tree-item"><span class="fold closed"></span>Notes<span class="count">4</span></div>
+        <div class="tree-item"><span class="fold closed"></span>Projects<span class="count">3</span></div>
+        <div class="rail-label">Tags</div>
+        <div class="tree-item"><span class="file-icon" style="border-color: var(--seed)"></span><span class="mono" style="font-size:12px">architecture</span><span class="count">4</span></div>
+        <div class="tree-item"><span class="file-icon" style="border-color: var(--violet)"></span><span class="mono" style="font-size:12px">ml</span><span class="count">3</span></div>
+        <div class="tree-item"><span class="file-icon" style="border-color: var(--amber)"></span><span class="mono" style="font-size:12px">pkms</span><span class="count">2</span></div>
+      </aside>
+
+      <main style="flex: 1; display: flex; flex-direction: column;">
+        <div class="graph-head">
+          <div>
+            <div class="graph-title">Knowledge Graph</div>
+            <div class="graph-stats mono" style="margin-top: 6px;">15 nodes · 32 edges</div>
+          </div>
+          <div class="legend">
+            <span><i style="background: var(--seed)"></i>Explicit</span>
+            <span><i style="background: var(--violet)"></i>Inferred</span>
+            <span><i style="background: var(--amber)"></i>Topic hub</span>
+          </div>
+        </div>
+        <div class="graph-area">
+          <div class="glow"></div>
+          <svg viewBox="0 0 1080 820" width="100%" height="100%" style="position: absolute; inset: 0;">
+            <g stroke="rgb(61 207 192 / 0.28)" stroke-width="1.2">
+              <line x1="540" y1="300" x2="380" y2="380" />
+              <line x1="540" y1="300" x2="700" y2="360" />
+              <line x1="540" y1="300" x2="540" y2="470" />
+              <line x1="380" y1="380" x2="300" y2="520" />
+              <line x1="380" y1="380" x2="470" y2="540" />
+              <line x1="700" y1="360" x2="790" y2="500" />
+              <line x1="700" y1="360" x2="610" y2="500" />
+              <line x1="540" y1="470" x2="470" y2="540" />
+              <line x1="540" y1="470" x2="610" y2="500" />
+              <line x1="300" y1="520" x2="380" y2="640" />
+              <line x1="470" y1="540" x2="380" y2="640" />
+              <line x1="610" y1="500" x2="700" y2="620" />
+              <line x1="790" y1="500" x2="700" y2="620" />
+              <line x1="380" y1="640" x2="540" y2="680" />
+              <line x1="700" y1="620" x2="540" y2="680" />
+              <line x1="540" y1="300" x2="430" y2="240" />
+              <line x1="700" y1="360" x2="640" y2="250" />
+            </g>
+            <g stroke="rgb(154 143 240 / 0.2)" stroke-width="1" stroke-dasharray="4 5">
+              <line x1="300" y1="520" x2="610" y2="500" />
+              <line x1="430" y1="240" x2="640" y2="250" />
+              <line x1="380" y1="380" x2="610" y2="500" />
+              <line x1="540" y1="680" x2="470" y2="540" />
+            </g>
+            <g>
+              <circle cx="540" cy="300" r="34" fill="var(--amber)" opacity="0.95" />
+              <circle cx="430" cy="240" r="24" fill="var(--amber)" opacity="0.9" />
+              <circle cx="640" cy="250" r="24" fill="var(--amber)" opacity="0.9" />
+              <circle cx="380" cy="380" r="20" fill="var(--seed)" />
+              <circle cx="700" cy="360" r="20" fill="var(--seed)" />
+              <circle cx="540" cy="470" r="22" fill="var(--seed)" />
+              <circle cx="300" cy="520" r="15" fill="var(--violet)" />
+              <circle cx="470" cy="540" r="15" fill="var(--violet)" />
+              <circle cx="610" cy="500" r="15" fill="var(--violet)" />
+              <circle cx="790" cy="500" r="15" fill="var(--violet)" />
+              <circle cx="380" cy="640" r="17" fill="#5aa7ff" opacity="0.9" />
+              <circle cx="700" cy="620" r="17" fill="#5aa7ff" opacity="0.9" />
+              <circle cx="540" cy="680" r="19" fill="var(--amber)" opacity="0.9" />
+            </g>
+            <g font-family="Satoshi, sans-serif" font-size="14" fill="var(--paper)">
+              <text x="540" y="300" text-anchor="middle" dy="4" fill="var(--ink)" font-weight="500" font-size="13">topics</text>
+              <text x="540" y="356" text-anchor="middle">Grafyn Architecture</text>
+              <text x="430" y="212" text-anchor="middle" fill="var(--mute)">ml</text>
+              <text x="640" y="222" text-anchor="middle" fill="var(--mute)">pkms</text>
+              <text x="380" y="414" text-anchor="middle" fill="var(--mute)">Local-First Sync</text>
+              <text x="700" y="394" text-anchor="middle" fill="var(--mute)">OpenRouter Routing</text>
+              <text x="540" y="506" text-anchor="middle" fill="var(--mute)">Vault Optimizer</text>
+              <text x="380" y="676" text-anchor="middle" fill="var(--mute)">Decision Journaling</text>
+              <text x="700" y="656" text-anchor="middle" fill="var(--mute)">Evaluation Harness</text>
+              <text x="540" y="716" text-anchor="middle" fill="var(--mute)">Zettelkasten Method</text>
+            </g>
+          </svg>
+        </div>
+      </main>
+
+      <aside class="rightbar">
+        <div>
+          <div class="inbox-head">
+            <span class="inbox-title">Link Inbox</span>
+            <span class="inbox-queue mono">2 pending</span>
+          </div>
+          <div style="font-size: 11px; color: var(--faint); margin-top: 4px;">Background suggestions, waiting for review.</div>
+        </div>
+        <div class="card suggestion">
+          <h4>Evaluation Harness ↔ Backlink Graph Algorithms</h4>
+          <div class="match mono">Strong match</div>
+          <p class="desc">Both describe index scoring and recall metrics.</p>
+          <div class="actions">
+            <span class="btn-mini btn-accept">Apply</span>
+            <span class="btn-mini btn-decline">Dismiss</span>
+            <span class="pct mono">82%</span>
+          </div>
+        </div>
+        <div class="card suggestion">
+          <h4>Vault Optimizer Design ↔ Decision Journaling</h4>
+          <div class="match mono">Strong match</div>
+          <p class="desc">Inbox review is a weekly decision ritual.</p>
+          <div class="actions">
+            <span class="btn-mini btn-accept">Apply</span>
+            <span class="btn-mini btn-decline">Dismiss</span>
+            <span class="pct mono">74%</span>
+          </div>
+        </div>
+      </aside>
+    </div>
+  </body>
+</html>

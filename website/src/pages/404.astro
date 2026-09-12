@@ -1,0 +1,23 @@
+---
+import Base from '../layouts/Base.astro';
+import { withBase } from '../lib/paths.js';
+---
+
+<Base title="Not found. Grafyn." description="That page is not in this vault.">
+  <section class="flex min-h-[100dvh] items-end px-4 pb-24 pt-32 md:px-10 lg:px-16">
+    <div class="max-w-xl">
+      <h1 class="text-4xl font-medium tracking-tight text-paper md:text-6xl">
+        No note with that title
+      </h1>
+      <p class="mt-5 text-lg text-mute">
+        That path is not on this site.
+      </p>
+      <a
+        class="mt-8 inline-block text-seed underline decoration-hairline underline-offset-4"
+        href={withBase()}
+      >
+        Back to Grafyn
+      </a>
+    </div>
+  </section>
+</Base>

@@ -1,0 +1,22 @@
+---
+import { withBase, GITHUB_REPO, GITHUB_LICENSE, GITHUB_RELEASES } from '../lib/paths.js';
+---
+
+<footer class="border-t border-rule px-4 pt-20 md:px-10 lg:px-16">
+  <p class="wordmark mx-auto max-w-6xl text-[clamp(4rem,15vw,13rem)]" aria-hidden="true">
+    Grafyn
+  </p>
+  <div class="mx-auto flex max-w-6xl flex-col gap-8 border-t border-rule py-10 md:flex-row md:items-end md:justify-between">
+    <div class="flex items-center gap-3">
+      <img src={withBase('mark.png')} alt="" width="28" height="28" class="rounded-lg" />
+      <p class="text-sm text-mute">Grafyn. Files on your disk.</p>
+    </div>
+    <nav class="flex flex-wrap gap-x-6 gap-y-2 text-sm text-mute" aria-label="Footer">
+      <a class="hover:text-paper" href={withBase('download/')}>Download</a>
+      <a class="hover:text-paper" href={withBase('privacy/')}>Privacy</a>
+      <a class="hover:text-paper" href={GITHUB_RELEASES}>Releases</a>
+      <a class="hover:text-paper" href={GITHUB_REPO}>Source</a>
+      <a class="hover:text-paper" href={GITHUB_LICENSE}>License</a>
+    </nav>
+  </div>
+</footer>
