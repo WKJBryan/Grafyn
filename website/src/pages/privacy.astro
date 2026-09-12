@@ -1,0 +1,88 @@
+---
+import Base from '../layouts/Base.astro';
+import { withBase } from '../lib/paths.js';
+---
+
+<Base
+  title="Privacy. Grafyn."
+  description="Grafyn is local-first. Notes, indexes, and twin evidence stay on your disk."
+>
+  <article class="px-4 pt-32 pb-24 md:px-10 md:pt-40 lg:px-16">
+    <div class="mx-auto max-w-2xl">
+      <h1 class="text-2xl font-medium tracking-tight text-paper md:text-4xl">
+        Your machine is the backend
+      </h1>
+      <p class="mt-6 text-lg leading-relaxed text-mute">
+        Grafyn is a desktop app. There is no Grafyn account and no Grafyn cloud.
+        The folder is the product.
+      </p>
+
+      <section class="mt-20">
+        <h2 class="text-lg font-medium text-paper md:text-2xl">What stays on disk</h2>
+        <p class="mt-4 leading-relaxed text-mute">
+          Markdown notes, search and graph indexes, canvas sessions, settings, and twin evidence all live under <code class="font-mono text-paper">~/Documents/Grafyn/</code> unless you choose another vault path. Delete that folder and the data is gone.
+        </p>
+      </section>
+
+      <section class="mt-14">
+        <h2 class="text-lg font-medium text-paper md:text-2xl">What can leave</h2>
+        <ul class="mt-6 space-y-6">
+          <li>
+            <p class="font-medium text-paper">Model prompts</p>
+            <p class="mt-1 leading-relaxed text-mute">
+              When you send a prompt in the canvas, distillation, or twin
+              answers, the context you assembled goes to the runtime you chose —
+              OpenRouter, a hosted model API, whose data policy then applies.
+              Optional web search is per prompt and visible in the UI. If you
+              run models locally with Ollama, nothing has to leave the machine.
+            </p>
+          </li>
+          <li>
+            <p class="font-medium text-paper">Update checks</p>
+            <p class="mt-1 leading-relaxed text-mute">
+              The app asks GitHub whether a newer release exists while it runs.
+              That is the only request Grafyn makes on its own.
+            </p>
+          </li>
+          <li>
+            <p class="font-medium text-paper">Nothing else</p>
+            <p class="mt-1 leading-relaxed text-mute">
+              No analytics, no telemetry, no crash reporting, no account.
+            </p>
+          </li>
+        </ul>
+      </section>
+
+      <section class="mt-14">
+        <h2 class="text-lg font-medium text-paper md:text-2xl">API keys</h2>
+        <p class="mt-4 leading-relaxed text-mute">
+          Your OpenRouter key is stored in the OS keychain, not in a config file
+          sitting in the vault.
+        </p>
+      </section>
+
+      <section class="mt-14">
+        <h2 class="text-lg font-medium text-paper md:text-2xl">Twin evidence</h2>
+        <p class="mt-4 leading-relaxed text-mute">
+          Grafyn does not train on your data. Records you mark rejected, private,
+          or no-train are never used in live answers. Exports exist so you can
+          train elsewhere, on your terms.
+        </p>
+      </section>
+
+      <section class="mt-14">
+        <h2 class="text-lg font-medium text-paper md:text-2xl">How to delete everything</h2>
+        <p class="mt-4 leading-relaxed text-mute">
+          Quit the app. Delete the vault folder and the data folder. Uninstall
+          the binary. That removes your data.
+        </p>
+      </section>
+
+      <p class="mt-16 text-sm text-mute">
+        <a class="underline decoration-hairline underline-offset-4 hover:text-paper" href={withBase('download/')}>
+          Download Grafyn
+        </a>
+      </p>
+    </div>
+  </article>
+</Base>

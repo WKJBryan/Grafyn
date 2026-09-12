@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <link rel="stylesheet" href="mock.css" />
+    <style>
+      .toolbar {
+        display: flex; align-items: center; gap: 14px;
+        padding: 18px 28px;
+        border-bottom: 1px solid var(--rule);
+        background: var(--abyss);
+      }
+      .session-name { font-size: 15px; font-weight: 500; }
+      .tb-sep { width: 1px; height: 18px; background: var(--rule); }
+      .tb-item { font-size: 12px; color: var(--mute); }
+      .tb-zoom { margin-left: auto; font-size: 12px; color: var(--faint); }
+      .surface { position: relative; flex: 1; overflow: hidden; }
+      .dots {
+        position: absolute; inset: 0;
+        background-image: radial-gradient(rgb(61 207 192 / 0.09) 1px, transparent 1px);
+        background-size: 28px 28px;
+      }
+      .edges { position: absolute; inset: 0; width: 100%; height: 100%; }
+      .node { position: absolute; }
+      .prompt-card {
+        width: 300px; padding: 16px 18px;
+        background: var(--abyss);
+        border: 1px solid var(--seed-dim);
+        border-radius: 12px;
+        box-shadow: 0 12px 40px rgb(2 26 32 / 0.6);
+      }
+      .prompt-tag { font-size: 10px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--seed); }
+      .prompt-text { font-size: 14px; line-height: 1.5; margin-top: 8px; }
+      .prompt-ctx { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 12px; }
+      .ctx-chip { font-size: 10px; padding: 3px 8px; border-radius: 6px; background: rgb(61 207 192 / 0.1); color: var(--mute); border: 1px solid var(--rule); }
+      .answer-card {
+        width: 330px;
+        background: var(--surface);
+        border: 1px solid var(--rule);
+        border-radius: 12px;
+        box-shadow: 0 12px 40px rgb(2 26 32 / 0.6);
+        overflow: hidden;
+      }
+      .answer-head {
+        display: flex; align-items: center; gap: 8px;
+        padding: 10px 14px;
+        border-bottom: 1px solid var(--rule);
+        font-size: 12px; font-weight: 500;
+      }
+      .answer-head i { width: 7px; height: 7px; border-radius: 999px; }
+      .answer-body { padding: 12px 14px; font-size: 12px; line-height: 1.55; color: var(--mute); }
+      .answer-body b { display: block; color: var(--paper); font-weight: 500; font-size: 12.5px; margin-bottom: 4px; }
+      .answer-body ol { margin: 6px 0 0 16px; }
+      .answer-body li { margin-top: 2px; }
+      .answer-foot {
+        display: flex; justify-content: space-between;
+        padding: 8px 14px;
+        border-top: 1px solid var(--rule);
+        font-size: 10px; color: var(--faint);
+      }
+      .fab {
+        position: absolute; left: 50%; bottom: 26px; transform: translateX(-50%);
+        display: flex; gap: 10px; align-items: center;
+        background: var(--raised);
+        border: 1px solid var(--rule);
+        padding: 10px 18px; border-radius: 999px;
+        font-size: 13px; box-shadow: 0 12px 40px rgb(2 26 32 / 0.7);
+      }
+      .fab .primary { color: var(--seed); font-weight: 500; }
+      .fab .ghost { color: var(--faint); }
+    </style>
+  </head>
+  <body>
+    <div style="display: flex; flex-direction: column; height: 100%;">
+      <div class="toolbar">
+        <span class="session-name">Vault Index Migration</span>
+        <span class="tb-sep"></span>
+        <span class="tb-item">Arrange</span>
+        <span class="tb-item">Notes</span>
+        <span class="tb-item">Twin</span>
+        <span class="tb-item">Save as Note</span>
+        <span class="tb-zoom mono">68%</span>
+      </div>
+      <div class="surface">
+        <div class="dots"></div>
+        <svg class="edges" viewBox="0 0 1600 900" preserveAspectRatio="none">
+          <g fill="none" stroke="rgb(61 207 192 / 0.4)" stroke-width="1.6">
+            <path d="M 400 250 C 500 250, 520 160, 620 160" />
+            <path d="M 400 250 C 500 250, 560 380, 660 380" />
+            <path d="M 400 250 C 480 250, 540 590, 640 590" />
+            <path d="M 370 700 C 480 700, 880 470, 980 420" stroke-dasharray="5 6" stroke="rgb(61 207 192 / 0.3)" />
+          </g>
+          <circle cx="400" cy="250" r="5" fill="var(--seed)" />
+          <circle cx="370" cy="700" r="5" fill="var(--seed)" opacity="0.7" />
+        </svg>
+
+        <div class="node prompt-card" style="left: 90px; top: 165px;">
+          <div class="prompt-tag">Prompt</div>
+          <p class="prompt-text">Should Grafyn migrate its search index to LanceDB, or keep the current SQLite FTS5?</p>
+          <div class="prompt-ctx">
+            <span class="ctx-chip mono">◈ Embedding Models</span>
+            <span class="ctx-chip mono">◈ Grafyn Architecture</span>
+          </div>
+        </div>
+
+        <div class="node answer-card" style="left: 620px; top: 60px;">
+          <div class="answer-head"><i style="background: var(--amber)"></i>Claude Sonnet 4.5</div>
+          <div class="answer-body">
+            <b>Why LanceDB fits</b>
+            Single embedded store for vectors and text, one transaction per note write. No server process — matches the local-first constraint.
+          </div>
+          <div class="answer-foot mono"><span>1,204 tokens</span><span>$0.0071</span></div>
+        </div>
+
+        <div class="node answer-card" style="left: 980px; top: 290px;">
+          <div class="answer-head"><i style="background: var(--violet)"></i>GPT-4o</div>
+          <div class="answer-body">
+            <b>Keep SQLite FTS5, add LanceDB only for vectors</b>
+            <ol>
+              <li>FTS5 is battle-tested; migration risk is real.</li>
+              <li>Fix the sync, not the store.</li>
+            </ol>
+          </div>
+          <div class="answer-foot mono"><span>986 tokens</span><span>$0.0042</span></div>
+        </div>
+
+        <div class="node answer-card" style="left: 640px; top: 520px;">
+          <div class="answer-head"><i style="background: var(--seed)"></i>Gemini 2.5 Pro</div>
+          <div class="answer-body">
+            <b>Instrument first, migrate second</b>
+            Run a two-week shadow index. Abort criterion: any correctness bug where LanceDB returns a note the live path missed.
+          </div>
+          <div class="answer-foot mono"><span>1,102 tokens</span><span>$0.0038</span></div>
+        </div>
+
+        <div class="node prompt-card" style="left: 90px; top: 620px; width: 280px; border-color: var(--rule); opacity: 0.9;">
+          <div class="prompt-tag" style="color: var(--mute)">Prompt · branch</div>
+          <p class="prompt-text" style="font-size: 13px;">Draft the shadow-index rollout plan. What gets measured, for how long, and what is the abort criterion?</p>
+        </div>
+
+        <div class="fab">
+          <span class="primary">+ New Prompt</span>
+          <span class="ghost mono">Debate (0)</span>
+        </div>
+      </div>
+    </div>
+  </body>
+</html>

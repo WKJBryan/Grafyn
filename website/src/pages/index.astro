@@ -1,0 +1,174 @@
+---
+import Base from '../layouts/Base.astro';
+import DownloadCta from '../components/DownloadCta.astro';
+import { withBase } from '../lib/paths.js';
+
+const products = [
+  {
+    kicker: 'Vault',
+    title: 'Notes stay plain files',
+    frame: 'Grafyn · Vault',
+    art: 'ui/vault.webp',
+    copy: `The vault is a folder of plain markdown files you already own. Write with
+      wikilinks — [[like this]] — and Grafyn builds the backlink graph,
+      full-text search, and topic hubs (index pages for recurring subjects)
+      on your disk.`,
+  },
+  {
+    kicker: 'Canvas',
+    title: 'Ask several models at once',
+    frame: 'Grafyn · Canvas',
+    art: 'ui/canvas.webp',
+    copy: `The canvas is a workspace that sends one prompt to several models
+      side by side. It pulls your relevant notes in as context. Pin what must
+      be included, branch answers, and make the models debate.`,
+  },
+  {
+    kicker: 'Twin',
+    title: 'Evidence for a twin',
+    frame: 'Grafyn · Twin',
+    art: 'ui/twin.webp',
+    copy: `The twin is an experimental profile of what you accept, reject, and
+      prefer, stored as evidence-linked records in your vault that you can
+      review, endorse, or delete. Experimental, and honest about it.`,
+  },
+];
+---
+
+<Base title="Grafyn. Your files. Your models. Your evidence.">
+  <section class="relative min-h-[100dvh] overflow-hidden">
+    <div class="hero-art-wrap" data-hero-drift>
+      <img
+        src={withBase('art/hero.jpg')}
+        alt=""
+        class="hero-art"
+      />
+    </div>
+    <div
+      class="absolute inset-0 bg-linear-to-t from-ink via-ink/55 to-abyss/20"
+    >
+    </div>
+    <div
+      class="relative flex min-h-[100dvh] flex-col justify-end px-4 pb-16 pt-24 md:px-10 lg:px-16"
+    >
+      <div class="max-w-4xl">
+        <h1
+          class="hero-enter text-5xl leading-[1.05] font-medium tracking-tight text-paper md:text-6xl lg:text-7xl"
+        >
+          Your files. Your models.<br />
+          Your evidence.
+        </h1>
+        <p class="hero-enter-delay mt-6 max-w-[40ch] text-lg leading-relaxed text-mute md:text-xl">
+          A local knowledge vault and multi-model canvas that keeps notes as
+          plain files on your disk. Point it at the folder you already have —
+          Obsidian vaults included. No import, no lock-in.
+        </p>
+        <div class="hero-enter-delay mt-8">
+          <DownloadCta />
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="border-t border-rule px-4 py-24 md:px-10 md:py-28 lg:px-16">
+    <div class="mx-auto max-w-6xl space-y-20 md:space-y-28">
+      {
+        products.map((product, index) => (
+          <article
+            class="reveal-group grid items-center gap-8 md:grid-cols-2 md:gap-16"
+            data-reveal-group
+          >
+            <div class:list={[index % 2 === 1 && 'md:order-2']}>
+              <p class="font-mono text-sm text-seed" data-reveal-item>
+                {product.kicker}
+              </p>
+              <h2
+                class="mt-3 text-3xl font-medium tracking-tight text-paper md:text-5xl"
+                data-reveal-item
+              >
+                {product.title}
+              </h2>
+              <p
+                class="mt-4 max-w-[42ch] text-base leading-relaxed text-mute md:text-lg"
+                data-reveal-item
+              >
+                {product.copy}
+              </p>
+            </div>
+            <figure
+              class:list={['app-frame', index % 2 === 1 && 'md:order-1']}
+              data-reveal-item
+            >
+              <div class="app-frame-bar" aria-hidden="true">
+                <span class="app-frame-dot"></span>
+                <span class="app-frame-dot"></span>
+                <span class="app-frame-dot"></span>
+                <span class="app-frame-title">{product.frame}</span>
+              </div>
+              <img
+                src={withBase(product.art)}
+                alt={`Grafyn ${product.kicker} view`}
+                class="aspect-8/5 w-full object-cover"
+                loading="lazy"
+                decoding="async"
+              />
+            </figure>
+          </article>
+        ))
+      }
+    </div>
+  </section>
+
+  <section class="border-t border-rule px-4 py-24 md:px-10 md:py-28 lg:px-16">
+    <div class="mx-auto grid max-w-6xl gap-12 md:grid-cols-2 md:gap-20">
+      <div class="reveal relative min-h-[22rem] overflow-hidden rounded-2xl md:min-h-[28rem]" data-reveal>
+        <img
+          src={withBase('art/local.jpg')}
+          alt=""
+          class="absolute inset-0 h-full w-full object-cover"
+          loading="lazy"
+          decoding="async"
+        />
+        <div class="absolute inset-0 bg-linear-to-t from-ink via-ink/50 to-ink/10"></div>
+        <div class="relative flex h-full min-h-[22rem] flex-col justify-end p-8 md:min-h-[28rem] md:p-10">
+          <h2 class="max-w-[16ch] text-3xl font-medium tracking-tight text-paper md:text-5xl">
+            Your machine is the backend
+          </h2>
+          <a
+            class="mt-6 text-sm text-mute underline decoration-hairline underline-offset-4 hover:text-paper"
+            href={withBase('privacy/')}
+          >
+            How privacy works
+          </a>
+        </div>
+      </div>
+      <ul class="reveal reveal-delay space-y-10 border-l border-hairline pl-8" data-reveal>
+        <li>
+          <h3 class="text-lg font-medium text-paper md:text-2xl">On your disk</h3>
+          <p class="mt-2 max-w-[42ch] text-mute">
+            Notes, indexes, canvas sessions, and twin records live under
+            <code class="font-mono text-sm text-paper">~/Documents/Grafyn/</code>.
+            There is no Grafyn account and no Grafyn cloud.
+          </p>
+        </li>
+        <li>
+          <h3 class="text-lg font-medium text-paper md:text-2xl">What can leave</h3>
+          <p class="mt-2 max-w-[42ch] text-mute">
+            Two things: update checks, which ask GitHub whether a newer release
+            exists, and the prompt context you choose to send to a model
+            runtime — a hosted API like OpenRouter, or models running on your
+            own machine with Ollama. Nothing is sent without a prompt from you.
+          </p>
+        </li>
+        <li>
+          <h3 class="text-lg font-medium text-paper md:text-2xl">Agents use the same vault</h3>
+          <p class="mt-2 max-w-[42ch] text-mute">
+            A small local server (MCP) ships with the app so tools like Claude
+            Desktop can search and write the same files. It only runs while
+            the app runs.
+          </p>
+        </li>
+      </ul>
+    </div>
+  </section>
+</Base>

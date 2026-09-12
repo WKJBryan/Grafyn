@@ -1,0 +1,59 @@
+---
+import Base from '../layouts/Base.astro';
+import DownloadCta from '../components/DownloadCta.astro';
+---
+
+<Base
+  title="Download Grafyn"
+  description="Install Grafyn on Windows, macOS, or Linux. Point it at a markdown folder."
+>
+  <article class="px-4 pt-32 pb-24 md:px-10 md:pt-40 lg:px-16">
+    <div class="mx-auto max-w-2xl">
+      <h1 class="text-2xl font-medium tracking-tight text-paper md:text-4xl">
+        Download Grafyn
+      </h1>
+      <p class="mt-6 max-w-[40ch] text-lg leading-relaxed text-mute">
+        One installer per platform. Auto-updates after install — the app checks
+        GitHub for new releases. The button below follows your OS.
+      </p>
+
+      <div class="mt-10">
+        <DownloadCta compact />
+      </div>
+
+      <section class="mt-20 border-t border-hairline pt-12">
+        <h2 class="text-lg font-medium text-paper md:text-2xl">First run</h2>
+        <ol class="mt-6 space-y-6 text-mute">
+          <li>
+            <p class="font-medium text-paper">Vault path</p>
+            <p class="mt-1 leading-relaxed">
+              Where your markdown lives. Default is <code class="font-mono text-sm text-paper">~/Documents/Grafyn/vault/</code>. Point it at an existing folder and Grafyn indexes it.
+            </p>
+          </li>
+          <li>
+            <p class="font-medium text-paper">Model runtime (optional)</p>
+            <p class="mt-1 leading-relaxed">
+              An OpenRouter key (a hosted model API) powers the canvas,
+              distillation, and twin answers. Skip it if you only want the
+              vault, or run models locally with Ollama instead.
+            </p>
+          </li>
+        </ol>
+      </section>
+
+      <section class="mt-16">
+        <h2 class="text-lg font-medium text-paper md:text-2xl">Platforms</h2>
+        <ul class="mt-6 space-y-3 text-mute">
+          <li>Windows x64 and ARM64</li>
+          <li>macOS Apple Silicon</li>
+          <li>Linux .deb and AppImage</li>
+        </ul>
+        <p class="mt-6 text-mute">
+          Alongside the app, the installer adds a small local MCP server so
+          tools like Claude Desktop can read and write your vault. It only
+          runs while Grafyn runs.
+        </p>
+      </section>
+    </div>
+  </article>
+</Base>

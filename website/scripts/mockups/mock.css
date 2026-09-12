@@ -1,0 +1,178 @@
+@font-face {
+  font-family: Satoshi;
+  src: url('../../src/fonts/satoshi-400.woff2') format('woff2');
+  font-weight: 400;
+}
+
+@font-face {
+  font-family: Satoshi;
+  src: url('../../src/fonts/satoshi-500.woff2') format('woff2');
+  font-weight: 500;
+}
+
+:root {
+  --ink: #061418;
+  --abyss: #021a20;
+  --surface: #0c2a32;
+  --raised: #10333c;
+  --seed: #3dcfc0;
+  --seed-dim: rgb(61 207 192 / 0.55);
+  --paper: #e8f2f2;
+  --mute: #8fb3b6;
+  --faint: #5d8489;
+  --rule: rgb(61 207 192 / 0.16);
+  --amber: #e8b04b;
+  --violet: #9a8ff0;
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html,
+body {
+  width: 1600px;
+  height: 1000px;
+  overflow: hidden;
+  background: var(--ink);
+  color: var(--paper);
+  font-family: Satoshi, ui-sans-serif, system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+.mono {
+  font-family: 'IBM Plex Mono', ui-monospace, monospace;
+}
+
+.shell {
+  display: flex;
+  width: 100%;
+  height: 100%;
+}
+
+.sidebar {
+  width: 236px;
+  flex: none;
+  background: var(--abyss);
+  border-right: 1px solid var(--rule);
+  padding: 22px 16px;
+}
+
+.rail-label {
+  font-size: 11px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--faint);
+  margin: 22px 8px 8px;
+}
+
+.rail-label:first-child {
+  margin-top: 0;
+}
+
+.tree-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 8px;
+  border-radius: 7px;
+  font-size: 13px;
+  color: var(--mute);
+}
+
+.tree-item.nested {
+  margin-left: 18px;
+}
+
+.tree-item.active {
+  background: rgb(61 207 192 / 0.1);
+  color: var(--paper);
+}
+
+.tree-item .count {
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--faint);
+}
+
+.fold {
+  width: 0;
+  height: 0;
+  border-left: 4px solid transparent;
+  border-right: 4px solid transparent;
+  border-top: 5px solid var(--faint);
+  flex: none;
+}
+
+.fold.open {
+  transform: rotate(0);
+}
+
+.fold.closed {
+  transform: rotate(-90deg);
+}
+
+.file-icon {
+  width: 12px;
+  height: 12px;
+  flex: none;
+  border: 1.4px solid var(--faint);
+  border-radius: 3px;
+}
+
+.tree-item.active .file-icon {
+  border-color: var(--seed);
+}
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--rule);
+  border-radius: 12px;
+}
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 3px 10px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 500;
+  border: 1px solid transparent;
+}
+
+.chip-amber {
+  color: var(--amber);
+  border-color: rgb(232 176 75 / 0.4);
+  background: rgb(232 176 75 / 0.08);
+}
+
+.chip-violet {
+  color: var(--violet);
+  border-color: rgb(154 143 240 / 0.4);
+  background: rgb(154 143 240 / 0.08);
+}
+
+.chip-seed {
+  color: var(--seed);
+  border-color: var(--seed-dim);
+  background: rgb(61 207 192 / 0.08);
+}
+
+.btn-mini {
+  padding: 4px 12px;
+  border-radius: 7px;
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.btn-accept {
+  background: var(--seed);
+  color: var(--ink);
+}
+
+.btn-decline {
+  border: 1px solid var(--rule);
+  color: var(--mute);
+}
