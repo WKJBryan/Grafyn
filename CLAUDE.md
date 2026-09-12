@@ -191,6 +191,10 @@ Streaming commands: `send_prompt`, `start_debate`, `continue_debate`, `add_model
 
 **Canvas response costs and caching:** OpenRouter's final streaming usage chunk provides the exact `cost_usd` persisted on each `ModelResponse` and `DebateResponse`; legacy sessions have no cost and show no label. Canvas OpenRouter requests include a stable session-and-model identifier so OpenRouter can apply compatible provider-side prompt caching to follow-up context without changing model routing.
 
+### Development-Only Canvas Persona Evaluation
+
+Canvas cognitive-fit and UI-simplicity evaluation is external development tooling, not a product or Twin feature. The approved design uses Computer Use as the primary persona driver against the real Grafyn window, a development-only interaction recorder for evidence and heat maps, and Playwright for deterministic fixtures and post-change regression checks. Persona runs use temporary owned data roots and deterministic model fixtures; they must never write simulated behavior into the real vault, Twin records, decision outcomes, Constitution, or production feedback paths. Treat interaction heat maps as click/navigation evidence, not eye tracking or population telemetry. See `docs/superpowers/specs/2026-09-12-canvas-persona-usability-harness-design.md`.
+
 ### Twin Identity, Constitution, And Decision Mirror
 
 Twin context mode is a native RAG path, not model-weight training. `frontend/src-tauri/src/commands/canvas/context.rs` assembles the model-facing prompt through `build_twin_context_prompt()`.
