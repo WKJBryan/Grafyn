@@ -39,6 +39,38 @@ describe('PromptDialog', () => {
     expect(wrapper.find('#contextMode option[value="knowledge_search"]').text()).toContain('Vault Notes')
   })
 
+  it('describes knowledge search as full branch then summary with notes only when needed', async () => {
+    const wrapper = mountDialog()
+
+    await wrapper.find('#contextMode').setValue('knowledge_search')
+
+    expect(wrapper.find('.context-mode-hint').text()).toBe(
+      'Full branch until it gets long, then a summary; notes only if this hop needs them.'
+    )
+  })
+
+  it('describes compact as summarizing the branch now even if short', async () => {
+    const wrapper = mountDialog({
+      branchContext: { parentTileId: 'tile-1', parentModelId: 'openai/gpt-4o', parentContent: 'prior' }
+    })
+
+    await wrapper.find('#contextMode').setValue('compact')
+
+    expect(wrapper.find('.context-mode-hint').text()).toBe(
+      'Summarize the branch now, even if it is short.'
+    )
+  })
+
+  it('keeps twin meaning and names session memory as the branch dream', async () => {
+    const wrapper = mountDialog()
+
+    await wrapper.find('#contextMode').setValue('twin')
+
+    expect(wrapper.find('.context-mode-hint').text()).toBe(
+      'Retrieves relevant notes plus approved user records and relevant candidate records from Twin Review. Session memory is the branch dream when one exists.'
+    )
+  })
+
   it('shows Twin context mode and emits simulation mode by default', async () => {
     const wrapper = mountDialog({ twinLlmProvider: 'ollama', ollamaModel: 'llama3.1:8b' })
 

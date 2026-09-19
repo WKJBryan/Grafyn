@@ -51,7 +51,8 @@ const { store, getOpenRouterStatus, getStatus, getSettings, updateSettings, list
       approved_user_records: { count: 1 },
       candidate_user_records: { count: 0 },
       rejected_user_records: { count: 0 }
-    })
+    }),
+    setToolbarBranchKey: vi.fn()
   },
   getOpenRouterStatus: vi.fn(),
   getStatus: vi.fn(),
@@ -64,9 +65,13 @@ const { store, getOpenRouterStatus, getStatus, getSettings, updateSettings, list
   toastError: vi.fn()
 }))
 
-vi.mock('@/stores/canvas', () => ({
-  useCanvasStore: () => store
-}))
+vi.mock('@/stores/canvas', async () => {
+  const actual = await vi.importActual('@/stores/canvas')
+  return {
+    ...actual,
+    useCanvasStore: () => store
+  }
+})
 
 vi.mock('@/api/client', () => ({
   settings: {
@@ -304,6 +309,40 @@ describe('CanvasContainer', () => {
     saveConstitutionSetup.mockResolvedValue({})
     toastSuccess.mockReset()
     toastError.mockReset()
+  })
+
+  it('hides the Memory chip when branch_memories has no dream, even if working_memory.summary is set', async () => {
+    getOpenRouterStatus.mockResolvedValue({ has_key: true, is_configured: true })
+    store.currentSession = {
+      ...store.currentSession,
+      working_memory: { summary: 'stale session field', version: 4 },
+      branch_memories: {}
+    }
+
+    const wrapper = mountContainer()
+    await flushPromises()
+
+    expect(wrapper.find('.toolbar-stats').text()).not.toContain('Memory')
+  })
+
+  it('shows the Memory chip for the most recently updated non-empty branch dream', async () => {
+    getOpenRouterStatus.mockResolvedValue({ has_key: true, is_configured: true })
+    store.currentSession = {
+      ...store.currentSession,
+      working_memory: { summary: '', version: 0 },
+      branch_memories: {
+        'tile-1::openai/gpt-4o': {
+          version: 3,
+          goal: 'Choose a school',
+          updated_at: '2026-09-19T12:00:00Z'
+        }
+      }
+    }
+
+    const wrapper = mountContainer()
+    await flushPromises()
+
+    expect(wrapper.find('.toolbar-stats').text()).toContain('Memory · v3')
   })
 
   it('surfaces a toast when loadModels fails on mount, instead of leaving PromptDialog with no models and no explanation', async () => {

@@ -15,6 +15,39 @@ export const THINK_HARDER_SYSTEM_PROMPT = [
   'Return the improved answer directly and call out any remaining uncertainty briefly.'
 ].join(' ')
 
+export function branchMemoryKey(tileId, modelId) {
+  return `${tileId}::${modelId}`
+}
+
+export function isNonEmptyDream(memory) {
+  if (!memory) return false
+  const textFields = [memory.goal, memory.discussed, memory.nuances, memory.summary, memory.question]
+  if (textFields.some(value => typeof value === 'string' && value.trim())) return true
+  return [memory.constraints, memory.open_questions, memory.decisions, memory.tried, memory.model_positions]
+    .some(list => Array.isArray(list) && list.length > 0)
+}
+
+export function mostRecentBranchKey(branchMemories) {
+  let bestKey = null
+  let bestTs = ''
+  for (const [key, memory] of Object.entries(branchMemories || {})) {
+    const ts = memory?.updated_at || ''
+    if (bestKey === null || ts > bestTs) {
+      bestKey = key
+      bestTs = ts
+    }
+  }
+  return bestKey
+}
+
+export function resolveToolbarMemory(branchMemories, selectedKey = null) {
+  const memories = branchMemories || {}
+  const key = selectedKey || mostRecentBranchKey(memories)
+  if (!key) return null
+  const memory = memories[key]
+  return isNonEmptyDream(memory) ? memory : null
+}
+
 export const useCanvasStore = defineStore('canvas', () => {
   // State
   const sessions = ref([])
@@ -143,7 +176,8 @@ export const useCanvasStore = defineStore('canvas', () => {
         retrieval_cues: [],
         needs_vault: null,
         compacted_turn_count: 0
-      }
+      },
+      branch_memories: session.branch_memories || {}
     }
   }
 
@@ -217,15 +251,38 @@ export const useCanvasStore = defineStore('canvas', () => {
       viewport: currentSession.value.viewport ?? fetched.viewport,
       prompt_tiles: mergedTiles,
       debates: mergedDebates,
-      working_memory: fetched.working_memory || currentSession.value.working_memory
+      working_memory: fetched.working_memory || currentSession.value.working_memory,
+      branch_memories: {
+        ...(currentSession.value.branch_memories || {}),
+        ...(fetched.branch_memories || {})
+      }
     }
   }
 
+  const toolbarBranchKey = ref(null)
+
+  function setToolbarBranchKey(key) {
+    toolbarBranchKey.value = key || null
+  }
+
+  const toolbarMemory = computed(() =>
+    resolveToolbarMemory(currentSession.value?.branch_memories, toolbarBranchKey.value)
+  )
+
   function applyWorkingMemoryUpdate(data) {
     if (!currentSession.value || currentSession.value.id !== data.session_id) return
+    if (!data.branch_key) return
+
+    const branchMemories = {
+      ...(currentSession.value.branch_memories || {}),
+      [data.branch_key]: data.working_memory
+    }
+    const isToolbarSubject = !toolbarBranchKey.value || data.branch_key === toolbarBranchKey.value
+
     currentSession.value = {
       ...currentSession.value,
-      working_memory: data.working_memory
+      branch_memories: branchMemories,
+      ...(isToolbarSubject ? { working_memory: data.working_memory } : {})
     }
   }
 
@@ -1360,6 +1417,7 @@ export const useCanvasStore = defineStore('canvas', () => {
     error,
     streamingModels,
     debateStreamingContent,
+    toolbarMemory,
     // Getters
     promptTiles,
     debates,
@@ -1375,6 +1433,8 @@ export const useCanvasStore = defineStore('canvas', () => {
     updateSession,
     deleteSession,
     loadModels,
+    applyWorkingMemoryUpdate,
+    setToolbarBranchKey,
     sendPrompt,
     updateTilePosition,
     updateLLMNodePosition,

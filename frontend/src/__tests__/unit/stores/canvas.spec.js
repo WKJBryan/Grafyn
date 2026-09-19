@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { flushPromises } from '@vue/test-utils'
 import { createPinia, setActivePinia } from 'pinia'
-import { useCanvasStore, THINK_HARDER_PROMPT, THINK_HARDER_WEB_SEARCH_MAX_RESULTS } from '@/stores/canvas'
+import { useCanvasStore, THINK_HARDER_PROMPT, THINK_HARDER_WEB_SEARCH_MAX_RESULTS, resolveToolbarMemory } from '@/stores/canvas'
 import * as apiClient from '@/api/client'
 
 const listenMock = vi.fn()
@@ -763,6 +763,7 @@ describe('Canvas Store', () => {
       error: 'No response returned from model',
       error_message: 'No response returned from model'
     })
+    expect(store.currentSession.branch_memories).toEqual({})
   })
 
   it('deleteTile removes the full descendant tree from the current session', async () => {
@@ -1090,6 +1091,222 @@ describe('Canvas Store', () => {
     broadcast({ session_id: 'session-A', type: 'complete', tile_id: 'tile-A1', model_id: 'openai/gpt-4' })
     await promise
     expect(store.streamingModels.size).toBe(0)
+  })
+
+  it('loadSession keeps persisted branch_memories as the source of truth', async () => {
+    vi.spyOn(apiClient.canvas, 'get').mockResolvedValue({
+      id: 'session-1',
+      prompt_tiles: [
+        {
+          id: 'tile-1',
+          prompt: 'Hello',
+          responses: {
+            'openai/gpt-4': {
+              status: 'completed',
+              content: 'Hi',
+              position: { x: 0, y: 0, width: 280, height: 200 }
+            }
+          }
+        }
+      ],
+      debates: [],
+      branch_memories: {
+        'tile-1::openai/gpt-4': {
+          version: 2,
+          goal: 'Stay on the parent branch',
+          discussed: 'We compared two schools',
+          nuances: 'Cost still open',
+          updated_at: '2026-09-19T00:00:00Z'
+        }
+      }
+    })
+
+    const store = useCanvasStore()
+    await store.loadSession('session-1')
+
+    expect(store.currentSession.branch_memories['tile-1::openai/gpt-4']).toMatchObject({
+      version: 2,
+      goal: 'Stay on the parent branch',
+      discussed: 'We compared two schools'
+    })
+  })
+
+  it('applyWorkingMemoryUpdate writes sibling keys and does not overwrite the toolbar subject', () => {
+    const store = useCanvasStore()
+    const memoryA = {
+      version: 1,
+      goal: 'A dream',
+      summary: 'A',
+      updated_at: '2026-09-19T00:00:00Z'
+    }
+    const memoryB = {
+      version: 1,
+      goal: 'B dream',
+      summary: 'B',
+      updated_at: '2026-09-19T01:00:00Z'
+    }
+
+    store.currentSession = {
+      id: 'session-1',
+      prompt_tiles: [],
+      debates: [],
+      working_memory: memoryA,
+      branch_memories: {
+        'tile-1::model-a': memoryA
+      }
+    }
+    store.setToolbarBranchKey('tile-1::model-a')
+
+    store.applyWorkingMemoryUpdate({
+      session_id: 'session-1',
+      branch_key: 'tile-1::model-b',
+      working_memory: memoryB
+    })
+
+    expect(store.currentSession.branch_memories['tile-1::model-a']).toMatchObject({ goal: 'A dream' })
+    expect(store.currentSession.branch_memories['tile-1::model-b']).toMatchObject({ goal: 'B dream' })
+    expect(store.currentSession.working_memory.goal).toBe('A dream')
+
+    store.applyWorkingMemoryUpdate({
+      session_id: 'session-1',
+      branch_key: 'tile-1::model-a',
+      working_memory: { ...memoryA, goal: 'A updated', version: 2 }
+    })
+
+    expect(store.currentSession.working_memory.goal).toBe('A updated')
+    expect(store.currentSession.branch_memories['tile-1::model-a'].goal).toBe('A updated')
+    expect(store.currentSession.branch_memories['tile-1::model-b'].goal).toBe('B dream')
+
+    store.setToolbarBranchKey(null)
+    store.applyWorkingMemoryUpdate({
+      session_id: 'session-1',
+      branch_key: 'tile-1::model-b',
+      working_memory: { ...memoryB, goal: 'B is now the toolbar subject' }
+    })
+    expect(store.currentSession.working_memory.goal).toBe('B is now the toolbar subject')
+  })
+
+  it('applyWorkingMemoryUpdate ignores events for a different session and empty branch_key', () => {
+    const store = useCanvasStore()
+    store.currentSession = {
+      id: 'session-1',
+      prompt_tiles: [],
+      debates: [],
+      working_memory: { goal: 'keep' },
+      branch_memories: {}
+    }
+
+    store.applyWorkingMemoryUpdate({
+      session_id: 'session-other',
+      branch_key: 'tile-1::model-a',
+      working_memory: { goal: 'other' }
+    })
+    store.applyWorkingMemoryUpdate({
+      session_id: 'session-1',
+      branch_key: '',
+      working_memory: { goal: 'no-key' }
+    })
+
+    expect(store.currentSession.branch_memories).toEqual({})
+    expect(store.currentSession.working_memory.goal).toBe('keep')
+  })
+
+  it('mergeSavedSession keeps local branch_memories and overlays fetched keys', async () => {
+    const handlers = []
+    listenMock.mockImplementation(async (_eventName, handler) => {
+      handlers.push(handler)
+      return unlistenMock
+    })
+    function broadcast(payload) {
+      handlers.slice().forEach(handler => handler({ payload }))
+    }
+
+    let resolveGet
+    vi.spyOn(apiClient.canvas, 'get').mockImplementation(() => new Promise(resolve => {
+      resolveGet = resolve
+    }))
+    vi.spyOn(apiClient.canvas, 'sendPrompt').mockImplementation(async () => {
+      broadcast({
+        session_id: 'session-1',
+        type: 'tile_created',
+        tile: {
+          id: 'tile-1',
+          prompt: 'Hello',
+          position: { x: 0, y: 0, width: 200, height: 120 },
+          responses: {
+            'openai/gpt-4': { status: 'pending', content: '', position: { x: 300, y: 0, width: 280, height: 200 } }
+          }
+        }
+      })
+      return 'tile-1'
+    })
+
+    const store = useCanvasStore()
+    store.currentSession = {
+      id: 'session-1',
+      prompt_tiles: [],
+      debates: [],
+      branch_memories: {
+        'tile-local::model-a': { goal: 'local only', updated_at: '2026-09-19T00:00:00Z' }
+      }
+    }
+
+    const promise = store.sendPrompt('Hello', ['openai/gpt-4'])
+    await flushPromises()
+    broadcast({ session_id: 'session-1', type: 'session_saved' })
+    await flushPromises()
+
+    resolveGet({
+      id: 'session-1',
+      prompt_tiles: [
+        {
+          id: 'tile-1',
+          prompt: 'Hello',
+          position: { x: 0, y: 0, width: 200, height: 120 },
+          responses: {
+            'openai/gpt-4': { status: 'pending', content: '', position: { x: 300, y: 0, width: 280, height: 200 } }
+          }
+        }
+      ],
+      debates: [],
+      branch_memories: {
+        'tile-fetched::model-b': { goal: 'from disk', updated_at: '2026-09-19T01:00:00Z' }
+      }
+    })
+    await flushPromises()
+
+    expect(store.currentSession.branch_memories['tile-local::model-a'].goal).toBe('local only')
+    expect(store.currentSession.branch_memories['tile-fetched::model-b'].goal).toBe('from disk')
+
+    broadcast({ session_id: 'session-1', type: 'complete', tile_id: 'tile-1', model_id: 'openai/gpt-4' })
+    await promise
+  })
+
+  it('resolveToolbarMemory hides empty dreams and prefers the selected branch key', () => {
+    const memories = {
+      'tile-1::model-a': {
+        goal: 'Selected dream',
+        updated_at: '2026-09-19T00:00:00Z'
+      },
+      'tile-1::model-b': {
+        goal: 'Newer dream',
+        updated_at: '2026-09-19T02:00:00Z'
+      },
+      'tile-1::model-empty': {
+        goal: '',
+        summary: '',
+        updated_at: '2026-09-19T03:00:00Z'
+      }
+    }
+
+    expect(resolveToolbarMemory(memories, 'tile-1::model-a').goal).toBe('Selected dream')
+    expect(resolveToolbarMemory({
+      'tile-1::model-a': memories['tile-1::model-a'],
+      'tile-1::model-b': memories['tile-1::model-b']
+    }, null).goal).toBe('Newer dream')
+    expect(resolveToolbarMemory(memories, 'tile-1::model-empty')).toBeNull()
+    expect(resolveToolbarMemory(memories, null)).toBeNull()
+    expect(resolveToolbarMemory({}, null)).toBeNull()
   })
 
   it('exportTwinData proxies export requests to the twin API', async () => {
