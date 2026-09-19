@@ -59,11 +59,12 @@ pub async fn send_prompt(
         )?
     };
     request.models = effective_model_ids(&model_route, &request.models);
-    let session = {
+    let mut session = {
         let mut store = state.canvas_store.write().await;
         store.get_session(&session_id).map_err(|e| e.to_string())?
     };
-    let resolved_context = resolve_prompt_context(state.inner(), &session, &request).await?;
+    let resolved_context =
+        resolve_prompt_context(state.inner(), &mut session, &request, Some(&window)).await?;
     let decision_episode_id = if request.prompt_type == PromptType::Decision {
         Some(uuid::Uuid::new_v4().to_string())
     } else {
@@ -519,7 +520,7 @@ pub async fn add_models_to_tile(
 ) -> Result<(), String> {
     // Get the tile's prompt
     let mut store = state.canvas_store.write().await;
-    let session = store.get_session(&session_id).map_err(|e| e.to_string())?;
+    let mut session = store.get_session(&session_id).map_err(|e| e.to_string())?;
     drop(store);
 
     let tile = session
@@ -539,7 +540,8 @@ pub async fn add_models_to_tile(
     };
     let model_ids = effective_model_ids(&model_route, &request.model_ids);
     let prompt_request = prompt_request_from_tile(&tile, model_ids.clone(), 0.7);
-    let resolved_context = resolve_prompt_context(state.inner(), &session, &prompt_request).await?;
+    let resolved_context =
+        resolve_prompt_context(state.inner(), &mut session, &prompt_request, Some(&window)).await?;
 
     let now = Utc::now();
 
@@ -800,14 +802,15 @@ pub async fn regenerate_response(
 ) -> Result<(), String> {
     // Get the tile's prompt
     let mut store = state.canvas_store.write().await;
-    let session = store.get_session(&session_id).map_err(|e| e.to_string())?;
+    let mut session = store.get_session(&session_id).map_err(|e| e.to_string())?;
     drop(store);
 
     let tile = session
         .prompt_tiles
         .iter()
         .find(|t| t.id == tile_id)
-        .ok_or_else(|| "Tile not found".to_string())?;
+        .ok_or_else(|| "Tile not found".to_string())?
+        .clone();
 
     let model_route = {
         let settings = state.settings_service.read().await;
@@ -827,8 +830,9 @@ pub async fn regenerate_response(
         return Err("Response not found".to_string());
     }
 
-    let request = prompt_request_from_tile(tile, vec![effective_model_id.clone()], 0.7);
-    let resolved_context = resolve_prompt_context(state.inner(), &session, &request).await?;
+    let request = prompt_request_from_tile(&tile, vec![effective_model_id.clone()], 0.7);
+    let resolved_context =
+        resolve_prompt_context(state.inner(), &mut session, &request, Some(&window)).await?;
 
     // Reset response to streaming
     {

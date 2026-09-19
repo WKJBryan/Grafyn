@@ -3,31 +3,53 @@
 //! Compact mode injects compiled session state plus the last two parent-chain
 //! turns. It does not truncate older turns to a character budget.
 //! KnowledgeSearch, Semantic, and Twin follow-ups send the full parent chain
-//! when estimated conversation tokens are below the compact threshold.
+//! when estimated conversation tokens are below the compact threshold, and
+//! compact on demand into a dreamed document once the chain is at/over it.
 
 use crate::models::canvas::{
     CanvasSession, CanvasStreamEvent, CanvasWorkingMemory, ContextMode, ModelPosition, PromptRequest,
 };
 use crate::models::twin::TraceEventType;
-use crate::services::canvas_store::CanvasStore;
-use crate::services::ollama::OllamaService;
-use crate::services::openrouter::{ChatMessage, OpenRouterService};
-use crate::services::settings::SettingsService;
-use crate::services::twin::TwinStore;
+use crate::services::openrouter::ChatMessage;
+use crate::AppState;
 use chrono::Utc;
 use serde_json::{json, Value};
 use std::collections::HashSet;
-use std::sync::Arc;
-use tokio::sync::RwLock;
+use std::time::Duration;
 
 pub(super) const COMPACT_HISTORY_RECENT_TURNS: usize = 2;
 const WORKING_MEMORY_TOKEN_BUDGET: usize = 800;
+const COMPACT_LLM_TIMEOUT: Duration = Duration::from_secs(60);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CompactAction {
+    Skipped,
+    Reused,
+    Compiled,
+    Failed,
+}
+
+struct CompactCompile {
+    user_prompt: String,
+    previous: CanvasWorkingMemory,
+    branch_key: String,
+    chain_len: usize,
+    parent_tile_id: String,
+    parent_model_id: String,
+}
+
+enum CompactDecision {
+    Skip,
+    Reuse,
+    Compile(Box<CompactCompile>),
+}
 
 #[derive(Debug, Clone)]
 pub(super) struct ConversationTurn {
+    pub(super) tile_id: String,
     pub(super) prompt: String,
     pub(super) response: String,
-    pub(super) _model_id: String,
+    pub(super) model_id: String,
 }
 
 pub(super) fn branch_memory_key(tile_id: &str, model_id: &str) -> String {
@@ -105,7 +127,7 @@ pub(super) fn build_canvas_messages_with_threshold(
                 if conversation_tokens(&turns) < compact_token_threshold {
                     Ok(turns_to_messages(turns, &request.prompt, None))
                 } else {
-                    // Task 4 replaces this last-2 stub with dream + last 2.
+                    // Dream is injected via compose_system_prompt; messages keep last 2.
                     let recent = recent_turns(&turns);
                     Ok(turns_to_messages(recent.to_vec(), &request.prompt, None))
                 }
@@ -437,9 +459,10 @@ pub(super) fn build_selected_parent_chain(
         })?;
 
         turns.push(ConversationTurn {
+            tile_id: tile_id.clone(),
             prompt: tile.prompt.clone(),
             response: response.content.clone(),
-            _model_id: model_id.clone(),
+            model_id: model_id.clone(),
         });
 
         match (&tile.parent_tile_id, &tile.parent_model_id) {
@@ -494,148 +517,6 @@ fn estimate_tokens(text: &str) -> usize {
     text.split_whitespace().count() * 4 / 3 + 1
 }
 
-// Kept for Task 4 branch-dream compile; not called from streaming completion.
-#[allow(dead_code)]
-pub(super) fn spawn_working_memory_compile(
-    window: tauri::Window,
-    session_id: String,
-    tile_id: String,
-    model_id: String,
-    canvas_store: Arc<RwLock<CanvasStore>>,
-    twin_store: Arc<RwLock<TwinStore>>,
-    openrouter: Arc<RwLock<OpenRouterService>>,
-    ollama: Arc<RwLock<OllamaService>>,
-    settings: Arc<RwLock<SettingsService>>,
-) {
-    tauri::async_runtime::spawn(async move {
-        if let Err(error) = compile_session_working_memory(
-            window,
-            session_id,
-            tile_id,
-            model_id,
-            canvas_store,
-            twin_store,
-            openrouter,
-            ollama,
-            settings,
-        )
-        .await
-        {
-            log::warn!("Canvas working-memory compile failed: {error}");
-        }
-    });
-}
-
-#[allow(dead_code)]
-async fn compile_session_working_memory(
-    window: tauri::Window,
-    session_id: String,
-    tile_id: String,
-    model_id: String,
-    canvas_store: Arc<RwLock<CanvasStore>>,
-    twin_store: Arc<RwLock<TwinStore>>,
-    openrouter: Arc<RwLock<OpenRouterService>>,
-    ollama: Arc<RwLock<OllamaService>>,
-    settings: Arc<RwLock<SettingsService>>,
-) -> Result<(), String> {
-    let session = {
-        let mut store = canvas_store.write().await;
-        store.get_session(&session_id).map_err(|e| e.to_string())?
-    };
-    let branch_key = branch_memory_key(&tile_id, &model_id);
-    let previous = session
-        .branch_memories
-        .get(&branch_key)
-        .cloned()
-        .unwrap_or_default();
-    if previous.compiled_from_tile_id.as_deref() == Some(tile_id.as_str()) && !previous.is_empty()
-    {
-        return Ok(());
-    }
-
-    let compile_user = build_compile_user_prompt(&session, &tile_id, &model_id);
-    let settings_snapshot = settings.read().await.get().clone();
-    let use_ollama = settings_snapshot.twin_llm_provider.eq_ignore_ascii_case("ollama");
-
-    let raw = if use_ollama {
-        let model = settings_snapshot.ollama_model.trim();
-        if model.is_empty() {
-            return Err("Select an Ollama model before compiling session memory".to_string());
-        }
-        let ollama = ollama.read().await;
-        ollama
-            .chat(
-                model,
-                vec![ChatMessage {
-                    role: "user".to_string(),
-                    content: compile_user,
-                }],
-                Some(COMPILE_SYSTEM_PROMPT),
-                Some(0.2),
-            )
-            .await
-            .map_err(|e| e.to_string())?
-    } else {
-        let model = settings_snapshot.llm_model.trim();
-        if model.is_empty() {
-            return Err("No compile model configured".to_string());
-        }
-        let openrouter = openrouter.read().await;
-        openrouter
-            .chat(
-                model,
-                vec![ChatMessage {
-                    role: "user".to_string(),
-                    content: compile_user,
-                }],
-                Some(COMPILE_SYSTEM_PROMPT),
-                Some(0.2),
-                Some(800),
-                Some("none"),
-                false,
-                0,
-            )
-            .await
-            .map_err(|e| e.to_string())?
-    };
-
-    let compiled = parse_working_memory_response(&raw, &previous, Some(tile_id.clone()));
-    if compiled.is_empty() {
-        return Ok(());
-    }
-
-    {
-        let mut store = canvas_store.write().await;
-        store
-            .update_branch_memory(&session_id, &branch_key, compiled.clone())
-            .map_err(|e| e.to_string())?;
-    }
-
-    let _ = window.emit(
-        "canvas-stream",
-        CanvasStreamEvent::WorkingMemoryUpdated {
-            session_id: session_id.clone(),
-            working_memory: compiled.clone(),
-            branch_key: String::new(),
-        },
-    );
-
-    let mut twin = twin_store.write().await;
-    let _ = twin.append_trace_event(
-        &session_id,
-        TraceEventType::WorkingMemoryCompiled,
-        json!({
-            "tile_id": tile_id,
-            "model_id": model_id,
-            "version": compiled.version,
-            "summary": compiled.summary.chars().take(240).collect::<String>(),
-        }),
-    );
-
-    Ok(())
-}
-
-#[allow(dead_code)]
 const COMPILE_SYSTEM_PROMPT: &str = "\
 You compile a short working-memory document for a multi-model canvas session. \
 Return ONLY JSON with keys: goal, discussed, nuances, retrieval_cues, needs_vault, \
@@ -644,27 +525,341 @@ model_positions is an array of {model_id, stance}. retrieval_cues is an array of
 needs_vault is true/false/null. Keep discussed under 120 words. Do not invent facts. \
 Do not write constitution or identity claims.";
 
-#[allow(dead_code)]
-fn build_compile_user_prompt(session: &CanvasSession, tile_id: &str, model_id: &str) -> String {
+pub(super) fn compact_branch_memory(
+    session: &mut CanvasSession,
+    request: &PromptRequest,
+    threshold: usize,
+    compile: impl FnOnce(&str) -> Result<String, String>,
+) -> CompactAction {
+    match prepare_branch_compact(session, request, threshold) {
+        CompactDecision::Skip => CompactAction::Skipped,
+        CompactDecision::Reuse => CompactAction::Reused,
+        CompactDecision::Compile(plan) => match compile(&plan.user_prompt) {
+            Ok(raw) => match apply_compact_compile(
+                session,
+                &plan.previous,
+                &raw,
+                &plan.branch_key,
+                plan.chain_len,
+                &plan.parent_tile_id,
+            ) {
+                Ok(_) => CompactAction::Compiled,
+                Err(error) => {
+                    log::warn!("Canvas compact parse failed: {error}");
+                    CompactAction::Failed
+                }
+            },
+            Err(error) => {
+                log::warn!("Canvas working-memory compact failed: {error}");
+                CompactAction::Failed
+            }
+        },
+    }
+}
+
+pub(super) fn build_canvas_messages_after_compact(
+    session: &CanvasSession,
+    request: &PromptRequest,
+    threshold: usize,
+    action: CompactAction,
+) -> Result<Vec<ChatMessage>, String> {
+    if action == CompactAction::Failed
+        && request.parent_debate_id.is_none()
+        && matches!(
+            request.context_mode,
+            ContextMode::KnowledgeSearch
+                | ContextMode::Semantic
+                | ContextMode::Twin
+                | ContextMode::Compact
+        )
+        && request.parent_tile_id.is_some()
+        && request.parent_model_id.is_some()
+    {
+        let turns = build_selected_parent_chain(session, request)?;
+        let tail = turns_fitting_threshold(&turns, threshold);
+        return Ok(turns_to_messages(tail, &request.prompt, None));
+    }
+    build_canvas_messages_with_threshold(session, request, threshold)
+}
+
+pub(super) async fn compact_branch_memory_live(
+    state: &AppState,
+    session: &mut CanvasSession,
+    request: &PromptRequest,
+    threshold: usize,
+    window: Option<&tauri::Window>,
+) -> CompactAction {
+    match prepare_branch_compact(session, request, threshold) {
+        CompactDecision::Skip => CompactAction::Skipped,
+        CompactDecision::Reuse => CompactAction::Reused,
+        CompactDecision::Compile(plan) => match compile_dream_with_llm(state, &plan.user_prompt).await {
+            Ok(raw) => match apply_compact_compile(
+                session,
+                &plan.previous,
+                &raw,
+                &plan.branch_key,
+                plan.chain_len,
+                &plan.parent_tile_id,
+            ) {
+                Ok(memory) => {
+                    persist_compacted_memory(
+                        state,
+                        window,
+                        session,
+                        &plan.branch_key,
+                        &memory,
+                        &plan.parent_tile_id,
+                        &plan.parent_model_id,
+                    )
+                    .await;
+                    CompactAction::Compiled
+                }
+                Err(error) => {
+                    log::warn!("Canvas compact parse failed: {error}");
+                    CompactAction::Failed
+                }
+            },
+            Err(error) => {
+                log::warn!("Canvas working-memory compact failed: {error}");
+                CompactAction::Failed
+            }
+        },
+    }
+}
+
+fn prepare_branch_compact(
+    session: &CanvasSession,
+    request: &PromptRequest,
+    threshold: usize,
+) -> CompactDecision {
+    if request.parent_debate_id.is_some() {
+        return CompactDecision::Skip;
+    }
+    if !matches!(
+        request.context_mode,
+        ContextMode::Compact
+            | ContextMode::KnowledgeSearch
+            | ContextMode::Semantic
+            | ContextMode::Twin
+    ) {
+        return CompactDecision::Skip;
+    }
+    let (Some(parent_tile_id), Some(parent_model_id)) =
+        (&request.parent_tile_id, &request.parent_model_id)
+    else {
+        return CompactDecision::Skip;
+    };
+    let Ok(chain) = build_selected_parent_chain(session, request) else {
+        return CompactDecision::Skip;
+    };
+    let force = request.context_mode == ContextMode::Compact;
+    if !force && conversation_tokens(&chain) < threshold {
+        return CompactDecision::Skip;
+    }
+    let branch_key = branch_memory_key(parent_tile_id, parent_model_id);
     let previous = session
         .branch_memories
-        .get(&branch_memory_key(tile_id, model_id))
+        .get(&branch_key)
         .cloned()
         .unwrap_or_default();
+    if covering_dream_reusable(&previous, &chain, threshold) {
+        return CompactDecision::Reuse;
+    }
+    CompactDecision::Compile(Box::new(CompactCompile {
+        user_prompt: build_compact_user_prompt(&previous, &chain),
+        previous,
+        branch_key,
+        chain_len: chain.len(),
+        parent_tile_id: parent_tile_id.clone(),
+        parent_model_id: parent_model_id.clone(),
+    }))
+}
+
+fn covering_dream_reusable(
+    memory: &CanvasWorkingMemory,
+    chain: &[ConversationTurn],
+    threshold: usize,
+) -> bool {
+    if memory.is_empty() {
+        return false;
+    }
+    let covered_needed = chain.len().saturating_sub(COMPACT_HISTORY_RECENT_TURNS);
+    if (memory.compacted_turn_count as usize) < covered_needed {
+        return false;
+    }
+    let after = turns_after_compiled_from(chain, memory.compiled_from_tile_id.as_deref());
+    estimate_dream_tokens(memory) + conversation_tokens(after) < threshold
+}
+
+fn estimate_dream_tokens(memory: &CanvasWorkingMemory) -> usize {
+    format_working_memory_for_prompt(memory)
+        .map(|text| estimate_tokens(&text))
+        .unwrap_or(0)
+}
+
+fn turns_after_compiled_from<'a>(
+    chain: &'a [ConversationTurn],
+    compiled_from_tile_id: Option<&str>,
+) -> &'a [ConversationTurn] {
+    let Some(from_id) = compiled_from_tile_id else {
+        return chain;
+    };
+    match chain.iter().position(|turn| turn.tile_id == from_id) {
+        Some(idx) if idx + 1 < chain.len() => &chain[idx + 1..],
+        Some(_) => &[],
+        None => chain,
+    }
+}
+
+fn turns_fitting_threshold(turns: &[ConversationTurn], threshold: usize) -> Vec<ConversationTurn> {
+    if turns.is_empty() {
+        return Vec::new();
+    }
+    let mut start = turns.len();
+    let mut tokens = 0;
+    while start > 0 {
+        let turn = &turns[start - 1];
+        let cost = estimate_tokens(&turn.prompt) + estimate_tokens(&turn.response);
+        if tokens + cost > threshold && start < turns.len() {
+            break;
+        }
+        tokens += cost;
+        start -= 1;
+    }
+    turns[start..].to_vec()
+}
+
+fn build_compact_user_prompt(previous: &CanvasWorkingMemory, chain: &[ConversationTurn]) -> String {
     let mut body = String::from("Previous working memory JSON for this branch only:\n");
-    body.push_str(&serde_json::to_string_pretty(&previous).unwrap_or_else(|_| "{}".to_string()));
+    body.push_str(&serde_json::to_string_pretty(previous).unwrap_or_else(|_| "{}".to_string()));
     body.push('\n');
 
-    if let Some(tile) = session.prompt_tiles.iter().find(|tile| tile.id == tile_id) {
-        body.push_str("\nLatest prompt:\n");
-        body.push_str(&tile.prompt);
-        if let Some(response) = tile.responses.get(model_id) {
-            body.push_str(&format!("\nThis model's answer ({model_id}):\n{}\n", response.content));
-        }
-        body.push_str("\nDo not include sibling models on the same prompt.\n");
+    let incremental = turns_after_compiled_from(chain, previous.compiled_from_tile_id.as_deref());
+    let (label, turns) = if previous.compiled_from_tile_id.is_some() && !incremental.is_empty() {
+        ("Turns since last compile:", incremental)
+    } else {
+        ("Full parent chain:", chain)
+    };
+    body.push('\n');
+    body.push_str(label);
+    body.push('\n');
+    for turn in turns {
+        body.push_str(&format!(
+            "\nPrompt:\n{}\nAnswer ({}):\n{}\n",
+            turn.prompt, turn.model_id, turn.response
+        ));
     }
-
     body
+}
+
+fn apply_compact_compile(
+    session: &mut CanvasSession,
+    previous: &CanvasWorkingMemory,
+    raw: &str,
+    branch_key: &str,
+    chain_len: usize,
+    parent_tile_id: &str,
+) -> Result<CanvasWorkingMemory, String> {
+    if extract_memory_json(raw).is_none() {
+        return Err("Compact compile returned no JSON".to_string());
+    }
+    let mut compiled =
+        parse_working_memory_response(raw, previous, Some(parent_tile_id.to_string()));
+    if compiled.is_empty() {
+        return Err("Compact compile produced empty working memory".to_string());
+    }
+    compiled.compacted_turn_count = chain_len as u32;
+    compiled.compiled_from_tile_id = Some(parent_tile_id.to_string());
+    session
+        .branch_memories
+        .insert(branch_key.to_string(), compiled.clone());
+    Ok(compiled)
+}
+
+async fn compile_dream_with_llm(state: &AppState, user_prompt: &str) -> Result<String, String> {
+    let settings = state.settings_service.read().await.get().clone();
+    let use_ollama = settings.twin_llm_provider.eq_ignore_ascii_case("ollama");
+    let messages = vec![ChatMessage {
+        role: "user".to_string(),
+        content: user_prompt.to_string(),
+    }];
+
+    let compile_future = async {
+        if use_ollama {
+            let model = settings.ollama_model.trim();
+            if model.is_empty() {
+                return Err("Select an Ollama model before compiling session memory".to_string());
+            }
+            let ollama = state.ollama.read().await;
+            ollama
+                .chat(model, messages, Some(COMPILE_SYSTEM_PROMPT), Some(0.2))
+                .await
+                .map_err(|e| e.to_string())
+        } else {
+            let model = settings.llm_model.trim();
+            if model.is_empty() {
+                return Err("No compile model configured".to_string());
+            }
+            let openrouter = state.openrouter.read().await;
+            openrouter
+                .chat(
+                    model,
+                    messages,
+                    Some(COMPILE_SYSTEM_PROMPT),
+                    Some(0.2),
+                    Some(800),
+                    Some("none"),
+                    false,
+                    0,
+                )
+                .await
+                .map_err(|e| e.to_string())
+        }
+    };
+
+    match tokio::time::timeout(COMPACT_LLM_TIMEOUT, compile_future).await {
+        Ok(result) => result,
+        Err(_) => Err("Canvas compact timed out".to_string()),
+    }
+}
+
+async fn persist_compacted_memory(
+    state: &AppState,
+    window: Option<&tauri::Window>,
+    session: &CanvasSession,
+    branch_key: &str,
+    memory: &CanvasWorkingMemory,
+    parent_tile_id: &str,
+    parent_model_id: &str,
+) {
+    {
+        let mut store = state.canvas_store.write().await;
+        if let Err(error) = store.update_branch_memory(&session.id, branch_key, memory.clone()) {
+            log::warn!("Failed to persist compacted branch memory: {error}");
+        }
+    }
+    if let Some(window) = window {
+        let _ = window.emit(
+            "canvas-stream",
+            CanvasStreamEvent::WorkingMemoryUpdated {
+                session_id: session.id.clone(),
+                working_memory: memory.clone(),
+                branch_key: branch_key.to_string(),
+            },
+        );
+    }
+    let mut twin = state.twin_store.write().await;
+    let _ = twin.append_trace_event(
+        &session.id,
+        TraceEventType::WorkingMemoryCompiled,
+        json!({
+            "tile_id": parent_tile_id,
+            "model_id": parent_model_id,
+            "version": memory.version,
+            "summary": memory.summary.chars().take(240).collect::<String>(),
+            "branch_key": branch_key,
+        }),
+    );
 }
 
 #[cfg(test)]
@@ -839,9 +1034,10 @@ mod tests {
     #[test]
     fn conversation_tokens_sums_prompt_and_response_estimates() {
         let turns = vec![ConversationTurn {
+            tile_id: "tile-1".to_string(),
             prompt: "Prompt 1".to_string(),
             response: "Response 1".to_string(),
-            _model_id: "openai/gpt-4".to_string(),
+            model_id: "openai/gpt-4".to_string(),
         }];
         assert_eq!(conversation_tokens(&turns), 6);
         assert_eq!(conversation_tokens(&[]), 0);
@@ -1090,5 +1286,147 @@ mod tests {
         assert_eq!(messages[0].content, "Root prompt");
         assert_eq!(messages[1].content, "Root response");
         assert_eq!(messages[4].content, "Final prompt");
+    }
+
+    fn covering_parent_dream() -> CanvasWorkingMemory {
+        CanvasWorkingMemory {
+            version: 3,
+            goal: "Keep this dream".to_string(),
+            discussed: "Covering summary of earlier turns.".to_string(),
+            compiled_from_tile_id: Some("tile-4".to_string()),
+            compacted_turn_count: 4,
+            ..CanvasWorkingMemory::default()
+        }
+    }
+
+    #[test]
+    fn reuse_covering_dream_skips_compile() {
+        let mut session = four_turn_session();
+        session.branch_memories.insert(
+            branch_memory_key("tile-4", "openai/gpt-4"),
+            covering_parent_dream(),
+        );
+        let request = build_request("Prompt 5", "tile-4", "openai/gpt-4", ContextMode::Compact);
+        let calls = std::cell::Cell::new(0);
+        let action = compact_branch_memory(&mut session, &request, 32_000, |_prompt| {
+            calls.set(calls.get() + 1);
+            Ok(r#"{"goal":"should not run"}"#.to_string())
+        });
+        assert_eq!(action, CompactAction::Reused);
+        assert_eq!(calls.get(), 0);
+        let memory = session
+            .branch_memories
+            .get(&branch_memory_key("tile-4", "openai/gpt-4"))
+            .expect("parent dream stays on the parent key");
+        assert_eq!(memory.goal, "Keep this dream");
+        assert_eq!(memory.compacted_turn_count, 4);
+    }
+
+    #[test]
+    fn over_threshold_without_dream_invokes_compile_once() {
+        let mut session = four_turn_session();
+        let request = build_request(
+            "What about the other option?",
+            "tile-4",
+            "openai/gpt-4",
+            ContextMode::KnowledgeSearch,
+        );
+        let calls = std::cell::Cell::new(0);
+        let action = compact_branch_memory(&mut session, &request, 1, |_prompt| {
+            calls.set(calls.get() + 1);
+            Ok(r#"{"goal":"Compacted goal","discussed":"All four turns"}"#.to_string())
+        });
+        assert_eq!(action, CompactAction::Compiled);
+        assert_eq!(calls.get(), 1);
+        let memory = session
+            .branch_memories
+            .get(&branch_memory_key("tile-4", "openai/gpt-4"))
+            .expect("dream is stored on the parent key");
+        assert_eq!(memory.goal, "Compacted goal");
+        assert_eq!(memory.discussed, "All four turns");
+        assert_eq!(memory.compacted_turn_count, 4);
+        assert_eq!(memory.compiled_from_tile_id.as_deref(), Some("tile-4"));
+
+        let composed = compose_system_prompt(&session, &request, None).expect("dream in system");
+        assert!(composed.contains("Compacted goal"));
+        let messages = build_canvas_messages_after_compact(&session, &request, 1, action).unwrap();
+        assert!(!messages.iter().any(|message| message.content.contains("Prompt 1")));
+        assert_eq!(messages[0].content, "Prompt 3");
+        assert_eq!(messages.last().unwrap().content, "What about the other option?");
+    }
+
+    #[test]
+    fn incremental_compile_prompt_contains_previous_goal_and_later_turns_only() {
+        let mut session = four_turn_session();
+        session.branch_memories.insert(
+            branch_memory_key("tile-4", "openai/gpt-4"),
+            CanvasWorkingMemory {
+                goal: "Find a quiet camera".to_string(),
+                discussed: "Compared two bodies.".to_string(),
+                compiled_from_tile_id: Some("tile-2".to_string()),
+                compacted_turn_count: 1,
+                ..CanvasWorkingMemory::default()
+            },
+        );
+        let request = build_request("Prompt 5", "tile-4", "openai/gpt-4", ContextMode::KnowledgeSearch);
+        let captured = std::cell::RefCell::new(String::new());
+        let action = compact_branch_memory(&mut session, &request, 1, |prompt| {
+            captured.replace(prompt.to_string());
+            Ok(r#"{"goal":"Find a quiet camera","discussed":"Updated with later turns"}"#.to_string())
+        });
+        assert_eq!(action, CompactAction::Compiled);
+        let user_prompt = captured.into_inner();
+        assert!(user_prompt.contains("Find a quiet camera"));
+        assert!(user_prompt.contains("Prompt 3"));
+        assert!(user_prompt.contains("Prompt 4"));
+        assert!(
+            !user_prompt.contains("Prompt 1"),
+            "incremental prompt must not resend turns at/before compiled_from_tile_id"
+        );
+        assert!(
+            !user_prompt.contains("Prompt 2"),
+            "turns after compiled_from_tile_id start at the next tile"
+        );
+        let memory = session
+            .branch_memories
+            .get(&branch_memory_key("tile-4", "openai/gpt-4"))
+            .unwrap();
+        assert_eq!(memory.compacted_turn_count, 4);
+        assert_eq!(memory.compiled_from_tile_id.as_deref(), Some("tile-4"));
+    }
+
+    #[test]
+    fn compact_compile_failure_sends_fitting_tail_and_does_not_write() {
+        let mut session = four_turn_session();
+        let request = build_request(
+            "What about the other option?",
+            "tile-4",
+            "openai/gpt-4",
+            ContextMode::KnowledgeSearch,
+        );
+        let action = compact_branch_memory(&mut session, &request, 1, |_prompt| {
+            Err("compile exploded".to_string())
+        });
+        assert_eq!(action, CompactAction::Failed);
+        assert!(session.branch_memories.is_empty());
+        let messages = build_canvas_messages_after_compact(&session, &request, 1, action).unwrap();
+        assert!(!messages.iter().any(|message| message.content.contains("Prompt 1")));
+        assert!(!messages.iter().any(|message| message.content.contains("Prompt 3")));
+        assert_eq!(messages[0].content, "Prompt 4");
+        assert_eq!(messages[1].content, "Response 4");
+        assert_eq!(messages.last().unwrap().content, "What about the other option?");
+    }
+
+    #[test]
+    fn compact_mode_under_threshold_without_dream_invokes_compile() {
+        let mut session = four_turn_session();
+        let request = build_request("Prompt 5", "tile-4", "openai/gpt-4", ContextMode::Compact);
+        let calls = std::cell::Cell::new(0);
+        let action = compact_branch_memory(&mut session, &request, 32_000, |_prompt| {
+            calls.set(calls.get() + 1);
+            Ok(r#"{"goal":"Summarize now","discussed":"Forced compact"}"#.to_string())
+        });
+        assert_eq!(action, CompactAction::Compiled);
+        assert_eq!(calls.get(), 1);
     }
 }

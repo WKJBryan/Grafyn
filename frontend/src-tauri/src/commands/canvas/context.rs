@@ -1,7 +1,7 @@
 use super::shared::ModelProviderRoute;
 use super::working_memory::{
-    build_canvas_messages_with_threshold, compose_system_prompt, format_working_memory_for_prompt,
-    memory_for_follow_up, rewrite_retrieval_query,
+    build_canvas_messages_after_compact, compact_branch_memory_live, compose_system_prompt,
+    format_working_memory_for_prompt, memory_for_follow_up, rewrite_retrieval_query,
 };
 #[cfg(test)]
 use super::working_memory::build_canvas_messages;
@@ -167,14 +167,28 @@ fn should_use_retrieved_notes(
 
 pub(super) async fn resolve_prompt_context(
     state: &AppState,
-    session: &CanvasSession,
+    session: &mut CanvasSession,
     request: &PromptRequest,
+    window: Option<&tauri::Window>,
 ) -> Result<ResolvedPromptContext, String> {
     let compact_token_threshold = {
         let settings = state.settings_service.read().await;
         settings.get().canvas_compact_token_threshold
     };
-    let messages = build_canvas_messages_with_threshold(session, request, compact_token_threshold)?;
+    let compact_action = compact_branch_memory_live(
+        state,
+        session,
+        request,
+        compact_token_threshold,
+        window,
+    )
+    .await;
+    let messages = build_canvas_messages_after_compact(
+        session,
+        request,
+        compact_token_threshold,
+        compact_action,
+    )?;
 
     if request.context_mode == ContextMode::Twin {
         return resolve_twin_prompt_context(state, messages, session, request).await;
