@@ -479,6 +479,8 @@ fn estimate_tokens(text: &str) -> usize {
     text.split_whitespace().count() * 4 / 3 + 1
 }
 
+// Kept for Task 4 branch-dream compile; not called from streaming completion.
+#[allow(dead_code)]
 pub(super) fn spawn_working_memory_compile(
     window: tauri::Window,
     session_id: String,
@@ -509,6 +511,7 @@ pub(super) fn spawn_working_memory_compile(
     });
 }
 
+#[allow(dead_code)]
 async fn compile_session_working_memory(
     window: tauri::Window,
     session_id: String,
@@ -617,6 +620,7 @@ async fn compile_session_working_memory(
     Ok(())
 }
 
+#[allow(dead_code)]
 const COMPILE_SYSTEM_PROMPT: &str = "\
 You compile a short working-memory document for a multi-model canvas session. \
 Return ONLY JSON with keys: goal, discussed, nuances, retrieval_cues, needs_vault, \
@@ -625,6 +629,7 @@ model_positions is an array of {model_id, stance}. retrieval_cues is an array of
 needs_vault is true/false/null. Keep discussed under 120 words. Do not invent facts. \
 Do not write constitution or identity claims.";
 
+#[allow(dead_code)]
 fn build_compile_user_prompt(session: &CanvasSession, tile_id: &str, model_id: &str) -> String {
     let previous = session
         .branch_memories
