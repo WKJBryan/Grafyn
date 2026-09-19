@@ -278,6 +278,10 @@ fn merge_working_memory(
     parsed.version = previous.version.saturating_add(1).max(1);
     parsed.updated_at = Some(Utc::now());
     parsed.compiled_from_tile_id = compiled_from_tile_id.or(parsed.compiled_from_tile_id);
+    // System-managed; compile JSON omits it and serde defaults to 0.
+    if parsed.compacted_turn_count == 0 {
+        parsed.compacted_turn_count = previous.compacted_turn_count;
+    }
     if parsed.question.trim().is_empty() {
         parsed.question = previous.question.clone();
     }
@@ -922,6 +926,23 @@ mod tests {
             ..CanvasWorkingMemory::default()
         };
         assert!(cues_only.is_empty());
+    }
+
+    #[test]
+    fn parse_preserves_previous_compacted_turn_count_when_omitted() {
+        let previous = CanvasWorkingMemory {
+            version: 2,
+            compacted_turn_count: 7,
+            goal: "Prior goal".to_string(),
+            ..CanvasWorkingMemory::default()
+        };
+        let parsed = parse_working_memory_response(
+            r#"{"goal":"Fresh goal","discussed":"Fresh discussed"}"#,
+            &previous,
+            Some("tile-3".to_string()),
+        );
+        assert_eq!(parsed.goal, "Fresh goal");
+        assert_eq!(parsed.compacted_turn_count, 7);
     }
 
     #[test]
