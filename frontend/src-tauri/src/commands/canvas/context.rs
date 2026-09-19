@@ -2,6 +2,7 @@ use super::shared::ModelProviderRoute;
 use super::working_memory::{
     build_canvas_messages_after_compact, compact_branch_memory_live, compose_system_prompt,
     format_working_memory_for_prompt, memory_for_follow_up, rewrite_retrieval_query,
+    should_fetch_vault,
 };
 #[cfg(test)]
 use super::working_memory::build_canvas_messages;
@@ -199,10 +200,11 @@ pub(super) async fn resolve_prompt_context(
         ContextMode::KnowledgeSearch | ContextMode::Semantic
     ) {
         let pinned_ids = session.pinned_note_ids.clone();
-        let retrieval_query = rewrite_retrieval_query(
-            &request.prompt,
-            &memory_for_follow_up(session, request),
-        );
+        let parent_memory = memory_for_follow_up(session, request);
+        if !should_fetch_vault(&request.prompt, &parent_memory) {
+            return resolve_pinned_only_context(state, session, request, messages).await;
+        }
+        let retrieval_query = rewrite_retrieval_query(&request.prompt, &parent_memory);
 
         // Quality gate: note-level retrieval to check if vault has relevant content
         let retrieval_results = run_retrieval(state, &retrieval_query, 5, &pinned_ids)
@@ -341,16 +343,20 @@ async fn resolve_twin_prompt_context(
     request: &PromptRequest,
 ) -> Result<ResolvedPromptContext, String> {
     let pinned_ids = session.pinned_note_ids.clone();
-    let retrieval_query = rewrite_retrieval_query(
-        &request.prompt,
-        &memory_for_follow_up(session, request),
-    );
-    let retrieval_results = run_retrieval(state, &retrieval_query, 5, &pinned_ids)
-        .await
-        .unwrap_or_default();
+    let parent_memory = memory_for_follow_up(session, request);
+    let retrieval_query = rewrite_retrieval_query(&request.prompt, &parent_memory);
+    let fetch_vault = should_fetch_vault(&request.prompt, &parent_memory);
+    let retrieval_results = if fetch_vault {
+        run_retrieval(state, &retrieval_query, 5, &pinned_ids)
+            .await
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
 
-    let should_use_notes = should_use_retrieved_notes(&retrieval_query, &retrieval_results)
-        == RetrievalDecisionReason::UseRetrievedNotes;
+    let should_use_notes = fetch_vault
+        && should_use_retrieved_notes(&retrieval_query, &retrieval_results)
+            == RetrievalDecisionReason::UseRetrievedNotes;
     let mut context_notes = Vec::new();
     let mut note_contexts = Vec::new();
 
@@ -481,22 +487,22 @@ async fn resolve_twin_prompt_context(
         .map(|episode| episode.id.clone())
         .collect::<Vec<_>>();
 
-    let twin_prompt = build_twin_context_prompt(
-        &setup,
-        &selection.cases,
-        &selection.notes,
-        &selection.approved,
-        &selection.candidates,
-        &selection.constitution_items,
-        &selection.action_gaps,
-        &request.twin_answer_mode,
-        &request.prompt_type,
-        request.decision_metadata.as_ref(),
+    let twin_prompt = prefix_twin_prompt_with_memory(
+        session,
+        request,
+        build_twin_context_prompt(
+            &setup,
+            &selection.cases,
+            &selection.notes,
+            &selection.approved,
+            &selection.candidates,
+            &selection.constitution_items,
+            &selection.action_gaps,
+            &request.twin_answer_mode,
+            &request.prompt_type,
+            request.decision_metadata.as_ref(),
+        ),
     );
-    let twin_prompt = match format_working_memory_for_prompt(&session.working_memory) {
-        Some(memory) => format!("{memory}\n\n{twin_prompt}"),
-        None => twin_prompt,
-    };
     let system_prompt = match &request.system_prompt {
         Some(user_sp) if !user_sp.trim().is_empty() => format!("{twin_prompt}\n\n{user_sp}"),
         _ => twin_prompt.clone(),
@@ -1040,6 +1046,17 @@ pub(super) async fn run_sealed_twin_prediction(
             let mut store = twin_store.write().await;
             let _ = store.mark_twin_prediction_failed(&episode_id);
         }
+    }
+}
+
+fn prefix_twin_prompt_with_memory(
+    session: &CanvasSession,
+    request: &PromptRequest,
+    twin_prompt: String,
+) -> String {
+    match format_working_memory_for_prompt(&memory_for_follow_up(session, request)) {
+        Some(memory) => format!("{memory}\n\n{twin_prompt}"),
+        None => twin_prompt,
     }
 }
 
@@ -2060,5 +2077,41 @@ mod tests {
         );
 
         assert_eq!(decision, RetrievalDecisionReason::NoKeywordMatch);
+    }
+
+    #[test]
+    fn twin_prefix_uses_parent_branch_memory_not_session_working_memory() {
+        let mut session = build_session(vec![build_tile(
+            "tile-1",
+            "Root prompt",
+            "openai/gpt-4",
+            "Root response",
+            None,
+            None,
+        )]);
+        session.working_memory = crate::models::canvas::CanvasWorkingMemory::default();
+        session.branch_memories.insert(
+            "tile-1::openai/gpt-4".to_string(),
+            crate::models::canvas::CanvasWorkingMemory {
+                goal: "Branch dream goal".to_string(),
+                discussed: "Discussed on the parent node.".to_string(),
+                ..crate::models::canvas::CanvasWorkingMemory::default()
+            },
+        );
+        let request = build_request(
+            "Follow up",
+            "tile-1",
+            "openai/gpt-4",
+            ContextMode::Twin,
+        );
+        let prefixed = prefix_twin_prompt_with_memory(
+            &session,
+            &request,
+            "## Twin Operating Contract\n\nbody".to_string(),
+        );
+        assert!(prefixed.contains("Branch dream goal"));
+        assert!(prefixed.contains("Discussed on the parent node."));
+        assert!(prefixed.contains("## Twin Operating Contract"));
+        assert!(prefixed.starts_with("## Session working memory"));
     }
 }

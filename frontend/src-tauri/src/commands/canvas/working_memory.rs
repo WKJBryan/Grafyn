@@ -20,6 +20,16 @@ use std::time::Duration;
 pub(super) const COMPACT_HISTORY_RECENT_TURNS: usize = 2;
 const WORKING_MEMORY_TOKEN_BUDGET: usize = 800;
 const COMPACT_LLM_TIMEOUT: Duration = Duration::from_secs(60);
+const KNOWLEDGE_SEEKING_TOKEN_THRESHOLD: usize = 12;
+const VAULT_FETCH_STOPWORDS: &[&str] = &[
+    "a", "an", "and", "are", "as", "at", "be", "but", "by", "can", "do", "for", "from", "how", "i",
+    "if", "in", "into", "is", "it", "its", "just", "like", "make", "more", "my", "next", "not", "now",
+    "of", "ok", "okay", "on", "option", "options", "or", "other", "our", "please", "so", "still",
+    "sure", "thanks", "that", "the", "their", "them", "then", "there", "these", "they", "this", "to",
+    "up", "use", "want", "was", "we", "well", "what", "when", "where", "which", "who", "why", "with",
+    "would", "yeah", "yes", "you", "your", "go", "another", "instead", "continue", "proceed",
+    "anyway", "whatever",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum CompactAction {
@@ -125,11 +135,11 @@ pub(super) fn build_canvas_messages_with_threshold(
             if request.parent_tile_id.is_some() && request.parent_model_id.is_some() {
                 let turns = build_selected_parent_chain(session, request)?;
                 if conversation_tokens(&turns) < compact_token_threshold {
-                    Ok(turns_to_messages(turns, &request.prompt, None))
+                    Ok(turns_to_messages(turns, &request.prompt))
                 } else {
                     // Dream is injected via compose_system_prompt; messages keep last 2.
                     let recent = recent_turns(&turns);
-                    Ok(turns_to_messages(recent.to_vec(), &request.prompt, None))
+                    Ok(turns_to_messages(recent.to_vec(), &request.prompt))
                 }
             } else {
                 Ok(vec![ChatMessage {
@@ -290,19 +300,96 @@ pub(super) fn format_working_memory_for_prompt(memory: &CanvasWorkingMemory) -> 
 }
 
 pub(super) fn rewrite_retrieval_query(prompt: &str, memory: &CanvasWorkingMemory) -> String {
-    let mut parts = vec![prompt.trim().to_string()];
-    if !memory.question.trim().is_empty() {
-        parts.push(memory.question.trim().to_string());
+    let mut parts: Vec<String> = memory
+        .retrieval_cues
+        .iter()
+        .map(|cue| cue.trim().to_string())
+        .filter(|cue| !cue.is_empty())
+        .collect();
+    let goal = if !memory.goal.trim().is_empty() {
+        memory.goal.trim()
+    } else {
+        memory.question.trim()
+    };
+    if !goal.is_empty() {
+        parts.push(goal.to_string());
     }
-    parts.extend(
-        memory
-            .open_questions
-            .iter()
-            .chain(memory.constraints.iter())
-            .map(|item| item.trim().to_string())
-            .filter(|item| !item.is_empty()),
-    );
+    let prompt = prompt.trim();
+    if !prompt.is_empty() {
+        parts.push(prompt.to_string());
+    }
     parts.join(" ")
+}
+
+pub(super) fn should_fetch_vault(prompt: &str, parent_memory: &CanvasWorkingMemory) -> bool {
+    if parent_memory.is_empty() || parent_memory.needs_vault.is_none() {
+        return true;
+    }
+    if parent_memory.needs_vault == Some(true)
+        || parent_memory
+            .retrieval_cues
+            .iter()
+            .any(|cue| !cue.trim().is_empty())
+    {
+        return true;
+    }
+    is_knowledge_seeking_prompt(prompt, parent_memory)
+}
+
+fn is_knowledge_seeking_prompt(prompt: &str, memory: &CanvasWorkingMemory) -> bool {
+    let lower = prompt.to_ascii_lowercase();
+    if lower.contains("what-did-i") || lower.contains("what did i") {
+        return true;
+    }
+
+    let tokens = vault_prompt_tokens(prompt);
+    if tokens
+        .iter()
+        .any(|token| matches!(token.as_str(), "note" | "notes" | "vault" | "remember"))
+    {
+        return true;
+    }
+    if tokens.len() >= KNOWLEDGE_SEEKING_TOKEN_THRESHOLD {
+        return true;
+    }
+
+    let goal = if !memory.goal.trim().is_empty() {
+        memory.goal.trim()
+    } else {
+        memory.question.trim()
+    };
+    let discussed = if !memory.discussed.trim().is_empty() {
+        memory.discussed.trim()
+    } else {
+        memory.summary.trim()
+    };
+    let dream_tokens: HashSet<String> = vault_prompt_tokens(&format!(
+        "{goal} {discussed} {}",
+        memory.nuances.trim()
+    ))
+    .into_iter()
+    .collect();
+    tokens
+        .iter()
+        .any(|token| token.len() >= 6 && !dream_tokens.contains(token))
+}
+
+fn vault_prompt_tokens(text: &str) -> Vec<String> {
+    let normalized: String = text
+        .chars()
+        .map(|ch| {
+            if ch.is_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                ' '
+            }
+        })
+        .collect();
+    normalized
+        .split_whitespace()
+        .filter(|token| !VAULT_FETCH_STOPWORDS.contains(token))
+        .map(str::to_string)
+        .collect()
 }
 
 pub(super) fn parse_working_memory_response(
@@ -371,7 +458,7 @@ fn build_full_history_messages(
     request: &PromptRequest,
 ) -> Result<Vec<ChatMessage>, String> {
     let turns = build_selected_parent_chain(session, request)?;
-    Ok(turns_to_messages(turns, &request.prompt, None))
+    Ok(turns_to_messages(turns, &request.prompt))
 }
 
 fn build_compact_history_messages(
@@ -380,12 +467,7 @@ fn build_compact_history_messages(
 ) -> Result<Vec<ChatMessage>, String> {
     let turns = build_selected_parent_chain(session, request)?;
     let recent = recent_turns(&turns);
-    let memory_prefix = format_working_memory_for_prompt(&memory_for_follow_up(session, request));
-    Ok(turns_to_messages(
-        recent.to_vec(),
-        &request.prompt,
-        memory_prefix,
-    ))
+    Ok(turns_to_messages(recent.to_vec(), &request.prompt))
 }
 
 fn recent_turns(turns: &[ConversationTurn]) -> &[ConversationTurn] {
@@ -396,18 +478,8 @@ fn recent_turns(turns: &[ConversationTurn]) -> &[ConversationTurn] {
     }
 }
 
-fn turns_to_messages(
-    turns: Vec<ConversationTurn>,
-    new_prompt: &str,
-    memory_prefix: Option<String>,
-) -> Vec<ChatMessage> {
+fn turns_to_messages(turns: Vec<ConversationTurn>, new_prompt: &str) -> Vec<ChatMessage> {
     let mut messages = Vec::new();
-    if let Some(prefix) = memory_prefix {
-        messages.push(ChatMessage {
-            role: "user".to_string(),
-            content: prefix,
-        });
-    }
     for turn in turns {
         messages.push(ChatMessage {
             role: "user".to_string(),
@@ -577,7 +649,7 @@ pub(super) fn build_canvas_messages_after_compact(
     {
         let turns = build_selected_parent_chain(session, request)?;
         let tail = turns_fitting_threshold(&turns, threshold);
-        return Ok(turns_to_messages(tail, &request.prompt, None));
+        return Ok(turns_to_messages(tail, &request.prompt));
     }
     build_canvas_messages_with_threshold(session, request, threshold)
 }
@@ -983,19 +1055,38 @@ mod tests {
         let request = build_request("Prompt 5", "tile-4", "openai/gpt-4", ContextMode::Compact);
         let messages = build_compact_history_messages(&session, &request).unwrap();
 
-        assert!(messages[0]
-            .content
-            .contains("Should we compact instead of truncate?"));
-        assert!(messages[0]
-            .content
-            .contains("compiled state beats 240-character chops"));
-        assert!(!messages[0].content.contains("Response 1"));
-        assert_eq!(messages[1].content, "Prompt 3");
-        assert_eq!(messages[2].content, "Response 3");
+        // Dream lives in compose_system_prompt, not as a leading user message.
+        assert_eq!(messages[0].content, "Prompt 3");
+        assert_eq!(messages[1].content, "Response 3");
+        assert_eq!(messages[2].content, "Prompt 4");
+        assert_eq!(messages[3].content, "Response 4");
         assert_eq!(messages.last().unwrap().content, "Prompt 5");
+        assert!(!messages.iter().any(|message| {
+            message.content.contains("Should we compact instead of truncate?")
+                || message.content.contains("compiled state beats 240-character chops")
+        }));
         assert!(!messages
             .iter()
             .any(|message| message.content.contains("Conversation summary before the most recent turns")));
+        assert!(!messages.iter().any(|message| message.content.contains("Response 1")));
+    }
+
+    #[test]
+    fn compose_system_prompt_includes_parent_dream_for_compact() {
+        let mut session = four_turn_session();
+        session.branch_memories.insert(
+            branch_memory_key("tile-4", "openai/gpt-4"),
+            CanvasWorkingMemory {
+                goal: "Keep the dream in the system prompt".to_string(),
+                discussed: "Earlier turns decided compiled state beats 240-character chops."
+                    .to_string(),
+                ..CanvasWorkingMemory::default()
+            },
+        );
+        let request = build_request("Prompt 5", "tile-4", "openai/gpt-4", ContextMode::Compact);
+        let composed = compose_system_prompt(&session, &request, None).expect("dream in system");
+        assert!(composed.contains("Keep the dream in the system prompt"));
+        assert!(composed.contains("compiled state beats 240-character chops"));
     }
 
     #[test]
@@ -1072,7 +1163,27 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_retrieval_query_appends_working_memory_question() {
+    fn rewrite_retrieval_query_uses_cues_and_goal_not_lists() {
+        let memory = CanvasWorkingMemory {
+            goal: "Pick a quiet camera".to_string(),
+            question: "Legacy question ignored when goal set".to_string(),
+            retrieval_cues: vec!["ricoh gr".to_string(), "leaf shutter".to_string()],
+            open_questions: vec!["TTL vs manual strobes".to_string()],
+            constraints: vec!["Stay under $500".to_string()],
+            ..CanvasWorkingMemory::default()
+        };
+        let query = rewrite_retrieval_query("the other option", &memory);
+        assert!(query.contains("ricoh gr"));
+        assert!(query.contains("leaf shutter"));
+        assert!(query.contains("Pick a quiet camera"));
+        assert!(query.contains("the other option"));
+        assert!(!query.contains("TTL vs manual strobes"));
+        assert!(!query.contains("Stay under $500"));
+        assert!(!query.contains("Legacy question"));
+    }
+
+    #[test]
+    fn rewrite_retrieval_query_falls_back_to_question_when_goal_empty() {
         let memory = CanvasWorkingMemory {
             question: "Mirofish social architecture".to_string(),
             open_questions: vec!["TTL vs manual strobes".to_string()],
@@ -1082,8 +1193,74 @@ mod tests {
         let query = rewrite_retrieval_query("the other option", &memory);
         assert!(query.contains("the other option"));
         assert!(query.contains("Mirofish social architecture"));
-        assert!(query.contains("TTL vs manual strobes"));
-        assert!(query.contains("Stay under $500"));
+        assert!(!query.contains("TTL vs manual strobes"));
+        assert!(!query.contains("Stay under $500"));
+    }
+
+    fn skip_vault_memory() -> CanvasWorkingMemory {
+        CanvasWorkingMemory {
+            goal: "Choose a quiet camera".to_string(),
+            discussed: "Compared two bodies.".to_string(),
+            nuances: "Keep shutter noise down.".to_string(),
+            needs_vault: Some(false),
+            ..CanvasWorkingMemory::default()
+        }
+    }
+
+    #[test]
+    fn should_fetch_vault_skip_vs_fetch_table() {
+        let empty = CanvasWorkingMemory::default();
+        assert!(
+            should_fetch_vault("ok go", &empty),
+            "empty memory fetches"
+        );
+
+        let needs_none = CanvasWorkingMemory {
+            goal: "Choose a quiet camera".to_string(),
+            discussed: "Compared two bodies.".to_string(),
+            needs_vault: None,
+            ..CanvasWorkingMemory::default()
+        };
+        assert!(
+            should_fetch_vault("ok go", &needs_none),
+            "needs_vault None fetches"
+        );
+
+        let flagged_true = CanvasWorkingMemory {
+            goal: "Choose a quiet camera".to_string(),
+            discussed: "Compared two bodies.".to_string(),
+            needs_vault: Some(true),
+            ..CanvasWorkingMemory::default()
+        };
+        assert!(should_fetch_vault("ok go", &flagged_true));
+
+        let with_cues = CanvasWorkingMemory {
+            goal: "Choose a quiet camera".to_string(),
+            discussed: "Compared two bodies.".to_string(),
+            needs_vault: Some(false),
+            retrieval_cues: vec!["ricoh".to_string()],
+            ..CanvasWorkingMemory::default()
+        };
+        assert!(should_fetch_vault("ok go", &with_cues));
+
+        let skip = skip_vault_memory();
+        assert!(
+            !should_fetch_vault("ok go", &skip),
+            "short anaphoric skips"
+        );
+        assert!(
+            !should_fetch_vault("the other option", &skip),
+            "short anaphoric skips"
+        );
+
+        assert!(should_fetch_vault("check the vault", &skip));
+        assert!(should_fetch_vault("please remember the prior decision", &skip));
+        assert!(should_fetch_vault("what did i write about this", &skip));
+        assert!(should_fetch_vault("What about Mirofish?", &skip));
+        assert!(should_fetch_vault(
+            "compare sony nikon canon fuji ricoh leica pentax olympus hasselblad sigma tamron street photography bodies",
+            &skip,
+        ));
     }
 
     #[test]
