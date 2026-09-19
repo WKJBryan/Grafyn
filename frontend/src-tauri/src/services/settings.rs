@@ -243,6 +243,13 @@ impl SettingsService {
             self.settings.canvas_model_presets = canvas_model_presets;
         }
 
+        if let Some(canvas_compact_token_threshold) = update.canvas_compact_token_threshold {
+            self.settings.canvas_compact_token_threshold =
+                crate::models::settings::clamp_canvas_compact_token_threshold(
+                    canvas_compact_token_threshold,
+                );
+        }
+
         // Persist to disk
         self.save()?;
 
@@ -476,6 +483,7 @@ mod tests {
                 background_vault_optimizer_program_enabled: None,
                 vault_optimizer_program_path: None,
                 canvas_model_presets: Some(presets.clone()),
+                canvas_compact_token_threshold: None,
             })
             .expect("settings update should succeed");
 
@@ -520,6 +528,7 @@ mod tests {
                 background_vault_optimizer_program_enabled: None,
                 vault_optimizer_program_path: None,
                 canvas_model_presets: None,
+                canvas_compact_token_threshold: None,
             })
             .expect("settings update should succeed");
 

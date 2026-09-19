@@ -154,22 +154,49 @@ pub(super) fn format_working_memory_for_prompt(memory: &CanvasWorkingMemory) -> 
     let mut open_questions = memory.open_questions.clone();
     let mut decisions = memory.decisions.clone();
     let mut positions = memory.model_positions.clone();
+    let mut retrieval_cues = memory.retrieval_cues.clone();
+
+    let goal = if !memory.goal.trim().is_empty() {
+        memory.goal.trim().to_string()
+    } else {
+        memory.question.trim().to_string()
+    };
+    let discussed = if !memory.discussed.trim().is_empty() {
+        memory.discussed.trim().to_string()
+    } else {
+        memory.summary.trim().to_string()
+    };
+    let mut nuances = if !memory.nuances.trim().is_empty() {
+        memory.nuances.trim().to_string()
+    } else {
+        memory
+            .open_questions
+            .iter()
+            .map(|item| item.trim())
+            .filter(|item| !item.is_empty())
+            .collect::<Vec<_>>()
+            .join("; ")
+    };
 
     let mut body = String::from("## Session working memory\n");
-    if !memory.question.trim().is_empty() {
-        body.push_str(&format!("\nQuestion: {}\n", memory.question.trim()));
+    if !goal.is_empty() {
+        body.push_str(&format!("\nGoal: {}\n", goal));
     }
-    if !memory.summary.trim().is_empty() {
-        body.push_str(&format!("\nSummary:\n{}\n", memory.summary.trim()));
+    if !discussed.is_empty() {
+        body.push_str(&format!("\nDiscussed:\n{}\n", discussed));
     }
 
     loop {
         let mut candidate = body.clone();
+        if !nuances.trim().is_empty() {
+            candidate.push_str(&format!("\nNuances:\n{}\n", nuances.trim()));
+        }
         append_list(&mut candidate, "Constraints", &constraints);
         append_list(&mut candidate, "Open questions", &open_questions);
         append_list(&mut candidate, "Decisions", &decisions);
         append_positions(&mut candidate, &positions);
         append_list(&mut candidate, "Tried", &tried);
+        append_list(&mut candidate, "Retrieval cues", &retrieval_cues);
 
         if estimate_tokens(&candidate) <= WORKING_MEMORY_TOKEN_BUDGET {
             sections.push(candidate);
@@ -178,6 +205,10 @@ pub(super) fn format_working_memory_for_prompt(memory: &CanvasWorkingMemory) -> 
 
         if !tried.is_empty() {
             tried.pop();
+            continue;
+        }
+        if !retrieval_cues.is_empty() {
+            retrieval_cues.pop();
             continue;
         }
         if constraints.len() > 1 {
@@ -194,6 +225,15 @@ pub(super) fn format_working_memory_for_prompt(memory: &CanvasWorkingMemory) -> 
         }
         if positions.len() > 1 {
             positions.pop();
+            continue;
+        }
+        if nuances.chars().count() > 40 {
+            let keep = nuances.chars().count() / 2;
+            nuances = nuances.chars().take(keep).collect();
+            continue;
+        }
+        if !nuances.trim().is_empty() {
+            nuances.clear();
             continue;
         }
         sections.push(candidate);
@@ -243,6 +283,22 @@ fn merge_working_memory(
     }
     if parsed.summary.trim().is_empty() {
         parsed.summary = previous.summary.clone();
+    }
+    if parsed.goal.trim().is_empty() {
+        parsed.goal = previous.goal.clone();
+    }
+    if parsed.discussed.trim().is_empty() {
+        parsed.discussed = previous.discussed.clone();
+    }
+    if parsed.nuances.trim().is_empty() {
+        parsed.nuances = previous.nuances.clone();
+    }
+    // Old compile JSON only had question/summary — promote into dreamed fields.
+    if parsed.goal.trim().is_empty() && !parsed.question.trim().is_empty() {
+        parsed.goal = parsed.question.clone();
+    }
+    if parsed.discussed.trim().is_empty() && !parsed.summary.trim().is_empty() {
+        parsed.discussed = parsed.summary.clone();
     }
     parsed
 }
@@ -538,6 +594,7 @@ async fn compile_session_working_memory(
         CanvasStreamEvent::WorkingMemoryUpdated {
             session_id: session_id.clone(),
             working_memory: compiled.clone(),
+            branch_key: String::new(),
         },
     );
 
@@ -558,9 +615,11 @@ async fn compile_session_working_memory(
 
 const COMPILE_SYSTEM_PROMPT: &str = "\
 You compile a short working-memory document for a multi-model canvas session. \
-Return ONLY JSON with keys: question, summary, constraints, open_questions, decisions, tried, model_positions, note_ids. \
-model_positions is an array of {model_id, stance}. \
-Keep summary under 120 words. Do not invent facts. Do not write constitution or identity claims.";
+Return ONLY JSON with keys: goal, discussed, nuances, retrieval_cues, needs_vault, \
+question, summary, constraints, open_questions, decisions, tried, model_positions, note_ids. \
+model_positions is an array of {model_id, stance}. retrieval_cues is an array of short search phrases. \
+needs_vault is true/false/null. Keep discussed under 120 words. Do not invent facts. \
+Do not write constitution or identity claims.";
 
 fn build_compile_user_prompt(session: &CanvasSession, tile_id: &str, model_id: &str) -> String {
     let previous = session
@@ -808,6 +867,95 @@ mod tests {
         let parsed = parse_working_memory_response("not json at all", &previous, Some("tile-1".to_string()));
         assert_eq!(parsed.version, 3);
         assert_eq!(parsed.summary, "Keep me");
+    }
+
+    #[test]
+    fn old_working_memory_json_deserializes_and_format_falls_back_to_question_summary() {
+        let memory: CanvasWorkingMemory = serde_json::from_str(r#"{"question":"Q","summary":"S"}"#)
+            .expect("old JSON should deserialize");
+        assert!(memory.goal.is_empty());
+        assert!(memory.discussed.is_empty());
+        assert_eq!(memory.question, "Q");
+        assert_eq!(memory.summary, "S");
+
+        let formatted = format_working_memory_for_prompt(&memory).expect("should format");
+        assert!(formatted.contains("## Session working memory"));
+        assert!(formatted.contains("Goal: Q"));
+        assert!(formatted.contains("Discussed:\nS") || formatted.contains("Discussed: S"));
+        assert!(!formatted.contains("Question:"));
+        assert!(!formatted.contains("Summary:"));
+    }
+
+    #[test]
+    fn format_prefers_dreamed_fields_over_legacy_fallbacks() {
+        let memory = CanvasWorkingMemory {
+            goal: "Dreamed goal".to_string(),
+            discussed: "Dreamed discussed".to_string(),
+            nuances: "Dreamed nuances".to_string(),
+            question: "Legacy question".to_string(),
+            summary: "Legacy summary".to_string(),
+            open_questions: vec!["Legacy open Q".to_string()],
+            retrieval_cues: vec!["cue-a".to_string()],
+            ..CanvasWorkingMemory::default()
+        };
+        let formatted = format_working_memory_for_prompt(&memory).expect("should format");
+        assert!(formatted.contains("Goal: Dreamed goal"));
+        assert!(formatted.contains("Dreamed discussed"));
+        assert!(formatted.contains("Dreamed nuances"));
+        assert!(!formatted.contains("Legacy question"));
+        assert!(!formatted.contains("Legacy summary"));
+        assert!(formatted.contains("Retrieval cues:"));
+        assert!(formatted.contains("cue-a"));
+    }
+
+    #[test]
+    fn is_empty_is_false_when_only_goal_is_set() {
+        let memory = CanvasWorkingMemory {
+            goal: "Only goal".to_string(),
+            ..CanvasWorkingMemory::default()
+        };
+        assert!(!memory.is_empty());
+
+        let cues_only = CanvasWorkingMemory {
+            retrieval_cues: vec!["ignored-for-emptiness".to_string()],
+            needs_vault: Some(true),
+            ..CanvasWorkingMemory::default()
+        };
+        assert!(cues_only.is_empty());
+    }
+
+    #[test]
+    fn parse_sets_goal_and_keeps_previous_goal_on_garbage() {
+        let previous = CanvasWorkingMemory {
+            version: 1,
+            goal: "Keep goal".to_string(),
+            discussed: "Keep discussed".to_string(),
+            nuances: "Keep nuances".to_string(),
+            question: "Old Q".to_string(),
+            summary: "Old S".to_string(),
+            ..CanvasWorkingMemory::default()
+        };
+        let parsed = parse_working_memory_response(
+            r#"{"goal":"New goal","discussed":"New discussed","nuances":"New nuances","question":"New Q","summary":"New S"}"#,
+            &previous,
+            Some("tile-9".to_string()),
+        );
+        assert_eq!(parsed.goal, "New goal");
+        assert_eq!(parsed.discussed, "New discussed");
+        assert_eq!(parsed.nuances, "New nuances");
+
+        let garbage = parse_working_memory_response("not json", &previous, Some("tile-1".to_string()));
+        assert_eq!(garbage.goal, "Keep goal");
+        assert_eq!(garbage.discussed, "Keep discussed");
+        assert_eq!(garbage.nuances, "Keep nuances");
+
+        let legacy = parse_working_memory_response(
+            r#"{"question":"Mapped Q","summary":"Mapped S"}"#,
+            &CanvasWorkingMemory::default(),
+            None,
+        );
+        assert_eq!(legacy.goal, "Mapped Q");
+        assert_eq!(legacy.discussed, "Mapped S");
     }
 
     #[test]

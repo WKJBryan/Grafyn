@@ -131,12 +131,18 @@ export const useCanvasStore = defineStore('canvas', () => {
         version: 0,
         summary: '',
         question: '',
+        goal: '',
+        discussed: '',
+        nuances: '',
         constraints: [],
         open_questions: [],
         decisions: [],
         tried: [],
         model_positions: [],
-        note_ids: []
+        note_ids: [],
+        retrieval_cues: [],
+        needs_vault: null,
+        compacted_turn_count: 0
       }
     }
   }

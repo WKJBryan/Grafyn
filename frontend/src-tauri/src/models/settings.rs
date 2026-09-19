@@ -97,6 +97,10 @@ pub struct UserSettings {
     /// Saved model presets for canvas prompts
     #[serde(default = "default_canvas_model_presets")]
     pub canvas_model_presets: Vec<CanvasModelPreset>,
+
+    /// Token estimate threshold that triggers on-demand canvas compaction
+    #[serde(default = "default_canvas_compact_token_threshold")]
+    pub canvas_compact_token_threshold: usize,
 }
 
 fn default_theme() -> String {
@@ -147,6 +151,14 @@ fn default_vault_optimizer_program_path() -> String {
     "_grafyn/program.md".to_string()
 }
 
+fn default_canvas_compact_token_threshold() -> usize {
+    32_000
+}
+
+pub fn clamp_canvas_compact_token_threshold(value: usize) -> usize {
+    value.clamp(8_000, 150_000)
+}
+
 impl Default for UserSettings {
     fn default() -> Self {
         Self {
@@ -173,6 +185,7 @@ impl Default for UserSettings {
                 default_background_vault_optimizer_program_enabled(),
             vault_optimizer_program_path: default_vault_optimizer_program_path(),
             canvas_model_presets: default_canvas_model_presets(),
+            canvas_compact_token_threshold: default_canvas_compact_token_threshold(),
         }
     }
 }
@@ -258,6 +271,7 @@ pub struct SettingsUpdate {
     pub background_vault_optimizer_program_enabled: Option<bool>,
     pub vault_optimizer_program_path: Option<String>,
     pub canvas_model_presets: Option<Vec<CanvasModelPreset>>,
+    pub canvas_compact_token_threshold: Option<usize>,
 }
 
 /// Response for settings status check
@@ -284,6 +298,7 @@ pub struct SettingsStatus {
     pub background_vault_optimizer_program_enabled: bool,
     pub vault_optimizer_program_path: String,
     pub canvas_model_presets: Vec<CanvasModelPreset>,
+    pub canvas_compact_token_threshold: usize,
 }
 
 impl From<&UserSettings> for SettingsStatus {
@@ -315,6 +330,7 @@ impl From<&UserSettings> for SettingsStatus {
                 .background_vault_optimizer_program_enabled,
             vault_optimizer_program_path: settings.vault_optimizer_program_path.clone(),
             canvas_model_presets: settings.canvas_model_presets.clone(),
+            canvas_compact_token_threshold: settings.canvas_compact_token_threshold,
         }
     }
 }
@@ -340,6 +356,31 @@ mod tests {
             "sidecar_first"
         );
         assert_eq!(settings.vault_optimizer_program_path, "_grafyn/program.md");
+        assert_eq!(settings.canvas_compact_token_threshold, 32_000);
+    }
+
+    #[test]
+    fn canvas_compact_token_threshold_clamps_to_allowed_range() {
+        assert_eq!(clamp_canvas_compact_token_threshold(100), 8_000);
+        assert_eq!(clamp_canvas_compact_token_threshold(8_000), 8_000);
+        assert_eq!(clamp_canvas_compact_token_threshold(32_000), 32_000);
+        assert_eq!(clamp_canvas_compact_token_threshold(150_000), 150_000);
+        assert_eq!(clamp_canvas_compact_token_threshold(200_000), 150_000);
+    }
+
+    #[test]
+    fn older_settings_payloads_default_canvas_compact_token_threshold() {
+        let json = r#"{
+            "vault_path": "C:\\Vault",
+            "setup_completed": true,
+            "theme": "dark",
+            "mcp_enabled": false,
+            "llm_model": "openai/gpt-4o",
+            "smart_web_search": true
+        }"#;
+        let settings: UserSettings =
+            serde_json::from_str(json).expect("settings should deserialize");
+        assert_eq!(settings.canvas_compact_token_threshold, 32_000);
     }
 
     #[test]
