@@ -1,8 +1,10 @@
 use super::shared::ModelProviderRoute;
 use super::working_memory::{
-    build_canvas_messages, compose_system_prompt, format_working_memory_for_prompt,
+    build_canvas_messages_with_threshold, compose_system_prompt, format_working_memory_for_prompt,
     memory_for_follow_up, rewrite_retrieval_query,
 };
+#[cfg(test)]
+use super::working_memory::build_canvas_messages;
 use crate::commands::run_retrieval;
 use crate::models::canvas::{
     CanvasSession, ContextMode, DecisionPromptMetadata, PromptRequest, PromptType, TileContextNote,
@@ -168,7 +170,11 @@ pub(super) async fn resolve_prompt_context(
     session: &CanvasSession,
     request: &PromptRequest,
 ) -> Result<ResolvedPromptContext, String> {
-    let messages = build_canvas_messages(session, request)?;
+    let compact_token_threshold = {
+        let settings = state.settings_service.read().await;
+        settings.get().canvas_compact_token_threshold
+    };
+    let messages = build_canvas_messages_with_threshold(session, request, compact_token_threshold)?;
 
     if request.context_mode == ContextMode::Twin {
         return resolve_twin_prompt_context(state, messages, session, request).await;

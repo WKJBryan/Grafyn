@@ -2,6 +2,8 @@
 //!
 //! Compact mode injects compiled session state plus the last two parent-chain
 //! turns. It does not truncate older turns to a character budget.
+//! KnowledgeSearch, Semantic, and Twin follow-ups send the full parent chain
+//! when estimated conversation tokens are below the compact threshold.
 
 use crate::models::canvas::{
     CanvasSession, CanvasStreamEvent, CanvasWorkingMemory, ContextMode, ModelPosition, PromptRequest,
@@ -59,9 +61,24 @@ fn debate_recap_message(session: &CanvasSession, debate_id: &str) -> Option<Chat
         })
 }
 
+pub(super) fn conversation_tokens(turns: &[ConversationTurn]) -> usize {
+    turns
+        .iter()
+        .map(|turn| estimate_tokens(&turn.prompt) + estimate_tokens(&turn.response))
+        .sum()
+}
+
 pub(super) fn build_canvas_messages(
     session: &CanvasSession,
     request: &PromptRequest,
+) -> Result<Vec<ChatMessage>, String> {
+    build_canvas_messages_with_threshold(session, request, 32_000)
+}
+
+pub(super) fn build_canvas_messages_with_threshold(
+    session: &CanvasSession,
+    request: &PromptRequest,
+    compact_token_threshold: usize,
 ) -> Result<Vec<ChatMessage>, String> {
     if let Some(debate_id) = request.parent_debate_id.as_deref() {
         let mut messages = Vec::new();
@@ -84,7 +101,14 @@ pub(super) fn build_canvas_messages(
         ContextMode::Compact => build_compact_history_messages(session, request),
         ContextMode::KnowledgeSearch | ContextMode::Semantic | ContextMode::Twin => {
             if request.parent_tile_id.is_some() && request.parent_model_id.is_some() {
-                build_recent_turn_messages(session, request)
+                let turns = build_selected_parent_chain(session, request)?;
+                if conversation_tokens(&turns) < compact_token_threshold {
+                    Ok(turns_to_messages(turns, &request.prompt, None))
+                } else {
+                    // Task 4 replaces this last-2 stub with dream + last 2.
+                    let recent = recent_turns(&turns);
+                    Ok(turns_to_messages(recent.to_vec(), &request.prompt, None))
+                }
             } else {
                 Ok(vec![ChatMessage {
                     role: "user".to_string(),
@@ -340,15 +364,6 @@ fn build_compact_history_messages(
         &request.prompt,
         memory_prefix,
     ))
-}
-
-fn build_recent_turn_messages(
-    session: &CanvasSession,
-    request: &PromptRequest,
-) -> Result<Vec<ChatMessage>, String> {
-    let turns = build_selected_parent_chain(session, request)?;
-    let recent = recent_turns(&turns);
-    Ok(turns_to_messages(recent.to_vec(), &request.prompt, None))
 }
 
 fn recent_turns(turns: &[ConversationTurn]) -> &[ConversationTurn] {
@@ -799,10 +814,37 @@ mod tests {
         );
         let messages = build_canvas_messages(&session, &request).unwrap();
 
+        assert!(messages.iter().any(|message| message.content.contains("Prompt 1")));
+        assert!(messages.iter().any(|message| message.content.contains("Prompt 4")));
+        assert_eq!(messages.last().unwrap().content, "What about the other option?");
+    }
+
+    #[test]
+    fn knowledge_search_over_threshold_keeps_last_two_turns() {
+        let session = four_turn_session();
+        let request = build_request(
+            "What about the other option?",
+            "tile-4",
+            "openai/gpt-4",
+            ContextMode::KnowledgeSearch,
+        );
+        let messages = build_canvas_messages_with_threshold(&session, &request, 1).unwrap();
+
+        assert!(!messages.iter().any(|message| message.content.contains("Prompt 1")));
         assert_eq!(messages[0].content, "Prompt 3");
         assert_eq!(messages[1].content, "Response 3");
         assert_eq!(messages.last().unwrap().content, "What about the other option?");
-        assert!(!messages.iter().any(|message| message.content.contains("Prompt 1")));
+    }
+
+    #[test]
+    fn conversation_tokens_sums_prompt_and_response_estimates() {
+        let turns = vec![ConversationTurn {
+            prompt: "Prompt 1".to_string(),
+            response: "Response 1".to_string(),
+            _model_id: "openai/gpt-4".to_string(),
+        }];
+        assert_eq!(conversation_tokens(&turns), 6);
+        assert_eq!(conversation_tokens(&[]), 0);
     }
 
     #[test]
