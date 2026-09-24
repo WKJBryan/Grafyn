@@ -13,6 +13,10 @@
         <span class="stat-item">{{ stats.edges }} Edges</span>
       </div>
       <div class="toolbar-actions">
+        <button v-if="showSettings" class="btn btn-secondary btn-sm" type="button"
+          :aria-pressed="showTimeline" @click="toggleTimeline">
+          Time
+        </button>
         <div class="graph-legend">
           <span class="legend-item"><i class="legend-swatch explicit" />Explicit</span>
           <span class="legend-item"><i class="legend-swatch inferred" />Inferred</span>
@@ -39,6 +43,11 @@
       ref="canvas"
       class="graph-canvas"
     />
+    <PerspectiveTimeline v-if="showTimeline" :nodes="timelineNodes" :source-note-id="focusedNodeId || ''"
+      @select-state="selectPerspectiveState" @close="showTimeline = false; selectPerspectiveState(null)" />
+    <p v-if="hiddenPerspectiveSources" class="graph-source-hint" role="status">
+      {{ hiddenPerspectiveSources }} source note{{ hiddenPerspectiveSources === 1 ? '' : 's' }} unavailable in this view (filtered or deleted).
+    </p>
     
     <!-- Settings Panel -->
     <GraphSettings
@@ -94,6 +103,7 @@ import { drag as d3Drag } from 'd3-drag'
 import 'd3-transition'
 import { graph as graphApi } from '../api/client'
 import GraphSettings from './GraphSettings.vue'
+import PerspectiveTimeline from './PerspectiveTimeline.vue'
 import { useBootStore } from '@/stores/boot'
 
 const props = defineProps({
@@ -134,6 +144,17 @@ let zoomGroup = null
 let canvasWidth = 800
 let canvasHeight = 600
 let currentZoomLevel = 1
+let lastDetailKey = ''
+let focusedNodeId = null
+const showTimeline = ref(false)
+const selectedPerspectiveState = ref(null)
+const timelineNodes = ref([])
+const hiddenPerspectiveSources = computed(() => {
+  const search = currentFilters.value.search.toLowerCase()
+  return selectedPerspectiveState.value?.source_note_ids
+    .filter(id => !timelineNodes.value.some(node => node.id === id && node.label.toLowerCase().includes(search))).length || 0
+})
+const savedPositions = new Map()
 
 // Graph data
 let nodes = []
@@ -239,6 +260,8 @@ function applyFilters() {
     
     return true
   }).map(d => ({ ...d }))
+  timelineNodes.value = nodes.filter(node => !isTopicHub(node))
+  if (focusedNodeId && !nodes.some(node => node.id === focusedNodeId)) focusedNodeId = null
   
   // Filter links to only include visible nodes
   const visibleIds = new Set(nodes.map(n => n.id))
@@ -250,6 +273,12 @@ function applyFilters() {
 }
 
 function initGraph() {
+  currentZoomLevel = 1
+  lastDetailKey = ''
+  for (const node of nodes) {
+    const position = savedPositions.get(node.id)
+    if (position) Object.assign(node, position)
+  }
   // Stop any previous simulation so it doesn't keep ticking against a detached DOM
   // (a bare reassignment would otherwise orphan it until alpha decays on its own)
   if (simulation) {
@@ -290,14 +319,14 @@ function initGraph() {
     .on('zoom', (event) => {
       currentZoomLevel = event.transform.k
       zoomGroup.attr('transform', event.transform)
-      updateTextOpacity()
+      updateGraphDetail()
     })
     
   svg.call(zoom)
   
   // Simulation with configurable forces
   simulation = forceSimulation(nodes)
-    .force('link', forceLink(links).id(d => d.id).distance(currentForces.value.distance).strength(currentForces.value.link))
+    .force('link', forceLink(links).id(d => d.id).distance(getLinkDistance).strength(currentForces.value.link))
     .force('charge', forceManyBody().strength(currentForces.value.repel))
     .force('x', forceX(canvasWidth / 2).strength(currentForces.value.center))
     .force('y', forceY(canvasHeight / 2).strength(currentForces.value.center))
@@ -324,6 +353,8 @@ function initGraph() {
     .call(makeDrag(simulation))
     .on('click', (event, d) => {
       event.stopPropagation()
+      focusedNodeId = d.id
+      updateGraphDetail()
       emit('node-click', d.id)
     })
     
@@ -334,6 +365,7 @@ function initGraph() {
     .attr('stroke', '#fff')
     .attr('stroke-width', d => isTopicHub(d) ? 2.5 : 1.5)
     .attr('class', 'node-circle')
+  node.append('title').text(d => d.label)
     
   // Node labels
   const textColor = getComputedStyle(document.documentElement).getPropertyValue('--text-primary').trim() || '#e8e8ed'
@@ -356,10 +388,35 @@ function initGraph() {
       
     node
       .attr('transform', d => `translate(${d.x},${d.y})`)
+    for (const item of nodes) savedPositions.set(item.id, { x: item.x, y: item.y })
   })
   
   // Initial text opacity
-  updateTextOpacity()
+  lastDetailKey = '' // The zoom listener may have fired before labels were drawn.
+  updateGraphDetail()
+}
+
+// The graph API has relationship kinds, but no calibrated semantic distance.
+// Keep a fixed scale and use those known kinds as provisional layout constraints.
+function getLinkDistance(link) {
+  const base = currentForces.value.distance
+  if (link.edge_kind === 'topic_membership') return base * 0.7
+  if (link.edge_kind === 'topic_related') return base * 1.6
+  return base
+}
+
+function linkTouches(link, id) {
+  return id && [link.source, link.target].some(end => (typeof end === 'object' ? end.id : end) === id)
+}
+
+function selectPerspectiveState(state) {
+  selectedPerspectiveState.value = state
+  updateGraphDetail()
+}
+
+function toggleTimeline() {
+  showTimeline.value = !showTimeline.value
+  if (!showTimeline.value) selectPerspectiveState(null)
 }
 
 function getNodeRadius(node) {
@@ -401,19 +458,28 @@ function getLinkColor(link) {
   return relationColors[link.relation] || '#4a4a4f'
 }
 
-function updateTextOpacity() {
+function updateGraphDetail() {
   if (!zoomGroup) return
-  
-  const threshold = currentDisplay.value.textFade / 100
-  const fadeStart = 0.3 + threshold * 0.7  // Range: 0.3 to 1.0
-  
-  // Fade text based on zoom level
-  const opacity = currentZoomLevel < fadeStart 
-    ? Math.max(0, (currentZoomLevel - 0.1) / (fadeStart - 0.1))
-    : 1
-    
+  // Pan events do not change visibility. Avoid restyling the full SVG on pan.
+  const detailKey = [currentZoomLevel.toFixed(2), currentDisplay.value.textFade,
+    focusedNodeId, selectedPerspectiveState.value?.id, currentFilters.value.search].join('|')
+  if (detailKey === lastDetailKey) return
+  lastDetailKey = detailKey
+  const start = 0.75 + currentDisplay.value.textFade / 100 * 0.7
+  const detail = Math.max(0, Math.min(1, (currentZoomLevel - start) / 0.6))
+  const sources = new Set(selectedPerspectiveState.value?.source_note_ids || [])
+  const isSearched = d => currentFilters.value.search &&
+    d.label.toLowerCase().includes(currentFilters.value.search.toLowerCase())
   zoomGroup.selectAll('.graph-node-label')
-    .style('opacity', opacity)
+    .style('opacity', d => isTopicHub(d) || d.id === focusedNodeId || sources.has(d.id) || isSearched(d) ? 1 : detail)
+    .style('visibility', d => isTopicHub(d) || d.id === focusedNodeId || sources.has(d.id) || isSearched(d) || detail > 0 ? 'visible' : 'hidden')
+  zoomGroup.selectAll('.node-circle')
+    .style('opacity', d => sources.size && !sources.has(d.id) && !isTopicHub(d) ? 0.38 : 1)
+  zoomGroup.selectAll('.links-group line')
+    .style('opacity', d => linkTouches(d, focusedNodeId) || [...sources].some(id => linkTouches(d, id)) ? 1 :
+      d.edge_kind === 'topic_related' ? 0.8 : d.edge_kind === 'topic_membership' ? 0.12 + detail * 0.4 : detail * 0.6)
+    .style('visibility', d => d.edge_kind === 'topic_related' || d.edge_kind === 'topic_membership' ||
+      linkTouches(d, focusedNodeId) || [...sources].some(id => linkTouches(d, id)) || detail > 0 ? 'visible' : 'hidden')
 }
 
 function updateDimensions() {
@@ -452,7 +518,7 @@ function handleDisplayUpdate(display) {
     .attr('r', d => getNodeRadius(d))
   
   // Update text visibility
-  updateTextOpacity()
+  updateGraphDetail()
 }
 
 function handleForcesUpdate(forces) {
@@ -463,7 +529,7 @@ function handleForcesUpdate(forces) {
   // Update existing force parameters rather than replacing forces
   const linkForce = simulation.force('link')
   if (linkForce) {
-    linkForce.distance(forces.distance).strength(forces.link)
+    linkForce.distance(getLinkDistance).strength(forces.link)
   }
   
   const chargeForce = simulation.force('charge')
@@ -617,6 +683,8 @@ function resetZoom() {
 .graph-canvas:active {
   cursor: grabbing;
 }
+
+.graph-source-hint { position: absolute; bottom: 8px; left: 12px; z-index: 10; padding: 5px 8px; font-size: .75rem; color: var(--text-secondary); background: var(--bg-primary); border-radius: 4px; }
 
 .loading-overlay {
   position: absolute;

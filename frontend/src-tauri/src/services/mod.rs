@@ -12,6 +12,7 @@ pub mod memory;
 pub mod ollama;
 pub mod openrouter;
 pub mod priority;
+pub mod perspective_history;
 pub mod retrieval;
 pub mod search;
 pub mod settings;
