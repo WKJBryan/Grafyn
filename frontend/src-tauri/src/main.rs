@@ -18,6 +18,7 @@ use services::{
     ollama::OllamaService,
     openrouter::OpenRouterService,
     priority::PriorityScoringService,
+    perspective_history::PerspectiveHistory,
     retrieval::RetrievalService,
     search::SearchService,
     settings::SettingsService,
@@ -34,6 +35,7 @@ use tokio::sync::RwLock;
 pub struct AppState {
     pub knowledge_store: Arc<RwLock<KnowledgeStore>>,
     pub graph_index: Arc<RwLock<GraphIndex>>,
+    pub perspective_history: Arc<RwLock<PerspectiveHistory>>,
     pub search_service: Arc<RwLock<SearchService>>,
     pub canvas_store: Arc<RwLock<CanvasStore>>,
     pub openrouter: Arc<RwLock<OpenRouterService>>,
@@ -91,6 +93,7 @@ fn main() {
             // Initialize services
             let knowledge_store = KnowledgeStore::new(vault_path.clone(), data_path.clone());
             let graph_index = GraphIndex::new();
+            let perspective_history = PerspectiveHistory::new(data_path.join("perspectives").join("states"));
             let search_service = match SearchService::new(data_path.clone()) {
                 Ok(s) => s,
                 Err(e) => {
@@ -160,6 +163,7 @@ fn main() {
             let state = AppState {
                 knowledge_store: Arc::new(RwLock::new(knowledge_store)),
                 graph_index: Arc::new(RwLock::new(graph_index)),
+                perspective_history: Arc::new(RwLock::new(perspective_history)),
                 search_service: Arc::new(RwLock::new(search_service)),
                 canvas_store: Arc::new(RwLock::new(canvas_store)),
                 openrouter: Arc::new(RwLock::new(openrouter)),
@@ -218,6 +222,8 @@ fn main() {
             commands::graph::get_neighbors,
             commands::graph::get_unlinked,
             commands::graph::get_full_graph,
+            commands::graph::list_perspective_states,
+            commands::graph::record_perspective_state,
             commands::graph::rebuild_graph,
             // Canvas commands
             commands::canvas::list_sessions,

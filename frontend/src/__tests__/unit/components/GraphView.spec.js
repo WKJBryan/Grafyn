@@ -3,7 +3,8 @@ import { mount, flushPromises } from '@vue/test-utils'
 import { createPinia, setActivePinia } from 'pinia'
 import GraphView from '@/components/GraphView.vue'
 import * as apiClient from '@/api/client'
-import { forceSimulation, forceCenter } from 'd3-force'
+import { forceSimulation, forceCenter, forceLink } from 'd3-force'
+import { zoom as d3Zoom } from 'd3-zoom'
 import { useBootStore } from '@/stores/boot'
 // Mock GraphSettings child component
 vi.mock('@/components/GraphSettings.vue', () => ({
@@ -29,6 +30,15 @@ const mockSelection = {
   text: vi.fn().mockReturnThis(),
   remove: vi.fn().mockReturnThis(),
 }
+const labelSelection = { style: vi.fn().mockReturnThis() }
+const linkSelection = { style: vi.fn().mockReturnThis(), attr: vi.fn().mockReturnThis() }
+const circleSelection = { style: vi.fn().mockReturnThis(), attr: vi.fn().mockReturnThis() }
+mockSelection.selectAll.mockImplementation(selector => {
+  if (selector === '.graph-node-label') return labelSelection
+  if (selector === '.links-group line') return linkSelection
+  if (selector === '.node-circle') return circleSelection
+  return mockSelection
+})
 
 vi.mock('d3-selection', () => ({
   select: vi.fn(() => mockSelection),
@@ -201,7 +211,7 @@ describe('GraphView', () => {
 
     const firstSim = forceSimulation.mock.results[0].value
 
-    const refreshBtn = wrapper.findAll('.btn-secondary')[0]
+    const refreshBtn = wrapper.find('[title="Refresh Graph"]')
     await refreshBtn.trigger('click')
     await flushPromises()
 
@@ -280,7 +290,7 @@ describe('GraphView', () => {
 
     const callsBefore = apiClient.graph.full.mock.calls.length
 
-    const refreshBtn = wrapper.findAll('.btn-secondary')[0]
+    const refreshBtn = wrapper.find('[title="Refresh Graph"]')
     await refreshBtn.trigger('click')
     await flushPromises()
 
@@ -300,5 +310,90 @@ describe('GraphView', () => {
 
     expect(wrapper.find('.graph-toolbar').exists()).toBe(true)
     expect(wrapper.find('.toolbar-actions').exists()).toBe(true)
+  })
+
+  it('uses bounded structural distances instead of treating every relationship alike', async () => {
+    wrapper = mount(GraphView)
+    await flushPromises()
+    const distance = forceLink.mock.results[0].value.distance.mock.calls[0][0]
+    expect(distance({ edge_kind: 'topic_membership' })).toBe(70)
+    expect(distance({ edge_kind: 'note_link' })).toBe(100)
+    expect(distance({ edge_kind: 'topic_related' })).toBe(160)
+  })
+
+  it('reveals a clicked note and its local edge at overview zoom', async () => {
+    wrapper = mount(GraphView)
+    await flushPromises()
+    const click = mockSelection.on.mock.calls.find(([name]) => name === 'click')[1]
+    click({ stopPropagation: vi.fn() }, { id: '1', label: 'Note 1', node_kind: 'note' })
+    const labelVisibility = labelSelection.style.mock.calls.filter(([name]) => name === 'visibility').at(-1)[1]
+    const linkVisibility = linkSelection.style.mock.calls.filter(([name]) => name === 'visibility').at(-1)[1]
+    expect(labelVisibility({ id: '1', node_kind: 'note' })).toBe('visible')
+    expect(linkVisibility({ source: '1', target: '2', edge_kind: 'note_link' })).toBe('visible')
+    expect(wrapper.emitted('node-click')?.[0]).toEqual(['1'])
+  })
+
+  it('keeps hub labels and note circles at overview, then reveals note labels and links', async () => {
+    wrapper = mount(GraphView)
+    await flushPromises()
+    const labelVisibility = () => labelSelection.style.mock.calls
+      .filter(([key]) => key === 'visibility').at(-1)[1]
+    const zoomHandler = d3Zoom.mock.results[0].value.on.mock.calls.find(([kind]) => kind === 'zoom')[1]
+    const overview = labelVisibility()
+    expect(overview({ id: '2', node_kind: 'topic_hub' })).toBe('visible')
+    expect(overview({ id: '1', node_kind: 'note' })).toBe('hidden')
+    expect(circleSelection.style).toHaveBeenCalled()
+    const overviewEdges = linkSelection.style.mock.calls.filter(([key]) => key === 'visibility').at(-1)[1]
+    expect(overviewEdges({ source: '1', target: '2', edge_kind: 'note_link' })).toBe('hidden')
+
+    zoomHandler({ transform: { k: 2 } })
+    expect(labelVisibility()({ id: '1', node_kind: 'note' })).toBe('visible')
+    const detailedEdges = linkSelection.style.mock.calls.filter(([key]) => key === 'visibility').at(-1)[1]
+    expect(detailedEdges({ source: '1', target: '2', edge_kind: 'note_link' })).toBe('visible')
+  })
+
+  it('shows the sourced perspective lineage at the selected time slice', async () => {
+    const initial = { id: 's1', perspective_id: 'p1', title: 'Design', statement: 'Optimise first',
+      change_kind: 'initial', reason: 'Early view', source_note_ids: ['1'], previous_state_id: null,
+      effective_at: '2025-01-01T12:00:00Z' }
+    const revised = { ...initial, id: 's2', statement: 'Explore first', change_kind: 'revised',
+      previous_state_id: 's1', effective_at: '2026-01-01T12:00:00Z' }
+    vi.spyOn(apiClient.graph, 'perspectiveStates').mockResolvedValue([initial, revised])
+    wrapper = mount(GraphView)
+    await flushPromises()
+    await wrapper.find('button[aria-pressed="false"]').trigger('click')
+    await flushPromises()
+    expect(wrapper.find('.lineage').text()).toContain('Explore first')
+    expect(wrapper.find('.lineage').text()).toContain('Optimise first')
+    expect(wrapper.find('input[aria-label="Time slice"]').exists()).toBe(true)
+    await wrapper.find('input[aria-label="Time slice"]').setValue('0')
+    expect(wrapper.find('.lineage').text()).toContain('Optimise first')
+    expect(wrapper.find('.lineage').text()).not.toContain('Explore first')
+    const labelVisibility = labelSelection.style.mock.calls.filter(([key]) => key === 'visibility').at(-1)[1]
+    expect(labelVisibility({ id: '1', node_kind: 'note' })).toBe('visible')
+  })
+
+  it('records an explicit next state linked to its parent and selected source note', async () => {
+    const initial = { id: 's1', perspective_id: 'p1', title: 'Design', statement: 'Optimise first',
+      change_kind: 'initial', reason: 'Early view', source_note_ids: ['1'], previous_state_id: null,
+      effective_at: '2025-01-01T12:00:00Z' }
+    vi.spyOn(apiClient.graph, 'perspectiveStates').mockResolvedValue([initial])
+    const save = vi.spyOn(apiClient.graph, 'recordPerspectiveState').mockResolvedValue({
+      ...initial, id: 's2', statement: 'Explore first', previous_state_id: 's1', change_kind: 'revised',
+      effective_at: '2026-09-24T12:00:00Z'
+    })
+    wrapper = mount(GraphView)
+    await flushPromises()
+    await wrapper.find('button[aria-pressed="false"]').trigger('click')
+    await flushPromises()
+    await wrapper.find('select[required]').setValue('1')
+    await wrapper.find('textarea[required]').setValue('Explore first')
+    await wrapper.find('form').trigger('submit')
+    await flushPromises()
+    expect(save).toHaveBeenCalledWith(expect.objectContaining({
+      perspective_id: 'p1', previous_state_id: 's1', source_note_ids: ['1'],
+      statement: 'Explore first', change_kind: 'revised'
+    }))
+    expect(wrapper.find('.lineage').text()).toContain('Explore first')
   })
 })
