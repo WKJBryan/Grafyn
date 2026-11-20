@@ -13,8 +13,13 @@
         <span class="stat-item">{{ stats.edges }} Edges</span>
       </div>
       <div class="toolbar-actions">
-        <button v-if="showSettings" class="btn btn-secondary btn-sm" type="button"
-          :aria-pressed="showTimeline" @click="toggleTimeline">
+        <button
+          v-if="showSettings"
+          class="btn btn-secondary btn-sm"
+          type="button"
+          :aria-pressed="showTimeline"
+          @click="toggleTimeline"
+        >
           Time
         </button>
         <div class="graph-legend">
@@ -43,9 +48,18 @@
       ref="canvas"
       class="graph-canvas"
     />
-    <PerspectiveTimeline v-if="showTimeline" :nodes="timelineNodes" :source-note-id="focusedNodeId || ''"
-      @select-state="selectPerspectiveState" @close="showTimeline = false; selectPerspectiveState(null)" />
-    <p v-if="hiddenPerspectiveSources" class="graph-source-hint" role="status">
+    <PerspectiveTimeline
+      v-if="showTimeline"
+      :nodes="timelineNodes"
+      :source-note-id="focusedNodeId || ''"
+      @select-state="selectPerspectiveState"
+      @close="showTimeline = false; selectPerspectiveState(null)"
+    />
+    <p
+      v-if="hiddenPerspectiveSources"
+      class="graph-source-hint"
+      role="status"
+    >
       {{ hiddenPerspectiveSources }} source note{{ hiddenPerspectiveSources === 1 ? '' : 's' }} unavailable in this view (filtered or deleted).
     </p>
     

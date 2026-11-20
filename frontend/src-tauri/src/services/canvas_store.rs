@@ -236,6 +236,7 @@ impl CanvasStore {
         session
             .debates
             .retain(|debate| !Self::debate_uses_removed_tiles(debate, &removed_tile_ids));
+        Self::prune_branch_memories(session);
 
         session.updated_at = Utc::now();
         let session = session.clone();
@@ -265,11 +266,24 @@ impl CanvasStore {
             !Self::debate_uses_removed_tiles(debate, &descendants)
                 && !Self::debate_uses_deleted_response(debate, tile_id, model_id)
         });
+        session
+            .branch_memories
+            .remove(&format!("{tile_id}::{model_id}"));
+        Self::prune_branch_memories(session);
 
         session.updated_at = Utc::now();
         let session = session.clone();
         self.write_session_file(&session)?;
         Ok(())
+    }
+
+    /// Drop branch dreams (`{tile_id}::{model_id}`) whose tile no longer exists.
+    fn prune_branch_memories(session: &mut CanvasSession) {
+        let live: HashSet<&str> = session.prompt_tiles.iter().map(|t| t.id.as_str()).collect();
+        session.branch_memories.retain(|key, _| {
+            key.split_once("::")
+                .is_some_and(|(tile_id, _)| live.contains(tile_id))
+        });
     }
 
     pub fn update_branch_memory(
@@ -831,6 +845,65 @@ mod tests {
         assert_eq!(root.models, vec!["model-b".to_string()]);
         assert!(!root.responses.contains_key("model-a"));
         assert_eq!(remaining_debate_ids, vec!["debate-b".to_string()]);
+    }
+
+    #[test]
+    fn deletes_prune_branch_memories_of_removed_tiles_and_responses() {
+        let temp_dir = tempdir().expect("temp dir should be created");
+        let mut store = CanvasStore::new(temp_dir.path().to_path_buf());
+        let session = store
+            .create_session(SessionCreate {
+                title: "Dreams".to_string(),
+                description: None,
+                tags: Vec::new(),
+            })
+            .expect("session should be created");
+        for tile in [
+            build_tile("root", None, None, &["model-a", "model-b"]),
+            build_tile("branch-a", Some("root"), Some("model-a"), &["model-a"]),
+            build_tile("branch-b", Some("root"), Some("model-b"), &["model-b"]),
+            build_tile("other", None, None, &["model-a"]),
+        ] {
+            store.add_tile(&session.id, tile).expect("tile should be added");
+        }
+        let dream = CanvasWorkingMemory {
+            goal: "dream".to_string(),
+            ..CanvasWorkingMemory::default()
+        };
+        for key in [
+            "root::model-a",
+            "root::model-b",
+            "branch-a::model-a",
+            "branch-b::model-b",
+            "other::model-a",
+        ] {
+            store
+                .update_branch_memory(&session.id, key, dream.clone())
+                .expect("memory should persist");
+        }
+        let sorted_keys = |store: &mut CanvasStore| {
+            let mut keys: Vec<String> = store
+                .get_session(&session.id)
+                .expect("session should load")
+                .branch_memories
+                .into_keys()
+                .collect();
+            keys.sort();
+            keys
+        };
+
+        store
+            .delete_response(&session.id, "root", "model-a")
+            .expect("delete response should succeed");
+        assert_eq!(
+            sorted_keys(&mut store),
+            vec!["branch-b::model-b", "other::model-a", "root::model-b"]
+        );
+
+        store
+            .delete_tile(&session.id, "root")
+            .expect("delete tile should succeed");
+        assert_eq!(sorted_keys(&mut store), vec!["other::model-a"]);
     }
 
     #[test]

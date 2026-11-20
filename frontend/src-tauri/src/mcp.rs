@@ -65,7 +65,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(&data_path)?;
 
     // Initialize services
-    let knowledge_store = KnowledgeStore::new(vault_path, data_path.clone());
+    let knowledge_store = KnowledgeStore::new(vault_path.clone(), data_path.clone());
 
     // Try full SearchService first; fall back to read-only if writer lock is held
     let search_service = match SearchService::new(data_path.clone()) {
@@ -85,10 +85,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     s
                 }
                 Err(e2) => {
-                    log::error!("Failed to open search index: {}", e2);
-                    log::info!("Starting without search — create/update will skip indexing");
-                    // Create a minimal writable service as last resort
-                    SearchService::new(data_path.clone())?
+                    // No no-search mode exists; fail with both causes instead of
+                    // retrying the constructor that just failed.
+                    return Err(format!(
+                        "Cannot open search index: writable open failed ({}); \
+                         read-only open failed ({})",
+                        e, e2
+                    )
+                    .into());
                 }
             }
         }
@@ -137,6 +141,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         chunk_index,
         Arc::new(RwLock::new(retrieval_service)),
         Arc::new(RwLock::new(priority_service)),
+        vault_path,
     );
 
     log::info!("Starting Grafyn MCP server on stdio...");

@@ -179,9 +179,9 @@ Discovers potential links using semantic similarity and LLM analysis. Three meth
 
 Compare responses from multiple LLM models simultaneously via OpenRouter. Features: parallel model streaming, infinite canvas with D3.js zoom/pan, model debate mode, session persistence in `data/canvas/`, **semantic note context** (retrieves relevant notes as LLM system prompt).
 
-**Semantic context mode:** When `context_mode == Semantic` / `knowledge_search` (the default), `send_prompt` runs a two-stage pipeline: (1) note-level retrieval as a quality gate, (2) if `chunk_retrieval_enabled` (default: `true`), chunk-level retrieval fills relevant paragraphs within `default_token_budget` (default: 4000 tokens). Falls back to whole-note truncation (1500 chars) if chunks are empty or disabled. Retrieval queries are rewritten with compiled session working memory (`question` / open questions / constraints). **Pinned notes are always included**, even when the quality gate rejects retrieved hits. Context notes are stored on the tile and emitted via `ContextNotes`.
+**Semantic context mode:** When `context_mode == Semantic` / `knowledge_search` (the default), `send_prompt` sends the full parent-chain transcript until estimated conversation tokens reach `canvas_compact_token_threshold` (default 32k, clamp 8k–150k), then injects the branch dream plus the last two turns. Vault retrieval is a **second stage**: notes are fetched only if this hop needs them (`should_fetch_vault`); pins always merge. If `chunk_retrieval_enabled` (default: `true`), chunk-level retrieval fills relevant paragraphs within `default_token_budget` (default: 4000 tokens). Falls back to whole-note truncation (1500 chars) if chunks are empty or disabled. Retrieval queries are rewritten from the parent branch dream (`retrieval_cues` + `goal`, else `question`) plus the prompt — not open questions/constraints. **Pinned notes are always included**, even when vault fetch is skipped or the quality gate rejects retrieved hits. Context notes are stored on the tile and emitted via `ContextNotes`.
 
-**Session working memory and compaction:** After a tile persist succeeds, a cheap compile rewrites **branch** memory keyed by `tile_id::model_id` so siblings do not mix. Compact mode injects that branch block plus the last two parent-chain turns — it does **not** truncate older turns to 240 characters. Vault and Twin modes also attach those last two turns when branching. `context_mode=none` remains an escape hatch.
+**Session working memory and compaction:** Compiled working memory lives per branch in `session.branch_memories` keyed by `{tile_id}::{model_id}` — production compile does **not** write `session.working_memory`. Compact is **on demand** at `canvas_compact_token_threshold` (default 32k, clamp 8k–150k), or immediately in Compact mode even if the branch is short. Under the threshold, Knowledge Search / Twin / Semantic send the full parent chain with no compile LLM call. Over the threshold, a cheap compile writes a dreamed goal / discussed / nuances document at the **parent** key; follow-ups inject that dream plus the last two turns. Twin reads the parent branch key (`memory_for_follow_up`), not `session.working_memory`. Compact mode does **not** truncate older turns to 240 characters. `context_mode=none` remains an escape hatch.
 
 **Debate:** Default two parallel rounds of loose talk (hear the room, then answer the others). No UNDERSTAND/THINK/POSITION skeleton. After the last round, a separate chair model (not a participant) talks once; that speech is `Debate.recap`. Reply from the debate node parents a new prompt on `parent_debate_id` and injects the recap, not every speech. Continue still adds an optional extra round. Twin records/Constitution stay review-gated. Do not use `services/memory.rs` for this path.
 
@@ -203,15 +203,17 @@ Twin context mode is a native RAG path, not model-weight training. `frontend/src
 
 The prompt order is:
 
-1. Session working memory (when compiled; omitted if empty)
+1. Parent branch dream from `branch_memories` (when present; omitted if empty)
 2. Twin Operating Contract
 3. Twin Identity
-4. Reviewed Constitution
-5. Action Gap Risks
-6. Relevant Evidence
-7. Approved User Records
-8. Tentative Candidate Records
-9. Answer Instructions
+4. Past Decision Cases (always present; placeholder line when none selected)
+5. Reviewed Constitution (Active + Softened items only)
+6. Action Gap Risks
+7. Relevant Evidence
+8. Approved User Records
+9. Tentative Candidate Records
+10. Candidate Constitution Hypotheses (only when Candidate items were selected)
+11. Answer Instructions
 
 Twin Identity lives in `ConstitutionSetup` and is persisted in `constitution_setup.json` with `twin_name`, `twin_role`, and optional `source_boundaries`. Name and role/context are required before `TwinAnswerMode::Simulation` can run. The backend enforces this in the twin context resolution path so direct IPC calls cannot bypass the setup gate.
 

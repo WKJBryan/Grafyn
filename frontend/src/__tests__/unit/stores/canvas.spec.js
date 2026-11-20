@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { flushPromises } from '@vue/test-utils'
 import { createPinia, setActivePinia } from 'pinia'
-import { useCanvasStore, THINK_HARDER_PROMPT, THINK_HARDER_WEB_SEARCH_MAX_RESULTS } from '@/stores/canvas'
+import { useCanvasStore, THINK_HARDER_PROMPT, THINK_HARDER_WEB_SEARCH_MAX_RESULTS, resolveToolbarMemory } from '@/stores/canvas'
 import * as apiClient from '@/api/client'
 
 const listenMock = vi.fn()
@@ -1090,6 +1090,387 @@ describe('Canvas Store', () => {
     broadcast({ session_id: 'session-A', type: 'complete', tile_id: 'tile-A1', model_id: 'openai/gpt-4' })
     await promise
     expect(store.streamingModels.size).toBe(0)
+  })
+
+  it('loadSession keeps persisted branch_memories as the source of truth', async () => {
+    vi.spyOn(apiClient.canvas, 'get').mockResolvedValue({
+      id: 'session-1',
+      prompt_tiles: [
+        {
+          id: 'tile-1',
+          prompt: 'Hello',
+          responses: {
+            'openai/gpt-4': {
+              status: 'completed',
+              content: 'Hi',
+              position: { x: 0, y: 0, width: 280, height: 200 }
+            }
+          }
+        }
+      ],
+      debates: [],
+      branch_memories: {
+        'tile-1::openai/gpt-4': {
+          version: 2,
+          goal: 'Stay on the parent branch',
+          discussed: 'We compared two schools',
+          nuances: 'Cost still open',
+          updated_at: '2026-09-19T00:00:00Z'
+        }
+      }
+    })
+
+    const store = useCanvasStore()
+    await store.loadSession('session-1')
+
+    expect(store.currentSession.branch_memories['tile-1::openai/gpt-4']).toMatchObject({
+      version: 2,
+      goal: 'Stay on the parent branch',
+      discussed: 'We compared two schools'
+    })
+  })
+
+  it('applyWorkingMemoryUpdate writes sibling keys and does not overwrite the toolbar subject', () => {
+    const store = useCanvasStore()
+    const memoryA = {
+      version: 1,
+      goal: 'A dream',
+      summary: 'A',
+      updated_at: '2026-09-19T00:00:00Z'
+    }
+    const memoryB = {
+      version: 1,
+      goal: 'B dream',
+      summary: 'B',
+      updated_at: '2026-09-19T01:00:00Z'
+    }
+
+    store.currentSession = {
+      id: 'session-1',
+      prompt_tiles: [],
+      debates: [],
+      working_memory: memoryA,
+      branch_memories: {
+        'tile-1::model-a': memoryA
+      }
+    }
+    store.setToolbarBranchKey('tile-1::model-a')
+
+    store.applyWorkingMemoryUpdate({
+      session_id: 'session-1',
+      branch_key: 'tile-1::model-b',
+      working_memory: memoryB
+    })
+
+    expect(store.currentSession.branch_memories['tile-1::model-a']).toMatchObject({ goal: 'A dream' })
+    expect(store.currentSession.branch_memories['tile-1::model-b']).toMatchObject({ goal: 'B dream' })
+    expect(store.currentSession.working_memory.goal).toBe('A dream')
+
+    store.applyWorkingMemoryUpdate({
+      session_id: 'session-1',
+      branch_key: 'tile-1::model-a',
+      working_memory: { ...memoryA, goal: 'A updated', version: 2 }
+    })
+
+    expect(store.currentSession.working_memory.goal).toBe('A updated')
+    expect(store.currentSession.branch_memories['tile-1::model-a'].goal).toBe('A updated')
+    expect(store.currentSession.branch_memories['tile-1::model-b'].goal).toBe('B dream')
+
+    store.setToolbarBranchKey(null)
+    store.applyWorkingMemoryUpdate({
+      session_id: 'session-1',
+      branch_key: 'tile-1::model-b',
+      working_memory: { ...memoryB, goal: 'B is now the toolbar subject' }
+    })
+    expect(store.currentSession.working_memory.goal).toBe('B is now the toolbar subject')
+  })
+
+  it('applyWorkingMemoryUpdate ignores events for a different session and empty branch_key', () => {
+    const store = useCanvasStore()
+    store.currentSession = {
+      id: 'session-1',
+      prompt_tiles: [],
+      debates: [],
+      working_memory: { goal: 'keep' },
+      branch_memories: {}
+    }
+
+    store.applyWorkingMemoryUpdate({
+      session_id: 'session-other',
+      branch_key: 'tile-1::model-a',
+      working_memory: { goal: 'other' }
+    })
+    store.applyWorkingMemoryUpdate({
+      session_id: 'session-1',
+      branch_key: '',
+      working_memory: { goal: 'no-key' }
+    })
+
+    expect(store.currentSession.branch_memories).toEqual({})
+    expect(store.currentSession.working_memory.goal).toBe('keep')
+  })
+
+  it('mergeSavedSession keeps local branch_memories and overlays fetched keys', async () => {
+    const handlers = []
+    listenMock.mockImplementation(async (_eventName, handler) => {
+      handlers.push(handler)
+      return unlistenMock
+    })
+    function broadcast(payload) {
+      handlers.slice().forEach(handler => handler({ payload }))
+    }
+
+    let resolveGet
+    vi.spyOn(apiClient.canvas, 'get').mockImplementation(() => new Promise(resolve => {
+      resolveGet = resolve
+    }))
+    vi.spyOn(apiClient.canvas, 'sendPrompt').mockImplementation(async () => {
+      broadcast({
+        session_id: 'session-1',
+        type: 'tile_created',
+        tile: {
+          id: 'tile-1',
+          prompt: 'Hello',
+          position: { x: 0, y: 0, width: 200, height: 120 },
+          responses: {
+            'openai/gpt-4': { status: 'pending', content: '', position: { x: 300, y: 0, width: 280, height: 200 } }
+          }
+        }
+      })
+      return 'tile-1'
+    })
+
+    const store = useCanvasStore()
+    store.currentSession = {
+      id: 'session-1',
+      prompt_tiles: [],
+      debates: [],
+      branch_memories: {
+        'tile-local::model-a': { goal: 'local only', updated_at: '2026-09-19T00:00:00Z' }
+      }
+    }
+
+    const promise = store.sendPrompt('Hello', ['openai/gpt-4'])
+    await flushPromises()
+    broadcast({ session_id: 'session-1', type: 'session_saved' })
+    await flushPromises()
+
+    resolveGet({
+      id: 'session-1',
+      prompt_tiles: [
+        {
+          id: 'tile-1',
+          prompt: 'Hello',
+          position: { x: 0, y: 0, width: 200, height: 120 },
+          responses: {
+            'openai/gpt-4': { status: 'pending', content: '', position: { x: 300, y: 0, width: 280, height: 200 } }
+          }
+        }
+      ],
+      debates: [],
+      branch_memories: {
+        'tile-fetched::model-b': { goal: 'from disk', updated_at: '2026-09-19T01:00:00Z' }
+      }
+    })
+    await flushPromises()
+
+    expect(store.currentSession.branch_memories['tile-local::model-a'].goal).toBe('local only')
+    expect(store.currentSession.branch_memories['tile-fetched::model-b'].goal).toBe('from disk')
+
+    broadcast({ session_id: 'session-1', type: 'complete', tile_id: 'tile-1', model_id: 'openai/gpt-4' })
+    await promise
+  })
+
+  it('resolveToolbarMemory hides empty dreams and prefers the selected branch key', () => {
+    const memories = {
+      'tile-1::model-a': {
+        goal: 'Selected dream',
+        updated_at: '2026-09-19T00:00:00Z'
+      },
+      'tile-1::model-b': {
+        goal: 'Newer dream',
+        updated_at: '2026-09-19T02:00:00Z'
+      },
+      'tile-1::model-empty': {
+        goal: '',
+        summary: '',
+        updated_at: '2026-09-19T03:00:00Z'
+      }
+    }
+
+    expect(resolveToolbarMemory(memories, 'tile-1::model-a').goal).toBe('Selected dream')
+    expect(resolveToolbarMemory({
+      'tile-1::model-a': memories['tile-1::model-a'],
+      'tile-1::model-b': memories['tile-1::model-b']
+    }, null).goal).toBe('Newer dream')
+    expect(resolveToolbarMemory(memories, 'tile-1::model-empty')).toBeNull()
+    expect(resolveToolbarMemory(memories, null)).toBeNull()
+    expect(resolveToolbarMemory({}, null)).toBeNull()
+  })
+
+  function captureBroadcast() {
+    const handlers = []
+    listenMock.mockImplementation(async (_eventName, handler) => {
+      handlers.push(handler)
+      return unlistenMock
+    })
+    return payload => handlers.slice().forEach(handler => handler({ payload }))
+  }
+
+  it('ignores a tile_created that arrives after the user switched sessions', async () => {
+    const broadcast = captureBroadcast()
+    let resolveInvoke
+    vi.spyOn(apiClient.canvas, 'sendPrompt').mockImplementation(
+      () => new Promise(resolve => { resolveInvoke = resolve })
+    )
+
+    const store = useCanvasStore()
+    store.currentSession = { id: 'session-A', prompt_tiles: [], debates: [] }
+    const promise = store.sendPrompt('A prompt', ['openai/gpt-4'])
+    await flushPromises()
+
+    store.currentSession = { id: 'session-B', prompt_tiles: [], debates: [] }
+    broadcast({
+      session_id: 'session-A',
+      type: 'tile_created',
+      tile: { id: 'tile-A1', responses: { 'openai/gpt-4': { status: 'pending', content: '' } } }
+    })
+    expect(store.currentSession.prompt_tiles).toEqual([])
+
+    resolveInvoke('tile-A1')
+    await flushPromises()
+    broadcast({ session_id: 'session-A', type: 'complete', tile_id: 'tile-A1', model_id: 'openai/gpt-4' })
+    await promise
+    expect(store.currentSession.id).toBe('session-B')
+  })
+
+  it('debate_complete does not reload an abandoned session', async () => {
+    const broadcast = captureBroadcast()
+    const getSpy = vi.spyOn(apiClient.canvas, 'get').mockResolvedValue({ id: 'session-A', prompt_tiles: [], debates: [] })
+    vi.spyOn(apiClient.canvas, 'continueDebate').mockResolvedValue(undefined)
+
+    const store = useCanvasStore()
+    store.currentSession = {
+      id: 'session-A',
+      prompt_tiles: [],
+      debates: [{ id: 'debate-1', participating_models: ['m'] }]
+    }
+    const promise = store.continueDebate('debate-1', 'Go on')
+    await flushPromises()
+
+    store.currentSession = { id: 'session-B', prompt_tiles: [], debates: [] }
+    broadcast({ session_id: 'session-A', type: 'debate_complete', debate_id: 'debate-1' })
+    await promise
+
+    expect(getSpy).not.toHaveBeenCalled()
+    expect(store.currentSession.id).toBe('session-B')
+  })
+
+  it('stream timeout is idle-based: chunks every 100s keep it alive past 240s, silence finalizes', async () => {
+    vi.useFakeTimers()
+    try {
+      const broadcast = captureBroadcast()
+      vi.spyOn(apiClient.canvas, 'sendPrompt').mockImplementation(async () => {
+        broadcast({
+          session_id: 'session-1',
+          type: 'tile_created',
+          tile: { id: 'tile-1', responses: { m: { status: 'pending', content: '' } } }
+        })
+        return 'tile-1'
+      })
+
+      const store = useCanvasStore()
+      store.currentSession = { id: 'session-1', prompt_tiles: [], debates: [] }
+      let settled = false
+      const promise = store.sendPrompt('Long run', ['m']).then(() => { settled = true })
+      await vi.advanceTimersByTimeAsync(0)
+
+      for (let i = 0; i < 3; i++) {
+        await vi.advanceTimersByTimeAsync(100000)
+        broadcast({ session_id: 'session-1', type: 'chunk', tile_id: 'tile-1', model_id: 'm', chunk: `${i}` })
+      }
+      await vi.advanceTimersByTimeAsync(100000) // 400s total, 100s idle
+      expect(settled).toBe(false)
+      expect(store.currentSession.prompt_tiles[0].responses.m.content).toBe('012')
+
+      await vi.advanceTimersByTimeAsync(21000) // >120s idle
+      await promise
+      expect(settled).toBe(true)
+      expect(store.streamingModels.size).toBe(0)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('scopes concurrent debates: no doubled chunks, streaming survives the other debate completing', async () => {
+    const broadcast = captureBroadcast()
+    vi.spyOn(apiClient.canvas, 'get').mockResolvedValue({ id: 'session-1', prompt_tiles: [], debates: [] })
+    const resolvers = []
+    vi.spyOn(apiClient.canvas, 'startDebate').mockImplementation(
+      () => new Promise(resolve => { resolvers.push(resolve) })
+    )
+
+    const store = useCanvasStore()
+    store.currentSession = { id: 'session-1', prompt_tiles: [], debates: [] }
+    const first = store.startDebate([], ['m'])
+    await flushPromises()
+    const second = store.startDebate([], ['m'])
+    await flushPromises()
+    resolvers[0]('debate-1')
+    resolvers[1]('debate-2')
+    await flushPromises()
+
+    for (const id of ['debate-1', 'debate-2']) {
+      broadcast({ session_id: 'session-1', type: 'debate_created', debate: { id } })
+      broadcast({ session_id: 'session-1', type: 'round_start', debate_id: id, round_number: 1 })
+    }
+    broadcast({ session_id: 'session-1', type: 'debate_chunk', debate_id: 'debate-1', round_number: 1, model_id: 'm', chunk: 'a' })
+    broadcast({ session_id: 'session-1', type: 'debate_chunk', debate_id: 'debate-2', round_number: 1, model_id: 'm', chunk: 'b' })
+
+    expect(store.currentSession.debates.map(d => d.id)).toEqual(['debate-1', 'debate-2'])
+    expect(store.debateStreamingContent['debate-1'].models.m).toBe('a')
+    expect(store.debateStreamingContent['debate-2'].models.m).toBe('b')
+
+    broadcast({ session_id: 'session-1', type: 'model_complete', debate_id: 'debate-1', model_id: 'm' })
+    broadcast({ session_id: 'session-1', type: 'debate_complete', debate_id: 'debate-1' })
+    await first
+    expect(store.streamingModels.has('m')).toBe(true)
+
+    broadcast({ session_id: 'session-1', type: 'model_complete', debate_id: 'debate-2', model_id: 'm' })
+    broadcast({ session_id: 'session-1', type: 'debate_complete', debate_id: 'debate-2' })
+    await second
+    expect(store.streamingModels.size).toBe(0)
+  })
+
+  it('keeps branch and legacy working memory when session_saved fetches an empty default', async () => {
+    const broadcast = captureBroadcast()
+    vi.spyOn(apiClient.canvas, 'get').mockResolvedValue({ id: 'session-1', prompt_tiles: [], debates: [] })
+    vi.spyOn(apiClient.canvas, 'sendPrompt').mockResolvedValue('tile-1')
+
+    const store = useCanvasStore()
+    // Legacy sessions may still carry a session-level working_memory from disk.
+    const legacy = { version: 1, summary: 'Legacy memory', question: '' }
+    store.currentSession = { id: 'session-1', prompt_tiles: [], debates: [], working_memory: legacy }
+    const promise = store.sendPrompt('Hi', ['m'])
+    await flushPromises()
+
+    const memory = { version: 3, summary: 'Dreamed goal', question: '' }
+    broadcast({
+      session_id: 'session-1',
+      type: 'working_memory_updated',
+      branch_key: 'tile-1::m',
+      working_memory: memory
+    })
+    broadcast({ session_id: 'session-1', type: 'session_saved' })
+    await flushPromises()
+
+    expect(store.currentSession.branch_memories['tile-1::m']).toEqual(memory)
+    // The event mirrors the toolbar-subject dream into working_memory; the session_saved
+    // guard must keep that mirror when the fetched session carries only the empty default.
+    expect(store.currentSession.working_memory).toEqual(memory)
+
+    broadcast({ session_id: 'session-1', type: 'complete', tile_id: 'tile-1', model_id: 'm' })
+    await promise
   })
 
   it('exportTwinData proxies export requests to the twin API', async () => {

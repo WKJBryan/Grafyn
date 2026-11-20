@@ -16,6 +16,10 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
+/// Source tag for machine-seeded setup items; only these may be pruned by inference.
+/// `guided_setup` items are user-authored and must never be auto-deleted.
+const AUTO_SETUP_SOURCE: &str = "auto_setup";
+
 fn clean_setup_entries(entries: Vec<String>) -> Vec<String> {
     let mut seen = HashSet::new();
     entries
@@ -81,9 +85,8 @@ fn behavior_event_for_constitution(event_type: &TraceEventType) -> bool {
 fn constitution_status_from_record(record: &UserRecord) -> ConstitutionStatus {
     let support_count = record.evidence_refs.len();
     match record.promotion_state {
-        PromotionState::AutoPromoted | PromotionState::Endorsed
-            if support_count >= AUTO_PROMOTE_SUPPORT_COUNT =>
-        {
+        // Only human endorsement makes an item Active; AutoPromoted is machine-assigned.
+        PromotionState::Endorsed if support_count >= AUTO_PROMOTE_SUPPORT_COUNT => {
             ConstitutionStatus::Active
         }
         _ => ConstitutionStatus::Candidate,
@@ -1146,10 +1149,21 @@ impl TwinStore {
     }
 
     fn write_auto_constitution_setup(&self, mut setup: ConstitutionSetup) -> Result<()> {
+        // Union distilled entries into the saved setup: user-typed priors must survive inference.
         if let Ok(existing) = self.get_constitution_setup() {
             setup.twin_name = existing.twin_name;
             setup.twin_role = existing.twin_role;
             setup.source_boundaries = existing.source_boundaries;
+            for (saved, distilled) in [
+                (existing.values, &mut setup.values),
+                (existing.tastes, &mut setup.tastes),
+                (existing.constraints, &mut setup.constraints),
+                (existing.somatic_cues, &mut setup.somatic_cues),
+                (existing.action_tendencies, &mut setup.action_tendencies),
+            ] {
+                let new_entries = std::mem::replace(distilled, saved);
+                distilled.extend(new_entries);
+            }
         }
         setup.twin_name = clean_optional_setup_entry(setup.twin_name);
         setup.twin_role = clean_optional_setup_entry(setup.twin_role);
@@ -1228,7 +1242,7 @@ impl TwinStore {
         let stale_items = self
             .list_constitution_items()?
             .into_iter()
-            .filter(|item| item.source.as_deref() == Some("guided_setup"))
+            .filter(|item| item.source.as_deref() == Some(AUTO_SETUP_SOURCE))
             .filter(|item| !setup_claims.contains(item.claim.trim()))
             .collect::<Vec<_>>();
 
@@ -1441,8 +1455,9 @@ mod tests {
             .expect("behavior-derived constitution item should exist");
 
         assert_eq!(summary.scanned_behavior_events, 3);
-        assert_eq!(summary.auto_active_items, 1);
-        assert_eq!(item.status, ConstitutionStatus::Active);
+        // AutoPromoted is machine-assigned, so the derived item awaits review.
+        assert_eq!(summary.auto_active_items, 0);
+        assert_eq!(item.status, ConstitutionStatus::Candidate);
         assert_eq!(item.source.as_deref(), Some("behavior_inference"));
         assert!(item
             .evidence_refs
@@ -1559,7 +1574,7 @@ mod tests {
             .expect("old record should be created");
         store
             .create_constitution_item(ConstitutionItemCreate {
-                claim: "Old guided setup claim".to_string(),
+                claim: "Old auto setup claim".to_string(),
                 dimension: "values".to_string(),
                 scope: vec!["setup".to_string()],
                 priority: 0.9,
@@ -1568,7 +1583,7 @@ mod tests {
                 evidence_refs: Vec::new(),
                 tensions: Vec::new(),
                 linked_record_ids: Vec::new(),
-                source: Some("guided_setup".to_string()),
+                source: Some(AUTO_SETUP_SOURCE.to_string()),
             })
             .expect("old setup constitution item should be created");
 
@@ -1589,7 +1604,7 @@ mod tests {
             .expect("constitution should list")
             .iter()
             .all(|item| !item.claim.contains("Old note-backed claim")
-                && !item.claim.contains("Old guided setup claim")));
+                && !item.claim.contains("Old auto setup claim")));
         assert!(store
             .list_user_records()
             .expect("records should list")
@@ -1722,6 +1737,105 @@ mod tests {
         assert_eq!(
             setup.source_boundaries,
             vec!["Use reviewed notes only.".to_string()]
+        );
+    }
+
+    #[test]
+    fn constitution_inference_preserves_user_setup_values_and_guided_items() {
+        let temp_dir = tempdir().expect("temp dir should be created");
+        let mut store = TwinStore::new(temp_dir.path().to_path_buf());
+        store
+            .save_constitution_setup(ConstitutionSetup {
+                values: vec!["Family before career moves".to_string()],
+                tastes: vec!["Plain-spoken writing".to_string()],
+                constraints: vec!["Never relocate abroad".to_string()],
+                somatic_cues: vec!["Tight chest means slow down".to_string()],
+                action_tendencies: vec!["Sleep on big decisions".to_string()],
+                ..ConstitutionSetup::default()
+            })
+            .expect("setup should save");
+
+        let notes = vec![test_note(
+            "interview-setup",
+            "Interview: strategy",
+            "### Message 1: User\n\nWhat are some personal values or cultural values that drive your decisions?\n\n### Message 2: Interviewee\n\nI want work to make something better.\n\n### Message 3: User\n\nCan you walk us through a concrete example and how you balance innovation and stability?",
+            Some("interview"),
+        )];
+        store
+            .run_constitution_inference_with_notes(&notes)
+            .expect("constitution inference should run");
+        store
+            .run_constitution_inference_with_notes(&[])
+            .expect("second inference should run");
+
+        let setup = store.get_constitution_setup().expect("setup should load");
+        assert!(setup
+            .values
+            .contains(&"Family before career moves".to_string()));
+        assert!(setup
+            .values
+            .iter()
+            .any(|entry| entry.contains("values and cultural assumptions")));
+        assert!(setup.tastes.contains(&"Plain-spoken writing".to_string()));
+        assert!(setup
+            .constraints
+            .contains(&"Never relocate abroad".to_string()));
+        assert!(setup
+            .somatic_cues
+            .contains(&"Tight chest means slow down".to_string()));
+        assert!(setup
+            .action_tendencies
+            .contains(&"Sleep on big decisions".to_string()));
+
+        let guided = store
+            .list_constitution_items()
+            .expect("constitution should list")
+            .into_iter()
+            .filter(|item| item.source.as_deref() == Some("guided_setup"))
+            .count();
+        assert_eq!(guided, 5);
+    }
+
+    #[test]
+    fn auto_promoted_records_become_candidate_constitution_items() {
+        let mut record = UserRecord {
+            id: "r1".to_string(),
+            kind: UserRecordKind::Preference,
+            content: "Prefers exact commands".to_string(),
+            evidence_refs: vec![
+                EvidenceRef {
+                    trace_id: "t".to_string(),
+                    event_id: "e".to_string(),
+                    session_id: "s".to_string(),
+                    tile_id: None,
+                    model_id: None,
+                    note: None,
+                    source_type: None,
+                    source_id: None,
+                    source_label: None,
+                    excerpt: None,
+                    speaker_role: None,
+                };
+                AUTO_PROMOTE_SUPPORT_COUNT
+            ],
+            confidence: 0.9,
+            origin: RecordOrigin::Inferred,
+            promotion_state: PromotionState::AutoPromoted,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            valid_from: None,
+            valid_until: None,
+            links: Vec::new(),
+            metadata: HashMap::new(),
+        };
+        assert_eq!(
+            constitution_status_from_record(&record),
+            ConstitutionStatus::Candidate
+        );
+        record.promotion_state = PromotionState::Endorsed;
+        assert_eq!(
+            constitution_status_from_record(&record),
+            ConstitutionStatus::Active
         );
     }
 }

@@ -195,8 +195,8 @@ impl ChunkIndex {
     /// Reindex all notes.
     pub fn reindex_all(&mut self, notes: &[Note]) -> Result<()> {
         let writer = self.writer.as_mut().context("Writer not available")?;
+        // Single commit for delete + re-add: a crash mid-rebuild keeps the old index.
         writer.delete_all_documents()?;
-        writer.commit()?;
 
         for note in notes {
             self.index_note_chunks(note)?;
@@ -375,5 +375,12 @@ mod tests {
         assert_eq!(alpha[0].parent_note_id, "n1");
         assert_eq!(beta.len(), 1);
         assert_eq!(beta[0].parent_note_id, "n2");
+
+        // Second reindex drops old docs and keeps the re-added ones (single commit).
+        index
+            .reindex_all(&[make_note("n3", "Gamma", "Content about gamma topic.")])
+            .unwrap();
+        assert!(index.search_chunks("alpha", 10).unwrap().is_empty());
+        assert_eq!(index.search_chunks("gamma", 10).unwrap().len(), 1);
     }
 }

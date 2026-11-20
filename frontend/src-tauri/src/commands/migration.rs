@@ -62,6 +62,7 @@ pub async fn apply_markdown_migration(
                 background_vault_optimizer_program_enabled: Some(true),
                 vault_optimizer_program_path: request.program_path.clone(),
                 canvas_model_presets: None,
+                canvas_compact_token_threshold: None,
             })
             .map_err(|error| error.to_string())?;
     }
@@ -159,6 +160,7 @@ pub async fn update_vault_optimizer_settings(
                 .background_vault_optimizer_program_enabled,
             vault_optimizer_program_path: update.vault_optimizer_program_path,
             canvas_model_presets: None,
+            canvas_compact_token_threshold: None,
         })
         .map_err(|error| error.to_string())
 }

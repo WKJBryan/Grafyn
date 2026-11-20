@@ -85,11 +85,26 @@ pub struct CanvasWorkingMemory {
     pub note_ids: Vec<String>,
     #[serde(default)]
     pub summary: String,
+    #[serde(default)]
+    pub goal: String,
+    #[serde(default)]
+    pub discussed: String,
+    #[serde(default)]
+    pub nuances: String,
+    #[serde(default)]
+    pub retrieval_cues: Vec<String>,
+    #[serde(default)]
+    pub needs_vault: Option<bool>,
+    #[serde(default)]
+    pub compacted_turn_count: u32,
 }
 
 impl CanvasWorkingMemory {
     pub fn is_empty(&self) -> bool {
-        self.summary.trim().is_empty()
+        self.goal.trim().is_empty()
+            && self.discussed.trim().is_empty()
+            && self.nuances.trim().is_empty()
+            && self.summary.trim().is_empty()
             && self.question.trim().is_empty()
             && self.constraints.is_empty()
             && self.open_questions.is_empty()
@@ -668,6 +683,8 @@ pub enum CanvasStreamEvent {
     WorkingMemoryUpdated {
         session_id: String,
         working_memory: CanvasWorkingMemory,
+        #[serde(default)]
+        branch_key: String,
     },
     DebateCreated {
         session_id: String,

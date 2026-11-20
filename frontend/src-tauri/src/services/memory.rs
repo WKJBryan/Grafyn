@@ -45,7 +45,8 @@ impl MemoryService {
                 } else {
                     0.0
                 };
-                let total = (r.score + graph_boost).min(1.0);
+                // BM25 scores are unbounded; clamping to 1.0 would erase the boost.
+                let total = r.score + graph_boost;
                 RecallResult {
                     note_id: r.note.id,
                     title: r.note.title,
@@ -82,6 +83,8 @@ impl MemoryService {
             .find_similar(note_id, &note.content, 10)
             .map_err(|e| e.to_string())?;
 
+        // BM25 scores aren't 0-1: judge similarity relative to the best match.
+        let max_score = similar.iter().map(|r| r.score).fold(0.0_f32, f32::max);
         let mut contradictions = Vec::new();
         let note_status = note.status.to_string();
         let note_tags: HashSet<String> = note.tags.iter().cloned().collect();
@@ -91,13 +94,20 @@ impl MemoryService {
                 continue;
             }
 
-            // Status mismatch on similar content
-            if result.score > 0.7 && result.note.status.to_string() != note_status {
+            let similarity = if max_score > 0.0 {
+                result.score / max_score
+            } else {
+                0.0
+            };
+
+            // Status mismatch on similar content. The best match is always ratio 1.0, so an
+            // absolute BM25 floor keeps sparse vaults from flagging weak top hits.
+            if similarity > 0.7 && result.score > 0.7 && result.note.status.to_string() != note_status {
                 contradictions.push(Contradiction {
                     note_id: result.note.id.clone(),
                     title: result.note.title.clone(),
                     snippet: result.snippet.clone().unwrap_or_default(),
-                    similarity_score: result.score,
+                    similarity_score: similarity,
                     conflict_type: "status_mismatch".to_string(),
                     details: format!(
                         "Status '{}' vs '{}' on similar content",
@@ -106,8 +116,8 @@ impl MemoryService {
                 });
             }
 
-            // Tag mismatch on highly similar content
-            if result.score > 0.8 {
+            // Tag mismatch on highly similar content (same absolute floor as above)
+            if similarity > 0.8 && result.score > 0.8 {
                 let similar_tags: HashSet<String> = result.note.tags.iter().cloned().collect();
                 if !note_tags.is_empty()
                     && !similar_tags.is_empty()
@@ -117,7 +127,7 @@ impl MemoryService {
                         note_id: result.note.id.clone(),
                         title: result.note.title.clone(),
                         snippet: result.snippet.unwrap_or_default(),
-                        similarity_score: result.score,
+                        similarity_score: similarity,
                         conflict_type: "tag_mismatch".to_string(),
                         details: format!(
                             "Tags {:?} vs {:?} on similar content",
@@ -155,11 +165,7 @@ impl MemoryService {
             for para in paragraphs {
                 if let Some(claim_type) = classify_claim(para) {
                     let title = para.split('.').next().unwrap_or(para);
-                    let title = if title.len() > 100 {
-                        &title[..100]
-                    } else {
-                        title
-                    };
+                    let title: String = title.chars().take(100).collect();
 
                     let mut tags = extract_tags(para);
                     if msg.role == "assistant" {
@@ -167,7 +173,7 @@ impl MemoryService {
                     }
 
                     claims.push(ExtractedClaim {
-                        title: title.to_string(),
+                        title,
                         content: para.to_string(),
                         tags,
                         claim_type: claim_type.to_string(),
@@ -236,4 +242,111 @@ fn extract_tags(text: &str) -> Vec<String> {
         }
     }
     tags
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::note::{NoteCreate, NoteStatus};
+    use tempfile::TempDir;
+
+    fn create(
+        store: &mut KnowledgeStore,
+        search: &mut SearchService,
+        title: &str,
+        content: &str,
+        status: NoteStatus,
+    ) -> String {
+        let note = store
+            .create_note(NoteCreate {
+                title: title.into(),
+                content: content.into(),
+                relative_path: None,
+                aliases: Vec::new(),
+                status,
+                tags: Vec::new(),
+                schema_version: crate::models::note::CURRENT_NOTE_SCHEMA_VERSION,
+                migration_source: None,
+                optimizer_managed: false,
+                properties: Default::default(),
+            })
+            .unwrap();
+        search.index_note(&note).unwrap();
+        note.id
+    }
+
+    #[test]
+    fn claim_title_truncation_is_char_safe() {
+        // 99 ASCII bytes then a 2-byte char straddling byte 100.
+        let para = format!("{}é and more text after it for length", "a".repeat(99));
+        let claims = MemoryService::new().extract_from_conversation(&[ConversationMessage {
+            role: "user".into(),
+            content: para,
+        }]);
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].title.chars().count(), 100);
+        assert!(claims[0].title.ends_with("aé"));
+    }
+
+    #[test]
+    fn recall_graph_boost_is_not_saturated() {
+        let tmp = TempDir::new().unwrap();
+        let mut store = KnowledgeStore::new(tmp.path().join("vault"), tmp.path().join("data"));
+        let mut search = SearchService::new(tmp.path().join("data")).unwrap();
+        let ctx = create(
+            &mut store,
+            &mut search,
+            "Context",
+            "See [[Target]]",
+            NoteStatus::Draft,
+        );
+        create(
+            &mut store,
+            &mut search,
+            "Target",
+            "zebra zebra zebra",
+            NoteStatus::Draft,
+        );
+        search.commit().unwrap();
+        let mut graph = GraphIndex::new();
+        graph.build_from_notes(&store.list_full_notes().unwrap());
+
+        let results = MemoryService::new()
+            .recall_relevant(&search, &graph, "zebra", &[ctx], 5)
+            .unwrap();
+        let hit = &results[0];
+        assert_eq!(hit.graph_boost, 0.15);
+        assert!((hit.total_score - (hit.score + 0.15)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn contradictions_use_relative_similarity() {
+        let tmp = TempDir::new().unwrap();
+        let mut store = KnowledgeStore::new(tmp.path().join("vault"), tmp.path().join("data"));
+        let mut search = SearchService::new(tmp.path().join("data")).unwrap();
+        let words = "alpha bravo charlie delta echoes foxtrot golfer hotel indigo juliet";
+        let src = create(&mut store, &mut search, "Source", words, NoteStatus::Draft);
+        let close = create(
+            &mut store,
+            &mut search,
+            "Close",
+            words,
+            NoteStatus::Canonical,
+        );
+        let weak = create(
+            &mut store,
+            &mut search,
+            "Weak",
+            "alpha plus unrelated filler words entirely",
+            NoteStatus::Canonical,
+        );
+        search.commit().unwrap();
+
+        let found = MemoryService::new()
+            .find_contradictions(&search, &store, &src)
+            .unwrap();
+        assert!(found.iter().any(|c| c.note_id == close));
+        assert!(!found.iter().any(|c| c.note_id == weak), "{found:?}");
+        assert!(found.iter().all(|c| c.similarity_score <= 1.0));
+    }
 }

@@ -1,23 +1,22 @@
 #[cfg(test)]
 use super::decisions::parse_twin_prediction;
 use super::TwinStore;
+use crate::models::twin::{
+    ConstitutionStatus, ExportBundle, ExportFileSummary, PromotionState, TraceEventType,
+    TwinExportRequest, UserRecord,
+};
 #[cfg(test)]
 use crate::models::twin::{
     DecisionEpisodeCreate, DecisionOutcomeUpdate, EvidenceRef, PrimitiveDecisionAssessment,
     RecordOrigin, UserRecordCreate,
 };
-use crate::models::twin::{
-    ExportBundle, ExportFileSummary, PromotionState, TraceEventType, TwinExportRequest, UserRecord,
-};
 use crate::services::atomic_io::write_atomic;
 use anyhow::{Context, Result};
 use chrono::Utc;
 use serde_json::{json, Value};
-use std::collections::hash_map::DefaultHasher;
 #[cfg(test)]
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::hash::{Hash, Hasher};
 use std::path::Path;
 
 const DEFAULT_EVAL_PERCENTAGE: u8 = 10;
@@ -134,15 +133,24 @@ impl TwinStore {
             })
             .collect::<std::result::Result<Vec<_>, _>>()?;
         self.write_jsonl_file(&benchmark_path, &benchmark_lines)?;
+        // Privacy rule (mirrors records): Private/NoTrain items never leave the machine.
+        let exportable = |status: &ConstitutionStatus| {
+            !matches!(
+                status,
+                ConstitutionStatus::Private | ConstitutionStatus::NoTrain
+            )
+        };
         let constitution_lines = self
             .list_constitution_items()?
             .into_iter()
+            .filter(|item| exportable(&item.status))
             .map(|item| serde_json::to_string(&item))
             .collect::<std::result::Result<Vec<_>, _>>()?;
         self.write_jsonl_file(&constitution_path, &constitution_lines)?;
         let action_gap_lines = self
             .list_action_gaps()?
             .into_iter()
+            .filter(|gap| exportable(&gap.status))
             .map(|gap| serde_json::to_string(&gap))
             .collect::<std::result::Result<Vec<_>, _>>()?;
         self.write_jsonl_file(&action_gaps_path, &action_gap_lines)?;
@@ -227,6 +235,9 @@ impl TwinStore {
 
         let manifest = serde_json::json!({
             "bundle_schema_version": 2,
+            // shortcut: split assignments changed once when the hash moved to FNV-1a over
+            // record.id; external harnesses must not mix holdouts across split_method values.
+            "split_method": "fnv1a64-id",
             "generated_at": Utc::now(),
             "root_path": self.root_path.display().to_string(),
             "eval_percentage": eval_percentage,
@@ -329,14 +340,8 @@ impl TwinStore {
         eval_percentage: u8,
         holdout_percentage: u8,
     ) -> ExportSplit {
-        let key = format!(
-            "{}:{}:{}:{}",
-            record.id,
-            serde_json::to_string(&record.kind).unwrap_or_default(),
-            record.content,
-            record.updated_at
-        );
-        let bucket = Self::stable_bucket(&key);
+        // Id only: edits must never move a record between splits (holdout contamination).
+        let bucket = Self::stable_bucket(&record.id);
 
         if bucket < holdout_percentage {
             ExportSplit::Holdout
@@ -347,10 +352,14 @@ impl TwinStore {
         }
     }
 
+    /// FNV-1a 64-bit: specified and toolchain-independent, unlike `DefaultHasher`.
     fn stable_bucket(key: &str) -> u8 {
-        let mut hasher = DefaultHasher::new();
-        key.hash(&mut hasher);
-        (hasher.finish() % 100) as u8
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for byte in key.bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        (hash % 100) as u8
     }
 
     fn record_to_export_value(record: &UserRecord) -> serde_json::Value {
@@ -560,5 +569,133 @@ mod tests {
         assert!(!feedback_content.contains("extremely sensitive rationale"));
         assert!(!feedback_content.contains(&private_event.id));
         assert!(feedback_content.contains(&exportable_event.id));
+    }
+
+    #[test]
+    fn export_omits_private_and_no_train_constitution_items_and_action_gaps() {
+        use crate::models::twin::{
+            ActionGapCreate, ConstitutionItemCreate, ConstitutionReviewRequest, ConstitutionStatus,
+            MemoryDigestAction,
+        };
+        let temp_dir = tempdir().expect("temp dir should be created");
+        let mut store = TwinStore::new(temp_dir.path().to_path_buf());
+
+        let item = |claim: &str| ConstitutionItemCreate {
+            claim: claim.to_string(),
+            dimension: "values".to_string(),
+            scope: vec!["general".to_string()],
+            priority: 0.8,
+            confidence: 0.8,
+            status: ConstitutionStatus::Active,
+            evidence_refs: Vec::new(),
+            tensions: Vec::new(),
+            linked_record_ids: Vec::new(),
+            source: None,
+        };
+        let gap = |stated: &str| ActionGapCreate {
+            stated_value: stated.to_string(),
+            revealed_behavior: "does otherwise".to_string(),
+            driver_hypothesis: None,
+            somatic_taste_signal: None,
+            decision_risk: "risk".to_string(),
+            evidence_refs: Vec::new(),
+            linked_record_ids: Vec::new(),
+            confidence: 0.7,
+            status: ConstitutionStatus::Candidate,
+        };
+        let review = |action| ConstitutionReviewRequest {
+            action,
+            rationale: None,
+        };
+
+        let private_item = store
+            .create_constitution_item(item("secret private claim"))
+            .expect("item should create");
+        let no_train_item = store
+            .create_constitution_item(item("secret no-train claim"))
+            .expect("item should create");
+        store
+            .create_constitution_item(item("shareable claim"))
+            .expect("item should create");
+        store
+            .review_constitution_item(&private_item.id, review(MemoryDigestAction::Private))
+            .expect("review should apply");
+        store
+            .review_constitution_item(&no_train_item.id, review(MemoryDigestAction::NoTrain))
+            .expect("review should apply");
+        let private_gap = store
+            .create_action_gap(gap("secret private gap"))
+            .expect("gap should create");
+        store
+            .create_action_gap(gap("shareable gap"))
+            .expect("gap should create");
+        store
+            .review_action_gap(&private_gap.id, review(MemoryDigestAction::Private))
+            .expect("gap review should apply");
+
+        let bundle = store
+            .export_bundle(TwinExportRequest::default())
+            .expect("export should succeed");
+
+        assert_eq!(bundle.constitution_items.count, 1);
+        assert_eq!(bundle.action_gaps.count, 1);
+        for entry in std::fs::read_dir(&bundle.output_dir).expect("bundle dir should list") {
+            let content =
+                std::fs::read_to_string(entry.expect("entry").path()).expect("file should read");
+            assert!(
+                !content.contains("secret"),
+                "private text leaked: {content}"
+            );
+        }
+    }
+
+    #[test]
+    fn export_split_depends_only_on_record_id() {
+        let temp_dir = tempdir().expect("temp dir should be created");
+        let mut store = TwinStore::new(temp_dir.path().to_path_buf());
+        let mut record = store
+            .create_user_record(UserRecordCreate {
+                kind: UserRecordKind::Preference,
+                content: "Original".to_string(),
+                origin: RecordOrigin::User,
+                evidence_refs: Vec::new(),
+                confidence: 0.9,
+                promotion_state: Some(PromotionState::Endorsed),
+                valid_from: None,
+                valid_until: None,
+                links: Vec::new(),
+                metadata: HashMap::new(),
+            })
+            .expect("record should be created");
+
+        // Every id must keep its split no matter how content/kind/updated_at change.
+        for index in 0..200 {
+            record.id = format!("record-{index}");
+            record.content = "Original".to_string();
+            record.updated_at = Utc::now();
+            let before = TwinStore::split_for_record(&record, 10, 10);
+            record.content = format!("Edited {index}");
+            record.kind = UserRecordKind::Fact;
+            record.updated_at = Utc::now() + chrono::Duration::days(1);
+            assert_eq!(TwinStore::split_for_record(&record, 10, 10), before);
+        }
+
+        // Pinned FNV-1a value: the bucket must not drift across Rust toolchains.
+        assert_eq!(TwinStore::stable_bucket("record-0"), 49);
+
+        let mut counts = HashMap::new();
+        for _ in 0..2000 {
+            record.id = uuid::Uuid::new_v4().to_string();
+            *counts
+                .entry(format!(
+                    "{:?}",
+                    TwinStore::split_for_record(&record, 10, 10)
+                ))
+                .or_insert(0_usize) += 1;
+        }
+        let holdout = counts.get("Holdout").copied().unwrap_or(0);
+        let eval = counts.get("Eval").copied().unwrap_or(0);
+        assert!((120..=280).contains(&holdout), "holdout {holdout}");
+        assert!((120..=280).contains(&eval), "eval {eval}");
     }
 }
