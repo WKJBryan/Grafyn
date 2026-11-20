@@ -100,8 +100,11 @@ impl HubRegistry {
 }
 
 pub fn sync_topic_hubs(store: &mut KnowledgeStore) -> Result<TopicHubSyncResult> {
+    // One stamp walk picks up external edits; every later read is from the store's
+    // cache, which each store write below refreshes itself.
+    store.refresh_cache();
     let mut notes_by_id = store
-        .list_full_notes()?
+        .cached_full_notes()
         .into_iter()
         .map(|note| (note.id.clone(), note))
         .collect::<HashMap<_, _>>();
@@ -188,7 +191,7 @@ pub fn sync_topic_hubs(store: &mut KnowledgeStore) -> Result<TopicHubSyncResult>
         }
     }
 
-    let refreshed_notes = store.list_full_notes()?;
+    let refreshed_notes = store.cached_full_notes();
     notes_by_id = refreshed_notes
         .into_iter()
         .map(|note| (note.id.clone(), note))
@@ -216,7 +219,7 @@ pub fn sync_topic_hubs(store: &mut KnowledgeStore) -> Result<TopicHubSyncResult>
     }
 
     Ok(TopicHubSyncResult {
-        all_notes: store.list_full_notes()?,
+        all_notes: store.cached_full_notes(),
         changed_note_ids: changed_note_ids.into_iter().collect(),
         removed_note_ids: removed_note_ids.into_iter().collect(),
     })

@@ -244,8 +244,39 @@ impl GraphIndex {
 
     /// Add or update a note in the index
     pub fn update_note(&mut self, note: &Note) {
-        self.notes.insert(note.id.clone(), note.clone());
-        self.rebuild_from_cached_notes();
+        self.update_notes(std::slice::from_ref(note));
+    }
+
+    /// Upserts notes; adjacency is rebuilt (from the cache, no disk) only when a
+    /// change can move an edge or a title/alias/path resolution.
+    pub fn update_notes(&mut self, notes: &[Note]) {
+        let mut rebuild = false;
+        for note in notes {
+            match self.notes.get(&note.id) {
+                Some(old) if old == note => continue,
+                Some(old) if same_graph_shape(old, note) => {
+                    self.note_meta.insert(note.id.clone(), NoteMeta::from(note));
+                }
+                _ => rebuild = true,
+            }
+            self.notes.insert(note.id.clone(), note.clone());
+        }
+        if rebuild {
+            self.rebuild_from_cached_notes();
+        }
+    }
+
+    /// Same result as `build_from_notes`, but only clones and re-resolves what changed.
+    pub fn sync_notes(&mut self, notes: &[Note]) {
+        let ids = notes
+            .iter()
+            .map(|note| note.id.as_str())
+            .collect::<HashSet<_>>();
+        if ids.len() != self.notes.len() || !self.notes.keys().all(|id| ids.contains(id.as_str())) {
+            self.build_from_notes(notes);
+            return;
+        }
+        self.update_notes(notes);
     }
 
     /// Remove a note from the index
@@ -666,6 +697,19 @@ pub struct GraphLink {
     pub provenance: GraphEdgeProvenance,
 }
 
+/// True when every input the adjacency/topic rebuild reads is identical, so only metadata moved.
+fn same_graph_shape(old: &Note, new: &Note) -> bool {
+    old.title == new.title
+        && old.relative_path == new.relative_path
+        && old.aliases == new.aliases
+        && old.parsed_links == new.parsed_links
+        && old.is_topic_hub() == new.is_topic_hub()
+        && old.topic_key() == new.topic_key()
+        && old.topic_hub_ids() == new.topic_hub_ids()
+        && old.inferred_link_ids() == new.inferred_link_ids()
+        && old.auto_inserted_link_ids() == new.auto_inserted_link_ids()
+}
+
 fn bump_topic_pair(
     scores: &mut HashMap<(String, String), usize>,
     left: &str,
@@ -783,5 +827,43 @@ mod tests {
             assert_eq!(outgoing.len(), 1);
             assert_eq!(outgoing[0].id, "meeting-a", "round {round}");
         }
+    }
+
+    fn backlink_ids(graph: &GraphIndex, id: &str) -> Vec<String> {
+        let mut ids = graph
+            .get_backlinks(id)
+            .into_iter()
+            .map(|meta| meta.id)
+            .collect::<Vec<_>>();
+        ids.sort();
+        ids
+    }
+
+    #[test]
+    fn sync_notes_patches_content_edits_and_rebuilds_link_edits() {
+        let a = make_note("a", "A", vec![("B", RelationType::Related)]);
+        let b = make_note("b", "B", vec![]);
+        let c = make_note("c", "C", vec![]);
+        let mut graph = GraphIndex::new();
+        graph.build_from_notes(&[a.clone(), b.clone(), c.clone()]);
+
+        // Content-only edit: edges unchanged, metadata refreshed.
+        let mut a_edit = a.clone();
+        a_edit.content = "new body".into();
+        a_edit.tags = vec!["fresh".into()];
+        graph.sync_notes(&[a_edit.clone(), b.clone(), c.clone()]);
+        assert_eq!(backlink_ids(&graph, "b"), vec!["a"]);
+        assert_eq!(graph.get_backlinks("b")[0].tags, vec!["fresh".to_string()]);
+
+        // Link edit: the backlink moves from B to C.
+        let a_relinked = make_note("a", "A", vec![("C", RelationType::Related)]);
+        graph.sync_notes(&[a_relinked.clone(), b.clone(), c.clone()]);
+        assert!(backlink_ids(&graph, "b").is_empty());
+        assert_eq!(backlink_ids(&graph, "c"), vec!["a"]);
+
+        // Removal falls back to a full build.
+        graph.sync_notes(&[b.clone(), c.clone()]);
+        assert!(backlink_ids(&graph, "c").is_empty());
+        assert!(graph.get_outgoing("a").is_empty());
     }
 }

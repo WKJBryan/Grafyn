@@ -42,6 +42,8 @@ pub struct GrafynMcpServer {
     /// Latest vault mtime this process has loaded; another process writing
     /// the vault moves it and triggers a cache + graph refresh.
     vault_stamp: Arc<Mutex<Option<SystemTime>>>,
+    /// Monotonic time of the last vault probe, for throttling.
+    last_probe: Arc<Mutex<Option<std::time::Instant>>>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -360,6 +362,7 @@ impl GrafynMcpServer {
             priority_service,
             vault_path,
             vault_stamp,
+            last_probe: Arc::new(Mutex::new(None)),
             tool_router: Self::tool_router(),
         }
     }
@@ -367,6 +370,14 @@ impl GrafynMcpServer {
     /// If the vault changed on disk since we last loaded it (e.g. the Grafyn
     /// app wrote notes), reload the note cache and rebuild the local graph.
     async fn refresh_if_vault_changed(&self) {
+        // The probe stats the whole vault; at most one probe per 2 s keeps bursts of tool calls cheap.
+        {
+            let mut last = self.last_probe.lock().unwrap_or_else(|e| e.into_inner());
+            if last.is_some_and(|at| at.elapsed() < std::time::Duration::from_secs(2)) {
+                return;
+            }
+            *last = Some(std::time::Instant::now());
+        }
         let current = latest_vault_mtime(&self.vault_path);
         {
             let mut seen = self.vault_stamp.lock().unwrap_or_else(|e| e.into_inner());
@@ -377,14 +388,9 @@ impl GrafynMcpServer {
         }
         // Lock order matches the write tools: knowledge_store, then graph.
         let mut ks = self.knowledge_store.write().await;
-        ks.set_vault_path(self.vault_path.clone()); // re-walks the vault cache
-        let notes: Vec<_> = ks
-            .list_notes()
-            .unwrap_or_default()
-            .iter()
-            .filter_map(|m| ks.get_note(&m.id).ok())
-            .collect();
-        self.graph_index.write().await.build_from_notes(&notes);
+        ks.set_vault_path(self.vault_path.clone()); // re-walks the vault cache (changed files only)
+        let notes = ks.cached_full_notes();
+        self.graph_index.write().await.sync_notes(&notes);
     }
 
     #[tool(
@@ -738,6 +744,7 @@ impl GrafynMcpServer {
         };
 
         let mut created_ids = Vec::new();
+        let mut created_notes = Vec::new();
         let mut errors = Vec::new();
         let mut index_warning = None;
 
@@ -766,18 +773,16 @@ impl GrafynMcpServer {
                             index_warning = Some(w);
                         }
                     }
-                    // Update graph
-                    {
-                        let mut graph = self.graph_index.write().await;
-                        graph.update_note(&note);
-                    }
-                    created_ids.push(note.id);
+                    created_ids.push(note.id.clone());
+                    created_notes.push(note);
                 }
                 Err(e) => {
                     errors.push(format!("Failed to create '{}': {}", title, e));
                 }
             }
         }
+        // One graph rebuild for the whole import instead of one per note.
+        self.graph_index.write().await.update_notes(&created_notes);
 
         let result = serde_json::json!({
             "platform": platform,
