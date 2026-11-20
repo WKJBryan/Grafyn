@@ -272,16 +272,37 @@ body {
 }
 
 /* Hero mode: one orchestrated assembly on page load. */
-.mark-hero .m-facet {
+.mark-hero .m-seed-fill {
   opacity: 0;
-  animation: m-fade 600ms var(--ease-fluid) both;
-  animation-delay: calc(150ms + var(--i, 0) * 70ms);
+  animation: m-fade 700ms var(--ease-fluid) 100ms both;
 }
 
-.mark-hero .m-stem {
+.mark-hero .m-seam {
   stroke-dasharray: 1;
   stroke-dashoffset: 1;
-  animation: m-draw 800ms var(--ease-fluid) 750ms both;
+  animation: m-draw 450ms var(--ease-fluid) both;
+  animation-delay: calc(350ms + var(--i, 0) * 50ms);
+}
+
+/* The stem's round linecap paints a dot even at full dashoffset, so the
+   undrawn state also needs opacity 0. */
+.mark-hero .m-stem {
+  stroke-dasharray: 1;
+  animation: m-draw-stem 800ms var(--ease-fluid) 750ms both;
+}
+
+@keyframes m-draw-stem {
+  0% {
+    opacity: 0;
+    stroke-dashoffset: 1;
+  }
+  1% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 1;
+    stroke-dashoffset: 0;
+  }
 }
 
 .mark-hero .m-edge {
@@ -329,6 +350,10 @@ body {
   stroke-dasharray: 1;
   stroke-dashoffset: 1;
   transition: stroke-dashoffset 900ms var(--ease-fluid);
+}
+
+.mark-story[data-stage='0'] .m-stem {
+  opacity: 0;
 }
 
 .mark-story .m-node {
@@ -494,7 +519,8 @@ body {
     transform: none;
   }
 
-  .mark-hero .m-facet,
+  .mark-hero .m-seed-fill,
+  .mark-hero .m-seam,
   .mark-hero .m-stem,
   .mark-hero .m-edge,
   .mark-hero .m-node {

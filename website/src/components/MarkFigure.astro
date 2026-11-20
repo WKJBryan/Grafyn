@@ -8,7 +8,7 @@
 const { mode = 'hero' } = Astro.props;
 
 const nodes = [
-  { x: 210, y: 198, r: 7, base: true },
+  { x: 210, y: 198, r: 8, base: true, alt: true },
   { x: 150, y: 150, r: 5.5 },
   { x: 248, y: 142, r: 5.5 },
   { x: 118, y: 92, r: 5 },
@@ -25,17 +25,27 @@ const edges = [
   [4, 7], [5, 7], [5, 8], [2, 8], [1, 9], [3, 9],
 ];
 
-// Seed crystal facets: outer ring T→A→B→C→D→E→F around inner point M.
-const T = [168, 332], A = [216, 354], B = [226, 402], C = [192, 442];
-const D = [142, 436], E = [114, 392], F = [126, 348], M = [172, 392];
-const facets = [
-  { pts: [T, A, M], o: 0.95 },
-  { pts: [A, B, M], o: 0.7 },
-  { pts: [B, C, M], o: 0.5 },
-  { pts: [C, D, M], o: 0.8 },
-  { pts: [D, E, M], o: 0.6 },
-  { pts: [E, F, M], o: 0.45 },
-  { pts: [F, T, M], o: 0.66 },
+// Seed, traced from frontend/src-tauri/icons/app-icon.png: an irregular
+// angular gem with a deep Z-shaped cleft in its top edge — the stem grows
+// out of the split. One solid silhouette; the facets are dark seam lines
+// (the page background showing through as cuts), meeting at a lower hub H
+// and the cleft apex, like the source mark.
+const seedOutline =
+  'M120 330 L185 295 L232 308 L196 382 L252 330 L285 338 L292 398 ' +
+  'L255 452 L165 460 L108 420 L95 365 Z';
+
+const H = [175, 408];
+const apex = [196, 382];
+const seams = [
+  [[120, 330], H],
+  [[185, 295], H],
+  [[95, 365], H],
+  [[108, 420], H],
+  [H, [165, 460]],
+  [H, [255, 452]],
+  [H, apex],
+  [apex, [255, 452]],
+  [[252, 330], [255, 452]],
 ];
 ---
 
@@ -49,16 +59,19 @@ const facets = [
   aria-hidden="true"
 >
   <g class="m-seed">
+    <path class="m-seed-fill" d={seedOutline} fill="var(--color-seed)" />
     {
-      facets.map((f, i) => (
-        <polygon
-          class="m-facet"
+      seams.map(([a, b], i) => (
+        <line
+          class="m-seam"
           style={`--i:${i}`}
-          points={f.pts.map((p) => p.join(',')).join(' ')}
-          fill="var(--color-seed)"
-          fill-opacity={f.o}
-          stroke="var(--color-abyss)"
-          stroke-width="1.5"
+          x1={a[0]}
+          y1={a[1]}
+          x2={b[0]}
+          y2={b[1]}
+          pathLength="1"
+          stroke="var(--color-ink)"
+          stroke-width="4"
         />
       ))
     }
@@ -66,10 +79,10 @@ const facets = [
 
   <path
     class="m-stem"
-    d="M168 332 C172 290 196 250 210 198"
+    d="M205 375 C215 355 238 342 240 318 C242 298 222 290 216 262 C212 240 210 220 210 198"
     pathLength="1"
     stroke="var(--color-seed)"
-    stroke-width="2.5"
+    stroke-width="4"
     stroke-linecap="round"
   />
 
