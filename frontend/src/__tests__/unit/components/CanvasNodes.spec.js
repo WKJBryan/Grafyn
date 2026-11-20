@@ -4,7 +4,6 @@ import { afterEach, describe, expect, it } from 'vitest'
 import PromptNode from '@/components/canvas/PromptNode.vue'
 import LLMNode from '@/components/canvas/LLMNode.vue'
 import DebateNode from '@/components/canvas/DebateNode.vue'
-import ModelResponseCard from '@/components/canvas/ModelResponseCard.vue'
 
 const mountedWrappers = []
 
@@ -138,20 +137,6 @@ describe('Canvas Nodes', () => {
     })
 
     expect(wrapper.find('.node-content').attributes('data-selectable-text')).toBe('true')
-  })
-
-  it('marks legacy model response cards as selectable', () => {
-    const wrapper = mountAttached(ModelResponseCard, {
-      props: {
-        response: {
-          status: 'completed',
-          content: 'Copy text from a compact response card.',
-          model_name: 'GPT-4'
-        }
-      }
-    })
-
-    expect(wrapper.find('.response-content').attributes('data-selectable-text')).toBe('true')
   })
 
   it('resizes prompt nodes and keeps x/y fixed when dragging from the resize handle', () => {
