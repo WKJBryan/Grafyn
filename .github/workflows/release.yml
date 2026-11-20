@@ -226,7 +226,7 @@ jobs:
               '|----------|------|-------|',
               '| **Windows (64-bit)** | `Grafyn_*_x64-setup.exe` | Most Windows PCs |',
               '| **Windows (ARM)** | `Grafyn_*_arm64-setup.exe` | Surface Pro X, Snapdragon laptops |',
-              '| **macOS** | `Grafyn_*_aarch64.dmg` | M1/M2/M3/M4 Macs (also runs on Intel via Rosetta 2) |',
+              '| **macOS** | `Grafyn_*_aarch64.dmg` | M1/M2/M3/M4 Macs |',
               '| **Linux (Debian/Ubuntu)** | `grafyn_*_amd64.deb` | `sudo dpkg -i` to install |',
               '| **Linux (Universal)** | `grafyn_*_amd64.AppImage` | `chmod +x` and run — works on any distro |',
               '',
