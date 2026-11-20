@@ -50,7 +50,9 @@ struct CompactCompile {
 
 enum CompactDecision {
     Skip,
-    Reuse,
+    /// Some((parent_key, memory)) when the reused dream was seeded from the
+    /// previous turn and must be copied to the parent key.
+    Reuse(Option<(String, CanvasWorkingMemory)>),
     Compile(Box<CompactCompile>),
 }
 
@@ -151,10 +153,27 @@ pub(super) fn build_canvas_messages_with_threshold(
     }
 }
 
+/// KnowledgeSearch/Semantic/Twin send the whole parent chain under the
+/// threshold, so a parent dream in the system prompt would duplicate it.
+pub(super) fn sends_full_parent_chain(
+    session: &CanvasSession,
+    request: &PromptRequest,
+    compact_token_threshold: usize,
+) -> bool {
+    request.parent_debate_id.is_none()
+        && matches!(
+            request.context_mode,
+            ContextMode::KnowledgeSearch | ContextMode::Semantic | ContextMode::Twin
+        )
+        && build_selected_parent_chain(session, request)
+            .is_ok_and(|turns| conversation_tokens(&turns) < compact_token_threshold)
+}
+
 pub(super) fn compose_system_prompt(
     session: &CanvasSession,
     request: &PromptRequest,
     inner: Option<String>,
+    include_memory: bool,
 ) -> Option<String> {
     if request.context_mode == ContextMode::None {
         return request
@@ -176,9 +195,12 @@ pub(super) fn compose_system_prompt(
         {
             parts.push(recap.to_string());
         }
-    } else if let Some(memory) = format_working_memory_for_prompt(&memory_for_follow_up(session, request))
-    {
-        parts.push(memory);
+    } else if include_memory {
+        if let Some(memory) =
+            format_working_memory_for_prompt(&memory_for_follow_up(session, request))
+        {
+            parts.push(memory);
+        }
     }
     if let Some(inner) = inner.map(|value| value.trim().to_string()).filter(|value| !value.is_empty())
     {
@@ -586,7 +608,8 @@ fn append_positions(body: &mut String, positions: &[ModelPosition]) {
 }
 
 fn estimate_tokens(text: &str) -> usize {
-    text.split_whitespace().count() * 4 / 3 + 1
+    // chars/4 floor keeps minified JSON / CJK (few whitespace splits) from counting as ~1 word.
+    std::cmp::max(text.split_whitespace().count() * 4 / 3, text.chars().count() / 4) + 1
 }
 
 const COMPILE_SYSTEM_PROMPT: &str = "\
@@ -605,7 +628,12 @@ pub(super) fn compact_branch_memory(
 ) -> CompactAction {
     match prepare_branch_compact(session, request, threshold) {
         CompactDecision::Skip => CompactAction::Skipped,
-        CompactDecision::Reuse => CompactAction::Reused,
+        CompactDecision::Reuse(seeded) => {
+            if let Some((key, memory)) = seeded {
+                session.branch_memories.insert(key, memory);
+            }
+            CompactAction::Reused
+        }
         CompactDecision::Compile(plan) => match compile(&plan.user_prompt) {
             Ok(raw) => match apply_compact_compile(
                 session,
@@ -663,7 +691,13 @@ pub(super) async fn compact_branch_memory_live(
 ) -> CompactAction {
     match prepare_branch_compact(session, request, threshold) {
         CompactDecision::Skip => CompactAction::Skipped,
-        CompactDecision::Reuse => CompactAction::Reused,
+        CompactDecision::Reuse(seeded) => {
+            if let Some((key, memory)) = seeded {
+                session.branch_memories.insert(key.clone(), memory.clone());
+                persist_branch_memory(state, window, session, &key, &memory).await;
+            }
+            CompactAction::Reused
+        }
         CompactDecision::Compile(plan) => match compile_dream_with_llm(state, &plan.user_prompt).await {
             Ok(raw) => match apply_compact_compile(
                 session,
@@ -674,16 +708,19 @@ pub(super) async fn compact_branch_memory_live(
                 &plan.parent_tile_id,
             ) {
                 Ok(memory) => {
-                    persist_compacted_memory(
-                        state,
-                        window,
-                        session,
-                        &plan.branch_key,
-                        &memory,
-                        &plan.parent_tile_id,
-                        &plan.parent_model_id,
-                    )
-                    .await;
+                    persist_branch_memory(state, window, session, &plan.branch_key, &memory).await;
+                    let mut twin = state.twin_store.write().await;
+                    let _ = twin.append_trace_event(
+                        &session.id,
+                        TraceEventType::WorkingMemoryCompiled,
+                        json!({
+                            "tile_id": plan.parent_tile_id,
+                            "model_id": plan.parent_model_id,
+                            "version": memory.version,
+                            "summary": memory.summary.chars().take(240).collect::<String>(),
+                            "branch_key": plan.branch_key,
+                        }),
+                    );
                     CompactAction::Compiled
                 }
                 Err(error) => {
@@ -729,13 +766,24 @@ fn prepare_branch_compact(
         return CompactDecision::Skip;
     }
     let branch_key = branch_memory_key(parent_tile_id, parent_model_id);
-    let previous = session
-        .branch_memories
-        .get(&branch_key)
-        .cloned()
-        .unwrap_or_default();
+    // Dreams live at the key of the request's parent, so on a linear chain the
+    // latest one sits one turn back; seed from it to stay incremental.
+    let (previous, seeded) = match session.branch_memories.get(&branch_key) {
+        Some(memory) => (memory.clone(), false),
+        None => match chain.len().checked_sub(2).map(|idx| &chain[idx]) {
+            Some(turn) => (
+                session
+                    .branch_memories
+                    .get(&branch_memory_key(&turn.tile_id, &turn.model_id))
+                    .cloned()
+                    .unwrap_or_default(),
+                true,
+            ),
+            None => (CanvasWorkingMemory::default(), false),
+        },
+    };
     if covering_dream_reusable(&previous, &chain, threshold) {
-        return CompactDecision::Reuse;
+        return CompactDecision::Reuse(seeded.then(|| (branch_key, previous)));
     }
     CompactDecision::Compile(Box::new(CompactCompile {
         user_prompt: build_compact_user_prompt(&previous, &chain),
@@ -895,14 +943,12 @@ async fn compile_dream_with_llm(state: &AppState, user_prompt: &str) -> Result<S
     }
 }
 
-async fn persist_compacted_memory(
+async fn persist_branch_memory(
     state: &AppState,
     window: Option<&tauri::Window>,
     session: &CanvasSession,
     branch_key: &str,
     memory: &CanvasWorkingMemory,
-    parent_tile_id: &str,
-    parent_model_id: &str,
 ) {
     {
         let mut store = state.canvas_store.write().await;
@@ -920,18 +966,6 @@ async fn persist_compacted_memory(
             },
         );
     }
-    let mut twin = state.twin_store.write().await;
-    let _ = twin.append_trace_event(
-        &session.id,
-        TraceEventType::WorkingMemoryCompiled,
-        json!({
-            "tile_id": parent_tile_id,
-            "model_id": parent_model_id,
-            "version": memory.version,
-            "summary": memory.summary.chars().take(240).collect::<String>(),
-            "branch_key": branch_key,
-        }),
-    );
 }
 
 #[cfg(test)]
@@ -1084,7 +1118,7 @@ mod tests {
             },
         );
         let request = build_request("Prompt 5", "tile-4", "openai/gpt-4", ContextMode::Compact);
-        let composed = compose_system_prompt(&session, &request, None).expect("dream in system");
+        let composed = compose_system_prompt(&session, &request, None, true).expect("dream in system");
         assert!(composed.contains("Keep the dream in the system prompt"));
         assert!(composed.contains("compiled state beats 240-character chops"));
     }
@@ -1524,7 +1558,7 @@ mod tests {
         assert_eq!(memory.compacted_turn_count, 4);
         assert_eq!(memory.compiled_from_tile_id.as_deref(), Some("tile-4"));
 
-        let composed = compose_system_prompt(&session, &request, None).expect("dream in system");
+        let composed = compose_system_prompt(&session, &request, None, true).expect("dream in system");
         assert!(composed.contains("Compacted goal"));
         let messages = build_canvas_messages_after_compact(&session, &request, 1, action).unwrap();
         assert!(!messages.iter().any(|message| message.content.contains("Prompt 1")));
@@ -1592,6 +1626,100 @@ mod tests {
         assert_eq!(messages[0].content, "Prompt 4");
         assert_eq!(messages[1].content, "Response 4");
         assert_eq!(messages.last().unwrap().content, "What about the other option?");
+    }
+
+    fn dream_compiled_at_tile_3() -> CanvasWorkingMemory {
+        CanvasWorkingMemory {
+            version: 1,
+            goal: "Seeded dream".to_string(),
+            discussed: "Covers turns one through three.".to_string(),
+            compiled_from_tile_id: Some("tile-3".to_string()),
+            compacted_turn_count: 3,
+            ..CanvasWorkingMemory::default()
+        }
+    }
+
+    #[test]
+    fn follow_up_one_tile_deeper_compiles_incrementally_from_previous_turn_dream() {
+        let mut session = four_turn_session();
+        session.branch_memories.insert(
+            branch_memory_key("tile-3", "openai/gpt-4"),
+            dream_compiled_at_tile_3(),
+        );
+        let request = build_request("Prompt 5", "tile-4", "openai/gpt-4", ContextMode::KnowledgeSearch);
+        let captured = std::cell::RefCell::new(String::new());
+        let action = compact_branch_memory(&mut session, &request, 1, |prompt| {
+            captured.replace(prompt.to_string());
+            Ok(r#"{"goal":"Seeded dream","discussed":"Now covers four"}"#.to_string())
+        });
+        assert_eq!(action, CompactAction::Compiled);
+        let user_prompt = captured.into_inner();
+        assert!(user_prompt.contains("Seeded dream"));
+        assert!(user_prompt.contains("Turns since last compile:"));
+        assert!(user_prompt.contains("Prompt 4"));
+        assert!(!user_prompt.contains("Prompt 3"), "seeded dream already covers tile-3");
+        assert!(!user_prompt.contains("Prompt 1"));
+        let memory = session
+            .branch_memories
+            .get(&branch_memory_key("tile-4", "openai/gpt-4"))
+            .unwrap();
+        assert_eq!(memory.version, 2);
+        assert_eq!(memory.compacted_turn_count, 4);
+    }
+
+    #[test]
+    fn follow_up_one_tile_deeper_reuses_previous_turn_dream_and_stores_it_at_parent_key() {
+        let long = "word ".repeat(300);
+        let mut session = build_session(vec![
+            build_tile("tile-1", "Prompt 1", "openai/gpt-4", &long, None, None),
+            build_tile("tile-2", "Prompt 2", "openai/gpt-4", &long, Some("tile-1"), Some("openai/gpt-4")),
+            build_tile("tile-3", "Prompt 3", "openai/gpt-4", &long, Some("tile-2"), Some("openai/gpt-4")),
+            build_tile("tile-4", "Prompt 4", "openai/gpt-4", "Response 4", Some("tile-3"), Some("openai/gpt-4")),
+        ]);
+        session.branch_memories.insert(
+            branch_memory_key("tile-3", "openai/gpt-4"),
+            dream_compiled_at_tile_3(),
+        );
+        let request = build_request("Prompt 5", "tile-4", "openai/gpt-4", ContextMode::KnowledgeSearch);
+        let calls = std::cell::Cell::new(0);
+        let action = compact_branch_memory(&mut session, &request, 500, |_prompt| {
+            calls.set(calls.get() + 1);
+            Ok(r#"{"goal":"should not run"}"#.to_string())
+        });
+        assert_eq!(action, CompactAction::Reused);
+        assert_eq!(calls.get(), 0);
+        let memory = session
+            .branch_memories
+            .get(&branch_memory_key("tile-4", "openai/gpt-4"))
+            .expect("seeded dream is carried forward to the parent key");
+        assert_eq!(memory.goal, "Seeded dream");
+        let composed = compose_system_prompt(&session, &request, None, true).expect("dream in system");
+        assert!(composed.contains("Seeded dream"));
+    }
+
+    #[test]
+    fn full_chain_under_threshold_omits_duplicate_parent_dream() {
+        let mut session = four_turn_session();
+        session.branch_memories.insert(
+            branch_memory_key("tile-4", "openai/gpt-4"),
+            covering_parent_dream(),
+        );
+        let request = build_request("Prompt 5", "tile-4", "openai/gpt-4", ContextMode::KnowledgeSearch);
+        assert!(sends_full_parent_chain(&session, &request, 32_000));
+        assert!(!sends_full_parent_chain(&session, &request, 1), "over threshold sends last two");
+        let full_history = build_request("Prompt 5", "tile-4", "openai/gpt-4", ContextMode::FullHistory);
+        assert!(
+            !sends_full_parent_chain(&session, &full_history, 32_000),
+            "FullHistory keeps its documented dream prefix"
+        );
+        assert_eq!(compose_system_prompt(&session, &request, None, false), None);
+    }
+
+    #[test]
+    fn estimate_tokens_counts_unspaced_text_by_characters() {
+        assert_eq!(estimate_tokens(&"x".repeat(400)), 101);
+        assert_eq!(estimate_tokens("Prompt 1"), 3);
+        assert_eq!(estimate_tokens("one two three four five six"), 9);
     }
 
     #[test]
