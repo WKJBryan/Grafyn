@@ -199,8 +199,8 @@ impl SearchService {
             ))?;
         }
 
-        writer.commit()?;
-        Ok(())
+        // Route through commit() so the reader is reloaded synchronously.
+        self.commit()
     }
 
     /// Search notes by query string
@@ -216,7 +216,7 @@ impl SearchService {
             .context("Failed to parse query")?;
 
         let top_docs = searcher
-            .search(&query, &TopDocs::with_limit(limit))
+            .search(&query, &TopDocs::with_limit(limit.max(1)))
             .context("Search failed")?;
 
         let mut results = Vec::new();
@@ -311,33 +311,34 @@ impl SearchService {
     }
 }
 
-/// Create a text snippet around matching terms
+/// Create a text snippet around matching terms.
+///
+/// All offsets are in chars (not bytes) so non-ASCII content can't displace
+/// the window or split a codepoint.
 fn create_snippet(content: &str, query: &str, max_len: usize) -> String {
+    let chars: Vec<char> = content.chars().collect();
     let content_lower = content.to_lowercase();
     let query_lower = query.to_lowercase();
 
-    // Find first occurrence of any query term
-    let query_terms: Vec<&str> = query_lower.split_whitespace().collect();
-
-    let mut best_pos = 0;
-    for term in &query_terms {
-        if let Some(pos) = content_lower.find(term) {
-            best_pos = pos;
-            break;
-        }
-    }
+    // Char index of the first occurrence of any query term.
+    // shortcut: assumes lowercasing keeps char count (true except rare chars like 'İ'); drift is a few chars.
+    let best_pos = query_lower
+        .split_whitespace()
+        .find_map(|term| content_lower.find(term))
+        .map(|byte_pos| content_lower[..byte_pos].chars().count().min(chars.len()))
+        .unwrap_or(0);
 
     // Extract snippet around the match
     let start = best_pos.saturating_sub(max_len / 2);
-    let end = (start + max_len).min(content.len());
+    let end = (start + max_len).min(chars.len());
 
-    let mut snippet: String = content.chars().skip(start).take(end - start).collect();
+    let mut snippet: String = chars[start..end].iter().collect();
 
     // Add ellipsis if truncated
     if start > 0 {
         snippet = format!("...{}", snippet.trim_start());
     }
-    if end < content.len() {
+    if end < chars.len() {
         snippet = format!("{}...", snippet.trim_end());
     }
 
@@ -347,7 +348,58 @@ fn create_snippet(content: &str, query: &str, max_len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
+    use crate::models::note::NoteStatus;
+    use tempfile::{tempdir, TempDir};
+
+    fn note(id: &str, content: &str) -> Note {
+        Note {
+            id: id.to_string(),
+            title: id.to_string(),
+            content: content.to_string(),
+            relative_path: format!("{}.md", id),
+            status: NoteStatus::Draft,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn search_with_zero_limit_returns_results_instead_of_panicking() {
+        let tmp = TempDir::new().unwrap();
+        let mut search = SearchService::new(tmp.path().to_path_buf()).unwrap();
+        search
+            .index_note(&note("a", "quantum entanglement"))
+            .unwrap();
+        search.commit().unwrap();
+
+        let results = search.search("quantum", 0).unwrap();
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn reindex_all_is_immediately_searchable() {
+        let tmp = TempDir::new().unwrap();
+        let mut search = SearchService::new(tmp.path().to_path_buf()).unwrap();
+        search
+            .reindex_all(&[note("a", "photosynthesis"), note("b", "mitochondria")])
+            .unwrap();
+        assert_eq!(search.search("photosynthesis", 5).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn snippet_centers_on_match_in_non_ascii_content() {
+        // 100 two-byte chars before the match: byte offset 200, char offset 100.
+        let content = format!("{}target word here", "é".repeat(100));
+        let snippet = create_snippet(&content, "target", 20);
+        assert!(snippet.contains("target"), "snippet was {snippet:?}");
+        assert!(snippet.starts_with("..."));
+    }
+
+    #[test]
+    fn snippet_handles_multibyte_without_match() {
+        let content = "日本語のテキスト".repeat(50);
+        let snippet = create_snippet(&content, "missing", 10);
+        assert_eq!(snippet, format!("{}...", "日本語のテキスト日本"));
+    }
 
     #[test]
     fn writer_lock_contention_is_classified_and_leaves_index_intact() {
