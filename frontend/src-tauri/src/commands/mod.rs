@@ -514,6 +514,11 @@ mod commit_note_write_tests {
         let state = AppState {
             knowledge_store: Arc::new(RwLock::new(knowledge_store)),
             graph_index: Arc::new(RwLock::new(GraphIndex::new())),
+            perspective_history: Arc::new(RwLock::new(
+                crate::services::perspective_history::PerspectiveHistory::new(
+                    data_path.join("perspectives").join("states"),
+                ),
+            )),
             search_service: Arc::new(RwLock::new(search_service)),
             canvas_store: Arc::new(RwLock::new(CanvasStore::new(data_path.join("canvas")))),
             openrouter: Arc::new(RwLock::new(OpenRouterService::new(String::new()))),

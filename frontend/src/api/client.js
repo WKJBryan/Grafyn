@@ -42,6 +42,8 @@ export const graph = {
   rebuild: () => invoke('rebuild_graph', {}),
 
   full: () => invoke('get_full_graph', {}),
+  perspectiveStates: () => invoke('list_perspective_states', {}),
+  recordPerspectiveState: (input) => invoke('record_perspective_state', { input }),
 
   unlinked: () => invoke('get_unlinked', {}),
 }
