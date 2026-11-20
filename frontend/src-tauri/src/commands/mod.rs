@@ -165,11 +165,13 @@ pub(crate) async fn sync_topic_hubs(state: &AppState) -> Result<Vec<Note>, Strin
 
     {
         let mut graph = state.graph_index.write().await;
-        graph.build_from_notes(&sync_result.all_notes);
+        graph.sync_notes(&sync_result.all_notes);
     }
 
+    // Cheap for unchanged notes (content-hash skip). The optimizer is NOT
+    // bootstrapped here: on an empty queue that re-enqueued the whole vault on
+    // every save. Bulk paths (`rebuild_all_indexes`, boot) bootstrap it themselves.
     rebuild_link_discovery(state, &sync_result.all_notes).await;
-    bootstrap_vault_optimizer(state, &sync_result.all_notes).await;
 
     Ok(sync_result.all_notes)
 }
@@ -332,8 +334,7 @@ pub(crate) async fn commit_note_writes(
 /// write) does — so this extra pass costs nothing against
 /// `background_vault_optimizer_max_daily_writes`. It also cannot enqueue the
 /// rest of the vault: `sync_topic_hubs` (which this function still calls,
-/// see below) only re-bootstraps the WHOLE queue when the queue is fully
-/// empty, and a re-enqueued single note keeps the queue non-empty.
+/// see below) no longer bootstraps the optimizer queue at all.
 ///
 /// So the loop is real but self-correcting and free. It was still rejected
 /// in favor of this narrower helper for two reasons: (1) it's a wasted extra
@@ -955,5 +956,84 @@ mod commit_note_write_tests {
              without any manual reindex, found: {:?}",
             results.iter().map(|r| &r.note.id).collect::<Vec<_>>()
         );
+    }
+
+    #[tokio::test]
+    async fn one_save_in_a_200_note_vault_stays_incremental() {
+        use crate::services::link_discovery::{BUILD_PROFILE_CALLS, RECORD_WRITES};
+        let (state, _vault_dir, _data_dir) = build_test_state();
+        {
+            let mut store = state.knowledge_store.write().await;
+            for i in 0..200 {
+                store
+                    .create_note(NoteCreate {
+                        title: format!("Note {i}"),
+                        content: format!("Plain body {i}. See [[Note {}]].", (i + 1) % 200),
+                        relative_path: None,
+                        aliases: Vec::new(),
+                        status: NoteStatus::Draft,
+                        tags: Vec::new(),
+                        schema_version: crate::models::note::CURRENT_NOTE_SCHEMA_VERSION,
+                        migration_source: None,
+                        optimizer_managed: false,
+                        properties: Default::default(),
+                    })
+                    .expect("note should be created");
+            }
+        }
+        // Warm every derived index once.
+        commit_note_write(&state, "note-0", "warmup")
+            .await
+            .expect("warmup");
+        let queue_size = || async {
+            state
+                .vault_optimizer
+                .read()
+                .await
+                .status(&UserSettings::default())
+                .queue_size
+        };
+        // Per-save path enqueues only the written note (no whole-vault bootstrap).
+        assert_eq!(queue_size().await, 1);
+        assert_eq!(
+            state.graph_index.read().await.get_backlinks("note-1")[0].id,
+            "note-0"
+        );
+
+        BUILD_PROFILE_CALLS.with(|calls| calls.set(0));
+        RECORD_WRITES.with(|writes| writes.set(0));
+        {
+            let mut store = state.knowledge_store.write().await;
+            store
+                .update_note(
+                    "note-0",
+                    NoteUpdate {
+                        content: Some("Plain body 0. Now see [[Note 2]].".into()),
+                        ..Default::default()
+                    },
+                )
+                .expect("note should be updated");
+        }
+        commit_note_write(&state, "note-0", "test_note_updated")
+            .await
+            .expect("commit_note_write should succeed");
+
+        let profiles = BUILD_PROFILE_CALLS.with(|calls| calls.get());
+        let writes = RECORD_WRITES.with(|writes| writes.get());
+        assert_eq!(profiles, 1, "only the saved note is re-profiled");
+        assert_eq!(
+            writes, 1,
+            "only the saved note's discovery record is rewritten"
+        );
+
+        let graph = state.graph_index.read().await;
+        assert!(graph.get_backlinks("note-1").is_empty());
+        let backlinks = graph
+            .get_backlinks("note-2")
+            .into_iter()
+            .map(|meta| meta.id)
+            .collect::<Vec<_>>();
+        assert!(backlinks.contains(&"note-0".to_string()), "{backlinks:?}");
+        assert!(backlinks.contains(&"note-1".to_string()), "{backlinks:?}");
     }
 }

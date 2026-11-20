@@ -56,6 +56,21 @@ struct OverlayNoteData {
     properties: HashMap<String, Value>,
 }
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static NOTE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// File (mtime, length) as reported by the directory listing.
+type FileStamp = (Option<std::time::SystemTime>, u64);
+
+#[derive(Debug, Clone)]
+struct CachedNote {
+    note: Note,
+    stamp: FileStamp,
+    overlay_stamp: Option<FileStamp>,
+}
+
 /// Service for managing markdown notes with YAML frontmatter and migration overlays.
 #[derive(Debug, Clone)]
 pub struct KnowledgeStore {
@@ -63,6 +78,8 @@ pub struct KnowledgeStore {
     overlay_notes_dir: PathBuf,
     /// In-memory cache of note metadata, kept in sync with disk.
     meta_cache: Vec<NoteMeta>,
+    /// Parsed notes by file path; `refresh_cache` re-reads only files whose stamp moved.
+    note_cache: HashMap<PathBuf, CachedNote>,
     path_index: HashMap<String, PathBuf>,
     title_index: HashMap<String, String>,
     alias_index: HashMap<String, String>,
@@ -89,6 +106,7 @@ impl KnowledgeStore {
             vault_path,
             overlay_notes_dir,
             meta_cache: Vec::new(),
+            note_cache: HashMap::new(),
             path_index: HashMap::new(),
             title_index: HashMap::new(),
             alias_index: HashMap::new(),
@@ -111,13 +129,15 @@ impl KnowledgeStore {
         self.refresh_cache();
     }
 
-    /// Rebuild the metadata cache and lookups from disk.
-    fn refresh_cache(&mut self) {
-        let mut notes = Vec::new();
-        self.path_index.clear();
-        self.title_index.clear();
-        self.alias_index.clear();
-        self.relative_path_index.clear();
+    /// Rebuild the metadata cache and lookups from disk. Walks the vault (and the
+    /// overlay dir) for stamps, but only re-reads/parses files whose note or
+    /// overlay stamp changed since the last refresh.
+    /// shortcut: an external rewrite with identical mtime and length is missed until
+    /// that file's stamp moves again; this process's own writes evict explicitly.
+    pub(crate) fn refresh_cache(&mut self) {
+        let overlay_stamps = self.overlay_stamps();
+        let mut previous = std::mem::take(&mut self.note_cache);
+        let mut cache = HashMap::with_capacity(previous.len());
 
         for entry in WalkDir::new(&self.vault_path)
             .min_depth(1)
@@ -137,20 +157,30 @@ impl KnowledgeStore {
                 continue;
             }
 
+            let stamp = entry
+                .metadata()
+                .ok()
+                .map(|meta| (meta.modified().ok(), meta.len()));
+            if let Some(cached) = previous.remove(path).filter(|cached| {
+                Some(cached.stamp) == stamp
+                    && overlay_stamps.get(&cached.note.id) == cached.overlay_stamp.as_ref()
+            }) {
+                cache.insert(path.to_path_buf(), cached);
+                continue;
+            }
+
             match self.read_note_file(path) {
                 Ok(note) => {
-                    self.path_index.insert(note.id.clone(), path.to_path_buf());
-                    self.relative_path_index
-                        .insert(normalize_lookup_key(&note.relative_path), note.id.clone());
-                    self.title_index
-                        .entry(normalize_lookup_key(&note.title))
-                        .or_insert_with(|| note.id.clone());
-                    for alias in &note.aliases {
-                        self.alias_index
-                            .entry(normalize_lookup_key(alias))
-                            .or_insert_with(|| note.id.clone());
-                    }
-                    notes.push(NoteMeta::from(&note));
+                    let overlay_stamp = overlay_stamps.get(&note.id).copied();
+                    cache.insert(
+                        path.to_path_buf(),
+                        CachedNote {
+                            note,
+                            // An unknown stamp never matches again, so the file is re-read next time.
+                            stamp: stamp.unwrap_or((None, u64::MAX)),
+                            overlay_stamp,
+                        },
+                    );
                 }
                 Err(error) => {
                     log::warn!(
@@ -162,8 +192,82 @@ impl KnowledgeStore {
             }
         }
 
+        self.note_cache = cache;
+        self.rebuild_lookups();
+    }
+
+    /// Rebuilds the id/title/alias/path lookups from `note_cache`. Sorted by
+    /// (id, path) with first-wins, matching `GraphIndex`'s duplicate-title rule.
+    fn rebuild_lookups(&mut self) {
+        self.path_index.clear();
+        self.title_index.clear();
+        self.alias_index.clear();
+        self.relative_path_index.clear();
+
+        let mut entries = self.note_cache.iter().collect::<Vec<_>>();
+        entries.sort_by(|(left_path, left), (right_path, right)| {
+            left.note
+                .id
+                .cmp(&right.note.id)
+                .then_with(|| left_path.cmp(right_path))
+        });
+        let mut notes = Vec::with_capacity(entries.len());
+        for (path, cached) in entries {
+            let note = &cached.note;
+            self.path_index
+                .entry(note.id.clone())
+                .or_insert_with(|| path.clone());
+            self.relative_path_index
+                .insert(normalize_lookup_key(&note.relative_path), note.id.clone());
+            self.title_index
+                .entry(normalize_lookup_key(&note.title))
+                .or_insert_with(|| note.id.clone());
+            for alias in &note.aliases {
+                self.alias_index
+                    .entry(normalize_lookup_key(alias))
+                    .or_insert_with(|| note.id.clone());
+            }
+            notes.push(NoteMeta::from(note));
+        }
+
         notes.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
         self.meta_cache = notes;
+    }
+
+    /// Overlay sidecar stamps by note id (overlays are written under a read lock,
+    /// so they cannot evict the cache themselves).
+    fn overlay_stamps(&self) -> HashMap<String, FileStamp> {
+        let Ok(entries) = std::fs::read_dir(&self.overlay_notes_dir) else {
+            return HashMap::new();
+        };
+        entries
+            .flatten()
+            .filter_map(|entry| {
+                let path = entry.path();
+                if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                    return None;
+                }
+                let note_id = path.file_stem()?.to_str()?.to_string();
+                let meta = entry.metadata().ok()?;
+                Some((note_id, (meta.modified().ok(), meta.len())))
+            })
+            .collect()
+    }
+
+    /// Every cached note, in `list_notes` order, without touching disk. Callers that
+    /// need freshness against external edits call `refresh_cache` first.
+    pub(crate) fn cached_full_notes(&self) -> Vec<Note> {
+        self.meta_cache
+            .iter()
+            .filter_map(|meta| self.path_index.get(&meta.id))
+            .filter_map(|path| self.note_cache.get(path))
+            .map(|cached| cached.note.clone())
+            .collect()
+    }
+
+    /// Drops a note's cached parse so the next refresh re-reads it even if its stamp looks unchanged.
+    fn evict_cached_note(&mut self, id: &str) {
+        self.note_cache.retain(|_, cached| cached.note.id != id);
     }
 
     pub fn list_notes(&self) -> Result<Vec<NoteMeta>> {
@@ -241,6 +345,7 @@ impl KnowledgeStore {
         note.parsed_links = self.extract_links(&note.content, &note.relative_path);
 
         self.write_note_file(&note)?;
+        self.evict_cached_note(&note.id);
         self.refresh_cache();
         self.get_note(&note.id)
     }
@@ -347,6 +452,7 @@ impl KnowledgeStore {
             })?;
         }
 
+        self.evict_cached_note(&note.id);
         self.refresh_cache();
         self.get_note(&note.id)
     }
@@ -518,6 +624,8 @@ impl KnowledgeStore {
     }
 
     fn read_note_file(&self, path: &Path) -> Result<Note> {
+        #[cfg(test)]
+        NOTE_READS.with(|reads| reads.set(reads.get() + 1));
         let content = std::fs::read_to_string(path)
             .with_context(|| format!("Failed to read file: {}", path.display()))?;
 
@@ -1003,6 +1111,84 @@ mod tests {
     use crate::models::note::NoteStatus;
     use crate::services::atomic_io::assert_no_tmp_siblings;
     use tempfile::tempdir;
+
+    fn write_raw(vault: &Path, file: &str, id: &str, title: &str, body: &str) {
+        std::fs::write(
+            vault.join(file),
+            format!("---\nnote_id: {id}\ntitle: {title}\n---\n\n{body}"),
+        )
+        .expect("raw note write");
+    }
+
+    #[test]
+    fn duplicate_titles_resolve_to_lowest_id_regardless_of_walk_order() {
+        let vault_dir = tempdir().expect("vault tempdir");
+        let data_dir = tempdir().expect("data tempdir");
+        // Walk order is by file name here, so the first file walked holds the highest id.
+        write_raw(vault_dir.path(), "a.md", "zeta", "Meeting Notes", "one");
+        write_raw(vault_dir.path(), "b.md", "alpha", "Meeting Notes", "two");
+        write_raw(vault_dir.path(), "c.md", "mid", "Meeting Notes", "three");
+        let store = KnowledgeStore::new(
+            vault_dir.path().to_path_buf(),
+            data_dir.path().to_path_buf(),
+        );
+        let found = store
+            .find_note_by_title_case_insensitive("meeting notes")
+            .expect("lookup")
+            .expect("a match");
+        assert_eq!(found.id, "alpha");
+    }
+
+    #[test]
+    fn refresh_rereads_only_changed_notes_and_sees_external_and_overlay_edits() {
+        let vault_dir = tempdir().expect("vault tempdir");
+        let data_dir = tempdir().expect("data tempdir");
+        for index in 0..50 {
+            write_raw(
+                vault_dir.path(),
+                &format!("n{index}.md"),
+                &format!("n{index}"),
+                &format!("Note {index}"),
+                "body",
+            );
+        }
+        let mut store = KnowledgeStore::new(
+            vault_dir.path().to_path_buf(),
+            data_dir.path().to_path_buf(),
+        );
+
+        NOTE_READS.with(|reads| reads.set(0));
+        store
+            .update_note(
+                "n3",
+                NoteUpdate {
+                    content: Some("saved".into()),
+                    ..Default::default()
+                },
+            )
+            .expect("update");
+        // get_note before the write, the evicted re-parse, and get_note after it.
+        assert!(NOTE_READS.with(|reads| reads.get()) <= 3);
+
+        // External edit (different length, so the stamp moves) and an overlay tag.
+        write_raw(
+            vault_dir.path(),
+            "n7.md",
+            "n7",
+            "Note 7",
+            "edited elsewhere",
+        );
+        store
+            .write_overlay("n9", &serde_json::json!({ "tags": ["from-overlay"] }))
+            .expect("overlay");
+        store.refresh_cache();
+        let notes = store.cached_full_notes();
+        let by_id = |id: &str| notes.iter().find(|note| note.id == id).expect("note");
+        assert_eq!(by_id("n3").content.trim(), "saved");
+        assert_eq!(by_id("n7").content.trim(), "edited elsewhere");
+        assert!(by_id("n9").tags.contains(&"from-overlay".to_string()));
+        assert_eq!(notes.len(), 50);
+    }
 
     #[test]
     fn note_and_overlay_writes_are_atomic_with_no_tmp_litter() {

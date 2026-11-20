@@ -59,7 +59,13 @@ impl DiscoverMode {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[cfg(test)]
+thread_local! {
+    pub(crate) static BUILD_PROFILE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static RECORD_WRITES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct LinkDiscoveryProfile {
     pub note_id: String,
     pub title: String,
@@ -220,11 +226,21 @@ impl LinkDiscoveryService {
         for note in notes {
             let previous = self.stored_notes.get(&note.id).cloned();
             let last_discovered_at = previous.as_ref().and_then(|record| record.cached_at);
-            let mut profile = build_profile(note, &title_to_id, last_discovered_at);
+            // Unchanged text: reuse the YAKE/TF-IDF fields and only refresh the cheap ones.
+            let mut profile = match previous
+                .as_ref()
+                .filter(|record| record.profile.content_hash == profile_content_hash(note))
+            {
+                Some(record) => reuse_profile(note, &title_to_id, &record.profile),
+                None => build_profile(note, &title_to_id, last_discovered_at),
+            };
             let content_changed = previous
                 .as_ref()
                 .map(|record| record.profile.content_hash != profile.content_hash)
                 .unwrap_or(true);
+            let previous_state = previous
+                .as_ref()
+                .map(|record| (record.profile.clone(), record.is_stale));
 
             let mut record = previous.unwrap_or_default();
             if content_changed {
@@ -242,9 +258,14 @@ impl LinkDiscoveryService {
             profile.last_discovered_at = record.cached_at;
             record.profile = profile.clone();
 
+            let record_changed = previous_state.map_or(true, |(old_profile, old_stale)| {
+                old_profile != profile || old_stale != record.is_stale
+            });
             self.profiles.insert(note.id.clone(), profile.clone());
             self.stored_notes.insert(note.id.clone(), record.clone());
-            self.persist_note_record(&note.id);
+            if record_changed {
+                self.persist_note_record(&note.id);
+            }
 
             if content_changed {
                 self.enqueue(note.id.clone(), QueuePriority::Dirty);
@@ -753,6 +774,8 @@ impl LinkDiscoveryService {
     }
 
     fn persist_note_record(&self, note_id: &str) {
+        #[cfg(test)]
+        RECORD_WRITES.with(|writes| writes.set(writes.get() + 1));
         if let Some(record) = self.stored_notes.get(note_id) {
             let path = self.note_file_path(note_id);
             if let Ok(contents) = serde_json::to_string_pretty(record) {
@@ -1008,6 +1031,8 @@ pub fn build_profile(
     title_to_id: &HashMap<String, String>,
     last_discovered_at: Option<DateTime<Utc>>,
 ) -> LinkDiscoveryProfile {
+    #[cfg(test)]
+    BUILD_PROFILE_CALLS.with(|calls| calls.set(calls.get() + 1));
     let summary = extract_summary(&note.content);
     let clean_content = clean_markdown(&note.content);
     let compact_content = truncate_text(clean_content.trim(), PROFILE_VECTOR_TEXT_LIMIT);
@@ -1017,7 +1042,44 @@ pub fn build_profile(
     let key_terms = extract_key_terms(&vector_source)
         .into_iter()
         .collect::<Vec<_>>();
-    let existing_link_ids = note
+    LinkDiscoveryProfile {
+        summary,
+        key_terms,
+        term_vector,
+        last_discovered_at,
+        is_stale: last_discovered_at.is_none(),
+        ..profile_shell(note, title_to_id)
+    }
+}
+
+/// Rebuilds a profile for unchanged text, keeping the expensive text-derived fields.
+fn reuse_profile(
+    note: &Note,
+    title_to_id: &HashMap<String, String>,
+    previous: &LinkDiscoveryProfile,
+) -> LinkDiscoveryProfile {
+    LinkDiscoveryProfile {
+        summary: previous.summary.clone(),
+        key_terms: previous.key_terms.clone(),
+        term_vector: previous.term_vector.clone(),
+        last_discovered_at: previous.last_discovered_at,
+        is_stale: previous.is_stale,
+        ..profile_shell(note, title_to_id)
+    }
+}
+
+fn profile_content_hash(note: &Note) -> String {
+    stable_hash_string(&format!(
+        "{}\n{}\n{}",
+        note.title,
+        note.content,
+        note.tags.join(",")
+    ))
+}
+
+/// The cheap, vault-relative profile fields (links resolve against other notes' titles).
+fn profile_shell(note: &Note, title_to_id: &HashMap<String, String>) -> LinkDiscoveryProfile {
+    let mut existing_link_ids = note
         .parsed_links
         .iter()
         .filter_map(|parsed_link| {
@@ -1031,6 +1093,8 @@ pub fn build_profile(
         .collect::<HashSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
+    // Sorted so an unchanged note compares equal and its record is not rewritten.
+    existing_link_ids.sort();
 
     LinkDiscoveryProfile {
         note_id: note.id.clone(),
@@ -1039,19 +1103,10 @@ pub fn build_profile(
         topic_key: note.topic_key(),
         topic_hub_ids: note.topic_hub_ids(),
         is_topic_hub: note.is_topic_hub(),
-        summary,
-        key_terms,
-        term_vector,
         existing_link_ids,
-        content_hash: stable_hash_string(&format!(
-            "{}\n{}\n{}",
-            note.title,
-            note.content,
-            note.tags.join(",")
-        )),
+        content_hash: profile_content_hash(note),
         updated_at: note.updated_at,
-        last_discovered_at,
-        is_stale: last_discovered_at.is_none(),
+        ..LinkDiscoveryProfile::default()
     }
 }
 
@@ -1832,5 +1887,35 @@ mod tests {
 
         assert_eq!(service.profiles.len(), 1000);
         assert!(!service.queue.is_empty());
+    }
+
+    #[test]
+    fn bootstrap_skips_profile_and_write_for_unchanged_notes() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let mut service = LinkDiscoveryService::new(temp_dir.path().to_path_buf());
+        let mut notes = (0..200)
+            .map(|index| {
+                let target = format!("Note {}", (index + 1) % 200);
+                make_note(
+                    &format!("note-{index}"),
+                    &format!("Note {index}"),
+                    &format!("Body {index} about Machine Learning and Rust."),
+                    &["ai"],
+                    &[target.as_str()],
+                )
+            })
+            .collect::<Vec<_>>();
+        service.bootstrap(&notes);
+
+        notes[7].content = "Edited body".to_string();
+        BUILD_PROFILE_CALLS.with(|calls| calls.set(0));
+        RECORD_WRITES.with(|writes| writes.set(0));
+        service.bootstrap(&notes);
+
+        assert_eq!(BUILD_PROFILE_CALLS.with(|calls| calls.get()), 1);
+        assert_eq!(RECORD_WRITES.with(|writes| writes.get()), 1);
+        assert_eq!(service.profiles["note-7"].summary, "Edited body");
+        // Reused profiles keep their text-derived fields.
+        assert!(!service.profiles["note-8"].key_terms.is_empty());
     }
 }

@@ -74,7 +74,7 @@ pub enum DeduplicationAction {
 }
 
 /// Full note object with all fields
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Note {
     pub id: String,
     pub title: String,
@@ -519,7 +519,7 @@ impl std::fmt::Display for RelationType {
 }
 
 /// A parsed wikilink with optional relationship type
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ParsedLink {
     pub target_title: String,
     #[serde(default)]
