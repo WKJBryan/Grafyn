@@ -160,6 +160,15 @@ fn deduplicate_links(links: Vec<ZettelLinkCandidate>) -> Vec<ZettelLinkCandidate
     seen.into_values().collect()
 }
 
+/// `create_link` status: "linked" only when the reverse write (if one was needed) landed.
+fn create_link_status(reverse_ok: bool) -> &'static str {
+    if reverse_ok {
+        "linked"
+    } else {
+        "linked_one_way"
+    }
+}
+
 // ── Tauri commands ───────────────────────────────────────────────────────
 
 /// Discover potential links for a note using multiple strategies
@@ -189,6 +198,12 @@ mod tests {
             DiscoverMode::Algorithm
         );
         assert_eq!(DiscoverMode::parse(Some("manual")), DiscoverMode::Manual);
+    }
+
+    #[test]
+    fn create_link_status_reports_one_way_when_reverse_write_fails() {
+        assert_eq!(super::create_link_status(true), "linked");
+        assert_eq!(super::create_link_status(false), "linked_one_way");
     }
 
     #[test]
@@ -370,6 +385,7 @@ pub async fn create_link(
 
     // Reverse link: target → source
     let reverse = reverse_link_type(&link_type);
+    let mut reverse_ok = true;
     {
         let store = state.knowledge_store.read().await;
         let target = store.get_note(&targetId).map_err(|e| e.to_string())?;
@@ -378,14 +394,23 @@ pub async fn create_link(
         {
             drop(store);
             let mut store = state.knowledge_store.write().await;
-            let _ = store.update_note(
+            match store.update_note(
                 &targetId,
                 NoteUpdate {
                     content: Some(new_content),
                     ..Default::default()
                 },
-            );
-            dirty_note_ids.insert(targetId.clone());
+            ) {
+                Ok(_) => {
+                    dirty_note_ids.insert(targetId.clone());
+                }
+                Err(error) => {
+                    log::warn!(
+                        "create_link: reverse link {targetId} -> {sourceId} failed: {error}"
+                    );
+                    reverse_ok = false;
+                }
+            }
         }
     }
 
@@ -395,7 +420,7 @@ pub async fn create_link(
     }
 
     Ok(CreateLinkResponse {
-        status: "linked".to_string(),
+        status: create_link_status(reverse_ok).to_string(),
         source: sourceId,
         target: targetId,
         link_type,

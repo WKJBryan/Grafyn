@@ -14,7 +14,7 @@ use crate::models::twin::{
 };
 use crate::services::ollama::OllamaService;
 use crate::services::openrouter::{ChatMessage, OpenRouterService};
-use crate::services::retrieval::RetrievalResult;
+use crate::services::retrieval::{retain_resolvable_chunks, RetrievalResult};
 use crate::services::twin::{parse_twin_prediction, TwinStore};
 use crate::AppState;
 use std::collections::{HashMap, HashSet};
@@ -207,7 +207,7 @@ pub(super) async fn resolve_prompt_context(
 
         if chunk_enabled {
             // Chunk-level context: retrieve relevant paragraphs within token budget
-            let chunks = {
+            let mut chunks = {
                 let retrieval = state.retrieval_service.read().await;
                 let chunk_index = state.chunk_index.read().await;
                 let graph = state.graph_index.read().await;
@@ -224,6 +224,8 @@ pub(super) async fn resolve_prompt_context(
                     )
                     .unwrap_or_default()
             };
+            // Chunks can outlive notes deleted by grafyn-mcp; drop orphans.
+            retain_resolvable_chunks(&mut chunks, &*state.knowledge_store.read().await);
 
             if chunks.is_empty() {
                 log::info!("Chunk retrieval returned no results, falling back to note-level");
@@ -341,7 +343,7 @@ async fn resolve_twin_prompt_context(
         };
 
         if chunk_enabled {
-            let chunks = {
+            let mut chunks = {
                 let retrieval = state.retrieval_service.read().await;
                 let chunk_index = state.chunk_index.read().await;
                 let graph = state.graph_index.read().await;
@@ -358,6 +360,8 @@ async fn resolve_twin_prompt_context(
                     )
                     .unwrap_or_default()
             };
+            // Chunks can outlive notes deleted by grafyn-mcp; drop orphans.
+            retain_resolvable_chunks(&mut chunks, &*state.knowledge_store.read().await);
 
             if !chunks.is_empty() {
                 let mut seen_notes: HashSet<String> = HashSet::new();
