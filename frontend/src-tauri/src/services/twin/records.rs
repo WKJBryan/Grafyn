@@ -963,7 +963,7 @@ mod tests {
     }
 
     #[test]
-    fn user_records_auto_promote_and_export() {
+    fn user_records_default_to_endorsed_and_export() {
         let temp_dir = tempdir().expect("temp dir should be created");
         let mut store = TwinStore::new(temp_dir.path().to_path_buf());
 
@@ -982,7 +982,7 @@ mod tests {
             })
             .expect("user record should be created");
 
-        assert_eq!(record.promotion_state, PromotionState::AutoPromoted);
+        assert_eq!(record.promotion_state, PromotionState::Endorsed);
 
         let bundle = store
             .export_bundle(TwinExportRequest::default())
