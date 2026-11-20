@@ -100,8 +100,9 @@ impl MemoryService {
                 0.0
             };
 
-            // Status mismatch on similar content
-            if similarity > 0.7 && result.note.status.to_string() != note_status {
+            // Status mismatch on similar content. The best match is always ratio 1.0, so an
+            // absolute BM25 floor keeps sparse vaults from flagging weak top hits.
+            if similarity > 0.7 && result.score > 0.7 && result.note.status.to_string() != note_status {
                 contradictions.push(Contradiction {
                     note_id: result.note.id.clone(),
                     title: result.note.title.clone(),
@@ -115,8 +116,8 @@ impl MemoryService {
                 });
             }
 
-            // Tag mismatch on highly similar content
-            if similarity > 0.8 {
+            // Tag mismatch on highly similar content (same absolute floor as above)
+            if similarity > 0.8 && result.score > 0.8 {
                 let similar_tags: HashSet<String> = result.note.tags.iter().cloned().collect();
                 if !note_tags.is_empty()
                     && !similar_tags.is_empty()
