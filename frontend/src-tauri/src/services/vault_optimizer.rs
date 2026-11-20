@@ -119,20 +119,27 @@ impl VaultOptimizerService {
     pub fn bootstrap(&mut self, notes: &[Note]) {
         if self.state.queue.is_empty() {
             for note in notes.iter().filter(|note| !note.is_topic_hub()) {
-                self.enqueue_note(&note.id, "bootstrap");
+                self.push_queue_entry(&note.id, "bootstrap");
             }
             let _ = self.persist_state();
         }
     }
 
+    /// Queues a note and persists the queue so enqueues survive an exit before the next run.
     pub fn enqueue_note(&mut self, note_id: &str, reason: &str) {
+        if self.push_queue_entry(note_id, reason) {
+            let _ = self.persist_state();
+        }
+    }
+
+    fn push_queue_entry(&mut self, note_id: &str, reason: &str) -> bool {
         if self
             .state
             .queue
             .iter()
             .any(|entry| entry.note_id == note_id)
         {
-            return;
+            return false;
         }
 
         self.state.queue.push(QueuedOptimizerNote {
@@ -141,6 +148,7 @@ impl VaultOptimizerService {
             enqueued_at: Utc::now(),
             attempts: 0,
         });
+        true
     }
 
     pub fn status(&self, settings: &UserSettings) -> VaultOptimizerStatus {
@@ -955,6 +963,20 @@ mod tests {
             std::fs::read_to_string(&service.queue_path).expect("queue.json should exist");
         assert!(persisted.contains("note-1"));
         assert_no_tmp_siblings(&service.optimizer_dir);
+    }
+
+    #[test]
+    fn enqueue_note_survives_restart() {
+        let data_dir = tempdir().expect("temp dir should be created");
+        let mut service = VaultOptimizerService::new(data_dir.path().to_path_buf());
+        service.enqueue_note("note-queued", "note_saved");
+
+        let reloaded = VaultOptimizerService::new(data_dir.path().to_path_buf());
+        assert!(reloaded
+            .state
+            .queue
+            .iter()
+            .any(|entry| entry.note_id == "note-queued"));
     }
 
     #[test]
