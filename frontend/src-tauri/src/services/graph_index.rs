@@ -73,9 +73,13 @@ impl GraphIndex {
         self.topic_hub_members.clear();
         self.topic_related.clear();
 
-        for note in self.notes.values() {
+        // Sorted ids + first-wins so duplicate titles resolve the same way on every rebuild.
+        let mut ordered = self.notes.values().collect::<Vec<_>>();
+        ordered.sort_by(|left, right| left.id.cmp(&right.id));
+        for note in ordered {
             self.title_to_id
-                .insert(note.title.to_lowercase(), note.id.clone());
+                .entry(note.title.to_lowercase())
+                .or_insert_with(|| note.id.clone());
             self.path_to_id
                 .insert(note.relative_path.to_lowercase(), note.id.clone());
             for alias in &note.aliases {
@@ -757,5 +761,27 @@ mod tests {
         let backlinks = graph.get_backlinks("target");
         assert_eq!(backlinks.len(), 1);
         assert_eq!(backlinks[0].id, "source");
+    }
+
+    #[test]
+    fn duplicate_titles_resolve_to_lowest_id_on_every_rebuild() {
+        // Fresh HashMaps get fresh random seeds, so repeated builds exercise many iteration orders.
+        for round in 0..32 {
+            let mut notes = vec![
+                make_note(
+                    "source",
+                    "Source",
+                    vec![("Meeting Notes", RelationType::Related)],
+                ),
+                make_note("meeting-b", "Meeting Notes", vec![]),
+                make_note("meeting-a", "Meeting Notes", vec![]),
+            ];
+            notes.rotate_left(round % 3);
+            let mut graph = GraphIndex::new();
+            graph.build_from_notes(&notes);
+            let outgoing = graph.get_outgoing("source");
+            assert_eq!(outgoing.len(), 1);
+            assert_eq!(outgoing[0].id, "meeting-a", "round {round}");
+        }
     }
 }
