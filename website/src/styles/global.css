@@ -271,17 +271,14 @@ body {
   height: auto;
 }
 
-/* Hero mode: one orchestrated assembly on page load. */
-.mark-hero .m-seed-fill {
+/* Hero mode: one orchestrated assembly on page load. The seed's facets
+   pop in bottom-up, like a crystal growing. */
+.mark-hero .m-facet {
   opacity: 0;
-  animation: m-fade 700ms var(--ease-fluid) 100ms both;
-}
-
-.mark-hero .m-seam {
-  stroke-dasharray: 1;
-  stroke-dashoffset: 1;
-  animation: m-draw 450ms var(--ease-fluid) both;
-  animation-delay: calc(350ms + var(--i, 0) * 50ms);
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: m-pop 400ms var(--ease-fluid) both;
+  animation-delay: calc(120ms + var(--i, 0) * 45ms);
 }
 
 /* The stem's round linecap paints a dot even at full dashoffset, so the
@@ -519,8 +516,7 @@ body {
     transform: none;
   }
 
-  .mark-hero .m-seed-fill,
-  .mark-hero .m-seam,
+  .mark-hero .m-facet,
   .mark-hero .m-stem,
   .mark-hero .m-edge,
   .mark-hero .m-node {
