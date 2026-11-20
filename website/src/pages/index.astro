@@ -1,124 +1,202 @@
 ---
 import Base from '../layouts/Base.astro';
 import DownloadCta from '../components/DownloadCta.astro';
-import { withBase } from '../lib/paths.js';
+import MarkFigure from '../components/MarkFigure.astro';
+import { withBase, GITHUB_REPO } from '../lib/paths.js';
 
-const products = [
+const storySteps = [
   {
-    kicker: 'Vault',
-    title: 'Notes stay plain files',
+    title: 'A note is a seed',
+    copy: `Every note in Grafyn is a plain markdown file in a folder you own.
+      No database, no proprietary format — a seed that outlasts any app,
+      this one included.`,
+  },
+  {
+    title: 'Links make it grow',
+    copy: `Write [[wikilinks]] and notes reach for each other. Backlinks,
+      full-text search, and topic hubs are grown from your files, on your
+      disk — not fetched from a server.`,
+  },
+  {
+    title: 'Thought becomes a graph',
+    copy: `That's the name — Grafyn, from graph. The mark is a seed
+      crystallising into a constellation of connected notes. The whole app
+      exists to get you from one to the other.`,
+  },
+];
+
+const layers = [
+  {
+    kicker: 'Layer one · Vault',
+    title: 'Capture comes first',
     frame: 'Grafyn · Vault',
     art: 'ui/vault.webp',
-    copy: `The vault is a folder of plain markdown files you already own. Write with
-      wikilinks — [[like this]] — and Grafyn builds the backlink graph,
-      full-text search, and topic hubs (index pages for recurring subjects)
-      on your disk.`,
+    copy: `The vault is the folder of markdown you already have — Obsidian
+      vaults included. Grafyn indexes it in place: backlinks, search, topic
+      hubs. If you never touch a model, this layer is still yours forever.`,
   },
   {
-    kicker: 'Canvas',
-    title: 'Ask several models at once',
+    kicker: 'Layer two · Canvas',
+    title: 'One answer is an opinion',
     frame: 'Grafyn · Canvas',
     art: 'ui/canvas.webp',
-    copy: `The canvas is a workspace that sends one prompt to several models
-      side by side. It pulls your relevant notes in as context. Pin what must
-      be included, branch answers, and make the models debate.`,
+    copy: `The canvas sends your prompt to several models side by side, and
+      pulls the relevant notes from your vault in as context — so they argue
+      about your thinking, not the internet's. Pin notes, branch answers,
+      make the models debate.`,
   },
   {
-    kicker: 'Twin',
-    title: 'Evidence for a twin',
+    kicker: 'Layer three · Twin',
+    title: 'The long game',
     frame: 'Grafyn · Twin',
     art: 'ui/twin.webp',
-    copy: `The twin is an experimental profile of what you accept, reject, and
-      prefer, stored as evidence-linked records in your vault that you can
-      review, endorse, or delete. Experimental, and honest about it.`,
+    experimental: true,
+    copy: `As you accept, reject, and decide, Grafyn keeps evidence-linked
+      records you review, endorse, or delete yourself. The aim: enough honest
+      evidence that a model could one day reason like you. It's experimental,
+      and the app says so.`,
   },
 ];
 ---
 
 <Base title="Grafyn. Your files. Your models. Your evidence.">
-  <section class="relative min-h-[100dvh] overflow-hidden">
-    <div class="hero-art-wrap" data-hero-drift>
-      <img
-        src={withBase('art/hero.jpg')}
-        alt=""
-        class="hero-art"
-      />
-    </div>
+  <!-- Act 1 · Hero: the mark assembles once, on load -->
+  <section
+    class="relative flex min-h-[100dvh] flex-col justify-center overflow-hidden bg-linear-to-b from-abyss to-ink px-4 pt-24 pb-10 md:px-10 lg:px-16"
+  >
     <div
-      class="absolute inset-0 bg-linear-to-t from-ink via-ink/55 to-abyss/20"
+      class="mx-auto grid w-full max-w-6xl items-center gap-10 md:grid-cols-[1fr_minmax(260px,420px)] md:gap-16"
     >
-    </div>
-    <div
-      class="relative flex min-h-[100dvh] flex-col justify-end px-4 pb-16 pt-24 md:px-10 lg:px-16"
-    >
-      <div class="max-w-4xl">
+      <div class="order-2 md:order-1">
         <h1
           class="hero-enter text-5xl leading-[1.05] font-medium tracking-tight text-paper md:text-6xl lg:text-7xl"
         >
-          Your files. Your models.<br />
-          Your evidence.
+          Notes that grow<br />into a graph.
         </h1>
-        <p class="hero-enter-delay mt-6 max-w-[40ch] text-lg leading-relaxed text-mute md:text-xl">
-          A local knowledge vault and multi-model canvas that keeps notes as
-          plain files on your disk. Point it at the folder you already have —
-          Obsidian vaults included. No import, no lock-in.
+        <p
+          class="hero-enter-delay mt-6 max-w-[42ch] text-lg leading-relaxed text-mute md:text-xl"
+        >
+          Grafyn is a desktop app for thinking in plain markdown files. They
+          live on your disk, link into a graph, and feed the models you choose
+          — never a cloud you don't.
         </p>
-        <div class="hero-enter-delay mt-8">
-          <DownloadCta />
+        <div class="hero-enter-delay mt-8 flex flex-wrap items-center gap-4">
+          <a class="btn-primary group" href="#download">
+            <span>Download Grafyn</span>
+            <span class="icon-circle" aria-hidden="true">
+              <i class="ph-light ph-arrow-down text-base"></i>
+            </span>
+          </a>
+          <a class="btn-ghost" href={GITHUB_REPO}>View source</a>
         </div>
+      </div>
+      <div class="order-1 mx-auto w-[min(58vw,260px)] md:order-2 md:w-full">
+        <MarkFigure mode="hero" />
+      </div>
+    </div>
+    <p
+      class="hero-enter-delay mx-auto mt-10 flex items-center gap-2 font-mono text-xs text-mute md:mt-4"
+    >
+      <i class="ph-light ph-arrow-down" aria-hidden="true"></i>
+      the story of the mark
+    </p>
+  </section>
+
+  <!-- Act 2 · The mark, staged by scroll -->
+  <section class="border-t border-rule px-4 md:px-10 lg:px-16" aria-label="The story of the mark">
+    <div class="mx-auto grid max-w-6xl grid-cols-[minmax(100px,38vw)_1fr] gap-6 md:grid-cols-2 md:gap-16">
+      <div class="relative">
+        <div class="sticky top-[max(18vh,6rem)] py-6">
+          <MarkFigure mode="story" />
+        </div>
+      </div>
+      <div>
+        {
+          storySteps.map((step, index) => (
+            <div
+              class="story-step flex min-h-[70vh] flex-col justify-center py-10"
+              data-story-step={index}
+            >
+              <h2 class="text-3xl font-medium tracking-tight text-paper md:text-5xl">
+                {step.title}
+              </h2>
+              <p class="mt-4 max-w-[40ch] text-base leading-relaxed text-mute md:text-lg">
+                {step.copy}
+              </p>
+            </div>
+          ))
+        }
       </div>
     </div>
   </section>
 
+  <!-- Act 3 · The three layers, in the order they must exist -->
   <section class="border-t border-rule px-4 py-24 md:px-10 md:py-28 lg:px-16">
-    <div class="mx-auto max-w-6xl space-y-20 md:space-y-28">
-      {
-        products.map((product, index) => (
-          <article
-            class="reveal-group grid items-center gap-8 md:grid-cols-2 md:gap-16"
-            data-reveal-group
-          >
-            <div class:list={[index % 2 === 1 && 'md:order-2']}>
-              <p class="font-mono text-sm text-seed" data-reveal-item>
-                {product.kicker}
-              </p>
-              <h2
-                class="mt-3 text-3xl font-medium tracking-tight text-paper md:text-5xl"
-                data-reveal-item
-              >
-                {product.title}
-              </h2>
-              <p
-                class="mt-4 max-w-[42ch] text-base leading-relaxed text-mute md:text-lg"
-                data-reveal-item
-              >
-                {product.copy}
-              </p>
-            </div>
-            <figure
-              class:list={['app-frame', index % 2 === 1 && 'md:order-1']}
-              data-reveal-item
+    <div class="relative mx-auto max-w-6xl">
+      <div class="layers-line" data-layers-line aria-hidden="true"></div>
+      <div class="max-w-2xl pl-8 md:pl-12">
+        <h2 class="text-3xl font-medium tracking-tight text-paper md:text-5xl" data-reveal>
+          Built in three layers, in this order
+        </h2>
+        <p class="mt-4 max-w-[46ch] text-mute md:text-lg">
+          Each layer only makes sense because the one below it exists. Files
+          you own, then models that read them, then — maybe — a model that
+          reasons like you.
+        </p>
+      </div>
+      <div class="mt-20 space-y-20 pl-8 md:space-y-28 md:pl-12">
+        {
+          layers.map((layer, index) => (
+            <article
+              class="reveal-group grid items-center gap-8 md:grid-cols-2 md:gap-16"
+              data-reveal-group
             >
-              <div class="app-frame-bar" aria-hidden="true">
-                <span class="app-frame-dot"></span>
-                <span class="app-frame-dot"></span>
-                <span class="app-frame-dot"></span>
-                <span class="app-frame-title">{product.frame}</span>
+              <div class:list={[index % 2 === 1 && 'md:order-2']}>
+                <p class="font-mono text-sm text-seed" data-reveal-item>
+                  {layer.kicker}
+                  {layer.experimental && (
+                    <span class="experimental-pill">experimental</span>
+                  )}
+                </p>
+                <h3
+                  class="mt-3 text-3xl font-medium tracking-tight text-paper md:text-5xl"
+                  data-reveal-item
+                >
+                  {layer.title}
+                </h3>
+                <p
+                  class="mt-4 max-w-[42ch] text-base leading-relaxed text-mute md:text-lg"
+                  data-reveal-item
+                >
+                  {layer.copy}
+                </p>
               </div>
-              <img
-                src={withBase(product.art)}
-                alt={`Grafyn ${product.kicker} view`}
-                class="aspect-8/5 w-full object-cover"
-                loading="lazy"
-                decoding="async"
-              />
-            </figure>
-          </article>
-        ))
-      }
+              <figure
+                class:list={['app-frame', index % 2 === 1 && 'md:order-1']}
+                data-reveal-item
+              >
+                <div class="app-frame-bar" aria-hidden="true">
+                  <span class="app-frame-dot" />
+                  <span class="app-frame-dot" />
+                  <span class="app-frame-dot" />
+                  <span class="app-frame-title">{layer.frame}</span>
+                </div>
+                <img
+                  src={withBase(layer.art)}
+                  alt={`Grafyn ${layer.frame.split('· ')[1]} view`}
+                  class="aspect-8/5 w-full object-cover"
+                  loading="lazy"
+                  decoding="async"
+                />
+              </figure>
+            </article>
+          ))
+        }
+      </div>
     </div>
   </section>
 
+  <!-- Act 4 · Privacy is the design reason -->
   <section class="border-t border-rule px-4 py-24 md:px-10 md:py-28 lg:px-16">
     <div class="mx-auto grid max-w-6xl gap-12 md:grid-cols-2 md:gap-20">
       <div class="reveal relative min-h-[22rem] overflow-hidden rounded-2xl md:min-h-[28rem]" data-reveal>
@@ -169,6 +247,32 @@ const products = [
           </p>
         </li>
       </ul>
+    </div>
+  </section>
+
+  <!-- Act 5 · One download moment -->
+  <section id="download" class="border-t border-rule px-4 py-24 md:px-10 md:py-32 lg:px-16">
+    <div class="reveal mx-auto max-w-6xl" data-reveal>
+      <h2 class="text-4xl font-medium tracking-tight text-paper md:text-6xl">
+        Plant the seed.
+      </h2>
+      <p class="mt-5 max-w-[46ch] text-lg leading-relaxed text-mute md:text-xl">
+        One installer per platform, auto-updates from GitHub Releases, and a
+        vault that stays on your disk. Point it at the markdown folder you
+        already have.
+      </p>
+      <div class="mt-10">
+        <DownloadCta />
+      </div>
+      <p class="mt-8 text-sm text-mute">
+        Windows x64 and ARM64 · macOS Apple Silicon · Linux .deb and AppImage ·
+        <a
+          class="underline decoration-hairline underline-offset-4 hover:text-paper"
+          href={withBase('download/')}
+        >
+          first-run details</a
+        >
+      </p>
     </div>
   </section>
 </Base>

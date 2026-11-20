@@ -1,0 +1,187 @@
+---
+// Inline version of the Grafyn mark: a faceted seed crystal split open by a
+// sprouting stem that grows into a graph of nodes. Two modes share one
+// drawing:
+//   hero  — assembles once on page load (CSS keyframes)
+//   story — advances by scroll stage (data-stage 0/1/2, set by motion.js)
+// Default stage is "2" (fully drawn) so the figure is complete without JS
+// and under prefers-reduced-motion.
+//
+// The seed is constructed, not hand-drawn: outline vertices sit on a
+// √φ-aspect ellipse, the cleft is a channel cut from the top-right mouth
+// past the centre, fracture seams radiate from a hub just below the cleft
+// tip (where the stem split the gem), and the stem follows the channel
+// axis so it rises out of the dark split.
+const { mode = 'hero' } = Astro.props;
+
+const PHI = (1 + Math.sqrt(5)) / 2;
+const rad = (deg) => (deg * Math.PI) / 180;
+
+const C = { x: 180, y: 385 };
+const AX = 100;
+const BX = AX / Math.sqrt(PHI);
+const TILT = rad(-10);
+
+function pt(angleDeg, rf) {
+  const t = rad(angleDeg);
+  const x = AX * rf * Math.cos(t);
+  const y = BX * rf * Math.sin(t);
+  return [
+    C.x + x * Math.cos(TILT) - y * Math.sin(TILT),
+    C.y + x * Math.sin(TILT) + y * Math.cos(TILT),
+  ];
+}
+
+// Outer ring (slight radius modulation for crystal character)
+const vTop = pt(264, 0.97);
+const entryL = pt(-70, 0.98);
+const entryR = pt(-38, 1);
+const v0 = pt(0, 0.96);
+const v44 = pt(44, 1);
+const v88 = pt(88, 0.97);
+const vBot = pt(132, 1);
+const v176 = pt(176, 0.95);
+const v220 = pt(220, 0.98);
+
+// Cleft channel from the mouth (entryL–entryR) past the centre, with a
+// kink on the right wall — the lobe's jutting corner.
+const apexC = pt(135, 0.15);
+const mouthC = [(entryL[0] + entryR[0]) / 2, (entryL[1] + entryR[1]) / 2];
+const axv = [mouthC[0] - apexC[0], mouthC[1] - apexC[1]];
+const alen = Math.hypot(axv[0], axv[1]);
+const n = [-axv[1] / alen, axv[0] / alen];
+const HALF_W = 11;
+// n points to the right of the mouth→apex axis; entryL sits on the -n
+// side, so the left wall's deep end must too (walls must not cross).
+const apexL = [apexC[0] - n[0] * HALF_W, apexC[1] - n[1] * HALF_W];
+const apexR = [apexC[0] + n[0] * HALF_W, apexC[1] + n[1] * HALF_W];
+const kinkR = [
+  (apexR[0] + entryR[0]) / 2 - n[0] * 5,
+  (apexR[1] + entryR[1]) / 2 - n[1] * 5,
+];
+
+const outlinePts = [vTop, entryL, apexL, apexR, kinkR, entryR, v0, v44, v88, vBot, v176, v220];
+const seedOutline =
+  'M' + outlinePts.map((p) => p.map((v) => v.toFixed(1)).join(' ')).join(' L') + ' Z';
+
+// Fracture topology transcribed from the app icon: a roof seam from the
+// left rim to the cleft wall, a left hub (JL) radiating four seams, and
+// the crack hub (JC) just below the cleft tip throwing one long diagonal
+// to the lower-right rim — hubs well separated, each degree ≤ 4.
+const u = [axv[0] / alen, axv[1] / alen];
+const JC = [apexC[0] - u[0] * 34, apexC[1] - u[1] * 34];
+const JL = pt(190, 0.45);
+// Roof seam meets the cleft's left wall where the channel is clearly dark,
+// not at the apex where the stem covers it.
+const WL = [apexL[0] + (entryL[0] - apexL[0]) * 0.3, apexL[1] + (entryL[1] - apexL[1]) * 0.3];
+
+const seams = [
+  [v220, WL],
+  [JL, JC],
+  [JL, v176],
+  [JL, v220],
+  [JL, vBot],
+  [JC, v88],
+  [JC, v44],
+  [kinkR, v0],
+];
+
+// Stem: rides the channel axis out of the split, then an S-bend to the
+// base node at (210, 198).
+const axisP = (t) =>
+  `${(apexC[0] + t * axv[0]).toFixed(1)} ${(apexC[1] + t * axv[1]).toFixed(1)}`;
+const stemPath =
+  `M ${apexC[0].toFixed(1)} ${apexC[1].toFixed(1)} ` +
+  `C ${axisP(0.45)} ${axisP(0.8)} ${axisP(1.05)} ` +
+  `C ${axisP(1.3)} 234 246 212 198`;
+
+const nodes = [
+  { x: 210, y: 198, r: 8, base: true, alt: true },
+  { x: 150, y: 150, r: 5.5 },
+  { x: 248, y: 142, r: 5.5 },
+  { x: 118, y: 92, r: 5 },
+  { x: 196, y: 72, r: 6.5, alt: true },
+  { x: 278, y: 84, r: 5 },
+  { x: 158, y: 34, r: 4 },
+  { x: 240, y: 28, r: 4.5, alt: true },
+  { x: 312, y: 138, r: 4 },
+  { x: 94, y: 160, r: 4, alt: true },
+];
+
+const edges = [
+  [0, 1], [0, 2], [1, 4], [1, 3], [2, 4], [2, 5], [3, 6], [4, 6],
+  [4, 7], [5, 7], [5, 8], [2, 8], [1, 9], [3, 9],
+];
+---
+
+<svg
+  class:list={['mark-svg', mode === 'hero' ? 'mark-hero' : 'mark-story']}
+  data-mark-story={mode === 'story' ? '' : undefined}
+  data-stage={mode === 'story' ? '2' : undefined}
+  viewBox="0 0 400 480"
+  fill="none"
+  xmlns="http://www.w3.org/2000/svg"
+  aria-hidden="true"
+>
+  <g class="m-seed">
+    <path class="m-seed-fill" d={seedOutline} fill="var(--color-seed)" />
+    {
+      seams.map(([a, b], i) => (
+        <line
+          class="m-seam"
+          style={`--i:${i}`}
+          x1={a[0].toFixed(1)}
+          y1={a[1].toFixed(1)}
+          x2={b[0].toFixed(1)}
+          y2={b[1].toFixed(1)}
+          pathLength="1"
+          stroke="var(--color-ink)"
+          stroke-width="4"
+        />
+      ))
+    }
+  </g>
+
+  <path
+    class="m-stem"
+    d={stemPath}
+    pathLength="1"
+    stroke="var(--color-seed)"
+    stroke-width="4"
+    stroke-linecap="round"
+  />
+
+  <g class="m-edges">
+    {
+      edges.map(([a, b], i) => (
+        <line
+          class="m-edge"
+          style={`--i:${i}`}
+          x1={nodes[a].x}
+          y1={nodes[a].y}
+          x2={nodes[b].x}
+          y2={nodes[b].y}
+          pathLength="1"
+          stroke="var(--color-node)"
+          stroke-opacity="0.55"
+          stroke-width="1.5"
+        />
+      ))
+    }
+  </g>
+
+  <g class="m-nodes">
+    {
+      nodes.map((n, i) => (
+        <circle
+          class:list={['m-node', n.base && 'm-node--base']}
+          style={`--i:${i}`}
+          cx={n.x}
+          cy={n.y}
+          r={n.r}
+          fill={n.alt ? 'var(--color-nodealt)' : 'var(--color-node)'}
+        />
+      ))
+    }
+  </g>
+</svg>
