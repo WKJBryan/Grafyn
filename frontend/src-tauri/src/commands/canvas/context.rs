@@ -1,8 +1,11 @@
 use super::shared::ModelProviderRoute;
 use super::working_memory::{
-    build_canvas_messages, compose_system_prompt, format_working_memory_for_prompt,
-    memory_for_follow_up, rewrite_retrieval_query,
+    build_canvas_messages_after_compact, compact_branch_memory_live, compose_system_prompt,
+    format_working_memory_for_prompt, memory_for_follow_up, rewrite_retrieval_query,
+    sends_full_parent_chain, should_fetch_vault,
 };
+#[cfg(test)]
+use super::working_memory::build_canvas_messages;
 use crate::commands::run_retrieval;
 use crate::models::canvas::{
     CanvasSession, ContextMode, DecisionPromptMetadata, PromptRequest, PromptType, TileContextNote,
@@ -165,13 +168,33 @@ fn should_use_retrieved_notes(
 
 pub(super) async fn resolve_prompt_context(
     state: &AppState,
-    session: &CanvasSession,
+    session: &mut CanvasSession,
     request: &PromptRequest,
+    window: Option<&tauri::Window>,
 ) -> Result<ResolvedPromptContext, String> {
-    let messages = build_canvas_messages(session, request)?;
+    let compact_token_threshold = {
+        let settings = state.settings_service.read().await;
+        compact_token_threshold(settings.get())
+    };
+    let compact_action = compact_branch_memory_live(
+        state,
+        session,
+        request,
+        compact_token_threshold,
+        window,
+    )
+    .await;
+    let messages = build_canvas_messages_after_compact(
+        session,
+        request,
+        compact_token_threshold,
+        compact_action,
+    )?;
+    let include_memory = !sends_full_parent_chain(session, request, compact_token_threshold);
 
     if request.context_mode == ContextMode::Twin {
-        return resolve_twin_prompt_context(state, messages, session, request).await;
+        return resolve_twin_prompt_context(state, messages, session, request, include_memory)
+            .await;
     }
 
     if matches!(
@@ -179,10 +202,12 @@ pub(super) async fn resolve_prompt_context(
         ContextMode::KnowledgeSearch | ContextMode::Semantic
     ) {
         let pinned_ids = session.pinned_note_ids.clone();
-        let retrieval_query = rewrite_retrieval_query(
-            &request.prompt,
-            &memory_for_follow_up(session, request),
-        );
+        let parent_memory = memory_for_follow_up(session, request);
+        if !should_fetch_vault(&request.prompt, &parent_memory) {
+            return resolve_pinned_only_context(state, session, request, messages, include_memory)
+                .await;
+        }
+        let retrieval_query = rewrite_retrieval_query(&request.prompt, &parent_memory);
 
         // Quality gate: note-level retrieval to check if vault has relevant content
         let retrieval_results = run_retrieval(state, &retrieval_query, 5, &pinned_ids)
@@ -196,7 +221,8 @@ pub(super) async fn resolve_prompt_context(
                 request.prompt,
                 retrieval_decision
             );
-            return resolve_pinned_only_context(state, session, request, messages).await;
+            return resolve_pinned_only_context(state, session, request, messages, include_memory)
+                .await;
         }
 
         // Check if chunk-level retrieval is enabled
@@ -236,6 +262,7 @@ pub(super) async fn resolve_prompt_context(
                     messages,
                     &retrieval_results,
                     &pinned_ids,
+                    include_memory,
                 )
                 .await;
             }
@@ -283,7 +310,12 @@ pub(super) async fn resolve_prompt_context(
                 candidate_twin_records: Vec::new(),
                 constitution_items: Vec::new(),
                 action_gaps: Vec::new(),
-                system_prompt: compose_system_prompt(session, request, Some(note_prompt)),
+                system_prompt: compose_system_prompt(
+                    session,
+                    request,
+                    Some(note_prompt),
+                    include_memory,
+                ),
                 twin_context_prompt: None,
                 context_version: None,
                 decision_case_ids: Vec::new(),
@@ -297,6 +329,7 @@ pub(super) async fn resolve_prompt_context(
                 messages,
                 &retrieval_results,
                 &pinned_ids,
+                include_memory,
             )
             .await
         }
@@ -308,7 +341,7 @@ pub(super) async fn resolve_prompt_context(
             candidate_twin_records: Vec::new(),
             constitution_items: Vec::new(),
             action_gaps: Vec::new(),
-            system_prompt: compose_system_prompt(session, request, None),
+            system_prompt: compose_system_prompt(session, request, None, include_memory),
             twin_context_prompt: None,
             context_version: None,
             decision_case_ids: Vec::new(),
@@ -321,18 +354,23 @@ async fn resolve_twin_prompt_context(
     messages: Vec<ChatMessage>,
     session: &CanvasSession,
     request: &PromptRequest,
+    include_memory: bool,
 ) -> Result<ResolvedPromptContext, String> {
     let pinned_ids = session.pinned_note_ids.clone();
-    let retrieval_query = rewrite_retrieval_query(
-        &request.prompt,
-        &memory_for_follow_up(session, request),
-    );
-    let retrieval_results = run_retrieval(state, &retrieval_query, 5, &pinned_ids)
-        .await
-        .unwrap_or_default();
+    let parent_memory = memory_for_follow_up(session, request);
+    let retrieval_query = rewrite_retrieval_query(&request.prompt, &parent_memory);
+    let fetch_vault = should_fetch_vault(&request.prompt, &parent_memory);
+    let retrieval_results = if fetch_vault {
+        run_retrieval(state, &retrieval_query, 5, &pinned_ids)
+            .await
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
 
-    let should_use_notes = should_use_retrieved_notes(&retrieval_query, &retrieval_results)
-        == RetrievalDecisionReason::UseRetrievedNotes;
+    let should_use_notes = fetch_vault
+        && should_use_retrieved_notes(&retrieval_query, &retrieval_results)
+            == RetrievalDecisionReason::UseRetrievedNotes;
     let mut context_notes = Vec::new();
     let mut note_contexts = Vec::new();
 
@@ -465,22 +503,23 @@ async fn resolve_twin_prompt_context(
         .map(|episode| episode.id.clone())
         .collect::<Vec<_>>();
 
-    let twin_prompt = build_twin_context_prompt(
-        &setup,
-        &selection.cases,
-        &selection.notes,
-        &selection.approved,
-        &selection.candidates,
-        &selection.constitution_items,
-        &selection.action_gaps,
-        &request.twin_answer_mode,
-        &request.prompt_type,
-        request.decision_metadata.as_ref(),
+    let twin_prompt = prefix_twin_prompt_with_memory(
+        session,
+        request,
+        build_twin_context_prompt(
+            &setup,
+            &selection.cases,
+            &selection.notes,
+            &selection.approved,
+            &selection.candidates,
+            &selection.constitution_items,
+            &selection.action_gaps,
+            &request.twin_answer_mode,
+            &request.prompt_type,
+            request.decision_metadata.as_ref(),
+        ),
+        include_memory,
     );
-    let twin_prompt = match format_working_memory_for_prompt(&session.working_memory) {
-        Some(memory) => format!("{memory}\n\n{twin_prompt}"),
-        None => twin_prompt,
-    };
     let system_prompt = match &request.system_prompt {
         Some(user_sp) if !user_sp.trim().is_empty() => format!("{twin_prompt}\n\n{user_sp}"),
         _ => twin_prompt.clone(),
@@ -526,6 +565,7 @@ async fn resolve_note_level_context(
     messages: Vec<ChatMessage>,
     retrieval_results: &[RetrievalResult],
     pinned_ids: &[String],
+    include_memory: bool,
 ) -> Result<ResolvedPromptContext, String> {
     let note_contexts = fetch_note_contexts(state, retrieval_results).await;
 
@@ -557,7 +597,7 @@ async fn resolve_note_level_context(
         candidate_twin_records: Vec::new(),
         constitution_items: Vec::new(),
         action_gaps: Vec::new(),
-        system_prompt: compose_system_prompt(session, request, Some(note_prompt)),
+        system_prompt: compose_system_prompt(session, request, Some(note_prompt), include_memory),
         twin_context_prompt: None,
         context_version: None,
         decision_case_ids: Vec::new(),
@@ -569,6 +609,7 @@ async fn resolve_pinned_only_context(
     session: &CanvasSession,
     request: &PromptRequest,
     messages: Vec<ChatMessage>,
+    include_memory: bool,
 ) -> Result<ResolvedPromptContext, String> {
     let pinned = fetch_notes_by_ids(state, &session.pinned_note_ids).await;
     let context_notes: Vec<TileContextNote> = pinned
@@ -594,7 +635,7 @@ async fn resolve_pinned_only_context(
         candidate_twin_records: Vec::new(),
         constitution_items: Vec::new(),
         action_gaps: Vec::new(),
-        system_prompt: compose_system_prompt(session, request, inner),
+        system_prompt: compose_system_prompt(session, request, inner, include_memory),
         twin_context_prompt: None,
         context_version: None,
         decision_case_ids: Vec::new(),
@@ -1025,6 +1066,28 @@ pub(super) async fn run_sealed_twin_prediction(
             let _ = store.mark_twin_prediction_failed(&episode_id);
         }
     }
+}
+
+fn prefix_twin_prompt_with_memory(
+    session: &CanvasSession,
+    request: &PromptRequest,
+    twin_prompt: String,
+    include_memory: bool,
+) -> String {
+    if !include_memory {
+        return twin_prompt;
+    }
+    match format_working_memory_for_prompt(&memory_for_follow_up(session, request)) {
+        Some(memory) => format!("{memory}\n\n{twin_prompt}"),
+        None => twin_prompt,
+    }
+}
+
+/// On-disk settings can hold any value; the clamp in `update_settings` alone does not cover hand edits.
+fn compact_token_threshold(settings: &crate::models::settings::UserSettings) -> usize {
+    crate::models::settings::clamp_canvas_compact_token_threshold(
+        settings.canvas_compact_token_threshold,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2044,5 +2107,61 @@ mod tests {
         );
 
         assert_eq!(decision, RetrievalDecisionReason::NoKeywordMatch);
+    }
+
+    #[test]
+    fn twin_prefix_uses_parent_branch_memory_not_session_working_memory() {
+        let mut session = build_session(vec![build_tile(
+            "tile-1",
+            "Root prompt",
+            "openai/gpt-4",
+            "Root response",
+            None,
+            None,
+        )]);
+        session.working_memory = crate::models::canvas::CanvasWorkingMemory::default();
+        session.branch_memories.insert(
+            "tile-1::openai/gpt-4".to_string(),
+            crate::models::canvas::CanvasWorkingMemory {
+                goal: "Branch dream goal".to_string(),
+                discussed: "Discussed on the parent node.".to_string(),
+                ..crate::models::canvas::CanvasWorkingMemory::default()
+            },
+        );
+        let request = build_request(
+            "Follow up",
+            "tile-1",
+            "openai/gpt-4",
+            ContextMode::Twin,
+        );
+        let prefixed = prefix_twin_prompt_with_memory(
+            &session,
+            &request,
+            "## Twin Operating Contract\n\nbody".to_string(),
+            true,
+        );
+        assert!(prefixed.contains("Branch dream goal"));
+        assert!(prefixed.contains("Discussed on the parent node."));
+        assert!(prefixed.contains("## Twin Operating Contract"));
+        assert!(prefixed.starts_with("## Session working memory"));
+
+        let unprefixed = prefix_twin_prompt_with_memory(
+            &session,
+            &request,
+            "## Twin Operating Contract\n\nbody".to_string(),
+            false,
+        );
+        assert!(!unprefixed.contains("Branch dream goal"));
+    }
+
+    #[test]
+    fn compact_token_threshold_clamps_out_of_range_on_disk_values() {
+        let mut settings = crate::models::settings::UserSettings::default();
+        settings.canvas_compact_token_threshold = 100;
+        assert_eq!(compact_token_threshold(&settings), 8_000);
+        settings.canvas_compact_token_threshold = 10_000_000;
+        assert_eq!(compact_token_threshold(&settings), 150_000);
+        settings.canvas_compact_token_threshold = 32_000;
+        assert_eq!(compact_token_threshold(&settings), 32_000);
     }
 }

@@ -60,3 +60,6 @@ error_output.txt
 .cloudflare/.wrangler/
 .cloudflare/latest.json
 .wrangler/
+
+# Session tooling and local worktrees
+.claude/

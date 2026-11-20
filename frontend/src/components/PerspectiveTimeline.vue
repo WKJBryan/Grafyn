@@ -1,23 +1,49 @@
 <template>
-  <aside class="perspective-timeline" aria-label="Perspective history">
+  <aside
+    class="perspective-timeline"
+    aria-label="Perspective history"
+  >
     <header>
       <strong>Perspective through time</strong>
-      <button type="button" aria-label="Close perspective history" @click="$emit('close')">
+      <button
+        type="button"
+        aria-label="Close perspective history"
+        @click="$emit('close')"
+      >
         ×
       </button>
     </header>
     <p class="hint">
       Recorded perspectives over the current note map. Earlier note layouts are not reconstructed.
     </p>
-    <p v-if="error" role="alert" class="error">{{ error }}</p>
+    <p
+      v-if="error"
+      role="alert"
+      class="error"
+    >
+      {{ error }}
+    </p>
 
-    <label v-if="perspectives.length" class="field">
+    <label
+      v-if="perspectives.length"
+      class="field"
+    >
       Perspective
-      <select v-model="selectedPerspectiveId" @change="selectAtTime">
-        <option v-for="p in perspectives" :key="p.id" :value="p.id">{{ p.title }}</option>
+      <select
+        v-model="selectedPerspectiveId"
+        @change="selectAtTime"
+      >
+        <option
+          v-for="p in perspectives"
+          :key="p.id"
+          :value="p.id"
+        >{{ p.title }}</option>
       </select>
     </label>
-    <label v-if="dates.length" class="field">
+    <label
+      v-if="dates.length"
+      class="field"
+    >
       As of {{ formatDate(dates[timeIndex]) }}
       <input
         v-model.number="timeIndex"
@@ -27,10 +53,14 @@
         :max="dates.length - 1"
         step="1"
         @input="selectAtTime"
-      />
+      >
     </label>
 
-    <div v-if="lineage.length" class="lineage" aria-label="Backward perspective lineage">
+    <div
+      v-if="lineage.length"
+      class="lineage"
+      aria-label="Backward perspective lineage"
+    >
       <button
         v-for="state in lineage"
         :key="state.id"
@@ -43,49 +73,83 @@
         <span class="kind">{{ state.change_kind }}</span>
         <strong>{{ state.statement }}</strong>
         <small v-if="state.reason">{{ state.reason }}</small>
-        <small
-          >{{ state.source_note_ids.length }} source note{{
-            state.source_note_ids.length === 1 ? '' : 's'
-          }}</small
-        >
+        <small>{{ state.source_note_ids.length }} source note{{
+          state.source_note_ids.length === 1 ? '' : 's'
+        }}</small>
       </button>
     </div>
-    <p v-else class="hint">No recorded state at this time. Record one below.</p>
+    <p
+      v-else
+      class="hint"
+    >
+      No recorded state at this time. Record one below.
+    </p>
 
     <form @submit.prevent="recordState">
       <h3>Record a perspective</h3>
-      <label class="field"
-        >Source note
-        <select v-model="form.sourceNoteId" required>
-          <option value="" disabled>Select a note</option>
-          <option v-for="note in nodes" :key="note.id" :value="note.id">{{ note.label }}</option>
+      <label class="field">Source note
+        <select
+          v-model="form.sourceNoteId"
+          required
+        >
+          <option
+            value=""
+            disabled
+          >Select a note</option>
+          <option
+            v-for="note in nodes"
+            :key="note.id"
+            :value="note.id"
+          >{{ note.label }}</option>
         </select>
       </label>
-      <label class="field"
-        >Title <input v-model.trim="form.title" required maxlength="120"
-      /></label>
-      <label class="field"
-        >What did you think?
-        <textarea v-model.trim="form.statement" required rows="2" maxlength="2000" />
+      <label class="field">Title <input
+        v-model.trim="form.title"
+        required
+        maxlength="120"
+      ></label>
+      <label class="field">What did you think?
+        <textarea
+          v-model.trim="form.statement"
+          required
+          rows="2"
+          maxlength="2000"
+        />
       </label>
-      <label class="field"
-        >When did you hold this view? <input v-model="form.effectiveAt" type="date" required
-      /></label>
-      <label v-if="activeState" class="field"
-        >Change
+      <label class="field">When did you hold this view? <input
+        v-model="form.effectiveAt"
+        type="date"
+        required
+      ></label>
+      <label
+        v-if="activeState"
+        class="field"
+      >Change
         <select v-model="form.changeKind">
           <option value="revised">Revised</option>
           <option value="qualified">Qualified</option>
           <option value="reversed">Reversed</option>
         </select>
       </label>
-      <label class="field"
-        >Why? <textarea v-model.trim="form.reason" rows="2" maxlength="1000" />
+      <label class="field">Why? <textarea
+        v-model.trim="form.reason"
+        rows="2"
+        maxlength="1000"
+      />
       </label>
-      <button class="save" type="submit" :disabled="saving">
+      <button
+        class="save"
+        type="submit"
+        :disabled="saving"
+      >
         {{ saving ? 'Recording...' : activeState ? 'Add next state' : 'Start perspective' }}
       </button>
-      <button v-if="activeState" class="new" type="button" @click="startNew">
+      <button
+        v-if="activeState"
+        class="new"
+        type="button"
+        @click="startNew"
+      >
         Start a different perspective
       </button>
     </form>

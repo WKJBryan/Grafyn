@@ -413,7 +413,7 @@ import { select } from 'd3-selection'
 import { zoom as d3Zoom, zoomIdentity } from 'd3-zoom'
 
 import 'd3-transition'
-import { useCanvasStore } from '@/stores/canvas'
+import { useCanvasStore, branchMemoryKey, resolveToolbarMemory } from '@/stores/canvas'
 import { settings as settingsApi, twin as twinApi, isDesktopApp } from '@/api/client'
 import { useToast } from '@/composables/useToast'
 import PromptNode from './PromptNode.vue'
@@ -472,30 +472,6 @@ const session = computed(() => canvasStore.currentSession)
 const promptTiles = computed(() => canvasStore.promptTiles)
 const debates = computed(() => canvasStore.debates)
 const availableModels = computed(() => canvasStore.availableModels)
-const compactToolbarStats = computed(() => {
-  const parts = [
-    formatCount(promptTiles.value.length, 'prompt'),
-    formatCount(llmNodes.value.length, 'response'),
-    formatCount(debates.value.length, 'debate')
-  ]
-  const memory = session.value?.working_memory
-  if (memory?.summary) {
-    parts.push(`Memory · v${memory.version || 1}`)
-  }
-  return parts.join(' / ')
-})
-const toolbarStatsTitle = computed(() => {
-  const parts = [
-    formatCount(promptTiles.value.length, 'prompt', true),
-    formatCount(llmNodes.value.length, 'response', true),
-    formatCount(debates.value.length, 'debate', true)
-  ]
-  const memory = session.value?.working_memory
-  if (memory?.summary) {
-    parts.push(memory.question || memory.summary)
-  }
-  return parts.join(', ')
-})
 const loading = computed(() => canvasStore.loading)
 const streamingModels = computed(() => canvasStore.streamingModels)
 const debateStreamingContent = computed(() => canvasStore.debateStreamingContent)
@@ -526,6 +502,44 @@ const selectedLLMNodes = computed(() => {
       return { tileId: parts[1], modelId: parts.slice(2).join(':') }
     })
 })
+
+const selectedBranchKey = computed(() => {
+  const selected = selectedLLMNodes.value
+  if (!selected.length) return null
+  const node = selected[selected.length - 1]
+  return branchMemoryKey(node.tileId, node.modelId)
+})
+const toolbarMemory = computed(() =>
+  resolveToolbarMemory(session.value?.branch_memories, selectedBranchKey.value)
+)
+const compactToolbarStats = computed(() => {
+  const parts = [
+    formatCount(promptTiles.value.length, 'prompt'),
+    formatCount(llmNodes.value.length, 'response'),
+    formatCount(debates.value.length, 'debate')
+  ]
+  const memory = toolbarMemory.value
+  if (memory) {
+    parts.push(`Memory · v${memory.version || 1}`)
+  }
+  return parts.join(' / ')
+})
+const toolbarStatsTitle = computed(() => {
+  const parts = [
+    formatCount(promptTiles.value.length, 'prompt', true),
+    formatCount(llmNodes.value.length, 'response', true),
+    formatCount(debates.value.length, 'debate', true)
+  ]
+  const memory = toolbarMemory.value
+  if (memory) {
+    parts.push(memory.goal || memory.question || memory.discussed || memory.summary)
+  }
+  return parts.join(', ')
+})
+
+watch(selectedBranchKey, (key) => {
+  canvasStore.setToolbarBranchKey?.(key)
+}, { immediate: true })
 
 const selectedCompletedLLMNodes = computed(() => {
   return selectedLLMNodes.value.filter(({ tileId, modelId }) => {

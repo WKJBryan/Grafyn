@@ -501,10 +501,10 @@ const twinRuntimeHint = computed(() => {
 // Context mode descriptions
 const contextModeHints = {
   none: 'No additional context - just your prompt',
-  knowledge_search: 'Vault notes, pinned notes, and compiled session memory when you are branching.',
-  twin: 'Retrieves relevant notes plus approved user records and relevant candidate records from Twin Review, plus session memory when branching.',
+  knowledge_search: 'Full branch until it gets long, then a summary; notes only if this hop needs them.',
+  twin: 'Retrieves relevant notes plus approved user records and relevant candidate records from Twin Review. Session memory is the branch dream when one exists.',
   full_history: 'Include all conversation turns from the parent chain, prefixed with compiled session memory when available.',
-  compact: 'Compiled session state plus the last two turns. Older transcript is summarized, not cut mid-sentence.'
+  compact: 'Summarize the branch now, even if it is short.'
 }
 
 const twinModeHints = {
