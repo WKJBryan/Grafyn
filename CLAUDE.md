@@ -206,12 +206,14 @@ The prompt order is:
 1. Session working memory (when compiled; omitted if empty)
 2. Twin Operating Contract
 3. Twin Identity
-4. Reviewed Constitution
-5. Action Gap Risks
-6. Relevant Evidence
-7. Approved User Records
-8. Tentative Candidate Records
-9. Answer Instructions
+4. Past Decision Cases (always present; placeholder line when none selected)
+5. Reviewed Constitution (Active + Softened items only)
+6. Action Gap Risks
+7. Relevant Evidence
+8. Approved User Records
+9. Tentative Candidate Records
+10. Candidate Constitution Hypotheses (only when Candidate items were selected)
+11. Answer Instructions
 
 Twin Identity lives in `ConstitutionSetup` and is persisted in `constitution_setup.json` with `twin_name`, `twin_role`, and optional `source_boundaries`. Name and role/context are required before `TwinAnswerMode::Simulation` can run. The backend enforces this in the twin context resolution path so direct IPC calls cannot bypass the setup gate.
 
