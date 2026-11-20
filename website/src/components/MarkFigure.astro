@@ -9,8 +9,9 @@
 //
 // The seed is constructed, not hand-drawn: outline vertices sit on a
 // √φ-aspect ellipse, the cleft is a channel cut from the top-right mouth
-// past the centre, facets radiate rose-cut-style from the bottom vertex,
-// and the stem follows the channel axis so it rises out of the dark split.
+// past the centre, fracture seams radiate from a hub just below the cleft
+// tip (where the stem split the gem), and the stem follows the channel
+// axis so it rises out of the dark split.
 const { mode = 'hero' } = Astro.props;
 
 const PHI = (1 + Math.sqrt(5)) / 2;
@@ -49,9 +50,11 @@ const mouthC = [(entryL[0] + entryR[0]) / 2, (entryL[1] + entryR[1]) / 2];
 const axv = [mouthC[0] - apexC[0], mouthC[1] - apexC[1]];
 const alen = Math.hypot(axv[0], axv[1]);
 const n = [-axv[1] / alen, axv[0] / alen];
-const HALF_W = 9;
-const apexL = [apexC[0] + n[0] * HALF_W, apexC[1] + n[1] * HALF_W];
-const apexR = [apexC[0] - n[0] * HALF_W, apexC[1] - n[1] * HALF_W];
+const HALF_W = 11;
+// n points to the right of the mouth→apex axis; entryL sits on the -n
+// side, so the left wall's deep end must too (walls must not cross).
+const apexL = [apexC[0] - n[0] * HALF_W, apexC[1] - n[1] * HALF_W];
+const apexR = [apexC[0] + n[0] * HALF_W, apexC[1] + n[1] * HALF_W];
 const kinkR = [
   (apexR[0] + entryR[0]) / 2 - n[0] * 5,
   (apexR[1] + entryR[1]) / 2 - n[1] * 5,
@@ -61,13 +64,26 @@ const outlinePts = [vTop, entryL, apexL, apexR, kinkR, entryR, v0, v44, v88, vBo
 const seedOutline =
   'M' + outlinePts.map((p) => p.map((v) => v.toFixed(1)).join(' ')).join(' L') + ' Z';
 
-// Rose-cut pavilion: main facets radiate from the bottom vertex.
+// Fracture topology transcribed from the app icon: a roof seam from the
+// left rim to the cleft wall, a left hub (JL) radiating four seams, and
+// the crack hub (JC) just below the cleft tip throwing one long diagonal
+// to the lower-right rim — hubs well separated, each degree ≤ 4.
+const u = [axv[0] / alen, axv[1] / alen];
+const JC = [apexC[0] - u[0] * 34, apexC[1] - u[1] * 34];
+const JL = pt(190, 0.45);
+// Roof seam meets the cleft's left wall where the channel is clearly dark,
+// not at the apex where the stem covers it.
+const WL = [apexL[0] + (entryL[0] - apexL[0]) * 0.3, apexL[1] + (entryL[1] - apexL[1]) * 0.3];
+
 const seams = [
-  [vBot, v220],
-  [vBot, vTop],
-  [vBot, apexL],
-  [vBot, v44],
-  [kinkR, v44],
+  [v220, WL],
+  [JL, JC],
+  [JL, v176],
+  [JL, v220],
+  [JL, vBot],
+  [JC, v88],
+  [JC, v44],
+  [kinkR, v0],
 ];
 
 // Stem: rides the channel axis out of the split, then an S-bend to the
