@@ -124,6 +124,10 @@ pub fn sync_topic_hubs(store: &mut KnowledgeStore) -> Result<TopicHubSyncResult>
             removed_note_ids.insert(current.id);
             continue;
         }
+        // User-authored notes that merely look like hubs (tag `hub`, "Hub: " title) are never rewritten.
+        if !is_auto_topic_hub(&current) {
+            continue;
+        }
 
         let desired = standardize_existing_hub(&current);
         if let Some(updated) = persist_if_changed(store, &current, desired)? {
@@ -199,6 +203,9 @@ pub fn sync_topic_hubs(store: &mut KnowledgeStore) -> Result<TopicHubSyncResult>
         let Some(current) = notes_by_id.get(&hub_id).cloned() else {
             continue;
         };
+        if !is_auto_topic_hub(&current) {
+            continue;
+        }
         let members = memberships.get(&hub_id).cloned().unwrap_or_default();
         let related = related_hubs.get(&hub_id).cloned().unwrap_or_default();
         let desired = rewrite_hub_note(&current, &members, &related, &notes_by_id);
@@ -918,6 +925,15 @@ fn persist_if_changed(
     if notes_equal(current, &desired) {
         return Ok(None);
     }
+    // Unparsable original frontmatter is preserved verbatim; any metadata update would
+    // clear the fallback and destroy it (same guard as vault_optimizer/markdown_migration).
+    if current.frontmatter_raw_fallback.is_some() {
+        log::warn!(
+            "Skipping topic hub sync for note '{}': original frontmatter is unparsable and preserved verbatim",
+            current.id
+        );
+        return Ok(None);
+    }
 
     let updated = store.update_note(
         &current.id,
@@ -1376,6 +1392,45 @@ mod tests {
             optimizer_managed: false,
             properties: HashMap::new(),
         })
+    }
+
+    #[test]
+    fn user_note_tagged_hub_survives_sync_byte_for_byte() -> Result<()> {
+        let dir = tempdir()?;
+        let mut store = KnowledgeStore::new(dir.path().to_path_buf(), dir.path().to_path_buf());
+        let user_hub = write_note(
+            &mut store,
+            "My Reading List",
+            "Hand-written notes I care about.\n\n- item one\n- item two",
+            &["hub", "rust"],
+        )?;
+        write_note(&mut store, "Ownership", "Rust ownership rules.", &["rust"])?;
+        let path = dir.path().join(&user_hub.relative_path);
+        let before = std::fs::read(&path)?;
+
+        sync_topic_hubs(&mut store)?;
+
+        assert_eq!(std::fs::read(&path)?, before);
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_frontmatter_note_keeps_raw_frontmatter_after_sync() -> Result<()> {
+        let dir = tempdir()?;
+        let raw = "---\ntitle: Original Title\ntags:\n\t- alpha\nstatus: canonical\n---\n\nOriginal body about #rust ownership.";
+        let path = dir.path().join("broken.md");
+        std::fs::write(&path, raw)?;
+        let mut store = KnowledgeStore::new(dir.path().to_path_buf(), dir.path().to_path_buf());
+        assert!(store.get_note("broken")?.frontmatter_raw_fallback.is_some());
+
+        sync_topic_hubs(&mut store)?;
+
+        let after = std::fs::read_to_string(&path)?;
+        assert!(
+            after.starts_with("---\ntitle: Original Title\ntags:\n\t- alpha\nstatus: canonical\n---"),
+            "raw frontmatter must be preserved, got:\n{after}"
+        );
+        Ok(())
     }
 
     #[test]

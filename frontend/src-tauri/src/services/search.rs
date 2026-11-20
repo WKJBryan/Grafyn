@@ -6,6 +6,21 @@ use tantivy::query::QueryParser;
 use tantivy::schema::*;
 use tantivy::{doc, Index, IndexReader, IndexWriter, ReloadPolicy};
 
+/// True when `err` (from `SearchService::new` / `ChunkIndex::new`) means another
+/// `IndexWriter` holds the directory's writer lock — e.g. the bundled grafyn-mcp
+/// binary — rather than a damaged index. Callers must not delete the index then.
+#[allow(dead_code)] // only the Tauri binary uses it; the MCP binary shares this module
+pub fn is_writer_lock_busy(err: &anyhow::Error) -> bool {
+    // anyhow's downcast sees through `.context(...)` to the TantivyError underneath.
+    matches!(
+        err.downcast_ref::<tantivy::TantivyError>(),
+        Some(tantivy::TantivyError::LockFailure(
+            tantivy::directory::error::LockError::LockBusy,
+            _
+        ))
+    )
+}
+
 /// Full-text search service using Tantivy
 pub struct SearchService {
     index: Index,
@@ -163,7 +178,12 @@ impl SearchService {
 
     /// Reindex all notes
     pub fn reindex_all(&mut self, notes: &[Note]) -> Result<()> {
-        let writer = self.writer.as_mut().context("Writer not available")?;
+        // Read-only (another process owns the writer): its index is served as-is,
+        // so boot and rebuild_all_indexes must not fail here.
+        let Some(writer) = self.writer.as_mut() else {
+            log::warn!("Search index is read-only; skipping reindex of {} notes", notes.len());
+            return Ok(());
+        };
 
         // Clear existing index
         writer.delete_all_documents()?;
@@ -179,8 +199,8 @@ impl SearchService {
             ))?;
         }
 
-        writer.commit()?;
-        Ok(())
+        // Route through commit() so the reader is reloaded synchronously.
+        self.commit()
     }
 
     /// Search notes by query string
@@ -196,7 +216,7 @@ impl SearchService {
             .context("Failed to parse query")?;
 
         let top_docs = searcher
-            .search(&query, &TopDocs::with_limit(limit))
+            .search(&query, &TopDocs::with_limit(limit.max(1)))
             .context("Search failed")?;
 
         let mut results = Vec::new();
@@ -291,35 +311,122 @@ impl SearchService {
     }
 }
 
-/// Create a text snippet around matching terms
+/// Create a text snippet around matching terms.
+///
+/// All offsets are in chars (not bytes) so non-ASCII content can't displace
+/// the window or split a codepoint.
 fn create_snippet(content: &str, query: &str, max_len: usize) -> String {
+    let chars: Vec<char> = content.chars().collect();
     let content_lower = content.to_lowercase();
     let query_lower = query.to_lowercase();
 
-    // Find first occurrence of any query term
-    let query_terms: Vec<&str> = query_lower.split_whitespace().collect();
-
-    let mut best_pos = 0;
-    for term in &query_terms {
-        if let Some(pos) = content_lower.find(term) {
-            best_pos = pos;
-            break;
-        }
-    }
+    // Char index of the first occurrence of any query term.
+    // shortcut: assumes lowercasing keeps char count (true except rare chars like 'İ'); drift is a few chars.
+    let best_pos = query_lower
+        .split_whitespace()
+        .find_map(|term| content_lower.find(term))
+        .map(|byte_pos| content_lower[..byte_pos].chars().count().min(chars.len()))
+        .unwrap_or(0);
 
     // Extract snippet around the match
     let start = best_pos.saturating_sub(max_len / 2);
-    let end = (start + max_len).min(content.len());
+    let end = (start + max_len).min(chars.len());
 
-    let mut snippet: String = content.chars().skip(start).take(end - start).collect();
+    let mut snippet: String = chars[start..end].iter().collect();
 
     // Add ellipsis if truncated
     if start > 0 {
         snippet = format!("...{}", snippet.trim_start());
     }
-    if end < content.len() {
+    if end < chars.len() {
         snippet = format!("{}...", snippet.trim_end());
     }
 
     snippet
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::note::NoteStatus;
+    use tempfile::{tempdir, TempDir};
+
+    fn note(id: &str, content: &str) -> Note {
+        Note {
+            id: id.to_string(),
+            title: id.to_string(),
+            content: content.to_string(),
+            relative_path: format!("{}.md", id),
+            status: NoteStatus::Draft,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn search_with_zero_limit_returns_results_instead_of_panicking() {
+        let tmp = TempDir::new().unwrap();
+        let mut search = SearchService::new(tmp.path().to_path_buf()).unwrap();
+        search
+            .index_note(&note("a", "quantum entanglement"))
+            .unwrap();
+        search.commit().unwrap();
+
+        let results = search.search("quantum", 0).unwrap();
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn reindex_all_is_immediately_searchable() {
+        let tmp = TempDir::new().unwrap();
+        let mut search = SearchService::new(tmp.path().to_path_buf()).unwrap();
+        search
+            .reindex_all(&[note("a", "photosynthesis"), note("b", "mitochondria")])
+            .unwrap();
+        assert_eq!(search.search("photosynthesis", 5).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn snippet_centers_on_match_in_non_ascii_content() {
+        // 100 two-byte chars before the match: byte offset 200, char offset 100.
+        let content = format!("{}target word here", "é".repeat(100));
+        let snippet = create_snippet(&content, "target", 20);
+        assert!(snippet.contains("target"), "snippet was {snippet:?}");
+        assert!(snippet.starts_with("..."));
+    }
+
+    #[test]
+    fn snippet_handles_multibyte_without_match() {
+        let content = "日本語のテキスト".repeat(50);
+        let snippet = create_snippet(&content, "missing", 10);
+        assert_eq!(snippet, format!("{}...", "日本語のテキスト日本"));
+    }
+
+    #[test]
+    fn writer_lock_contention_is_classified_and_leaves_index_intact() {
+        let dir = tempdir().unwrap();
+        let data = dir.path().to_path_buf();
+        let holder = SearchService::new(data.clone()).unwrap(); // stands in for grafyn-mcp
+
+        let err = SearchService::new(data.clone()).err().expect("second writer must fail");
+        assert!(is_writer_lock_busy(&err), "unexpected error: {err:#}");
+        assert!(data.join("search_index").join("meta.json").exists());
+
+        let readonly = SearchService::new_readonly(data.clone()).unwrap();
+        assert!(readonly.is_readonly());
+        drop(holder);
+    }
+
+    #[test]
+    fn non_lock_errors_are_not_classified_as_lock_busy() {
+        assert!(!is_writer_lock_busy(&anyhow::anyhow!("corrupt meta.json")));
+    }
+
+    #[test]
+    fn readonly_reindex_is_a_noop() {
+        let dir = tempdir().unwrap();
+        let data = dir.path().to_path_buf();
+        let _holder = SearchService::new(data.clone()).unwrap();
+        let mut readonly = SearchService::new_readonly(data).unwrap();
+        assert!(readonly.reindex_all(&[]).is_ok());
+    }
 }

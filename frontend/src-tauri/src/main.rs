@@ -20,7 +20,7 @@ use services::{
     priority::PriorityScoringService,
     perspective_history::PerspectiveHistory,
     retrieval::RetrievalService,
-    search::SearchService,
+    search::{is_writer_lock_busy, SearchService},
     settings::SettingsService,
     twin::TwinStore,
     vault_optimizer::{OptimizerTick, VaultOptimizerService},
@@ -52,6 +52,67 @@ pub struct AppState {
     /// MemoryService is stateless — no lock needed, just Arc for shared ownership
     pub memory_service: Arc<MemoryService>,
     pub boot_state: Arc<RwLock<BootStatus>>,
+}
+
+/// Open a Tantivy index with its writer. Writer-lock contention (most likely the
+/// bundled grafyn-mcp launched by Claude Desktop) is retried, then served read-only;
+/// the directory is only wiped and recreated for non-lock failures (corruption),
+/// never while another process holds the writer.
+fn open_index<T>(
+    name: &str,
+    index_path: &std::path::Path,
+    open: impl Fn() -> anyhow::Result<T>,
+    open_readonly: impl Fn() -> anyhow::Result<T>,
+) -> T {
+    let mut result = open();
+    for delay_ms in [100, 250, 500] {
+        match &result {
+            Err(e) if is_writer_lock_busy(e) => {
+                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                result = open();
+            }
+            _ => break,
+        }
+    }
+    let err = match result {
+        Ok(index) => return index,
+        Err(err) => err,
+    };
+
+    if is_writer_lock_busy(&err) {
+        match open_readonly() {
+            Ok(index) => {
+                log::warn!(
+                    "{} writer lock is held by another process (likely grafyn-mcp launched by \
+                     Claude Desktop). Running read-only: queries work, index updates are skipped \
+                     until Grafyn restarts without it.",
+                    name
+                );
+                return index;
+            }
+            Err(ro_err) => {
+                // Deleting here would pull the directory out from under a live writer.
+                log::error!(
+                    "{} is locked by another process (likely grafyn-mcp) and could not be opened \
+                     read-only: {:#}. Close Claude Desktop / grafyn-mcp and restart Grafyn.",
+                    name,
+                    ro_err
+                );
+                std::process::exit(1);
+            }
+        }
+    }
+
+    log::error!("Failed to open {}: {:#}. Rebuilding it.", name, err);
+    if index_path.exists() {
+        if let Err(rm_err) = std::fs::remove_dir_all(index_path) {
+            log::error!("Failed to remove corrupted {}: {}", name, rm_err);
+        }
+    }
+    open().unwrap_or_else(|e2| {
+        log::error!("{} initialization failed after rebuild: {:#}", name, e2);
+        std::process::exit(1);
+    })
 }
 
 fn main() {
@@ -94,44 +155,19 @@ fn main() {
             let knowledge_store = KnowledgeStore::new(vault_path.clone(), data_path.clone());
             let graph_index = GraphIndex::new();
             let perspective_history = PerspectiveHistory::new(data_path.join("perspectives").join("states"));
-            let search_service = match SearchService::new(data_path.clone()) {
-                Ok(s) => s,
-                Err(e) => {
-                    log::error!(
-                        "Failed to initialize search service: {}. Attempting index rebuild.",
-                        e
-                    );
-                    // Try deleting corrupted index and retrying
-                    let index_path = data_path.join("search_index");
-                    if index_path.exists() {
-                        if let Err(rm_err) = std::fs::remove_dir_all(&index_path) {
-                            log::error!("Failed to remove corrupted index: {}", rm_err);
-                        }
-                    }
-                    SearchService::new(data_path.clone()).unwrap_or_else(|e2| {
-                        log::error!("Search service initialization failed after rebuild: {}", e2);
-                        std::process::exit(1);
-                    })
-                }
-            };
+            let search_service = open_index(
+                "search index",
+                &data_path.join("search_index"),
+                || SearchService::new(data_path.clone()),
+                || SearchService::new_readonly(data_path.clone()),
+            );
             // Initialize chunk index (parallel to search index)
-            let chunk_index = match ChunkIndex::new(data_path.clone()) {
-                Ok(c) => c,
-                Err(e) => {
-                    log::error!(
-                        "Failed to initialize chunk index: {}. Attempting rebuild.",
-                        e
-                    );
-                    let chunk_path = data_path.join("chunk_index");
-                    if chunk_path.exists() {
-                        let _ = std::fs::remove_dir_all(&chunk_path);
-                    }
-                    ChunkIndex::new(data_path.clone()).unwrap_or_else(|e2| {
-                        log::error!("Chunk index initialization failed: {}", e2);
-                        std::process::exit(1);
-                    })
-                }
-            };
+            let chunk_index = open_index(
+                "chunk index",
+                &data_path.join("chunk_index"),
+                || ChunkIndex::new(data_path.clone()),
+                || ChunkIndex::new_readonly(data_path.clone()),
+            );
 
             let canvas_store = CanvasStore::new(data_path.join("canvas"));
             let twin_store = TwinStore::new(settings_service.get().effective_twin_data_path());

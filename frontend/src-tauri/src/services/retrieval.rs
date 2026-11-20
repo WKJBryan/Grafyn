@@ -12,6 +12,7 @@ use crate::models::note::{ChunkResult, NoteMeta, RelationType};
 use crate::services::atomic_io::write_atomic;
 use crate::services::chunk_index::ChunkIndex;
 use crate::services::graph_index::GraphIndex;
+use crate::services::knowledge_store::KnowledgeStore;
 use crate::services::priority::PriorityScoringService;
 use crate::services::search::SearchService;
 use anyhow::Result;
@@ -517,6 +518,19 @@ impl RetrievalService {
     }
 }
 
+/// Drop chunks whose parent note no longer exists on disk.
+///
+/// The chunk index can outlive a note deleted by another process (app vs
+/// grafyn-mcp), so hydration checks the store (a disk read per unique parent).
+pub fn retain_resolvable_chunks(chunks: &mut Vec<ChunkResult>, store: &KnowledgeStore) {
+    let mut live: HashMap<String, bool> = HashMap::new();
+    chunks.retain(|chunk| {
+        *live
+            .entry(chunk.parent_note_id.clone())
+            .or_insert_with(|| store.get_note(&chunk.parent_note_id).is_ok())
+    });
+}
+
 /// Partial update for retrieval config
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RetrievalConfigUpdate {
@@ -885,5 +899,40 @@ mod tests {
         assert_eq!(config.default_token_budget, 4000);
         assert!(config.chunk_retrieval_enabled);
         assert_eq!(config.relation_weights.supports, 1.5);
+    }
+
+    #[test]
+    fn chunks_with_missing_parent_are_dropped() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut store = KnowledgeStore::new(tmp.path().join("vault"), tmp.path().join("data"));
+        let live = store
+            .create_note(crate::models::note::NoteCreate {
+                title: "Live".into(),
+                content: "still here".into(),
+                relative_path: None,
+                aliases: Vec::new(),
+                status: NoteStatus::Draft,
+                tags: Vec::new(),
+                schema_version: crate::models::note::CURRENT_NOTE_SCHEMA_VERSION,
+                migration_source: None,
+                optimizer_managed: false,
+                properties: HashMap::new(),
+            })
+            .unwrap();
+        let chunk = |parent: &str| ChunkResult {
+            chunk_id: format!("{parent}::0"),
+            parent_note_id: parent.to_string(),
+            parent_title: parent.to_string(),
+            text: "text".into(),
+            start_char: 0,
+            end_char: 4,
+            depth_score: 0.0,
+            search_score: 1.0,
+            token_estimate: 1,
+        };
+        let mut chunks = vec![chunk(&live.id), chunk("deleted-note"), chunk(&live.id)];
+        retain_resolvable_chunks(&mut chunks, &store);
+        assert_eq!(chunks.len(), 2);
+        assert!(chunks.iter().all(|c| c.parent_note_id == live.id));
     }
 }

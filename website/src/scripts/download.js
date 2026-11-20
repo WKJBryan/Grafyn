@@ -1,14 +1,17 @@
 import { loadReleases, latestRelease } from './github.js';
 import { FALLBACK, INSTALLERS } from './installers.js';
 
-const REFRESH_MS = 90_000;
+const REFRESH_MS = 600_000;
 const STATUS_LINK_CLASS =
   'underline decoration-hairline underline-offset-4 hover:text-paper';
 
 const reduceMotion = () =>
   window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 
-function detectPlatform() {
+async function detectPlatform() {
+  const hints = await navigator.userAgentData
+    ?.getHighEntropyValues?.(['architecture'])
+    .catch(() => null);
   const ua = navigator.userAgent || '';
   const uaLower = ua.toLowerCase();
   const platform = (
@@ -17,7 +20,7 @@ function detectPlatform() {
     ''
   ).toLowerCase();
   const haystack = `${platform} ${uaLower}`;
-  const archHint = (navigator.userAgentData?.architecture || '').toLowerCase();
+  const archHint = (hints?.architecture || '').toLowerCase();
   const isArm = archHint.includes('arm') || /aarch64|arm64/.test(haystack);
 
   if (/win/.test(haystack)) return isArm ? 'win-arm64' : 'win-x64';
@@ -144,11 +147,13 @@ function renderStatusError(root) {
   status.append(link);
 }
 
-function renderCta(root, release) {
-  const platform = detectPlatform();
+async function renderCta(root, release) {
+  const platform = await detectPlatform();
   const matched = matchAssets(release);
-  const primary =
-    matched.find((item) => item.id === platform) ||
+  // Prerelease fallback (no stable release exists): keep the labeled Releases link.
+  const primary = release.prerelease
+    ? null
+    : matched.find((item) => item.id === platform) ||
     (platform.startsWith('win')
       ? matched.find((item) => item.id === 'win-x64')
       : null);
@@ -190,14 +195,15 @@ function renderCta(root, release) {
 
 async function enhance() {
   const roots = document.querySelectorAll('[data-download-cta]');
+  if (roots.length === 0) return;
   roots.forEach(renderStatusLoading);
   try {
     const payload = await loadReleases();
     const latest = latestRelease(payload.releases);
-    roots.forEach((root) => {
-      if (latest) renderCta(root, latest);
+    for (const root of roots) {
+      if (latest) await renderCta(root, latest);
       renderStatusSuccess(root, payload.downloads);
-    });
+    }
   } catch {
     roots.forEach(renderStatusError);
   }
