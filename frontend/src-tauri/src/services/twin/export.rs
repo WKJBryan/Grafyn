@@ -235,6 +235,9 @@ impl TwinStore {
 
         let manifest = serde_json::json!({
             "bundle_schema_version": 2,
+            // shortcut: split assignments changed once when the hash moved to FNV-1a over
+            // record.id; external harnesses must not mix holdouts across split_method values.
+            "split_method": "fnv1a64-id",
             "generated_at": Utc::now(),
             "root_path": self.root_path.display().to_string(),
             "eval_percentage": eval_percentage,
