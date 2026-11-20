@@ -6,6 +6,21 @@ use tantivy::query::QueryParser;
 use tantivy::schema::*;
 use tantivy::{doc, Index, IndexReader, IndexWriter, ReloadPolicy};
 
+/// True when `err` (from `SearchService::new` / `ChunkIndex::new`) means another
+/// `IndexWriter` holds the directory's writer lock — e.g. the bundled grafyn-mcp
+/// binary — rather than a damaged index. Callers must not delete the index then.
+#[allow(dead_code)] // only the Tauri binary uses it; the MCP binary shares this module
+pub fn is_writer_lock_busy(err: &anyhow::Error) -> bool {
+    // anyhow's downcast sees through `.context(...)` to the TantivyError underneath.
+    matches!(
+        err.downcast_ref::<tantivy::TantivyError>(),
+        Some(tantivy::TantivyError::LockFailure(
+            tantivy::directory::error::LockError::LockBusy,
+            _
+        ))
+    )
+}
+
 /// Full-text search service using Tantivy
 pub struct SearchService {
     index: Index,
@@ -163,7 +178,12 @@ impl SearchService {
 
     /// Reindex all notes
     pub fn reindex_all(&mut self, notes: &[Note]) -> Result<()> {
-        let writer = self.writer.as_mut().context("Writer not available")?;
+        // Read-only (another process owns the writer): its index is served as-is,
+        // so boot and rebuild_all_indexes must not fail here.
+        let Some(writer) = self.writer.as_mut() else {
+            log::warn!("Search index is read-only; skipping reindex of {} notes", notes.len());
+            return Ok(());
+        };
 
         // Clear existing index
         writer.delete_all_documents()?;
@@ -329,7 +349,7 @@ fn create_snippet(content: &str, query: &str, max_len: usize) -> String {
 mod tests {
     use super::*;
     use crate::models::note::NoteStatus;
-    use tempfile::TempDir;
+    use tempfile::{tempdir, TempDir};
 
     fn note(id: &str, content: &str) -> Note {
         Note {
@@ -379,5 +399,34 @@ mod tests {
         let content = "日本語のテキスト".repeat(50);
         let snippet = create_snippet(&content, "missing", 10);
         assert_eq!(snippet, format!("{}...", "日本語のテキスト日本"));
+    }
+
+    #[test]
+    fn writer_lock_contention_is_classified_and_leaves_index_intact() {
+        let dir = tempdir().unwrap();
+        let data = dir.path().to_path_buf();
+        let holder = SearchService::new(data.clone()).unwrap(); // stands in for grafyn-mcp
+
+        let err = SearchService::new(data.clone()).err().expect("second writer must fail");
+        assert!(is_writer_lock_busy(&err), "unexpected error: {err:#}");
+        assert!(data.join("search_index").join("meta.json").exists());
+
+        let readonly = SearchService::new_readonly(data.clone()).unwrap();
+        assert!(readonly.is_readonly());
+        drop(holder);
+    }
+
+    #[test]
+    fn non_lock_errors_are_not_classified_as_lock_busy() {
+        assert!(!is_writer_lock_busy(&anyhow::anyhow!("corrupt meta.json")));
+    }
+
+    #[test]
+    fn readonly_reindex_is_a_noop() {
+        let dir = tempdir().unwrap();
+        let data = dir.path().to_path_buf();
+        let _holder = SearchService::new(data.clone()).unwrap();
+        let mut readonly = SearchService::new_readonly(data).unwrap();
+        assert!(readonly.reindex_all(&[]).is_ok());
     }
 }
