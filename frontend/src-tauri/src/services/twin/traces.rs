@@ -221,10 +221,17 @@ impl TwinStore {
     fn get_or_create_trace_mut(&mut self, session_id: &str) -> Result<&mut SessionTrace> {
         if !self.trace_cache.contains_key(session_id) {
             let path = self.trace_file_path(session_id);
-            let trace = if path.exists() {
-                self.read_trace_file(&path)?
+            let loaded = if path.exists() {
+                load_or_quarantine::<SessionTrace>(&path, "trace")
             } else {
-                SessionTrace::new(session_id)
+                None
+            };
+            let trace = match loaded {
+                Some(trace) => trace,
+                // Corrupt files were renamed away, so start fresh. A file still present was
+                // unreadable (lock/permissions): error instead of overwriting it.
+                None if path.exists() => self.read_trace_file(&path)?,
+                None => SessionTrace::new(session_id),
             };
             self.trace_cache.insert(session_id.to_string(), trace);
         }
@@ -341,5 +348,36 @@ mod tests {
         assert_eq!(trace.events.len(), 1);
         assert_eq!(trace.events[0].id, event.id);
         assert_eq!(trace.events[0].event_type, TraceEventType::PromptSubmitted);
+    }
+
+    #[test]
+    fn append_to_corrupt_trace_quarantines_and_starts_fresh() {
+        let temp_dir = tempdir().expect("temp dir should be created");
+        let mut store = TwinStore::new(temp_dir.path().to_path_buf());
+        std::fs::create_dir_all(&store.traces_path).expect("traces dir should exist");
+        let path = store.trace_file_path("session-1");
+        std::fs::write(&path, b"{ \"session_id\": \"session-1\", \"events\": [").expect("seed");
+
+        let event = store
+            .append_trace_event(
+                "session-1",
+                TraceEventType::PromptSubmitted,
+                serde_json::json!({ "prompt": "hello" }),
+            )
+            .expect("append should recover from a corrupt trace");
+
+        let trace = store
+            .read_trace_file(&path)
+            .expect("fresh trace should parse");
+        assert_eq!(trace.events.len(), 1);
+        assert_eq!(trace.events[0].id, event.id);
+        let quarantined = std::fs::read_dir(&store.traces_path)
+            .expect("traces dir should list")
+            .filter_map(|entry| entry.ok())
+            .any(|entry| entry.file_name().to_string_lossy().contains(".corrupt-"));
+        assert!(
+            quarantined,
+            "corrupt trace should be kept as a .corrupt- sibling"
+        );
     }
 }

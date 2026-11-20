@@ -38,6 +38,10 @@ struct StoredManifest {
     backup_files: Vec<String>,
     #[serde(default)]
     overlay_note_ids: Vec<String>,
+    /// Overlay content that existed before this run replaced it (SidecarFirst), keyed by
+    /// note id. Rollback restores these instead of deleting the overlay.
+    #[serde(default)]
+    overlay_before: HashMap<String, Value>,
     #[serde(default)]
     touched_note_ids: Vec<String>,
     #[serde(default)]
@@ -240,14 +244,65 @@ impl MarkdownMigrationService {
             mode: request.mode.clone(),
             created_at: preview.created_at.unwrap_or_else(Utc::now),
             applied_at: Some(Utc::now()),
-            status: "applied".to_string(),
+            status: "in_progress".to_string(),
             ..Default::default()
         };
 
-        let mut touched_note_ids = Vec::new();
-        let mut overlay_note_ids = Vec::new();
-        let mut skipped_fallback_note_ids = Vec::new();
+        // The manifest is persisted before the first write and after each note's backup,
+        // so a mid-apply failure (or crash) still leaves a manifest rollback can use.
+        self.persist_manifest(&run_dir, &manifest)?;
+        if let Err(error) = self.apply_steps(&preview, &request, store, &run_dir, &mut manifest) {
+            manifest.status = "failed".to_string();
+            if let Err(persist_error) = self.persist_manifest(&run_dir, &manifest) {
+                log::error!(
+                    "Failed to record failed status for migration run '{}': {}",
+                    run_id,
+                    persist_error
+                );
+            }
+            return Err(error);
+        }
+        manifest.status = "applied".to_string();
+        self.persist_manifest(&run_dir, &manifest)?;
 
+        let message = if manifest.skipped_fallback_note_ids.is_empty() {
+            "Markdown migration applied".to_string()
+        } else {
+            format!(
+                "Markdown migration applied ({} note(s) skipped: unparsable frontmatter preserved verbatim)",
+                manifest.skipped_fallback_note_ids.len()
+            )
+        };
+
+        Ok(MarkdownMigrationApplyResult {
+            run_id,
+            status: "applied".to_string(),
+            created_hub_note_ids: manifest.created_hub_note_ids,
+            touched_note_ids: manifest.touched_note_ids,
+            overlay_note_ids: manifest.overlay_note_ids,
+            skipped_fallback_note_ids: manifest.skipped_fallback_note_ids,
+            message,
+        })
+    }
+
+    fn persist_manifest(&self, run_dir: &Path, manifest: &StoredManifest) -> Result<()> {
+        write_atomic(
+            &run_dir.join("manifest.json"),
+            serde_json::to_string_pretty(manifest)?.as_bytes(),
+        )?;
+        Ok(())
+    }
+
+    /// Every vault/overlay mutation of `apply`. Each mutation is recorded in `manifest`
+    /// (and persisted) *before* it happens, so rollback can always undo it.
+    fn apply_steps(
+        &self,
+        preview: &MarkdownMigrationPreview,
+        request: &MarkdownMigrationRequest,
+        store: &mut KnowledgeStore,
+        run_dir: &Path,
+        manifest: &mut StoredManifest,
+    ) -> Result<()> {
         for proposal in &preview.note_proposals {
             if request.mode == MarkdownMigrationMode::SidecarFirst {
                 let overlay = json!({
@@ -261,8 +316,19 @@ impl MarkdownMigrationService {
                         PROP_INFERRED_LINK_IDS: proposal.inferred_link_ids,
                     }
                 });
+                // Capture any existing overlay (e.g. the vault optimizer's) so rollback
+                // restores it instead of deleting it.
+                if let Some(before) = std::fs::read_to_string(store.overlay_path(&proposal.note_id))
+                    .ok()
+                    .and_then(|content| serde_json::from_str::<Value>(&content).ok())
+                {
+                    manifest
+                        .overlay_before
+                        .insert(proposal.note_id.clone(), before);
+                }
+                manifest.overlay_note_ids.push(proposal.note_id.clone());
+                self.persist_manifest(run_dir, manifest)?;
                 store.write_overlay(&proposal.note_id, &overlay)?;
-                overlay_note_ids.push(proposal.note_id.clone());
                 continue;
             }
 
@@ -280,15 +346,16 @@ impl MarkdownMigrationService {
                     "Skipping markdown migration for note '{}': original frontmatter is unparsable and preserved verbatim",
                     note.id
                 );
-                skipped_fallback_note_ids.push(note.id.clone());
+                manifest.skipped_fallback_note_ids.push(note.id.clone());
                 continue;
             }
 
-            if self.backup_note(&run_dir, &preview.vault_path, &note.relative_path)?
+            if self.backup_note(run_dir, &preview.vault_path, &note.relative_path)?
                 && !manifest.backup_files.contains(&note.relative_path)
             {
                 manifest.backup_files.push(note.relative_path.clone());
             }
+            self.persist_manifest(run_dir, manifest)?;
             let mut properties = note.properties.clone();
 
             if let Some(topic_key) = &proposal.topic_key {
@@ -361,10 +428,9 @@ impl MarkdownMigrationService {
                     properties: Some(properties),
                 },
             )?;
-            touched_note_ids.push(updated.id.clone());
+            manifest.touched_note_ids.push(updated.id.clone());
         }
 
-        let mut created_hub_note_ids = Vec::new();
         for topic in &preview.topic_candidates {
             if topic.reuse_existing_hub_id.is_some() {
                 continue;
@@ -399,12 +465,15 @@ impl MarkdownMigrationService {
                     ("is_topic_hub".to_string(), Value::Bool(true)),
                 ]),
             })?;
-            created_hub_note_ids.push(created.id.clone());
+            manifest.created_hub_note_ids.push(created.id.clone());
             manifest.created_files.push(created.relative_path.clone());
+            self.persist_manifest(run_dir, manifest)?;
         }
 
         let program_path = Path::new(&preview.vault_path).join(&preview.program_path);
         if !program_path.exists() {
+            manifest.created_files.push(preview.program_path.clone());
+            self.persist_manifest(run_dir, manifest)?;
             if let Some(parent) = program_path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
@@ -413,36 +482,9 @@ impl MarkdownMigrationService {
                 default_program_file_contents(&preview.hub_folder, &preview.program_path)
                     .as_bytes(),
             )?;
-            manifest.created_files.push(preview.program_path.clone());
         }
 
-        manifest.overlay_note_ids = overlay_note_ids.clone();
-        manifest.touched_note_ids = touched_note_ids.clone();
-        manifest.created_hub_note_ids = created_hub_note_ids.clone();
-        manifest.skipped_fallback_note_ids = skipped_fallback_note_ids.clone();
-        write_atomic(
-            &run_dir.join("manifest.json"),
-            serde_json::to_string_pretty(&manifest)?.as_bytes(),
-        )?;
-
-        let message = if skipped_fallback_note_ids.is_empty() {
-            "Markdown migration applied".to_string()
-        } else {
-            format!(
-                "Markdown migration applied ({} note(s) skipped: unparsable frontmatter preserved verbatim)",
-                skipped_fallback_note_ids.len()
-            )
-        };
-
-        Ok(MarkdownMigrationApplyResult {
-            run_id,
-            status: "applied".to_string(),
-            created_hub_note_ids,
-            touched_note_ids,
-            overlay_note_ids,
-            skipped_fallback_note_ids,
-            message,
-        })
+        Ok(())
     }
 
     pub fn status(&self, run_id: Option<&str>) -> Result<MarkdownMigrationStatus> {
@@ -553,9 +595,13 @@ impl MarkdownMigrationService {
         }
 
         for note_id in &manifest.overlay_note_ids {
-            if let Err(error) = store.delete_overlay(note_id) {
+            let result = match manifest.overlay_before.get(note_id) {
+                Some(before) => store.write_overlay(note_id, before),
+                None => store.delete_overlay(note_id),
+            };
+            if let Err(error) = result {
                 failures.push(format!(
-                    "failed to delete overlay for note '{}': {}",
+                    "failed to restore overlay for note '{}': {}",
                     note_id, error
                 ));
             }
@@ -688,10 +734,8 @@ impl MarkdownMigrationService {
     /// Copies `relative_path` into this run's `backups/` directory so `rollback()` can
     /// later restore it. Returns `Ok(true)` if a backup was actually captured (the source
     /// existed on disk), or `Ok(false)` if there was nothing to back up (e.g. the note
-    /// file is missing). The caller is responsible for recording a successful backup into
-    /// the in-memory manifest — this function intentionally does not touch manifest.json,
-    /// since the manifest for a run is only written once, after `apply()` finishes, from
-    /// the single in-memory `StoredManifest` it accumulates.
+    /// file is missing). The caller records a successful backup into the manifest and
+    /// persists it before rewriting the note.
     fn backup_note(&self, run_dir: &Path, vault_path: &str, relative_path: &str) -> Result<bool> {
         let source_path = Path::new(vault_path).join(relative_path);
         if !source_path.exists() {
@@ -1261,6 +1305,7 @@ mod tests {
             created_files: Vec::new(),
             backup_files: Vec::new(),
             overlay_note_ids: Vec::new(),
+            overlay_before: HashMap::new(),
             touched_note_ids: vec!["note-1".to_string()],
             created_hub_note_ids: Vec::new(),
             skipped_fallback_note_ids: Vec::new(),
@@ -1317,6 +1362,129 @@ mod tests {
         assert!(
             result.is_err(),
             "rollback must surface an error (not panic) when a backup file is missing"
+        );
+    }
+
+    #[test]
+    fn failed_apply_leaves_a_manifest_that_rolls_back_earlier_notes() {
+        let vault_dir = tempdir().expect("vault tempdir");
+        let data_dir = tempdir().expect("data tempdir");
+        let mut store = KnowledgeStore::new(
+            vault_dir.path().to_path_buf(),
+            data_dir.path().to_path_buf(),
+        );
+        seed_two_notes(&mut store);
+        store
+            .create_note(NoteCreate {
+                title: "Rollback Note C".to_string(),
+                content: "Original body C.".to_string(),
+                relative_path: None,
+                aliases: Vec::new(),
+                status: Default::default(),
+                tags: Vec::new(),
+                schema_version: 1,
+                migration_source: None,
+                optimizer_managed: false,
+                properties: HashMap::new(),
+            })
+            .expect("note c should be created");
+
+        let service = MarkdownMigrationService::new(data_dir.path().to_path_buf());
+        let request = MarkdownMigrationRequest {
+            mode: MarkdownMigrationMode::FullRewrite,
+            ..Default::default()
+        };
+        let preview = service
+            .preview(vault_dir.path().to_path_buf(), request.clone())
+            .expect("preview should succeed");
+        assert_eq!(preview.note_proposals.len(), 3);
+        let first = store
+            .get_note(&preview.note_proposals[0].note_id)
+            .expect("first note");
+        let first_path = vault_dir.path().join(&first.relative_path);
+        let first_original = std::fs::read_to_string(&first_path).expect("first note file");
+
+        // Inject a failure on note 2 of 3: point its proposal at a note that doesn't exist.
+        let mut tampered = preview.clone();
+        tampered.note_proposals[1].note_id = "missing-note".to_string();
+        let run_dir = service.runs_dir.join(&preview.preview_id);
+        write_atomic(
+            &run_dir.join("preview.json"),
+            serde_json::to_string_pretty(&tampered).unwrap().as_bytes(),
+        )
+        .unwrap();
+
+        assert!(service
+            .apply(&preview.preview_id, request, &mut store)
+            .is_err());
+        assert_ne!(
+            std::fs::read_to_string(&first_path).unwrap(),
+            first_original,
+            "note 1 should have been rewritten before the failure"
+        );
+        let status = service.status(Some(&preview.preview_id)).unwrap();
+        assert_eq!(status.status, "failed");
+        assert!(status.rollback_available);
+
+        service
+            .rollback(&preview.preview_id, &mut store)
+            .expect("rollback from a partial manifest should succeed");
+        assert_eq!(
+            std::fs::read_to_string(&first_path).unwrap(),
+            first_original
+        );
+    }
+
+    #[test]
+    fn sidecar_apply_and_rollback_preserve_existing_optimizer_overlay() {
+        let vault_dir = tempdir().expect("vault tempdir");
+        let data_dir = tempdir().expect("data tempdir");
+        let mut store = KnowledgeStore::new(
+            vault_dir.path().to_path_buf(),
+            data_dir.path().to_path_buf(),
+        );
+        let (note_a, note_b) = seed_two_notes(&mut store);
+        let optimizer_overlay = json!({
+            "aliases": ["Optimizer Alias"],
+            "tags": ["optimizer-topic"],
+            "migration_source": "vault_optimizer",
+            "optimizer_managed": false,
+            "properties": {},
+        });
+        store
+            .write_overlay(&note_a.id, &optimizer_overlay)
+            .expect("optimizer overlay");
+
+        let service = MarkdownMigrationService::new(data_dir.path().to_path_buf());
+        let request = MarkdownMigrationRequest {
+            mode: MarkdownMigrationMode::SidecarFirst,
+            ..Default::default()
+        };
+        let preview = service
+            .preview(vault_dir.path().to_path_buf(), request.clone())
+            .expect("preview should succeed");
+        let result = service
+            .apply(&preview.preview_id, request, &mut store)
+            .expect("apply should succeed");
+        assert!(result.overlay_note_ids.contains(&note_a.id));
+        fn read_overlay(store: &KnowledgeStore, id: &str) -> Option<Value> {
+            std::fs::read_to_string(store.overlay_path(id))
+                .ok()
+                .map(|content| serde_json::from_str(&content).unwrap())
+        }
+        assert_ne!(
+            read_overlay(&store, &note_a.id),
+            Some(optimizer_overlay.clone())
+        );
+
+        service
+            .rollback(&result.run_id, &mut store)
+            .expect("rollback should succeed");
+        assert_eq!(read_overlay(&store, &note_a.id), Some(optimizer_overlay));
+        assert_eq!(
+            read_overlay(&store, &note_b.id),
+            None,
+            "migration-only overlay is deleted"
         );
     }
 

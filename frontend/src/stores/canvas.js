@@ -5,7 +5,10 @@ import { useAsyncOperation } from '@/composables/useAsyncOperation'
 
 export const DEFAULT_WEB_SEARCH_MAX_RESULTS = 5
 export const THINK_HARDER_WEB_SEARCH_MAX_RESULTS = 8
-export const REASONING_EFFORTS = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh']
+// Streams are finalized after this long with NO chunk (idle), not after a total duration.
+export const STREAM_IDLE_TIMEOUT_MS = 120000
+export const DEBATE_IDLE_TIMEOUT_MS = 180000
+export const REASONING_EFFORTS =['none', 'minimal', 'low', 'medium', 'high', 'xhigh']
 export const THINK_HARDER_PROMPT = 'Think harder and improve your previous answer.'
 export const THINK_HARDER_SYSTEM_PROMPT = [
   'You are revisiting your immediately previous answer.',
@@ -63,6 +66,9 @@ export const useCanvasStore = defineStore('canvas', () => {
   // Debate streaming state: { [debateId]: { currentRound, models: { [modelId]: text }, completedRounds: [] } }
   // Kept as ref() (not shallowRef) because deeply nested mutations need automatic reactivity for streaming display
   const debateStreamingContent = ref({})
+  // Last chunk timestamp per streaming key (`${tileId}:${modelId}` or `debate:${id}`),
+  // read by waitUntilDoneOrIdle's idle timeout. Plain Map: never rendered.
+  const streamActivity = new Map()
 
   // shallowRef mutation helpers — wrap mutation + triggerRef
   function addStreaming(modelId) {
@@ -251,7 +257,9 @@ export const useCanvasStore = defineStore('canvas', () => {
       viewport: currentSession.value.viewport ?? fetched.viewport,
       prompt_tiles: mergedTiles,
       debates: mergedDebates,
-      working_memory: fetched.working_memory || currentSession.value.working_memory,
+      // Backend no longer persists session.working_memory (it writes branch_memories), so a
+      // fetched empty default must not clobber the one applied from working_memory_updated.
+      working_memory: fetched.working_memory?.summary ? fetched.working_memory : currentSession.value.working_memory,
       branch_memories: {
         ...(currentSession.value.branch_memories || {}),
         ...(fetched.branch_memories || {})
@@ -387,29 +395,6 @@ export const useCanvasStore = defineStore('canvas', () => {
       currentSession.value = session
       return session
     })
-  }
-
-  async function updateSession(sessionId, data) {
-    try {
-      const updated = normalizeSession(await canvasApi.update(sessionId, data))
-
-      // Update in sessions list
-      const idx = sessions.value.findIndex(s => s.id === sessionId)
-      if (idx !== -1) {
-        sessions.value[idx] = { ...sessions.value[idx], ...updated }
-      }
-
-      // Update current session if it's the same
-      if (currentSession.value?.id === sessionId) {
-        currentSession.value = updated
-      }
-
-      return updated
-    } catch (err) {
-      error.value = err.message || 'Failed to update session'
-      console.error('Failed to update canvas session:', err)
-      throw err
-    }
   }
 
   async function deleteSession(sessionId) {
@@ -566,7 +551,9 @@ export const useCanvasStore = defineStore('canvas', () => {
           // Safe for every concurrent listener: push-if-absent dedupes the tile so N
           // concurrent operations broadcasting to each other's listeners still result
           // in exactly one push per tile, regardless of which operation it belongs to.
-          if (currentSession.value && data.tile) {
+          // Origin-session guard: the user may have switched sessions before this arrived.
+          if (!currentSession.value || currentSession.value.id !== sessionId) return
+          if (data.tile) {
             const exists = currentSession.value.prompt_tiles.some(t => t.id === data.tile.id)
             if (!exists) currentSession.value.prompt_tiles.push(data.tile)
           }
@@ -608,7 +595,7 @@ export const useCanvasStore = defineStore('canvas', () => {
           if (data.tile_id === ownTileId) scopedAppliers[type](data)
         })
 
-        await waitForModelsComplete(models.map(m => `${tileId}:${m}`), 120000)
+        await waitForModelsComplete(models.map(m => `${tileId}:${m}`))
         return tileId
       } finally {
         unlisten()
@@ -622,14 +609,16 @@ export const useCanvasStore = defineStore('canvas', () => {
     }
   }
 
-  // Wait for all streaming keys to complete (or timeout). `keys` are the composite
-  // `${tileId}:${modelId}` streaming-state keys owned by the calling operation.
-  function waitForModelsComplete(keys, timeoutMs = 120000) {
+  // Poll until isDone() or until no activity was seen on any of `keys` for idleMs.
+  // Idle (not total-duration) timeout: long reasoning/web-search runs keep streaming
+  // chunks well past any fixed total budget and must not be cut off mid-answer.
+  function waitUntilDoneOrIdle(isDone, keys, idleMs = STREAM_IDLE_TIMEOUT_MS) {
     return new Promise((resolve) => {
       const start = Date.now()
       const check = () => {
-        const stillStreaming = keys.some(k => streamingModels.value.has(k))
-        if (!stillStreaming || Date.now() - start > timeoutMs) {
+        const lastActivity = Math.max(start, ...keys.map(k => streamActivity.get(k) || 0))
+        if (isDone() || Date.now() - lastActivity > idleMs) {
+          keys.forEach(k => streamActivity.delete(k))
           resolve()
         } else {
           setTimeout(check, 100)
@@ -639,7 +628,14 @@ export const useCanvasStore = defineStore('canvas', () => {
     })
   }
 
+  // Wait for all streaming keys to complete (or go idle). `keys` are the composite
+  // `${tileId}:${modelId}` streaming-state keys owned by the calling operation.
+  function waitForModelsComplete(keys, idleMs = STREAM_IDLE_TIMEOUT_MS) {
+    return waitUntilDoneOrIdle(() => !keys.some(k => streamingModels.value.has(k)), keys, idleMs)
+  }
+
   function updateTileResponseLocal(tileId, modelId, content, status, errorMessage = null, costUsd) {
+    streamActivity.set(`${tileId}:${modelId}`, Date.now())
     if (!currentSession.value) return
 
     const tile = currentSession.value.prompt_tiles.find(t => t.id === tileId)
@@ -812,9 +808,6 @@ export const useCanvasStore = defineStore('canvas', () => {
     currentSession.value.prompt_tiles = currentSession.value.prompt_tiles.filter(
       tile => !tileIdsToRemove.has(tile.id)
     )
-    currentSession.value.debates = currentSession.value.debates.filter(
-      debate => debate.id !== tileId
-    )
     currentSession.value.debates = pruneDependentDebates(tileIdsToRemove).filter(
       debate => debate.id !== tileId
     )
@@ -871,6 +864,46 @@ export const useCanvasStore = defineStore('canvas', () => {
     })
   }
 
+  // Handlers for ONE debate's stream. Callers must feed them only that debate's events
+  // (concurrent debates share the session listener stream). Model streaming keys are
+  // plain model ids, so `tracker` gives this debate exactly one decrement per mark.
+  function createDebateStreamHandlers(sessionId, participatingModels, tracker, onRoundStart, onDone) {
+    return {
+      round_start: (data) => {
+        onRoundStart(data)
+        participatingModels.forEach(m => tracker.mark(m))
+      },
+      debate_chunk: (data) => {
+        streamActivity.set(`debate:${data.debate_id}`, Date.now())
+        const state = debateStreamingContent.value[data.debate_id]
+        if (state && state.currentRound === data.round_number) {
+          state.models[data.model_id] = (state.models[data.model_id] || '') + data.chunk
+        }
+      },
+      model_complete: (data) => {
+        tracker.clear(data.model_id)
+      },
+      debate_error: (data) => {
+        console.error(`Debate error for ${data.model_id}:`, data.error)
+        tracker.clear(data.model_id)
+      },
+      debate_complete: async (data) => {
+        // Snapshot final round if it has content
+        const state = debateStreamingContent.value[data.debate_id]
+        if (state && Object.keys(state.models).length > 0) {
+          state.completedRounds.push({
+            round_number: state.currentRound,
+            models: { ...state.models }
+          })
+        }
+        delete debateStreamingContent.value[data.debate_id]
+        // Don't yank the user back to a session they navigated away from.
+        if (currentSession.value?.id === sessionId) await loadSession(sessionId)
+        onDone()
+      }
+    }
+  }
+
   async function startDebate(tileIds, participatingModels, mode = 'auto', maxRounds = 2) {
     if (!currentSession.value) {
       throw new Error('No active session')
@@ -879,8 +912,14 @@ export const useCanvasStore = defineStore('canvas', () => {
     const sessionId = currentSession.value.id
     error.value = null
 
-    // Mark models as streaming
-    participatingModels.forEach(m => addStreaming(m))
+    // Same ownership rule as sendPrompt: our debate id is only known from the invoke()
+    // return; debate-scoped events arriving before it are buffered, then replayed and
+    // filtered, so a concurrent debate's events never touch this one's state.
+    let ownDebateId = null
+    let done = false
+    const pendingEvents = []
+    const tracker = createStreamingTracker()
+    participatingModels.forEach(m => tracker.mark(m))
 
     try {
       const reasoningEffort = maxReasoningEffort(
@@ -894,67 +933,49 @@ export const useCanvasStore = defineStore('canvas', () => {
         reasoning_effort: reasoningEffort
       }
 
-      let debateCompleteResolve
-      const debateCompletePromise = new Promise(resolve => { debateCompleteResolve = resolve })
+      const own = createDebateStreamHandlers(sessionId, participatingModels, tracker, (data) => {
+        const existing = debateStreamingContent.value[data.debate_id]
+        if (existing && Object.keys(existing.models).length > 0) {
+          // Snapshot current round into completedRounds
+          existing.completedRounds.push({
+            round_number: existing.currentRound,
+            models: { ...existing.models }
+          })
+        }
+        debateStreamingContent.value[data.debate_id] = {
+          ...(existing || {}),
+          currentRound: data.round_number,
+          models: {},
+          completedRounds: existing?.completedRounds || []
+        }
+      }, () => { done = true })
 
-      const unlisten = await setupTauriStreamListener(sessionId, {
+      const handlers = {
         debate_created: (data) => {
-          if (currentSession.value && data.debate) {
+          // Origin-session guard + push-if-absent (every concurrent listener sees this).
+          if (!currentSession.value || currentSession.value.id !== sessionId || !data.debate) return
+          if (!currentSession.value.debates.some(d => d.id === data.debate.id)) {
             currentSession.value.debates.push(data.debate)
           }
-        },
-        round_start: (data) => {
-          const debateId = data.debate_id
-          const existing = debateStreamingContent.value[debateId]
-          if (existing && Object.keys(existing.models).length > 0) {
-            // Snapshot current round into completedRounds
-            existing.completedRounds.push({
-              round_number: existing.currentRound,
-              models: { ...existing.models }
-            })
-          }
-          debateStreamingContent.value[debateId] = {
-            ...(existing || {}),
-            currentRound: data.round_number,
-            models: {},
-            completedRounds: existing?.completedRounds || []
-          }
-        },
-        debate_chunk: (data) => {
-          const state = debateStreamingContent.value[data.debate_id]
-          if (state && state.currentRound === data.round_number) {
-            state.models[data.model_id] = (state.models[data.model_id] || '') + data.chunk
-          }
-        },
-        model_complete: (data) => {
-          removeStreaming(data.model_id)
-        },
-        debate_error: (data) => {
-          console.error(`Debate error for ${data.model_id}:`, data.error)
-          removeStreaming(data.model_id)
-        },
-        debate_complete: async (data) => {
-          // Snapshot final round if it has content
-          const state = debateStreamingContent.value[data.debate_id]
-          if (state && Object.keys(state.models).length > 0) {
-            state.completedRounds.push({
-              round_number: state.currentRound,
-              models: { ...state.models }
-            })
-          }
-          delete debateStreamingContent.value[data.debate_id]
-          await loadSession(sessionId)
-          debateCompleteResolve()
         }
-      })
+      }
+      for (const [type, apply] of Object.entries(own)) {
+        handlers[type] = (data) => {
+          if (ownDebateId === null) { pendingEvents.push([type, data]); return }
+          if (data.debate_id === ownDebateId) apply(data)
+        }
+      }
+
+      const unlisten = await setupTauriStreamListener(sessionId, handlers)
 
       try {
         const debateId = await canvasApi.startDebate(sessionId, request)
+        ownDebateId = debateId
+        pendingEvents.splice(0).forEach(([type, data]) => {
+          if (data.debate_id === ownDebateId) own[type](data)
+        })
         // Wait for debate_complete (the real end signal), not model_complete
-        await Promise.race([
-          debateCompletePromise,
-          new Promise(resolve => setTimeout(resolve, 180000))
-        ])
+        await waitUntilDoneOrIdle(() => done, [`debate:${debateId}`], DEBATE_IDLE_TIMEOUT_MS)
         return debateId
       } finally {
         unlisten()
@@ -964,7 +985,7 @@ export const useCanvasStore = defineStore('canvas', () => {
       console.error('Failed to start debate:', err)
       throw err
     } finally {
-      participatingModels.forEach(m => removeStreaming(m))
+      tracker.finalize()
     }
   }
 
@@ -985,7 +1006,9 @@ export const useCanvasStore = defineStore('canvas', () => {
     }
 
     const participatingModels = debate.participating_models
-    participatingModels.forEach(m => addStreaming(m))
+    let done = false
+    const tracker = createStreamingTracker()
+    participatingModels.forEach(m => tracker.mark(m))
 
     try {
       const request = {
@@ -993,49 +1016,23 @@ export const useCanvasStore = defineStore('canvas', () => {
         reasoning_effort: normalizeReasoningEffort(debate.reasoning_effort)
       }
 
-      let debateCompleteResolve
-      const debateCompletePromise = new Promise(resolve => { debateCompleteResolve = resolve })
-
-      const unlisten = await setupTauriStreamListener(sessionId, {
-        round_start: (data) => {
-          debateStreamingContent.value[debateId] = {
-            currentRound: data.round_number,
-            models: {},
-            completedRounds: []
-          }
-        },
-        debate_chunk: (data) => {
-          const state = debateStreamingContent.value[data.debate_id]
-          if (state && state.currentRound === data.round_number) {
-            state.models[data.model_id] = (state.models[data.model_id] || '') + data.chunk
-          }
-        },
-        model_complete: (data) => {
-          removeStreaming(data.model_id)
-        },
-        debate_error: (data) => {
-          removeStreaming(data.model_id)
-        },
-        debate_complete: async (data) => {
-          const state = debateStreamingContent.value[data.debate_id]
-          if (state && Object.keys(state.models).length > 0) {
-            state.completedRounds.push({
-              round_number: state.currentRound,
-              models: { ...state.models }
-            })
-          }
-          delete debateStreamingContent.value[data.debate_id]
-          await loadSession(sessionId)
-          debateCompleteResolve()
+      const own = createDebateStreamHandlers(sessionId, participatingModels, tracker, (data) => {
+        debateStreamingContent.value[debateId] = {
+          currentRound: data.round_number,
+          models: {},
+          completedRounds: []
         }
-      })
+      }, () => { done = true })
+      const handlers = {}
+      for (const [type, apply] of Object.entries(own)) {
+        handlers[type] = (data) => { if (data.debate_id === debateId) apply(data) }
+      }
+
+      const unlisten = await setupTauriStreamListener(sessionId, handlers)
 
       try {
         await canvasApi.continueDebate(sessionId, debateId, request)
-        await Promise.race([
-          debateCompletePromise,
-          new Promise(resolve => setTimeout(resolve, 180000))
-        ])
+        await waitUntilDoneOrIdle(() => done, [`debate:${debateId}`], DEBATE_IDLE_TIMEOUT_MS)
       } finally {
         unlisten()
       }
@@ -1043,7 +1040,7 @@ export const useCanvasStore = defineStore('canvas', () => {
       error.value = err.message || 'Failed to continue debate'
       throw err
     } finally {
-      participatingModels.forEach(m => removeStreaming(m))
+      tracker.finalize()
     }
   }
 
@@ -1128,7 +1125,7 @@ export const useCanvasStore = defineStore('canvas', () => {
 
       try {
         await canvasApi.addModelsToTile(sessionId, tileId, request)
-        await waitForModelsComplete(newModelIds.map(m => `${tileId}:${m}`), 120000)
+        await waitForModelsComplete(newModelIds.map(m => `${tileId}:${m}`))
       } finally {
         unlisten()
       }
@@ -1190,7 +1187,7 @@ export const useCanvasStore = defineStore('canvas', () => {
 
       try {
         await canvasApi.regenerateResponse(sessionId, tileId, modelId)
-        await waitForModelsComplete([streamingKey], 120000)
+        await waitForModelsComplete([streamingKey])
       } finally {
         unlisten()
       }
@@ -1430,7 +1427,6 @@ export const useCanvasStore = defineStore('canvas', () => {
     loadSessions,
     loadSession,
     createSession,
-    updateSession,
     deleteSession,
     loadModels,
     applyWorkingMemoryUpdate,

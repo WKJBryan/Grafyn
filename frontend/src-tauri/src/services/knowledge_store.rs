@@ -27,6 +27,17 @@ lazy_static! {
     static ref H1_REGEX: Regex = Regex::new(r"(?m)^\#\s+(.+?)\s*$").unwrap();
     /// Inline hashtag extraction for topic seeding.
     static ref HASHTAG_REGEX: Regex = Regex::new(r"(?m)(?:^|[^\w/])#([A-Za-z][\w/-]+)").unwrap();
+    /// Fenced and inline code (same patterns as link_discovery::clean_markdown).
+    static ref FENCED_CODE_REGEX: Regex = Regex::new(r"(?s)```.*?```").unwrap();
+    static ref INLINE_CODE_REGEX: Regex = Regex::new(r"`[^`]+`").unwrap();
+}
+
+/// Removes fenced and inline code so link syntax inside code samples creates no graph edges.
+fn strip_code(content: &str) -> String {
+    let without_fences = FENCED_CODE_REGEX.replace_all(content, " ");
+    INLINE_CODE_REGEX
+        .replace_all(&without_fences, " ")
+        .into_owned()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -276,8 +287,22 @@ impl KnowledgeStore {
         if let Some(content) = update.content {
             note.content = content;
         }
+        // True when the new path is a different spelling of this note's own file
+        // (case-only rename on a case-insensitive FS): no collision, and no old-file removal.
+        let mut renamed_onto_self = false;
         if let Some(relative_path) = update.relative_path {
             note.relative_path = normalize_note_relative_path(&relative_path)?;
+            let target = self.resolve_vault_relative_path(&note.relative_path)?;
+            renamed_onto_self = target != old_path
+                && target.exists()
+                && std::fs::canonicalize(&target).ok() == std::fs::canonicalize(&old_path).ok();
+            if target != old_path && target.exists() && !renamed_onto_self {
+                anyhow::bail!(
+                    "Cannot move note '{}' to '{}': another file already exists there",
+                    id,
+                    note.relative_path
+                );
+            }
         }
         if let Some(aliases) = update.aliases {
             note.aliases = dedupe_strings(aliases);
@@ -313,7 +338,7 @@ impl KnowledgeStore {
 
         self.write_note_file(&note)?;
         let new_path = self.resolve_vault_relative_path(&note.relative_path)?;
-        if old_path != new_path && old_path.exists() {
+        if old_path != new_path && old_path.exists() && !renamed_onto_self {
             std::fs::remove_file(&old_path).with_context(|| {
                 format!(
                     "Failed to remove original note after move: {}",
@@ -376,7 +401,7 @@ impl KnowledgeStore {
 
     pub fn extract_wikilinks(&self, content: &str) -> Vec<String> {
         WIKILINK_REGEX
-            .captures_iter(content)
+            .captures_iter(&strip_code(content))
             .filter_map(|cap| cap.get(1).map(|m| m.as_str().trim().to_string()))
             .filter(|value| !value.is_empty())
             .collect()
@@ -391,7 +416,7 @@ impl KnowledgeStore {
     /// Extract typed wikilinks with relationship information.
     pub fn extract_typed_wikilinks(&self, content: &str) -> Vec<ParsedLink> {
         TYPED_WIKILINK_REGEX
-            .captures_iter(content)
+            .captures_iter(&strip_code(content))
             .filter_map(|cap| {
                 let target_title = cap.get(1)?.as_str().trim().to_string();
                 if target_title.is_empty() {
@@ -415,7 +440,7 @@ impl KnowledgeStore {
         let base_dir = source_path.parent().unwrap_or_else(|| Path::new(""));
 
         MARKDOWN_LINK_REGEX
-            .captures_iter(content)
+            .captures_iter(&strip_code(content))
             .filter_map(|cap| {
                 let raw_target = cap.get(1)?.as_str().split('#').next()?.trim();
                 if raw_target.contains("://") || raw_target.starts_with("mailto:") {
@@ -451,7 +476,10 @@ impl KnowledgeStore {
             .iter()
             .map(|note| note.id.as_str())
             .collect::<HashSet<_>>();
-        while existing_ids.contains(id.as_str()) {
+        // Disk check catches notes created by another process (grafyn-mcp) since our last refresh.
+        while existing_ids.contains(id.as_str())
+            || self.vault_path.join(format!("{}.md", id)).exists()
+        {
             id = format!("{}-{}", base, counter);
             counter += 1;
         }
@@ -1446,5 +1474,119 @@ mod tests {
             persisted.contains("status: canonical"),
             "status edit should be reflected:\n{persisted}"
         );
+    }
+
+    fn simple_create(title: &str, content: &str) -> NoteCreate {
+        NoteCreate {
+            title: title.to_string(),
+            content: content.to_string(),
+            relative_path: None,
+            aliases: Vec::new(),
+            status: Default::default(),
+            tags: Vec::new(),
+            schema_version: CURRENT_NOTE_SCHEMA_VERSION,
+            migration_source: None,
+            optimizer_managed: false,
+            properties: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn update_relative_path_onto_another_notes_file_errors_and_leaves_it_untouched() {
+        let vault_dir = tempdir().expect("vault tempdir");
+        let data_dir = tempdir().expect("data tempdir");
+        let mut store = KnowledgeStore::new(
+            vault_dir.path().to_path_buf(),
+            data_dir.path().to_path_buf(),
+        );
+        let a = store
+            .create_note(simple_create("Alpha", "alpha body"))
+            .unwrap();
+        let b = store
+            .create_note(simple_create("Beta", "beta body"))
+            .unwrap();
+        let b_path = vault_dir.path().join(&b.relative_path);
+        let b_before = std::fs::read_to_string(&b_path).unwrap();
+
+        let result = store.update_note(
+            &a.id,
+            NoteUpdate {
+                relative_path: Some(b.relative_path.clone()),
+                ..Default::default()
+            },
+        );
+
+        assert!(
+            result.is_err(),
+            "rename onto another note's file must error"
+        );
+        assert_eq!(std::fs::read_to_string(&b_path).unwrap(), b_before);
+        assert!(vault_dir.path().join(&a.relative_path).exists());
+    }
+
+    #[test]
+    fn update_relative_path_to_free_location_still_moves_note() {
+        let vault_dir = tempdir().expect("vault tempdir");
+        let data_dir = tempdir().expect("data tempdir");
+        let mut store = KnowledgeStore::new(
+            vault_dir.path().to_path_buf(),
+            data_dir.path().to_path_buf(),
+        );
+        let a = store
+            .create_note(simple_create("Alpha", "alpha body"))
+            .unwrap();
+        let moved = store
+            .update_note(
+                &a.id,
+                NoteUpdate {
+                    relative_path: Some("sub/alpha-moved.md".to_string()),
+                    ..Default::default()
+                },
+            )
+            .expect("move to a free path should succeed");
+        assert_eq!(moved.relative_path, "sub/alpha-moved.md");
+        assert!(!vault_dir.path().join(&a.relative_path).exists());
+    }
+
+    #[test]
+    fn generate_note_id_skips_ids_whose_file_exists_on_disk_but_not_in_cache() {
+        let vault_dir = tempdir().expect("vault tempdir");
+        let data_dir = tempdir().expect("data tempdir");
+        let mut store = KnowledgeStore::new(
+            vault_dir.path().to_path_buf(),
+            data_dir.path().to_path_buf(),
+        );
+        // Simulates a note written by another process after this store's last refresh.
+        std::fs::write(
+            vault_dir.path().join("shared-title.md"),
+            "---\nnote_id: shared-title\ntitle: Shared Title\n---\n\nother process",
+        )
+        .unwrap();
+
+        let created = store
+            .create_note(simple_create("Shared Title", "this process"))
+            .unwrap();
+        assert_ne!(created.id, "shared-title");
+    }
+
+    #[test]
+    fn wikilinks_inside_code_create_no_links() {
+        let vault_dir = tempdir().expect("vault tempdir");
+        let data_dir = tempdir().expect("data tempdir");
+        let store = KnowledgeStore::new(
+            vault_dir.path().to_path_buf(),
+            data_dir.path().to_path_buf(),
+        );
+        let content = "See [[Real]] (supports).\n\n```md\n[[Phantom]] (supports)\n[x](ghost.md)\n```\n\nInline `[[AlsoPhantom]]` too.";
+
+        assert_eq!(store.extract_wikilinks(content), vec!["Real".to_string()]);
+        let links = store.extract_links(content, "note.md");
+        assert_eq!(
+            links.len(),
+            1,
+            "only the prose link should parse: {links:?}"
+        );
+        assert_eq!(links[0].target_title, "Real");
+        assert_eq!(links[0].relation, RelationType::Supports);
     }
 }

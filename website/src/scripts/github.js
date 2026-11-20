@@ -3,7 +3,7 @@ import { isInstallerAsset } from './installers.js';
 const RELEASES_API =
   'https://api.github.com/repos/WKJBryan/Grafyn/releases?per_page=100';
 const CACHE_KEY = 'grafyn:releases:v2';
-const TTL_MS = 90_000;
+const TTL_MS = 600_000;
 
 function readCache() {
   try {

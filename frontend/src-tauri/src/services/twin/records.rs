@@ -606,11 +606,17 @@ impl TwinStore {
                 let previous_state = record.promotion_state.clone();
                 let is_rejected_key = rejected_keys.contains(&draft.inference_key);
 
-                record.kind = draft.kind.clone();
-                record.content = draft.content.clone();
                 record.evidence_refs = draft.evidence_refs.clone();
-                record.confidence = draft.confidence;
-                record.origin = RecordOrigin::Inferred;
+                // Reviewed records (Endorsed/Rejected/Private/NoTrain) keep the user's wording.
+                if matches!(
+                    record.promotion_state,
+                    PromotionState::Candidate | PromotionState::AutoPromoted
+                ) {
+                    record.kind = draft.kind.clone();
+                    record.content = draft.content.clone();
+                    record.confidence = draft.confidence;
+                    record.origin = RecordOrigin::Inferred;
+                }
 
                 if is_rejected_key {
                     metadata.insert("auto_promoted".to_string(), Value::Bool(false));
@@ -1128,6 +1134,59 @@ mod tests {
 
         assert_eq!(record.promotion_state, PromotionState::Rejected);
         assert!(summary.skipped_rejected_records >= 1);
+    }
+
+    #[test]
+    fn inference_rerun_keeps_user_edits_to_endorsed_records() {
+        let temp_dir = tempdir().expect("temp dir should be created");
+        let mut store = TwinStore::new(temp_dir.path().to_path_buf());
+
+        for index in 0..3 {
+            store
+                .append_trace_event(
+                    "session-1",
+                    TraceEventType::DebateStarted,
+                    serde_json::json!({
+                        "debate_id": format!("debate-{}", index),
+                        "source_tile_ids": ["tile-1"],
+                        "participating_models": ["a", "b"],
+                    }),
+                )
+                .expect("trace event should append");
+        }
+        store.run_twin_inference().expect("inference should run");
+        let record = store
+            .list_user_records()
+            .expect("records should list")
+            .into_iter()
+            .find(|record| {
+                record.metadata.get("inference_key").and_then(Value::as_str)
+                    == Some("reasoning.uses_debate")
+            })
+            .expect("debate record should exist");
+
+        store
+            .update_user_record(
+                &record.id,
+                UserRecordUpdate {
+                    content: Some("I debate models only for high-stakes calls.".to_string()),
+                    confidence: Some(0.55),
+                    promotion_state: Some(PromotionState::Endorsed),
+                    ..UserRecordUpdate::default()
+                },
+            )
+            .expect("record should update");
+        store.run_twin_inference().expect("inference should rerun");
+        let record = store
+            .get_user_record(&record.id)
+            .expect("record should load");
+
+        assert_eq!(record.promotion_state, PromotionState::Endorsed);
+        assert_eq!(
+            record.content,
+            "I debate models only for high-stakes calls."
+        );
+        assert_eq!(record.confidence, 0.55);
     }
 
     #[test]
