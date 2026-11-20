@@ -1,11 +1,83 @@
 ---
-// Inline, hand-traced version of mark.png: a faceted seed crystal growing
-// through a stem into a graph of nodes. Two modes share one drawing:
+// Inline version of the Grafyn mark: a faceted seed crystal split open by a
+// sprouting stem that grows into a graph of nodes. Two modes share one
+// drawing:
 //   hero  — assembles once on page load (CSS keyframes)
 //   story — advances by scroll stage (data-stage 0/1/2, set by motion.js)
 // Default stage is "2" (fully drawn) so the figure is complete without JS
 // and under prefers-reduced-motion.
+//
+// The seed is constructed, not hand-drawn: outline vertices sit on a
+// √φ-aspect ellipse, the cleft is a channel cut from the top-right mouth
+// past the centre, facets radiate rose-cut-style from the bottom vertex,
+// and the stem follows the channel axis so it rises out of the dark split.
 const { mode = 'hero' } = Astro.props;
+
+const PHI = (1 + Math.sqrt(5)) / 2;
+const rad = (deg) => (deg * Math.PI) / 180;
+
+const C = { x: 180, y: 385 };
+const AX = 100;
+const BX = AX / Math.sqrt(PHI);
+const TILT = rad(-10);
+
+function pt(angleDeg, rf) {
+  const t = rad(angleDeg);
+  const x = AX * rf * Math.cos(t);
+  const y = BX * rf * Math.sin(t);
+  return [
+    C.x + x * Math.cos(TILT) - y * Math.sin(TILT),
+    C.y + x * Math.sin(TILT) + y * Math.cos(TILT),
+  ];
+}
+
+// Outer ring (slight radius modulation for crystal character)
+const vTop = pt(264, 0.97);
+const entryL = pt(-70, 0.98);
+const entryR = pt(-38, 1);
+const v0 = pt(0, 0.96);
+const v44 = pt(44, 1);
+const v88 = pt(88, 0.97);
+const vBot = pt(132, 1);
+const v176 = pt(176, 0.95);
+const v220 = pt(220, 0.98);
+
+// Cleft channel from the mouth (entryL–entryR) past the centre, with a
+// kink on the right wall — the lobe's jutting corner.
+const apexC = pt(135, 0.15);
+const mouthC = [(entryL[0] + entryR[0]) / 2, (entryL[1] + entryR[1]) / 2];
+const axv = [mouthC[0] - apexC[0], mouthC[1] - apexC[1]];
+const alen = Math.hypot(axv[0], axv[1]);
+const n = [-axv[1] / alen, axv[0] / alen];
+const HALF_W = 9;
+const apexL = [apexC[0] + n[0] * HALF_W, apexC[1] + n[1] * HALF_W];
+const apexR = [apexC[0] - n[0] * HALF_W, apexC[1] - n[1] * HALF_W];
+const kinkR = [
+  (apexR[0] + entryR[0]) / 2 - n[0] * 5,
+  (apexR[1] + entryR[1]) / 2 - n[1] * 5,
+];
+
+const outlinePts = [vTop, entryL, apexL, apexR, kinkR, entryR, v0, v44, v88, vBot, v176, v220];
+const seedOutline =
+  'M' + outlinePts.map((p) => p.map((v) => v.toFixed(1)).join(' ')).join(' L') + ' Z';
+
+// Rose-cut pavilion: main facets radiate from the bottom vertex.
+const seams = [
+  [vBot, v220],
+  [vBot, vTop],
+  [vBot, apexL],
+  [vBot, v44],
+  [kinkR, v44],
+];
+
+// Stem: rides the channel axis out of the split, then an S-bend to the
+// base node at (210, 198).
+const axisP = (t) =>
+  `${(apexC[0] + t * axv[0]).toFixed(1)} ${(apexC[1] + t * axv[1]).toFixed(1)}`;
+const stemPath =
+  `M ${apexC[0].toFixed(1)} ${apexC[1].toFixed(1)} ` +
+  `C ${axisP(0.45)} ${axisP(0.8)} ${axisP(1.05)} ` +
+  `C ${axisP(1.3)} 234 246 212 198`;
 
 const nodes = [
   { x: 210, y: 198, r: 8, base: true, alt: true },
@@ -23,29 +95,6 @@ const nodes = [
 const edges = [
   [0, 1], [0, 2], [1, 4], [1, 3], [2, 4], [2, 5], [3, 6], [4, 6],
   [4, 7], [5, 7], [5, 8], [2, 8], [1, 9], [3, 9],
-];
-
-// Seed, traced from frontend/src-tauri/icons/app-icon.png: an irregular
-// angular gem with a deep Z-shaped cleft in its top edge — the stem grows
-// out of the split. One solid silhouette; the facets are dark seam lines
-// (the page background showing through as cuts), meeting at a lower hub H
-// and the cleft apex, like the source mark.
-const seedOutline =
-  'M120 330 L185 295 L232 308 L196 382 L252 330 L285 338 L292 398 ' +
-  'L255 452 L165 460 L108 420 L95 365 Z';
-
-const H = [175, 408];
-const apex = [196, 382];
-const seams = [
-  [[120, 330], H],
-  [[185, 295], H],
-  [[95, 365], H],
-  [[108, 420], H],
-  [H, [165, 460]],
-  [H, [255, 452]],
-  [H, apex],
-  [apex, [255, 452]],
-  [[252, 330], [255, 452]],
 ];
 ---
 
@@ -65,10 +114,10 @@ const seams = [
         <line
           class="m-seam"
           style={`--i:${i}`}
-          x1={a[0]}
-          y1={a[1]}
-          x2={b[0]}
-          y2={b[1]}
+          x1={a[0].toFixed(1)}
+          y1={a[1].toFixed(1)}
+          x2={b[0].toFixed(1)}
+          y2={b[1].toFixed(1)}
           pathLength="1"
           stroke="var(--color-ink)"
           stroke-width="4"
@@ -79,7 +128,7 @@ const seams = [
 
   <path
     class="m-stem"
-    d="M205 375 C215 355 238 342 240 318 C242 298 222 290 216 262 C212 240 210 220 210 198"
+    d={stemPath}
     pathLength="1"
     stroke="var(--color-seed)"
     stroke-width="4"
