@@ -40,7 +40,7 @@ impl Default for PromotionState {
 impl PromotionState {
     pub fn default_for_origin(origin: &RecordOrigin) -> Self {
         match origin {
-            RecordOrigin::User => PromotionState::AutoPromoted,
+            RecordOrigin::User => PromotionState::Endorsed,
             RecordOrigin::Synthetic | RecordOrigin::Inferred => PromotionState::Candidate,
         }
     }
