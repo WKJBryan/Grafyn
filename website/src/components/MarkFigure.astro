@@ -1,0 +1,109 @@
+---
+// Inline, hand-traced version of mark.png: a faceted seed crystal growing
+// through a stem into a graph of nodes. Two modes share one drawing:
+//   hero  — assembles once on page load (CSS keyframes)
+//   story — advances by scroll stage (data-stage 0/1/2, set by motion.js)
+// Default stage is "2" (fully drawn) so the figure is complete without JS
+// and under prefers-reduced-motion.
+const { mode = 'hero' } = Astro.props;
+
+const nodes = [
+  { x: 210, y: 198, r: 7, base: true },
+  { x: 150, y: 150, r: 5.5 },
+  { x: 248, y: 142, r: 5.5 },
+  { x: 118, y: 92, r: 5 },
+  { x: 196, y: 72, r: 6.5, alt: true },
+  { x: 278, y: 84, r: 5 },
+  { x: 158, y: 34, r: 4 },
+  { x: 240, y: 28, r: 4.5, alt: true },
+  { x: 312, y: 138, r: 4 },
+  { x: 94, y: 160, r: 4, alt: true },
+];
+
+const edges = [
+  [0, 1], [0, 2], [1, 4], [1, 3], [2, 4], [2, 5], [3, 6], [4, 6],
+  [4, 7], [5, 7], [5, 8], [2, 8], [1, 9], [3, 9],
+];
+
+// Seed crystal facets: outer ring T→A→B→C→D→E→F around inner point M.
+const T = [168, 332], A = [216, 354], B = [226, 402], C = [192, 442];
+const D = [142, 436], E = [114, 392], F = [126, 348], M = [172, 392];
+const facets = [
+  { pts: [T, A, M], o: 0.95 },
+  { pts: [A, B, M], o: 0.7 },
+  { pts: [B, C, M], o: 0.5 },
+  { pts: [C, D, M], o: 0.8 },
+  { pts: [D, E, M], o: 0.6 },
+  { pts: [E, F, M], o: 0.45 },
+  { pts: [F, T, M], o: 0.66 },
+];
+---
+
+<svg
+  class:list={['mark-svg', mode === 'hero' ? 'mark-hero' : 'mark-story']}
+  data-mark-story={mode === 'story' ? '' : undefined}
+  data-stage={mode === 'story' ? '2' : undefined}
+  viewBox="0 0 400 480"
+  fill="none"
+  xmlns="http://www.w3.org/2000/svg"
+  aria-hidden="true"
+>
+  <g class="m-seed">
+    {
+      facets.map((f, i) => (
+        <polygon
+          class="m-facet"
+          style={`--i:${i}`}
+          points={f.pts.map((p) => p.join(',')).join(' ')}
+          fill="var(--color-seed)"
+          fill-opacity={f.o}
+          stroke="var(--color-abyss)"
+          stroke-width="1.5"
+        />
+      ))
+    }
+  </g>
+
+  <path
+    class="m-stem"
+    d="M168 332 C172 290 196 250 210 198"
+    pathLength="1"
+    stroke="var(--color-seed)"
+    stroke-width="2.5"
+    stroke-linecap="round"
+  />
+
+  <g class="m-edges">
+    {
+      edges.map(([a, b], i) => (
+        <line
+          class="m-edge"
+          style={`--i:${i}`}
+          x1={nodes[a].x}
+          y1={nodes[a].y}
+          x2={nodes[b].x}
+          y2={nodes[b].y}
+          pathLength="1"
+          stroke="var(--color-node)"
+          stroke-opacity="0.55"
+          stroke-width="1.5"
+        />
+      ))
+    }
+  </g>
+
+  <g class="m-nodes">
+    {
+      nodes.map((n, i) => (
+        <circle
+          class:list={['m-node', n.base && 'm-node--base']}
+          style={`--i:${i}`}
+          cx={n.x}
+          cy={n.y}
+          r={n.r}
+          fill={n.alt ? 'var(--color-nodealt)' : 'var(--color-node)'}
+        />
+      ))
+    }
+  </g>
+</svg>

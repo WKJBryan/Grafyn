@@ -29,6 +29,8 @@
   --color-mute: #8fb3b6;
   --color-hairline: rgb(61 207 192 / 0.5);
   --color-rule: rgb(61 207 192 / 0.18);
+  --color-node: #7ea2f5;
+  --color-nodealt: #9b8cf0;
   --ease-fluid: cubic-bezier(0.32, 0.72, 0, 1);
 }
 
@@ -261,18 +263,128 @@ body {
   transform: rotate(45deg) translateY(-2px);
 }
 
-.hero-art-wrap {
-  position: absolute;
-  inset: 0;
-  transform: translate3d(0, var(--hero-y, 0px), 0);
-}
+/* ---- Mark figure (inline SVG of the logo) ---- */
 
-.hero-art {
+.mark-svg {
   display: block;
   width: 100%;
-  height: 100%;
-  object-fit: cover;
-  transform: scale(1.08);
+  height: auto;
+}
+
+/* Hero mode: one orchestrated assembly on page load. */
+.mark-hero .m-facet {
+  opacity: 0;
+  animation: m-fade 600ms var(--ease-fluid) both;
+  animation-delay: calc(150ms + var(--i, 0) * 70ms);
+}
+
+.mark-hero .m-stem {
+  stroke-dasharray: 1;
+  stroke-dashoffset: 1;
+  animation: m-draw 800ms var(--ease-fluid) 750ms both;
+}
+
+.mark-hero .m-edge {
+  stroke-dasharray: 1;
+  stroke-dashoffset: 1;
+  animation: m-draw 500ms var(--ease-fluid) both;
+  animation-delay: calc(1300ms + var(--i, 0) * 60ms);
+}
+
+.mark-hero .m-node {
+  opacity: 0;
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: m-pop 450ms var(--ease-fluid) both;
+  animation-delay: calc(1350ms + var(--i, 0) * 60ms);
+}
+
+@keyframes m-fade {
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes m-draw {
+  to {
+    stroke-dashoffset: 0;
+  }
+}
+
+@keyframes m-pop {
+  from {
+    opacity: 0;
+    transform: scale(0.3);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* Story mode: motion.js sets data-stage 0→1→2 as the steps scroll past.
+   Markup defaults to stage 2 so the figure is complete without JS. */
+.mark-story .m-stem,
+.mark-story .m-edge {
+  stroke-dasharray: 1;
+  stroke-dashoffset: 1;
+  transition: stroke-dashoffset 900ms var(--ease-fluid);
+}
+
+.mark-story .m-node {
+  opacity: 0;
+  transform: scale(0.3);
+  transform-box: fill-box;
+  transform-origin: center;
+  transition:
+    opacity 500ms var(--ease-fluid),
+    transform 500ms var(--ease-fluid);
+  transition-delay: calc(300ms + var(--i, 0) * 50ms);
+}
+
+.mark-story[data-stage='1'] .m-stem,
+.mark-story[data-stage='2'] .m-stem {
+  stroke-dashoffset: 0;
+}
+
+.mark-story[data-stage='1'] .m-node--base,
+.mark-story[data-stage='2'] .m-node {
+  opacity: 1;
+  transform: none;
+}
+
+.mark-story[data-stage='2'] .m-edge {
+  stroke-dashoffset: 0;
+  transition-delay: calc(var(--i, 0) * 70ms);
+}
+
+/* ---- Layers section: hairline that fills with scroll ---- */
+
+.layers-line {
+  position: absolute;
+  left: 0;
+  top: 0.5rem;
+  bottom: 0.5rem;
+  width: 1px;
+  background: var(--color-rule);
+}
+
+.layers-line::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: var(--color-seed);
+  transform: scaleY(var(--p, 0));
+  transform-origin: top;
+}
+
+.experimental-pill {
+  margin-left: 0.6rem;
+  border: 1px solid var(--color-rule);
+  border-radius: 999px;
+  padding: 0.15rem 0.6rem;
+  font-size: 0.6875rem;
+  color: var(--color-mute);
 }
 
 .app-frame {
@@ -382,11 +494,25 @@ body {
     transform: none;
   }
 
-  .hero-art-wrap {
+  .mark-hero .m-facet,
+  .mark-hero .m-stem,
+  .mark-hero .m-edge,
+  .mark-hero .m-node {
+    animation: none;
+    opacity: 1;
+    stroke-dashoffset: 0;
     transform: none;
   }
 
-  .hero-art {
+  /* Story figure stays at its fully-drawn markup default (stage 2):
+     motion.js never resets it when reduced motion is on. */
+  .mark-story .m-stem,
+  .mark-story .m-edge,
+  .mark-story .m-node {
+    transition: none;
+  }
+
+  .layers-line::before {
     transform: none;
   }
 }
