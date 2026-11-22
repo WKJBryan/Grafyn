@@ -9,8 +9,8 @@ use crate::models::canvas::{
 use crate::models::twin::{
     DecisionEpisodeCreate, PrimitiveDecisionAssessment, ReflectionCardCreate, TraceEventType,
 };
-use crate::services::twin::TwinStore;
 use crate::services::openrouter::StreamUpdate;
+use crate::services::twin::TwinStore;
 use crate::AppState;
 use chrono::Utc;
 use futures::StreamExt;
@@ -31,11 +31,18 @@ const LLM_NODE_X_GAP: f64 = 80.0;
 
 type StreamedResponseUpdate = (String, String, ResponseStatus, Option<String>, Option<f64>);
 
-fn no_cost_stream<S>(stream: S) -> std::pin::Pin<Box<dyn futures::Stream<Item = anyhow::Result<StreamUpdate>> + Send>>
+fn no_cost_stream<S>(
+    stream: S,
+) -> std::pin::Pin<Box<dyn futures::Stream<Item = anyhow::Result<StreamUpdate>> + Send>>
 where
     S: futures::Stream<Item = anyhow::Result<String>> + Send + 'static,
 {
-    Box::pin(stream.map(|result| result.map(|content| StreamUpdate { content, cost_usd: None })))
+    Box::pin(stream.map(|result| {
+        result.map(|content| StreamUpdate {
+            content,
+            cost_usd: None,
+        })
+    }))
 }
 
 /// Send a prompt to multiple models with streaming responses via Tauri events.
@@ -304,7 +311,15 @@ pub async fn send_prompt(
                             )
                             .await;
                         drop(openrouter);
-                        result.map(|stream| Box::pin(stream) as std::pin::Pin<Box<dyn futures::Stream<Item = anyhow::Result<StreamUpdate>> + Send>>)
+                        result.map(|stream| {
+                            Box::pin(stream)
+                                as std::pin::Pin<
+                                    Box<
+                                        dyn futures::Stream<Item = anyhow::Result<StreamUpdate>>
+                                            + Send,
+                                    >,
+                                >
+                        })
                     }
                 };
 
@@ -385,7 +400,13 @@ pub async fn send_prompt(
                     Err(e) => {
                         let error = e.to_string();
                         emit_canvas_error(&window, &session_id, &tile_id, &model_id, &error);
-                        (model_id, String::new(), ResponseStatus::Error, Some(error), None)
+                        (
+                            model_id,
+                            String::new(),
+                            ResponseStatus::Error,
+                            Some(error),
+                            None,
+                        )
                     }
                 }
             });
@@ -621,6 +642,7 @@ pub async fn add_models_to_tile(
     let web_search_max_results = prompt_request.web_search_max_results;
     let reasoning_effort = prompt_request.reasoning_effort.clone();
     let provider_route = model_route.provider.clone();
+    let decision_episode_id = tile.decision_episode_id.clone();
 
     tauri::async_runtime::spawn(async move {
         // Stream all new models concurrently using JoinSet
@@ -663,7 +685,15 @@ pub async fn add_models_to_tile(
                             )
                             .await;
                         drop(openrouter);
-                        result.map(|stream| Box::pin(stream) as std::pin::Pin<Box<dyn futures::Stream<Item = anyhow::Result<StreamUpdate>> + Send>>)
+                        result.map(|stream| {
+                            Box::pin(stream)
+                                as std::pin::Pin<
+                                    Box<
+                                        dyn futures::Stream<Item = anyhow::Result<StreamUpdate>>
+                                            + Send,
+                                    >,
+                                >
+                        })
                     }
                 };
 
@@ -744,7 +774,13 @@ pub async fn add_models_to_tile(
                     Err(e) => {
                         let error = e.to_string();
                         emit_canvas_error(&window, &session_id, &tile_id, &model_id, &error);
-                        (model_id, String::new(), ResponseStatus::Error, Some(error), None)
+                        (
+                            model_id,
+                            String::new(),
+                            ResponseStatus::Error,
+                            Some(error),
+                            None,
+                        )
                     }
                 }
             });
@@ -752,8 +788,13 @@ pub async fn add_models_to_tile(
 
         // Wait for all models and collect results
         let mut results = Vec::new();
+        // First visible answer on the tile (if send_prompt never stamped one).
+        let mut first_completed_at = None;
         while let Some(result) = join_set.join_next().await {
             if let Ok(r) = result {
+                if first_completed_at.is_none() && r.2 == ResponseStatus::Completed {
+                    first_completed_at = Some(Utc::now());
+                }
                 results.push(r);
             }
         }
@@ -792,6 +833,19 @@ pub async fn add_models_to_tile(
             &results,
         )
         .await;
+
+        // First stamp wins in mark_twin_answer_rendered, so this only fills
+        // the gap where the original send produced no completed answer.
+        if let (Some(decision_episode_id), Some(rendered_at)) =
+            (decision_episode_id.as_deref(), first_completed_at)
+        {
+            let mut twin_store = twin_store_arc.write().await;
+            if let Err(error) =
+                twin_store.mark_twin_answer_rendered(decision_episode_id, rendered_at)
+            {
+                log::warn!("Failed to stamp answer render time for {decision_episode_id}: {error}");
+            }
+        }
 
         if persistence_ok {
             let _ = window.emit(
@@ -873,6 +927,7 @@ pub async fn regenerate_response(
     let web_search_max_results = request.web_search_max_results;
     let reasoning_effort = request.reasoning_effort.clone();
     let provider_route = model_route.provider.clone();
+    let decision_episode_id = tile.decision_episode_id.clone();
 
     tauri::async_runtime::spawn(async move {
         let model_id = effective_model_id;
@@ -901,7 +956,12 @@ pub async fn regenerate_response(
                     )
                     .await;
                 drop(openrouter);
-                result.map(|stream| Box::pin(stream) as std::pin::Pin<Box<dyn futures::Stream<Item = anyhow::Result<StreamUpdate>> + Send>>)
+                result.map(|stream| {
+                    Box::pin(stream)
+                        as std::pin::Pin<
+                            Box<dyn futures::Stream<Item = anyhow::Result<StreamUpdate>> + Send>,
+                        >
+                })
             }
         };
 
@@ -999,6 +1059,21 @@ pub async fn regenerate_response(
                     }),
                 )
                 .await;
+
+                // First stamp wins, so this only fills the gap where no
+                // earlier answer on this decision tile ever completed.
+                if matches!(final_status, ResponseStatus::Completed) {
+                    if let Some(decision_episode_id) = decision_episode_id.as_deref() {
+                        let mut twin_store = twin_store_arc.write().await;
+                        if let Err(error) =
+                            twin_store.mark_twin_answer_rendered(decision_episode_id, Utc::now())
+                        {
+                            log::warn!(
+                                "Failed to stamp answer render time for {decision_episode_id}: {error}"
+                            );
+                        }
+                    }
+                }
             }
             Err(e) => {
                 let error = e.to_string();
@@ -1155,7 +1230,13 @@ fn emit_persistence_error(
     }
 }
 
-fn emit_canvas_complete(window: &tauri::Window, session_id: &str, tile_id: &str, model_id: &str, cost_usd: Option<f64>) {
+fn emit_canvas_complete(
+    window: &tauri::Window,
+    session_id: &str,
+    tile_id: &str,
+    model_id: &str,
+    cost_usd: Option<f64>,
+) {
     let _ = window.emit(
         "canvas-stream",
         CanvasStreamEvent::Complete {
@@ -1200,7 +1281,13 @@ fn classify_streamed_model_response(
             None,
         )
     } else {
-        (model_id, full_content, ResponseStatus::Completed, None, None)
+        (
+            model_id,
+            full_content,
+            ResponseStatus::Completed,
+            None,
+            None,
+        )
     }
 }
 
