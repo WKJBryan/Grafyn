@@ -107,6 +107,26 @@ pub(super) fn load_or_quarantine<T: DeserializeOwned>(path: &Path, kind: &str) -
     }
 }
 
+/// FNV-1a 64-bit: specified and toolchain-independent, unlike `DefaultHasher`.
+/// Detects accidental drift only; it is not adversarial integrity protection.
+pub(super) fn fnv1a64(key: &str) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in key.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// Canonical sealed payload: `decision + "\n" + options.join("\n")`, byte-exact
+/// (no trimming or normalization), hashed with FNV-1a 64 as 16 lowercase hex digits.
+pub(super) fn sealed_payload_hash(decision: &str, options: &[String]) -> String {
+    format!(
+        "{:016x}",
+        fnv1a64(&format!("{decision}\n{}", options.join("\n")))
+    )
+}
+
 pub(super) fn lexical_terms(text: &str) -> HashSet<String> {
     const STOPWORDS: &[&str] = &[
         "a", "an", "and", "are", "as", "at", "be", "by", "can", "do", "for", "from", "how", "i",
@@ -382,6 +402,7 @@ mod tests {
                         review_date: None,
                         primitive_assessment: PrimitiveDecisionAssessment::default(),
                         context_version: None,
+                        repeat_of: None,
                     })
                     .expect("healthy decision episode should persist");
             }
@@ -500,6 +521,7 @@ mod tests {
                     review_date: None,
                     primitive_assessment: PrimitiveDecisionAssessment::default(),
                     context_version: None,
+                    repeat_of: None,
                 })
                 .expect("decision episode should persist");
 

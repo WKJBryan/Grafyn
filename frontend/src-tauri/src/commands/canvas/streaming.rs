@@ -155,6 +155,7 @@ pub async fn send_prompt(
                 stakes: decision_metadata.stakes,
                 initial_leaning: decision_metadata.initial_leaning,
                 review_date: decision_metadata.review_date,
+                repeat_of: decision_metadata.repeat_of,
                 primitive_assessment: PrimitiveDecisionAssessment::default(),
                 // Stamped on every decision episode — including non-Twin
                 // context tiles — so attribution survives a failed or absent
@@ -392,8 +393,13 @@ pub async fn send_prompt(
 
         // Wait for all models and collect results
         let mut results = Vec::new();
+        // When the first full answer reached the UI (anchoring signal for decisions).
+        let mut first_completed_at = None;
         while let Some(result) = join_set.join_next().await {
             if let Ok(r) = result {
+                if first_completed_at.is_none() && r.2 == ResponseStatus::Completed {
+                    first_completed_at = Some(Utc::now());
+                }
                 results.push(r);
             }
         }
@@ -431,6 +437,15 @@ pub async fn send_prompt(
 
         if let Some(decision_episode_id) = decision_episode_id_for_reflection {
             let mut twin_store = twin_store_arc.write().await;
+            if let Some(rendered_at) = first_completed_at {
+                if let Err(error) =
+                    twin_store.mark_twin_answer_rendered(&decision_episode_id, rendered_at)
+                {
+                    log::warn!(
+                        "Failed to stamp answer render time for {decision_episode_id}: {error}"
+                    );
+                }
+            }
             for (model_id, content, status, _, _) in &results {
                 if *status != ResponseStatus::Completed || content.trim().is_empty() {
                     continue;

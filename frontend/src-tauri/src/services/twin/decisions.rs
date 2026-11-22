@@ -1,6 +1,6 @@
 use super::shared::{
     excerpt, extract_event_model_id, extract_event_tile_id, lexical_terms, load_or_quarantine,
-    payload_string,
+    payload_string, sealed_payload_hash,
 };
 use super::TwinStore;
 use crate::models::twin::{
@@ -13,7 +13,7 @@ use crate::models::twin::{
 #[cfg(test)]
 use crate::models::twin::{DecisionMirrorPreset, PrimitiveDecisionAssessment};
 use anyhow::{Context, Result};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -345,6 +345,24 @@ fn sanitize_confidence(raw: Option<f64>) -> Option<f32> {
     Some(value.clamp(0.0, 1.0) as f32)
 }
 
+/// Keep the model's per-option vector only when it is exactly one finite
+/// probability in [0,1] per option. Never renormalized: the harness scores
+/// what the model actually said.
+fn sanitize_option_probabilities(raw: Option<&Value>, option_count: usize) -> Option<Vec<f32>> {
+    let items = raw?.as_array()?;
+    if items.len() != option_count {
+        return None;
+    }
+    items
+        .iter()
+        .map(|item| {
+            item.as_f64()
+                .filter(|p| p.is_finite() && (0.0..=1.0).contains(p))
+                .map(|p| p as f32)
+        })
+        .collect()
+}
+
 /// Extract the first balanced `{...}` span from `raw`, for best-effort JSON parsing of
 /// model output. Returns `None` if there's no opening brace, no closing brace, or the
 /// closing brace appears before the opening one (e.g. truncated/malformed model output
@@ -369,6 +387,8 @@ pub fn parse_twin_prediction(raw: &str, options: &[String]) -> TwinPredictionDra
         option_index: Option<Value>,
         confidence: Option<f64>,
         rationale: Option<String>,
+        // Raw Value so a malformed vector cannot fail the whole JSON parse.
+        option_probabilities: Option<Value>,
     }
 
     let json_slice = extract_json_slice(raw);
@@ -420,6 +440,10 @@ pub fn parse_twin_prediction(raw: &str, options: &[String]) -> TwinPredictionDra
                     .rationale
                     .map(|text| truncate_chars(&text, PREDICTION_RATIONALE_MAX_CHARS)),
                 parse_mode: "json".to_string(),
+                option_probabilities: sanitize_option_probabilities(
+                    parsed.option_probabilities.as_ref(),
+                    options.len(),
+                ),
             };
         }
     }
@@ -431,6 +455,7 @@ pub fn parse_twin_prediction(raw: &str, options: &[String]) -> TwinPredictionDra
             confidence: None,
             rationale: None,
             parse_mode: "string_match".to_string(),
+            option_probabilities: None,
         };
     }
 
@@ -440,6 +465,7 @@ pub fn parse_twin_prediction(raw: &str, options: &[String]) -> TwinPredictionDra
         confidence: None,
         rationale: None,
         parse_mode: "raw".to_string(),
+        option_probabilities: None,
     }
 }
 
@@ -529,6 +555,33 @@ impl TwinStore {
         Self::validate_file_id(&create.id)?;
         Self::validate_file_id(&create.session_id)?;
         Self::validate_file_id(&create.tile_id)?;
+        // Capture metadata degrades, it never blocks: an invalid repeat_of
+        // (bad id, self-reference, or missing episode) is dropped with a
+        // warning instead of failing the episode — and with it the prompt.
+        let repeat_of = create
+            .repeat_of
+            .as_deref()
+            .filter(|repeat_of| {
+                let valid = Self::validate_file_id(repeat_of).is_ok()
+                    && *repeat_of != create.id
+                    && self.decision_file_path(repeat_of).exists();
+                if !valid {
+                    log::warn!(
+                        "Dropping invalid repeat_of {repeat_of:?} on decision episode {}",
+                        create.id
+                    );
+                }
+                valid
+            })
+            .map(str::to_string);
+        // Re-recording an existing id must not erase a sealed prediction.
+        let previous_path = self.decision_file_path(&create.id);
+        let previous = if previous_path.exists() {
+            self.read_decision_file(&previous_path).ok()
+        } else {
+            None
+        }
+        .filter(|previous| previous.twin_prediction.is_some());
 
         let now = Utc::now();
         // A prediction is only attempted when there are at least two options
@@ -538,7 +591,7 @@ impl TwinStore {
         } else {
             None
         };
-        let episode = DecisionEpisode {
+        let mut episode = DecisionEpisode {
             id: create.id,
             session_id: create.session_id,
             tile_id: create.tile_id,
@@ -561,9 +614,17 @@ impl TwinStore {
             correction_note: None,
             context_version: create.context_version,
             outcome_recorded_at: None,
+            twin_answer_rendered_at: None,
+            twin_answer_visible_before_choice: None,
+            repeat_of,
             created_at: now,
             updated_at: now,
         };
+        if let Some(previous) = previous {
+            episode.twin_prediction = previous.twin_prediction;
+            episode.prediction_status = previous.prediction_status;
+            self.void_if_payload_drifted(&mut episode)?;
+        }
 
         self.write_decision_file(&episode)?;
         self.append_trace_event(
@@ -578,10 +639,63 @@ impl TwinStore {
                 "initial_leaning": episode.initial_leaning,
                 "review_date": episode.review_date,
                 "primitive_assessment": episode.primitive_assessment,
+                "repeat_of": episode.repeat_of,
             }),
         )?;
 
         Ok(episode)
+    }
+
+    /// Freeze rule: a sealed prediction whose decision/options no longer hash
+    /// to the sealed payload is voided (kept for audit, never scored). Legacy
+    /// seals without a hash cannot be checked and are left alone. Caller writes.
+    fn void_if_payload_drifted(&mut self, episode: &mut DecisionEpisode) -> Result<()> {
+        if episode.prediction_status.as_deref() != Some("sealed") {
+            return Ok(());
+        }
+        let Some(sealed_hash) = episode
+            .twin_prediction
+            .as_ref()
+            .and_then(|prediction| prediction.sealed_payload_hash.clone())
+        else {
+            return Ok(());
+        };
+        let current_hash = sealed_payload_hash(&episode.decision, &episode.options);
+        if current_hash == sealed_hash {
+            return Ok(());
+        }
+        episode.prediction_status = Some("voided".to_string());
+        episode.agreement = None;
+        self.append_trace_event(
+            &episode.session_id,
+            TraceEventType::TwinPredictionVoided,
+            json!({
+                "decision_episode_id": episode.id,
+                "tile_id": episode.tile_id,
+                "reason": "decision_or_options_changed_after_seal",
+                "sealed_payload_hash": sealed_hash,
+                "current_payload_hash": current_hash,
+            }),
+        )?;
+        Ok(())
+    }
+
+    /// Stamp when the first visible answer on the decision tile finished
+    /// streaming. First stamp wins.
+    pub fn mark_twin_answer_rendered(
+        &mut self,
+        episode_id: &str,
+        rendered_at: DateTime<Utc>,
+    ) -> Result<()> {
+        Self::validate_file_id(episode_id)?;
+        let path = self.decision_file_path(episode_id);
+        let mut episode = self.read_decision_file(&path)?;
+        if episode.twin_answer_rendered_at.is_some() {
+            return Ok(());
+        }
+        episode.twin_answer_rendered_at = Some(rendered_at);
+        episode.updated_at = Utc::now();
+        self.write_decision_file(&episode)
     }
 
     pub fn list_decision_episodes(&self) -> Result<Vec<DecisionEpisode>> {
@@ -681,6 +795,13 @@ impl TwinStore {
             episode.selected_response = Some(selected_response);
         }
         if let Some(chosen_option) = update.chosen_option {
+            if episode.chosen_option.is_none() {
+                // First recorded choice: was the visible answer already on screen?
+                let choice_at = Utc::now();
+                episode.twin_answer_visible_before_choice = episode
+                    .twin_answer_rendered_at
+                    .map(|rendered_at| rendered_at < choice_at);
+            }
             // Canonicalize label/case variants ("b", "Option 2", extra
             // whitespace) against the recorded options; unmatched free text
             // is kept as-is (legacy and "other" outcomes stay recordable).
@@ -722,8 +843,13 @@ impl TwinStore {
 
         // Agreement is recomputed whenever both sides exist, so a corrected
         // chosen_option keeps the stored agreement current. Only predictions
-        // sealed before the outcome was first recorded count.
-        if let (Some(chosen), Some(prediction)) = (&episode.chosen_option, &episode.twin_prediction)
+        // sealed before the outcome was first recorded count; voided seals never do.
+        self.void_if_payload_drifted(&mut episode)?;
+        let voided = episode.prediction_status.as_deref() == Some("voided");
+        if voided {
+            episode.agreement = None;
+        } else if let (Some(chosen), Some(prediction)) =
+            (&episode.chosen_option, &episode.twin_prediction)
         {
             let recorded_at = episode.outcome_recorded_at.unwrap_or_else(Utc::now);
             if prediction.sealed_at <= recorded_at {
@@ -771,6 +897,8 @@ impl TwinStore {
         draft: TwinPredictionDraft,
         model_id: &str,
         context_version: &str,
+        elicitation_prompt: Option<&str>,
+        temperature: Option<f32>,
     ) -> Result<DecisionEpisode> {
         Self::validate_file_id(episode_id)?;
         let path = self.decision_file_path(episode_id);
@@ -803,6 +931,11 @@ impl TwinStore {
             model_id: model_id.to_string(),
             context_version: context_version.to_string(),
             sealed_at: Utc::now(),
+            option_probabilities: draft.option_probabilities,
+            elicitation_prompt: elicitation_prompt.map(str::to_string),
+            temperature,
+            // Freeze the question + options exactly as stored at seal time.
+            sealed_payload_hash: Some(sealed_payload_hash(&episode.decision, &episode.options)),
         };
         let sealed_at = prediction.sealed_at;
         episode.twin_prediction = Some(prediction);
@@ -1239,6 +1372,7 @@ mod tests {
                     outcome_feedback: None,
                 },
                 context_version: None,
+                repeat_of: None,
             })
             .expect("decision episode should persist");
 
@@ -1408,6 +1542,7 @@ mod tests {
                 review_date: None,
                 primitive_assessment: PrimitiveDecisionAssessment::default(),
                 context_version: Some("ctx-test".to_string()),
+                repeat_of: None,
             })
             .expect("decision episode should persist");
         assert_eq!(episode.prediction_status.as_deref(), Some("requested"));
@@ -1422,6 +1557,10 @@ mod tests {
             model_id: "test/model".to_string(),
             context_version: "ctx-test".to_string(),
             sealed_at: Utc::now(),
+            option_probabilities: None,
+            elicitation_prompt: None,
+            temperature: None,
+            sealed_payload_hash: None,
         });
         sealed.prediction_status = Some("sealed".to_string());
         store
@@ -1483,6 +1622,7 @@ mod tests {
                 review_date: None,
                 primitive_assessment: PrimitiveDecisionAssessment::default(),
                 context_version: None,
+                repeat_of: None,
             })
             .expect("episode should persist");
         let mut decided = episode.clone();
@@ -1526,6 +1666,7 @@ mod tests {
                 review_date: None,
                 primitive_assessment: PrimitiveDecisionAssessment::default(),
                 context_version: None,
+                repeat_of: None,
             })
             .expect("undecided episode should persist");
 
@@ -1702,19 +1843,34 @@ mod tests {
                 review_date: None,
                 primitive_assessment: PrimitiveDecisionAssessment::default(),
                 context_version: Some("ctx-test".to_string()),
+                repeat_of: None,
             })
             .expect("episode should persist");
 
         let draft = parse_twin_prediction("Stay in Austin", &prediction_options());
         let sealed = store
-            .attach_twin_prediction(&episode.id, draft.clone(), "test/model", "ctx-test")
+            .attach_twin_prediction(
+                &episode.id,
+                draft.clone(),
+                "test/model",
+                "ctx-test",
+                None,
+                None,
+            )
             .expect("first attach should seal");
         assert_eq!(sealed.prediction_status.as_deref(), Some("sealed"));
         let first_sealed_at = sealed.twin_prediction.as_ref().unwrap().sealed_at;
 
         // Duplicate attach is a no-op.
         let duplicate = store
-            .attach_twin_prediction(&episode.id, draft.clone(), "other/model", "ctx-test")
+            .attach_twin_prediction(
+                &episode.id,
+                draft.clone(),
+                "other/model",
+                "ctx-test",
+                None,
+                None,
+            )
             .expect("duplicate attach should not error");
         assert_eq!(
             duplicate.twin_prediction.as_ref().unwrap().sealed_at,
@@ -1738,6 +1894,7 @@ mod tests {
                 review_date: None,
                 primitive_assessment: PrimitiveDecisionAssessment::default(),
                 context_version: None,
+                repeat_of: None,
             })
             .expect("episode should persist");
         store
@@ -1750,7 +1907,14 @@ mod tests {
             )
             .expect("outcome should record");
         let refused = store
-            .attach_twin_prediction(&late_episode.id, draft, "test/model", "ctx-test")
+            .attach_twin_prediction(
+                &late_episode.id,
+                draft,
+                "test/model",
+                "ctx-test",
+                None,
+                None,
+            )
             .expect("late attach should not error");
         assert!(refused.twin_prediction.is_none());
         assert_eq!(
@@ -1776,11 +1940,12 @@ mod tests {
                 review_date: None,
                 primitive_assessment: PrimitiveDecisionAssessment::default(),
                 context_version: Some("ctx-test".to_string()),
+                repeat_of: None,
             })
             .expect("episode should persist");
         let draft = parse_twin_prediction("Stay in Austin", &prediction_options());
         store
-            .attach_twin_prediction(&episode.id, draft, "test/model", "ctx-test")
+            .attach_twin_prediction(&episode.id, draft, "test/model", "ctx-test", None, None)
             .expect("prediction should seal");
 
         // Label + case variant resolves to the canonical option text and
@@ -1838,6 +2003,7 @@ mod tests {
                 review_date: None,
                 primitive_assessment: PrimitiveDecisionAssessment::default(),
                 context_version: None,
+                repeat_of: None,
             })
             .expect("episode should persist");
 
@@ -1856,5 +2022,272 @@ mod tests {
             Some("Negotiated a remote arrangement instead")
         );
         assert!(updated.agreement.is_none());
+    }
+
+    fn create_for(id: &str, decision: &str, options: Vec<String>) -> DecisionEpisodeCreate {
+        DecisionEpisodeCreate {
+            id: id.to_string(),
+            session_id: "session-1".to_string(),
+            tile_id: format!("tile-{id}"),
+            decision: decision.to_string(),
+            options,
+            stakes: None,
+            initial_leaning: None,
+            review_date: None,
+            primitive_assessment: PrimitiveDecisionAssessment::default(),
+            context_version: Some("ctx-test".to_string()),
+            repeat_of: None,
+        }
+    }
+
+    #[test]
+    fn parse_twin_prediction_option_probabilities_validated_not_renormalized() {
+        let options = prediction_options();
+        let parse = |probs: &str| {
+            parse_twin_prediction(
+                &format!(
+                    r#"{{"predicted_option": "Stay in Austin", "option_probabilities": {probs}}}"#
+                ),
+                &options,
+            )
+        };
+        let valid = parse("[0.3, 0.6]");
+        assert_eq!(valid.parse_mode, "json");
+        assert_eq!(valid.option_probabilities, Some(vec![0.3, 0.6]));
+        for bad in [
+            "[0.5]",
+            "[0.2, 0.3, 0.5]",
+            "[1.2, 0.1]",
+            "[-0.1, 0.9]",
+            "[\"0.5\", 0.5]",
+            "0.5",
+        ] {
+            let draft = parse(bad);
+            assert_eq!(
+                draft.parse_mode, "json",
+                "bad vector must not break JSON parse: {bad}"
+            );
+            assert!(draft.option_probabilities.is_none(), "{bad}");
+            assert_eq!(draft.matched_option_index, Some(1));
+        }
+        assert!(parse_twin_prediction("Stay in Austin", &options)
+            .option_probabilities
+            .is_none());
+    }
+
+    #[test]
+    fn sealing_stamps_payload_hash_prompt_temperature_and_probabilities() {
+        let temp_dir = tempdir().expect("temp dir should be created");
+        let mut store = TwinStore::new(temp_dir.path().to_path_buf());
+        store
+            .record_decision_episode(create_for(
+                "seal-1",
+                "Take the Denver job?",
+                prediction_options(),
+            ))
+            .expect("episode should persist");
+        let draft = parse_twin_prediction(
+            r#"{"predicted_option": "Stay in Austin", "option_probabilities": [0.25, 0.75]}"#,
+            &prediction_options(),
+        );
+        let sealed = store
+            .attach_twin_prediction(
+                "seal-1",
+                draft,
+                "test/model",
+                "ctx-test",
+                Some("the prompt"),
+                Some(0.2),
+            )
+            .expect("prediction should seal");
+        let prediction = sealed.twin_prediction.expect("prediction stored");
+        assert_eq!(prediction.option_probabilities, Some(vec![0.25, 0.75]));
+        assert_eq!(prediction.elicitation_prompt.as_deref(), Some("the prompt"));
+        assert_eq!(prediction.temperature, Some(0.2));
+        assert_eq!(
+            prediction.sealed_payload_hash,
+            Some(sealed_payload_hash(
+                "Take the Denver job?",
+                &prediction_options()
+            ))
+        );
+        // Canonical format pinned: decision + "\n" + options joined by "\n".
+        assert_eq!(
+            sealed_payload_hash("D", &["A".to_string(), "B".to_string()]),
+            format!("{:016x}", super::super::shared::fnv1a64("D\nA\nB"))
+        );
+    }
+
+    #[test]
+    fn post_seal_edit_voids_prediction_and_skips_agreement() {
+        let temp_dir = tempdir().expect("temp dir should be created");
+        let mut store = TwinStore::new(temp_dir.path().to_path_buf());
+        let draft = || parse_twin_prediction("Stay in Austin", &prediction_options());
+
+        // Path 1: re-recording the same id with changed options.
+        store
+            .record_decision_episode(create_for(
+                "void-1",
+                "Take the Denver job?",
+                prediction_options(),
+            ))
+            .expect("episode should persist");
+        store
+            .attach_twin_prediction("void-1", draft(), "test/model", "ctx-test", None, None)
+            .expect("prediction should seal");
+        let mut changed = prediction_options();
+        changed.push("Move to Seattle".to_string());
+        let rerecorded = store
+            .record_decision_episode(create_for("void-1", "Take the Denver job?", changed))
+            .expect("re-record should persist");
+        assert_eq!(rerecorded.prediction_status.as_deref(), Some("voided"));
+        assert!(rerecorded.twin_prediction.is_some(), "kept for audit");
+        let decided = store
+            .update_decision_outcome(
+                "void-1",
+                DecisionOutcomeUpdate {
+                    chosen_option: Some("Stay in Austin".to_string()),
+                    ..DecisionOutcomeUpdate::default()
+                },
+            )
+            .expect("outcome should record");
+        assert!(decided.agreement.is_none());
+
+        // Path 2: decision text changed on disk after sealing (hand edit / future edit path).
+        store
+            .record_decision_episode(create_for(
+                "void-2",
+                "Take the Denver job?",
+                prediction_options(),
+            ))
+            .expect("episode should persist");
+        let mut edited = store
+            .attach_twin_prediction("void-2", draft(), "test/model", "ctx-test", None, None)
+            .expect("prediction should seal");
+        edited.decision = "Take the Boston job?".to_string();
+        store
+            .write_decision_file(&edited)
+            .expect("edit should write");
+        let decided = store
+            .update_decision_outcome(
+                "void-2",
+                DecisionOutcomeUpdate {
+                    chosen_option: Some("Stay in Austin".to_string()),
+                    ..DecisionOutcomeUpdate::default()
+                },
+            )
+            .expect("outcome should record");
+        assert_eq!(decided.prediction_status.as_deref(), Some("voided"));
+        assert!(decided.agreement.is_none());
+        let trace = store
+            .list_session_traces()
+            .expect("traces should list")
+            .into_iter()
+            .find(|trace| trace.session_id == "session-1")
+            .expect("trace exists");
+        assert_eq!(
+            trace
+                .events
+                .iter()
+                .filter(|event| event.event_type == TraceEventType::TwinPredictionVoided)
+                .count(),
+            2
+        );
+
+        // Unchanged payload keeps the seal and scores normally.
+        store
+            .record_decision_episode(create_for(
+                "keep-1",
+                "Take the Denver job?",
+                prediction_options(),
+            ))
+            .expect("episode should persist");
+        store
+            .attach_twin_prediction("keep-1", draft(), "test/model", "ctx-test", None, None)
+            .expect("prediction should seal");
+        let decided = store
+            .update_decision_outcome(
+                "keep-1",
+                DecisionOutcomeUpdate {
+                    chosen_option: Some("Stay in Austin".to_string()),
+                    ..DecisionOutcomeUpdate::default()
+                },
+            )
+            .expect("outcome should record");
+        assert_eq!(decided.prediction_status.as_deref(), Some("sealed"));
+        assert_eq!(decided.agreement, Some(true));
+    }
+
+    #[test]
+    fn answer_visibility_is_stamped_at_first_choice_and_unknown_without_render() {
+        let temp_dir = tempdir().expect("temp dir should be created");
+        let mut store = TwinStore::new(temp_dir.path().to_path_buf());
+        let choose = |store: &mut TwinStore, id: &str| {
+            store
+                .update_decision_outcome(
+                    id,
+                    DecisionOutcomeUpdate {
+                        chosen_option: Some("Stay in Austin".to_string()),
+                        ..DecisionOutcomeUpdate::default()
+                    },
+                )
+                .expect("outcome should record")
+        };
+
+        store
+            .record_decision_episode(create_for(
+                "seen",
+                "Take the Denver job?",
+                prediction_options(),
+            ))
+            .expect("episode should persist");
+        let rendered_at = Utc::now() - chrono::Duration::seconds(5);
+        store
+            .mark_twin_answer_rendered("seen", rendered_at)
+            .expect("render should stamp");
+        store
+            .mark_twin_answer_rendered("seen", Utc::now())
+            .expect("second stamp is a no-op");
+        let seen = choose(&mut store, "seen");
+        assert_eq!(seen.twin_answer_rendered_at, Some(rendered_at));
+        assert_eq!(seen.twin_answer_visible_before_choice, Some(true));
+
+        store
+            .record_decision_episode(create_for(
+                "unseen",
+                "Take the Denver job?",
+                prediction_options(),
+            ))
+            .expect("episode should persist");
+        let unseen = choose(&mut store, "unseen");
+        assert_eq!(unseen.twin_answer_visible_before_choice, None);
+    }
+
+    #[test]
+    fn repeat_of_must_reference_another_existing_episode() {
+        let temp_dir = tempdir().expect("temp dir should be created");
+        let mut store = TwinStore::new(temp_dir.path().to_path_buf());
+        // An invalid repeat_of is dropped, never a create failure — a bad
+        // value must not kill the user's prompt in send_prompt.
+        let mut missing = create_for("repeat-1", "Take the Denver job?", prediction_options());
+        missing.repeat_of = Some("does-not-exist".to_string());
+        let stored = store
+            .record_decision_episode(missing)
+            .expect("invalid repeat_of must not fail the episode");
+        assert_eq!(stored.repeat_of, None);
+
+        store
+            .record_decision_episode(create_for(
+                "original",
+                "Take the Denver job?",
+                prediction_options(),
+            ))
+            .expect("original should persist");
+        let mut repeat = create_for("repeat-1", "Take the Denver job?", prediction_options());
+        repeat.repeat_of = Some("original".to_string());
+        let stored = store
+            .record_decision_episode(repeat)
+            .expect("repeat should persist");
+        assert_eq!(stored.repeat_of.as_deref(), Some("original"));
     }
 }
