@@ -160,6 +160,9 @@ pub enum PromptType {
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct DecisionPromptMetadata {
     pub decision: String,
+    /// Episode id this decision repeats; consumed by the external eval harness.
+    #[serde(default)]
+    pub repeat_of: Option<String>,
     #[serde(default)]
     pub options: Vec<String>,
     #[serde(default)]

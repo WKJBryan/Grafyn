@@ -93,6 +93,7 @@ pub enum TraceEventType {
     TileDeleted,
     ResponseDeleted,
     TwinPredictionSealed,
+    TwinPredictionVoided,
     WorkingMemoryCompiled,
 }
 
@@ -384,6 +385,18 @@ pub struct DecisionEpisode {
     pub context_version: Option<String>,
     #[serde(default)]
     pub outcome_recorded_at: Option<DateTime<Utc>>,
+    /// When the first visible canvas answer on this decision tile finished
+    /// streaming (any context mode). This is the answer the user saw, not the
+    /// hidden sealed prediction.
+    #[serde(default)]
+    pub twin_answer_rendered_at: Option<DateTime<Utc>>,
+    /// Stamped when `chosen_option` is first recorded: `Some(rendered < choice)`
+    /// when the render time is known, otherwise `None` (unknown, never false).
+    #[serde(default)]
+    pub twin_answer_visible_before_choice: Option<bool>,
+    /// Episode id this decision deliberately repeats (test-retest ceiling).
+    #[serde(default)]
+    pub repeat_of: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -399,6 +412,10 @@ pub struct TwinPredictionDraft {
     #[serde(default)]
     pub rationale: Option<String>,
     pub parse_mode: String,
+    /// One probability per option, in displayed order, exactly as the model
+    /// stated them (not renormalized). `None` unless valid JSON output.
+    #[serde(default)]
+    pub option_probabilities: Option<Vec<f32>>,
 }
 
 /// A sealed twin prediction. `sealed_at` is stamped when the prediction is
@@ -417,6 +434,17 @@ pub struct TwinPrediction {
     pub model_id: String,
     pub context_version: String,
     pub sealed_at: DateTime<Utc>,
+    #[serde(default)]
+    pub option_probabilities: Option<Vec<f32>>,
+    /// Exact user-message text sent for the sealed call.
+    #[serde(default)]
+    pub elicitation_prompt: Option<String>,
+    /// Temperature sent in the sealed request.
+    #[serde(default)]
+    pub temperature: Option<f32>,
+    /// Hash of the decision + options frozen at seal (see `sealed_payload_hash`).
+    #[serde(default)]
+    pub sealed_payload_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -437,6 +465,8 @@ pub struct DecisionEpisodeCreate {
     pub primitive_assessment: PrimitiveDecisionAssessment,
     #[serde(default)]
     pub context_version: Option<String>,
+    #[serde(default)]
+    pub repeat_of: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

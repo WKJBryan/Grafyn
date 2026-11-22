@@ -868,6 +868,9 @@ fn apply_twin_context_budget(
     }
 }
 
+/// Temperature sent on the hidden sealed-prediction call (recorded at seal).
+const SEALED_PREDICTION_TEMPERATURE: f64 = 0.2;
+
 /// User message for the hidden sealed-prediction call. With a configured
 /// Twin Identity the framing is immersed first person; the fallback is a
 /// neutral decision-support instruction. Disclosure language lives in the
@@ -918,10 +921,12 @@ fn build_twin_prediction_user_message(
              object and nothing else:\n",
         );
     }
-    message.push_str(
-        "{\"predicted_option\": \"<option text>\", \"option_index\": <option number from the list above>, \
-         \"confidence\": <0.0 to 1.0>, \"rationale\": \"<one or two sentences>\"}",
-    );
+    message.push_str(&format!(
+        "{{\"predicted_option\": \"<option text>\", \"option_index\": <option number from the list above>, \
+         \"confidence\": <0.0 to 1.0>, \"option_probabilities\": [<{} numbers from 0.0 to 1.0, one per option, \
+         in list order>], \"rationale\": \"<one or two sentences>\"}}",
+        options.len()
+    ));
     message
 }
 
@@ -1021,13 +1026,18 @@ pub(super) async fn run_sealed_twin_prediction(
 
     let messages = vec![ChatMessage {
         role: "user".to_string(),
-        content: user_message,
+        content: user_message.clone(),
     }];
     let result = match provider_route {
         ModelProviderRoute::Ollama => {
             let ollama = ollama.read().await;
             ollama
-                .chat(&prediction_model, messages, Some(&system_prompt), Some(0.2))
+                .chat(
+                    &prediction_model,
+                    messages,
+                    Some(&system_prompt),
+                    Some(SEALED_PREDICTION_TEMPERATURE),
+                )
                 .await
         }
         ModelProviderRoute::OpenRouter => {
@@ -1037,7 +1047,7 @@ pub(super) async fn run_sealed_twin_prediction(
                     &prediction_model,
                     messages,
                     Some(&system_prompt),
-                    Some(0.2),
+                    Some(SEALED_PREDICTION_TEMPERATURE),
                     Some(600),
                     Some("none"),
                     false,
@@ -1056,6 +1066,8 @@ pub(super) async fn run_sealed_twin_prediction(
                 draft,
                 &prediction_model,
                 &context_version,
+                Some(&user_message),
+                Some(SEALED_PREDICTION_TEMPERATURE as f32),
             ) {
                 log::warn!("Failed to seal twin prediction for {episode_id}: {error}");
             }
@@ -1818,6 +1830,7 @@ mod tests {
             stakes: Some("Product direction".into()),
             initial_leaning: Some("Decision Mirror first".into()),
             review_date: Some("2026-05-15".into()),
+            repeat_of: None,
         };
 
         let prompt = build_twin_context_prompt(
@@ -1849,6 +1862,7 @@ mod tests {
             stakes: Some("Product direction".into()),
             initial_leaning: Some("Decision Mirror first".into()),
             review_date: Some("2026-05-15".into()),
+            repeat_of: None,
         };
 
         let prompt = build_twin_context_prompt(
@@ -1906,6 +1920,9 @@ mod tests {
             correction_note: note.map(|text| text.to_string()),
             context_version: None,
             outcome_recorded_at: None,
+            twin_answer_rendered_at: None,
+            twin_answer_visible_before_choice: None,
+            repeat_of: None,
             created_at: now,
             updated_at: now,
         }
@@ -1993,6 +2010,9 @@ mod tests {
         assert!(user_message.contains("1. Ship now"));
         assert!(user_message.contains("2. Wait a sprint"));
         assert!(user_message.contains("predicted_option"));
+        assert!(user_message.contains(
+            "\"option_probabilities\": [<2 numbers from 0.0 to 1.0, one per option, in list order>]"
+        ));
 
         // The full model-facing prompt must never meta-frame the twin.
         let full_prompt = format!("{system_prompt}\n{user_message}").to_lowercase();

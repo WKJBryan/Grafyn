@@ -1,5 +1,6 @@
 #[cfg(test)]
 use super::decisions::parse_twin_prediction;
+use super::shared::fnv1a64;
 use super::TwinStore;
 use crate::models::twin::{
     ConstitutionStatus, ExportBundle, ExportFileSummary, PromotionState, TraceEventType,
@@ -234,7 +235,11 @@ impl TwinStore {
         self.write_jsonl_file(&feedback_events_path, &feedback_event_lines)?;
 
         let manifest = serde_json::json!({
-            "bundle_schema_version": 2,
+            // v3: sealed predictions carry option_probabilities, elicitation_prompt,
+            // temperature, sealed_payload_hash; episodes carry repeat_of,
+            // twin_answer_rendered_at, twin_answer_visible_before_choice, and
+            // prediction_status "voided" (exclude from scoring).
+            "bundle_schema_version": 3,
             // shortcut: split assignments changed once when the hash moved to FNV-1a over
             // record.id; external harnesses must not mix holdouts across split_method values.
             "split_method": "fnv1a64-id",
@@ -352,14 +357,8 @@ impl TwinStore {
         }
     }
 
-    /// FNV-1a 64-bit: specified and toolchain-independent, unlike `DefaultHasher`.
     fn stable_bucket(key: &str) -> u8 {
-        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-        for byte in key.bytes() {
-            hash ^= u64::from(byte);
-            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-        (hash % 100) as u8
+        (fnv1a64(key) % 100) as u8
     }
 
     fn record_to_export_value(record: &UserRecord) -> serde_json::Value {
@@ -481,11 +480,22 @@ mod tests {
                     review_date: None,
                     primitive_assessment: PrimitiveDecisionAssessment::default(),
                     context_version: Some("ctx-test".to_string()),
+                    repeat_of: None,
                 })
                 .expect("episode should persist");
-            let draft = parse_twin_prediction("Stay in Austin", &prediction_options());
+            let draft = parse_twin_prediction(
+                r#"{"predicted_option": "Stay in Austin", "option_probabilities": [0.25, 0.75]}"#,
+                &prediction_options(),
+            );
             store
-                .attach_twin_prediction(id, draft, "test/model", "ctx-test")
+                .attach_twin_prediction(
+                    id,
+                    draft,
+                    "test/model",
+                    "ctx-test",
+                    Some("elicitation text"),
+                    Some(0.2),
+                )
                 .expect("prediction should seal");
             if record_outcome {
                 store
@@ -499,6 +509,32 @@ mod tests {
                     .expect("outcome should record");
             }
         }
+
+        store
+            .record_decision_episode(DecisionEpisodeCreate {
+                id: "episode-repeat".to_string(),
+                session_id: "session-1".to_string(),
+                tile_id: "tile-repeat".to_string(),
+                decision: "Take the Denver job?".to_string(),
+                options: prediction_options(),
+                stakes: None,
+                initial_leaning: None,
+                review_date: None,
+                primitive_assessment: PrimitiveDecisionAssessment::default(),
+                context_version: None,
+                repeat_of: Some("episode-revealed".to_string()),
+            })
+            .expect("repeat episode should persist");
+        let listed = store
+            .list_decision_episodes()
+            .expect("episodes should list");
+        assert_eq!(
+            listed
+                .iter()
+                .find(|episode| episode.id == "episode-repeat")
+                .and_then(|episode| episode.repeat_of.as_deref()),
+            Some("episode-revealed")
+        );
 
         // One feedback event tied to a record later marked Private, one free.
         let private_event = store
@@ -545,7 +581,13 @@ mod tests {
         let bundle = store
             .export_bundle(TwinExportRequest::default())
             .expect("export should succeed");
-        assert_eq!(bundle.decision_episodes.count, 2);
+        assert_eq!(bundle.decision_episodes.count, 3);
+        let manifest: Value = serde_json::from_str(
+            &std::fs::read_to_string(&bundle.manifest_path).expect("manifest should read"),
+        )
+        .expect("manifest should parse");
+        assert_eq!(manifest["bundle_schema_version"], 3);
+        assert_eq!(manifest["split_method"], "fnv1a64-id");
 
         let episodes_content = std::fs::read_to_string(&bundle.decision_episodes.path)
             .expect("decision episodes file should read");
@@ -556,13 +598,39 @@ mod tests {
         assert!(sealed_line.contains("\"sealed\":true"));
         assert!(!sealed_line.contains("predicted_option"));
         assert!(!sealed_line.contains("rationale"));
-        let revealed_line = episodes_content
-            .lines()
-            .find(|line| line.contains("episode-revealed"))
-            .expect("revealed episode should export");
-        assert!(revealed_line.contains("predicted_option"));
-        assert!(revealed_line.contains("\"agreement\":true"));
-        assert!(revealed_line.contains("ctx-test"));
+        for hidden in [
+            "option_probabilities",
+            "elicitation",
+            "sealed_payload_hash",
+            "temperature",
+        ] {
+            assert!(!sealed_line.contains(hidden), "pre-outcome leak: {hidden}");
+        }
+        let revealed: Value = serde_json::from_str(
+            episodes_content
+                .lines()
+                .find(|line| line.contains("\"id\":\"episode-revealed\""))
+                .expect("revealed episode should export"),
+        )
+        .expect("revealed line should parse");
+        let prediction = &revealed["twin_prediction"];
+        assert_eq!(prediction["predicted_option"], "Stay in Austin");
+        assert_eq!(revealed["agreement"], true);
+        assert_eq!(prediction["context_version"], "ctx-test");
+        assert_eq!(prediction["option_probabilities"], json!([0.25, 0.75]));
+        assert_eq!(prediction["elicitation_prompt"], "elicitation text");
+        assert!(prediction["temperature"].is_number());
+        assert!(prediction["sealed_payload_hash"].is_string());
+        assert!(revealed.get("twin_answer_rendered_at").is_some());
+        assert!(revealed.get("twin_answer_visible_before_choice").is_some());
+        let repeat: Value = serde_json::from_str(
+            episodes_content
+                .lines()
+                .find(|line| line.contains("\"id\":\"episode-repeat\""))
+                .expect("repeat episode should export"),
+        )
+        .expect("repeat line should parse");
+        assert_eq!(repeat["repeat_of"], "episode-revealed");
 
         let feedback_content = std::fs::read_to_string(&bundle.feedback_events.path)
             .expect("feedback events file should read");
