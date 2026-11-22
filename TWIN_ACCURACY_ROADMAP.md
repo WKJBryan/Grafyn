@@ -130,7 +130,7 @@ Brainstormed alternatives/complements to plain case retrieval. Each is a context
 
 Current flow: tile marked Decision → `record_decision_episode` → models answer → user later records outcome via `DecisionOutcomeUpdate`. Insert:
 
-1. When a Decision tile runs, fire one hidden LLM call (twin context + decision + `options[]`) returning strict JSON: `{"predicted_option", "option_index", "confidence", "rationale"}`.
+1. When a Decision tile runs, fire one hidden LLM call (twin context + decision + `options[]`) returning strict JSON: `{"predicted_option", "option_index", "confidence", "option_probabilities", "rationale"}` — the per-option probability vector is stored exactly as the model stated it (never renormalized), so the external harness can compute proper scores (Brier/log) and calibration curves.
 2. **Do not display it.** Store immediately; UI shows a locked badge ("Twin has sealed a prediction").
 3. When the user records `chosen_option` (existing path), the backend computes agreement and reveals prediction + rationale. The reveal moment also feeds the **correction bank** (technique #2): on a miss, one optional free-text line — "why was the twin wrong?" — becomes a retrievable lesson exemplar.
 
@@ -139,10 +139,17 @@ Current flow: tile marked Decision → `record_decision_episode` → models answ
 ```rust
 twin_prediction: Option<TwinPrediction> {
     predicted_option, matched_option_index, confidence,
+    option_probabilities,          // full vector, as stated, never renormalized
     rationale, model_id, context_version, sealed_at,
+    elicitation_prompt, temperature,  // exact reproduction metadata
+    sealed_payload_hash,           // decision+options frozen at seal (FNV-1a)
 }
-agreement: Option<bool>   // computed when chosen_option is set
+agreement: Option<bool>   // computed when chosen_option is set; never for voided seals
+// On DecisionEpisode: twin_answer_rendered_at, twin_answer_visible_before_choice
+// (anchoring control), repeat_of (test-retest ceiling link).
 ```
+
+**Freeze rule (implemented):** any post-seal change to `decision`/`options` fails the stored hash check, sets `prediction_status: "voided"` (kept for audit, never scored) and emits a `TwinPredictionVoided` trace event.
 
 **Predicted-option parsing fallback chain:** strict JSON → normalized string match against `options[]` → (after Phase 3) embedding similarity → one-tap manual adjudication, counted but tagged.
 
@@ -152,7 +159,7 @@ agreement: Option<bool>   // computed when chosen_option is set
 
 ### Export obligations (scoring happens externally)
 
-The app must ensure exports include: sealed predictions with `context_version` + `model_id`, decision outcomes, full ranking/feedback trace payloads (the contrastive-pair raw material), correction-bank entries, and the existing train/eval/holdout splits — all under the `rejected`/`private`/`no_train` filter. The external harness owns: top-1 agreement, Kendall tau on ranking replay, Matches-Me label agreement, Wilson CIs, calibration curves, per-model and per-`context_version` breakdowns, and A/B replay of every conditioning technique in the catalog.
+The app must ensure exports include: sealed predictions with `context_version` + `model_id`, decision outcomes, full ranking/feedback trace payloads (the contrastive-pair raw material), correction-bank entries, and the existing train/eval/holdout splits — all under the `rejected`/`private`/`no_train` filter. As of `bundle_schema_version: 3`, prediction rows also carry `option_probabilities`, `elicitation_prompt`, `temperature`, and `sealed_payload_hash` (post-outcome only — the pre-outcome stub stays non-revealing), and episode rows carry `twin_answer_rendered_at`, `twin_answer_visible_before_choice`, `repeat_of`, and a `prediction_status` of `"voided"` for payload-drifted seals the harness must exclude. The external harness owns: top-1 agreement, Kendall tau on ranking replay, Matches-Me label agreement, Wilson CIs, calibration curves, per-model and per-`context_version` breakdowns, and A/B replay of every conditioning technique in the catalog.
 
 ### Statistical honesty
 
