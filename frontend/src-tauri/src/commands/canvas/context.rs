@@ -869,7 +869,7 @@ fn apply_twin_context_budget(
 }
 
 /// Temperature sent on the hidden sealed-prediction call (recorded at seal).
-const SEALED_PREDICTION_TEMPERATURE: f64 = 0.2;
+pub(super) const SEALED_PREDICTION_TEMPERATURE: f64 = 0.2;
 
 /// User message for the hidden sealed-prediction call. With a configured
 /// Twin Identity the framing is immersed first person; the fallback is a
@@ -949,6 +949,7 @@ pub(super) async fn run_sealed_twin_prediction(
     twin_context_prompt: Option<String>,
     context_version: String,
     decision_metadata: Option<DecisionPromptMetadata>,
+    shadow_predictions_enabled: bool,
 ) {
     let built = {
         let mut store = twin_store.write().await;
@@ -1024,6 +1025,8 @@ pub(super) async fn run_sealed_twin_prediction(
     };
     let (system_prompt, user_message) = built;
 
+    // OpenRouter gets reasoning effort "none"; Ollama has no such setting.
+    let reasoning_effort = (provider_route == ModelProviderRoute::OpenRouter).then_some("none");
     let messages = vec![ChatMessage {
         role: "user".to_string(),
         content: user_message.clone(),
@@ -1049,7 +1052,7 @@ pub(super) async fn run_sealed_twin_prediction(
                     Some(&system_prompt),
                     Some(SEALED_PREDICTION_TEMPERATURE),
                     Some(600),
-                    Some("none"),
+                    reasoning_effort,
                     false,
                     0,
                 )
@@ -1068,6 +1071,7 @@ pub(super) async fn run_sealed_twin_prediction(
                 &context_version,
                 Some(&user_message),
                 Some(SEALED_PREDICTION_TEMPERATURE as f32),
+                reasoning_effort,
             ) {
                 log::warn!("Failed to seal twin prediction for {episode_id}: {error}");
             }
@@ -1077,6 +1081,24 @@ pub(super) async fn run_sealed_twin_prediction(
             let mut store = twin_store.write().await;
             let _ = store.mark_twin_prediction_failed(&episode_id);
         }
+    }
+
+    // Comparators run whether or not the primary succeeded.
+    if shadow_predictions_enabled {
+        super::shadow_predictions::run_shadow_predictions(
+            &twin_store,
+            &openrouter,
+            &ollama,
+            &provider_route,
+            &prediction_model,
+            &episode_id,
+            &options,
+            &context_version,
+            &system_prompt,
+            &user_message,
+            reasoning_effort,
+        )
+        .await;
     }
 }
 
@@ -1915,6 +1937,7 @@ mod tests {
             missed_something: None,
             primitive_assessment: PrimitiveDecisionAssessment::default(),
             twin_prediction: None,
+            shadow_predictions: Vec::new(),
             prediction_status: None,
             agreement: None,
             correction_note: note.map(|text| text.to_string()),
@@ -2148,12 +2171,7 @@ mod tests {
                 ..crate::models::canvas::CanvasWorkingMemory::default()
             },
         );
-        let request = build_request(
-            "Follow up",
-            "tile-1",
-            "openai/gpt-4",
-            ContextMode::Twin,
-        );
+        let request = build_request("Follow up", "tile-1", "openai/gpt-4", ContextMode::Twin);
         let prefixed = prefix_twin_prompt_with_memory(
             &session,
             &request,

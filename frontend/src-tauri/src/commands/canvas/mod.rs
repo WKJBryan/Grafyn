@@ -22,6 +22,8 @@ mod working_memory;
 
 mod context;
 
+mod shadow_predictions;
+
 mod streaming;
 pub use streaming::*;
 

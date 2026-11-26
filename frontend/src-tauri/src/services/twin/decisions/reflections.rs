@@ -453,11 +453,7 @@ impl TwinStore {
                 let feedback_events = self.decision_feedback_events(&episode).unwrap_or_default();
                 // A sealed prediction must never cross IPC before the outcome
                 // is recorded; the UI only learns that one exists.
-                let prediction_sealed =
-                    episode.twin_prediction.is_some() && episode.chosen_option.is_none();
-                if prediction_sealed {
-                    episode.twin_prediction = None;
-                }
+                let prediction_sealed = episode.redact_sealed_predictions();
                 DecisionEpisodeWithReflections {
                     episode,
                     reflection_cards,

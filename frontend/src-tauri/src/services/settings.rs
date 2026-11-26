@@ -175,6 +175,10 @@ impl SettingsService {
             self.settings.smart_web_search = smart_web_search;
         }
 
+        if let Some(enabled) = update.twin_shadow_predictions_enabled {
+            self.settings.twin_shadow_predictions_enabled = enabled;
+        }
+
         if let Some(background_link_discovery_enabled) = update.background_link_discovery_enabled {
             self.settings.background_link_discovery_enabled = background_link_discovery_enabled;
         }
@@ -473,6 +477,7 @@ mod tests {
                 ollama_base_url: None,
                 ollama_model: None,
                 smart_web_search: None,
+                twin_shadow_predictions_enabled: None,
                 background_link_discovery_enabled: None,
                 background_link_discovery_llm_enabled: None,
                 background_vault_optimizer_enabled: None,
@@ -518,6 +523,7 @@ mod tests {
                 ollama_base_url: None,
                 ollama_model: None,
                 smart_web_search: None,
+                twin_shadow_predictions_enabled: None,
                 background_link_discovery_enabled: None,
                 background_link_discovery_llm_enabled: None,
                 background_vault_optimizer_enabled: None,

@@ -291,6 +291,16 @@
           {{ ollamaStatusMessage }}
         </p>
       </div>
+      <label class="checkbox-label">
+        <input
+          v-model="twinShadowPredictionsEnabled"
+          type="checkbox"
+        >
+        <span>Seal comparison predictions</span>
+      </label>
+      <p class="setting-hint">
+        Runs two extra hidden predictions per decision (no personal context, and with reasoning on) so your external evaluation can measure skill above baseline. Uses extra API calls.
+      </p>
     </div>
 
     <!-- Theme Section (non-setup only) -->
@@ -617,6 +627,7 @@ const twinLlmProvider = ref('openrouter')
 const ollamaBaseUrl = ref('http://localhost:11434')
 const ollamaModel = ref('')
 const smartWebSearch = ref(true)
+const twinShadowPredictionsEnabled = ref(false)
 const backgroundLinkDiscoveryEnabled = ref(true)
 const backgroundLinkDiscoveryLlmEnabled = ref(false)
 const backgroundVaultOptimizerEnabled = ref(true)
@@ -762,6 +773,7 @@ const loadCurrentSettings = async () => {
       ollamaBaseUrl.value = currentSettings.ollama_base_url || 'http://localhost:11434'
       ollamaModel.value = currentSettings.ollama_model || ''
       smartWebSearch.value = currentSettings.smart_web_search ?? true
+      twinShadowPredictionsEnabled.value = currentSettings.twin_shadow_predictions_enabled ?? false
       backgroundLinkDiscoveryEnabled.value =
         currentSettings.background_link_discovery_enabled ?? true
       backgroundLinkDiscoveryLlmEnabled.value =
@@ -920,6 +932,7 @@ const saveSettings = async () => {
       ollama_base_url: ollamaBaseUrl.value || 'http://localhost:11434',
       ollama_model: ollamaModel.value || '',
       smart_web_search: smartWebSearch.value,
+      twin_shadow_predictions_enabled: twinShadowPredictionsEnabled.value,
       background_link_discovery_enabled: backgroundLinkDiscoveryEnabled.value,
       background_link_discovery_llm_enabled: backgroundLinkDiscoveryLlmEnabled.value,
       background_vault_optimizer_enabled: backgroundVaultOptimizerEnabled.value,

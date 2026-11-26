@@ -182,7 +182,7 @@ describe('SettingsModal', () => {
     await flushPromises()
 
     const checkboxes = wrapper.findAll('input[type="checkbox"]')
-    await checkboxes.at(2).setValue(true)
+    await checkboxes.at(3).setValue(true)
     await wrapper.find('.save-btn').trigger('click')
 
     expect(settingsUpdate).toHaveBeenCalledWith(expect.objectContaining({

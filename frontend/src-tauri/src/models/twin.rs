@@ -375,6 +375,11 @@ pub struct DecisionEpisode {
     pub primitive_assessment: PrimitiveDecisionAssessment,
     #[serde(default)]
     pub twin_prediction: Option<TwinPrediction>,
+    /// Comparator predictions sealed at the same moment as the primary, each
+    /// tagged with `variant`. Export-only; never used in-app. Same secrecy
+    /// rule as `twin_prediction`.
+    #[serde(default)]
+    pub shadow_predictions: Vec<TwinPrediction>,
     #[serde(default)]
     pub prediction_status: Option<String>,
     #[serde(default)]
@@ -399,6 +404,18 @@ pub struct DecisionEpisode {
     pub repeat_of: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+impl DecisionEpisode {
+    /// Secrecy rule for IPC: while no choice is recorded, strip the primary
+    /// and every shadow prediction. Returns whether a primary was hidden.
+    pub fn redact_sealed_predictions(&mut self) -> bool {
+        if self.chosen_option.is_some() {
+            return false;
+        }
+        self.shadow_predictions.clear();
+        self.twin_prediction.take().is_some()
+    }
 }
 
 /// Parser output for a twin prediction before it is sealed into storage.
@@ -445,6 +462,13 @@ pub struct TwinPrediction {
     /// Hash of the decision + options frozen at seal (see `sealed_payload_hash`).
     #[serde(default)]
     pub sealed_payload_hash: Option<String>,
+    /// Comparator label (`no_context`, `reasoning_on`); `None` for the primary.
+    #[serde(default)]
+    pub variant: Option<String>,
+    /// Reasoning effort sent in the sealed request; `None` when the provider
+    /// has no such setting (Ollama).
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

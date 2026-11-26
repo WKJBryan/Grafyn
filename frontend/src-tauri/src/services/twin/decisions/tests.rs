@@ -177,6 +177,7 @@ fn decision_episode_old_json_loads_with_default_prediction_fields() {
     assert_eq!(episodes.len(), 1);
     let episode = &episodes[0];
     assert!(episode.twin_prediction.is_none());
+    assert!(episode.shadow_predictions.is_empty());
     assert!(episode.prediction_status.is_none());
     assert!(episode.agreement.is_none());
     assert!(episode.correction_note.is_none());
@@ -220,7 +221,12 @@ fn sealed_prediction_redacted_from_reflections_until_outcome() {
         elicitation_prompt: None,
         temperature: None,
         sealed_payload_hash: None,
+        variant: None,
+        reasoning_effort: None,
     });
+    let mut shadow = sealed.twin_prediction.clone().unwrap();
+    shadow.variant = Some("no_context".to_string());
+    sealed.shadow_predictions = vec![shadow];
     sealed.prediction_status = Some("sealed".to_string());
     store
         .write_decision_file(&sealed)
@@ -235,6 +241,11 @@ fn sealed_prediction_redacted_from_reflections_until_outcome() {
         .expect("episode should be listed");
     assert!(item.prediction_sealed);
     assert!(item.episode.twin_prediction.is_none());
+    assert!(item.episode.shadow_predictions.is_empty());
+    // Same helper guards the update_decision_outcome IPC return.
+    let mut ipc_copy = sealed.clone();
+    assert!(ipc_copy.redact_sealed_predictions());
+    assert!(ipc_copy.twin_prediction.is_none() && ipc_copy.shadow_predictions.is_empty());
 
     store
         .update_decision_outcome(
@@ -260,6 +271,7 @@ fn sealed_prediction_redacted_from_reflections_until_outcome() {
         .as_ref()
         .expect("prediction should be revealed after outcome");
     assert_eq!(prediction.predicted_option, "Stay");
+    assert_eq!(item.episode.shadow_predictions.len(), 1);
 }
 
 fn decided_episode(
@@ -515,6 +527,7 @@ fn attach_twin_prediction_refuses_after_outcome_and_duplicates() {
             "ctx-test",
             None,
             None,
+            None,
         )
         .expect("first attach should seal");
     assert_eq!(sealed.prediction_status.as_deref(), Some("sealed"));
@@ -527,6 +540,7 @@ fn attach_twin_prediction_refuses_after_outcome_and_duplicates() {
             draft.clone(),
             "other/model",
             "ctx-test",
+            None,
             None,
             None,
         )
@@ -573,6 +587,7 @@ fn attach_twin_prediction_refuses_after_outcome_and_duplicates() {
             "ctx-test",
             None,
             None,
+            None,
         )
         .expect("late attach should not error");
     assert!(refused.twin_prediction.is_none());
@@ -604,7 +619,15 @@ fn outcome_computes_agreement_and_canonicalizes_choice() {
         .expect("episode should persist");
     let draft = parse_twin_prediction("Stay in Austin", &prediction_options());
     store
-        .attach_twin_prediction(&episode.id, draft, "test/model", "ctx-test", None, None)
+        .attach_twin_prediction(
+            &episode.id,
+            draft,
+            "test/model",
+            "ctx-test",
+            None,
+            None,
+            None,
+        )
         .expect("prediction should seal");
 
     // Label + case variant resolves to the canonical option text and
@@ -757,6 +780,7 @@ fn sealing_stamps_payload_hash_prompt_temperature_and_probabilities() {
             "ctx-test",
             Some("the prompt"),
             Some(0.2),
+            None,
         )
         .expect("prediction should seal");
     let prediction = sealed.twin_prediction.expect("prediction stored");
@@ -792,7 +816,15 @@ fn post_seal_edit_voids_prediction_and_skips_agreement() {
         ))
         .expect("episode should persist");
     store
-        .attach_twin_prediction("void-1", draft(), "test/model", "ctx-test", None, None)
+        .attach_twin_prediction(
+            "void-1",
+            draft(),
+            "test/model",
+            "ctx-test",
+            None,
+            None,
+            None,
+        )
         .expect("prediction should seal");
     let mut changed = prediction_options();
     changed.push("Move to Seattle".to_string());
@@ -821,7 +853,15 @@ fn post_seal_edit_voids_prediction_and_skips_agreement() {
         ))
         .expect("episode should persist");
     let mut edited = store
-        .attach_twin_prediction("void-2", draft(), "test/model", "ctx-test", None, None)
+        .attach_twin_prediction(
+            "void-2",
+            draft(),
+            "test/model",
+            "ctx-test",
+            None,
+            None,
+            None,
+        )
         .expect("prediction should seal");
     edited.decision = "Take the Boston job?".to_string();
     store
@@ -862,7 +902,15 @@ fn post_seal_edit_voids_prediction_and_skips_agreement() {
         ))
         .expect("episode should persist");
     store
-        .attach_twin_prediction("keep-1", draft(), "test/model", "ctx-test", None, None)
+        .attach_twin_prediction(
+            "keep-1",
+            draft(),
+            "test/model",
+            "ctx-test",
+            None,
+            None,
+            None,
+        )
         .expect("prediction should seal");
     let decided = store
         .update_decision_outcome(
@@ -948,4 +996,109 @@ fn repeat_of_must_reference_another_existing_episode() {
         .record_decision_episode(repeat)
         .expect("repeat should persist");
     assert_eq!(stored.repeat_of.as_deref(), Some("original"));
+}
+
+#[test]
+fn attach_shadow_prediction_seals_and_refuses_duplicates_and_late_arrivals() {
+    let temp_dir = tempdir().expect("temp dir should be created");
+    let mut store = TwinStore::new(temp_dir.path().to_path_buf());
+    store
+        .record_decision_episode(create_for(
+            "shadow-1",
+            "Take the Denver job?",
+            prediction_options(),
+        ))
+        .expect("episode should persist");
+    let draft = || {
+        parse_twin_prediction(
+            r#"{"predicted_option": "Take the Denver job", "option_probabilities": [0.6, 0.4]}"#,
+            &prediction_options(),
+        )
+    };
+    store
+        .attach_twin_prediction(
+            "shadow-1",
+            parse_twin_prediction("Stay in Austin", &prediction_options()),
+            "test/model",
+            "ctx-test",
+            Some("the prompt"),
+            Some(0.2),
+            Some("none"),
+        )
+        .expect("primary should seal");
+
+    let sealed = store
+        .attach_shadow_prediction(
+            "shadow-1",
+            "reasoning_on",
+            draft(),
+            "test/model",
+            "ctx-test",
+            Some("the prompt"),
+            Some(0.2),
+            Some("medium"),
+        )
+        .expect("shadow should seal");
+    assert_eq!(sealed.shadow_predictions.len(), 1);
+    let shadow = &sealed.shadow_predictions[0];
+    assert_eq!(shadow.variant.as_deref(), Some("reasoning_on"));
+    assert_eq!(shadow.reasoning_effort.as_deref(), Some("medium"));
+    assert_eq!(shadow.elicitation_prompt.as_deref(), Some("the prompt"));
+    assert_eq!(shadow.temperature, Some(0.2));
+    assert_eq!(shadow.option_probabilities, Some(vec![0.6, 0.4]));
+    assert_eq!(
+        shadow.sealed_payload_hash,
+        Some(sealed_payload_hash(
+            "Take the Denver job?",
+            &prediction_options()
+        ))
+    );
+    let primary = sealed.twin_prediction.as_ref().expect("primary kept");
+    assert_eq!(primary.predicted_option, "Stay in Austin");
+    assert!(primary.variant.is_none());
+    assert_eq!(primary.reasoning_effort.as_deref(), Some("none"));
+    assert_eq!(sealed.prediction_status.as_deref(), Some("sealed"));
+
+    let duplicate = store
+        .attach_shadow_prediction(
+            "shadow-1",
+            "reasoning_on",
+            draft(),
+            "other/model",
+            "ctx-test",
+            None,
+            None,
+            None,
+        )
+        .expect("duplicate should not error");
+    assert_eq!(duplicate.shadow_predictions.len(), 1);
+    assert_eq!(duplicate.shadow_predictions[0].model_id, "test/model");
+
+    let decided = store
+        .update_decision_outcome(
+            "shadow-1",
+            DecisionOutcomeUpdate {
+                chosen_option: Some("Stay in Austin".to_string()),
+                ..DecisionOutcomeUpdate::default()
+            },
+        )
+        .expect("outcome should record");
+    // Agreement comes from the primary only (the shadow predicted Denver).
+    assert_eq!(decided.agreement, Some(true));
+
+    let late = store
+        .attach_shadow_prediction(
+            "shadow-1",
+            "no_context",
+            draft(),
+            "test/model",
+            "ctx-test",
+            None,
+            None,
+            None,
+        )
+        .expect("late shadow should not error");
+    assert_eq!(late.shadow_predictions.len(), 1);
+    assert_eq!(late.agreement, Some(true));
+    assert_eq!(late.prediction_status.as_deref(), Some("sealed"));
 }
