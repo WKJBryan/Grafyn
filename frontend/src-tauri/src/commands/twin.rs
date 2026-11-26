@@ -128,9 +128,12 @@ pub async fn update_decision_outcome(
     state: State<'_, AppState>,
 ) -> Result<DecisionEpisode, String> {
     let mut store = state.twin_store.write().await;
-    store
+    let mut episode = store
         .update_decision_outcome(&id, update)
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    // An update without a choice must not reveal sealed predictions over IPC.
+    episode.redact_sealed_predictions();
+    Ok(episode)
 }
 
 #[tauri::command]

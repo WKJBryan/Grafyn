@@ -58,6 +58,11 @@ pub struct UserSettings {
     #[serde(default = "default_smart_web_search")]
     pub smart_web_search: bool,
 
+    /// Whether to seal comparator ("shadow") twin predictions on decision
+    /// tiles. Off by default: each comparator is an extra paid hidden call.
+    #[serde(default)]
+    pub twin_shadow_predictions_enabled: bool,
+
     /// Whether the background link discovery scheduler is enabled
     #[serde(default = "default_background_link_discovery_enabled")]
     pub background_link_discovery_enabled: bool,
@@ -172,6 +177,7 @@ impl Default for UserSettings {
             ollama_base_url: default_ollama_base_url(),
             ollama_model: String::new(),
             smart_web_search: true,
+            twin_shadow_predictions_enabled: false,
             background_link_discovery_enabled: default_background_link_discovery_enabled(),
             background_link_discovery_llm_enabled: false,
             background_vault_optimizer_enabled: default_background_vault_optimizer_enabled(),
@@ -261,6 +267,7 @@ pub struct SettingsUpdate {
     pub ollama_base_url: Option<String>,
     pub ollama_model: Option<String>,
     pub smart_web_search: Option<bool>,
+    pub twin_shadow_predictions_enabled: Option<bool>,
     pub background_link_discovery_enabled: Option<bool>,
     pub background_link_discovery_llm_enabled: Option<bool>,
     pub background_vault_optimizer_enabled: Option<bool>,
@@ -288,6 +295,7 @@ pub struct SettingsStatus {
     pub ollama_base_url: String,
     pub ollama_model: String,
     pub smart_web_search: bool,
+    pub twin_shadow_predictions_enabled: bool,
     pub background_link_discovery_enabled: bool,
     pub background_link_discovery_llm_enabled: bool,
     pub background_vault_optimizer_enabled: bool,
@@ -315,6 +323,7 @@ impl From<&UserSettings> for SettingsStatus {
             ollama_base_url: settings.ollama_base_url.clone(),
             ollama_model: settings.ollama_model.clone(),
             smart_web_search: settings.smart_web_search,
+            twin_shadow_predictions_enabled: settings.twin_shadow_predictions_enabled,
             background_link_discovery_enabled: settings.background_link_discovery_enabled,
             background_link_discovery_llm_enabled: settings.background_link_discovery_llm_enabled,
             background_vault_optimizer_enabled: settings.background_vault_optimizer_enabled,
@@ -357,6 +366,7 @@ mod tests {
         );
         assert_eq!(settings.vault_optimizer_program_path, "_grafyn/program.md");
         assert_eq!(settings.canvas_compact_token_threshold, 32_000);
+        assert!(!settings.twin_shadow_predictions_enabled);
     }
 
     #[test]
@@ -406,6 +416,7 @@ mod tests {
         assert_eq!(settings.twin_llm_provider, "openrouter");
         assert_eq!(settings.ollama_base_url, "http://localhost:11434");
         assert!(settings.ollama_model.is_empty());
+        assert!(!settings.twin_shadow_predictions_enabled);
     }
 
     #[test]

@@ -4,7 +4,7 @@ use super::shared::fnv1a64;
 use super::TwinStore;
 use crate::models::twin::{
     ConstitutionStatus, ExportBundle, ExportFileSummary, PromotionState, TraceEventType,
-    TwinExportRequest, UserRecord,
+    TwinExportRequest, TwinPrediction, UserRecord,
 };
 #[cfg(test)]
 use crate::models::twin::{
@@ -163,21 +163,24 @@ impl TwinStore {
             .list_decision_episodes()?
             .into_iter()
             .map(|episode| {
-                let still_sealed =
-                    episode.twin_prediction.is_some() && episode.chosen_option.is_none();
                 let mut value = serde_json::to_value(&episode)?;
-                if still_sealed {
+                if episode.chosen_option.is_none() {
+                    let stub = |prediction: &TwinPrediction| {
+                        json!({
+                            "variant": prediction.variant,
+                            "sealed": true,
+                            "sealed_at": prediction.sealed_at,
+                            "model_id": prediction.model_id,
+                            "context_version": prediction.context_version,
+                            "parse_mode": prediction.parse_mode,
+                        })
+                    };
                     if let Some(object) = value.as_object_mut() {
-                        let stub = episode.twin_prediction.as_ref().map(|prediction| {
-                            serde_json::json!({
-                                "sealed": true,
-                                "sealed_at": prediction.sealed_at,
-                                "model_id": prediction.model_id,
-                                "context_version": prediction.context_version,
-                                "parse_mode": prediction.parse_mode,
-                            })
-                        });
-                        object.insert("twin_prediction".to_string(), stub.unwrap_or(Value::Null));
+                        if let Some(prediction) = episode.twin_prediction.as_ref() {
+                            object.insert("twin_prediction".to_string(), stub(prediction));
+                        }
+                        let shadows = episode.shadow_predictions.iter().map(stub).collect();
+                        object.insert("shadow_predictions".to_string(), Value::Array(shadows));
                     }
                 }
                 serde_json::to_string(&value).map_err(anyhow::Error::from)
@@ -239,7 +242,11 @@ impl TwinStore {
             // temperature, sealed_payload_hash; episodes carry repeat_of,
             // twin_answer_rendered_at, twin_answer_visible_before_choice, and
             // prediction_status "voided" (exclude from scoring).
-            "bundle_schema_version": 3,
+            // v4: episodes carry shadow_predictions (comparators sealed at the
+            // same moment, variants "no_context" and "reasoning_on"; stubbed
+            // pre-outcome like the primary); predictions carry variant and
+            // reasoning_effort.
+            "bundle_schema_version": 4,
             // shortcut: split assignments changed once when the hash moved to FNV-1a over
             // record.id; external harnesses must not mix holdouts across split_method values.
             "split_method": "fnv1a64-id",
@@ -495,8 +502,24 @@ mod tests {
                     "ctx-test",
                     Some("elicitation text"),
                     Some(0.2),
+                    Some("none"),
                 )
                 .expect("prediction should seal");
+            store
+                .attach_shadow_prediction(
+                    id,
+                    "no_context",
+                    parse_twin_prediction(
+                        r#"{"predicted_option": "Take the Denver job", "option_probabilities": [0.875, 0.125], "rationale": "shadow reasoning"}"#,
+                        &prediction_options(),
+                    ),
+                    "test/model",
+                    "ctx-test",
+                    Some("elicitation text"),
+                    Some(0.2),
+                    Some("none"),
+                )
+                .expect("shadow should seal");
             if record_outcome {
                 store
                     .update_decision_outcome(
@@ -586,7 +609,7 @@ mod tests {
             &std::fs::read_to_string(&bundle.manifest_path).expect("manifest should read"),
         )
         .expect("manifest should parse");
-        assert_eq!(manifest["bundle_schema_version"], 3);
+        assert_eq!(manifest["bundle_schema_version"], 4);
         assert_eq!(manifest["split_method"], "fnv1a64-id");
 
         let episodes_content = std::fs::read_to_string(&bundle.decision_episodes.path)
@@ -598,6 +621,20 @@ mod tests {
         assert!(sealed_line.contains("\"sealed\":true"));
         assert!(!sealed_line.contains("predicted_option"));
         assert!(!sealed_line.contains("rationale"));
+        assert!(!sealed_line.contains("reasoning_effort"));
+        let sealed_value: Value = serde_json::from_str(sealed_line).expect("sealed line parses");
+        let shadows = &sealed_value["shadow_predictions"];
+        assert_eq!(
+            shadows,
+            &json!([{
+                "variant": "no_context",
+                "sealed": true,
+                "sealed_at": shadows[0]["sealed_at"],
+                "model_id": "test/model",
+                "context_version": "ctx-test",
+                "parse_mode": "json",
+            }])
+        );
         for hidden in [
             "option_probabilities",
             "elicitation",
@@ -621,6 +658,12 @@ mod tests {
         assert_eq!(prediction["elicitation_prompt"], "elicitation text");
         assert!(prediction["temperature"].is_number());
         assert!(prediction["sealed_payload_hash"].is_string());
+        assert_eq!(prediction["reasoning_effort"], "none");
+        let shadow = &revealed["shadow_predictions"][0];
+        assert_eq!(shadow["variant"], "no_context");
+        assert_eq!(shadow["predicted_option"], "Take the Denver job");
+        assert_eq!(shadow["option_probabilities"], json!([0.875, 0.125]));
+        assert_eq!(shadow["rationale"], "shadow reasoning");
         assert!(revealed.get("twin_answer_rendered_at").is_some());
         assert!(revealed.get("twin_answer_visible_before_choice").is_some());
         let repeat: Value = serde_json::from_str(

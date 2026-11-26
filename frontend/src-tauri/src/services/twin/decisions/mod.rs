@@ -67,7 +67,9 @@ impl TwinStore {
         } else {
             None
         }
-        .filter(|previous| previous.twin_prediction.is_some());
+        .filter(|previous| {
+            previous.twin_prediction.is_some() || !previous.shadow_predictions.is_empty()
+        });
 
         let now = Utc::now();
         // A prediction is only attempted when there are at least two options
@@ -95,6 +97,7 @@ impl TwinStore {
             missed_something: None,
             primitive_assessment: create.primitive_assessment,
             twin_prediction: None,
+            shadow_predictions: Vec::new(),
             prediction_status,
             agreement: None,
             correction_note: None,
@@ -108,6 +111,7 @@ impl TwinStore {
         };
         if let Some(previous) = previous {
             episode.twin_prediction = previous.twin_prediction;
+            episode.shadow_predictions = previous.shadow_predictions;
             episode.prediction_status = previous.prediction_status;
             self.void_if_payload_drifted(&mut episode)?;
         }
@@ -319,6 +323,7 @@ impl TwinStore {
     /// or a prediction already exists, so `sealed_at` always precedes the
     /// outcome structurally. The trace payload never contains the predicted
     /// option — the trace viewer must not leak a sealed prediction.
+    #[allow(clippy::too_many_arguments)]
     pub fn attach_twin_prediction(
         &mut self,
         episode_id: &str,
@@ -327,6 +332,7 @@ impl TwinStore {
         context_version: &str,
         elicitation_prompt: Option<&str>,
         temperature: Option<f32>,
+        reasoning_effort: Option<&str>,
     ) -> Result<DecisionEpisode> {
         Self::validate_file_id(episode_id)?;
         let path = self.decision_file_path(episode_id);
@@ -350,21 +356,17 @@ impl TwinStore {
             return Ok(episode);
         }
 
-        let prediction = TwinPrediction {
-            predicted_option: draft.predicted_option,
-            matched_option_index: draft.matched_option_index,
-            confidence: draft.confidence,
-            rationale: draft.rationale,
-            parse_mode: draft.parse_mode.clone(),
-            model_id: model_id.to_string(),
-            context_version: context_version.to_string(),
-            sealed_at: Utc::now(),
-            option_probabilities: draft.option_probabilities,
-            elicitation_prompt: elicitation_prompt.map(str::to_string),
+        let parse_mode = draft.parse_mode.clone();
+        let prediction = seal_prediction(
+            &episode,
+            draft,
+            model_id,
+            context_version,
+            elicitation_prompt,
             temperature,
-            // Freeze the question + options exactly as stored at seal time.
-            sealed_payload_hash: Some(sealed_payload_hash(&episode.decision, &episode.options)),
-        };
+            reasoning_effort,
+            None,
+        );
         let sealed_at = prediction.sealed_at;
         episode.twin_prediction = Some(prediction);
         episode.prediction_status = Some("sealed".to_string());
@@ -379,7 +381,78 @@ impl TwinStore {
                 "tile_id": episode.tile_id,
                 "model_id": model_id,
                 "context_version": context_version,
-                "parse_mode": draft.parse_mode,
+                "parse_mode": parse_mode,
+                "sealed_at": sealed_at,
+            }),
+        )?;
+
+        Ok(episode)
+    }
+
+    /// Seal a comparator ("shadow") prediction alongside the primary. Same
+    /// stamping as `attach_twin_prediction`, but appended to
+    /// `shadow_predictions` under `variant`. Refuses (logged no-op) after the
+    /// outcome is recorded or when the variant is already sealed. Never
+    /// touches the primary, `prediction_status`, or `agreement`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attach_shadow_prediction(
+        &mut self,
+        episode_id: &str,
+        variant: &str,
+        draft: TwinPredictionDraft,
+        model_id: &str,
+        context_version: &str,
+        elicitation_prompt: Option<&str>,
+        temperature: Option<f32>,
+        reasoning_effort: Option<&str>,
+    ) -> Result<DecisionEpisode> {
+        Self::validate_file_id(episode_id)?;
+        let path = self.decision_file_path(episode_id);
+        let mut episode = self.read_decision_file(&path)?;
+
+        if episode.chosen_option.is_some() {
+            log::warn!(
+                "Shadow prediction {variant} for episode {episode_id} arrived after the outcome was recorded; discarding"
+            );
+            return Ok(episode);
+        }
+        if episode
+            .shadow_predictions
+            .iter()
+            .any(|shadow| shadow.variant.as_deref() == Some(variant))
+        {
+            log::warn!(
+                "Episode {episode_id} already has a sealed {variant} shadow prediction; ignoring duplicate"
+            );
+            return Ok(episode);
+        }
+
+        let parse_mode = draft.parse_mode.clone();
+        let prediction = seal_prediction(
+            &episode,
+            draft,
+            model_id,
+            context_version,
+            elicitation_prompt,
+            temperature,
+            reasoning_effort,
+            Some(variant),
+        );
+        let sealed_at = prediction.sealed_at;
+        episode.shadow_predictions.push(prediction);
+        episode.updated_at = Utc::now();
+        self.write_decision_file(&episode)?;
+
+        self.append_trace_event(
+            &episode.session_id,
+            TraceEventType::TwinPredictionSealed,
+            json!({
+                "decision_episode_id": episode.id,
+                "tile_id": episode.tile_id,
+                "variant": variant,
+                "model_id": model_id,
+                "context_version": context_version,
+                "parse_mode": parse_mode,
                 "sealed_at": sealed_at,
             }),
         )?;
@@ -483,5 +556,36 @@ impl TwinStore {
         }
         refs.sort_by(|a, b| a.event_id.cmp(&b.event_id));
         Ok(refs)
+    }
+}
+
+/// Stamp a parsed draft into a sealed prediction (shared by primary and shadows).
+#[allow(clippy::too_many_arguments)]
+fn seal_prediction(
+    episode: &DecisionEpisode,
+    draft: TwinPredictionDraft,
+    model_id: &str,
+    context_version: &str,
+    elicitation_prompt: Option<&str>,
+    temperature: Option<f32>,
+    reasoning_effort: Option<&str>,
+    variant: Option<&str>,
+) -> TwinPrediction {
+    TwinPrediction {
+        predicted_option: draft.predicted_option,
+        matched_option_index: draft.matched_option_index,
+        confidence: draft.confidence,
+        rationale: draft.rationale,
+        parse_mode: draft.parse_mode,
+        model_id: model_id.to_string(),
+        context_version: context_version.to_string(),
+        sealed_at: Utc::now(),
+        option_probabilities: draft.option_probabilities,
+        elicitation_prompt: elicitation_prompt.map(str::to_string),
+        temperature,
+        // Freeze the question + options exactly as stored at seal time.
+        sealed_payload_hash: Some(sealed_payload_hash(&episode.decision, &episode.options)),
+        variant: variant.map(str::to_string),
+        reasoning_effort: reasoning_effort.map(str::to_string),
     }
 }

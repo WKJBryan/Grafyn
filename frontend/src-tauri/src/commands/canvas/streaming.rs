@@ -524,6 +524,12 @@ pub async fn send_prompt(
                 .context_version
                 .clone()
                 .unwrap_or_else(|| TWIN_CONTEXT_VERSION.to_string());
+            let shadow_predictions_enabled = state
+                .settings_service
+                .read()
+                .await
+                .get()
+                .twin_shadow_predictions_enabled;
             tauri::async_runtime::spawn(run_sealed_twin_prediction(
                 state.twin_store.clone(),
                 state.openrouter.clone(),
@@ -538,6 +544,7 @@ pub async fn send_prompt(
                 resolved_context.twin_context_prompt.clone(),
                 context_version,
                 tile.decision_metadata.clone(),
+                shadow_predictions_enabled,
             ));
         }
     }
