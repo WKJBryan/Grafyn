@@ -1,18 +1,14 @@
-//! MCP Tool Definitions for Grafyn
+//! MCP tool definitions for Grafyn.
 //!
-//! Implements 12 MCP tools that expose the knowledge base to Claude Desktop
-//! and other MCP clients via the rmcp crate.
+//! Parameter schemas and `CallToolResult` payloads live here. Vault
+//! operations are [`crate::headless::Headless`] and return domain types;
+//! these handlers only map those results onto the existing MCP JSON.
 
-use crate::models::note::{NoteCreate, NoteStatus, NoteUpdate, CURRENT_NOTE_SCHEMA_VERSION};
-use crate::services::chunk_index::ChunkIndex;
-use crate::services::graph_index::GraphIndex;
-use crate::services::import;
-use crate::services::index_commit;
-use crate::services::knowledge_store::KnowledgeStore;
-use crate::services::memory::MemoryService;
-use crate::services::priority::PriorityScoringService;
-use crate::services::retrieval::{retain_resolvable_chunks, RetrievalService};
-use crate::services::search::SearchService;
+use crate::headless::{
+    ChunkQueryResult, DeletedNote, Headless, ImportedNotes, RecallOutcome, StoredNote,
+};
+use crate::models::memory::RecallResult;
+use crate::models::note::{ChunkResult, Note, NoteMeta, RelationType, SearchResult};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, Content, ServerCapabilities, ServerInfo};
@@ -20,30 +16,11 @@ use rmcp::{tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
-use std::io::{Cursor, Read};
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
-use tokio::sync::RwLock;
-use walkdir::WalkDir;
-use zip::ZipArchive;
 
-/// Shared state for the MCP server, holding all services needed by tools.
+/// MCP server: a headless vault plus the rmcp tool router.
 #[derive(Clone)]
 pub struct GrafynMcpServer {
-    pub knowledge_store: Arc<RwLock<KnowledgeStore>>,
-    pub search_service: Arc<RwLock<SearchService>>,
-    pub graph_index: Arc<RwLock<GraphIndex>>,
-    pub memory_service: Arc<RwLock<MemoryService>>,
-    pub chunk_index: Option<Arc<RwLock<ChunkIndex>>>,
-    pub retrieval_service: Arc<RwLock<RetrievalService>>,
-    pub priority_service: Arc<RwLock<PriorityScoringService>>,
-    vault_path: PathBuf,
-    /// Latest vault mtime this process has loaded; another process writing
-    /// the vault moves it and triggers a cache + graph refresh.
-    vault_stamp: Arc<Mutex<Option<SystemTime>>>,
-    /// Monotonic time of the last vault probe, for throttling.
-    last_probe: Arc<Mutex<Option<std::time::Instant>>>,
+    core: Headless,
     tool_router: ToolRouter<Self>,
 }
 
@@ -204,7 +181,7 @@ fn text_result(text: String) -> Result<CallToolResult, McpError> {
 fn json_result<T: Serialize>(data: &T) -> Result<CallToolResult, McpError> {
     let json = serde_json::to_string_pretty(data).map_err(|e| McpError {
         code: rmcp::model::ErrorCode::INTERNAL_ERROR,
-        message: Cow::from(format!("JSON serialization failed: {}", e)),
+        message: Cow::from(format!("JSON serialization failed: {e}")),
         data: None,
     })?;
     text_result(json)
@@ -214,218 +191,124 @@ fn err_result(msg: String) -> Result<CallToolResult, McpError> {
     Ok(CallToolResult::error(vec![Content::text(msg)]))
 }
 
-/// Strict status parse: a typo must not silently demote a note to draft.
-fn parse_status(raw: &str) -> Result<NoteStatus, String> {
-    raw.parse().map_err(|_| {
-        format!(
-            "Invalid status '{}': expected 'draft', 'evidence', or 'canonical'",
-            raw
-        )
+fn note_response(stored: StoredNote) -> NoteResponse {
+    NoteResponse {
+        id: stored.note.id,
+        title: stored.note.title,
+        status: stored.note.status.to_string(),
+        tags: stored.note.tags,
+        content: stored.note.content,
+        warning: stored.warning,
+    }
+}
+
+fn note_body_response(note: Note) -> NoteResponse {
+    NoteResponse {
+        id: note.id,
+        title: note.title,
+        status: note.status.to_string(),
+        tags: note.tags,
+        content: note.content,
+        warning: None,
+    }
+}
+
+fn meta_response(note: NoteMeta) -> NoteMetaResponse {
+    NoteMetaResponse {
+        id: note.id,
+        title: note.title,
+        status: note.status.to_string(),
+        tags: note.tags,
+    }
+}
+
+fn typed_meta_response(note: NoteMeta, relation: RelationType) -> TypedNoteMetaResponse {
+    TypedNoteMetaResponse {
+        id: note.id,
+        title: note.title,
+        status: note.status.to_string(),
+        tags: note.tags,
+        relation: relation.to_string(),
+    }
+}
+
+fn search_payload(result: &SearchResult) -> serde_json::Value {
+    serde_json::json!({
+        "id": result.note.id,
+        "title": result.note.title,
+        "score": result.score,
+        "snippet": result.snippet,
+        "status": result.note.status.to_string(),
+        "tags": result.note.tags,
     })
 }
 
-/// Applies a search-index change and commits it. Returns a warning for the
-/// tool result when the change could not be applied (instead of silently
-/// leaving the note unsearchable).
-fn apply_search_change(
-    search: &mut SearchService,
-    verb: &str,
-    change: impl FnOnce(&mut SearchService) -> Result<(), String>,
-) -> Option<String> {
-    if search.is_readonly() {
-        return Some(format!(
-            "note {verb}; search index held by the app — results may be stale until reindex"
-        ));
-    }
-    change(search)
-        .and_then(|_| index_commit::commit_search(search))
-        .err()
-        .map(|e| format!("note {verb}; search index update failed: {e}"))
+fn recall_payload(result: &RecallResult) -> serde_json::Value {
+    serde_json::json!({
+        "note_id": result.note_id,
+        "title": result.title,
+        "snippet": result.snippet,
+        "score": result.score,
+        "graph_boost": result.graph_boost,
+        "total_score": result.total_score,
+        "tags": result.tags,
+    })
 }
 
-/// Latest modification time of anything under the vault (files and dirs, so
-/// adds, edits, deletes and renames all move it). Stat-only, no file reads.
-fn latest_vault_mtime(vault: &Path) -> Option<SystemTime> {
-    WalkDir::new(vault)
-        .into_iter()
-        .filter_map(|entry| entry.ok())
-        .filter_map(|entry| entry.metadata().ok()?.modified().ok())
-        .max()
+fn chunk_payload(chunk: &ChunkResult) -> serde_json::Value {
+    serde_json::json!({
+        "parent_note_id": chunk.parent_note_id,
+        "parent_title": chunk.parent_title,
+        "text": chunk.text,
+        "score": chunk.search_score,
+        "token_estimate": chunk.token_estimate,
+    })
 }
 
-fn read_mcp_import_content(file_path: &str) -> Result<String, String> {
-    let extension = Path::new(file_path)
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-
-    if extension == "docx" {
-        let bytes = std::fs::read(file_path).map_err(|e| e.to_string())?;
-        return extract_mcp_docx_text(&bytes);
+fn delete_message(deleted: &DeletedNote) -> String {
+    let mut msg = format!("Note '{}' deleted successfully.", deleted.id);
+    if let Some(warning) = &deleted.warning {
+        msg.push_str(&format!(" Warning: {warning}"));
     }
-
-    if extension == "pdf" {
-        let text = pdf_extract::extract_text(file_path).map_err(|e| e.to_string())?;
-        let text = text.trim().to_string();
-        return if text.is_empty() {
-            Err("PDF did not contain readable text".to_string())
-        } else {
-            Ok(text)
-        };
-    }
-
-    std::fs::read_to_string(file_path).map_err(|e| e.to_string())
+    msg
 }
 
-fn extract_mcp_docx_text(bytes: &[u8]) -> Result<String, String> {
-    let cursor = Cursor::new(bytes);
-    let mut archive =
-        ZipArchive::new(cursor).map_err(|e| format!("Failed to open DOCX archive: {}", e))?;
-    let mut document = archive
-        .by_name("word/document.xml")
-        .map_err(|e| format!("Failed to find DOCX document text: {}", e))?;
-    let mut xml = String::new();
-    document
-        .read_to_string(&mut xml)
-        .map_err(|e| format!("Failed to read DOCX document text: {}", e))?;
+fn import_payload(imported: &ImportedNotes) -> serde_json::Value {
+    serde_json::json!({
+        "platform": imported.platform,
+        "imported": imported.note_ids.len(),
+        "note_ids": imported.note_ids,
+        "errors": imported.errors,
+        "warning": imported.warning,
+    })
+}
 
-    let mut reader = quick_xml::Reader::from_str(&xml);
-    reader.config_mut().trim_text(false);
-    let mut text = String::new();
-    let mut in_text_run = false;
-
-    loop {
-        match reader.read_event() {
-            Ok(quick_xml::events::Event::Start(event)) => match event.name().as_ref() {
-                b"w:t" => in_text_run = true,
-                b"w:tab" => text.push('\t'),
-                b"w:br" => text.push('\n'),
-                _ => {}
-            },
-            Ok(quick_xml::events::Event::Empty(event)) => match event.name().as_ref() {
-                b"w:tab" => text.push('\t'),
-                b"w:br" => text.push('\n'),
-                _ => {}
-            },
-            Ok(quick_xml::events::Event::Text(event)) if in_text_run => {
-                let decoded = event
-                    .xml_content()
-                    .map_err(|e| format!("Failed to decode DOCX text: {}", e))?;
-                text.push_str(&decoded);
-            }
-            Ok(quick_xml::events::Event::End(event)) => match event.name().as_ref() {
-                b"w:t" => in_text_run = false,
-                b"w:p" => {
-                    if !text.ends_with('\n') {
-                        text.push('\n');
-                    }
-                }
-                _ => {}
-            },
-            Ok(quick_xml::events::Event::Eof) => break,
-            Err(e) => return Err(format!("Failed to parse DOCX document text: {}", e)),
-            _ => {}
-        }
-    }
-
-    let content = text.trim().to_string();
-    if content.is_empty() {
-        Err("DOCX did not contain readable text".to_string())
-    } else {
-        Ok(content)
-    }
+fn chunk_query_payload(found: &ChunkQueryResult) -> serde_json::Value {
+    serde_json::json!({
+        "chunks": found.chunks.iter().map(chunk_payload).collect::<Vec<_>>(),
+        "total_tokens": found.total_tokens,
+        "token_budget": found.token_budget,
+    })
 }
 
 // ── Tool implementations ─────────────────────────────────────────────────────
 
-/// Services and paths `GrafynMcpServer::new` installs on the tool router.
-pub struct GrafynMcpServerDeps {
-    pub knowledge_store: Arc<RwLock<KnowledgeStore>>,
-    pub search_service: Arc<RwLock<SearchService>>,
-    pub graph_index: Arc<RwLock<GraphIndex>>,
-    pub memory_service: Arc<RwLock<MemoryService>>,
-    pub chunk_index: Option<Arc<RwLock<ChunkIndex>>>,
-    pub retrieval_service: Arc<RwLock<RetrievalService>>,
-    pub priority_service: Arc<RwLock<PriorityScoringService>>,
-    pub vault_path: PathBuf,
-}
-
 #[tool_router]
 impl GrafynMcpServer {
-    pub fn new(deps: GrafynMcpServerDeps) -> Self {
-        let GrafynMcpServerDeps {
-            knowledge_store,
-            search_service,
-            graph_index,
-            memory_service,
-            chunk_index,
-            retrieval_service,
-            priority_service,
-            vault_path,
-        } = deps;
-        let vault_stamp = Arc::new(Mutex::new(latest_vault_mtime(&vault_path)));
+    pub fn new(core: Headless) -> Self {
         Self {
-            knowledge_store,
-            search_service,
-            graph_index,
-            memory_service,
-            chunk_index,
-            retrieval_service,
-            priority_service,
-            vault_path,
-            vault_stamp,
-            last_probe: Arc::new(Mutex::new(None)),
+            core,
             tool_router: Self::tool_router(),
         }
-    }
-
-    /// If the vault changed on disk since we last loaded it (e.g. the Grafyn
-    /// app wrote notes), reload the note cache and rebuild the local graph.
-    async fn refresh_if_vault_changed(&self) {
-        // The probe stats the whole vault; at most one probe per 2 s keeps bursts of tool calls cheap.
-        {
-            let mut last = self.last_probe.lock().unwrap_or_else(|e| e.into_inner());
-            if last.is_some_and(|at| at.elapsed() < std::time::Duration::from_secs(2)) {
-                return;
-            }
-            *last = Some(std::time::Instant::now());
-        }
-        let current = latest_vault_mtime(&self.vault_path);
-        {
-            let mut seen = self.vault_stamp.lock().unwrap_or_else(|e| e.into_inner());
-            if *seen == current {
-                return;
-            }
-            *seen = current;
-        }
-        // Lock order matches the write tools: knowledge_store, then graph.
-        let mut ks = self.knowledge_store.write().await;
-        ks.set_vault_path(self.vault_path.clone()); // re-walks the vault cache (changed files only)
-        let notes = ks.cached_full_notes();
-        self.graph_index.write().await.sync_notes(&notes);
     }
 
     #[tool(
         description = "List all notes in the knowledge base with metadata (title, status, tags). Returns JSON array sorted by last updated."
     )]
     async fn list_notes(&self) -> Result<CallToolResult, McpError> {
-        self.refresh_if_vault_changed().await;
-        let ks = self.knowledge_store.read().await;
-        match ks.list_notes() {
-            Ok(notes) => {
-                let response: Vec<NoteMetaResponse> = notes
-                    .into_iter()
-                    .map(|n| NoteMetaResponse {
-                        id: n.id,
-                        title: n.title,
-                        status: n.status.to_string(),
-                        tags: n.tags,
-                    })
-                    .collect();
-                json_result(&response)
-            }
-            Err(e) => err_result(format!("Failed to list notes: {}", e)),
+        match self.core.list_notes().await {
+            Ok(notes) => json_result(&notes.into_iter().map(meta_response).collect::<Vec<_>>()),
+            Err(e) => err_result(e),
         }
     }
 
@@ -436,17 +319,9 @@ impl GrafynMcpServer {
         &self,
         Parameters(params): Parameters<GetNoteParams>,
     ) -> Result<CallToolResult, McpError> {
-        let ks = self.knowledge_store.read().await;
-        match ks.get_note(&params.id) {
-            Ok(note) => json_result(&NoteResponse {
-                id: note.id,
-                title: note.title,
-                status: note.status.to_string(),
-                tags: note.tags,
-                content: note.content,
-                warning: None,
-            }),
-            Err(e) => err_result(format!("Note not found: {}", e)),
+        match self.core.get_note(&params.id).await {
+            Ok(note) => json_result(&note_body_response(note)),
+            Err(e) => err_result(e),
         }
     }
 
@@ -457,48 +332,13 @@ impl GrafynMcpServer {
         &self,
         Parameters(params): Parameters<CreateNoteParams>,
     ) -> Result<CallToolResult, McpError> {
-        let status = match parse_status(&params.status) {
-            Ok(status) => status,
-            Err(e) => return err_result(e),
-        };
-        let create = NoteCreate {
-            title: params.title,
-            content: params.content,
-            relative_path: None,
-            aliases: Vec::new(),
-            status,
-            tags: params.tags,
-            schema_version: CURRENT_NOTE_SCHEMA_VERSION,
-            migration_source: None,
-            optimizer_managed: false,
-            properties: Default::default(),
-        };
-
-        let mut ks = self.knowledge_store.write().await;
-        match ks.create_note(create) {
-            Ok(note) => {
-                let warning = {
-                    let mut search = self.search_service.write().await;
-                    apply_search_change(&mut search, "written", |s| {
-                        index_commit::index_note_for_search(s, &note)
-                    })
-                };
-                // Update graph index
-                {
-                    let mut graph = self.graph_index.write().await;
-                    graph.update_note(&note);
-                }
-
-                json_result(&NoteResponse {
-                    id: note.id,
-                    title: note.title,
-                    status: note.status.to_string(),
-                    tags: note.tags,
-                    content: note.content,
-                    warning,
-                })
-            }
-            Err(e) => err_result(format!("Failed to create note: {}", e)),
+        match self
+            .core
+            .create_note(params.title, params.content, params.tags, &params.status)
+            .await
+        {
+            Ok(stored) => json_result(&note_response(stored)),
+            Err(e) => err_result(e),
         }
     }
 
@@ -509,49 +349,19 @@ impl GrafynMcpServer {
         &self,
         Parameters(params): Parameters<UpdateNoteParams>,
     ) -> Result<CallToolResult, McpError> {
-        let id = params.id.clone();
-        let status = match params.status.as_deref().map(parse_status).transpose() {
-            Ok(status) => status,
-            Err(e) => return err_result(e),
-        };
-        let update = NoteUpdate {
-            title: params.title,
-            content: params.content,
-            relative_path: None,
-            aliases: None,
-            status,
-            tags: params.tags,
-            schema_version: None,
-            migration_source: None,
-            optimizer_managed: None,
-            properties: None,
-        };
-
-        let mut ks = self.knowledge_store.write().await;
-        match ks.update_note(&id, update) {
-            Ok(note) => {
-                let warning = {
-                    let mut search = self.search_service.write().await;
-                    apply_search_change(&mut search, "written", |s| {
-                        index_commit::index_note_for_search(s, &note)
-                    })
-                };
-                // Update graph index
-                {
-                    let mut graph = self.graph_index.write().await;
-                    graph.update_note(&note);
-                }
-
-                json_result(&NoteResponse {
-                    id: note.id,
-                    title: note.title,
-                    status: note.status.to_string(),
-                    tags: note.tags,
-                    content: note.content,
-                    warning,
-                })
-            }
-            Err(e) => err_result(format!("Failed to update note: {}", e)),
+        match self
+            .core
+            .update_note(
+                &params.id,
+                params.title,
+                params.content,
+                params.tags,
+                params.status.as_deref(),
+            )
+            .await
+        {
+            Ok(stored) => json_result(&note_response(stored)),
+            Err(e) => err_result(e),
         }
     }
 
@@ -562,28 +372,9 @@ impl GrafynMcpServer {
         &self,
         Parameters(params): Parameters<DeleteNoteParams>,
     ) -> Result<CallToolResult, McpError> {
-        let mut ks = self.knowledge_store.write().await;
-        match ks.delete_note(&params.id) {
-            Ok(()) => {
-                let warning = {
-                    let mut search = self.search_service.write().await;
-                    apply_search_change(&mut search, "deleted", |s| {
-                        index_commit::remove_note_for_search(s, &params.id)
-                    })
-                };
-                // Update graph index
-                {
-                    let mut graph = self.graph_index.write().await;
-                    graph.remove_note(&params.id);
-                }
-
-                let mut msg = format!("Note '{}' deleted successfully.", params.id);
-                if let Some(warning) = warning {
-                    msg.push_str(&format!(" Warning: {warning}"));
-                }
-                text_result(msg)
-            }
-            Err(e) => err_result(format!("Failed to delete note: {}", e)),
+        match self.core.delete_note(&params.id).await {
+            Ok(deleted) => text_result(delete_message(&deleted)),
+            Err(e) => err_result(e),
         }
     }
 
@@ -594,25 +385,9 @@ impl GrafynMcpServer {
         &self,
         Parameters(params): Parameters<SearchParams>,
     ) -> Result<CallToolResult, McpError> {
-        let search = self.search_service.read().await;
-        match search.search(&params.query, params.limit.max(1)) {
-            Ok(results) => {
-                let response: Vec<serde_json::Value> = results
-                    .into_iter()
-                    .map(|r| {
-                        serde_json::json!({
-                            "id": r.note.id,
-                            "title": r.note.title,
-                            "score": r.score,
-                            "snippet": r.snippet,
-                            "status": r.note.status.to_string(),
-                            "tags": r.note.tags,
-                        })
-                    })
-                    .collect();
-                json_result(&response)
-            }
-            Err(e) => err_result(format!("Search failed: {}", e)),
+        match self.core.search_notes(&params.query, params.limit).await {
+            Ok(results) => json_result(&results.iter().map(search_payload).collect::<Vec<_>>()),
+            Err(e) => err_result(e),
         }
     }
 
@@ -623,20 +398,13 @@ impl GrafynMcpServer {
         &self,
         Parameters(params): Parameters<BacklinksParams>,
     ) -> Result<CallToolResult, McpError> {
-        self.refresh_if_vault_changed().await;
-        let graph = self.graph_index.read().await;
-        let backlinks = graph.get_typed_backlinks(&params.note_id);
-        let response: Vec<TypedNoteMetaResponse> = backlinks
-            .into_iter()
-            .map(|(n, relation)| TypedNoteMetaResponse {
-                id: n.id,
-                title: n.title,
-                status: n.status.to_string(),
-                tags: n.tags,
-                relation: relation.to_string(),
-            })
-            .collect();
-        json_result(&response)
+        let backlinks = self.core.get_backlinks(&params.note_id).await;
+        json_result(
+            &backlinks
+                .into_iter()
+                .map(|(note, relation)| typed_meta_response(note, relation))
+                .collect::<Vec<_>>(),
+        )
     }
 
     #[tool(
@@ -646,20 +414,13 @@ impl GrafynMcpServer {
         &self,
         Parameters(params): Parameters<OutgoingParams>,
     ) -> Result<CallToolResult, McpError> {
-        self.refresh_if_vault_changed().await;
-        let graph = self.graph_index.read().await;
-        let outgoing = graph.get_typed_outgoing(&params.note_id);
-        let response: Vec<TypedNoteMetaResponse> = outgoing
-            .into_iter()
-            .map(|(n, relation)| TypedNoteMetaResponse {
-                id: n.id,
-                title: n.title,
-                status: n.status.to_string(),
-                tags: n.tags,
-                relation: relation.to_string(),
-            })
-            .collect();
-        json_result(&response)
+        let outgoing = self.core.get_outgoing(&params.note_id).await;
+        json_result(
+            &outgoing
+                .into_iter()
+                .map(|(note, relation)| typed_meta_response(note, relation))
+                .collect::<Vec<_>>(),
+        )
     }
 
     #[tool(
@@ -669,142 +430,14 @@ impl GrafynMcpServer {
         &self,
         Parameters(params): Parameters<ImportParams>,
     ) -> Result<CallToolResult, McpError> {
-        let content = match read_mcp_import_content(&params.file_path) {
-            Ok(c) => c,
-            Err(e) => return err_result(format!("Failed to read file: {}", e)),
-        };
-
-        let path = Path::new(&params.file_path);
-        let file_name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or(&params.file_path);
-        let extension = path
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .unwrap_or_default();
-
-        let (platform, items) = if let Some(platform) = import::detect_platform(&content) {
-            let all_conversations = match import::parse_content(&content) {
-                Ok(c) => c,
-                Err(e) => return err_result(format!("Failed to parse: {}", e)),
-            };
-            let to_import = if params.conversation_ids.is_empty() {
-                all_conversations
-            } else {
-                all_conversations
-                    .into_iter()
-                    .filter(|c| params.conversation_ids.contains(&c.id))
-                    .collect()
-            };
-            let items = to_import
-                .iter()
-                .map(|conv| {
-                    let mut props = std::collections::HashMap::new();
-                    props.insert(
-                        "source".into(),
-                        serde_json::Value::String(conv.platform.clone()),
-                    );
-                    props.insert(
-                        "source_id".into(),
-                        serde_json::Value::String(conv.id.clone()),
-                    );
-                    props.insert(
-                        "created_via".into(),
-                        serde_json::Value::String("mcp-import".into()),
-                    );
-                    let mut tags = conv.suggested_tags.clone();
-                    if !tags.contains(&"import".to_string()) {
-                        tags.push("import".to_string());
-                    }
-                    tags.truncate(5);
-                    (
-                        conv.title.clone(),
-                        import::format_as_markdown(conv),
-                        tags,
-                        props,
-                    )
-                })
-                .collect::<Vec<_>>();
-            (platform.to_string(), items)
-        } else {
-            let batch = match import::document::parse_document_text(file_name, extension, &content)
-            {
-                Ok(batch) => batch,
-                Err(e) => return err_result(format!("Failed to parse content: {}", e)),
-            };
-            let to_import = if params.conversation_ids.is_empty() {
-                batch.items
-            } else {
-                batch
-                    .items
-                    .into_iter()
-                    .filter(|item| params.conversation_ids.contains(&item.id))
-                    .collect()
-            };
-            let items = to_import
-                .into_iter()
-                .map(|item| {
-                    let mut props = item.metadata;
-                    props.insert(
-                        "source_id".into(),
-                        serde_json::Value::String(item.id.clone()),
-                    );
-                    (item.title, item.content, item.suggested_tags, props)
-                })
-                .collect::<Vec<_>>();
-            ("document".to_string(), items)
-        };
-
-        let mut created_ids = Vec::new();
-        let mut created_notes = Vec::new();
-        let mut errors = Vec::new();
-        let mut index_warning = None;
-
-        for (title, content, tags, properties) in items {
-            let note_create = NoteCreate {
-                title: title.clone(),
-                content,
-                relative_path: None,
-                aliases: Vec::new(),
-                status: NoteStatus::Evidence,
-                tags,
-                schema_version: CURRENT_NOTE_SCHEMA_VERSION,
-                migration_source: Some("mcp-import".into()),
-                optimizer_managed: false,
-                properties,
-            };
-
-            let mut ks = self.knowledge_store.write().await;
-            match ks.create_note(note_create) {
-                Ok(note) => {
-                    {
-                        let mut search = self.search_service.write().await;
-                        if let Some(w) = apply_search_change(&mut search, "written", |s| {
-                            index_commit::index_note_for_search(s, &note)
-                        }) {
-                            index_warning = Some(w);
-                        }
-                    }
-                    created_ids.push(note.id.clone());
-                    created_notes.push(note);
-                }
-                Err(e) => {
-                    errors.push(format!("Failed to create '{}': {}", title, e));
-                }
-            }
+        match self
+            .core
+            .import_conversation(&params.file_path, &params.conversation_ids)
+            .await
+        {
+            Ok(imported) => json_result(&import_payload(&imported)),
+            Err(e) => err_result(e),
         }
-        // One graph rebuild for the whole import instead of one per note.
-        self.graph_index.write().await.update_notes(&created_notes);
-
-        let result = serde_json::json!({
-            "platform": platform,
-            "imported": created_ids.len(),
-            "note_ids": created_ids,
-            "errors": errors,
-            "warning": index_warning,
-        });
-        json_result(&result)
     }
 
     #[tool(
@@ -814,71 +447,23 @@ impl GrafynMcpServer {
         &self,
         Parameters(params): Parameters<RecallParams>,
     ) -> Result<CallToolResult, McpError> {
-        // If token_budget is set and chunk index is available, use chunk retrieval
-        if let (Some(budget), Some(chunk_index)) = (params.token_budget, &self.chunk_index) {
-            let chunk_index = chunk_index.read().await;
-            let graph = self.graph_index.read().await;
-            let priority = self.priority_service.read().await;
-            let retrieval = self.retrieval_service.read().await;
-
-            match retrieval.retrieve_chunks(
-                &chunk_index,
-                &graph,
-                &priority,
-                &params.query,
-                budget,
-                &params.context_note_ids,
-            ) {
-                Ok(mut chunks) => {
-                    retain_resolvable_chunks(&mut chunks, &*self.knowledge_store.read().await);
-                    let response: Vec<serde_json::Value> = chunks
-                        .into_iter()
-                        .map(|c| {
-                            serde_json::json!({
-                                "parent_note_id": c.parent_note_id,
-                                "parent_title": c.parent_title,
-                                "text": c.text,
-                                "score": c.search_score,
-                                "token_estimate": c.token_estimate,
-                            })
-                        })
-                        .collect();
-                    json_result(&response)
-                }
-                Err(e) => err_result(format!("Chunk recall failed: {}", e)),
-            }
-        } else {
-            // Note-level recall (original behavior)
-            let search = self.search_service.read().await;
-            let graph = self.graph_index.read().await;
-            let memory = self.memory_service.read().await;
-
-            match memory.recall_relevant(
-                &search,
-                &graph,
+        match self
+            .core
+            .recall_relevant(
                 &params.query,
                 &params.context_note_ids,
-                params.limit.max(1),
-            ) {
-                Ok(results) => {
-                    let response: Vec<serde_json::Value> = results
-                        .into_iter()
-                        .map(|r| {
-                            serde_json::json!({
-                                "note_id": r.note_id,
-                                "title": r.title,
-                                "snippet": r.snippet,
-                                "score": r.score,
-                                "graph_boost": r.graph_boost,
-                                "total_score": r.total_score,
-                                "tags": r.tags,
-                            })
-                        })
-                        .collect();
-                    json_result(&response)
-                }
-                Err(e) => err_result(format!("Recall failed: {}", e)),
+                params.limit,
+                params.token_budget,
+            )
+            .await
+        {
+            Ok(RecallOutcome::Chunks(chunks)) => {
+                json_result(&chunks.iter().map(chunk_payload).collect::<Vec<_>>())
             }
+            Ok(RecallOutcome::Notes(results)) => {
+                json_result(&results.iter().map(recall_payload).collect::<Vec<_>>())
+            }
+            Err(e) => err_result(e),
         }
     }
 
@@ -889,44 +474,13 @@ impl GrafynMcpServer {
         &self,
         Parameters(params): Parameters<SearchChunksParams>,
     ) -> Result<CallToolResult, McpError> {
-        let Some(chunk_index) = &self.chunk_index else {
-            return err_result(
-                "Chunk index not available. Run the Grafyn app first to build it.".into(),
-            );
-        };
-
-        let chunk_index = chunk_index.read().await;
-        let graph = self.graph_index.read().await;
-        let priority = self.priority_service.read().await;
-        let retrieval = self.retrieval_service.read().await;
-
-        match retrieval.retrieve_chunks(
-            &chunk_index,
-            &graph,
-            &priority,
-            &params.query,
-            params.token_budget,
-            &params.context_note_ids,
-        ) {
-            Ok(mut chunks) => {
-                retain_resolvable_chunks(&mut chunks, &*self.knowledge_store.read().await);
-                let total_tokens: usize = chunks.iter().map(|c| c.token_estimate).sum();
-                let response = serde_json::json!({
-                    "chunks": chunks.iter().map(|c| {
-                        serde_json::json!({
-                            "parent_note_id": c.parent_note_id,
-                            "parent_title": c.parent_title,
-                            "text": c.text,
-                            "score": c.search_score,
-                            "token_estimate": c.token_estimate,
-                        })
-                    }).collect::<Vec<_>>(),
-                    "total_tokens": total_tokens,
-                    "token_budget": params.token_budget,
-                });
-                json_result(&response)
-            }
-            Err(e) => err_result(format!("Chunk search failed: {}", e)),
+        match self
+            .core
+            .search_chunks(&params.query, params.token_budget, &params.context_note_ids)
+            .await
+        {
+            Ok(found) => json_result(&chunk_query_payload(&found)),
+            Err(e) => err_result(e),
         }
     }
 }
@@ -953,26 +507,38 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_status_rejects_unknown_strings() {
-        assert_eq!(parse_status("canonical").unwrap(), NoteStatus::Canonical);
-        assert!(parse_status("canonicl").is_err());
+    fn delete_message_appends_the_index_warning() {
+        assert_eq!(
+            delete_message(&DeletedNote {
+                id: "abc".into(),
+                warning: None,
+            }),
+            "Note 'abc' deleted successfully."
+        );
+        assert_eq!(
+            delete_message(&DeletedNote {
+                id: "abc".into(),
+                warning: Some(
+                    "note deleted; search index held by the app — results may be stale until reindex"
+                        .into(),
+                ),
+            }),
+            "Note 'abc' deleted successfully. Warning: note deleted; search index held by the app — results may be stale until reindex"
+        );
     }
 
     #[test]
-    fn readonly_search_yields_stale_index_warning() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        drop(SearchService::new(tmp.path().to_path_buf()).unwrap());
-        let mut search = SearchService::new_readonly(tmp.path().to_path_buf()).unwrap();
-        let warning = apply_search_change(&mut search, "written", |_| Ok(())).unwrap();
-        assert!(warning.contains("stale until reindex"));
-    }
-
-    #[test]
-    fn vault_mtime_moves_when_a_note_is_added() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let before = latest_vault_mtime(tmp.path());
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        std::fs::write(tmp.path().join("new.md"), "# new").unwrap();
-        assert_ne!(latest_vault_mtime(tmp.path()), before);
+    fn import_payload_keeps_null_warning_and_counts_ids() {
+        let payload = import_payload(&ImportedNotes {
+            platform: "chatgpt".into(),
+            note_ids: vec!["a".into()],
+            errors: Vec::new(),
+            warning: None,
+        });
+        assert_eq!(payload["platform"], "chatgpt");
+        assert_eq!(payload["imported"], 1);
+        assert_eq!(payload["note_ids"][0], "a");
+        assert!(payload["errors"].as_array().unwrap().is_empty());
+        assert!(payload["warning"].is_null());
     }
 }

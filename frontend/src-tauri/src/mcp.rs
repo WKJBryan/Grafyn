@@ -13,24 +13,17 @@
 // Suppress dead_code warnings for the unused services/models.
 #![allow(dead_code)]
 
+mod headless;
 mod mcp_tools;
 mod models;
 mod services;
 
-use crate::mcp_tools::{GrafynMcpServer, GrafynMcpServerDeps};
-use crate::services::chunk_index::ChunkIndex;
-use crate::services::graph_index::GraphIndex;
-use crate::services::knowledge_store::KnowledgeStore;
-use crate::services::memory::MemoryService;
-use crate::services::priority::PriorityScoringService;
-use crate::services::retrieval::RetrievalService;
-use crate::services::search::SearchService;
+use crate::headless::Headless;
+use crate::mcp_tools::GrafynMcpServer;
 use crate::services::settings::SettingsService;
 use clap::Parser;
 use rmcp::ServiceExt;
 use std::path::PathBuf;
-use std::sync::Arc;
-use tokio::sync::RwLock;
 
 /// Grafyn MCP Server — exposes your knowledge base to Claude Desktop
 #[derive(Parser, Debug)]
@@ -56,93 +49,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Resolve paths: CLI args > settings.json > defaults
     let (vault_path, data_path) = resolve_paths(args.vault, args.data);
-
-    log::info!("Vault path: {}", vault_path.display());
-    log::info!("Data path: {}", data_path.display());
-
-    // Ensure directories exist
-    std::fs::create_dir_all(&vault_path)?;
-    std::fs::create_dir_all(&data_path)?;
-
-    // Initialize services
-    let knowledge_store = KnowledgeStore::new(vault_path.clone(), data_path.clone());
-
-    // Try full SearchService first; fall back to read-only if writer lock is held
-    let search_service = match SearchService::new(data_path.clone()) {
-        Ok(s) => {
-            log::info!("Search service initialized with write access");
-            s
-        }
-        Err(e) => {
-            log::warn!(
-                "Could not acquire search writer (Grafyn app may be running): {}. \
-                 Falling back to read-only search.",
-                e
-            );
-            match SearchService::new_readonly(data_path.clone()) {
-                Ok(s) => {
-                    log::info!("Search service initialized in read-only mode");
-                    s
-                }
-                Err(e2) => {
-                    // No no-search mode exists; fail with both causes instead of
-                    // retrying the constructor that just failed.
-                    return Err(format!(
-                        "Cannot open search index: writable open failed ({}); \
-                         read-only open failed ({})",
-                        e, e2
-                    )
-                    .into());
-                }
-            }
-        }
-    };
-
-    // Build graph index from notes
-    let mut graph_index = GraphIndex::new();
-    let notes_for_graph: Vec<_> = knowledge_store
-        .list_notes()
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|m| knowledge_store.get_note(&m.id).ok())
-        .collect();
-    graph_index.build_from_notes(&notes_for_graph);
-    log::info!(
-        "Graph index built: {} notes, {} links",
-        graph_index.stats().total_notes,
-        graph_index.stats().total_links
-    );
-
-    let memory_service = MemoryService::new();
-    let priority_service = PriorityScoringService::new(data_path.clone());
-    let retrieval_service = RetrievalService::new(data_path.clone());
-
-    // Try to open chunk index (read-only — Tauri app may hold the writer lock)
-    let chunk_index = match ChunkIndex::new_readonly(data_path.clone()) {
-        Ok(ci) => {
-            log::info!("Chunk index opened in read-only mode");
-            Some(Arc::new(RwLock::new(ci)))
-        }
-        Err(e) => {
-            log::warn!(
-                "Chunk index not available: {}. search_chunks and chunk recall will be disabled.",
-                e
-            );
-            None
-        }
-    };
-
-    // Create MCP server
-    let server = GrafynMcpServer::new(GrafynMcpServerDeps {
-        knowledge_store: Arc::new(RwLock::new(knowledge_store)),
-        search_service: Arc::new(RwLock::new(search_service)),
-        graph_index: Arc::new(RwLock::new(graph_index)),
-        memory_service: Arc::new(RwLock::new(memory_service)),
-        chunk_index,
-        retrieval_service: Arc::new(RwLock::new(retrieval_service)),
-        priority_service: Arc::new(RwLock::new(priority_service)),
-        vault_path,
-    });
+    let core = Headless::open(vault_path, data_path)?;
+    let server = GrafynMcpServer::new(core);
 
     log::info!("Starting Grafyn MCP server on stdio...");
 
