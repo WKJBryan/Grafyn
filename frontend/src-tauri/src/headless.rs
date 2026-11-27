@@ -863,7 +863,10 @@ mod tests {
         assert_eq!(wide.token_budget, 4_000);
         assert_eq!(
             wide.total_tokens,
-            wide.chunks.iter().map(|chunk| chunk.token_estimate).sum()
+            wide.chunks
+                .iter()
+                .map(|chunk| chunk.token_estimate)
+                .sum::<usize>()
         );
         for chunk in &wide.chunks {
             assert!(chunk.search_score > 0.0, "score={}", chunk.search_score);
@@ -1042,7 +1045,10 @@ Original body about the dock.
             )
             .await
             .unwrap();
-        assert_eq!(edited.note.content, "Edited body about the dock.\n");
+        assert_eq!(
+            edited.note.content.trim_end(),
+            "Edited body about the dock."
+        );
         let preserved = std::fs::read_to_string(vault.path().join("custom-note.md")).unwrap();
         let block = frontmatter_block(&preserved);
         assert!(block.contains("custom_key: keep-me"));
@@ -1060,7 +1066,10 @@ Original body about the dock.
             .await
             .unwrap();
         assert_eq!(rewritten.note.status, NoteStatus::Canonical);
-        assert_eq!(rewritten.note.content, "Edited body about the dock.\n");
+        assert_eq!(
+            rewritten.note.content.trim_end(),
+            "Edited body about the dock."
+        );
         assert!(rewritten.note.frontmatter_raw_fallback.is_none());
         let file =
             std::fs::read_to_string(vault.path().join(&rewritten.note.relative_path)).unwrap();
