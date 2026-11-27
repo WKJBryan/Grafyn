@@ -1,6 +1,6 @@
 //! Shared search-index-commit primitives used by BOTH the Tauri desktop app
 //! (`main.rs` / `commands/mod.rs`) and the standalone MCP binary
-//! (`mcp.rs` / `mcp_tools.rs`).
+//! (`headless.rs`, reached from `mcp.rs` / `mcp_tools.rs`).
 //!
 //! Both binaries share the `services/` module tree verbatim (each declares
 //! its own `mod services;` pointing at the same directory — see `main.rs`
@@ -12,7 +12,7 @@
 //! note write" — not chunk indexing, not graph updates, not topic hubs. Chunk
 //! indexing in particular is NOT genuinely shared: the Tauri app always
 //! syncs the chunk index on every note write (`commands::sync_chunk_index_for_note`),
-//! but the MCP binary's `create_note`/`update_note`/`delete_note` tools have
+//! but the headless `create_note`/`update_note`/`delete_note` operations have
 //! never written to the chunk index at all (only `search_chunks` reads it,
 //! and only when a chunk index was supplied at startup) — extracting a
 //! shared "index commit" that included chunk sync would either change MCP
