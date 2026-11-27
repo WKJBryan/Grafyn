@@ -103,7 +103,7 @@ impl PriorityScoringService {
     /// Re-rank search results by applying priority scoring on top of BM25 scores.
     ///
     /// Final score = bm25_score * (1.0 + recency_boost + status_boost + tag_boost)
-    pub fn score_results(&self, results: &mut Vec<SearchResult>) {
+    pub fn score_results(&self, results: &mut [SearchResult]) {
         let now = Utc::now();
 
         for result in results.iter_mut() {

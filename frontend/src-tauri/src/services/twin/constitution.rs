@@ -543,7 +543,7 @@ fn constitution_item_is_vault_derived(item: &ConstitutionItem) -> bool {
 }
 
 fn record_is_vault_derived(record: &UserRecord) -> bool {
-    record.metadata.get("source_note_id").is_some()
+    record.metadata.contains_key("source_note_id")
         || matches!(
             record.metadata.get("source_type").and_then(Value::as_str),
             Some("interview_answer") | Some("note")
@@ -1213,7 +1213,7 @@ impl TwinStore {
         let stale_items = self
             .list_constitution_items()?
             .into_iter()
-            .filter(|item| constitution_item_is_vault_derived(item))
+            .filter(constitution_item_is_vault_derived)
             .filter(|item| {
                 item.evidence_refs
                     .iter()

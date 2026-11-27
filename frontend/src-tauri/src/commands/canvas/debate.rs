@@ -14,7 +14,7 @@ use crate::models::canvas::{
     DebateStartRequest, PromptType, TilePosition,
 };
 use crate::models::twin::TraceEventType;
-use crate::services::openrouter::{ChatMessage, StreamUpdate};
+use crate::services::openrouter::{ChatMessage, OpenRouterChatRequest, StreamUpdate};
 use crate::AppState;
 use chrono::Utc;
 use futures::StreamExt;
@@ -271,14 +271,16 @@ pub async fn start_debate(
                             let openrouter = openrouter_arc.read().await;
                             let result = openrouter
                                 .chat_stream(
-                                    &model_id,
-                                    messages,
-                                    None,
-                                    Some(0.7),
-                                    None,
-                                    Some(reasoning_effort.as_str()),
-                                    false,
-                                    5,
+                                    OpenRouterChatRequest {
+                                        model: &model_id,
+                                        messages,
+                                        system_prompt: None,
+                                        temperature: Some(0.7),
+                                        max_tokens: None,
+                                        reasoning_effort: Some(reasoning_effort.as_str()),
+                                        web_search: false,
+                                        web_search_max_results: 5,
+                                    },
                                     Some(&format!("canvas:{session_id}:{model_id}")),
                                 )
                                 .await;
@@ -628,14 +630,16 @@ pub async fn continue_debate(
                         let openrouter = openrouter_arc.read().await;
                         let result = openrouter
                             .chat_stream(
-                                &model_id,
-                                messages,
-                                None,
-                                Some(0.7),
-                                None,
-                                Some(reasoning_effort.as_str()),
-                                false,
-                                5,
+                                OpenRouterChatRequest {
+                                    model: &model_id,
+                                    messages,
+                                    system_prompt: None,
+                                    temperature: Some(0.7),
+                                    max_tokens: None,
+                                    reasoning_effort: Some(reasoning_effort.as_str()),
+                                    web_search: false,
+                                    web_search_max_results: 5,
+                                },
                                 Some(&format!("canvas:{session_id}:{model_id}")),
                             )
                             .await;
@@ -1018,16 +1022,16 @@ async fn run_debate_chair_synthesis(
         }
         let openrouter = openrouter.read().await;
         openrouter
-            .chat(
+            .chat(OpenRouterChatRequest {
                 model,
                 messages,
-                None,
-                Some(0.4),
-                Some(700),
-                Some("none"),
-                false,
-                0,
-            )
+                system_prompt: None,
+                temperature: Some(0.4),
+                max_tokens: Some(700),
+                reasoning_effort: Some("none"),
+                web_search: false,
+                web_search_max_results: 0,
+            })
             .await
             .map_err(|e| e.to_string())?
     };

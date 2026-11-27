@@ -16,7 +16,7 @@ use crate::models::twin::{
     ActionGap, ConstitutionItem, ConstitutionSetup, DecisionEpisode, TwinContextRecord,
 };
 use crate::services::ollama::OllamaService;
-use crate::services::openrouter::{ChatMessage, OpenRouterService};
+use crate::services::openrouter::{ChatMessage, OpenRouterChatRequest, OpenRouterService};
 use crate::services::retrieval::{retain_resolvable_chunks, RetrievalResult};
 use crate::services::twin::{parse_twin_prediction, TwinStore};
 use crate::AppState;
@@ -1046,16 +1046,16 @@ pub(super) async fn run_sealed_twin_prediction(
         ModelProviderRoute::OpenRouter => {
             let openrouter = openrouter.read().await;
             openrouter
-                .chat(
-                    &prediction_model,
+                .chat(OpenRouterChatRequest {
+                    model: &prediction_model,
                     messages,
-                    Some(&system_prompt),
-                    Some(SEALED_PREDICTION_TEMPERATURE),
-                    Some(600),
+                    system_prompt: Some(&system_prompt),
+                    temperature: Some(SEALED_PREDICTION_TEMPERATURE),
+                    max_tokens: Some(600),
                     reasoning_effort,
-                    false,
-                    0,
-                )
+                    web_search: false,
+                    web_search_max_results: 0,
+                })
                 .await
         }
     };

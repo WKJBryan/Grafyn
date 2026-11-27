@@ -17,7 +17,7 @@ mod mcp_tools;
 mod models;
 mod services;
 
-use crate::mcp_tools::GrafynMcpServer;
+use crate::mcp_tools::{GrafynMcpServer, GrafynMcpServerDeps};
 use crate::services::chunk_index::ChunkIndex;
 use crate::services::graph_index::GraphIndex;
 use crate::services::knowledge_store::KnowledgeStore;
@@ -133,16 +133,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Create MCP server
-    let server = GrafynMcpServer::new(
-        Arc::new(RwLock::new(knowledge_store)),
-        Arc::new(RwLock::new(search_service)),
-        Arc::new(RwLock::new(graph_index)),
-        Arc::new(RwLock::new(memory_service)),
+    let server = GrafynMcpServer::new(GrafynMcpServerDeps {
+        knowledge_store: Arc::new(RwLock::new(knowledge_store)),
+        search_service: Arc::new(RwLock::new(search_service)),
+        graph_index: Arc::new(RwLock::new(graph_index)),
+        memory_service: Arc::new(RwLock::new(memory_service)),
         chunk_index,
-        Arc::new(RwLock::new(retrieval_service)),
-        Arc::new(RwLock::new(priority_service)),
+        retrieval_service: Arc::new(RwLock::new(retrieval_service)),
+        priority_service: Arc::new(RwLock::new(priority_service)),
         vault_path,
-    );
+    });
 
     log::info!("Starting Grafyn MCP server on stdio...");
 

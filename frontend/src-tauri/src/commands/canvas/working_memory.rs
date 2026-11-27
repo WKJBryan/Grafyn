@@ -10,7 +10,7 @@ use crate::models::canvas::{
     CanvasSession, CanvasStreamEvent, CanvasWorkingMemory, ContextMode, ModelPosition, PromptRequest,
 };
 use crate::models::twin::TraceEventType;
-use crate::services::openrouter::ChatMessage;
+use crate::services::openrouter::{ChatMessage, OpenRouterChatRequest};
 use crate::AppState;
 use chrono::Utc;
 use serde_json::{json, Value};
@@ -922,16 +922,16 @@ async fn compile_dream_with_llm(state: &AppState, user_prompt: &str) -> Result<S
             }
             let openrouter = state.openrouter.read().await;
             openrouter
-                .chat(
+                .chat(OpenRouterChatRequest {
                     model,
                     messages,
-                    Some(COMPILE_SYSTEM_PROMPT),
-                    Some(0.2),
-                    Some(800),
-                    Some("none"),
-                    false,
-                    0,
-                )
+                    system_prompt: Some(COMPILE_SYSTEM_PROMPT),
+                    temperature: Some(0.2),
+                    max_tokens: Some(800),
+                    reasoning_effort: Some("none"),
+                    web_search: false,
+                    web_search_max_results: 0,
+                })
                 .await
                 .map_err(|e| e.to_string())
         }

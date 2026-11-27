@@ -1,6 +1,6 @@
 use crate::models::canvas::{
     CanvasSession, CanvasViewport, CanvasWorkingMemory, Debate, LLMNodePositionUpdate, PromptTile,
-    SessionCreate, SessionMeta, SessionUpdate, TilePosition, TilePositionUpdate,
+    ResponseStatus, SessionCreate, SessionMeta, SessionUpdate, TilePosition, TilePositionUpdate,
 };
 use crate::services::atomic_io::write_atomic;
 use anyhow::{Context, Result};
@@ -20,6 +20,16 @@ pub struct CanvasStore {
     session_cache: HashMap<String, CanvasSession>,
     /// Whether the session list cache has been populated from disk.
     list_cache_ready: bool,
+}
+
+/// Persisted fields for one model response on a canvas tile.
+#[derive(Debug, Clone)]
+pub struct TileResponseUpdate {
+    pub model_id: String,
+    pub content: String,
+    pub status: ResponseStatus,
+    pub error: Option<String>,
+    pub cost_usd: Option<f64>,
 }
 
 impl CanvasStore {
@@ -44,7 +54,7 @@ impl CanvasStore {
             .iter()
             .filter(|tile| {
                 tile.parent_tile_id.as_deref() == Some(tile_id)
-                    && parent_model_id.map_or(true, |model_id| {
+                    && parent_model_id.is_none_or(|model_id| {
                         tile.parent_model_id.as_deref() == Some(model_id)
                     })
             })
@@ -100,7 +110,7 @@ impl CanvasStore {
             .filter_map(|e| e.ok())
         {
             let path = entry.path();
-            if path.extension().map_or(false, |ext| ext == "json") {
+            if path.extension().is_some_and(|ext| ext == "json") {
                 if let Ok(session) = self.read_session_file(path) {
                     self.session_cache.insert(session.id.clone(), session);
                 }
@@ -465,23 +475,17 @@ impl CanvasStore {
         &mut self,
         session_id: &str,
         tile_id: &str,
-        updates: &[(
-            String,
-            String,
-            crate::models::canvas::ResponseStatus,
-            Option<String>,
-            Option<f64>,
-        )],
+        updates: Vec<TileResponseUpdate>,
     ) -> Result<()> {
         let session = self.get_session_mut(session_id)?;
 
         if let Some(tile) = session.prompt_tiles.iter_mut().find(|t| t.id == tile_id) {
-            for (model_id, content, status, error, cost_usd) in updates {
-                if let Some(response) = tile.responses.get_mut(model_id) {
-                    response.content = content.clone();
-                    response.status = status.clone();
-                    response.error = error.clone();
-                    response.cost_usd = *cost_usd;
+            for update in updates {
+                if let Some(response) = tile.responses.get_mut(&update.model_id) {
+                    response.content = update.content;
+                    response.status = update.status;
+                    response.error = update.error;
+                    response.cost_usd = update.cost_usd;
                 }
             }
         }
@@ -496,26 +500,9 @@ impl CanvasStore {
         &mut self,
         session_id: &str,
         tile_id: &str,
-        model_id: &str,
-        content: &str,
-        status: crate::models::canvas::ResponseStatus,
-        error: Option<&str>,
-        cost_usd: Option<f64>,
+        update: TileResponseUpdate,
     ) -> Result<()> {
-        let session = self.get_session_mut(session_id)?;
-
-        if let Some(tile) = session.prompt_tiles.iter_mut().find(|t| t.id == tile_id) {
-            if let Some(response) = tile.responses.get_mut(model_id) {
-                response.content = content.to_string();
-                response.status = status;
-                response.error = error.map(str::to_string);
-                response.cost_usd = cost_usd;
-            }
-        }
-
-        let session = session.clone();
-        self.write_session_file(&session)?;
-        Ok(())
+        self.batch_update_tile_responses(session_id, tile_id, vec![update])
     }
 
     /// Save a full session object (used after streaming completes)

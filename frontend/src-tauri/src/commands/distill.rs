@@ -3,7 +3,7 @@ use crate::models::note::{
     DeduplicationAction, DistillRequest, DistillResponse, ExtractionMode, HubCreatePolicy,
     HubUpdate, NoteCreate, NoteStatus, NoteUpdate,
 };
-use crate::services::openrouter::ChatMessage;
+use crate::services::openrouter::{ChatMessage, OpenRouterChatRequest};
 use crate::services::texttiling::{self, TextTilingConfig};
 use crate::services::yake;
 use crate::AppState;
@@ -378,16 +378,16 @@ async fn extract_candidates_llm(
 
     let openrouter = state.openrouter.read().await;
     let response = openrouter
-        .chat(
-            &model,
+        .chat(OpenRouterChatRequest {
+            model: &model,
             messages,
-            Some(system),
-            Some(0.3),
-            Some(4096),
-            None,
-            false,
-            5,
-        )
+            system_prompt: Some(system),
+            temperature: Some(0.3),
+            max_tokens: Some(4096),
+            reasoning_effort: None,
+            web_search: false,
+            web_search_max_results: 5,
+        })
         .await
         .map_err(|e| format!("LLM extraction failed: {}", e))?;
 

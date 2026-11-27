@@ -623,6 +623,37 @@ mod tests {
         assert!(session.working_memory.model_positions.is_empty());
         assert!(session.working_memory.is_empty());
     }
+
+    #[test]
+    fn tile_created_event_serializes_tile_inline() {
+        let tile = PromptTile {
+            id: "tile-1".to_string(),
+            prompt: "hello".to_string(),
+            ..Default::default()
+        };
+
+        let event = CanvasStreamEvent::TileCreated {
+            session_id: "session-1".to_string(),
+            tile: Box::new(tile),
+        };
+
+        let value = serde_json::to_value(&event).unwrap();
+        assert_eq!(value["type"], "tile_created");
+        assert_eq!(value["session_id"], "session-1");
+        assert_eq!(value["tile"]["id"], "tile-1");
+        assert_eq!(value["tile"]["prompt"], "hello");
+        assert!(value["tile"].is_object());
+
+        let restored: CanvasStreamEvent = serde_json::from_value(value).unwrap();
+        match restored {
+            CanvasStreamEvent::TileCreated { session_id, tile } => {
+                assert_eq!(session_id, "session-1");
+                assert_eq!(tile.id, "tile-1");
+                assert_eq!(tile.prompt, "hello");
+            }
+            other => panic!("expected tile_created, got {other:?}"),
+        }
+    }
 }
 
 /// Model pricing information
@@ -649,7 +680,8 @@ pub struct TilePositionUpdate {
 pub enum CanvasStreamEvent {
     TileCreated {
         session_id: String,
-        tile: PromptTile,
+        // Boxed so the stream-event enum stays small. Serde writes `Box<T>` as `T`.
+        tile: Box<PromptTile>,
     },
     Chunk {
         session_id: String,
