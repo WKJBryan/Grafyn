@@ -20,7 +20,7 @@ impl SettingsService {
     /// Create a SettingsService with default settings (used as fallback)
     pub fn load_defaults() -> Self {
         let config_dir = dirs::config_dir()
-            .or_else(|| dirs::data_local_dir())
+            .or_else(dirs::data_local_dir)
             .unwrap_or_else(|| PathBuf::from("."))
             .join("Grafyn");
 
@@ -41,7 +41,7 @@ impl SettingsService {
     /// Load settings from disk or create defaults
     pub fn load() -> Result<Self> {
         let config_dir = dirs::config_dir()
-            .or_else(|| dirs::data_local_dir())
+            .or_else(dirs::data_local_dir)
             .unwrap_or_else(|| PathBuf::from("."))
             .join("Grafyn");
 
@@ -432,10 +432,12 @@ mod tests {
 
     #[test]
     fn test_settings_update() {
-        let mut settings = UserSettings::default();
-        settings.vault_path = Some("/test/vault".to_string());
-        settings.openrouter_api_key = Some("sk-test".to_string());
-        settings.setup_completed = true;
+        let settings = UserSettings {
+            vault_path: Some("/test/vault".to_string()),
+            openrouter_api_key: Some("sk-test".to_string()),
+            setup_completed: true,
+            ..Default::default()
+        };
 
         assert!(!settings.needs_setup());
         assert!(settings.has_openrouter_key());

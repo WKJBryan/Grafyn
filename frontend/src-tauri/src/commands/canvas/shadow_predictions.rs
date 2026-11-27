@@ -6,7 +6,7 @@
 use super::context::SEALED_PREDICTION_TEMPERATURE;
 use super::shared::ModelProviderRoute;
 use crate::services::ollama::OllamaService;
-use crate::services::openrouter::{ChatMessage, OpenRouterService};
+use crate::services::openrouter::{ChatMessage, OpenRouterChatRequest, OpenRouterService};
 use crate::services::twin::{parse_twin_prediction, TwinStore};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -50,16 +50,16 @@ pub(super) async fn run_shadow_predictions(
         ModelProviderRoute::OpenRouter => {
             let openrouter = openrouter.read().await;
             openrouter
-                .chat(
+                .chat(OpenRouterChatRequest {
                     model,
-                    messages(),
-                    None,
-                    Some(SEALED_PREDICTION_TEMPERATURE),
-                    Some(600),
-                    primary_reasoning_effort,
-                    false,
-                    0,
-                )
+                    messages: messages(),
+                    system_prompt: None,
+                    temperature: Some(SEALED_PREDICTION_TEMPERATURE),
+                    max_tokens: Some(600),
+                    reasoning_effort: primary_reasoning_effort,
+                    web_search: false,
+                    web_search_max_results: 0,
+                })
                 .await
         }
     };
@@ -82,16 +82,16 @@ pub(super) async fn run_shadow_predictions(
     let reasoning_on = {
         let openrouter = openrouter.read().await;
         openrouter
-            .chat(
+            .chat(OpenRouterChatRequest {
                 model,
-                messages(),
-                Some(system_prompt),
-                Some(SEALED_PREDICTION_TEMPERATURE),
-                Some(REASONING_ON_MAX_TOKENS),
-                Some("medium"),
-                false,
-                0,
-            )
+                messages: messages(),
+                system_prompt: Some(system_prompt),
+                temperature: Some(SEALED_PREDICTION_TEMPERATURE),
+                max_tokens: Some(REASONING_ON_MAX_TOKENS),
+                reasoning_effort: Some("medium"),
+                web_search: false,
+                web_search_max_results: 0,
+            })
             .await
     };
     seal_shadow(

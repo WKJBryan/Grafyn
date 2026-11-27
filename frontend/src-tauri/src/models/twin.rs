@@ -20,21 +20,16 @@ pub enum RecordOrigin {
     Inferred,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum PromotionState {
+    #[default]
     Candidate,
     AutoPromoted,
     Endorsed,
     Rejected,
     Private,
     NoTrain,
-}
-
-impl Default for PromotionState {
-    fn default() -> Self {
-        PromotionState::Candidate
-    }
 }
 
 impl PromotionState {

@@ -258,7 +258,7 @@ impl LinkDiscoveryService {
             profile.last_discovered_at = record.cached_at;
             record.profile = profile.clone();
 
-            let record_changed = previous_state.map_or(true, |(old_profile, old_stale)| {
+            let record_changed = previous_state.is_none_or(|(old_profile, old_stale)| {
                 old_profile != profile || old_stale != record.is_stale
             });
             self.profiles.insert(note.id.clone(), profile.clone());
@@ -1838,7 +1838,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let mut service = LinkDiscoveryService::new(temp_dir.path().to_path_buf());
         let note = make_note("n1", "Source", "Initial content", &["ai"], &[]);
-        service.bootstrap(&[note.clone()]);
+        service.bootstrap(std::slice::from_ref(&note));
         service.dismiss_suggestion("n1", "target-1");
 
         let updated = make_note("n1", "Source", "Updated content", &["ai"], &[]);

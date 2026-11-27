@@ -300,7 +300,7 @@ fn compute_word_stats(sentences: &[String], window_size: usize) -> HashMap<Strin
             {
                 entry.uppercase_count += 1;
             }
-            if word.chars().next().map_or(false, |c| c.is_uppercase()) {
+            if word.chars().next().is_some_and(|c| c.is_uppercase()) {
                 entry.capitalized_count += 1;
             }
 
@@ -310,14 +310,15 @@ fn compute_word_stats(sentences: &[String], window_size: usize) -> HashMap<Strin
             }
 
             // Co-occurrence context (relatedness feature)
-            for j in i.saturating_sub(window_size)..i {
-                let ctx = words[j].to_lowercase();
+            for ctx_word in words.iter().take(i).skip(i.saturating_sub(window_size)) {
+                let ctx = ctx_word.to_lowercase();
                 if ctx != lower {
                     entry.left_context.insert(ctx);
                 }
             }
-            for j in (i + 1)..=(i + window_size).min(words.len().saturating_sub(1)) {
-                let ctx = words[j].to_lowercase();
+            let right_end = (i + window_size).min(words.len().saturating_sub(1));
+            for ctx_word in words.iter().take(right_end + 1).skip(i + 1) {
+                let ctx = ctx_word.to_lowercase();
                 if ctx != lower {
                     entry.right_context.insert(ctx);
                 }

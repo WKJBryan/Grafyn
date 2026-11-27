@@ -21,6 +21,21 @@ pub struct StreamUpdate {
     pub cost_usd: Option<f64>,
 }
 
+/// Inputs for one OpenRouter chat completion.
+///
+/// `chat` does not send a session id. `chat_stream` takes that separately so
+/// non-streaming requests keep the same JSON body.
+pub struct OpenRouterChatRequest<'a> {
+    pub model: &'a str,
+    pub messages: Vec<ChatMessage>,
+    pub system_prompt: Option<&'a str>,
+    pub temperature: Option<f64>,
+    pub max_tokens: Option<u32>,
+    pub reasoning_effort: Option<&'a str>,
+    pub web_search: bool,
+    pub web_search_max_results: u32,
+}
+
 impl OpenRouterService {
     pub fn new(api_key: String) -> Self {
         Self {
@@ -101,17 +116,18 @@ impl OpenRouterService {
     }
 
     /// Send a chat completion request (non-streaming)
-    pub async fn chat(
-        &self,
-        model: &str,
-        messages: Vec<ChatMessage>,
-        system_prompt: Option<&str>,
-        temperature: Option<f64>,
-        max_tokens: Option<u32>,
-        reasoning_effort: Option<&str>,
-        web_search: bool,
-        web_search_max_results: u32,
-    ) -> Result<String> {
+    pub async fn chat(&self, request: OpenRouterChatRequest<'_>) -> Result<String> {
+        let OpenRouterChatRequest {
+            model,
+            messages,
+            system_prompt,
+            temperature,
+            max_tokens,
+            reasoning_effort,
+            web_search,
+            web_search_max_results,
+        } = request;
+
         if !self.is_configured() {
             return Err(anyhow::anyhow!("OpenRouter API key not configured"));
         }
@@ -173,16 +189,20 @@ impl OpenRouterService {
     /// Send a streaming chat completion request
     pub async fn chat_stream(
         &self,
-        model: &str,
-        messages: Vec<ChatMessage>,
-        system_prompt: Option<&str>,
-        temperature: Option<f64>,
-        max_tokens: Option<u32>,
-        reasoning_effort: Option<&str>,
-        web_search: bool,
-        web_search_max_results: u32,
+        request: OpenRouterChatRequest<'_>,
         session_id: Option<&str>,
     ) -> Result<impl futures::Stream<Item = Result<StreamUpdate>>> {
+        let OpenRouterChatRequest {
+            model,
+            messages,
+            system_prompt,
+            temperature,
+            max_tokens,
+            reasoning_effort,
+            web_search,
+            web_search_max_results,
+        } = request;
+
         if !self.is_configured() {
             return Err(anyhow::anyhow!("OpenRouter API key not configured"));
         }

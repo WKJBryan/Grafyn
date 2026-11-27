@@ -339,18 +339,31 @@ fn extract_mcp_docx_text(bytes: &[u8]) -> Result<String, String> {
 
 // ── Tool implementations ─────────────────────────────────────────────────────
 
+/// Services and paths `GrafynMcpServer::new` installs on the tool router.
+pub struct GrafynMcpServerDeps {
+    pub knowledge_store: Arc<RwLock<KnowledgeStore>>,
+    pub search_service: Arc<RwLock<SearchService>>,
+    pub graph_index: Arc<RwLock<GraphIndex>>,
+    pub memory_service: Arc<RwLock<MemoryService>>,
+    pub chunk_index: Option<Arc<RwLock<ChunkIndex>>>,
+    pub retrieval_service: Arc<RwLock<RetrievalService>>,
+    pub priority_service: Arc<RwLock<PriorityScoringService>>,
+    pub vault_path: PathBuf,
+}
+
 #[tool_router]
 impl GrafynMcpServer {
-    pub fn new(
-        knowledge_store: Arc<RwLock<KnowledgeStore>>,
-        search_service: Arc<RwLock<SearchService>>,
-        graph_index: Arc<RwLock<GraphIndex>>,
-        memory_service: Arc<RwLock<MemoryService>>,
-        chunk_index: Option<Arc<RwLock<ChunkIndex>>>,
-        retrieval_service: Arc<RwLock<RetrievalService>>,
-        priority_service: Arc<RwLock<PriorityScoringService>>,
-        vault_path: PathBuf,
-    ) -> Self {
+    pub fn new(deps: GrafynMcpServerDeps) -> Self {
+        let GrafynMcpServerDeps {
+            knowledge_store,
+            search_service,
+            graph_index,
+            memory_service,
+            chunk_index,
+            retrieval_service,
+            priority_service,
+            vault_path,
+        } = deps;
         let vault_stamp = Arc::new(Mutex::new(latest_vault_mtime(&vault_path)));
         Self {
             knowledge_store,

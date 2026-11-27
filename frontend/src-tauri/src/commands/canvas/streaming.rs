@@ -9,7 +9,8 @@ use crate::models::canvas::{
 use crate::models::twin::{
     DecisionEpisodeCreate, PrimitiveDecisionAssessment, ReflectionCardCreate, TraceEventType,
 };
-use crate::services::openrouter::StreamUpdate;
+use crate::services::canvas_store::TileResponseUpdate;
+use crate::services::openrouter::{OpenRouterChatRequest, StreamUpdate};
 use crate::services::twin::TwinStore;
 use crate::AppState;
 use chrono::Utc;
@@ -30,6 +31,19 @@ const LLM_NODE_Y_STEP: f64 = 300.0; // height(200) + 100px gap for content overf
 const LLM_NODE_X_GAP: f64 = 80.0;
 
 type StreamedResponseUpdate = (String, String, ResponseStatus, Option<String>, Option<f64>);
+
+fn tile_response_updates(results: &[StreamedResponseUpdate]) -> Vec<TileResponseUpdate> {
+    results
+        .iter()
+        .map(|(model_id, content, status, error, cost_usd)| TileResponseUpdate {
+            model_id: model_id.clone(),
+            content: content.clone(),
+            status: status.clone(),
+            error: error.clone(),
+            cost_usd: *cost_usd,
+        })
+        .collect()
+}
 
 fn no_cost_stream<S>(
     stream: S,
@@ -210,7 +224,7 @@ pub async fn send_prompt(
         "canvas-stream",
         CanvasStreamEvent::TileCreated {
             session_id: session_id.clone(),
-            tile: tile.clone(),
+            tile: Box::new(tile.clone()),
         },
     );
 
@@ -299,14 +313,16 @@ pub async fn send_prompt(
                         let openrouter = openrouter_arc.read().await;
                         let result = openrouter
                             .chat_stream(
-                                &model_id,
-                                messages,
-                                system_prompt.as_deref(),
-                                Some(temperature),
-                                None,
-                                Some(reasoning_effort.as_str()),
-                                web_search,
-                                web_search_max_results,
+                                OpenRouterChatRequest {
+                                    model: &model_id,
+                                    messages,
+                                    system_prompt: system_prompt.as_deref(),
+                                    temperature: Some(temperature),
+                                    max_tokens: None,
+                                    reasoning_effort: Some(reasoning_effort.as_str()),
+                                    web_search,
+                                    web_search_max_results,
+                                },
                                 Some(&format!("canvas:{session_id}:{model_id}")),
                             )
                             .await;
@@ -428,7 +444,11 @@ pub async fn send_prompt(
         // Batch update store with all results in a single write
         let persistence_ok = {
             let mut store = canvas_store_arc.write().await;
-            match store.batch_update_tile_responses(&session_id_clone, &tile_id_clone, &results) {
+            match store.batch_update_tile_responses(
+                &session_id_clone,
+                &tile_id_clone,
+                tile_response_updates(&results),
+            ) {
                 Ok(()) => true,
                 Err(error) => {
                     let model_ids: Vec<String> = results
@@ -680,14 +700,16 @@ pub async fn add_models_to_tile(
                         let openrouter = openrouter_arc.read().await;
                         let result = openrouter
                             .chat_stream(
-                                &model_id,
-                                messages,
-                                system_prompt.as_deref(),
-                                Some(0.7),
-                                None,
-                                Some(reasoning_effort.as_str()),
-                                web_search,
-                                web_search_max_results,
+                                OpenRouterChatRequest {
+                                    model: &model_id,
+                                    messages,
+                                    system_prompt: system_prompt.as_deref(),
+                                    temperature: Some(0.7),
+                                    max_tokens: None,
+                                    reasoning_effort: Some(reasoning_effort.as_str()),
+                                    web_search,
+                                    web_search_max_results,
+                                },
                                 Some(&format!("canvas:{session_id}:{model_id}")),
                             )
                             .await;
@@ -809,7 +831,11 @@ pub async fn add_models_to_tile(
         // Batch update store
         let persistence_ok = {
             let mut store = canvas_store_arc.write().await;
-            match store.batch_update_tile_responses(&session_id, &tile_id, &results) {
+            match store.batch_update_tile_responses(
+                &session_id,
+                &tile_id,
+                tile_response_updates(&results),
+            ) {
                 Ok(()) => true,
                 Err(error) => {
                     let model_ids: Vec<String> = results
@@ -916,11 +942,13 @@ pub async fn regenerate_response(
         let _ = store.update_tile_response(
             &session_id,
             &tile_id,
-            &effective_model_id,
-            "",
-            ResponseStatus::Streaming,
-            None,
-            None,
+            TileResponseUpdate {
+                model_id: effective_model_id.clone(),
+                content: String::new(),
+                status: ResponseStatus::Streaming,
+                error: None,
+                cost_usd: None,
+            },
         );
     }
 
@@ -951,14 +979,16 @@ pub async fn regenerate_response(
                 let openrouter = openrouter_arc.read().await;
                 let result = openrouter
                     .chat_stream(
-                        &model_id,
-                        messages,
-                        system_prompt.as_deref(),
-                        Some(0.7),
-                        None,
-                        Some(reasoning_effort.as_str()),
-                        web_search,
-                        web_search_max_results,
+                        OpenRouterChatRequest {
+                            model: &model_id,
+                            messages,
+                            system_prompt: system_prompt.as_deref(),
+                            temperature: Some(0.7),
+                            max_tokens: None,
+                            reasoning_effort: Some(reasoning_effort.as_str()),
+                            web_search,
+                            web_search_max_results,
+                        },
                         Some(&format!("canvas:{session_id}:{model_id}")),
                     )
                     .await;
@@ -1036,11 +1066,13 @@ pub async fn regenerate_response(
                     if let Err(persist_error) = store.update_tile_response(
                         &session_id,
                         &tile_id,
-                        &model_id,
-                        &final_content,
-                        final_status.clone(),
-                        final_error.as_deref(),
-                        cost_usd,
+                        TileResponseUpdate {
+                            model_id: model_id.clone(),
+                            content: final_content.clone(),
+                            status: final_status.clone(),
+                            error: final_error.clone(),
+                            cost_usd,
+                        },
                     ) {
                         emit_persistence_error(
                             &window,
@@ -1089,11 +1121,13 @@ pub async fn regenerate_response(
                     if let Err(persist_error) = store.update_tile_response(
                         &session_id,
                         &tile_id,
-                        &model_id,
-                        "",
-                        ResponseStatus::Error,
-                        Some(error.as_str()),
-                        None,
+                        TileResponseUpdate {
+                            model_id: model_id.clone(),
+                            content: String::new(),
+                            status: ResponseStatus::Error,
+                            error: Some(error.clone()),
+                            cost_usd: None,
+                        },
                     ) {
                         emit_persistence_error(
                             &window,

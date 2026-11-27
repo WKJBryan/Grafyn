@@ -525,7 +525,7 @@ impl TwinStore {
             .filter_map(|entry| entry.ok())
         {
             let path = entry.path();
-            if !path.extension().is_some_and(|ext| ext == "json") {
+            if path.extension().is_none_or(|ext| ext != "json") {
                 continue;
             }
             let Some(trace) = load_or_quarantine::<SessionTrace>(path, "trace") else {

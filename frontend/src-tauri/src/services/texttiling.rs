@@ -174,9 +174,9 @@ fn compute_depth_scores(similarities: &[f64]) -> Vec<f64> {
 
         let max_right = {
             let mut max_val = similarities[i];
-            for j in (i + 1)..similarities.len() {
-                if similarities[j] > max_val {
-                    max_val = similarities[j];
+            for &similarity in similarities.iter().skip(i + 1) {
+                if similarity > max_val {
+                    max_val = similarity;
                 } else {
                     break;
                 }
@@ -280,11 +280,7 @@ fn snap_to_paragraph(text: &str, pos: usize) -> usize {
     for i in 0..bytes.len().saturating_sub(1) {
         if bytes[i] == b'\n' && bytes[i + 1] == b'\n' {
             let abs_pos = start + i + 2; // Position after the \n\n
-            let dist = if abs_pos > pos {
-                abs_pos - pos
-            } else {
-                pos - abs_pos
-            };
+            let dist = abs_pos.abs_diff(pos);
             if dist < best_dist {
                 best_dist = dist;
                 best_pos = abs_pos;
