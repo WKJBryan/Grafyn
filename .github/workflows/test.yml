@@ -68,6 +68,34 @@ jobs:
       - name: Run Rust tests
         run: cd frontend/src-tauri && cargo test
 
+  # grafyn-mcp only. verify.sh builds with --no-default-features --features mcp
+  # and drives a throwaway vault. It does not compile the Tauri app or need WebKit.
+  mcp-live-verification:
+    name: MCP Live Verification
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '20'
+
+      - uses: dtolnay/rust-toolchain@1.93.1
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: frontend/src-tauri
+          key: ${{ runner.os }}-ubuntu2204-mcp-live-1.93.1-${{ hashFiles('frontend/src-tauri/Cargo.lock', '.github/workflows/test.yml') }}-${{ env.RUST_CACHE_VERSION }}
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libssl-dev
+
+      - name: Run live verification
+        run: bash .cursor/skills/verify-grafyn/scripts/verify.sh
+
   frontend-tests:
     name: Frontend Tests
     runs-on: ubuntu-latest
@@ -174,7 +202,7 @@ jobs:
   test-summary:
     name: Test Summary
     runs-on: ubuntu-latest
-    needs: [release-preflight, rust-tests, frontend-tests, lint, security, build]
+    needs: [release-preflight, rust-tests, mcp-live-verification, frontend-tests, lint, security, build]
     if: always()
 
     steps:
@@ -186,6 +214,7 @@ jobs:
           echo "|-----|--------|" >> $GITHUB_STEP_SUMMARY
           echo "| Release Preflight | ${{ needs.release-preflight.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Rust Tests | ${{ needs.rust-tests.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| MCP Live Verification | ${{ needs.mcp-live-verification.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Frontend Tests | ${{ needs.frontend-tests.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Lint | ${{ needs.lint.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Security | ${{ needs.security.result }} |" >> $GITHUB_STEP_SUMMARY
